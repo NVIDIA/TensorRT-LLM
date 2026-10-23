@@ -9,7 +9,21 @@
 
 from typing import Optional, TypedDict
 
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _get_cached_merged_typed_dict
+import pytest
+import torch
+
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    _get_cached_merged_typed_dict,
+    _join_embeddings,
+)
+
+
+@pytest.mark.cpu_only
+def test_join_embeddings_handles_arbitrary_singleton_row_stride() -> None:
+    embeddings = torch.arange(6).reshape(3, 2)
+    first = embeddings[:1].as_strided((1, 2), (999, 1))
+    assert first.is_contiguous()
+    torch.testing.assert_close(_join_embeddings([first, embeddings[1:]]), embeddings)
 
 
 def test_merged_typed_dict_reuses_cached_schema():

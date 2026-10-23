@@ -29,7 +29,9 @@ from PIL import Image
 from torchvision.transforms import Normalize, Resize, ToTensor
 
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams)
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
 from tensorrt_llm.logger import logger
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
@@ -222,17 +224,50 @@ def _store_chunked_prefill_embeddings(
     )
 
 
+def _own_encoder_auxiliary_features(params: MultimodalParams) -> None:
+    """Retain named tower outputs before releasing temporary communication storage."""
+    features = params.multimodal_data.get("multimodal_features")
+    if features is not None:
+        params.multimodal_data["multimodal_features"] = [{
+            name:
+            tensor.detach().clone()
+            for name, tensor in item.items()
+        } for item in features]
+
+
 def _normalize_encoder_embeddings(
-    encoder_embeddings: Union[torch.Tensor, List[torch.Tensor]],
+    encoder_embeddings: torch.Tensor | List[torch.Tensor]
+    | List[MultimodalParams],
+    multimodal_params: List[MultimodalParams],
 ) -> List[torch.Tensor]:
     if isinstance(encoder_embeddings, torch.Tensor):
         return [encoder_embeddings]
+
+    if isinstance(encoder_embeddings,
+                  list) and encoder_embeddings and isinstance(
+                      encoder_embeddings[0], MultimodalParams):
+        if len(encoder_embeddings) != len(multimodal_params):
+            raise ValueError(
+                "Encoder results must align with the supplied input views")
+        embeddings = []
+        results = cast(List[MultimodalParams], encoder_embeddings)
+        for param, result in zip(multimodal_params, results, strict=True):
+            _own_encoder_auxiliary_features(result)
+            data = result.multimodal_data
+            embeddings.append(data["multimodal_embedding"])
+            param.multimodal_data.update({
+                key: value
+                for key, value in data.items()
+                if key not in ("multimodal_embedding", *MEDIA_MODALITIES,
+                               MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+            })
+        return [_join_embeddings(embeddings)]
 
     if (not isinstance(encoder_embeddings, list) or not all(
             isinstance(embedding, torch.Tensor)
             for embedding in encoder_embeddings)):
         raise TypeError(
-            "encoder_forward_fn must return a torch.Tensor or a list of torch.Tensor."
+            "encoder_forward_fn must return encoded Params views or physical encoder tensors."
         )
 
     return encoder_embeddings
@@ -270,14 +305,39 @@ def _join_embeddings(embeddings: List[torch.Tensor],
             return embeddings[0][:0]
         embeddings = slices
 
-    return embeddings[0] if len(embeddings) == 1 else torch.cat(embeddings,
-                                                                dim=0)
+    first = embeddings[0]
+    if len(embeddings) == 1:
+        return first
+    # Structured encoder results are row views of the same physical batch.
+    # Recover that view before the existing ownership clone instead of
+    # concatenating and allocating a second full batch.
+    if first.is_contiguous() and first.device.type != "meta":
+        storage = first.untyped_storage()
+        # A singleton row may be contiguous even with an arbitrary row stride.
+        row_size = math.prod(first.shape[1:])
+        offset = first.storage_offset() + first.numel()
+        for embedding in embeddings[1:]:
+            if (embedding.shape[1:] != first.shape[1:]
+                    or embedding.dtype != first.dtype
+                    or embedding.device != first.device
+                    or not embedding.is_contiguous()
+                    or embedding.untyped_storage() is not storage
+                    or embedding.storage_offset() != offset):
+                break
+            offset += embedding.numel()
+        else:
+            return first.as_strided(
+                (sum(embedding.shape[0]
+                     for embedding in embeddings), *first.shape[1:]),
+                (row_size, *first.stride()[1:]),
+            )
+    return torch.cat(embeddings, dim=0)
 
 
 def get_multimodal_embeddings(
     encoder_forward_fn: Callable[
         ...,
-        torch.Tensor | List[torch.Tensor],
+        torch.Tensor | List[torch.Tensor] | List[MultimodalParams],
     ],
     multimodal_params: List[MultimodalParams],
     encoder_kwargs: Optional[Dict[str, Any]] = None,
@@ -294,7 +354,8 @@ def get_multimodal_embeddings(
     Args:
         encoder_forward_fn: Callable that performs encoder forward pass.
                            Should accept List[MultimodalParams] and return either
-                           a single torch.Tensor or List[torch.Tensor].
+                           encoded Params views. Physical tower adapters may
+                           return a tensor or list of tensors.
         multimodal_params: All multimodal parameters in the batch.
         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
     Returns:
@@ -330,7 +391,8 @@ def get_multimodal_embeddings(
         kwargs = encoder_kwargs or {}
         encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
                                                 **kwargs)
-        encoder_embeddings = _normalize_encoder_embeddings(encoder_embeddings)
+        encoder_embeddings = _normalize_encoder_embeddings(
+            encoder_embeddings, uncached_multimodal_params)
 
         # TODO: support multiple multimodal modalities per request
         if len(encoder_embeddings) > 1:

@@ -18,7 +18,7 @@ All published functionality in the Release Notes has been fully tested and verif
   `MultimodalItemMetadata`, replacing `get_mm_encoder_item_metadata()` and
   `MultimodalEncoderItemMetadata`. The removed `DisaggPrefillMultimodalInputs`
   result is replaced by `(prompt_token_ids, MultimodalParams)` from
-  `build_disagg_prefill_multimodal_inputs()`, which also accepts the keyword-only
+  `finalize_multimodal_prompt()`, which also accepts the keyword-only
   `mm_hashes` argument. Custom processors must migrate these hooks; processors
   defining the removed metadata hook now fail at wrapper creation.
   Also removed: `MultimodalParams(mm_item_order=...)`, the
@@ -28,6 +28,18 @@ All published functionality in the Release Notes has been fully tested and verif
   Grouped encoders must also include item metadata with exact output row counts
   in `get_dummy_mm_data()` results used for startup profiling. See the
   [multimodal developer guide](developer-guide/multimodal.md).
+
+- <span style="color: red">**[BREAKING CHANGE] Structured multimodal encoder results and E/P handoff.**</span>
+  Outer encoder hooks now return ordered `MultimodalParams` views instead of a
+  concatenated tensor. Physical tower functions keep returning tensors.
+  `DisaggregatedParams.multimodal` carries versioned encoded items, an optional
+  finalized request layout, and model-required decode state; it replaces flat
+  E/P embedding/hash/mrope fields. E/P extensions use
+  `finalize_multimodal_prompt()` in place of
+  `build_disagg_prefill_multimodal_inputs()`. External E/P orchestrators,
+  including Dynamo, must deploy their matching adapter revision. Existing HTTP
+  P/D span fields remain supported. See the
+  [multimodal developer guide](developer-guide/multimodal.md#encoderprefill-handoff).
 
 ### Fixed Issues
 

@@ -43,6 +43,7 @@ from tensorrt_llm.inputs.multimodal import (
     check_mm_embed_cumsum_if_needed,
     strip_mm_data_for_generation,
 )
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, InputProcessor
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
@@ -320,8 +321,12 @@ class DecoderInputPreparer:
         use_beam_search: bool,
         steady_gen_cache_supported: bool,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
+        input_processor: InputProcessor | None = None,
     ) -> None:
         self._buffers = buffers
+        self._input_processor = (
+            input_processor if isinstance(input_processor, BaseMultimodalInputProcessor) else None
+        )
         self._mm_item_scheduler = mm_item_scheduler
         self._config = config
         self.mapping = mapping
@@ -1144,22 +1149,14 @@ class DecoderInputPreparer:
                 request.py_multimodal_data = multimodal_params.multimodal_data
             multimodal_params_list.append(multimodal_params)
 
-            # Re-register mrope tensors for context-only requests (EPD disaggregated serving).
-            # This creates new IPC handles owned by the prefill worker, so the decode worker
-            # can access them even after the encode worker's GC deallocates the original memory.
-            # Without this, the decode worker would receive handles pointing to freed memory.
-            if (
-                request.is_context_only_request
-                and _use_mrope
-                and "mrope_config" in multimodal_params.multimodal_data
-            ):
-                mrope_config = multimodal_params.multimodal_data["mrope_config"]
-                _mrope_position_ids = mrope_config.get("mrope_position_ids")
-                _mrope_position_deltas = mrope_config.get("mrope_position_deltas")
-                if _mrope_position_ids is not None and _mrope_position_deltas is not None:
-                    # Clone to allocate new memory owned by this (prefill) worker.
-                    request.py_result.set_mrope_position(
-                        _mrope_position_ids.clone(), _mrope_position_deltas.clone()
+            if request.is_context_only_request and self._input_processor is not None:
+                decode_params = self._input_processor.prepare_multimodal_decode_inputs(
+                    multimodal_params
+                )
+                request_layout = multimodal_params.multimodal_data.get("request_layout")
+                if decode_params.multimodal_data or request_layout is not None:
+                    request.py_result.set_multimodal_decode_inputs(
+                        decode_params, request_layout=request_layout
                     )
 
     def _classify_generation_requests(

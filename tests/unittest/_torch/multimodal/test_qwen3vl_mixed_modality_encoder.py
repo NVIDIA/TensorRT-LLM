@@ -71,7 +71,12 @@ def _patches(marker: int, n: int, dim: int = 2) -> torch.Tensor:
 
 
 def _encode(params: list) -> torch.Tensor:
-    return encode_multimodal_by_groups(_QWEN3VL_ENCODER_GROUPS, params)
+    return torch.cat(
+        [
+            result.multimodal_data["multimodal_embedding"]
+            for result in encode_multimodal_by_groups(_QWEN3VL_ENCODER_GROUPS, params)
+        ]
+    )
 
 
 def test_image_only_request() -> None:
@@ -215,6 +220,6 @@ def test_raw_inputs_route_through_encode_multimodal_by_groups() -> None:
             lengths=[5, 3],
         ),
     ]
-    out = encode_multimodal_by_groups(_QWEN3VL_ENCODER_GROUPS, params)
+    out = _encode(params)
     expected = torch.tensor([22.0] * 5 + [11.0] * 3)
     assert torch.equal(out[:, 0], expected)

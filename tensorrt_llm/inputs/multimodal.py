@@ -890,6 +890,27 @@ class MultimodalParams:
         if self.multimodal_data is None:
             self.multimodal_data = {}
 
+    def with_encoder_output(
+        self,
+        embeddings: torch.Tensor,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> "MultimodalParams":
+        """Return an encoded view without retaining raw inputs or cache ownership.
+
+        ``embeddings`` has shape ``[output_rows, feature_size]``; feature size
+        may include packed auxiliary features such as Qwen3-VL DeepStack.
+        The caller owns its storage lifetime. Constructing the view performs
+        no tensor copy or device synchronization. ``metadata`` contains only
+        model data needed to consume the output, never raw media.
+        """
+        data = {} if metadata is None else dict(metadata)
+        data["multimodal_embedding"] = embeddings
+        if self.item_metadata is not None:
+            data.setdefault(MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+                            self.item_metadata)
+        return MultimodalParams(multimodal_data=data)
+
     @classmethod
     def from_embeddings(
         cls,
@@ -957,6 +978,14 @@ class MultimodalParams:
     def item_metadata(self) -> MultimodalItemMetadata | None:
         """The single item record stored in this request's processed data."""
         return get_multimodal_item_metadata(self.multimodal_data)
+
+    def get_item_embeddings(self) -> list[torch.Tensor | dict[str, Any]]:
+        """Read primary item tensors or handles without copying their payloads."""
+        embeddings = self.multimodal_data["multimodal_embedding"]
+        if isinstance(embeddings, torch.Tensor):
+            return list(
+                torch.split(embeddings, self.get_item_layout()[1], dim=0))
+        return embeddings
 
     def get_item_layout(
             self) -> tuple[Sequence[tuple[str, int]], Sequence[int]]:
@@ -1245,6 +1274,9 @@ class MultimodalParams:
         """
         if not self.multimodal_data:
             return
+        if "decode_inputs" in self.multimodal_data:
+            self.multimodal_data = dict(self.multimodal_data["decode_inputs"])
+            return
         # Detach from the caller's dict, then apply the in-place primitive.
         self.multimodal_data = dict(self.multimodal_data)
         strip_mm_data_for_generation(self.multimodal_data)
@@ -1252,6 +1284,152 @@ class MultimodalParams:
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
         return bool(self.multimodal_input or self.multimodal_data)
+
+
+def _multimodal_embedding_shape(
+        embedding: torch.Tensor | dict[str, Any]) -> tuple[int, ...]:
+    """Read a tensor/handle shape without importing storage or synchronizing CUDA."""
+    return tuple(embedding.shape) if isinstance(
+        embedding, torch.Tensor) else tuple(embedding["tensor_size"])
+
+
+def export_multimodal_data(value: Any, *, clone_tensors: bool = False) -> Any:
+    """Export named model tensors as handles while preserving their shapes/dtypes."""
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().clone() if clone_tensors else value
+        return SharedTensorContainer.from_tensor(tensor).dump_to_dict()
+    if isinstance(value, dict):
+        return {
+            key: export_multimodal_data(item, clone_tensors=clone_tensors)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            export_multimodal_data(item, clone_tensors=clone_tensors)
+            for item in value
+        ]
+    return value
+
+
+def export_multimodal_params(params: MultimodalParams) -> dict[str, Any]:
+    """Project encoded items and optional finalized layout onto the E/P wire.
+
+    Only tensors in the encoded view are exported. Raw media, runtime views,
+    stream events and cache ownership never cross this boundary. Named tensor
+    handles preserve packed or auxiliary feature shapes without assuming a
+    language-model hidden size.
+    """
+    metadata = params.item_metadata
+    refs, lengths = params.get_item_layout()
+    items = []
+    auxiliary = params.multimodal_data.get("multimodal_embedding_metadata")
+    features = params.multimodal_data.get("multimodal_features")
+    if features is not None and len(features) != len(refs):
+        raise ValueError(
+            "Auxiliary feature mappings must align with encoded items")
+    for index, ((modality, local_index), tensor) in enumerate(
+            zip(refs, params.get_item_embeddings(), strict=True)):
+        item = {
+            "item_ref": [modality, local_index],
+            "embeddings": {
+                "multimodal_embedding": export_multimodal_data(tensor)
+            },
+            "output_embedding_length": lengths[index],
+        }
+        if features is not None:
+            item["embeddings"].update(export_multimodal_data(features[index]))
+        if params.multimodal_input is not None:
+            item["hash"] = params.multimodal_input.multimodal_hashes[index]
+        if metadata.encoder_token_lengths is not None:
+            item["encoder_token_length"] = metadata.encoder_token_lengths[index]
+        model_metadata = {}
+        if modality in params.multimodal_data:
+            model_metadata[modality] = select_multimodal_fields(
+                params.multimodal_data[modality],
+                metadata.input_partitions.get(modality, {}), [local_index])
+        if auxiliary is not None:
+            model_metadata.update(auxiliary[index])
+        if model_metadata:
+            item["model_metadata"] = export_multimodal_data(model_metadata)
+        items.append(item)
+    handoff = {"schema_version": 1, "items": items}
+    if "request_layout" in params.multimodal_data:
+        handoff["request_layout"] = export_multimodal_data(
+            params.multimodal_data["request_layout"])
+    if "decode_inputs" in params.multimodal_data:
+        handoff["decode_inputs"] = export_multimodal_data(
+            params.multimodal_data["decode_inputs"])
+    return handoff
+
+
+def import_multimodal_params(handoff: dict[str, Any]) -> MultimodalParams:
+    """Import encoded item handles without materializing their tensor payloads."""
+    if handoff.get("schema_version") != 1:
+        raise ValueError(
+            "Unsupported multimodal handoff schema_version; expected 1")
+    items = handoff["items"]
+    for item in items:
+        handle = item["embeddings"]["multimodal_embedding"]
+        if handle["tensor_size"][0] != item["output_embedding_length"]:
+            raise ValueError(
+                "Encoded item handle rows do not match its output length")
+        item_hash = item.get("hash")
+        if item_hash is not None and (not isinstance(item_hash, list)
+                                      or len(item_hash) != 8 or any(
+                                          type(value) is not int
+                                          for value in item_hash)):
+            raise ValueError("Encoded item hashes must contain eight integers")
+    metadata = MultimodalItemMetadata(
+        [tuple(item["item_ref"]) for item in items],
+        encoder_token_lengths=([item["encoder_token_length"] for item in items]
+                               if items and all("encoder_token_length" in item
+                                                for item in items) else None),
+        output_embedding_lengths=[
+            item["output_embedding_length"] for item in items
+        ],
+    )
+    metadata.validate()
+    data = {
+        "multimodal_embedding":
+        [item["embeddings"]["multimodal_embedding"] for item in items],
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+        metadata,
+        "multimodal_embedding_metadata":
+        [item.get("model_metadata", {}) for item in items],
+    }
+    if any(len(item["embeddings"]) > 1 for item in items):
+        data["multimodal_features"] = [{
+            name: handle
+            for name, handle in item["embeddings"].items()
+            if name != "multimodal_embedding"
+        } for item in items]
+    layout = handoff.get("request_layout")
+    if "decode_inputs" in handoff:
+        data["decode_inputs"] = handoff["decode_inputs"]
+    multimodal_input = None
+    if layout is not None:
+        hashes = [item.get("hash") for item in items]
+        if items and all(value is not None for value in hashes):
+            multimodal_input = MultimodalInput.from_components(
+                hashes,
+                layout["multimodal_positions"],
+                layout["multimodal_lengths"],
+                mm_item_run_cu_offsets=layout.get(
+                    "multimodal_item_run_cu_offsets"),
+                mm_run_positions=layout.get("multimodal_run_positions"),
+                mm_run_lengths=layout.get("multimodal_run_lengths"),
+            )
+        data.update(layout.get("model_data", {}))
+        if "special_token_offsets" in layout:
+            data["special_token_offsets"] = layout["special_token_offsets"]
+        data["request_layout"] = {
+            key: value
+            for key, value in layout.items() if key != "model_data"
+        }
+    return MultimodalParams(multimodal_input=multimodal_input,
+                            multimodal_data=data)
 
 
 @dataclass

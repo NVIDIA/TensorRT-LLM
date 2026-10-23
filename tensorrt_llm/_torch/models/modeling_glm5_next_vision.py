@@ -76,9 +76,11 @@ from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalModelMixin,
+    _encode_multimodal_group_tensor,
     encode_multimodal_by_groups,
+    split_multimodal_encoder_outputs,
 )
-from .modeling_qwen2vl import _prepare_qwen_vl_vision_attn_metadata
+from .modeling_qwen2vl import _prepare_qwen_vl_vision_attn_metadata, _qwen_encoder_device_paths
 from .modeling_utils import (
     ModelConfig,
     QuantConfig,
@@ -762,7 +764,18 @@ class Glm5NextVisionModelBase(nn.Module):
         )
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [_encode_multimodal_group_tensor(self.mm_encoder_groups, multimodal_params)]
+
+    @property
+    def multimodal_data_device_paths(self) -> list[str]:
+        return _qwen_encoder_device_paths(self.visual)
+
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> list[MultimodalParams]:
+        """Share the encoded-view contract with aggregated model execution."""
+        embeddings = self.forward(multimodal_params)
+        return split_multimodal_encoder_outputs(embeddings[0], multimodal_params)
 
 
 def _flatten_video_grid_thw(video_grid_thw: torch.Tensor) -> torch.Tensor:
@@ -1190,16 +1203,13 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
 
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
-    ) -> torch.Tensor:
+    ) -> list[MultimodalParams]:
         if self.mm_encoder is None:
             raise ValueError("Raw multimodal inputs require a local multimodal encoder.")
-        mm_embeds = self.mm_encoder.forward(list(multimodal_params), **encoder_kwargs)
-        if len(mm_embeds) != 1:
-            raise ValueError(
-                "glm5_next multimodal encoder must return one packed "
-                f"embedding tensor, but returned {len(mm_embeds)} tensors."
-            )
-        return mm_embeds[0]
+        return encode_multimodal_by_groups(
+            self.mm_encoder.mm_encoder_groups,
+            list(multimodal_params),
+        )
 
     def load_weights(self, weights: Dict[str, torch.Tensor], **_ignored: Any) -> None:
         """Route ``model.visual.*`` to the tower, everything else to the

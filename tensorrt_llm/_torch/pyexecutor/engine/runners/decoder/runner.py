@@ -251,6 +251,7 @@ class DecoderRunner(ScheduledModelRunner):
             mapping=self.mapping,
             dist=self.dist,
             model=self.model,
+            input_processor=self.input_processor,
             get_runtime_tokens_per_gen_step=self.get_runtime_tokens_per_gen_step,
             iter_states=self.iter_states,
             lora=self._lora,

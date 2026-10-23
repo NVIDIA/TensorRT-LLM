@@ -49,7 +49,11 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MultimodalItemMetadata,
+    MultimodalParams,
+    _multimodal_embedding_shape,
+)
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -74,6 +78,7 @@ from ..modules.mlp import MLP
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_mixin import split_multimodal_encoder_outputs
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -1020,6 +1025,13 @@ class KimiK25VisionModel(nn.Module):
             embeds = embeds.reshape(-1, embeds.shape[-1])
         return [embeds]
 
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> list[MultimodalParams]:
+        """Share the encoded-view contract with aggregated model execution."""
+        embeddings = self.forward(multimodal_params)
+        return split_multimodal_encoder_outputs(embeddings[0], multimodal_params)
+
 
 # ---------------------------------------------------------------------------
 # Weight loading helpers
@@ -1465,10 +1477,10 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             "multimodal_data": multimodal_data,
         }
 
-    def build_disagg_prefill_multimodal_inputs(
+    def _finalize_multimodal_prompt(
         self,
         inputs: TextPrompt,
-        mm_handles: List[Dict[str, Any]],
+        params: MultimodalParams,
         *,
         mm_hashes: list[list[int]] | None = None,
     ) -> tuple[list[int], MultimodalParams]:
@@ -1476,7 +1488,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
 
         Args:
             inputs: Text prompt input container.
-            mm_handles: List of multimodal embedding handles, each
+            embeddings: List of multimodal embedding handles, each
                 containing ``tensor_size``.
             mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
@@ -1484,14 +1496,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             Expanded token IDs and common multimodal params containing
             prompt layout, item metadata, and embedding handles.
         """
+        embeddings = params.get_item_embeddings()
         text_prompt = inputs.get("prompt")
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
 
         text_config = getattr(self._config, "text_config", self._config)
         expected_hidden_size = text_config.hidden_size
-        for i, mm_handle in enumerate(mm_handles):
-            hidden_size = mm_handle["tensor_size"][1]
+        for i, embedding in enumerate(embeddings):
+            hidden_size = _multimodal_embedding_shape(embedding)[1]
             if hidden_size != expected_hidden_size:
                 raise RuntimeError(
                     f"Multimodal embedding {i} hidden size {hidden_size} "
@@ -1504,12 +1517,12 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         image_mask = input_ids == self._media_placeholder_token_id
         image_positions = torch.where(image_mask)[0]
         num_images = len(image_positions)
-        assert num_images == len(mm_handles), (
+        assert num_images == len(embeddings), (
             f"Number of placeholders ({num_images}) must match "
-            f"number of mm_handles ({len(mm_handles)})"
+            f"number of embeddings ({len(embeddings)})"
         )
 
-        total_mm_tokens = sum(h["tensor_size"][0] for h in mm_handles)
+        total_mm_tokens = sum(_multimodal_embedding_shape(h)[0] for h in embeddings)
         final_length = len(input_ids) - num_images + total_mm_tokens
 
         expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
@@ -1520,7 +1533,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
 
         for read_pos in range(len(input_ids)):
             if input_ids[read_pos] == self._media_placeholder_token_id:
-                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
+                mm_token_num = _multimodal_embedding_shape(embeddings[image_cnt])[0]
                 expanded_ids[write_pos : write_pos + mm_token_num] = placeholder_id
                 mm_token_offsets.append(write_pos)
                 mm_token_length.append(mm_token_num)
@@ -1531,10 +1544,12 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 write_pos += 1
 
         return expanded_ids.to(torch.int32).tolist(), MultimodalParams.from_embeddings(
-            mm_handles,
+            embeddings,
             MultimodalItemMetadata(
-                [("image", i) for i in range(len(mm_handles))],
-                output_embedding_lengths=[handle["tensor_size"][0] for handle in mm_handles],
+                [("image", i) for i in range(len(embeddings))],
+                output_embedding_lengths=[
+                    _multimodal_embedding_shape(handle)[0] for handle in embeddings
+                ],
             ),
             multimodal_hashes=mm_hashes,
             multimodal_lengths=mm_token_length,

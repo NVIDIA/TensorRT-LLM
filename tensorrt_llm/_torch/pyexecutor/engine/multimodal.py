@@ -553,9 +553,10 @@ class MultimodalItemScheduler:
                 # Validate the entire batch before publishing any output. Otherwise a
                 # bad later item could leave earlier items READY and later requests
                 # admitted to prefill without committed outputs.
-                for output, (item_idx, cache_key, expected_rows) in zip(
+                for result, (item_idx, cache_key, expected_rows) in zip(
                     outputs, output_targets, strict=True
                 ):
+                    output = result.multimodal_data.get("multimodal_embedding")
                     if (
                         not isinstance(output, torch.Tensor)
                         or output.shape != (expected_rows, expected_width)
@@ -574,8 +575,8 @@ class MultimodalItemScheduler:
                         break
 
             if pending_error is None:
-                for output, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
-                    encoder_cache.commit(cache_key, output)
+                for result, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
+                    encoder_cache.commit(cache_key, result.multimodal_data["multimodal_embedding"])
         if pending_error is not None:
             raise pending_error
 

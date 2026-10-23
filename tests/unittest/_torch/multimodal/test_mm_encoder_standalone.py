@@ -716,39 +716,15 @@ def _load_inputs(llm: LLM, prompts, media, mm_embeddings=None):
     return inputs
 
 
-def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
-    # Helper function for checking that two SharedTensorContainer dict representations of the same
-    # underlying data are different. Certain metadata should stay the same (basically those describing
-    # the tensor's contents), while others should actually differ (those pertaining to the underlying
-    # storage).
-    matching_keys = [
-        "dtype",
-        "event_sync_required",
-        "method_key",
-        "requires_grad",
-        # NOTE: this assumes the workers are on the same physical device, which is the case in
-        # the tests in this file since `LLM` API does not expose a way to select the device ID.
-        "storage_device",
-        "storage_size_bytes",
-        "tensor_offset",
-        "tensor_size",
-        "tensor_stride",
-    ]
-
-    different_keys = [
-        "event_handle",
-        "ref_counter_handle",
-        "ref_counter_offset",
-        "storage_handle",
-        "storage_offset_bytes",
-    ]
-
-    assert set(matching_keys + different_keys) == x.keys() == y.keys()
-
-    for key in matching_keys:
-        assert x[key] == y[key]
-    for key in different_keys:
-        assert x[key] != y[key]
+def _assert_handles_are_different(x: dict, y: dict) -> None:
+    """P owns a copy of the state it retains for D, for CPU and CUDA handles."""
+    assert x["tensor_size"] == y["tensor_size"]
+    assert x["dtype"] == y["dtype"]
+    assert x["storage_handle"] != y["storage_handle"]
+    torch.testing.assert_close(
+        SharedTensorContainer.from_dict(x).get_local_view(),
+        SharedTensorContainer.from_dict(y).get_local_view(),
+    )
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -808,8 +784,13 @@ def test_single_request_chat_multiple_images(
         assert len(outputs) == 1
         pd_disaggregated_params = outputs[0].disaggregated_params
 
-        ep_handle = ep_disaggregated_params.mrope_position_ids_handle
-        pd_handle = pd_disaggregated_params.mrope_position_ids_handle
+        ep_handle = ep_disaggregated_params.multimodal.get(
+            "request_layout", {}).get("model_data",
+                                      {}).get("mrope_config",
+                                              {}).get("mrope_position_deltas")
+        pd_handle = pd_disaggregated_params.multimodal.get(
+            "decode_inputs", {}).get("mrope_config",
+                                     {}).get("mrope_position_deltas")
         assert type(ep_handle) is type(pd_handle)
         if ep_handle is not None:
             _assert_handles_are_different(ep_handle, pd_handle)
@@ -973,7 +954,7 @@ def test_multi_request_batch_chat(
         for input, encoder_output in zip(inputs, encoder_outputs):
             disagg_params = encoder_output.disaggregated_params
             assert disagg_params is not None
-            mm_embed_handles = disagg_params.multimodal_embedding_handles
+            mm_embed_handles = disagg_params.get_multimodal_embedding_handles()
             assert mm_embed_handles is not None
             # `mm_embed_handles` is list of handles (one per multimodal item).
             # Reconstruct and concatenate all embeddings for this request.
@@ -1176,7 +1157,7 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
             encoder_outputs = encoder.generate([inp])
             ep_params = encoder_outputs[0].disaggregated_params
             assert ep_params is not None, "Encoder should produce disaggregated_params"
-            assert ep_params.multimodal_embedding_handles is not None
+            assert ep_params.get_multimodal_embedding_handles() is not None
             assert ep_params.multimodal_hashes is not None
             all_ep_hashes.append(ep_params.multimodal_hashes)
 

@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 from pathlib import Path
 
@@ -109,7 +123,8 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
             # Get actual embedding tensor for this image
             disagg_params = encoder_outputs[image_idx].disaggregated_params
             assert disagg_params is not None
-            mm_embedding_handles = disagg_params.multimodal_embedding_handles
+            mm_embedding_handles = disagg_params.get_multimodal_embedding_handles(
+            )
             assert mm_embedding_handles is not None
             assert len(mm_embedding_handles) == 1
             actual_embedding = SharedTensorContainer.from_dict(
@@ -212,7 +227,8 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             # Get actual embedding tensor for this image
             disagg_params = encoder_outputs[video_idx].disaggregated_params
             assert disagg_params is not None
-            mm_embedding_handles = disagg_params.multimodal_embedding_handles
+            mm_embedding_handles = disagg_params.get_multimodal_embedding_handles(
+            )
             assert mm_embedding_handles is not None
             assert len(mm_embedding_handles) == 1
             actual_embedding = SharedTensorContainer.from_dict(

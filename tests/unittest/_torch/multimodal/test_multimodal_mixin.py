@@ -24,6 +24,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
+    split_multimodal_encoder_outputs,
 )
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import (
@@ -114,21 +115,18 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
         self.encode_calls = 0
         self._initialize_multimodal_encoder_cache(encoder_cache_max_bytes)
 
-    def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
+    def encode_multimodal_inputs(
+        self, multimodal_params: list[MultimodalParams], **encoder_kwargs: object
+    ) -> list[MultimodalParams]:
         self.encode_calls += 1
-        total_rows = 0
-        for param in multimodal_params:
-            # Residuals built by the partial-cache path carry `multimodal_embedding_lengths`
-            # but no `multimodal_runtime`; fall through to the metadata in that case.
-            if param.multimodal_runtime is not None:
-                total_rows += param.multimodal_runtime.total_embeds_in_request
-            else:
-                total_rows += sum(param.get_item_layout()[1])
-        return torch.full(
+        total_rows = sum(sum(param.get_item_layout()[1]) for param in multimodal_params)
+        embeddings = torch.full(
             (total_rows, self.embedding.embedding_dim),
             float(self.encode_calls),
             dtype=torch.float32,
         )
+
+        return split_multimodal_encoder_outputs(embeddings, multimodal_params)
 
 
 def make_cached_multimodal_param(mm_embeds: torch.Tensor) -> MultimodalParams:

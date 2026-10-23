@@ -312,7 +312,10 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
             return []
 
         def forward_multimodal_encoder_items(self, _):
-            return outputs
+            return [
+                MultimodalParams(multimodal_data={"multimodal_embedding": output})
+                for output in outputs
+            ]
 
     outputs = [torch.ones(1, 4, dtype=torch.bfloat16) for _ in range(3)]
     outputs[1] = {
@@ -372,8 +375,10 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
 
         def forward_multimodal_encoder_items(self, encoder_inputs):
             return [
-                torch.full((embedding_length, 2), float(embedding_length))
-                for _, embedding_lengths, _ in encoder_inputs
+                param.with_encoder_output(
+                    torch.full((embedding_length, 2), float(embedding_length))
+                )
+                for param, embedding_lengths, _ in encoder_inputs
                 for embedding_length in embedding_lengths
             ]
 

@@ -143,12 +143,16 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
     )
 
     video = VideoData(frames=[object()], metadata={}, audio=None)
-    prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
+    prompt_token_ids, params = processor._finalize_multimodal_prompt(
         {
             input_field: input_value,
             "multi_modal_data": {"video": [video]},
         },
-        [{"tensor_size": (4, 16)}],
+        MultimodalParams(
+            multimodal_data={
+                "multimodal_embedding": [{"tensor_size": (4, 16)}],
+            }
+        ),
         mm_hashes=[[1] * 8],
     )
 

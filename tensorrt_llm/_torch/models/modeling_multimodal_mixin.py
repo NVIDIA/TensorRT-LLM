@@ -51,6 +51,8 @@ from tensorrt_llm.logger import logger
 
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from .modeling_multimodal_utils import (
+    _join_embeddings,
+    _normalize_encoder_embeddings,
     _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -124,6 +126,80 @@ class EncoderGroup:
     """Builds the kwargs dict passed to `encoder_fn`. Responsible for
     concatenating raw per-item tensors from `multimodal_data` across
     requests in the order described in the class docstring."""
+
+    batch_key: Callable[[MultimodalParams], Hashable] | None = None
+    """Optional host-side compatibility key, for example padded shapes and
+    mask availability. Equal keys may share one physical encoder call.
+    The framework restores request/item order across different keys."""
+
+    max_num_tokens: int | None = None
+    """Optional encoder-token limit for combining input views. Admission owns
+    atomic request limits; an input view is never split by this helper."""
+
+    get_num_tokens: Callable[[MultimodalParams], int] | None = None
+    """Conservative host-side input cost, required with ``max_num_tokens``.
+    This counts encoder work, independently of output embedding rows."""
+
+
+def _encode_compatible_batches(group: EncoderGroup, params: list[MultimodalParams]) -> torch.Tensor:
+    """Run compatible physical batches and restore the group's payload order."""
+    if group.batch_key is None and group.max_num_tokens is None:
+        return group.encoder_fn(**group.build_batched_input(params))
+    get_num_tokens = group.get_num_tokens if group.max_num_tokens is not None else None
+    if group.max_num_tokens is not None and get_num_tokens is None:
+        raise ValueError("An encoder batch token limit requires get_num_tokens")
+    compatible: dict[Hashable, list[tuple[int, MultimodalParams]]] = {}
+    for index, param in enumerate(params):
+        key = group.batch_key(param) if group.batch_key is not None else None
+        compatible.setdefault(key, []).append((index, param))
+    batches = []
+    for bucket in compatible.values():
+        current = []
+        num_tokens = 0
+        for entry in bucket:
+            cost = get_num_tokens(entry[1]) if get_num_tokens is not None else 0
+            if (
+                group.max_num_tokens is not None
+                and current
+                and num_tokens + cost > group.max_num_tokens
+            ):
+                batches.append(current)
+                current = []
+                num_tokens = 0
+            current.append(entry)
+            num_tokens += cost
+        if current:
+            batches.append(current)
+    if len(batches) == 1:
+        return group.encoder_fn(**group.build_batched_input(params))
+    outputs: dict[tuple[int, str, int], torch.Tensor] = {}
+    for batch in batches:
+        output = group.encoder_fn(**group.build_batched_input([param for _, param in batch]))
+        cursor = 0
+        for modality in group.modalities:
+            for request_index, param in batch:
+                refs, lengths = param.get_item_layout()
+                for local_index, length in sorted(
+                    (local_index, length)
+                    for (item_modality, local_index), length in zip(refs, lengths, strict=True)
+                    if item_modality == modality
+                ):
+                    outputs[request_index, modality, local_index] = output[cursor : cursor + length]
+                    cursor += length
+        if cursor != output.shape[0]:
+            raise MultimodalEncoderContractError("Compatible encoder batch returned incorrect rows")
+    ordered = []
+    for modality in group.modalities:
+        for request_index, param in enumerate(params):
+            ordered.extend(
+                outputs[request_index, modality, local_index]
+                for local_index in sorted(
+                    index
+                    for item_modality, index in param.item_metadata.item_refs
+                    if item_modality == modality
+                )
+            )
+    return _join_embeddings(ordered)
 
 
 def _lengths_by_modality(
@@ -230,7 +306,7 @@ def _reorder_embeds_by_manifest(
     return torch.cat(slices, dim=0)
 
 
-def encode_multimodal_by_groups(
+def _encode_multimodal_group_tensor(
     mm_encoder_groups: Sequence["EncoderGroup"],
     multimodal_params: List[MultimodalParams],
 ) -> torch.Tensor:
@@ -263,8 +339,14 @@ def encode_multimodal_by_groups(
                 group_layouts.append(layout)
         if not group_params:
             continue
-        out = group.encoder_fn(**group.build_batched_input(group_params))
+        out = _encode_compatible_batches(group, group_params)
         lengths = _lengths_by_modality(group_layouts, group.modalities)
+        expected_rows = sum(sum(values) for values in lengths.values())
+        if out.shape[0] != expected_rows:
+            raise MultimodalEncoderContractError(
+                f"MM encoder group {group.modalities} returned {out.shape[0]} rows; "
+                f"expected {expected_rows}"
+            )
         cursor = 0
         for m in group.modalities:
             total = sum(lengths[m])
@@ -272,6 +354,57 @@ def encode_multimodal_by_groups(
             cursor += total
         per_modality_lengths.update(lengths)
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
+
+
+def split_multimodal_encoder_outputs(
+    embeddings: torch.Tensor,
+    multimodal_params: Sequence[MultimodalParams],
+    *,
+    metadata_fn: Callable[[MultimodalParams], dict[str, Any]] | None = None,
+) -> list[MultimodalParams]:
+    """Wrap prompt-ordered encoder rows in one output view per input view.
+
+    The physical encoder owns packing and auxiliary feature dimensions. The
+    common boundary owns request ordering and output lengths. All splits are
+    tensor views; consumers retaining NCCL-window or graph outputs must still
+    take an owned copy at their existing lifetime boundary.
+    """
+    lengths = [sum(param.get_item_layout()[1]) for param in multimodal_params]
+    if embeddings.shape[0] != sum(lengths):
+        raise MultimodalEncoderContractError(
+            f"MM encoder returned {embeddings.shape[0]} rows; expected {sum(lengths)}"
+        )
+    outputs = []
+    for param, embedding in zip(
+        multimodal_params, torch.split(embeddings, lengths, dim=0), strict=True
+    ):
+        metadata = {
+            key: param.multimodal_data[key]
+            for key in (
+                "mrope_config",
+                "special_token_offsets",
+                "multimodal_embedding_metadata",
+                "num_tokens_in_video",
+            )
+            if key in param.multimodal_data
+        }
+        if metadata_fn is not None:
+            metadata.update(metadata_fn(param))
+        outputs.append(param.with_encoder_output(embedding, metadata=metadata))
+    return outputs
+
+
+def encode_multimodal_by_groups(
+    mm_encoder_groups: Sequence[EncoderGroup],
+    multimodal_params: list[MultimodalParams],
+    *,
+    metadata_fn: Callable[[MultimodalParams], dict[str, Any]] | None = None,
+) -> list[MultimodalParams]:
+    """Batch shared physical encoders and return request-ordered encoded views."""
+    if not multimodal_params:
+        return []
+    embeddings = _encode_multimodal_group_tensor(mm_encoder_groups, multimodal_params)
+    return split_multimodal_encoder_outputs(embeddings, multimodal_params, metadata_fn=metadata_fn)
 
 
 if TYPE_CHECKING:
@@ -458,12 +591,13 @@ class MultimodalModelMixin:
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
-    ) -> torch.Tensor:
+    ) -> list[MultimodalParams]:
         """Run model-specific multimodal encoder work.
 
-        Returns the single primary multimodal embedding tensor for the supplied params. Rows are
-        expected to be concatenated in request order, and special multimodal tokens occupy token
-        positions but do not have rows here.
+        Return one encoded Params view per input, in the same order. Each view
+        carries prompt-ordered embeddings, their item metadata and any required
+        model output metadata. It retains neither raw inputs nor request cache
+        ownership. Special framing tokens have positions but no embedding rows.
         """
         raise NotImplementedError
 
@@ -576,44 +710,49 @@ class MultimodalModelMixin:
     def forward_multimodal_encoder_items(
         self,
         encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
-    ) -> list[torch.Tensor]:
-        """Forward prepared MM encoder inputs in scheduler item order.
+    ) -> list[MultimodalParams]:
+        """Batch selected inputs and return one encoded view per scheduler item.
 
-        Args:
-            encoder_inputs: Tuples returned by `prepare_multimodal_encoder_inputs`. Consecutive
-                inputs with the same modality must be batch-compatible.
-
-        Returns:
-            One encoder output tensor **per item** (not per input tuple). Each tensor has the
-            declared embedding row count and retains scheduler input order.
+        Models declare physical batch compatibility through their EncoderGroups.
+        Scheduler order does not impose an extra same-modality batch boundary.
         """
-        outputs: list[torch.Tensor] = []
-        group_params: list[MultimodalParams] = []
-        group_lengths: list[int] = []
-        group_modality: Optional[str] = None
-
-        def flush_group() -> None:
-            if not group_params:
-                return
-            embeddings = self.encode_multimodal_inputs(group_params)
-            expected_length = sum(group_lengths)
-            if embeddings.shape[0] != expected_length:
+        if not encoder_inputs:
+            return []
+        results = self.encode_multimodal_inputs([param for param, _, _ in encoder_inputs])
+        if len(results) != len(encoder_inputs):
+            raise MultimodalEncoderContractError("Encoder results must align with input views")
+        outputs = []
+        for result, (source, lengths, _) in zip(results, encoder_inputs, strict=True):
+            embeddings = result.multimodal_data["multimodal_embedding"]
+            if result.get_item_layout()[0] != source.get_item_layout()[0] or tuple(
+                result.get_item_layout()[1]
+            ) != tuple(lengths):
                 raise MultimodalEncoderContractError(
-                    f"MM encoder output length {embeddings.shape[0]} does not "
-                    f"match the {expected_length} rows declared by the "
-                    "selected items"
+                    "Encoder output item metadata changed during encoding"
                 )
-            outputs.extend(torch.split(embeddings, group_lengths, dim=0))
-            group_params.clear()
-            group_lengths.clear()
-
-        for multimodal_param, embedding_lengths, modality in encoder_inputs:
-            if group_modality is not None and modality != group_modality:
-                flush_group()
-            group_modality = modality
-            group_params.append(multimodal_param)
-            group_lengths.extend(embedding_lengths)
-        flush_group()
+            if embeddings.shape[0] != sum(lengths):
+                raise MultimodalEncoderContractError(
+                    f"MM encoder returned {embeddings.shape[0]} rows; expected {sum(lengths)}"
+                )
+            for index, embedding in enumerate(torch.split(embeddings, lengths, dim=0)):
+                modality, local_index = result.item_metadata.item_refs[index]
+                data = {
+                    key: value
+                    for key, value in result.multimodal_data.items()
+                    if key not in (*_MM_DATA_INPUT_MODALITY_KEYS, "request_layout", "mrope_config")
+                }
+                if modality in result.multimodal_data:
+                    data[modality] = select_multimodal_fields(
+                        result.multimodal_data[modality],
+                        result.item_metadata.input_partitions.get(modality, {}),
+                        [local_index],
+                    )
+                for key in ("multimodal_features", "multimodal_embedding_metadata"):
+                    if key in data:
+                        data[key] = [data[key][index]]
+                data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = result.item_metadata.select([index])
+                item = result.with_encoder_output(embedding, metadata=data)
+                outputs.append(item)
         return outputs
 
     @property
@@ -1417,9 +1556,10 @@ class MultimodalModelMixin:
         )
         # Keep one call across requests and modalities so EncoderGroup can
         # batch modalities that share an encoder.
-        batched_output = self.encode_multimodal_inputs([param for param, _, _ in encoder_inputs])
-        output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
-        encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
+        encoded_items = iter(
+            result.multimodal_data["multimodal_embedding"]
+            for result in self.forward_multimodal_encoder_items(encoder_inputs)
+        )
 
         for param, partition in partials:
             miss_tensors = [next(encoded_items) for _ in partition.miss_indices]
@@ -1716,7 +1856,10 @@ def _dispatch_cross_iter_prefetch(
                 if partial_hits and encoder_cache is not None:
                     model._encode_with_partial_cache(partial_hits, encoder_cache)
                 if cache_misses:
-                    encoder_output = model.encode_multimodal_inputs(cache_misses).clone()
+                    encoder_results = model.encode_multimodal_inputs(cache_misses)
+                    encoder_output = _normalize_encoder_embeddings(encoder_results, cache_misses)[
+                        0
+                    ].clone()
                     _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
                     if encoder_cache is not None:
                         for param in cache_misses:

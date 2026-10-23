@@ -39,6 +39,15 @@ pytestmark = pytest.mark.cpu_only
 ITEM_ROWS = {"image": [2, 3], "video": [4]}
 
 
+def _tensors(results: list[MultimodalParams]) -> list[torch.Tensor]:
+    return [result.multimodal_data["multimodal_embedding"] for result in results]
+
+
+def _embeddings(results: list[MultimodalParams]) -> torch.Tensor:
+    tensors = _tensors(results)
+    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+
+
 def test_qwen_processor_produces_prompt_order_and_packed_partitions():
     from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
 
@@ -379,7 +388,7 @@ class _GroupedEncoderModel(MultimodalModelMixin):
         # test can assert *which* rows came back, not just how many.
         return pixel_values.clone()
 
-    def encode_multimodal_inputs(self, multimodal_params) -> torch.Tensor:
+    def encode_multimodal_inputs(self, multimodal_params) -> list[MultimodalParams]:
         return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
 
 
@@ -394,7 +403,7 @@ def test_grouped_encoder_rejects_raw_payload_without_item_layout(empty_record: b
     params = MultimodalParams(multimodal_data=data)
 
     with pytest.raises(MultimodalEncoderContractError, match="metadata.*grouped encoding"):
-        model.encode_multimodal_inputs([params])
+        _embeddings(model.encode_multimodal_inputs([params]))
 
     assert model.encoder_calls == []
 
@@ -447,7 +456,7 @@ def test_qwen_profiling_dummy_supports_grouped_encoding(
         encoder_fn=lambda pixel_values: pixel_values[::4],
         build_batched_input=_GroupedEncoderModel._build_batched_input,
     )
-    output = encode_multimodal_by_groups([group], [params])
+    output = _embeddings(encode_multimodal_by_groups([group], [params]))
     assert output.shape == (sum(expected_rows), HIDDEN)
     assert output.dtype == torch.float16
 
@@ -467,7 +476,7 @@ def test_common_metadata_shares_executor_and_encoder_layout():
     request = SimpleNamespace(py_multimodal_data=params.multimodal_data, multimodal_lengths=[3, 2])
 
     assert get_multimodal_embedding_lengths(request) == (3, 2)
-    actual = _GroupedEncoderModel().encode_multimodal_inputs([params])
+    actual = _embeddings(_GroupedEncoderModel().encode_multimodal_inputs([params]))
 
     torch.testing.assert_close(actual, torch.cat((pixels[2:], pixels[:2])))
     assert params.item_metadata.encoder_token_lengths is None
@@ -521,7 +530,7 @@ def _expected_rows(request: MultimodalParams, item_idx: int) -> torch.Tensor:
 
 def _run_items(model, selected):
     encoder_inputs = model.prepare_multimodal_encoder_inputs(selected)
-    return model.forward_multimodal_encoder_items(encoder_inputs), encoder_inputs
+    return _tensors(model.forward_multimodal_encoder_items(encoder_inputs)), encoder_inputs
 
 
 @pytest.mark.parametrize("indices", [[2, 0], [1, 2]])
@@ -534,7 +543,7 @@ def test_declared_qwen_layout_keeps_shared_fields(indices):
 
     encoder_inputs = model.prepare_multimodal_encoder_inputs([(request, i) for i in indices])
     residual = encoder_inputs[0][0]
-    outputs = model.forward_multimodal_encoder_items(encoder_inputs)
+    outputs = _tensors(model.forward_multimodal_encoder_items(encoder_inputs))
 
     torch.testing.assert_close(torch.cat(outputs), expected, rtol=0, atol=0)
     assert residual.multimodal_data["image"]["shared_stats"] is shared
@@ -645,14 +654,14 @@ def test_full_and_item_encoder_paths_share_item_metadata(
     )
     expected = [_expected_rows(request, i) for i in range(len(item_order))]
     torch.testing.assert_close(
-        model.encode_multimodal_inputs([request]), torch.cat(expected), rtol=0, atol=0
+        _embeddings(model.encode_multimodal_inputs([request])), torch.cat(expected), rtol=0, atol=0
     )
 
     model.encoder_calls.clear()
     item_outputs, encoder_inputs = _run_items(model, [(request, i) for i in range(len(item_order))])
 
     assert [modality for _, _, modality in encoder_inputs] == [m for m, _ in expected_runs]
-    assert model.encoder_calls == [rows for _, rows in expected_runs]
+    assert model.encoder_calls == [sum(rows for _, rows in expected_runs)]
     assert len(item_outputs) == len(expected)
     for actual, rows in zip(item_outputs, expected, strict=True):
         torch.testing.assert_close(actual, rows, rtol=0, atol=0)
@@ -699,7 +708,7 @@ def test_partial_cache_uses_prompt_refs_and_lengths(reversed_order):
         request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
     lengths = metadata.output_embedding_lengths
     _attach_cache_metadata(request, lengths)
-    expected = model.encode_multimodal_inputs([request])
+    expected = _embeddings(model.encode_multimodal_inputs([request]))
     keys = model._encoder_cache_keys(request)
     model._multimodal_encoder_cache.put(keys[0], expected[: lengths[0]])
 
@@ -719,7 +728,7 @@ def test_full_cache_write_uses_canonical_lengths_without_legacy_fields():
     request = _make_request(["image", "image"])
     lengths = request.item_metadata.output_embedding_lengths
     _attach_cache_metadata(request, lengths)
-    expected = model.encode_multimodal_inputs([request])
+    expected = _embeddings(model.encode_multimodal_inputs([request]))
     calls_before = len(model.encoder_calls)
 
     actual = model._get_or_encode_multimodal_embeddings([request])
@@ -757,7 +766,7 @@ def test_partial_cache_batches_mixed_vision_and_audio_misses():
     )
     lengths = request.item_metadata.output_embedding_lengths
     _attach_cache_metadata(request, lengths)
-    expected = model.encode_multimodal_inputs([request])
+    expected = _embeddings(model.encode_multimodal_inputs([request]))
     expected_items = torch.split(expected, lengths)
     keys = model._encoder_cache_keys(request)
     for i in (0, 3):
@@ -828,7 +837,7 @@ def test_vision_and_audio_groups_share_full_and_item_ordering(shared_vision_enco
         [_expected_rows(request, 0), audio[0], _expected_rows(request, 2), audio[1]]
     )
 
-    full_output = model.encode_multimodal_inputs([request])
+    full_output = _embeddings(model.encode_multimodal_inputs([request]))
     item_outputs, _ = _run_items(model, [(request, i) for i in range(4)])
 
     torch.testing.assert_close(full_output, expected, rtol=0, atol=0)
@@ -852,14 +861,17 @@ def test_wrong_encoder_output_rows_are_request_contract_error():
     class _WrongRowsModel(_GroupedEncoderModel):
         def encode_multimodal_inputs(self, multimodal_params):
             output = super().encode_multimodal_inputs(multimodal_params)
-            return output[:-1]
+            output[0].multimodal_data["multimodal_embedding"] = output[0].multimodal_data[
+                "multimodal_embedding"
+            ][:-1]
+            return output
 
     model = _WrongRowsModel()
     request = _make_request(["image"])
     encoder_inputs = model.prepare_multimodal_encoder_inputs([(request, 0)])
 
-    with pytest.raises(MultimodalEncoderContractError, match="rows declared"):
-        model.forward_multimodal_encoder_items(encoder_inputs)
+    with pytest.raises(MultimodalEncoderContractError, match="rows; expected"):
+        _tensors(model.forward_multimodal_encoder_items(encoder_inputs))
 
 
 def test_items_from_multiple_requests_stay_separated():
@@ -907,3 +919,144 @@ def test_request_cache_input_is_built_once_and_shared_with_forward_views():
     model._apply_metadata_slice(residual, request.py_multimodal_params, [1])
     assert residual.multimodal_input.multimodal_hashes == [[2] * 8]
     assert first.multimodal_hashes == [[1] * 8, [2] * 8]
+
+
+def test_encoded_results_borrow_rows_without_retaining_request_inputs_or_state() -> None:
+    from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+
+    model = _GroupedEncoderModel()
+    first = _make_request(["image"])
+    second = _make_request(["image"], value_start=10.0)
+    first.encoder_state = MultimodalEncoderRequestState(first.item_metadata, [False])
+    results = model.encode_multimodal_inputs([first, second])
+
+    assert len(results) == 2
+    for source, result in zip((first, second), results, strict=True):
+        assert result.item_metadata is source.item_metadata
+        assert result.encoder_state is None
+        assert "image" not in result.multimodal_data
+    tensors = _tensors(results)
+    joined = _join_embeddings(tensors)
+    assert joined.untyped_storage() is tensors[0].untyped_storage()
+    torch.testing.assert_close(
+        joined, torch.cat([_expected_rows(first, 0), _expected_rows(second, 0)])
+    )
+    from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
+
+    pixels = first.multimodal_data["image"]["pixel_values"]
+    results[0].multimodal_data["image"] = {"image_grid_thw": torch.tensor([[1, 1, 2]])}
+    auxiliary = torch.arange(5)
+    results[0].multimodal_data["multimodal_features"] = [{"auxiliary": auxiliary}]
+    get_multimodal_embeddings(lambda _: results, [first, second])
+    assert first.multimodal_data["image"]["pixel_values"] is pixels
+    retained = first.multimodal_data["multimodal_features"][0]["auxiliary"]
+    torch.testing.assert_close(retained, auxiliary)
+    assert retained.untyped_storage() is not auxiliary.untyped_storage()
+
+
+def test_finalized_handoff_roundtrip_preserves_item_layout_and_named_tensor_handles() -> None:
+    import dataclasses
+    import json
+
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+    from tensorrt_llm.inputs.multimodal import export_multimodal_params, import_multimodal_params
+
+    source = _make_request(["image", "video"])
+    source.multimodal_input = MultimodalInput.from_components([[1] * 8, [2] * 8], [1, 6], [2, 4])
+    result = _GroupedEncoderModel().encode_multimodal_inputs([source])[0]
+    # The E boundary associates the pure encoder view with the original request.
+    result.multimodal_input = source.multimodal_input
+    result.multimodal_data["multimodal_features"] = [
+        {"auxiliary": torch.arange(6).reshape(3, 2)},
+        {},
+    ]
+    result.multimodal_data["request_layout"] = {
+        "prompt_token_ids": [0] * 10,
+        "multimodal_positions": [1, 6],
+        "multimodal_lengths": [2, 4],
+    }
+    envelope = DisaggregatedParams(multimodal=export_multimodal_params(result))
+    envelope = DisaggregatedParams(**json.loads(json.dumps(dataclasses.asdict(envelope))))
+    imported = import_multimodal_params(envelope.multimodal)
+
+    assert imported.get_item_layout() == result.get_item_layout()
+    assert imported.multimodal_input == source.multimodal_input
+    assert imported.multimodal_data["request_layout"] == result.multimodal_data["request_layout"]
+    assert len(envelope.get_multimodal_embedding_handles()) == 2
+    imported.to_tensor("multimodal_data")
+    torch.testing.assert_close(
+        imported.multimodal_data["multimodal_features"][0]["auxiliary"],
+        result.multimodal_data["multimodal_features"][0]["auxiliary"],
+    )
+    torch.testing.assert_close(
+        torch.cat(imported.multimodal_data["multimodal_embedding"]),
+        result.multimodal_data["multimodal_embedding"],
+    )
+
+
+@pytest.mark.parametrize("token_limit", [2, 4])
+def test_gemma_batches_compatible_audio_and_vision_requests_and_restores_order(
+    token_limit: int,
+) -> None:
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4MultimodalModelBase
+
+    class Model:
+        mm_encoder_groups = Gemma4MultimodalModelBase.mm_encoder_groups
+        encode_multimodal_inputs = Gemma4MultimodalModelBase.encode_multimodal_inputs
+        _encode_audio_params = Gemma4MultimodalModelBase._encode_audio_params
+        _encoder_batch_key = staticmethod(Gemma4MultimodalModelBase._encoder_batch_key)
+        _encoder_batch_tokens = staticmethod(Gemma4MultimodalModelBase._encoder_batch_tokens)
+
+        def __init__(self) -> None:
+            self.calls = []
+            self.model_config = SimpleNamespace(
+                extra_attrs={"encoder_max_num_tokens": token_limit}, max_num_tokens=8192
+            )
+
+        def _encode_multimodal_tensor(
+            self, multimodal_params: list[MultimodalParams]
+        ) -> torch.Tensor:
+            pixels = [param.multimodal_data["image"]["pixel_values"] for param in multimodal_params]
+            self.calls.append(("image", len(pixels)))
+            return torch.cat(pixels).reshape(-1, HIDDEN)
+
+        def _get_audio_features(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            self.calls.append(("audio", features.shape[0]))
+            return features[:, ::4][mask[:, ::4]]
+
+    params = []
+    expected = []
+    for modality, length, value in [
+        ("image", 2, 1),
+        ("audio", 2, 2),
+        ("image", 3, 3),
+        ("image", 2, 4),
+        ("audio", 1, 5),
+    ]:
+        if modality == "image":
+            payload = {"pixel_values": torch.full((1, length, HIDDEN), float(value))}
+        else:
+            payload = {
+                "audio_features": torch.full((1, 8, HIDDEN), float(value)),
+                "audio_features_mask": torch.arange(8).unsqueeze(0) < length * 4,
+            }
+        params.append(
+            MultimodalParams(
+                multimodal_data={
+                    modality: payload,
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [(modality, 0)], output_embedding_lengths=[length]
+                    ),
+                }
+            )
+        )
+        expected.append(torch.full((length, HIDDEN), float(value)))
+    model = Model()
+    results = model.encode_multimodal_inputs(params)
+    assert model.calls == (
+        [("image", 2), ("image", 1), ("audio", 2)]
+        if token_limit == 4
+        else [("image", 1)] * 3 + [("audio", 1)] * 2
+    )
+    for result, wanted in zip(results, expected, strict=True):
+        torch.testing.assert_close(result.multimodal_data["multimodal_embedding"], wanted)

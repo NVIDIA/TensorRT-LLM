@@ -274,9 +274,13 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
         assert grid_thw.shape == (num_images, 3)
         return pixel_values.new_zeros((pixel_values.shape[0] // 4, 2))
 
-    output = encode_multimodal_by_groups(
+    results = encode_multimodal_by_groups(
         (EncoderGroup(("image", "video"), encode, _glm5_next_build_batched_input),), params
     )
+    assert len(results) == len(params)
+    assert results[0].item_metadata is params[0].item_metadata
+    assert "image" not in results[0].multimodal_data
+    output = results[0].multimodal_data["multimodal_embedding"]
     assert output.shape == (num_images * 4, 2)
     assert output.dtype == torch.float16
     metadata = params[0].item_metadata

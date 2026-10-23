@@ -55,7 +55,7 @@ from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
-from .engine.runners import resolve_runner_type
+from .engine.runners import MultimodalEncoderRunner, resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache)
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
@@ -376,6 +376,8 @@ class PyTorchModelEngine(ModelEngine):
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
         if isinstance(self.model,
                       MultimodalModelMixin) and mapping.is_first_pp_rank():
+            self.model.model_config.extra_attrs[
+                "encoder_max_num_tokens"] = self.encoder_max_num_tokens
             multimodal_config = self.model.model_config.multimodal_config
             reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
                                     if self.model.encoder_cache_active else 0)
@@ -696,6 +698,9 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
+            **({
+                "input_processor": self.input_processor
+            } if issubclass(runner_cls, MultimodalEncoderRunner) else {}),
         )
 
     def _decoder_runner_config(

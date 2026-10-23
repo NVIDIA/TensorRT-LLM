@@ -1986,8 +1986,12 @@ def to_disaggregated_params(
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
         remote_tail_start=tllm_disagg_params.remote_tail_start,
-        multimodal_positions=tllm_disagg_params.multimodal_positions,
-        multimodal_lengths=tllm_disagg_params.multimodal_lengths,
+        multimodal_positions=((tllm_disagg_params.multimodal or {}).get(
+            "request_layout", {}).get("multimodal_positions",
+                                      tllm_disagg_params.multimodal_positions)),
+        multimodal_lengths=((tllm_disagg_params.multimodal or {}).get(
+            "request_layout", {}).get("multimodal_lengths",
+                                      tllm_disagg_params.multimodal_lengths)),
     )
 
 

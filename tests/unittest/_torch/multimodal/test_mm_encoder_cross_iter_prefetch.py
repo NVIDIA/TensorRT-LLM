@@ -31,6 +31,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _get_mm_aux_stream,
     maybe_prefetch_mm_encoder_for_next_iter,
+    split_multimodal_encoder_outputs,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
@@ -53,7 +54,7 @@ class _StubModel(MultimodalModelMixin):
         self.encoder_call_stream_id = None
         self.encoder_item_metadata = None
 
-    def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> torch.Tensor:
+    def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> list[MultimodalParams]:
         self.encoder_call_count += 1
         self.encoder_call_stream_id = torch.cuda.current_stream().cuda_stream
         self.encoder_item_metadata = multimodal_params[0].item_metadata
@@ -66,7 +67,7 @@ class _StubModel(MultimodalModelMixin):
             self._hidden_size,
             device=pv.device,
         )
-        return embeddings
+        return split_multimodal_encoder_outputs(embeddings, multimodal_params)
 
 
 class _CacheStubModel(_StubModel):
@@ -91,16 +92,17 @@ class _CacheStubModel(_StubModel):
     def embedding_dtype(self) -> torch.dtype:
         return torch.float32
 
-    def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> torch.Tensor:
+    def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> list[MultimodalParams]:
         self.encoder_call_count += 1
         self.last_encoder_batch_size = len(multimodal_params)
         self.encoder_call_stream_id = torch.cuda.current_stream().cuda_stream
         total_rows = sum(sum(param.get_item_layout()[1]) for param in multimodal_params)
-        return torch.full(
+        embeddings = torch.full(
             (total_rows, self._hidden_size),
             float(self.encoder_call_count),
             device="cuda",
         )
+        return split_multimodal_encoder_outputs(embeddings, multimodal_params)
 
 
 def _make_request(request_id: int, num_tokens: int) -> LlmRequest:
@@ -396,7 +398,8 @@ def test_cross_iter_prefetch_scopes_encoder_and_stores_clone(monkeypatch):
     req.py_mm_encoder_event.synchronize()
 
     assert anchored_on_cuda == [[True]]
-    (encoder_output,) = encoder_outputs
+    (encoder_views,) = encoder_outputs
+    encoder_output = encoder_views[0].multimodal_data["multimodal_embedding"]
     embedding = req.py_multimodal_data["multimodal_embedding"]
     assert embedding.untyped_storage().data_ptr() != encoder_output.untyped_storage().data_ptr()
     torch.testing.assert_close(embedding, encoder_output)

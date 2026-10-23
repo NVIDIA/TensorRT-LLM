@@ -23,7 +23,6 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
-from itertools import groupby
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -56,8 +55,10 @@ from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_mixin import (
     EncoderCachePartition,
+    EncoderGroup,
     MultimodalModelMixin,
     PreparedLlmInputs,
+    encode_multimodal_by_groups,
 )
 from .modeling_multimodal_utils import _MULTIMODAL_ENV_NAME, _is_mm_disagg
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
@@ -760,7 +761,97 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             return None
         return _gemma4_input_partitions(param.multimodal_data, metadata).get(modality)
 
-    def encode_multimodal_inputs(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
+    @property
+    def mm_encoder_groups(self) -> tuple[EncoderGroup, ...]:
+        def pack(params: list[MultimodalParams]) -> dict:
+            return {"multimodal_params": params}
+
+        token_limit = self.model_config.extra_attrs.get(
+            "encoder_max_num_tokens", self.model_config.max_num_tokens
+        )
+        return (
+            EncoderGroup(
+                ("image",),
+                self._encode_multimodal_tensor,
+                pack,
+                self._encoder_batch_key,
+                token_limit,
+                self._encoder_batch_tokens,
+            ),
+            EncoderGroup(
+                ("video",),
+                self._encode_multimodal_tensor,
+                pack,
+                self._encoder_batch_key,
+                token_limit,
+                self._encoder_batch_tokens,
+            ),
+            EncoderGroup(
+                ("audio",),
+                self._encode_audio_params,
+                pack,
+                self._encoder_batch_key,
+                token_limit,
+                self._encoder_batch_tokens,
+            ),
+        )
+
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> list[MultimodalParams]:
+        for param in multimodal_params:
+            if (
+                sum(param.multimodal_data.get(m) is not None for m in ("image", "video", "audio"))
+                > 1
+            ):
+                raise ValueError(
+                    "Gemma4 requests containing multiple multimodal input types are not supported."
+                )
+        return encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)
+
+    @staticmethod
+    def _encoder_batch_tokens(param: MultimodalParams) -> int:
+        """Bound padded attention rows using shapes, without reading CUDA data."""
+        audio = param.multimodal_data.get("audio")
+        if audio is not None:
+            features = audio["audio_features"]
+            # The audio tower's two stride-2 stages precede its attention blocks.
+            return features.shape[0] * ((features.shape[1] + 3) // 4)
+        data = param.multimodal_data.get("image") or param.multimodal_data["video"]
+        pixels = data["pixel_values"]
+        return pixels.shape[0] * pixels.shape[1]
+
+    @staticmethod
+    def _encoder_batch_key(param: MultimodalParams) -> tuple:
+        """Only batch equal padded shapes with the same mask/position inputs."""
+        for modality in ("image", "video", "audio"):
+            data = param.multimodal_data.get(modality)
+            if data is not None:
+                fields = (
+                    ("audio_features", "audio_features_mask")
+                    if modality == "audio"
+                    else ("pixel_values", "image_position_ids")
+                )
+                return tuple(
+                    None
+                    if data.get(key) is None
+                    else (tuple(data[key].shape[1:]), data[key].dtype, data[key].device)
+                    for key in fields
+                ) + (data.get("image_seq_lens") is not None,)
+        raise ValueError("Gemma4 encoder input has no modality payload")
+
+    def _encode_audio_params(self, multimodal_params: list[MultimodalParams]) -> torch.Tensor:
+        """Run one compatible audio batch, preserving clip and request order."""
+        data = [param.multimodal_data["audio"] for param in multimodal_params]
+        features = torch.cat([item["audio_features"] for item in data], dim=0)
+        mask = (
+            torch.cat([item["audio_features_mask"] for item in data], dim=0)
+            if data[0].get("audio_features_mask") is not None
+            else None
+        )
+        return self._get_audio_features(features, mask)
+
+    def _encode_multimodal_tensor(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         """Encode uncached Gemma4 image, video, and audio payloads."""
         modality_inputs = (
             ("image", "pixel_values"),
@@ -780,23 +871,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             raise ValueError(
                 "Gemma4 requests containing multiple multimodal input types are not supported."
             )
-
-        # The cache helper splits this tensor by request. Preserve that order while still batching
-        # consecutive requests with the same modality.
-        if (
-            all(len(modalities) == 1 for modalities in param_modalities)
-            and len({modalities[0] for modalities in param_modalities}) > 1
-        ):
-            embeddings = []
-            for _, param_group in groupby(
-                zip(param_modalities, multimodal_params), key=lambda item: item[0][0]
-            ):
-                embeddings.append(
-                    self.encode_multimodal_inputs(
-                        [multimodal_param for _, multimodal_param in param_group]
-                    )
-                )
-            return torch.cat(embeddings, dim=0)
 
         pixel_values_list = []
         image_position_ids_list = []

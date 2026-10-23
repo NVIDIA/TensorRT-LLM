@@ -7,11 +7,16 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    _join_embeddings,
+    _own_encoder_auxiliary_features,
+)
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
-from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 
 from .no_kv_cache import NoKVCacheRunner
 
@@ -24,6 +29,12 @@ class MultimodalEncoderRunner(NoKVCacheRunner):
     ``MultimodalEncoderGraphRunner`` belongs to, and is owned by, the vision model layer.
     """
 
+    def __init__(
+        self, *args: Any, input_processor: BaseMultimodalInputProcessor, **kwargs: Any
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._input_processor = input_processor
+
     @nvtx_range("_forward_step_mm_encoder_only")
     def _forward_step(
         self,
@@ -33,105 +44,45 @@ class MultimodalEncoderRunner(NoKVCacheRunner):
         gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
-        """Forward step for multimodal encoder only mode - returns mm_embeddings instead of logits."""  # noqa: E501
-        # Keep the old profiling label above so this movement is trace-compatible.
-        multimodal_params = inputs.get("multimodal_params", [])
-        if not multimodal_params or len(multimodal_params) == 0:
-            return {
-                "mm_embeddings": [],
-                "mm_embedding_request_indices": [],
-                "mm_embedding_lengths": [],
-            }
-        # Some ctx requests carry only mrope metadata (no actual vision
-        # content). Skip them so the encoder only runs on real image payloads.
-        mm_context_requests = [
-            (request_idx, request)
-            for request_idx, request in enumerate(scheduled_requests.context_requests)
+        """Return encoded Params views aligned with their scheduled requests."""
+        params = inputs.get("multimodal_params", [])
+        requests = [
+            (index, request)
+            for index, request in enumerate(scheduled_requests.context_requests)
             if request.py_multimodal_data is not None
         ]
-        if len(mm_context_requests) != len(multimodal_params):
-            raise ValueError(
-                "mm_encoder_only expects one multimodal payload per context "
-                "request carrying py_multimodal_data"
-            )
-        mm_request_indices_with_payload = []
-        mm_params_with_payload = []
-        mm_embedding_lengths = []
-        for (request_idx, request), multimodal_param in zip(mm_context_requests, multimodal_params):
-            if not _has_mm_payload_keys(request.py_multimodal_data):
-                # mrope-only warmup request (no actual vision content) -> skip.
-                continue
-            multimodal_embedding_lengths = get_multimodal_embedding_lengths(request)
-            if multimodal_embedding_lengths is None:
-                # Vision payload keys present but no pre-computed embedding
-                # lengths — skip to avoid a downstream sum(None) TypeError.
-                continue
-            mm_request_indices_with_payload.append(request_idx)
-            mm_params_with_payload.append(multimodal_param)
-            mm_embedding_lengths.append(list(multimodal_embedding_lengths))
-        if not mm_params_with_payload:
-            return {
-                "mm_embeddings": [],
-                "mm_embedding_request_indices": [],
-                "mm_embedding_lengths": [],
-            }
-        # For mm_encoder_only mode, we only run the vision encoder part.
-        # The model should be a vision encoder (e.g., Qwen2VisionModelBase).
-        # This call bypasses ModelCaller, so scope the TP all-reduce windows here.
-        # The embeddings outlive this step, so keep a clone rather than a window.
-        with discard_nccl_window_tensor_outputs(inputs):
-            mm_embeddings = self._model.forward(mm_params_with_payload)
-            assert len(mm_embeddings) == 1, (
-                "mm_embeddings should be a 1-element list, mix modality (video+image) is not "
-                "supported"
-            )
-            mm_embedding_batch = mm_embeddings[0].clone()
-
-        split_lengths = [sum(lengths) for lengths in mm_embedding_lengths]
-        mm_embeddings = list(torch.split(mm_embedding_batch, split_lengths, dim=0))
-        if len(mm_embeddings) != len(mm_embedding_lengths):
-            raise ValueError(
-                "mm_encoder_only produced an embedding batch that does not match "
-                "mm_embedding_lengths"
-            )
-
-        # Extract mrope position data from multimodal_params if available.
-        mrope_position_ids_list = []
-        mrope_position_deltas_list = []
-        for multimodal_param in mm_params_with_payload:
-            mrope_config = multimodal_param.multimodal_data.get("mrope_config", {})
-            mrope_position_ids = mrope_config.get("mrope_position_ids")
-            mrope_position_deltas = mrope_config.get("mrope_position_deltas")
-            if mrope_position_ids is not None:
-                mrope_position_ids_list.append(mrope_position_ids)
-            if mrope_position_deltas is not None:
-                mrope_position_deltas_list.append(mrope_position_deltas)
-
-        # mrope lists must align 1:1 with multimodal_params (or be empty);
-        # the sampler indexes them by per-MM-result position into mm_embeddings.
-        assert len(mrope_position_ids_list) == len(mrope_position_deltas_list) and len(
-            mrope_position_ids_list
-        ) in (0, len(mm_params_with_payload)), (
-            f"mrope alignment: got {len(mrope_position_ids_list)} ids, "
-            f"{len(mrope_position_deltas_list)} deltas, "
-            f"{len(mm_params_with_payload)} mm params"
-        )
-
-        result = {
-            "mm_embeddings": mm_embeddings,
-            "logits": None,
-            "mm_embedding_request_indices": mm_request_indices_with_payload,
-            "mm_embedding_lengths": mm_embedding_lengths,
-        }
-        embedding_metadata = [
-            param.multimodal_data.get("multimodal_embedding_metadata")
-            for param in mm_params_with_payload
+        if len(requests) != len(params):
+            raise ValueError("Encoder inputs must align with multimodal context requests")
+        selected = [
+            (index, request, param)
+            for (index, request), param in zip(requests, params, strict=True)
+            if _has_mm_payload_keys(param.multimodal_data)
         ]
-        if any(metadata is not None for metadata in embedding_metadata):
-            result["mm_embedding_metadata"] = embedding_metadata
-        if mrope_position_ids_list:
-            result["mrope_position_ids"] = mrope_position_ids_list
-        if mrope_position_deltas_list:
-            result["mrope_position_deltas"] = mrope_position_deltas_list
-
-        return result
+        if not selected:
+            return {"mm_encoder_outputs": [], "mm_embedding_request_indices": [], "logits": None}
+        selected_params = [param for _, _, param in selected]
+        with discard_nccl_window_tensor_outputs(inputs):
+            results = self._model.encode_multimodal_inputs(selected_params)
+            if len(results) != len(selected):
+                raise ValueError("Encoder outputs must align with multimodal context requests")
+            # One ownership copy before releasing temporary NCCL windows. Adjacent
+            # result views recover their original physical batch without a concat.
+            owned = _join_embeddings(
+                [result.multimodal_data["multimodal_embedding"] for result in results]
+            ).clone()
+            lengths = [sum(result.get_item_layout()[1]) for result in results]
+            for result, embedding in zip(results, torch.split(owned, lengths, dim=0), strict=True):
+                result.multimodal_data["multimodal_embedding"] = embedding
+                _own_encoder_auxiliary_features(result)
+        for (_, request, _), result in zip(selected, results, strict=True):
+            result.multimodal_input = _build_request_multimodal_input(request, True)
+            if result.multimodal_input is not None:
+                _, finalized = self._input_processor.finalize_multimodal_prompt(
+                    {"prompt_token_ids": request.get_tokens(0)}, result
+                )
+                result.multimodal_data = finalized.multimodal_data
+        return {
+            "mm_encoder_outputs": results,
+            "mm_embedding_request_indices": [index for index, _, _ in selected],
+            "logits": None,
+        }
