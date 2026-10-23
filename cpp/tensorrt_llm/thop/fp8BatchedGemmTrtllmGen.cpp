@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -194,7 +194,7 @@ public:
     {
 
         auto const smVersion = tensorrt_llm::common::getSMVersion();
-        if (smVersion != tensorrt_llm::kernels::kSM_100)
+        if (!tensorrt_llm::common::isSM100Family(smVersion))
         {
             TLLM_THROW("Unsupported or unimplemented compute capability for fp8 batched gemm: %i", smVersion);
         }
