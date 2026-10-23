@@ -15,16 +15,13 @@
 
 from __future__ import annotations
 
-import dataclasses
 import weakref
 from abc import ABC, abstractmethod
 from enum import Enum
-from functools import cache, partial
-from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional, final
+from typing import TYPE_CHECKING, ClassVar, Optional, final
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.cpp_schema import CPP_METADATA_KEY
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm.logger import logger
 
@@ -33,53 +30,6 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
-
-
-@cache
-def _native_fields(source_type: type, native_type: type) -> tuple[tuple[str, Any], ...]:
-    """Compile the schema's renaming and flattening once for each native type."""
-    result = []
-    for field in dataclasses.fields(source_type):
-        metadata = field.metadata.get(CPP_METADATA_KEY)
-        if metadata is not None and metadata.skip:
-            continue
-        if metadata is not None and metadata.flatten is not None:
-            paths = {
-                name: f"{field.name}.{projection[1]}"
-                for name, projection in metadata.flatten.items()
-            }
-        else:
-            name = metadata.name if metadata is not None and metadata.name else field.name
-            paths = {name: field.name}
-        result.extend(
-            (name, partial(_read_native_field, path=tuple(path.split("."))))
-            for name, path in paths.items()
-            if hasattr(native_type, name)
-        )
-    return tuple(result)
-
-
-def _read_native_field(source: object, *, path: tuple[str, ...]) -> object:
-    for name in path:
-        if source is None:
-            return None
-        source = getattr(source, name)
-    return source
-
-
-def build_op_params(target: Any, source: object) -> None:
-    """Lower schema objects or flat compatibility arguments to the native struct."""
-    if isinstance(source, Mapping):
-        values = ((name, value) for name, value in source.items() if hasattr(type(target), name))
-    else:
-        values = ((name, read(source)) for name, read in _native_fields(type(source), type(target)))
-    for name, value in values:
-        if value is None:
-            continue
-        if dataclasses.is_dataclass(value):
-            build_op_params(getattr(target, name), value)
-        else:
-            setattr(target, name, value)
 
 
 class FmhaPhase(str, Enum):

@@ -20,8 +20,8 @@ in modules that already import one another.
 
 from __future__ import annotations
 
-import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 
 # Namespaced so the native schema metadata cannot collide with other users of
 # dataclasses.field(metadata=...).
@@ -32,46 +32,37 @@ CPP_METADATA_KEY = "fmha.cpp"
 class CppMetadata:
     """Controls a field's representation in the native FmhaParams struct.
 
-    The generator reads the schema's source, while Python lowering reads this
-    metadata to apply the same renaming and nested-field projections.
+    The generator reads the schema's source; nothing at runtime consults this,
+    the native reader is generated C++.
     """
 
     dtype: object = None
-    name: str | None = None
-    skip: bool = False
-    optional: bool | None = None
-    flatten: dict[str, tuple] | None = None
 
 
-def cpp_metadata(
-    *,
-    dtype: object = None,
-    default: object = None,
-    name: str | None = None,
-    skip: bool = False,
-    optional: bool | None = None,
-    flatten: dict[str, tuple] | None = None,
-) -> dataclasses.Field[object]:
-    """Customize a dataclass field's representation in the native struct.
+def cpp_metadata(*, dtype: object = None) -> Mapping[str, Any]:
+    """Metadata for ``dataclasses.field`` customizing a field's native representation.
 
-    The annotation gives the shape -- tensor, optional, set, scalar, or a named
-    type -- and ``dtype`` gives its fixed element type as a ``torch`` dtype.
+    Schema classes use it through ``cpp_field``; this helper only carries the native
+    options and never touches the dataclass default.
 
-    The default is ``None`` unless explicitly supplied. Scalars annotated as
-    bool, int, float, or their Optional forms do not need this helper: their
-    native types are bool, std::int64_t, and double, respectively.
-
-    A tensor without this helper is a native field with no generated getter,
-    for example when its pointer type is supplied by C++ dtype dispatch or its
-    view needs offsets. These getters are handwritten in attentionOp.h.
-    Registered native structs and supported named types are recognized by their
-    annotations and need no marker either. Defaults and default factories remain
-    Python-owned. ``name`` renames a native field, ``skip`` keeps it Python-only,
-    and ``optional=False`` marks a tensor required at the native boundary.
-    ``flatten`` projects a nested object without copying its state: each entry
-    maps a native name to (native annotation, attribute path, optional dtype).
+    The annotation gives the shape -- tensor, optional, set, scalar, enum, or a
+    nested schema class -- and ``dtype`` gives a tensor's fixed element type as a
+    ``torch`` dtype, which produces a typed pointer accessor. A tensor without a
+    dtype is a native field with no generated getter, for example when its pointer
+    type is supplied by C++ dtype dispatch or its view needs offsets; those getters
+    are handwritten in attentionOp.h. Scalars, enums, nested schema classes and
+    plain tensors need no metadata at all. The native field keeps the Python name, and an
+    ``Optional`` annotation is what makes it ``std::optional`` natively.
     """
-    return dataclasses.field(
-        default=default,
-        metadata={CPP_METADATA_KEY: CppMetadata(dtype, name, skip, optional, flatten)},
-    )
+    return {CPP_METADATA_KEY: CppMetadata(dtype)}
+
+
+def cpp_field(*, default: Any = None, dtype: object = None) -> Any:
+    """``dataclasses.field`` with native metadata attached.
+
+    Use as ``x: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)``. ``default`` is the
+    ordinary dataclass default and stays Python-owned; it is ``None`` because almost every
+    native-visible field is an optional tensor, and a field with another default passes
+    it explicitly.
+    """
+    return field(default=default, metadata=cpp_metadata(dtype=dtype))

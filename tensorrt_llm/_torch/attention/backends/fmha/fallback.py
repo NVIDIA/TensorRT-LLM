@@ -15,18 +15,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
-from threading import Thread, current_thread
-from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
+from dataclasses import fields
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, ClassVar, Mapping, Optional
 
 import torch
-from torch.utils.weak import WeakTensorKeyDictionary
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     CustomAttentionMask,
     PredefinedAttentionMask,
+    RopeParams,
 )
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
@@ -35,252 +35,14 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
 from ..sparse.params import SparseRuntimeParams
-from .interface import FmhaPhase, build_op_params
+from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .utils import get_multi_ctas_kv_counter
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
-    from tensorrt_llm.functional import PositionEmbeddingType
-    from tensorrt_llm.quantization.mode import QuantMode
-
-
-@dataclass(kw_only=True, slots=True, frozen=True)
-class StaticAttentionConfig:
-    """The attention-layer configuration used to build native kernel runners."""
-
-    num_heads: int = 0
-    num_kv_heads: int = 0
-    head_size: int = 0
-    tokens_per_block: int = 0
-    type: DataType = None
-    is_fp8_out: bool = False
-    is_fp4_out: bool = False
-    use_kv_cache: bool = False
-    paged_context_fmha: bool = False
-    position_embedding_type: PositionEmbeddingType = 0
-    mask_type: AttentionMaskType = 1
-    q_scaling: float = 1.0
-    rotary_embedding_dim: int = 0
-    attn_logit_softcapping_scale: float = 0.0
-    remove_padding: bool = True
-    cross_attention: bool = False
-    dense_context_fmha: bool = False
-    fuses_dsv4_inv_rope_fp8_quant: bool = False
-    use_sparse_attention: bool = False
-    uses_spcompress: bool = False
-    use_tllm_gen_sparse_attention: bool = False
-    use_nvfp4_mla_kv_cache: bool = False
-    is_spec_decoding_enabled: bool = False
-    spec_decoding_target_max_gen_len: int = 0
-    is_mla_enable: bool = False
-    q_lora_rank: int = 0
-    kv_lora_rank: int = 0
-    qk_nope_head_dim: int = 0
-    qk_rope_head_dim: int = 0
-    v_head_dim: int = 0
-    predicted_tokens_per_seq: int = 1
-    mla_layer_num: int = 0
-    rope_append: bool = True
-    sage_attn_num_elts_per_blk_q: int = 0
-    sage_attn_num_elts_per_blk_k: int = 0
-    sage_attn_num_elts_per_blk_v: int = 0
-    sage_attn_qk_int8: bool = False
-    sage_attn_smooth_k: bool = False
-    quant_mode: QuantMode = 0
-    skip_correction_threshold: float = 0.0
-
-    @classmethod
-    def from_params(
-        cls,
-        params: FmhaParams,
-        *,
-        skip_correction_threshold: float = 0.0,
-    ) -> StaticAttentionConfig:
-        """Capture the runner configuration from the layer and per-call parameters."""
-        from tensorrt_llm._utils import torch_dtype_to_binding
-        from tensorrt_llm.quantization.mode import QuantMode
-
-        attn, meta, fwd = params.attn, params.meta, params.fwd
-        if fwd is None:
-            raise RuntimeError("StaticAttentionConfig requires forward args.")
-        if params.output is None:
-            raise RuntimeError("StaticAttentionConfig requires output.")
-        query = params.qkv_input if params.qkv_input is not None else params.query_input
-        if query is None:
-            raise RuntimeError("StaticAttentionConfig requires qkv_input or query_input.")
-
-        quant_mode = QuantMode(attn.quant_mode)
-        sparse = fwd.sparse_runtime_params
-        has_sparse_attn_indices = (
-            sparse.sparse_attn_indices is not None and sparse.sparse_attn_indices.numel() > 0
-        )
-        has_sparse_attention = (
-            sparse.sparse_kv_indices is not None and sparse.sparse_kv_indices.numel() > 0
-        ) or has_sparse_attn_indices
-        has_paged_sparse_attention = (
-            has_sparse_attn_indices
-            and sparse.sparse_attn_offsets is not None
-            and sparse.sparse_attn_offsets.numel() > 0
-        )
-        use_tllm_gen_sparse_attention = has_sparse_attn_indices and not has_paged_sparse_attention
-        pool_mapping = meta.host_kv_cache_pool_mapping
-        use_kv_cache = (
-            meta.kv_cache_block_offsets is not None
-            and meta.host_kv_cache_pool_pointers is not None
-            and pool_mapping is not None
-        )
-        target_max_gen_len = 0
-        if meta.max_total_draft_tokens is not None:
-            target_max_gen_len = meta.max_total_draft_tokens + 1
-
-        return cls(
-            num_heads=attn.num_heads,
-            num_kv_heads=attn.num_kv_heads,
-            head_size=attn.head_dim,
-            tokens_per_block=params.tokens_per_block,
-            type=torch_dtype_to_binding(query.dtype),
-            is_fp8_out=params.output.dtype == torch.float8_e4m3fn,
-            is_fp4_out=params.output.dtype == torch.uint8,
-            use_kv_cache=use_kv_cache,
-            paged_context_fmha=meta.use_paged_context_fmha,
-            position_embedding_type=attn.position_embedding_type,
-            mask_type=fwd.mask_type,
-            q_scaling=attn.q_scaling,
-            rotary_embedding_dim=attn.rope_params.dim if attn.rope_params is not None else 0,
-            cross_attention=params.is_cross,
-            fuses_dsv4_inv_rope_fp8_quant=fwd.enable_dsv4_epilogue_fusion,
-            use_sparse_attention=has_sparse_attention,
-            uses_spcompress=attn.uses_spcompress,
-            use_tllm_gen_sparse_attention=use_tllm_gen_sparse_attention,
-            use_nvfp4_mla_kv_cache=(
-                quant_mode.has_fp4_kv_cache()
-                and use_tllm_gen_sparse_attention
-                and sparse.sparse_attn_kv_lens is None
-                and sparse.aux_kv_cache_pool_ptr is not None
-            ),
-            is_spec_decoding_enabled=meta.is_spec_decoding_enabled,
-            spec_decoding_target_max_gen_len=target_max_gen_len,
-            is_mla_enable=attn.is_mla_enable,
-            q_lora_rank=attn.q_lora_rank or 0,
-            kv_lora_rank=attn.kv_lora_rank or 0,
-            qk_nope_head_dim=attn.qk_nope_head_dim or 0,
-            qk_rope_head_dim=attn.qk_rope_head_dim or 0,
-            v_head_dim=attn.v_head_dim or 0,
-            predicted_tokens_per_seq=attn.predicted_tokens_per_seq,
-            mla_layer_num=pool_mapping.size(0) if pool_mapping is not None else 0,
-            rope_append=attn.rope_append is not False,
-            sage_attn_num_elts_per_blk_q=fwd.sage_attn_num_elts_per_blk_q,
-            sage_attn_num_elts_per_blk_k=fwd.sage_attn_num_elts_per_blk_k,
-            sage_attn_num_elts_per_blk_v=fwd.sage_attn_num_elts_per_blk_v,
-            sage_attn_qk_int8=fwd.sage_attn_qk_int8,
-            sage_attn_smooth_k=fwd.sage_attn_smooth_k,
-            quant_mode=quant_mode,
-            skip_correction_threshold=skip_correction_threshold,
-        )
-
-    @classmethod
-    def from_legacy_arguments(cls, arguments: Mapping[str, Any]) -> StaticAttentionConfig:
-        """Build the config for the flat compatibility entry point."""
-        from tensorrt_llm._utils import torch_dtype_to_binding
-        from tensorrt_llm.quantization.mode import QuantMode
-
-        def arg(name: str, default: Any = None) -> Any:
-            value = arguments.get(name, default)
-            return default if value is None else value
-
-        quant_mode = QuantMode(arg("quant_mode", 0))
-        attn_indices = arg("sparse_attn_indices")
-        has_attn_indices = attn_indices is not None and attn_indices.numel() > 0
-        kv_indices = arg("sparse_kv_indices")
-        attn_offsets = arg("sparse_attn_offsets")
-        use_tllm_gen_sparse = has_attn_indices and not (
-            attn_offsets is not None and attn_offsets.numel() > 0
-        )
-        pool_mapping = arg("host_kv_cache_pool_mapping")
-        target_max_draft_tokens = arg("spec_decoding_target_max_draft_tokens")
-        output = arguments["output"]
-        return cls(
-            num_heads=arg("num_heads", 0),
-            num_kv_heads=arg("num_kv_heads", 0),
-            head_size=arg("head_size", 0),
-            tokens_per_block=arg("tokens_per_block", 0),
-            position_embedding_type=arg("position_embedding_type", 0),
-            mask_type=arg("mask_type", 1),
-            q_scaling=arg("q_scaling", 1.0),
-            is_spec_decoding_enabled=arg("is_spec_decoding_enabled", False),
-            is_mla_enable=arg("is_mla_enable", False),
-            q_lora_rank=arg("q_lora_rank", 0),
-            kv_lora_rank=arg("kv_lora_rank", 0),
-            qk_nope_head_dim=arg("qk_nope_head_dim", 0),
-            qk_rope_head_dim=arg("qk_rope_head_dim", 0),
-            v_head_dim=arg("v_head_dim", 0),
-            predicted_tokens_per_seq=arg("predicted_tokens_per_seq", 1),
-            rope_append=arg("rope_append", True),
-            sage_attn_num_elts_per_blk_q=arg("sage_attn_num_elts_per_blk_q", 0),
-            sage_attn_num_elts_per_blk_k=arg("sage_attn_num_elts_per_blk_k", 0),
-            sage_attn_num_elts_per_blk_v=arg("sage_attn_num_elts_per_blk_v", 0),
-            sage_attn_qk_int8=arg("sage_attn_qk_int8", False),
-            sage_attn_smooth_k=arg("sage_attn_smooth_k", False),
-            skip_correction_threshold=arg("skip_correction_threshold", 0.0),
-            uses_spcompress=arg("uses_spcompress", False),
-            type=torch_dtype_to_binding(arguments["q"].dtype),
-            is_fp8_out=output.dtype == torch.float8_e4m3fn,
-            is_fp4_out=output.dtype == torch.uint8,
-            use_kv_cache=(
-                arg("kv_cache_block_offsets") is not None
-                and arg("host_kv_cache_pool_pointers") is not None
-                and pool_mapping is not None
-            ),
-            paged_context_fmha=bool(arg("use_paged_context_fmha", False)),
-            rotary_embedding_dim=int(arg("rope_dim", 0)),
-            spec_decoding_target_max_gen_len=(
-                target_max_draft_tokens + 1 if target_max_draft_tokens is not None else 0
-            ),
-            cross_attention=bool(arg("is_cross", False)),
-            fuses_dsv4_inv_rope_fp8_quant=bool(arg("enable_dsv4_epilogue_fusion", False)),
-            use_sparse_attention=(kv_indices is not None and kv_indices.numel() > 0)
-            or has_attn_indices,
-            use_tllm_gen_sparse_attention=use_tllm_gen_sparse,
-            use_nvfp4_mla_kv_cache=(
-                quant_mode.has_fp4_kv_cache()
-                and use_tllm_gen_sparse
-                and arg("sparse_attn_kv_lens") is None
-                and arg("aux_kv_cache_pool_ptr") is not None
-            ),
-            mla_layer_num=pool_mapping.size(0) if pool_mapping is not None else 0,
-            quant_mode=quant_mode,
-        )
-
-    def to_thop_config(self) -> Any:
-        """Build the native constructor configuration."""
-        from tensorrt_llm.bindings.internal import thop
-
-        target = thop.StaticAttentionConfig()
-        build_op_params(target, self)
-        return target
-
-
-class _AttentionOpCache:
-    """Reuse initialized runners, without retaining any per-call tensors."""
-
-    def __init__(self) -> None:
-        self._ops: dict[tuple[Thread, torch.device, StaticAttentionConfig], thop.AttentionOp] = {}
-
-    def get(self, config: StaticAttentionConfig, device: torch.device) -> "thop.AttentionOp":
-        # Native runners and cuBLAS state must not be shared by concurrent host threads.
-        # Do not key by stream: CUDA graph capture must reuse the op initialized during
-        # warmup on another stream. Execution passes the current stream and scratch anew.
-        key = (current_thread(), device, config)
-        op = self._ops.get(key)
-        if op is None:
-            with torch.cuda.device(device):
-                op = thop.AttentionOp(config.to_thop_config())
-            self._ops[key] = op
-        return op
 
 
 _FORWARD_ARG_NAMES = frozenset(field.name for field in fields(AttentionForwardArgs))
@@ -336,29 +98,6 @@ def _legacy_forward_args(
     return AttentionForwardArgs(**values)
 
 
-def _set_context_workspace_shape(
-    params: FmhaParams, *, num_contexts: int, num_ctx_tokens: int
-) -> None:
-    """Point the phase counters at the context extent for native workspace sizing.
-
-    Only the counts: the op reduces the host length arrays over `seq_offset` and
-    `batch_size` itself, so the extents no longer cross the boundary.
-    """
-    active = num_contexts > 0 and num_ctx_tokens > 0
-    params.seq_offset = 0
-    params.batch_size = num_contexts if active else 0
-    params.num_requests = num_contexts if active else 0
-    params.num_tokens = num_ctx_tokens if active else 0
-
-
-def _phase_query(params: FmhaParams) -> torch.Tensor:
-    """The phase's query tensor, whichever of the two mutually exclusive fields holds it."""
-    query = params.qkv_input if params.qkv_input is not None else params.query_input
-    if query is None:
-        raise RuntimeError("FallbackFmha requires qkv_input or query_input.")
-    return query
-
-
 class FallbackFmha(PhasedFmha):
     """Fallback FMHA implementation over the phased TRT-LLM thop ops."""
 
@@ -366,8 +105,6 @@ class FallbackFmha(PhasedFmha):
     # Native attention consumes pool pointers directly; sparse managers may have
     # no Role.KEY buffer from which to query a dense block extent.
     NEEDS_BLOCK_EXTENT = False
-    _attention_ops: ClassVar[_AttentionOpCache] = _AttentionOpCache()
-    _compat_counters: ClassVar[WeakTensorKeyDictionary] = WeakTensorKeyDictionary()
     supports_skip_correction = True
     supports_workspace_reclamation = True
 
@@ -519,63 +256,6 @@ class FallbackFmha(PhasedFmha):
             f"disable KV block reuse, chunked prefill and speculative "
             f"decoding for this model."
         )
-
-    def __init__(self, attn: "TrtllmAttention"):
-        super().__init__(attn)
-        self._multi_ctas_kv_counter: Optional[torch.Tensor] = None
-        self._ops_by_signature: dict[tuple[object, ...], thop.AttentionOp] = {}
-        self._op: Optional[thop.AttentionOp] = None
-
-    def attention_op(self, params: FmhaParams) -> "thop.AttentionOp":
-        meta, fwd = params.meta, params.fwd
-        query = _phase_query(params)
-        sparse = fwd.sparse_runtime_params
-        sparse_signature = ()
-        if sparse.sparse_kv_indices is not None or sparse.sparse_attn_indices is not None:
-            sparse_signature = (
-                sparse.sparse_kv_indices is not None and sparse.sparse_kv_indices.numel() > 0,
-                sparse.sparse_attn_indices is not None and sparse.sparse_attn_indices.numel() > 0,
-                sparse.sparse_attn_offsets is not None and sparse.sparse_attn_offsets.numel() > 0,
-                sparse.sparse_attn_kv_lens is None,
-                sparse.aux_kv_cache_pool_ptr is not None,
-            )
-        pool_mapping = meta.host_kv_cache_pool_mapping
-        # Layer geometry is fixed; cache only the configuration inputs that can vary
-        # across batches, output precisions, or sparse/Sage execution modes.
-        signature = (
-            current_thread(),
-            query.device,
-            query.dtype,
-            params.output.dtype,
-            params.tokens_per_block,
-            fwd.mask_type,
-            params.is_cross,
-            meta.use_paged_context_fmha,
-            meta.is_spec_decoding_enabled,
-            meta.max_total_draft_tokens,
-            meta.kv_cache_block_offsets is not None
-            and meta.host_kv_cache_pool_pointers is not None
-            and pool_mapping is not None,
-            pool_mapping.size(0) if pool_mapping is not None else 0,
-            self.attn.quant_mode,
-            self.attn.skip_correction_threshold,
-            fwd.enable_dsv4_epilogue_fusion,
-            fwd.sage_attn_num_elts_per_blk_q,
-            fwd.sage_attn_num_elts_per_blk_k,
-            fwd.sage_attn_num_elts_per_blk_v,
-            fwd.sage_attn_qk_int8,
-            fwd.sage_attn_smooth_k,
-            sparse_signature,
-        )
-        op = self._ops_by_signature.get(signature)
-        if op is not None:
-            return op
-        config = StaticAttentionConfig.from_params(
-            params, skip_correction_threshold=self.attn.skip_correction_threshold
-        )
-        op = self._attention_ops.get(config, query.device)
-        self._ops_by_signature[signature] = op
-        return op
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -823,75 +503,121 @@ class FallbackFmha(PhasedFmha):
                 f"num_ctx_tokens={num_ctx_tokens}."
             )
 
-        # Generation requires an FMHA-owned multi-CTA scratch buffer in addition to
-        # MLA's caller-owned scheduler counter.
-        multi_ctas_kv_counter = None
-        if num_generations > 0:
-            multi_ctas_kv_counter = get_multi_ctas_kv_counter(
-                cls._compat_counters.get(workspace),
-                q.device,
-                num_heads,
-                max_num_sequences or max_num_requests,
-            )
-            cls._compat_counters[workspace] = multi_ctas_kv_counter
-
         effective_beam_width = 1 if is_cross else beam_width
-        sizing_num_contexts = num_contexts if num_ctx_tokens > 0 and not is_gen_only else 0
-        params = dict(
-            arguments,
-            kv_factor=1,
-            qkv_or_q=q,
+        max_attention_window_size = (
+            attention_window_size
+            if effective_beam_width == 1 or cache_indirection is None
+            else cache_indirection.size(2)
+        )
+        has_context = num_contexts > 0 and not is_gen_only
+        has_generation = num_generations > 0 and not is_ctx_only
+
+        # The native reader walks `attn` and `meta` by attribute name, so the flat
+        # arguments are presented under the names the attention layer and metadata use.
+        attn = SimpleNamespace(
             layer_idx=local_layer_idx,
-            num_seqs=sizing_num_contexts,
-            num_requests=sizing_num_contexts,
-            num_tokens=num_ctx_tokens if sizing_num_contexts > 0 else 0,
-            max_num_sequences=max_num_sequences or max_num_requests,
-            beam_width=effective_beam_width,
-            multi_ctas_kv_counter=multi_ctas_kv_counter,
-            fwd=_legacy_forward_args(
-                arguments,
-                chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size or 1,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_size,
+            is_mla_enable=is_mla_enable,
+            v_head_dim=v_head_dim if v_head_dim is not None else head_size,
+            rope_params=RopeParams(
+                dim=rope_dim,
+                theta=rope_base,
+                scale_type=rope_scale_type,
+                scale=rope_scale,
+                short_m_scale=rope_short_m_scale,
+                long_m_scale=rope_long_m_scale,
+                max_positions=rope_max_positions,
+                original_max_positions=rope_original_max_positions,
             ),
-            rotary_embedding_base=rope_base,
-            rotary_embedding_scale_type=rope_scale_type,
-            rotary_embedding_scale=rope_scale,
-            rotary_embedding_short_mscale=rope_short_m_scale,
-            rotary_embedding_long_mscale=rope_long_m_scale,
-            rotary_embedding_max_positions=rope_max_positions,
-            rotary_embedding_original_max_positions=rope_original_max_positions,
+            q_scaling=q_scaling,
+            predicted_tokens_per_seq=predicted_tokens_per_seq,
+            skip_correction_threshold=skip_correction_threshold,
+            uses_spcompress=bool(uses_spcompress),
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            rope_append=rope_append,
+            rotary_inv_freq=rotary_inv_freq,
+            rotary_cos_sin=rotary_cos_sin,
+            position_embedding_type=position_embedding_type,
+            skip_softmax_stat=skip_softmax_stat,
+            quant_mode=quant_mode,
+            attention_chunk_size=attention_chunk_size,
+            get_local_layer_idx=lambda metadata: local_layer_idx,
+        )
+        meta = SimpleNamespace(
+            max_num_requests=max_num_requests,
+            max_num_sequences=max_num_sequences,
+            cache_indirection=cache_indirection,
+            effective_beam_width=effective_beam_width,
+            max_seq_len=max_seq_len,
+            max_context_length=max_context_length,
+            max_context_q_len_override=max_context_q_len_override,
+            is_spec_decoding_enabled=is_spec_decoding_enabled,
+            is_spec_dec_tree=is_spec_dec_tree,
+            force_prepare_spec_dec_tree_mask=force_prepare_spec_dec_tree_mask,
+            max_total_draft_tokens=spec_decoding_target_max_draft_tokens,
+            trtllm_gen_jit_warmup=trtllm_gen_jit_warmup,
+            helix_position_offsets=helix_position_offsets,
+            helix_is_inactive_rank=helix_is_inactive_rank,
+            kv_cache_block_offsets=kv_cache_block_offsets,
+            block_ids_per_seq=block_ids_per_seq,
+            flash_mla_tile_scheduler_metadata=flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=flash_mla_num_splits,
+            use_paged_context_fmha=use_paged_context_fmha,
             num_sparse_topk=num_sparse_topk or 0,
-            cyclic_attention_window_size=attention_window_size,
-            max_attention_window_size=(
-                attention_window_size
-                if effective_beam_width == 1 or cache_indirection is None
-                else cache_indirection.size(2)
-            ),
+            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+            kv_lens_runtime=host_past_key_value_lengths,
+            prompt_lens_cpu_runtime=host_context_lengths,
+            prompt_lens_cuda_runtime=context_lengths,
+            is_cross=is_cross,
         )
-        tp = thop.FmhaParams()
-        build_op_params(tp, params)
-        op = cls._attention_ops.get(
-            StaticAttentionConfig.from_legacy_arguments(arguments), arguments["q"].device
+        fwd = _legacy_forward_args(
+            arguments,
+            chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size or 1,
         )
 
-        max_blocks_per_sequence = (
-            kv_cache_block_offsets.size(-1) if kv_cache_block_offsets is not None else 0
-        )
-        workspace_size = op.get_attention_workspace_size(
-            tp,
-            num_tokens,
-            attention_window_size,
-            num_gen_tokens,
-            max_blocks_per_sequence,
-        )
-        if workspace.numel() < workspace_size:
-            workspace.resize_(workspace_size)
+        def phase_params(token_lo: int, token_hi: int, seq_lo: int, seq_hi: int) -> FmhaParams:
+            return FmhaParams(
+                attn=attn,
+                meta=meta,
+                fwd=fwd,
+                workspace=workspace,
+                qkv_input=q[token_lo:token_hi],
+                key_input=k[token_lo:token_hi] if k is not None else None,
+                value_input=v[token_lo:token_hi] if v is not None else None,
+                output=output if enable_dsv4_epilogue_fusion else output[token_lo:token_hi],
+                sequence_lengths=sequence_length[seq_lo:seq_hi],
+                context_lengths=context_lengths[seq_lo:seq_hi],
+                host_total_kv_lens=host_total_kv_lens,
+                max_attention_window_size=max_attention_window_size,
+                cyclic_attention_window_size=attention_window_size,
+                tokens_per_block=tokens_per_block or 0,
+                kv_factor=1,
+                batch_size=seq_hi - seq_lo,
+                num_requests=seq_hi - seq_lo,
+                seq_offset=seq_lo,
+                token_offset=token_lo,
+                num_tokens=token_hi - token_lo,
+                use_spec_decoding=use_spec_decoding,
+                spec_decoding_generation_lengths=spec_decoding_generation_lengths,
+                spec_decoding_position_offsets=spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_packed_mask,
+                spec_decoding_bl_tree_mask_offset=spec_decoding_bl_tree_mask_offset,
+                spec_decoding_bl_tree_mask=spec_decoding_bl_tree_mask,
+                spec_bl_tree_first_sparse_mask_offset_kv=spec_bl_tree_first_sparse_mask_offset_kv,
+                is_cross=is_cross,
+                local_layer_idx=local_layer_idx,
+            )
 
-        if num_contexts > 0 and not is_gen_only:
-            # Context phase. The context-MLA path is handled inside run_context, so
-            # both MLA and non-MLA go through run_context.
+        if has_context:
+            max_context_q_len = int(host_context_lengths[:num_contexts].max())
+            max_past_kv_len = int(host_past_key_value_lengths[:num_contexts].max())
             if max_context_q_len_override is not None:
-                max_context_q_len = int(host_context_lengths[:num_contexts].max())
-                max_past_kv_len = int(host_past_key_value_lengths[:num_contexts].max())
                 override = int(max_context_q_len_override)
                 if override < max_context_q_len or override < max_past_kv_len:
                     raise ValueError(
@@ -899,75 +625,24 @@ class FallbackFmha(PhasedFmha):
                         f"context q length ({max_context_q_len}) and max past kv length "
                         f"({max_past_kv_len})."
                     )
-            tp.qkv_or_q = q[:num_ctx_tokens]
-            if k is not None:
-                tp.k = k[:num_ctx_tokens]
-            if v is not None:
-                tp.v = v[:num_ctx_tokens]
-            tp.output = output if enable_dsv4_epilogue_fusion else output[:num_ctx_tokens]
-            tp.sequence_length = sequence_length[:num_contexts]
-            tp.context_lengths = context_lengths[:num_contexts]
-            tp.seq_offset = 0
-            tp.num_seqs = num_contexts
-            tp.num_requests = num_contexts
-            tp.token_offset = 0
-            tp.num_tokens = num_ctx_tokens
-            op.run_context(tp)
+            params = phase_params(0, num_ctx_tokens, 0, num_contexts)
+            params.input_seq_length = max_context_q_len
+            params.max_past_kv_length = max_past_kv_len
+            # The context call reserves the generation phase's workspace as well.
+            params.num_gen_tokens = num_gen_tokens if has_generation else 0
+            thop.run_context(params)
 
-        if num_generations > 0 and not is_ctx_only:
-            # Native preparation mutates its carrier; each phase needs fresh parameters.
-            if num_contexts > 0 and not is_gen_only:
-                tp = thop.FmhaParams()
-                build_op_params(tp, params)
-            seq_offset = num_contexts
-            tp.qkv_or_q = q[num_ctx_tokens:]
-            if k is not None:
-                tp.k = k[num_ctx_tokens:]
-            if v is not None:
-                tp.v = v[num_ctx_tokens:]
-            tp.output = output if enable_dsv4_epilogue_fusion else output[num_ctx_tokens:]
-            tp.sequence_length = sequence_length[seq_offset:]
-            tp.context_lengths = context_lengths[seq_offset:]
-            tp.seq_offset = seq_offset
-            tp.num_seqs = num_generations
-            tp.num_requests = num_generations // effective_beam_width
-            # The tensors above are phase-local; token_offset only indexes the whole-batch
-            # FP4 scaling-factor output.
-            tp.token_offset = num_ctx_tokens
-            tp.num_tokens = num_gen_tokens
-            if is_mla_enable:
-                op.run_mla_generation(tp)
-            else:
-                op.run_generation(tp)
-
-    def _to_op_params(self, params: FmhaParams) -> "thop.FmhaParams":
-        """Validate and lower one phase's Python parameters.
-
-        The native struct is the only place these values are gathered: FmhaParams keeps
-        the phase slice, and the layer and batch state stay behind `attn` and `meta`
-        rather than being mirrored into a second carrier.
-        """
-        fwd, attn, meta = params.fwd, params.attn, params.meta
-        if fwd is None:
-            raise RuntimeError("FallbackFmha requires forward args.")
-        if params.output is None:
-            raise RuntimeError("FallbackFmha requires output.")
-        if params.workspace is None:
-            raise RuntimeError("FallbackFmha requires workspace.")
-        query = _phase_query(params)
-
-        params.multi_ctas_kv_counter = self._multi_ctas_kv_counter
-        tp = thop.FmhaParams()
-        build_op_params(tp, params)
-        tp.qkv_or_q = query
-        # Direct phase callers may omit the prompt-length view.
-        if params.context_lengths is None:
-            tp.context_lengths = meta.prompt_lens_cuda_runtime[params.seq_offset :]
-        # Encoder KV is request-scoped; each decoder beam reads it independently.
-        tp.num_requests = params.batch_size if meta.is_cross else params.num_requests
-        tp.max_num_sequences = meta.max_num_sequences or meta.max_num_requests
-        tp.local_layer_idx = attn.get_local_layer_idx(meta)
-        return tp
+        if has_generation:
+            params = phase_params(num_ctx_tokens, num_tokens, num_contexts, total_seqs)
+            params.input_seq_length = (
+                num_gen_tokens // num_generations if num_generations > 0 else 1
+            )
+            params.max_past_kv_length = int(
+                host_past_key_value_lengths[num_contexts:total_seqs].max()
+            )
+            params.num_requests = num_generations // effective_beam_width
+            params.num_gen_tokens = num_gen_tokens
+            thop.run_generation(params)
 
     # Keep nanobind calls eager, including when CombinedFmha delegates individual phases.
     @torch.compiler.disable
@@ -980,104 +655,27 @@ class FallbackFmha(PhasedFmha):
         forward_args: AttentionForwardArgs,
         workspace: torch.Tensor,
     ) -> None:
+        """The native op sizes and grows the workspace itself, inside each phase call."""
         if forward_args.sage_attn_smooth_v:
             logger.warning_once(
                 "The attention op quantizes V without the V smoothing this SageAttention "
                 "recipe requests.",
                 key="fallback_fmha_sage_attn_smooth_v",
             )
-        if metadata.num_generations > 0:
-            self._multi_ctas_kv_counter = get_multi_ctas_kv_counter(
-                self._multi_ctas_kv_counter,
-                q.device,
-                self.attn.num_heads,
-                metadata.max_num_sequences or metadata.max_num_requests,
-            )
-        # The native sizing call wants a parameter carrier, but the phase split has not
-        # run yet: build one covering the whole batch and point the phase counters at the
-        # context extent, which is what bounds the context workspace.
-        attn = self.attn
-        output = forward_args.output
-        if output is None:
-            raise RuntimeError("FallbackFmha requires output.")
-        num_tokens = q.size(0)
-        is_gen_only = forward_args.attention_input_type == AttentionInputType.generation_only
-        num_gen_tokens = num_tokens if is_gen_only else num_tokens - metadata.num_ctx_tokens
-        attention_window_size = forward_args.attention_window_size
-        cache_indirection = metadata.cache_indirection
-        max_attention_window_size = (
-            attention_window_size
-            if metadata.effective_beam_width == 1
-            else (
-                cache_indirection.size(2)
-                if cache_indirection is not None
-                else attention_window_size
-            )
-        )
-        is_fused_qkv = forward_args.is_fused_qkv
-        params = FmhaParams(
-            attn=attn,
-            meta=metadata,
-            fwd=forward_args,
-            workspace=workspace,
-            qkv_input=q if is_fused_qkv else None,
-            query_input=None if is_fused_qkv else q,
-            key_input=k,
-            value_input=v,
-            # Workspace sizing only needs the output dtype; preserve the caller's layout.
-            output=output,
-            sequence_lengths=metadata.kv_lens_cuda_runtime,
-            context_lengths=metadata.prompt_lens_cuda_runtime,
-            max_attention_window_size=max_attention_window_size,
-            cyclic_attention_window_size=attention_window_size,
-            tokens_per_block=(
-                metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
-            ),
-            kv_factor=self.kv_factor,
-            is_cross=metadata.is_cross,
-        )
-        _set_context_workspace_shape(
-            params,
-            num_contexts=0 if is_gen_only else metadata.num_contexts,
-            num_ctx_tokens=0 if is_gen_only else metadata.num_ctx_tokens,
-        )
-        tp = self._to_op_params(params)
-
-        kv_cache_block_offsets = metadata.kv_cache_block_offsets
-        use_kv_cache = kv_cache_block_offsets is not None
-        max_blocks_per_sequence = kv_cache_block_offsets.size(-1) if use_kv_cache else 0
-        max_attention_window_size = (
-            params.cyclic_attention_window_size
-            if metadata.effective_beam_width == 1
-            else params.max_attention_window_size
-        )
-        self._op = self.attention_op(params)
-        workspace_size = self._op.get_attention_workspace_size(
-            tp,
-            num_tokens,
-            max_attention_window_size,
-            num_gen_tokens,
-            max_blocks_per_sequence,
-        )
-        if workspace.numel() < workspace_size:
-            workspace.resize_(workspace_size)
 
     @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:
-        assert self._op is not None
-        self._op.run_context(self._to_op_params(params))
+        thop.run_context(params)
 
     @torch.compiler.disable
     def run_mla_context(self, params: FmhaParams) -> None:
-        assert self._op is not None
-        self._op.run_context(self._to_op_params(params))
+        thop.run_context(params)
 
     @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:
-        assert self._op is not None
-        self._op.run_generation(self._to_op_params(params))
+        thop.run_generation(params)
 
     @torch.compiler.disable
     def run_mla_generation(self, params: FmhaParams) -> None:
-        assert self._op is not None
-        self._op.run_mla_generation(self._to_op_params(params))
+        # The native op dispatches to the MLA generation path from the layer configuration.
+        thop.run_generation(params)

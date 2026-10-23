@@ -15,6 +15,7 @@
  */
 
 #include "bindings.h"
+#include <c10/cuda/CUDAGuard.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/set.h>
@@ -29,7 +30,6 @@
 #include <tensorrt_llm/thop/outputTensor.h>
 #include <tensorrt_llm/thop/trtllmGenFusedOps.h>
 #include <torch/extension.h>
-#include <type_traits>
 #include <utility>
 
 namespace nb = nanobind;
@@ -117,6 +117,68 @@ bool fusedContextFmhaKernelExists(
     return tensorrt_llm::kernels::FmhaDispatcher(params).isSupported();
 }
 
+// Readers for the cached native parameters, as the measured prototype spelled them.
+inline nb::object attr(nb::handle o, char const* name)
+{
+    return o.attr(name);
+}
+
+template <typename T>
+T get(nb::handle o, char const* name)
+{
+    return nb::cast<T>(o.attr(name));
+}
+
+template <typename T>
+std::optional<T> opt(nb::handle o, char const* name)
+{
+    nb::object const v = o.attr(name);
+    return v.is_none() ? std::nullopt : std::optional<T>(nb::cast<T>(v));
+}
+
+#include "tensorrt_llm/thop/fmha_params_update.inc"
+
+/// Fill the native parameters from the Python FmhaParams: the generated field copy, then
+/// the two reads the schema cannot express as one.
+void prepare(torch_ext::FmhaParams& params, nb::handle source)
+{
+    update(params, source);
+    if (!params.context_lengths.has_value())
+    {
+        // Direct phase callers may omit the prompt-length view.
+        params.context_lengths
+            = get<torch::Tensor>(attr(source, "meta"), "prompt_lens_cuda_runtime").slice(0, params.seq_offset);
+    }
+    // Encoder KV is request-scoped; each decoder beam reads it independently.
+    params.num_requests = params.meta.is_cross ? params.batch_size : params.num_requests;
+}
+
+// Each phase entry builds the native parameters for this call on the stack, so every
+// tensor reference is released when the call returns, on success or on a throw.
+void runContext(nb::handle source)
+{
+    torch_ext::FmhaParams params{};
+    prepare(params, source);
+    torch_ext::AttentionConfig key{};
+    torch_ext::fillAttentionConfig(key, params);
+
+    nb::gil_scoped_release const gil;
+    c10::cuda::CUDAGuard const device(params.getQueryInput().device());
+    torch_ext::AttentionBase::getCached(key)->runContext(params);
+}
+
+void runGeneration(nb::handle source)
+{
+    torch_ext::FmhaParams params{};
+    prepare(params, source);
+    torch_ext::AttentionConfig key{};
+    torch_ext::fillAttentionConfig(key, params);
+
+    nb::gil_scoped_release const gil;
+    c10::cuda::CUDAGuard const device(params.getQueryInput().device());
+    torch_ext::AttentionBase::getCached(key)->runGeneration(params);
+}
+
 } // namespace
 
 void initBindings(nb::module_& m)
@@ -133,64 +195,20 @@ void initBindings(nb::module_& m)
         m.attr(kv.first) = kv.second;
     }
 
-    auto sparseBackendForwardArgs
-        = nb::class_<torch_ext::SparseBackendForwardArgs>(m, "SparseBackendForwardArgs").def(nb::init<>());
-#define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type)                                                                        \
-    sparseBackendForwardArgs.def_rw(#name, &torch_ext::SparseBackendForwardArgs::name);
-#include "tensorrt_llm/thop/sparse_backend_forward_args_fields.inc"
-#undef TRTLLM_FMHA_PARAM_FIELD
-
-    auto sparseRuntimeParams = nb::class_<torch_ext::SparseRuntimeParams>(m, "SparseRuntimeParams").def(nb::init<>());
-#define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type)                                                                        \
-    sparseRuntimeParams.def_rw(#name, &torch_ext::SparseRuntimeParams::name);
-#include "tensorrt_llm/thop/sparse_runtime_params_fields.inc"
-#undef TRTLLM_FMHA_PARAM_FIELD
-
-    auto attentionForwardArgs
-        = nb::class_<torch_ext::AttentionForwardArgs>(m, "AttentionForwardArgs").def(nb::init<>());
-#define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type)                                                                        \
-    attentionForwardArgs.def_rw(#name, &torch_ext::AttentionForwardArgs::name);
-#include "tensorrt_llm/thop/attention_forward_args_fields.inc"
-#undef TRTLLM_FMHA_PARAM_FIELD
-
-    auto staticAttentionConfig
-        = nb::class_<torch_ext::StaticAttentionConfig>(m, "StaticAttentionConfig").def(nb::init<>());
-#define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type)                                                                        \
-    staticAttentionConfig.def_rw(#name, &torch_ext::StaticAttentionConfig::name);
-#include "tensorrt_llm/thop/static_attention_config_fields.inc"
-#undef TRTLLM_FMHA_PARAM_FIELD
-
-    auto fmhaParams = nb::class_<torch_ext::FmhaParams>(m, "FmhaParams").def(nb::init<>());
-#define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type) fmhaParams.def_rw(#name, &torch_ext::FmhaParams::name);
-#include "tensorrt_llm/thop/fmha_params_fields.inc"
-#undef TRTLLM_FMHA_PARAM_FIELD
-
-    nb::class_<torch_ext::AttentionOp>(m, "AttentionOp",
-        "One attention layer's native op. Reuse the same instance for every call from that layer so its "
-        "kernel runners are built once; drop it when the layer's quantization config changes and on "
-        "teardown, since it owns a cuBLAS handle, the runners, and the context-parallel communicator.")
-        .def(nb::init<torch_ext::StaticAttentionConfig const&>(), nb::arg("config"))
-        .def("run_context", &torch_ext::AttentionOp::runContext, nb::arg("params"), "Phased attention context pass.",
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("run_generation", &torch_ext::AttentionOp::runGeneration, nb::arg("params"),
-            "Phased attention generation pass.", nb::call_guard<nb::gil_scoped_release>())
-        .def("run_mla_generation", &torch_ext::AttentionOp::runMlaGeneration, nb::arg("params"),
-            "Phased attention MLA generation pass.", nb::call_guard<nb::gil_scoped_release>())
-        .def("get_attention_workspace_size", &torch_ext::AttentionOp::getAttentionWorkspaceSize, nb::arg("params"),
-            nb::arg("num_tokens"), nb::arg("max_attention_window_size"), nb::arg("num_gen_tokens"),
-            nb::arg("max_blocks_per_sequence"),
-            "Max of the context/generation workspace byte requirements for sizing FmhaParams.workspace.",
-            nb::call_guard<nb::gil_scoped_release>());
+    m.def("run_context", &runContext, nb::arg("params"),
+        "Phased attention context pass. Reads the Python FmhaParams into native parameters, resolves the op "
+        "for the layer's configuration from a per-thread cache (building it outside CUDA graph capture on "
+        "first use), and launches.");
+    m.def("run_generation", &runGeneration, nb::arg("params"), "Phased attention generation pass, MLA or not.");
 
     m.def(
         "get_helix_workspace_size_per_rank",
         [](int cp_size) { return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size); },
         nb::arg("cp_size"), "Get helix all-to-all workspace size per rank in bytes");
 
-    m.def("get_context_mla_workspace_bytes_per_token",
-        &tensorrt_llm::torch_ext::AttentionOp::contextMlaWorkspaceBytesPerToken, nb::arg("num_attn_heads"),
-        nb::arg("qk_rope_head_dim"), nb::arg("qk_nope_head_dim"), nb::arg("v_head_dim"), nb::arg("fp8_context_mla"),
-        nb::arg("separate_q_and_kv_input"), nb::arg("sparse_mla"),
+    m.def("get_context_mla_workspace_bytes_per_token", &tensorrt_llm::torch_ext::contextMlaWorkspaceBytesPerToken,
+        nb::arg("num_attn_heads"), nb::arg("qk_rope_head_dim"), nb::arg("qk_nope_head_dim"), nb::arg("v_head_dim"),
+        nb::arg("fp8_context_mla"), nb::arg("separate_q_and_kv_input"), nb::arg("sparse_mla"),
         "Per-token byte cost of the context-MLA K/V dequant staging buffers (scales with summed attended KV "
         "length). Returns 0 outside the fp8 context-MLA separate-Q/KV path. Used by the KV-cache estimator to "
         "reserve workspace headroom before sizing the KV pool.");
@@ -201,7 +219,7 @@ void initBindings(nb::module_& m)
         "tokens per block, output dtype), with Q at the KV precision (FP8 Q for an NVFP4 KV cache, which only the "
         "SM100-family kernel set carries), causal masking, and equal Q/KV heads. "
         "This is a diagnostic for a fixed probe configuration and does not describe what a given model will run; "
-        "AttentionOp checks its own exact initialized configuration before allowing paged-context attention. "
+        "The attention op checks its own exact initialized configuration before allowing paged-context attention. "
         "A build whose --cuda_architectures omits this device's SM carries no kernels for it and reports false.",
         nb::call_guard<nb::gil_scoped_release>());
 

@@ -33,7 +33,7 @@ from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
-from .cpp_schema import cpp_metadata
+from .cpp_schema import cpp_field
 from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
                             SparseRuntimeParams)
 
@@ -920,30 +920,27 @@ class AttentionForwardArgs:
     # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
-    kv_scale_orig_quant: Optional[torch.Tensor] = cpp_metadata(
-        dtype=torch.float32)
-    kv_scale_quant_orig: Optional[torch.Tensor] = cpp_metadata(
-        dtype=torch.float32)
-    out_scale: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
-    out_scale_sf: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
+    kv_scale_orig_quant: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    kv_scale_quant_orig: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    out_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    out_scale_sf: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
-    mrope_position_deltas: Optional[torch.Tensor] = cpp_metadata(
-        dtype=torch.int32)
+    mrope_position_deltas: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     softmax_stats_tensor: Optional[torch.Tensor] = None
-    attention_sinks: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
-    cu_q_seqlens: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
-    cu_kv_seqlens: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
-    fmha_scheduler_counter: Optional[torch.Tensor] = cpp_metadata(
+    attention_sinks: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    cu_q_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    fmha_scheduler_counter: Optional[torch.Tensor] = cpp_field(
         dtype=torch.uint32)
-    mla_bmm1_scale: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
-    mla_bmm2_scale: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
+    mla_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    mla_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     quant_q_buffer: Optional[torch.Tensor] = None
     cross_kv: Optional[torch.Tensor] = None
     relative_attention_bias: Optional[torch.Tensor] = None
-    quant_scale_qkv: Optional[torch.Tensor] = cpp_metadata(dtype=torch.float32)
-    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_metadata(
+    quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
         dtype=torch.float32)
     enable_dsv4_epilogue_fusion: bool = False
 
@@ -956,7 +953,7 @@ class AttentionForwardArgs:
     attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
     attention_input_type: AttentionInputType = AttentionInputType.mixed
     attention_window_size: Optional[int] = None
-    attention_mask_data: Optional[torch.Tensor] = cpp_metadata(dtype=torch.bool)
+    attention_mask_data: Optional[torch.Tensor] = cpp_field(dtype=torch.bool)
     relative_attention_max_distance: int = 0
     chunked_prefill_buffer_batch_size: int = 1
     skip_mla_rope_generation: bool = False
@@ -980,7 +977,7 @@ class AttentionForwardArgs:
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
-    timestep: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    timestep: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
     # algorithm, resolved on the host by the caller. When set, backends use it
     # instead of reading ``timestep``, which CUDA Graph capture cannot do.

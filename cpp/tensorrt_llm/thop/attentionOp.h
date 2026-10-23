@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -29,16 +30,20 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <torch/extension.h>
 
 #include <cassert>
+#include <concepts>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
@@ -59,10 +64,23 @@ struct KvCachePoolPointers
 
 #define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type) cpp_type name{};
 
-/// Attention configuration fixed at op construction.
-struct StaticAttentionConfig
+/// Rotary embedding parameters, mirrored from the Python RopeParams.
+struct AttentionRopeParams
 {
-#include "tensorrt_llm/thop/static_attention_config_fields.inc"
+#include "tensorrt_llm/thop/attention_rope_params_fields.inc"
+};
+
+/// Layer state read from the Python TrtllmAttention. Members are the ones this file
+/// reads as `attn.<name>`; the generator emits exactly that set.
+struct AttentionLayerParams
+{
+#include "tensorrt_llm/thop/attention_layer_params_fields.inc"
+};
+
+/// Batch state read from the Python TrtllmAttentionMetadata, selected the same way.
+struct AttentionMetadataParams
+{
+#include "tensorrt_llm/thop/attention_metadata_params_fields.inc"
 };
 
 /// Sparse inputs from the attention module to its backend.
@@ -86,28 +104,15 @@ struct AttentionForwardArgs
 #include "tensorrt_llm/thop/attention_forward_args_fields.inc"
 
     template <typename T>
-    T* getLatentCache() const
+    [[nodiscard]] T* getLatentCache() const
     {
         return latent_cache.has_value() ? static_cast<T*>(latent_cache.value().data_ptr()) : nullptr;
     }
 
     template <typename T>
-    T* getQPe() const
+    [[nodiscard]] T* getQPe() const
     {
         return q_pe.has_value() ? static_cast<T*>(q_pe.value().data_ptr()) : nullptr;
-    }
-
-    template <typename T>
-    T* getCrossKv() const
-    {
-        return cross_kv.has_value() ? static_cast<T*>(cross_kv.value().data_ptr()) : nullptr;
-    }
-
-    template <typename T>
-    T* getRelativeAttentionBias() const
-    {
-        return relative_attention_bias.has_value() ? static_cast<T*>(relative_attention_bias.value().data_ptr())
-                                                   : nullptr;
     }
 
     void* getOutputSf() const
@@ -120,203 +125,230 @@ struct AttentionForwardArgs
         return quant_q_buffer.has_value() ? quant_q_buffer.value().data_ptr() : nullptr;
     }
 
-    float2* getMropeRotaryCosSin() const
+    [[nodiscard]] float2* getMropeRotaryCosSin() const
     {
         return mrope_rotary_cos_sin.has_value() ? static_cast<float2*>(mrope_rotary_cos_sin.value().data_ptr())
                                                 : nullptr;
     }
 
-    float2* getSoftmaxStatsTensor() const
+    [[nodiscard]] float2* getSoftmaxStatsTensor() const
     {
         return softmax_stats_tensor.has_value() ? static_cast<float2*>(softmax_stats_tensor.value().data_ptr())
                                                 : nullptr;
     }
 };
 
-class AttentionOp;
+class AttentionBase;
 
-/// Parameters for phased attention, generated from fmha/interface.py.
+/// Everything that selects and configures a layer's kernel runners, and the key of the
+/// per-thread op cache. Plain struct: copying a key is memberwise and `operator==` is
+/// defaulted over every member; `std::hash<AttentionConfig>` below reads the same set.
+/// Values derived from these members live on AttentionBase, not here.
+struct AttentionConfig
+{
+    using RotaryScalingType = tensorrt_llm::kernels::RotaryScalingType;
+    using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
+    using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
+
+    int device = 0;
+    tensorrt_llm::DataType type = tensorrt_llm::DataType::kHALF;
+    bool is_fp8_out = false;
+    bool is_fp4_out = false;
+    bool use_kv_cache = false;
+    bool cross_attention = false;
+    std::int64_t tokens_per_block = 0;
+    AttentionMaskType mask_type = AttentionMaskType::CAUSAL;
+    PositionEmbeddingType position_embedding_type = PositionEmbeddingType::kLEARNED_ABSOLUTE;
+    std::int64_t num_heads = 0;
+    std::int64_t num_kv_heads = 0;
+    std::int64_t head_size = 0;
+    double q_scaling = 1.0;
+    std::int64_t rotary_embedding_dim = 0;
+    tensorrt_llm::common::QuantMode quant_mode{};
+    bool uses_spcompress = false;
+    bool paged_context_fmha = false;
+    bool is_spec_decoding_enabled = false;
+    std::int64_t spec_decoding_target_max_gen_len = 0;
+    bool fuses_dsv4_inv_rope_fp8_quant = false;
+    bool use_sparse_attention = false;
+    bool use_tllm_gen_sparse_attention = false;
+    bool use_nvfp4_mla_kv_cache = false;
+    bool is_mla_enable = false;
+    std::int64_t q_lora_rank = 0;
+    std::int64_t kv_lora_rank = 0;
+    std::int64_t qk_nope_head_dim = 0;
+    std::int64_t qk_rope_head_dim = 0;
+    std::int64_t v_head_dim = 0;
+    std::int64_t predicted_tokens_per_seq = 1;
+    std::int64_t mla_layer_num = 0;
+    bool rope_append = true;
+    std::int64_t sage_attn_num_elts_per_blk_q = 0;
+    std::int64_t sage_attn_num_elts_per_blk_k = 0;
+    std::int64_t sage_attn_num_elts_per_blk_v = 0;
+    bool sage_attn_qk_int8 = false;
+    bool sage_attn_smooth_k = false;
+    double skip_correction_threshold = 0.0;
+
+    // Fixed for the phased path: inputs are never padded, the dense context FMHA is never
+    // selected, and logit soft-capping is not exposed.
+    static constexpr bool remove_padding = true;
+    static constexpr bool dense_context_fmha = false;
+    static constexpr double attn_logit_softcapping_scale = 0.0;
+
+    bool operator==(AttentionConfig const&) const = default;
+
+    [[nodiscard]] bool isRelativePosition() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kRELATIVE;
+    }
+
+    [[nodiscard]] bool isALiBi() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kALIBI
+            || position_embedding_type == PositionEmbeddingType::kALIBI_WITH_SCALE;
+    }
+
+    [[nodiscard]] bool isAliBiWithScale() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kALIBI_WITH_SCALE;
+    }
+
+    [[nodiscard]] bool isRoPE() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kROPE_GPTJ
+            || position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+            || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+            || position_embedding_type == PositionEmbeddingType::kYARN
+            || position_embedding_type == PositionEmbeddingType::kROPE_M;
+    }
+
+    [[nodiscard]] bool isLongRoPE() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kLONG_ROPE;
+    }
+
+    [[nodiscard]] bool isMRoPE() const
+    {
+        return position_embedding_type == PositionEmbeddingType::kROPE_M;
+    }
+
+    [[nodiscard]] bool useCustomMask() const
+    {
+        return mask_type == AttentionMaskType::CUSTOM_MASK;
+    }
+
+    [[nodiscard]] bool isMLAEnabled() const
+    {
+        return is_mla_enable;
+    }
+
+    [[nodiscard]] bool sageAttnRequested() const
+    {
+        return sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
+    }
+
+    /// The key fields, for the cache-miss log and for diffing two keys.
+    [[nodiscard]] std::string toString() const;
+};
+
+/// Parameters for phased attention, generated from fmha/phased.py.
 /// Device tensors are phase-local; host tensors, KV-cache block offsets and FP4
 /// scales remain whole-batch. Their accessors apply seq_offset / token_offset.
+///
+/// One instance is cached per fallback library instance and host thread. The binding
+/// refreshes the generated fields from the Python objects on every call and clears
+/// every tensor reference afterwards.
 struct FmhaParams
 {
 #include "tensorrt_llm/thop/fmha_params_fields.inc"
 #undef TRTLLM_FMHA_PARAM_FIELD
 
-    // Derived by AttentionOp::prepare().
-    kernels::SparseAttentionParams sparse_params{};
-    KvCachePoolPointers kv_cache_pool_pointers{};
+    // Derived by prepare(): host reductions over the pinned length tensors, computed once
+    // per call.
+    std::int64_t total_kv_len = 0;
 
-    tensorrt_llm::DataType getType() const
+    [[nodiscard]] tensorrt_llm::DataType getType() const
     {
-        return tensorrt_llm::runtime::TorchUtils::dataType(qkv_or_q.scalar_type());
+        return tensorrt_llm::runtime::TorchUtils::dataType(getQueryInput().scalar_type());
     }
 
-    bool isFp8Out() const
+    /// The query-bearing input: packed QKV, or the separate query tensor MLA hands over.
+    [[nodiscard]] torch::Tensor const& getQueryInput() const
     {
-        return output.scalar_type() == torch::kFloat8_e4m3fn;
+        return qkv_input.has_value() ? qkv_input.value() : query_input.value();
     }
 
-    bool isFp4Out() const
+    [[nodiscard]] bool isFp8Out() const
     {
-        return output.scalar_type() == torch::kUInt8;
+        return output->scalar_type() == torch::kFloat8_e4m3fn;
     }
 
-    bool hasSparseAttnIndices() const
+    [[nodiscard]] bool isFp4Out() const
+    {
+        return output->scalar_type() == torch::kUInt8;
+    }
+
+    [[nodiscard]] bool hasSparseAttnIndices() const
     {
         return fwd.sparse_runtime_params.sparse_attn_indices.has_value()
             && fwd.sparse_runtime_params.sparse_attn_indices.value().numel() > 0;
     }
 
-    bool hasPagedSparseAttnIndices() const
+    [[nodiscard]] bool hasPagedSparseAttnIndices() const
     {
         return hasSparseAttnIndices() && fwd.sparse_runtime_params.sparse_attn_offsets.has_value()
             && fwd.sparse_runtime_params.sparse_attn_offsets.value().numel() > 0;
     }
 
-    template <typename T>
-    T* getQkvBias() const
+    /// `out_scale` is the FP8 output scale, but the global scale of the scaling factors
+    /// when the NVFP4 quant epilogue is fused; the two feed different kernel arguments.
+    [[nodiscard]] float* getOutQuantScale() const
     {
-        return qkv_bias.has_value() ? static_cast<T*>(qkv_bias.value().data_ptr()) : nullptr;
+        return isFp4Out() ? nullptr : getOutScale();
     }
 
-    template <typename T>
-    T* getAlibiSlopes() const
+    [[nodiscard]] float* getOutSfScale() const
     {
-        return alibi_slopes.has_value() ? static_cast<T*>(alibi_slopes.value().data_ptr()) : nullptr;
+        return isFp4Out() ? getOutScale() : nullptr;
     }
 
-    bool* getAttentionMask() const
-    {
-        return attention_mask.has_value() ? attention_mask.value().data_ptr<bool>() : nullptr;
-    }
-
-    std::uint32_t* getAttentionPackedMask() const
-    {
-        return attention_packed_mask.has_value() ? attention_packed_mask.value().data_ptr<std::uint32_t>() : nullptr;
-    }
-
-    void* getKeyValueCache() const
-    {
-        return key_value_cache.has_value() ? key_value_cache.value().data_ptr() : nullptr;
-    }
-
-    float* getLognScalingPtr() const
-    {
-        return logn_scaling_ptr.has_value() ? logn_scaling_ptr.value().data_ptr<float>() : nullptr;
-    }
-
-    float* getOutSfScale() const
-    {
-        return out_sf_scale.has_value() ? out_sf_scale.value().data_ptr<float>() : nullptr;
-    }
-
-    std::int32_t* getEncoderInputLengths() const
-    {
-        return encoder_input_lengths.has_value() ? encoder_input_lengths.value().data_ptr<std::int32_t>() : nullptr;
-    }
-
-    std::int64_t* getRuntimePerfKnobs() const
-    {
-        return runtime_perf_knobs.has_value() ? runtime_perf_knobs.value().data_ptr<std::int64_t>() : nullptr;
-    }
-
-    bool hasUnpagedSparseAttnIndices() const
+    /// Cross attention addresses the encoder KV by the phase-local sequence lengths.
+    [[nodiscard]] bool hasUnpagedSparseAttnIndices() const
     {
         return hasSparseAttnIndices() && !hasPagedSparseAttnIndices();
     }
-
-    std::int64_t attention_mask_stride = 0;
-    tensorrt_llm::kernels::BlockSparseParams block_sparse_params{};
-    bool can_use_one_more_block = false;
-    std::int64_t cross_kv_length = 0;
-    std::optional<torch::Tensor> encoder_input_lengths{};
-    bool has_full_attention_mask = false;
-    std::int64_t input_seq_length = 0;
-    std::int64_t max_blocks_per_sequence = 0;
-    std::int64_t max_cyclic_attention_window_size = 0;
-    std::int64_t max_past_kv_length = 0;
-    std::int64_t num_encoder_tokens = 0;
-    std::optional<torch::Tensor> out_sf_scale{};
-    std::optional<torch::Tensor> qkv_bias{};
-    std::optional<torch::Tensor> alibi_slopes{};
-    std::optional<torch::Tensor> key_value_cache{};
-    std::optional<torch::Tensor> logn_scaling_ptr{};
-    std::optional<torch::Tensor> attention_mask{};
-    std::optional<torch::Tensor> attention_packed_mask{};
-    bool pos_shift_enabled = false;
-    bool qkv_bias_enabled = false;
-    std::int64_t relative_attention_bias_stride = 0;
-    std::optional<torch::Tensor> runtime_perf_knobs{};
-    std::int64_t sink_token_length = 0;
-    bool spec_decoding_is_generation_length_variable = false;
-    std::int64_t spec_decoding_max_generation_length = 1;
-    std::int64_t total_kv_len = 0;
-    bool unfuse_qkv_gemm = false;
-    std::int64_t unidirectional = 1;
-    bool use_logn_scaling = false;
-    bool use_sparse_attention = false;
-    std::int64_t vision_length = -1;
-    std::int64_t vision_start = -1;
-
-    /// Build MLA parameters; the caller retains them for the kernel launch.
-    template <typename T>
-    kernels::MlaParams<T> buildContextMlaParams(AttentionOp const& op) const;
-
-    template <typename T>
-    kernels::MlaParams<T> buildGenerationMlaParams(AttentionOp const& op) const;
-
-    /// Fills the fields flash-MLA generation adds on top of buildGenerationMlaParams().
-    template <typename T>
-    void addFlashMlaGenerationParams(kernels::MlaParams<T>& mla) const;
-
-    /// Fill shared MLA fields using the op's layer configuration.
-    template <typename T>
-    void finalizeMlaParams(kernels::MlaParams<T>& mla, AttentionOp const& op) const;
 
 #include "tensorrt_llm/thop/fmha_params_accessors.inc"
 #include "tensorrt_llm/thop/fmha_params_forwarding.inc"
 
     template <typename T>
-    T* getQkvOrQ() const
+    [[nodiscard]] T* getQueryInput() const
     {
-        return static_cast<T*>(qkv_or_q.data_ptr());
+        return static_cast<T*>(getQueryInput().data_ptr());
     }
 
     template <typename T>
-    T* getK() const
+    [[nodiscard]] T* getK() const
     {
-        return k.has_value() ? static_cast<T*>(k.value().data_ptr()) : nullptr;
+        return key_input.has_value() ? static_cast<T*>(key_input.value().data_ptr()) : nullptr;
     }
 
     template <typename T>
-    T* getV() const
+    [[nodiscard]] T* getV() const
     {
-        return v.has_value() ? static_cast<T*>(v.value().data_ptr()) : nullptr;
+        return value_input.has_value() ? static_cast<T*>(value_input.value().data_ptr()) : nullptr;
     }
 
     template <typename T>
-    T* getLatentCache() const
+    [[nodiscard]] T* getLatentCache() const
     {
         return fwd.getLatentCache<T>();
     }
 
     template <typename T>
-    T* getQPe() const
+    [[nodiscard]] T* getQPe() const
     {
         return fwd.getQPe<T>();
-    }
-
-    template <typename T>
-    T* getCrossKv() const
-    {
-        return fwd.getCrossKv<T>();
-    }
-
-    template <typename T>
-    T* getRelativeAttentionBias() const
-    {
-        return fwd.getRelativeAttentionBias<T>();
     }
 
     void* getWorkspace() const
@@ -324,15 +356,9 @@ struct FmhaParams
         return workspace.data_ptr();
     }
 
-    /// The multi-CTA-KV counter semaphores are an opaque byte-sized scratch buffer.
-    void* getMultiCtasKvCounter() const
-    {
-        return multi_ctas_kv_counter.has_value() ? multi_ctas_kv_counter.value().data_ptr() : nullptr;
-    }
-
     void* getOutput() const
     {
-        return output.data_ptr();
+        return output.has_value() ? output->data_ptr() : nullptr;
     }
 
     void* getOutputSf() const
@@ -345,17 +371,63 @@ struct FmhaParams
         return fwd.getQuantQBuffer();
     }
 
-    float2* getRotaryCosSin() const
+    // ---- layer tensors, read from attn ----
+    [[nodiscard]] float2* getRotaryCosSin() const
     {
-        return rotary_cos_sin.has_value() ? static_cast<float2*>(rotary_cos_sin.value().data_ptr()) : nullptr;
+        return attn.rotary_cos_sin.has_value() ? static_cast<float2*>(attn.rotary_cos_sin.value().data_ptr()) : nullptr;
     }
 
-    float2* getMropeRotaryCosSin() const
+    [[nodiscard]] float* getRotaryInvFreq() const
+    {
+        return attn.rotary_inv_freq.has_value() ? attn.rotary_inv_freq.value().data_ptr<float>() : nullptr;
+    }
+
+    [[nodiscard]] std::uint32_t* getSkipSoftmaxStat() const
+    {
+        return attn.skip_softmax_stat.defined() ? attn.skip_softmax_stat.data_ptr<std::uint32_t>() : nullptr;
+    }
+
+    // ---- batch tensors, read from meta ----
+    [[nodiscard]] std::int32_t* getCacheIndirection() const
+    {
+        return meta.cache_indirection.has_value() ? meta.cache_indirection.value().data_ptr<std::int32_t>() : nullptr;
+    }
+
+    [[nodiscard]] std::int32_t* getBlockIdsPerSeq() const
+    {
+        return meta.block_ids_per_seq.has_value() ? meta.block_ids_per_seq.value().data_ptr<std::int32_t>() : nullptr;
+    }
+
+    [[nodiscard]] std::int32_t* getHelixPositionOffsets() const
+    {
+        return meta.helix_position_offsets.has_value() ? meta.helix_position_offsets.value().data_ptr<std::int32_t>()
+                                                       : nullptr;
+    }
+
+    [[nodiscard]] bool* getHelixIsInactiveRank() const
+    {
+        return meta.helix_is_inactive_rank.has_value() ? meta.helix_is_inactive_rank.value().data_ptr<bool>() : nullptr;
+    }
+
+    [[nodiscard]] std::int32_t* getFlashMlaTileSchedulerMetadata() const
+    {
+        return meta.flash_mla_tile_scheduler_metadata.has_value()
+            ? meta.flash_mla_tile_scheduler_metadata.value().data_ptr<std::int32_t>()
+            : nullptr;
+    }
+
+    [[nodiscard]] std::int32_t* getFlashMlaNumSplits() const
+    {
+        return meta.flash_mla_num_splits.has_value() ? meta.flash_mla_num_splits.value().data_ptr<std::int32_t>()
+                                                     : nullptr;
+    }
+
+    [[nodiscard]] float2* getMropeRotaryCosSin() const
     {
         return fwd.getMropeRotaryCosSin();
     }
 
-    float2* getSoftmaxStatsTensor() const
+    [[nodiscard]] float2* getSoftmaxStatsTensor() const
     {
         return fwd.getSoftmaxStatsTensor();
     }
@@ -363,35 +435,11 @@ struct FmhaParams
     // ---- hand-written accessors: sizes, derived pointers, and anything taking an index ----
     // Sequence lengths, windows, and paged-KV metadata.
     /// Block offsets for this phase's sequences; `seq_offset` is applied here.
-    kernels::KVBlockArray::DataType* getKvCacheBlockOffsets(int32_t poolIndex) const
+    [[nodiscard]] kernels::KVBlockArray::DataType* getKvCacheBlockOffsets(int32_t poolIndex) const
     {
-        return kv_cache_block_offsets.has_value() ? static_cast<kernels::KVBlockArray::DataType*>(
-                   kv_cache_block_offsets.value().index({poolIndex, seq_offset}).data_ptr())
-                                                  : nullptr;
-    }
-
-    // The KV-cache pool base pointers are derived state, not inputs: they are the
-    // int64 values stored in `host_kv_cache_pool_pointers` shifted by this layer's
-    // intra-pool offset, resolved once the op knows the cache element size. Never
-    // Python-facing.
-    void* getHostPrimaryPoolPtr() const
-    {
-        return kv_cache_pool_pointers.primaryPoolPtr;
-    }
-
-    void* getHostSecondaryPoolPtr() const
-    {
-        return kv_cache_pool_pointers.secondaryPoolPtr;
-    }
-
-    void* getHostPrimaryBlockScalePoolPtr() const
-    {
-        return kv_cache_pool_pointers.primaryBlockScalePoolPtr;
-    }
-
-    void* getHostSecondaryBlockScalePoolPtr() const
-    {
-        return kv_cache_pool_pointers.secondaryBlockScalePoolPtr;
+        return meta.kv_cache_block_offsets.has_value() ? static_cast<kernels::KVBlockArray::DataType*>(
+                   meta.kv_cache_block_offsets.value().index({poolIndex, seq_offset}).data_ptr())
+                                                       : nullptr;
     }
 
     // Quantization scales and output quantization.
@@ -410,44 +458,44 @@ struct FmhaParams
     ///
     /// `seq_offset` is applied here, so the returned array is phase-local and lines up
     /// with the device tensors, which the caller slices before handing them over.
-    int32_t* getHostPastKeyValueLengths() const
+    [[nodiscard]] int32_t* getHostPastKeyValueLengths() const
     {
         // A None source lowers to an undefined tensor rather than an error, so name the
         // field here instead of failing inside data_ptr with only a dtype to go on.
-        TORCH_CHECK(host_past_key_value_lengths.defined(), "FmhaParams.host_past_key_value_lengths is unset.");
-        return static_cast<int32_t*>(host_past_key_value_lengths.data_ptr()) + seq_offset;
+        TORCH_CHECK(meta.kv_lens_runtime.defined(), "FmhaParams.meta.kv_lens_runtime is unset.");
+        return static_cast<int32_t*>(meta.kv_lens_runtime.data_ptr()) + seq_offset;
     }
 
     /// Host context lengths for this phase's sequences, offset as above.
-    int32_t* getHostContextLengths() const
+    [[nodiscard]] int32_t* getHostContextLengths() const
     {
-        TORCH_CHECK(host_context_lengths.defined(), "FmhaParams.host_context_lengths is unset.");
-        return static_cast<int32_t*>(host_context_lengths.data_ptr()) + seq_offset;
+        TORCH_CHECK(meta.prompt_lens_cpu_runtime.defined(), "FmhaParams.meta.prompt_lens_cpu_runtime is unset.");
+        return static_cast<int32_t*>(meta.prompt_lens_cpu_runtime.data_ptr()) + seq_offset;
     }
 
     /// A phase with no sequences has no extent; at::max() rejects an empty input, so the
     /// empty range yields 0, matching the sum-based reduction below.
-    int32_t getMaxHostPastKeyValueLength(int64_t seqOffset, int64_t numSeqs) const
+    [[nodiscard]] int32_t getMaxHostPastKeyValueLength(int64_t seqOffset, int64_t numSeqs) const
     {
         if (numSeqs <= 0)
         {
             return 0;
         }
-        return host_past_key_value_lengths.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
+        return meta.kv_lens_runtime.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
     }
 
-    int32_t getMaxHostContextLength(int64_t seqOffset, int64_t numSeqs) const
+    [[nodiscard]] int32_t getMaxHostContextLength(int64_t seqOffset, int64_t numSeqs) const
     {
         if (numSeqs <= 0)
         {
             return 0;
         }
-        return host_context_lengths.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
+        return meta.prompt_lens_cpu_runtime.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
     }
 
     /// Total attended-KV length for this phase. Prefer explicit phase totals when
     /// supplied; otherwise sum the host KV lengths over the phase's sequences.
-    int32_t getTotalKvLen(int64_t seqOffset, int64_t numSeqs, bool isGen) const
+    [[nodiscard]] int32_t getTotalKvLen(int64_t seqOffset, int64_t numSeqs, bool isGen) const
     {
         if (numSeqs <= 0)
         {
@@ -457,50 +505,60 @@ struct FmhaParams
         {
             return host_total_kv_lens.value().select(0, isGen ? 1 : 0).item<int32_t>();
         }
-        return host_past_key_value_lengths.slice(0, seqOffset, seqOffset + numSeqs).sum().item<int32_t>();
+        return meta.kv_lens_runtime.slice(0, seqOffset, seqOffset + numSeqs).sum().item<int32_t>();
     }
 
-    int getCacheIndirectionWindowSize(int defaultValue) const
+    [[nodiscard]] int getCacheIndirectionWindowSize(int defaultValue) const
     {
-        return cache_indirection.has_value() ? static_cast<int>(cache_indirection.value().size(2)) : defaultValue;
+        return meta.cache_indirection.has_value() ? static_cast<int>(meta.cache_indirection.value().size(2))
+                                                  : defaultValue;
     }
 
-    bool hasKvCache() const
+    [[nodiscard]] bool hasKvCache() const
     {
-        return kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
-            && host_kv_cache_pool_mapping.has_value();
+        return meta.kv_cache_block_offsets.has_value() && meta.host_kv_cache_pool_pointers.has_value()
+            && meta.host_kv_cache_pool_mapping.has_value();
     }
 
-    torch::Tensor const& getHostKvCachePoolPointers() const
+    [[nodiscard]] torch::Tensor const& getHostKvCachePoolPointers() const
     {
-        return host_kv_cache_pool_pointers.value();
+        return meta.host_kv_cache_pool_pointers.value();
     }
 
-    int getMaxBlocksPerSequence() const
+    [[nodiscard]] int getMaxBlocksPerSequence() const
     {
-        return kv_cache_block_offsets.has_value() ? static_cast<int>(kv_cache_block_offsets.value().size(-1)) : 0;
+        return meta.kv_cache_block_offsets.has_value() ? static_cast<int>(meta.kv_cache_block_offsets.value().size(-1))
+                                                       : 0;
+    }
+
+    /// Sequences the generation workspace is sized for: the batch bound, not this
+    /// call's row count, so a context call sizing a mixed batch and the following
+    /// generation call agree.
+    [[nodiscard]] int64_t getMaxNumSequences() const
+    {
+        return meta.max_num_sequences.value_or(meta.max_num_requests);
     }
 
     // NOTE: `host_kv_cache_pool_mapping` is indexed by the layer's index *within its own
     // KV-cache manager* (`local_layer_idx`), not by the model-global `layer_idx`. The two
     // differ for draft / MTP models, whose mapping holds only their own layers.
-    int32_t getKvCachePoolIndex(int64_t localLayerIdx) const
+    [[nodiscard]] int32_t getKvCachePoolIndex(int64_t localLayerIdx) const
     {
-        return host_kv_cache_pool_mapping.has_value()
+        return meta.host_kv_cache_pool_mapping.has_value()
             ? checkedPoolMapping(localLayerIdx).index({localLayerIdx, 0}).item<int32_t>()
             : 0;
     }
 
-    int32_t getLayerIdxInCachePool(int64_t localLayerIdx) const
+    [[nodiscard]] int32_t getLayerIdxInCachePool(int64_t localLayerIdx) const
     {
-        return host_kv_cache_pool_mapping.has_value()
+        return meta.host_kv_cache_pool_mapping.has_value()
             ? checkedPoolMapping(localLayerIdx).index({localLayerIdx, 1}).item<int32_t>()
             : 0;
     }
 
-    torch::Tensor const& checkedPoolMapping(int64_t localLayerIdx) const
+    [[nodiscard]] torch::Tensor const& checkedPoolMapping(int64_t localLayerIdx) const
     {
-        auto const& mapping = host_kv_cache_pool_mapping.value();
+        auto const& mapping = meta.host_kv_cache_pool_mapping.value();
         TORCH_CHECK(localLayerIdx >= 0 && localLayerIdx < mapping.size(0), "local_layer_idx ", localLayerIdx,
             " is out of range for host_kv_cache_pool_mapping with ", mapping.size(0),
             " layers. This index must be the layer's position within its own KV-cache manager, "
@@ -508,295 +566,108 @@ struct FmhaParams
         return mapping;
     }
 
-    int64_t getMlaLayerNum() const
+    [[nodiscard]] int64_t getMlaLayerNum() const
     {
-        return host_kv_cache_pool_mapping.has_value() ? host_kv_cache_pool_mapping.value().size(0) : 0;
+        return meta.host_kv_cache_pool_mapping.has_value() ? meta.host_kv_cache_pool_mapping.value().size(0) : 0;
     }
 
-    int64_t getSparseAttnIndicesStride() const
+    [[nodiscard]] int64_t getSparseAttnIndicesStride() const
     {
         return fwd.sparse_runtime_params.sparse_attn_indices.has_value()
             ? fwd.sparse_runtime_params.sparse_attn_indices.value().size(-1)
             : 0;
     }
 
-    int32_t getCrossKvNumTokens() const
+    [[nodiscard]] int32_t getCrossKvNumTokens() const
     {
         return fwd.cross_kv.has_value() ? static_cast<int32_t>(fwd.cross_kv.value().size(0)) : 0;
     }
 
-    char* getSparseKvCachePool(int32_t poolIndex) const
+    [[nodiscard]] char* getSparseKvCachePool(int32_t poolIndex) const
     {
-        if (!host_kv_cache_pool_pointers.has_value())
+        if (!meta.host_kv_cache_pool_pointers.has_value())
         {
             return nullptr;
         }
-        auto const& poolPointers = host_kv_cache_pool_pointers.value();
+        auto const& poolPointers = meta.host_kv_cache_pool_pointers.value();
         return reinterpret_cast<char*>(poolPointers.dim() == 3 ? poolPointers.index({poolIndex, 0, 0}).item<int64_t>()
                                                                : poolPointers.index({poolIndex, 0}).item<int64_t>());
     }
+
+    /// Kernel view of the sparse indices and the KV pools they address. The pool fields
+    /// are only meaningful while sparse attention is active; callers gate on the op.
+    [[nodiscard]] kernels::SparseAttentionParams getSparseParams() const
+    {
+        kernels::SparseAttentionParams sparse{};
+        sparse.sparse_kv_indices = getSparseKvIndices();
+        sparse.sparse_kv_offsets = getSparseKvOffsets();
+        sparse.sparse_attn_indices = getSparseAttnIndices();
+        sparse.sparse_attn_offsets = getSparseAttnOffsets();
+        sparse.sparse_attn_indices_block_size = fwd.sparse_runtime_params.sparse_attn_indices_block_size;
+        sparse.sparse_attn_indices_stride = getSparseAttnIndicesStride();
+        sparse.num_sparse_topk = meta.num_sparse_topk;
+        sparse.sparse_attn_kv_lens = getSparseAttnKvLens();
+        if (!hasKvCache())
+        {
+            return sparse;
+        }
+        auto* kvCachePool = getSparseKvCachePool(getKvCachePoolIndex(local_layer_idx));
+        if (kvCachePool == nullptr)
+        {
+            return sparse;
+        }
+        if (fwd.sparse_runtime_params.sparse_attn_kv_lens.has_value())
+        {
+            // Deepseek V4 dynamic sparse MLA always uses the SWA pool for now.
+            sparse.sliding_window_kv_cache_pool = kvCachePool;
+            if (fwd.sparse_runtime_params.aux_kv_cache_pool_ptr.has_value())
+            {
+                sparse.sparse_kv_cache_pool
+                    = reinterpret_cast<void*>(fwd.sparse_runtime_params.aux_kv_cache_pool_ptr.value());
+            }
+        }
+        else
+        {
+            sparse.sparse_kv_cache_pool = kvCachePool;
+        }
+        return sparse;
+    }
 };
 
-class AttentionOp
+/// Per-token byte cost of the context-MLA K/V dequant staging buffers, whose size scales with the
+/// summed attended KV length. Only the fp8 context-MLA separate-Q/KV path stages these buffers; every
+/// other path (incl. sparse MLA, which reads K/V straight from the paged cache) returns 0. Shared by
+/// the op's context sizing and the KV-cache estimator so the two cannot drift.
+[[nodiscard]] size_t contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim,
+    int32_t qkNopeHeadDim, int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept;
+
+/// Fill the key from live parameters. Reads tensor metadata (dtype, device, presence and
+/// sizes), so it runs in the binding while the tensors are still attached.
+void fillAttentionConfig(AttentionConfig& config, FmhaParams const& p);
+
+/// Abstract attention op: the key plus every value derived from it, and the entry points
+/// the binding calls. The per-thread op cache stores these; the miss path chooses the
+/// concrete class.
+class AttentionBase : public AttentionConfig
 {
 public:
-    /// Acquires the handles the op keeps for its lifetime and derives everything that
-    /// follows from the layer's fixed shape. Deliberately not per call: cublasCreate()
-    /// is illegal while a stream is capturing, so the op has to be built outside
-    /// capture and reused for calls with the same configuration.
-    explicit AttentionOp(StaticAttentionConfig const& cfg);
+    /// Derives the device constants and the plain layer geometry. Does no CUDA work:
+    /// runners and the cuBLAS handle are created on the first call of each phase, which
+    /// keeps construction legal while a stream is capturing.
+    explicit AttentionBase(AttentionConfig const& cfg);
+    // No CUDA calls in destructors: the thread_local cache is destroyed at thread exit,
+    // possibly after the CUDA context.
+    virtual ~AttentionBase() = default;
+    AttentionBase(AttentionBase const&) = delete;
+    AttentionBase& operator=(AttentionBase const&) = delete;
 
-    using RotaryScalingType = tensorrt_llm::kernels::RotaryScalingType;
-    using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
-    using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
+    virtual void runContext(FmhaParams& p) = 0;
+    virtual void runGeneration(FmhaParams& p) = 0;
 
-    /// Derives the per-call state into \p p. Kernel runners are fixed by the constructor;
-    /// `mMultiBlockMode` remains a per-call runtime knob read from
-    /// `p.runtime_perf_knobs` at generation time.
-    int prepare(FmhaParams& p, bool isGen);
+    /// The op for `key`, built on first use and owned by the calling thread's cache.
+    static AttentionBase* getCached(AttentionConfig const& key);
 
-    /// One per entry point, instantiated per activation dtype. prepare() is called from
-    /// here so the dtype-independent and dtype-dependent halves of the setup sit
-    /// together, and so the MlaParams this scope owns outlives the launch.
-    template <typename T>
-    void runContextImpl(FmhaParams& p);
-    template <typename T>
-    void runGenerationImpl(FmhaParams& p);
-    template <typename T>
-    void runMlaGenerationImpl(FmhaParams& p);
-
-    /// Phased attention entry points. Reuse one op per configuration: it owns the cuBLAS handle,
-    /// which is expensive to create and cannot be created while a stream is capturing.
-    /// The caller's params are filled in place: Python builds a fresh holder for every
-    /// call, so there is nothing to preserve and nothing to copy.
-    void runContext(FmhaParams& params);
-    void runGeneration(FmhaParams& params);
-    void runMlaGeneration(FmhaParams& params);
-
-    [[nodiscard]] bool supportsNvFp4Output() const
-    {
-        return mEnableContextFMHA && mEnableXQA;
-    }
-
-    /// Max of the context and generation workspace byte requirements.
-    int64_t getAttentionWorkspaceSize(FmhaParams const& params, int64_t numTokens, int64_t maxAttentionWindowSize,
-        int64_t numGenTokens, int64_t maxBlocksPerSequence);
-
-    [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize(FmhaParams const& p) const noexcept;
-    [[nodiscard]] int getHeadSize(bool checkInit = true) const;
-    [[nodiscard]] int getMaxNumSeqLenTile(FmhaParams const& p, int batch_beam_size = 1) const;
-    [[nodiscard]] size_t getWorkspaceSizeForContext(FmhaParams const& p, int32_t nbReq, int32_t max_input_length,
-        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0, int32_t total_kv_len = 0) const noexcept;
-    // Per-token byte cost of the context-MLA K/V dequant staging buffers, whose size scales with the summed
-    // attended KV length (`total_kv_len`). Only the fp8 context-MLA separate-Q/KV path stages these buffers;
-    // every other path (incl. sparse MLA, which reads K/V straight from the paged cache) returns 0. Single
-    // source of truth shared by getWorkspaceSizeForContext (runtime sizing) and the KV-cache estimator, so
-    // the two cannot drift.
-    [[nodiscard]] static size_t contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim,
-        int32_t qkNopeHeadDim, int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept;
-    // total_num_seq is the sum of beam_width for multiple requests
-    [[nodiscard]] size_t getWorkspaceSizeForGeneration(FmhaParams const& p, int32_t total_num_seq,
-        int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept;
-
-    template <typename T, typename KVCacheBuffer>
-    int enqueueContext(FmhaParams const& p, kernels::MlaParams<T>* mlaParam, cudaStream_t stream);
-
-    template <typename T, typename KVCacheBuffer>
-    int enqueueGeneration(FmhaParams const& p, cudaStream_t stream);
-
-    template <typename T>
-    int mlaGeneration(kernels::MlaParams<T>& params, FmhaParams const& p, cudaStream_t stream);
-
-    int getFlashMlaNumSmParts(int s_q, int num_heads, int num_kv_heads, int head_size_v) const
-    {
-        static constexpr int block_size_m = 64;
-        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
-        int sm_cnt = mMultiProcessorCount;
-        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
-        return num_sm_parts;
-    }
-
-    static int getFlashMlaNumSmPartsStatic(int s_q, int num_heads, int num_kv_heads, int head_size_v)
-    {
-        static constexpr int block_size_m = 64;
-        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
-        int device;
-        cudaGetDevice(&device);
-        int sm_cnt;
-        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, device);
-        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
-        return num_sm_parts;
-    }
-
-    template <typename T>
-    int getKvCacheElemSizeInBits(FmhaParams const& p) const
-    {
-        return getKvCacheElemSizeInBits(mCfg.quant_mode, sizeof(T));
-    }
-
-    static int getKvCacheElemSizeInBits(tensorrt_llm::common::QuantMode quantMode, size_t dTypeSize)
-    {
-        if (quantMode.hasInt8KvCache() || quantMode.hasFp8KvCache())
-        {
-            return 8;
-        }
-        else if (quantMode.hasFp4KvCache())
-        {
-            return 4;
-        }
-        return dTypeSize * 8;
-    }
-
-    /// Defaulted so the dtype dispatch can name this directly; paged KV is the only
-    /// layout the generation path prepares for.
-    template <typename T, typename KVCacheBuffer = kernels::KVBlockArray>
-    void prepareEnqueueGeneration(FmhaParams const& p);
-
-    template <typename T, typename KVCacheBuffer>
-    bool convertMMHAParamsToXQAParams(
-        tensorrt_llm::kernels::XQAParams& xqaParams, FmhaParams const& p, bool forConfigurePlugin);
-
-    /// The op's own derived state, for debugging a dispatch decision.
-    [[nodiscard]] std::string toString() const;
-
-    // ---------------------------------------------------------------------------
-    // Predicates over the layer's configuration, read from mCfg, and over the per-call
-    // state, which is passed explicitly.
-    // ---------------------------------------------------------------------------
-    [[nodiscard]] bool isRelativePosition() const
-    {
-        return mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kRELATIVE;
-    }
-
-    [[nodiscard]] bool isALiBi() const
-    {
-        return mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kALIBI
-            || mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kALIBI_WITH_SCALE;
-    }
-
-    [[nodiscard]] bool isAliBiWithScale() const
-    {
-        return mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kALIBI_WITH_SCALE;
-    }
-
-    [[nodiscard]] bool isRoPE() const
-    {
-        return mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
-            || mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
-            || mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE
-            || mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kYARN
-            || mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
-    }
-
-    [[nodiscard]] bool isLongRoPE() const
-    {
-        return mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE;
-    }
-
-    [[nodiscard]] bool isUnfusedCrossAttention(FmhaParams const& p) const
-    {
-        return !mEnableContextFMHA && p.is_cross;
-    }
-
-    [[nodiscard]] bool isMRoPE() const
-    {
-        return mCfg.position_embedding_type == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
-    }
-
-    [[nodiscard]] bool isLognScaling(FmhaParams const& p) const
-    {
-        return p.use_logn_scaling;
-    }
-
-    [[nodiscard]] bool isCrossAttention(FmhaParams const& p) const
-    {
-        return p.is_cross;
-    }
-
-    [[nodiscard]] bool useKVCache(FmhaParams const& p) const
-    {
-        return p.hasKvCache();
-    }
-
-    [[nodiscard]] bool useCustomMask() const
-    {
-        return mCfg.mask_type == AttentionMaskType::CUSTOM_MASK;
-    }
-
-    [[nodiscard]] bool useFullCustomMask(FmhaParams const& p) const
-    {
-        return useCustomMask() && p.has_full_attention_mask;
-    }
-
-    [[nodiscard]] bool usePackedCustomMask(FmhaParams const& p) const
-    {
-        return useCustomMask() && mEnableContextFMHA;
-    }
-
-    [[nodiscard]] bool isMLAEnabled() const
-    {
-        return mCfg.is_mla_enable;
-    }
-
-    [[nodiscard]] bool useSparseAttention(FmhaParams const& p) const
-    {
-        return p.use_sparse_attention && mPagedKVCache && mEnableXQA;
-    }
-
-    [[nodiscard]] bool useTllmGenSparseAttentionPaged(FmhaParams const& p) const
-    {
-        return p.hasPagedSparseAttnIndices() && useSparseAttention(p);
-    }
-
-    // Config-only variants, for initialize(): it runs at construction and has no call to
-    // read, so the same questions are answered from mCfg.
-    [[nodiscard]] bool cfgUseSparseMLA() const
-    {
-        return mCfg.use_sparse_attention && mUseTllmGen && mCfg.is_mla_enable;
-    }
-
-    [[nodiscard]] bool cfgUseTllmGenSparseAttention() const
-    {
-        return cfgUseSparseMLA() || (mCfg.use_sparse_attention && mUseTllmGen && mCfg.use_tllm_gen_sparse_attention);
-    }
-
-    [[nodiscard]] bool useSparseMLA(FmhaParams const& p) const
-    {
-        return p.use_sparse_attention && mUseTllmGen && mCfg.is_mla_enable;
-    }
-
-    [[nodiscard]] bool useTllmGenSparseAttention(FmhaParams const& p) const
-    {
-        return useSparseMLA(p) || (p.use_sparse_attention && mUseTllmGen && p.hasUnpagedSparseAttnIndices());
-    }
-
-    [[nodiscard]] StaticAttentionConfig const& config() const
-    {
-        return mCfg;
-    }
-
-    [[nodiscard]] bool sageAttnRequested() const
-    {
-        return mCfg.sage_attn_num_elts_per_blk_q > 0 || mCfg.sage_attn_num_elts_per_blk_k > 0
-            || mCfg.sage_attn_num_elts_per_blk_v > 0;
-    }
-
-    [[nodiscard]] bool useSageAttn() const
-    {
-        return sageAttnRequested() && mFP8ContextFMHA && !mCfg.is_mla_enable && !mCfg.use_kv_cache;
-    }
-
-    [[nodiscard]] bool useHopperSageAttn() const
-    {
-        return useSageAttn() && mSM == kernels::kSM_90 && mCfg.sage_attn_qk_int8
-            && mCfg.sage_attn_num_elts_per_blk_q == 2 && mCfg.sage_attn_num_elts_per_blk_k == 16
-            && mCfg.sage_attn_num_elts_per_blk_v == 1;
-    }
-
-    [[nodiscard]] tensorrt_llm::kernels::MlaMetaParams const& mlaMeta() const
-    {
-        return mMLAParams;
-    }
+    [[nodiscard]] int getHeadSize() const;
 
     [[nodiscard]] int smVersion() const
     {
@@ -808,64 +679,20 @@ public:
         return mMultiProcessorCount;
     }
 
-private:
-    int mNumKVHeads = -1;
-    int mHeadSize = -1;
-
-    bool mPagedKVCache = true;
-    bool mFP8ContextFMHA = false;
-    bool mFP8AttenOutput = false;
-    bool mFP8ContextMLA = false;
-    bool mFP8GenerationMLA = false;
-    bool mIsGenerationMLA = false;
-    bool mUseGenFlashMLA = false;
-    // Static sparse MLA reads a separately dequantized FP8 scratch pool, so an NVFP4
-    // paged cache still runs the FP8 kernels.
-    bool mUseNvfp4MlaKvCache = false;
-    // Skip correction when the row-max increase is within this base-2 threshold.
-    float mSkipCorrectionThreshold = 0.0F;
-
-    // Equal to the full head counts: this op always runs on a single rank.
-    int mNumAttnHeads = -1;
-    // The layer's fixed configuration, captured at construction. Every value the
-    // kernel-runner selection and the per-call paths read that does not vary between
-    // calls lives here rather than being resent on each FmhaParams.
-    StaticAttentionConfig const mCfg;
-    tensorrt_llm::kernels::MlaMetaParams mMLAParams{};
-    int mNumAttnKVHeads = -1;
-
-    // fmha runner (enabled by default)
-    // flag: disabled = 0, enabled = 1, enabled with fp32 accumulation = 2
-    bool mEnableContextFMHA = true;
-    bool mFMHAForceFP32Acc = false;
-    bool mMultiBlockMode = true;
-    bool mEnableXQA = true;
-
-    bool mFuseFp4Quant = false;
-
-    using XqaPrepareProfile = std::tuple<bool, bool, bool, bool, bool, int64_t, int64_t, bool>;
-    std::map<XqaPrepareProfile, int64_t> mXqaPreparedBeamWidths;
-
-#ifdef SKIP_SOFTMAX_STAT
-    at::Tensor mDefaultSkipSoftmaxStat;
-#endif
-
-    void initialize();
-    int finishPrepare(FmhaParams& p, bool isGen);
-
-    static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
-
+protected:
+    // Derived from the device.
     int mSM = tensorrt_llm::common::getSMVersion();
     bool mUseTllmGen = (mSM >= 100) && (mSM != 120) && (mSM != 121);
-    bool mForceMultiBlockWarned = false;
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
-    std::shared_ptr<CUDADriverWrapper> mDriver;
-    std::unique_ptr<tensorrt_llm::kernels::FusedMHARunnerV2> mDecoderFMHARunner;
-    std::unique_ptr<tensorrt_llm::kernels::FmhaDispatcher> mFmhaDispatcher;
-    std::unique_ptr<tensorrt_llm::kernels::XqaDispatcher> mXqaDispatcher;
-    std::unique_ptr<tensorrt_llm::kernels::TllmGenFmhaRunner> mTllmGenFMHARunner;
-    std::unique_ptr<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
+    // Plain layer geometry from the key. An op whose KV layout differs (MLA) overrides
+    // these in its own constructor; nothing MLA-specific lives here.
+    int mNumKVHeads = -1;
+    int mHeadSize = -1;
+    // Equal to the full head counts: this op always runs on a single rank.
+    int mNumAttnHeads = -1;
+    int mNumAttnKVHeads = -1;
+    bool mFMHAForceFP32Acc = false;
 };
 
 struct KvCachePoolMapping
@@ -907,8 +734,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedK
     int64_t kv_cache_quant_mode, at::ScalarType dtype);
 
 // Layout manager for the thop attention workspace slices used by trtllm-gen.
-// Context follows AttentionOp::getWorkspaceSizeForContext() ordering. Generation
-// follows the XQA workspace ordering used by AttentionOp generation.
+// Context follows MHA::getWorkspaceSizeForContext() ordering. Generation
+// follows the XQA workspace ordering used by MHA generation.
 struct TrtllmGenContextWorkspaceLayout
 {
     int64_t trtllmGenWorkspaceOffset{};
@@ -1038,3 +865,10 @@ void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_schedul
     int64_t batch_size, int64_t s_q, int64_t num_q_heads, int64_t num_kv_heads, int64_t head_size_v);
 
 TRTLLM_NAMESPACE_END
+
+/// Hashes exactly the members `AttentionConfig::operator==` compares.
+template <>
+struct std::hash<tensorrt_llm::torch_ext::AttentionConfig>
+{
+    std::size_t operator()(tensorrt_llm::torch_ext::AttentionConfig const& c) const noexcept;
+};

@@ -153,15 +153,12 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
 
     output = TrtllmAttention.forward(attn, q, k, v, metadata, forward_args)
 
-    selected_args = attn._fmha_manager.select.call_args.args[-1]
     metadata.presented_token_major.assert_called_once_with(None)
-    attn._fmha_manager.select.assert_called_once_with(attn, q, k, v, metadata, selected_args)
-    fmha.forward.assert_called_once_with(q, k, v, metadata, selected_args)
-    assert selected_args is not forward_args
-    assert selected_args.sparse_runtime_params is sparse_params
-    assert forward_args.sparse_runtime_params.sparse_attn_indices is None
-    assert not selected_args.is_fused_qkv
-    assert selected_args.update_kv_cache
+    attn._fmha_manager.select.assert_called_once_with(attn, q, k, v, metadata, forward_args)
+    fmha.forward.assert_called_once_with(q, k, v, metadata, forward_args)
+    assert forward_args.sparse_runtime_params is sparse_params
+    assert not forward_args.is_fused_qkv
+    assert forward_args.update_kv_cache
     assert output is forward_args.output
 
 

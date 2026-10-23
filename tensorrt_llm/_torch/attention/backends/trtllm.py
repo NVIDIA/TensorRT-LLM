@@ -18,7 +18,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
                     List, Optional, Tuple)
 
@@ -39,6 +39,7 @@ from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantMode
 
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -797,9 +798,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         graph binding so the set of runtime views stays in sync across paths.
         """
         self.kv_lens_cuda_runtime = kv_lens_cuda
-        self.kv_lens_runtime = kv_lens
-        self.prompt_lens_cuda_runtime = prompt_lens_cuda
-        self.prompt_lens_cpu_runtime = prompt_lens_cpu
+        self.kv_lens_runtime: torch.Tensor = kv_lens
+        self.prompt_lens_cuda_runtime: torch.Tensor = prompt_lens_cuda
+        self.prompt_lens_cpu_runtime: torch.Tensor = prompt_lens_cpu
         self.host_request_types_runtime = host_request_types
 
     def mla_prepare_scheduler_buffers(
@@ -1619,6 +1620,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
 
+    # Layer state the native attention op reads through FmhaParams.attn. The
+    # generator (scripts/generate_fmha_params.py) collects these annotations;
+    # attributes assigned from an annotated __init__ parameter need none.
+    num_kv_heads: int
+    is_mla_enable: bool
+    v_head_dim: int
+    rope_params: RopeParams
+    q_scaling: float
+    predicted_tokens_per_seq: int
+    skip_correction_threshold: float
+    uses_spcompress: bool
+    q_lora_rank: Optional[int]
+    kv_lora_rank: Optional[int]
+    qk_nope_head_dim: Optional[int]
+    qk_rope_head_dim: Optional[int]
+    rope_append: Optional[bool]
+    rotary_inv_freq: Optional[torch.Tensor]
+    rotary_cos_sin: Optional[torch.Tensor]
+    position_embedding_type: PositionEmbeddingType
+    skip_softmax_stat: torch.Tensor
+    quant_mode: QuantMode
+
     @staticmethod
     def is_sm_version_trtllm_gen_kernel(sm):
         return not (sm < 100 or sm in [120, 121])
@@ -2333,10 +2356,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     seq_start=num_ctx,
                 )
 
-        forward_args = replace(
-            forward_args,
-            sparse_runtime_params=prepare_sparse_runtime_params(
-                self, q, k, v, metadata, forward_args))
+        forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
+            self, q, k, v, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata

@@ -475,12 +475,18 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
-`FallbackFmha` and its `attention()` compatibility adapter share a native
-`AttentionOp` cache, keyed by `StaticAttentionConfig`, CUDA device, and host thread.
-Streams are excluded so CUDA graph capture can reuse runners initialized during warmup.
-Each fallback instance caches ops by the configuration inputs that vary between
-calls. Workspace preparation resolves the op once per forward; context and
-generation reuse it without rebuilding `StaticAttentionConfig`.
+`FallbackFmha` hands the Python `FmhaParams` to `thop.run_context` or
+`thop.run_generation`; the native carrier behind them is per host thread and
+never visible to Python. Generated nanobind readers
+(`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,
+`meta` and `fwd` into the native struct, build an `AttentionConfig` key, and
+resolve the op from a per-thread C++ cache keyed by that configuration; the op
+is built outside CUDA graph capture on first use and its kernel runners are
+created lazily per phase. Workspace sizing, growth and the multi-CTA counter
+live in C++; `prepare_workspace()` is empty. After each launch the holder drops
+every tensor reference so cached parameters never pin a layer's activations.
+Streams are not part of the key so CUDA graph capture reuses runners
+initialized during warmup.
 
 `FallbackFmha._is_supported()` accepts separate Q/K/V only for MLA, cross
 attention, or SageAttention; self-attention requires KV-cache updates. It rejects
@@ -581,7 +587,7 @@ The FMHA package is split by role:
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the fallback library on the native phased
-  `thop.AttentionOp`.
+  `thop.run_context` / `thop.run_generation` entry points.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
 Use `PhasedFmha` for libraries that implement one or more phase-specific entry
@@ -620,7 +626,7 @@ prefill, KV block reuse or speculative draft tokens are configured. Those
 features all require the context phase to attend to KV that is already in the
 cache, and only the fused context FMHA kernel can do that.
 
-`AttentionOp::initialize()` ends with
+`MHA::initContext()` ends with
 `mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported()`, so a
 configuration with no compiled kernel silently clears the flag and the context
 phase runs the unfused path instead. That path builds K and V from the current
@@ -628,7 +634,7 @@ chunk alone: the cached prefix is dropped from attention and then overwritten
 by the chunk's write-back, which turns a missing kernel into a plausible wrong
 answer rather than an error.
 
-`AttentionOp::prepare()` refuses a non-MLA, non-cross paged-context request whose
+`MHA::prepareInputs()` refuses a non-MLA, non-cross paged-context request whose
 initialized op has no context FMHA kernel, so an unsupported configuration fails
 when the first context call prepares its workspace (normally during warmup), not
 at op construction. The check uses the exact Q/KV/output precision, mask type and
@@ -637,8 +643,8 @@ page size.
 The refusal has three distinct causes, each with its own message, and the
 distinction matters when triaging:
 
-- Relative position embedding (T5-style self attention). `initialize()` clears
-  `mEnableContextFMHA` for it before the kernel table is consulted, so no
+- Relative position embedding (T5-style self attention). The `MHA` constructor
+  clears `mEnableContextFMHA` for it before the kernel table is consulted, so no
   build carries a fused kernel for it. This is an unsupported feature
   combination: disable chunked prefill, KV block reuse and speculative
   decoding for the model. The message says so and does not point at the

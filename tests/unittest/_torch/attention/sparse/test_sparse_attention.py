@@ -196,13 +196,8 @@ def test_prepare_sparse_runtime_params_runs_index_hooks_once() -> None:
     assert runtime_params.sparse_attn_offsets is sparse_attn_offsets
     assert runtime_params.sparse_attn_indices_block_size == 1
     assert runtime_params.sparse_attn_kv_lens is caller_kv_lens
-    hook_args = attention.sparse_kv_predict.call_args.args[-1]
-    assert hook_args is not forward_args
-    assert hook_args.sparse_runtime_params is runtime_params
-    assert forward_args.sparse_runtime_params.sparse_kv_indices is None
-    assert forward_args.sparse_runtime_params.sparse_attn_indices is None
-    attention.sparse_kv_predict.assert_called_once_with(q, k, metadata, hook_args)
-    attention.sparse_attn_predict.assert_called_once_with(q, k, metadata, hook_args)
+    attention.sparse_kv_predict.assert_called_once_with(q, k, metadata, forward_args)
+    attention.sparse_attn_predict.assert_called_once_with(q, k, metadata, forward_args)
 
 
 def test_prepare_sparse_runtime_params_schedules_skip_softmax_thresholds() -> None:
@@ -279,11 +274,7 @@ def test_block_sparse_attn_predict_override_composes_with_index_predictors() -> 
     assert runtime_params.block_sparse_inputs is block_sparse_inputs
     assert runtime_params.sparse_attn_indices is sparse_attn_indices
     assert runtime_params.sparse_attn_indices_block_size == 1
-    hook_args = attention.block_sparse_attn_predict.call_args.args[-1]
-    assert hook_args is not forward_args
-    assert hook_args.sparse_runtime_params is runtime_params
-    assert forward_args.sparse_runtime_params.block_sparse_inputs is None
-    attention.block_sparse_attn_predict.assert_called_once_with(q, k, v, metadata, hook_args)
+    attention.block_sparse_attn_predict.assert_called_once_with(q, k, v, metadata, forward_args)
 
 
 def test_attention_forward_args_default_to_empty_sparse_runtime_params() -> None:
@@ -353,7 +344,7 @@ def test_forward_materializes_dynamic_block_sparse_prediction_before_shape_valid
     assert prepare.call_count == 2
     prepare.assert_called_with(attention, q, k, v, metadata, forward_args)
     assert attention._ensure_rope_table_size.call_count == 2
-    assert forward_args.sparse_runtime_params == SparseRuntimeParams()
+    assert forward_args.sparse_runtime_params is prediction
 
 
 @pytest.mark.parametrize("has_block_sparse_inputs", [False, True])
@@ -386,7 +377,7 @@ def test_forward_assigns_prepared_sparse_runtime_params(
 
     assert prepare.call_count == 2
     assert attention._ensure_rope_table_size.call_count == 2
-    assert forward_args.sparse_runtime_params is caller_params
+    assert forward_args.sparse_runtime_params is prediction
 
 
 @pytest.mark.parametrize("backend_name", ["FLASHINFER", "unknown"])

@@ -28,13 +28,25 @@ set(TRTLLM_FMHA_PARAMS_GENERATOR
     "${TRTLLM_REPO_ROOT_DIR}/scripts/generate_fmha_params.py")
 set(TRTLLM_FMHA_PARAMS_SCHEMAS
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/phased.py"
-    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/fallback.py"
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/interface.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/trtllm.py"
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/sparse/params.py"
 )
+# The C++ consumer decides which members of the mirrored runtime classes
+# (TrtllmAttention, TrtllmAttentionMetadata) are emitted: a member crosses when
+# these sources read it as attn.<name> / meta.<name>.
+set(TRTLLM_FMHA_PARAMS_USAGE_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionOp.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionFeature.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionVariant.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionOp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/nanobind/thop/bindings.cpp")
 set(TRTLLM_FMHA_PARAMS_SCHEMA_ARGS "")
 foreach(_schema ${TRTLLM_FMHA_PARAMS_SCHEMAS})
   list(APPEND TRTLLM_FMHA_PARAMS_SCHEMA_ARGS --module-path "${_schema}")
+endforeach()
+foreach(_usage ${TRTLLM_FMHA_PARAMS_USAGE_SOURCES})
+  list(APPEND TRTLLM_FMHA_PARAMS_SCHEMA_ARGS --usage-source "${_usage}")
 endforeach()
 set(TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -44,7 +56,7 @@ set_property(
   DIRECTORY
   APPEND
   PROPERTY CMAKE_CONFIGURE_DEPENDS ${TRTLLM_FMHA_PARAMS_GENERATOR}
-           ${TRTLLM_FMHA_PARAMS_SCHEMAS})
+           ${TRTLLM_FMHA_PARAMS_SCHEMAS} ${TRTLLM_FMHA_PARAMS_USAGE_SOURCES})
 execute_process(
   COMMAND
     "${Python3_EXECUTABLE}" "${TRTLLM_FMHA_PARAMS_GENERATOR}"
