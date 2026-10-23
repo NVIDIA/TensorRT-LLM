@@ -27,7 +27,6 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
-#include "tensorrt_llm/kernels/xqaDispatcher.h"
 
 TRTLLM_NAMESPACE_BEGIN
 

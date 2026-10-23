@@ -23,11 +23,11 @@
 #include <nanobind/stl/vector.h>
 #include <tensorrt_llm/common/cudaUtils.h>
 #include <tensorrt_llm/common/tllmDataType.h>
-#include <tensorrt_llm/kernels/fmhaDispatcher.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moe/communication/moeAlltoAllMeta.h>
 #include <tensorrt_llm/thop/outputTensor.h>
+#include <tensorrt_llm/thop/phasedFmha.h>
 #include <tensorrt_llm/thop/trtllmGenFusedOps.h>
 #include <torch/extension.h>
 #include <utility>
@@ -70,9 +70,9 @@ bool fusedContextFmhaKernelExists(
     case tensorrt_llm::DataType::kFP4:
         // Only the trtllm-gen kernel set has E2M1-KV context kernels. The
         // FMHA-v2 runner used everywhere else asserts that Q and KV precision
-        // match, so answer "no" wherever FmhaDispatcher would pick FMHA-v2
+        // match, so answer "no" wherever the attention op would pick FMHA-v2
         // instead of tripping that assertion inside a diagnostic query. This
-        // mirrors the dispatcher's trtllm-gen selection: SM100 family, and
+        // mirrors the op's trtllm-gen selection: SM100 family, and
         // head size 72 excluded (trtllm-gen has no kernel for it).
         if (!tensorrt_llm::common::isSM100Family() || headSize == 72)
         {
@@ -114,7 +114,12 @@ bool fusedContextFmhaKernelExists(
     params.scaleAlibi = false;
     params.saveSoftmax = false;
 
-    return tensorrt_llm::kernels::FmhaDispatcher(params).isSupported();
+    // The library the attention op picks: trtllm-gen on the SM100 family except head size 72, fmha_v2 otherwise.
+    if (tensorrt_llm::common::isSM100Family() && headSize != 72)
+    {
+        return torch_ext::TrtllmGenFmha<torch_ext::MHA>::isContextSupported(params);
+    }
+    return torch_ext::FmhaV2Fmha<torch_ext::MHA>::isContextSupported(params);
 }
 
 // Readers for the cached native parameters, as the measured prototype spelled them.

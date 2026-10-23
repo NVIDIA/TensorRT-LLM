@@ -20,13 +20,14 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/fmhaDispatcher.h"
+#include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
-#include "tensorrt_llm/kernels/xqaDispatcher.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -527,7 +528,16 @@ struct FmhaParams
 [[nodiscard]] size_t contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim,
     int32_t qkNopeHeadDim, int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept;
 
-/// Defined in attentionFeature.h; named here for the friend list of AttentionBase.
+/// Defined in attentionFeature.h and phasedFmha.h; named here for the friend list of AttentionBase.
+template <typename AttentionVariant>
+class TrtllmGenFmha;
+template <typename AttentionVariant>
+class FmhaV2Fmha;
+template <typename AttentionVariant>
+class XqaFmha;
+class FlashMlaFmha;
+class MmhaFmha;
+class UnfusedFmha;
 class PagedKVCacheFeature;
 class CustomMaskFeature;
 class SageAttnFeature;
@@ -735,9 +745,19 @@ protected:
     bool mFMHAForceFP32Acc = false;
 
 private:
-    // These read the key members directly: the hash reads all of them, the features read
-    // the ones that configure them, and the NVFP4 support probe builds a key from scalars.
+    // These read the key members directly: the hash reads all of them, the features and the
+    // FMHA libraries read the ones that configure them, and the NVFP4 support probe builds a
+    // key from scalars.
     friend struct std::hash<AttentionBase>;
+    template <typename>
+    friend class TrtllmGenFmha;
+    template <typename>
+    friend class FmhaV2Fmha;
+    template <typename>
+    friend class XqaFmha;
+    friend class FlashMlaFmha;
+    friend class MmhaFmha;
+    friend class UnfusedFmha;
     friend class PagedKVCacheFeature;
     friend class CustomMaskFeature;
     friend class SageAttnFeature;

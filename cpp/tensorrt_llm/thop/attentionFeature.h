@@ -142,32 +142,6 @@ public:
         }
     }
 
-    void apply(kernels::XqaFixedParams& fp) const
-    {
-        fp.numTokensPerBlock = mTokensPerBlock;
-        fp.isPagedKv = mEnabled;
-        if (mQuantMode.hasInt8KvCache())
-        {
-            fp.kvDataType = kernels::DATA_TYPE_INT8;
-            fp.mathDataType = fp.inputDataType;
-        }
-        else if (mQuantMode.hasFp8KvCache())
-        {
-            fp.kvDataType = kernels::DATA_TYPE_E4M3;
-            fp.mathDataType = kernels::DATA_TYPE_E4M3;
-        }
-        else if (mQuantMode.hasFp4KvCache())
-        {
-            fp.kvDataType = kernels::DATA_TYPE_E2M1;
-            fp.mathDataType = kernels::DATA_TYPE_E4M3;
-        }
-        else
-        {
-            fp.kvDataType = fp.inputDataType;
-            fp.mathDataType = fp.inputDataType;
-        }
-    }
-
     void apply(kernels::XQAParams& xp) const
     {
         xp.paged_kv_cache = mEnabled;
@@ -420,18 +394,6 @@ public:
         }
     }
 
-    void apply(kernels::XqaFixedParams& fp) const
-    {
-        if (mFp4Out)
-        {
-            fp.outputDataType = kernels::DATA_TYPE_E2M1;
-        }
-        else if (mFp8Out)
-        {
-            fp.outputDataType = kernels::DATA_TYPE_E4M3;
-        }
-    }
-
     void apply(kernels::MHARunnerParams& rp) const
     {
         rp.outputSfPtr = mOutputSf;
@@ -627,11 +589,6 @@ public:
         fp.scaleAlibi = mAlibiScale;
     }
 
-    void apply(kernels::XqaFixedParams& fp) const
-    {
-        fp.hasAlibi = mAlibi;
-    }
-
     void apply(kernels::XQAParams& xp) const
     {
         xp.max_distance = mMaxDistance;
@@ -791,7 +748,6 @@ class SpecDecodingFeature
 public:
     explicit SpecDecodingFeature(AttentionBase const& c)
         : mEnabled(c.is_spec_decoding_enabled)
-        , mTargetMaxGenLen(static_cast<int>(c.spec_decoding_target_max_gen_len))
     {
     }
 
@@ -861,17 +817,6 @@ public:
         return mActive;
     }
 
-    void apply(kernels::XqaFixedParams& fp) const
-    {
-        fp.isSpecDecoding = mEnabled;
-        fp.specDecodingTargetMaxGenLen = mTargetMaxGenLen;
-        if (mEnabled && !mTllmGen)
-        {
-            fp.outputDataType = kernels::DATA_TYPE_E4M3;
-            TLLM_CHECK_WITH_INFO(fp.numQHeads % fp.numKvHeads == 0, "num_heads should be multiples of mNumKVHeads.");
-        }
-    }
-
     void apply(kernels::XQAParams& xp) const
     {
         xp.multi_query_tokens = mActive;
@@ -890,8 +835,6 @@ public:
 
 private:
     bool mEnabled;
-    int mTargetMaxGenLen;
-    bool mTllmGen = isTllmGenDevice();
     bool mSm100Family = tensorrt_llm::common::isSM100Family();
     // Per call, set by prepare().
     bool mActive{false};
@@ -935,14 +878,6 @@ public:
     }
 
     void apply(kernels::MHARunnerFixedParams& fp) const
-    {
-        if (mTllmGen)
-        {
-            fp.useTllmGenSparseAttention = true;
-        }
-    }
-
-    void apply(kernels::XqaFixedParams& fp) const
     {
         if (mTllmGen)
         {
@@ -1020,14 +955,6 @@ public:
         if (mEnabled)
         {
             fp.useSparseMLA = true;
-            fp.useTllmGenSparseAttention = true;
-        }
-    }
-
-    void apply(kernels::XqaFixedParams& fp) const
-    {
-        if (mEnabled)
-        {
             fp.useTllmGenSparseAttention = true;
         }
     }

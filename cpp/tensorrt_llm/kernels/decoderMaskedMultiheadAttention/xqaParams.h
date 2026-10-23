@@ -235,6 +235,8 @@ struct XQAParams
     }
 };
 
+constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
