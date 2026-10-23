@@ -1701,6 +1701,16 @@ class MLA(nn.Module):
                             quant_q_buffer,
                             **fp4_rope_kwargs,
                         )
+                        if getattr(attn_metadata, "mixed_high_block_table", None) is not None:
+                            # Sparse MLA on a mixed-precision cache: also keep
+                            # the retained tokens' rows at the attention dtype.
+                            from .backends.sparse.mixed_precision_overlay import (
+                                write_generation_rows,
+                            )
+
+                            write_generation_rows(
+                                self.mqa, attn_metadata, latent_cache, position_ids
+                            )
 
             if fuse_fp4_q_quant or use_fp8_mla:
                 rope_stream = None

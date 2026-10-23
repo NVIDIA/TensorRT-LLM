@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
+    Role,
     _fill_kv_pages,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -47,6 +48,7 @@ from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     AttentionLayerConfig,
+    AttentionReusePolicy,
     BatchDesc,
     BufferConfig,
     BufferId,
@@ -1061,6 +1063,71 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if generation_size_per_token <= 0:
             return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
+
+    # Mixed-precision KV: the compressed history (COMPRESS of the ratio-4 and
+    # ratio-128 layers) gains a retained-token twin holding the compressed rows
+    # of the first_n / last_n tokens at mixed.high. The sliding-window and
+    # compressor-state pools already keep full precision. Twins are keyed by the
+    # local model layer; the base byte accounting addresses only the native pools.
+    _supports_mixed_precision_kv = True
+
+    def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
+        return False
+
+    def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        if self.low_precision_dtype is None:
+            return config
+        layers = list(config.layers)
+        for local, layer in enumerate(self.pp_layers):
+            if self._first_spec_layer_id is not None and layer >= self._first_spec_layer_id:
+                continue
+            if not compress_ratio_has_attention(
+                self._compress_ratios[layer], DeepseekV4AttentionType.COMPRESS
+            ):
+                continue
+            rows_per_page = self.compressed_block_sizes[layer]
+            self.high_layers[local] = len(layers)
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=LayerId(len(layers)),
+                    buffers=[
+                        BufferConfig(
+                            role=Role.KEY,
+                            size=get_size_in_bytes(
+                                rows_per_page * self.head_dim, self.retained_dtype
+                            ),
+                        )
+                    ],
+                    # Windows count raw tokens; a page holds tokens_per_block // ratio rows.
+                    sliding_window_size=self.last_n + 1 + self._max_draft_len,
+                    num_sink_tokens=self.first_n,
+                    reuse_policy=AttentionReusePolicy.REQUIRED,
+                )
+            )
+        if not self.high_layers:
+            return config
+        self._num_manager_layers = len(layers)
+        return replace(config, layers=layers)
+
+    def _get_mixed_precision_buffers(
+        self, layer_offset: int, kv_layout: str, mixed_precision_pool: str
+    ) -> torch.Tensor:
+        if mixed_precision_pool != "high":
+            raise ValueError("DeepSeek-V4 keeps its history in the native compressed pools")
+        layer = self.high_layers[layer_offset]
+        address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
+        shape = [
+            self.impl.get_page_index_upper_bound(layer, Role.KEY),
+            1,
+            self.compressed_block_sizes[self.pp_layers[layer_offset]],
+            1,
+            self.head_dim,
+        ]
+        return convert_to_torch_tensor(TensorWrapper(address, self.retained_dtype, shape))
+
+    def fill_mixed_precision_page_tables(self, request_ids: List[int], layer_idx: int, out) -> None:
+        # Only the retained lane exists here; the history stays in the native pools.
+        self._fill_page_table(self.high_layers[self.layer_offsets[layer_idx]], request_ids, out[1])
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """

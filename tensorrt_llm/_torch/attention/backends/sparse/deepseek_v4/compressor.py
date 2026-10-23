@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
+from ..mixed_precision_overlay import write_compressed_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -310,6 +311,13 @@ class Compressor(nn.Module):
 
         position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
         compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
+        # Mixed-precision KV: the main compressor also stores its post-processed
+        # rows in the retained-token twin of this layer.
+        write_retained = (
+            not self.is_indexer and getattr(metadata, "mixed_high_block_table", None) is not None
+        )
+        if write_retained and kv_out is None:
+            kv_out = torch.empty_like(kv_comp)
 
         if self.footer_scale_cache and not self.is_indexer:
             self._footer_scale_postprocess_scatter(
@@ -352,11 +360,22 @@ class Compressor(nn.Module):
             scale_output,
         )
 
+        if write_retained:
+            write_compressed_rows(
+                self,
+                metadata,
+                kv_out,
+                num_comp_tokens,
+                cu_new_comp_kv,
+                start_pos,
+                compressed_mask,
+                bsz,
+            )
         if quant_output is not None:
             if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
                 return quant_output.view(torch.float4_e2m1fn_x2), scale_output
             return quant_output.view(torch.float8_e4m3fn), scale_output
-        if kv_out is not None:
+        if kv_out is not None and self.is_indexer:
             return kv_out, None
         return kv_comp, None
 

@@ -377,6 +377,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
+    def _has_mixed_precision_kv(self) -> bool:
+        # The NVFP4 pool is read through the top-k gather, and the retained
+        # rows are overlaid there (mixed_precision_overlay); no staging copy.
+        return False
+
     def prepare(self):
         self._validate_ragged_verification()
         super().prepare()
@@ -1106,6 +1111,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # Mixed-precision KV: page table of the retained-token (high) pool in
+        # block_table's row order; -1 where a page is not retained.
+        self.mixed_high_block_table = None
+        self.mixed_ctx_positions = None
+        if getattr(self.kv_cache_manager, "high_layers", None):
+            self.mixed_high_block_table = self.get_empty(
+                self.cuda_graph_buffers,
+                [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
+                cache_name="mixed_high_block_table",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         if is_dsa_cache_manager(self.draft_kv_cache_manager):
             self.draft_block_table = self.get_empty(
                 self.cuda_graph_buffers,
@@ -2079,6 +2096,37 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table[: self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True
         )
+        high_table = getattr(self, "mixed_high_block_table", None)
+        if high_table is not None and self.kv_cache_manager.high_layers:
+            tables = torch.full(
+                (2, self.num_seqs, max_blocks_used),
+                -1,
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
+            # Every mixed layer shares the same two pools, so one table serves all of them.
+            local = next(iter(self.kv_cache_manager.high_layers))
+            self.kv_cache_manager.fill_mixed_precision_page_tables(
+                self.request_ids, self.kv_cache_manager.pp_layers[local], tables.numpy()
+            )
+            high_table[: self.num_seqs, :max_blocks_used].copy_(tables[1], non_blocking=True)
+            # Absolute position of every context token, for the retained-row write.
+            self.mixed_ctx_positions = None
+            if self.num_ctx_tokens > 0:
+                positions = torch.empty(
+                    self.num_ctx_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
+                )
+                torch.cat(
+                    [
+                        torch.arange(int(cached), int(cached) + int(length), dtype=torch.int32)
+                        for cached, length in zip(
+                            cached_token_lens[: self.num_contexts].tolist(),
+                            self.seq_lens[: self.num_contexts].tolist(),
+                        )
+                    ],
+                    out=positions,
+                )
+                self.mixed_ctx_positions = positions.to(high_table.device, non_blocking=True)
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens

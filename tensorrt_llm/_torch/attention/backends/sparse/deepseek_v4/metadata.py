@@ -295,6 +295,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
+        # Mixed-precision KV: page table of the retained-token twins (compressed
+        # rows at the attention dtype), -1 where a page is not retained.
+        self.mixed_high_block_table = None
+        if getattr(self.kv_cache_manager, "high_layers", None):
+            self.mixed_high_block_table = self.get_empty(
+                self.cuda_graph_buffers,
+                compress_block_table_shape,
+                cache_name="mixed_high_block_table",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         self._init_sparse_offload_state()
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
@@ -484,6 +495,19 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
+        high_table = getattr(self, "mixed_high_block_table", None)
+        if high_table is not None and self.kv_cache_manager.high_layers:
+            tables = torch.full(
+                (2, self.num_seqs, high_table.shape[1]),
+                -1,
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
+            local = next(iter(self.kv_cache_manager.high_layers))
+            self.kv_cache_manager.fill_mixed_precision_page_tables(
+                self.request_ids, self.kv_cache_manager.pp_layers[local], tables.numpy()
+            )
+            high_table[: self.num_seqs].copy_(tables[1], non_blocking=True)
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
@@ -711,6 +735,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
         if state is not None:
             state.is_prefill = True
+
+    def _has_mixed_precision_kv(self) -> bool:
+        # The compressed history is read through the top-k gather, and the
+        # retained rows are overlaid there (mixed_precision_overlay); no staging.
+        return False
 
     def prepare(self) -> None:
         self._validate_ragged_verification()
