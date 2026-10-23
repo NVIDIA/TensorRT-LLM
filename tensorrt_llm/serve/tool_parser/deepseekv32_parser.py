@@ -80,6 +80,10 @@ class DeepSeekV32Parser(BaseToolParser):
         )
         self._last_arguments = ""
         self.current_tool_id = -1
+        # Between a block's opening and closing tags, the newlines that separate
+        # the invokes and precede the closing tag are the format's layout (the
+        # checkpoint's encoder writes them), not content.
+        self._in_calls_block = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -188,6 +192,20 @@ class DeepSeekV32Parser(BaseToolParser):
             self._ends_with_partial_token(current_text, token) for token in partial_tokens
         )
 
+        if self._in_calls_block and not has_tool_call:
+            closing = current_text.find(self.eot_token)
+            layout = current_text if closing == -1 else current_text[:closing]
+            if not layout.strip():
+                if closing == -1:
+                    # Still layout until the next invoke or the closing tag.
+                    return StreamingParseResult()
+                self._in_calls_block = False
+                current_text = current_text[closing + len(self.eot_token) :]
+                self._buffer = current_text
+                ends_with_partial_token = any(
+                    self._ends_with_partial_token(current_text, token) for token in partial_tokens
+                )
+
         if not has_tool_call and not ends_with_partial_token:
             normal_text = current_text
             self._buffer = ""
@@ -202,6 +220,11 @@ class DeepSeekV32Parser(BaseToolParser):
         if normal_text:
             current_text = current_text[prefix_len:]
             self._buffer = current_text
+        if has_tool_call:
+            if self._in_calls_block and not normal_text.strip():
+                # The separator before the next invoke.
+                normal_text = ""
+            self._in_calls_block = True
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
