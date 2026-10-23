@@ -74,12 +74,24 @@ pytestmark = pytest.mark.cpu_only
     ("shutdown_method", "releases_model_owned_graphs"),
     [
         ("shutdown", True),
-        ("shutdown_for_kv_cache_estimation", False),
+        ("release_resources", False),
     ],
 )
 def test_shutdown_graph_lifecycle(shutdown_method, releases_model_owned_graphs):
     engine = Mock()
     executor = object.__new__(PyExecutor)
+    executor._closed = False
+    executor._resources_released = False
+    executor.worker_started = True
+    executor.kv_cache_transceiver = None
+    executor.pending_encoder_steps = []
+    executor.active_requests = []
+    executor.responses = {}
+    executor.result_wait_queues = {}
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor.request_accumulated = []
+    executor.control_requests = []
     executor.executor_request_queue = Mock()
     executor.shutdown_event = Mock()
     executor.hang_detector = Mock()

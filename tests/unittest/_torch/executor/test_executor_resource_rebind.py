@@ -132,9 +132,12 @@ def test_final_shutdown_after_release_does_not_release_resources_twice(executor)
     with pytest.raises(RuntimeError, match="already released"):
         ex.release_resources()
     assert events == before
+    engine = ex.model_engine
+    engine._release_model_owned_cuda_graphs = Mock()
     ex.shutdown()
     ex.shutdown()
-    assert events == before
+    engine._release_model_owned_cuda_graphs.assert_called_once()
+    assert events == before + ["synchronize"]
     assert ex._closed
     assert not hasattr(ex, "model_engine")
 
