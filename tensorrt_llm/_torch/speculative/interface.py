@@ -34,6 +34,7 @@ from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import ResourceManagerType
+from . import fused_accept
 from .greedy_argmax import greedy_argmax
 
 if TYPE_CHECKING:
@@ -1891,6 +1892,38 @@ class SpecWorkerBase(nn.Module, ABC):
                                                      dtype=torch.int64,
                                                      device=device)
 
+    def _force_accept_plan(self, runtime_draft_len: int, spec_metadata=None):
+        """``(mode, base_total, frac_part)`` of the synthetic acceptance this
+        step applies (see :meth:`_apply_force_accepted_tokens`): mode
+        ``FORCE_NONE`` keeps the verified counts (no override configured, or
+        the eager CUDA-graph warmup), ``FORCE_BASE`` sets every generation
+        request to ``base_total``, ``FORCE_RANDOM`` adds one token with
+        probability ``frac_part``.
+        """
+        if self.force_num_accepted_tokens == 0.0:
+            return fused_accept.FORCE_NONE, 0, 0.0
+
+        if spec_metadata is not None:
+            is_warmup = (spec_metadata.is_cuda_graph
+                         and not torch.cuda.is_current_stream_capturing())
+            if is_warmup:
+                return fused_accept.FORCE_NONE, 0, 0.0
+
+        # Decompose into a deterministic integer part (always accepted) and a
+        # probabilistic fractional part. ``int(...)`` truncates toward zero,
+        # which matches floor for the supported non-negative range.
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+
+        # ``num_accepted_tokens`` counts the target token + accepted draft
+        # tokens, so the maximum reachable value is ``runtime_draft_len + 1``.
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+
+        if frac_part > 0.0 and base_total < max_total:
+            return fused_accept.FORCE_RANDOM, base_total, frac_part
+        return fused_accept.FORCE_BASE, base_total, frac_part
+
     def _apply_force_accepted_tokens(self,
                                      num_accepted_tokens,
                                      num_contexts,
@@ -1931,27 +1964,13 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             Modified num_accepted_tokens tensor.
         """
-        if self.force_num_accepted_tokens == 0.0:
+        force_mode, base_total, frac_part = self._force_accept_plan(
+            runtime_draft_len, spec_metadata)
+        if force_mode == fused_accept.FORCE_NONE:
             return num_accepted_tokens
-
-        if spec_metadata is not None:
-            is_warmup = (spec_metadata.is_cuda_graph
-                         and not torch.cuda.is_current_stream_capturing())
-            if is_warmup:
-                return num_accepted_tokens
-
-        # Decompose into a deterministic integer part (always accepted) and a
-        # probabilistic fractional part. ``int(...)`` truncates toward zero,
-        # which matches floor for the supported non-negative range.
-        int_part = int(self.force_num_accepted_tokens)
-        frac_part = self.force_num_accepted_tokens - int_part
-
-        # ``num_accepted_tokens`` counts the target token + accepted draft
-        # tokens, so the maximum reachable value is ``runtime_draft_len + 1``.
         max_total = runtime_draft_len + 1
-        base_total = min(int_part + 1, max_total)
 
-        if frac_part > 0.0 and base_total < max_total:
+        if force_mode == fused_accept.FORCE_RANDOM:
             self._ensure_force_accept_rng_state(num_accepted_tokens.device)
 
             # ``num_gens`` is fixed at CUDA-graph capture time (graphs are
@@ -2021,6 +2040,11 @@ class SpecWorkerBase(nn.Module, ABC):
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
+        if self._can_use_fused_strict_accept(logits, num_contexts, num_gens,
+                                             runtime_draft_len, spec_metadata):
+            return self._fused_strict_accept(logits, draft_tokens, num_gens,
+                                             runtime_draft_len, spec_metadata)
+
         # Allocate return buffers
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
                                       dtype=torch.int,
@@ -2087,6 +2111,44 @@ class SpecWorkerBase(nn.Module, ABC):
                 num_accepted_tokens[num_contexts:],
                 spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
+
+    @staticmethod
+    def _can_use_fused_strict_accept(logits, num_contexts, num_gens,
+                                     runtime_draft_len, spec_metadata) -> bool:
+        """Whether a strict acceptance runs as ``fused_accept.strict_accept``:
+        a greedy, generation-only, uniform verify step of a CUDA-graph batch
+        (eager steps keep the composed ops and their fewer host launches)."""
+        return (spec_metadata is not None and spec_metadata.is_cuda_graph
+                and spec_metadata.is_all_greedy_sample
+                and not spec_metadata.is_ragged_verify and num_contexts == 0
+                and 0 < num_gens <= fused_accept.MAX_REQUESTS
+                and logits.dim() == 2
+                and logits.shape[0] == num_gens * (runtime_draft_len + 1))
+
+    def _fused_strict_accept(self, logits, draft_tokens, num_gens,
+                             runtime_draft_len, spec_metadata):
+        """The strict acceptance of `_sample_and_accept_draft_tokens_base`
+        for the steps `_can_use_fused_strict_accept` admits: the greedy target
+        tokens, then one launch for the accepted tokens and counts, including
+        the synthetic acceptance override."""
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata, 0,
+                                                      num_gens)
+        force_mode, base_total, frac_part = self._force_accept_plan(
+            runtime_draft_len, spec_metadata)
+        if force_mode == fused_accept.FORCE_RANDOM:
+            self._ensure_force_accept_rng_state(logits.device)
+        return fused_accept.strict_accept(
+            target_tokens,
+            draft_tokens.contiguous(),
+            num_gens,
+            runtime_draft_len,
+            force_mode=force_mode,
+            force_base=base_total,
+            force_frac=frac_part,
+            counter=self._force_accept_rng_counter,
+            pool=self._force_accept_rng_pool,
+            counter_stride=_FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+            slot_stride=_FORCE_ACCEPT_RNG_SLOT_STRIDE)
 
     def _apply_occurrence_penalties(
             self, logits: torch.Tensor, draft_tokens: torch.Tensor,
@@ -2890,7 +2952,10 @@ class SpecWorkerBase(nn.Module, ABC):
         # requests with replicated full-vocab logits, so a per-rank argmax is
         # the correct proposal and a gather would desync the ranks (see
         # _draft_logits_are_sharded). Plain argmax; caller applies d2t.
-        return greedy_argmax(logits, torch.int32)
+        return greedy_argmax(logits,
+                             torch.int32,
+                             small_rows=spec_metadata is not None
+                             and spec_metadata.is_cuda_graph)
 
     def advanced_sample_draft_block(self, gen_logits: torch.Tensor,
                                     spec_metadata: "SpecMetadata",
@@ -3270,6 +3335,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 seed=seed,
                 offset=offset)
         else:
-            sampled_tokens = greedy_argmax(logits)
+            sampled_tokens = greedy_argmax(
+                logits, small_rows=spec_metadata.is_cuda_graph)
 
         return sampled_tokens

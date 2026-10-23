@@ -178,6 +178,7 @@ from .ops.attention.qsa_topk_select import qsa_topk_select
 from .ops.attention.qwen4_exp_attn_decode_prologue import SCORE_ROWS as _PROLOGUE_SCORE_ROWS
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
+from .ops.attention.spec_rollback_commit import spec_rollback_commit, spec_rollback_stage
 from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.gemm.bf16_gemv_pdl import MAX_ROWS as _GEMV_MAX_ROWS
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
@@ -6314,6 +6315,7 @@ class DecodeTarget:
                 logical_positions=md.qsa_logical_positions[:num_tokens],
                 block_table=md.qsa_block_table,
                 tokens_per_block=md.tokens_per_block,
+                fused=md.is_cuda_graph,
             )
 
         # Scratch shared by all attention layers: thop_attention overwrites rows
@@ -7468,7 +7470,11 @@ class SpeculativeRollback:
     returns. Staging and commit use metadata-sized
     allocations, gathers, `torch.where` and indexed writes only, and everything staged is
     allocated by the forward and consumed by that forward's commit, so a captured graph
-    holds both ends and replay re-reads the engine's buffers in place."""
+    holds both ends and replay re-reads the engine's buffers in place.
+
+    A step opened with `fused` (the decode target's graph-captured steps) stages the PLE
+    pools with one `spec_rollback_stage` launch and, with the index planes bound, commits
+    with one `spec_rollback_commit` launch instead of the gathers and indexed writes."""
 
     def __init__(self) -> None:
         self._pending: dict | None = None
@@ -7500,12 +7506,14 @@ class SpeculativeRollback:
         logical_positions: torch.Tensor,
         block_table: torch.Tensor,
         tokens_per_block: int,
+        fused: bool = False,
     ) -> None:
         """Open a verify step's staging. The generation rows follow the `prefix_tokens`
         context rows as `num_gens` runs of `rows_per_gen`, so row `s * p + t` is ordinal `t`
         of generation request `s`. `slots` are those requests' recurrent slots;
         `request_indices` and `logical_positions` are the generation rows' own. Each row's
-        QSA slot is resolved here, as `qsa_paged_index_store` resolves it."""
+        QSA slot is resolved here, as `qsa_paged_index_store` resolves it. `fused` selects
+        the one-launch PLE staging and commit."""
         n, p = num_gens, rows_per_gen
         assert n > 0 and p > 1, (
             f"a verify step stages generation requests carrying drafts; got {n} "
@@ -7528,6 +7536,8 @@ class SpeculativeRollback:
             index=[],
             position=None,
             index_all=None,
+            fused=fused,
+            ngram_stream=None,
         )
         if self._planes is not None:
             # Every plane's slots before the trunk writes any of them: what each layer's
@@ -7555,9 +7565,16 @@ class SpeculativeRollback:
         history and the rows' ids. Row `t`'s history after the step is the last
         `context` ids of `[history | ids of rows 0..t]` -- what the id window of row `t`
         minus its oldest id is, every generation sequence carrying its history."""
-        self.stage_ple_pools(ngram_pool, conv_pool)
         pending = self._pending
         prefix, n, p = pending["prefix"], pending["n"], pending["p"]
+        if pending["fused"]:
+            pending["ngram_pool"] = ngram_pool
+            pending["conv_pool"] = conv_pool
+            pending["ngram_stream"], pending["conv_prev"] = spec_rollback_stage(
+                ngram_pool, conv_pool, pending["slots"], input_ids[prefix : prefix + n * p], p
+            )
+            return
+        self.stage_ple_pools(ngram_pool, conv_pool)
         context = ngram_pool.shape[1]
         ids = torch.reshape(input_ids[prefix : prefix + n * p], [n, p]).to(ngram_pool.dtype)
         stream = torch.cat([ngram_pool[pending["slots"]], ids], 1)
@@ -7612,6 +7629,26 @@ class SpeculativeRollback:
             "a verify step staged neither its PLE rows nor any attention layer; "
             "the forward did not run the staging it opened"
         )
+        if pending["ngram_stream"] is not None and pending["index_all"] is not None:
+            ptrs, strides, _ = self._planes
+            cache, old = pending["position"]
+            spec_rollback_commit(
+                num_accepted_tokens[num_contexts : num_contexts + n],
+                state_indices[num_contexts:],
+                pending["ngram_pool"],
+                pending["ngram_stream"],
+                pending["conv_pool"],
+                pending["conv_prev"],
+                pending["conv_x"],
+                cache,
+                old,
+                pending["pages"],
+                pending["within"],
+                ptrs,
+                strides,
+                pending["index_all"],
+            )
+            return
         accepted = num_accepted_tokens[num_contexts : num_contexts + n].to(torch.long)
         slots = state_indices[num_contexts:].to(torch.long)
         rows = torch.arange(n, device=accepted.device)

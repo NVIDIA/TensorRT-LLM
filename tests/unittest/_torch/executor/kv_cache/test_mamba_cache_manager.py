@@ -1544,6 +1544,60 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
 
 
+def _v2_replay_manager(seed, num_gens):
+    """A V2 hybrid manager reduced to what `update_mamba_states` reads on the replay path:
+    stacked conv views over 3 layers, a 6-wide verify window, random checkpoint counters
+    (some about to wrap), every other row a dummy."""
+    g = torch.Generator().manual_seed(seed)
+    layers, slots, width, conv_dim, kernel = 3, 12, 4, 40, 3
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = layers
+    mgr._use_replay_state_update = True
+    mgr._use_kda_replay_update = False
+    mgr.replay_step_width = width
+    mgr.replay_history_size = MIN_REPLAY_HISTORY_SIZE
+    mgr.prev_num_accepted_tokens = torch.randint(
+        0, MIN_REPLAY_HISTORY_SIZE, (slots,), generator=g, dtype=torch.int32
+    ).cuda()
+    mgr.cache_buf_idx = torch.randint(0, 2, (slots,), generator=g, dtype=torch.int32).cuda()
+    mgr._dummy_request_mask = (torch.arange(num_gens + 2) % 2 == 1).cuda()
+    mgr.intermediate_state_indices = torch.arange(num_gens + 2, dtype=torch.int32).cuda()
+    mgr.intermediate_conv_states = torch.randn(
+        layers, num_gens + 2, width, conv_dim, kernel - 1, generator=g
+    ).cuda()
+    mgr._stacked_conv_states = torch.randn(layers, slots, conv_dim, kernel - 1, generator=g).cuda()
+    mgr.all_conv_states = list(mgr._stacked_conv_states)
+    mgr._commit_gdn_cached_replay_history_layers = MagicMock()
+    return mgr
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("num_gens", [1, 2, 5])
+def test_v2_graph_step_folds_replay_bookkeeping_into_conv_promotion(num_gens):
+    """A CUDA-graph step of the V2 manager promotes the conv windows and advances the replay
+    counters in one launch; the state it leaves is the composed path's, bit for bit."""
+    states = []
+    for is_cuda_graph in (False, True):
+        mgr = _v2_replay_manager(5, num_gens)
+        slots = torch.randperm(12, generator=torch.Generator().manual_seed(6))[:num_gens]
+        accepted = torch.randint(
+            1, 5, (num_gens,), generator=torch.Generator().manual_seed(7), dtype=torch.int32
+        )
+        attn = SimpleNamespace(num_seqs=num_gens, num_contexts=0, is_cuda_graph=is_cuda_graph)
+        assert mgr._can_fold_replay_update(attn, num_gens, None) == is_cuda_graph
+        mgr.update_mamba_states(attn, accepted.cuda(), state_indices=slots.to(torch.int32).cuda())
+        mgr._commit_gdn_cached_replay_history_layers.assert_called_once()
+        states.append(
+            (
+                mgr._stacked_conv_states.clone(),
+                mgr.prev_num_accepted_tokens.clone(),
+                mgr.cache_buf_idx.clone(),
+            )
+        )
+    for composed, folded in zip(*states):
+        assert torch.equal(composed, folded)
+
+
 @skip_no_cuda
 def test_attention_dp_dummy_has_reserved_slot_with_batch_size_one():
     mgr = _make_mgr(max_batch_size=1, max_draft_len=0, enable_attention_dp=True)

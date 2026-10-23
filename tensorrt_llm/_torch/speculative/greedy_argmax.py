@@ -12,6 +12,11 @@ The result equals `torch.argmax` element for element: NaN ranks above every numb
 first NaN of a row wins), equal values (including -0.0 and +0.0) resolve to the lowest
 index, and an all -inf row returns 0. bf16 / fp16 inputs are compared after an exact
 widening to fp32.
+
+Inside a CUDA graph a few rows (`small_rows=True`, at most `SMALL_ROWS`) take the Triton
+kernels too, at `_SMALL_SPLITS` chunks a row: torch's generic reduce replays as a memset and a
+31-block reduce kernel there (~11 us a call at 1-4 rows of 248320), two short launches here.
+Eager callers keep torch.argmax for such inputs (fewer host launches).
 """
 
 from __future__ import annotations
@@ -29,6 +34,11 @@ _INT32_MAX = 2**31 - 1
 #: `(min_rows, splits)`, largest first: chunks a row by the row count, so that a launch has
 #: ~1000-4000 programs. GB300 sweep over splits x block x warps at 64-1024 rows of 248320.
 _SPLITS = ((1024, 1), (512, 2), (256, 8), (128, 16), (0, 32))
+#: Most rows `small_rows` callers route to the Triton kernels below `MIN_NUMEL`.
+SMALL_ROWS = 16
+#: Chunks a row for `small_rows` launches (GB300 graph replay, 248320 fp32 columns, 1-16 rows:
+#: 2.4-5.0 us against 10.6-16.4 us for torch.argmax; 32 and 128 chunks within 0.5 us).
+_SMALL_SPLITS = 64
 
 
 @triton.jit
@@ -86,7 +96,9 @@ def _argmax_final_kernel(val_ptr, idx_ptr, out_ptr, SPLITS: tl.constexpr):
     tl.store(out_ptr + row, best_i.to(out_ptr.dtype.element_ty))
 
 
-def _splits(rows: int) -> int:
+def _splits(rows: int, n_cols: int) -> int:
+    if rows * n_cols < MIN_NUMEL:
+        return _SMALL_SPLITS
     return next(splits for min_rows, splits in _SPLITS if rows >= min_rows)
 
 
@@ -111,7 +123,7 @@ def _warm(logits: torch.Tensor, out_dtype: torch.dtype) -> None:
         return
     n_cols = logits.shape[1]
     out = torch.empty(1, dtype=out_dtype, device=logits.device)
-    for splits in sorted({s for _, s in _SPLITS}):
+    for splits in sorted({s for _, s in _SPLITS} | {_SMALL_SPLITS}):
         val, idx = _buffers(1, splits, out)
         chunk = triton.cdiv(triton.cdiv(n_cols, splits), _BLOCK) * _BLOCK
         _argmax_chunk_kernel.warmup(
@@ -132,29 +144,36 @@ def _warm(logits: torch.Tensor, out_dtype: torch.dtype) -> None:
     _WARMED.add(key)
 
 
-def eligible(logits: torch.Tensor) -> bool:
-    """Whether `greedy_argmax` takes the Triton kernels for `logits` (else torch.argmax)."""
+def eligible(logits: torch.Tensor, small_rows: bool = False) -> bool:
+    """Whether `greedy_argmax` takes the Triton kernels for `logits` (else torch.argmax):
+    from `MIN_NUMEL` elements on, or with `small_rows` at 1 to `SMALL_ROWS` rows."""
     return (
         logits.is_cuda
         and logits.dim() == 2
         and logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
         and logits.stride(-1) == 1
-        and logits.numel() >= MIN_NUMEL
+        and (
+            logits.numel() >= MIN_NUMEL
+            or (small_rows and 0 < logits.shape[0] <= SMALL_ROWS and logits.shape[1] > 0)
+        )
         and logits.shape[-1] < _INT32_MAX
     )
 
 
-def greedy_argmax(logits: torch.Tensor, out_dtype: torch.dtype = torch.int64) -> torch.Tensor:
+def greedy_argmax(
+    logits: torch.Tensor, out_dtype: torch.dtype = torch.int64, small_rows: bool = False
+) -> torch.Tensor:
     """`torch.argmax(logits, dim=-1).to(out_dtype)` for a 2-D `[rows, vocab]` tensor: the
-    Triton kernels when `eligible(logits)`, else torch.argmax. Graph-capturable (no host
-    sync). The first call for an input specialization compiles every split variant (`_warm`);
-    the row count then only selects among them."""
-    if not eligible(logits):
+    Triton kernels when `eligible(logits, small_rows)`, else torch.argmax. Graph-capturable
+    (no host sync); callers pass `small_rows=True` for steps that a CUDA graph replays. The
+    first call for an input specialization compiles every split variant (`_warm`); the row
+    count then only selects among them."""
+    if not eligible(logits, small_rows):
         return torch.argmax(logits, dim=-1).to(out_dtype)
     _warm(logits, out_dtype)
     rows, n_cols = logits.shape
     out = torch.empty(rows, dtype=out_dtype, device=logits.device)
-    splits = _splits(rows)
+    splits = _splits(rows, n_cols)
     chunk = triton.cdiv(triton.cdiv(n_cols, splits), _BLOCK) * _BLOCK
     val, idx = _buffers(rows, splits, out)
     _argmax_chunk_kernel[(rows, splits)](
