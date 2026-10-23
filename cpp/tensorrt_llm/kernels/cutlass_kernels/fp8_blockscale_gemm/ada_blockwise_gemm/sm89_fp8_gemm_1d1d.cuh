@@ -251,19 +251,31 @@ struct AdaBlockwiseGemmKernel
             tBpB(n, 0) = cute::get<0>(tBcB(0, n, 0)) < residue_n; // blk_n coord < residue_n
         }
 
+        // The scale-factor gmem->smem TV layouts use stride 0 across warps (SFA) and across all threads
+        // (SFB), so every warp owns every scale element. Restrict the clears and copies to a single owner
+        // per element; the other threads would only rewrite identical bytes to the same shared address.
+        bool const own_sfa = threadIdx.x < KT::ScaleMsPerTile;
+        bool const own_sfb = threadIdx.x == 0;
+
         auto tApSFA = cute::make_tensor<bool>(
             cute::make_shape(cute::size<1>(tAsSFA), cute::size<2>(tAsSFA)), cute::Stride<cute::_1, cute::_0>{});
         CUTLASS_PRAGMA_UNROLL
         for (int m = 0; m < cute::size<0>(tApSFA); ++m)
         {
-            tApSFA(m, 0) = cute::get<0>(tAcSFA(0, m, 0)) < residue_m; // blk_m coord < residue_m
+            tApSFA(m, 0) = own_sfa && cute::get<0>(tAcSFA(0, m, 0)) < residue_m; // owner && blk_m coord < residue_m
         }
 
         // prefetch gmem A/B
         cute::clear(tAsA);
         cute::clear(tBsB);
-        cute::clear(tAsSFA);
-        cute::clear(tBsSFB);
+        if (own_sfa)
+        {
+            cute::clear(tAsSFA);
+        }
+        if (own_sfb)
+        {
+            cute::clear(tBsSFB);
+        }
 
         int k_tile_count = cute::size<2>(gA);
         CUTLASS_PRAGMA_NO_UNROLL
@@ -282,8 +294,11 @@ struct AdaBlockwiseGemmKernel
                 tBsB(cute::_, cute::_, cute::_, k_pipe));
             cute::copy_if(g2s_copy_SFA, tApSFA, tAgSFA(cute::_, cute::_, cute::_, k_tile_iter),
                 tAsSFA(cute::_, cute::_, cute::_, k_pipe));
-            cute::copy(g2s_copy_SFB, tBgSFB(cute::_, cute::_, cute::_, k_tile_iter),
-                tBsSFB(cute::_, cute::_, cute::_, k_pipe));
+            if (own_sfb)
+            {
+                cute::copy(g2s_copy_SFB, tBgSFB(cute::_, cute::_, cute::_, k_tile_iter),
+                    tBsSFB(cute::_, cute::_, cute::_, k_pipe));
+            }
 
             cute::cp_async_fence();
         }
@@ -371,8 +386,11 @@ struct AdaBlockwiseGemmKernel
                             tBsB(cute::_, cute::_, cute::_, smem_pipe_write));
                         cute::copy_if(g2s_copy_SFA, tApSFA, tAgSFA(cute::_, cute::_, cute::_, k_tile_iter),
                             tAsSFA(cute::_, cute::_, cute::_, smem_pipe_write));
-                        cute::copy(g2s_copy_SFB, tBgSFB(cute::_, cute::_, cute::_, k_tile_iter),
-                            tBsSFB(cute::_, cute::_, cute::_, smem_pipe_write));
+                        if (own_sfb)
+                        {
+                            cute::copy(g2s_copy_SFB, tBgSFB(cute::_, cute::_, cute::_, k_tile_iter),
+                                tBsSFB(cute::_, cute::_, cute::_, smem_pipe_write));
+                        }
                         cute::cp_async_fence();
                         k_tile_iter++;
                         smem_pipe_write = smem_pipe_read;
