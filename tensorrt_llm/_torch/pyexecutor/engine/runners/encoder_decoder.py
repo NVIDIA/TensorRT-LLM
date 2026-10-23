@@ -839,6 +839,7 @@ class EncoderDecoderInputPreparer(DecoderInputPreparer):
                     non_blocking=True,
                 )
                 self._staged_request_ids = staged_request_ids
+                self._staged_previous_batch_indices = None
             generation_begin = num_context_tokens
             generation_end = generation_begin + num_previous_batch_requests
             torch.index_select(

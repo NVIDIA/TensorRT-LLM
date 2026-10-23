@@ -3392,14 +3392,17 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
             "speculators DSpark drafters are supported with a qwen3 backbone; "
             f"this one has model_type {layer.get('model_type')!r}")
     aux_layer_ids = config_dict.get("aux_hidden_state_layer_ids")
-    if not aux_layer_ids or min(aux_layer_ids) < 1:
+    if (not isinstance(aux_layer_ids, list) or not aux_layer_ids or any(
+            type(layer_id) is not int or layer_id < 1
+            for layer_id in aux_layer_ids)):
         raise ValueError(
-            "a speculators DSpark drafter needs aux_hidden_state_layer_ids >= 1 "
+            "a speculators DSpark drafter needs aux_hidden_state_layer_ids to be "
+            "a non-empty list of positive integers (>= 1, excluding bool) "
             "(layer 0's input is the embedding output, which is not captured); "
             f"got {aux_layer_ids}")
     num_layers = layer["num_hidden_layers"]
     dflash_config = {
-        "target_layer_ids": [int(layer_id) - 1 for layer_id in aux_layer_ids]
+        "target_layer_ids": [layer_id - 1 for layer_id in aux_layer_ids]
     }
     if config_dict.get("mask_token_id") is not None:
         dflash_config["mask_token_id"] = config_dict["mask_token_id"]
