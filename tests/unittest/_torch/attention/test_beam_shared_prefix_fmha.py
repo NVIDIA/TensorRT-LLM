@@ -240,8 +240,13 @@ def _fake_sampling_metadata(
     max_blocks=None,
     is_cuda_graph=False,
     plan_caches=None,
+    q_len=1,
+    device_kv_lens=None,
 ):
-    """Minimal metadata for the host planner: one pool, page stride 2."""
+    """Minimal metadata for the host planner: one pool, page stride 2.
+
+    ``q_len`` tokens per row (speculative decoding); ``device_kv_lens`` are the
+    true lengths when they differ from the host ``kv_lens``."""
     from types import SimpleNamespace
 
     rows = len(block_tables)
@@ -250,7 +255,11 @@ def _fake_sampling_metadata(
     offsets = torch.zeros(1, rows, 2, max_blocks, dtype=torch.int32)
     for r, table in enumerate(block_tables):
         offsets[0, r, 0, : len(table)] = torch.tensor(table) * 2
-    manager = SimpleNamespace(
+
+    class _Manager(SimpleNamespace):  # weak-referenceable, like the real managers
+        pass
+
+    manager = _Manager(
         layer_offsets={0: 0},
         kv_factor=2,
         get_buffers=lambda layer, kv_layout: torch.empty(num_pages, 1),
@@ -263,8 +272,13 @@ def _fake_sampling_metadata(
         host_kv_cache_block_offsets=offsets,
         kv_cache_block_offsets=torch.empty((0,), device=device),
         kv_lens_runtime=torch.tensor(kv_lens),
+        kv_lens_cuda_runtime=torch.tensor(
+            kv_lens if device_kv_lens is None else device_kv_lens, dtype=torch.int32, device=device
+        ),
         tokens_per_block=tokens_per_block,
         num_generations=rows,
+        num_tokens=rows * q_len,
+        seq_lens=torch.full((rows,), q_len, dtype=torch.int32),
         is_cuda_graph=is_cuda_graph,
     )
 
@@ -437,7 +451,7 @@ def test_sampling_prefix_and_tail_match_dense_attention(batch_order):
 
     q = torch.randn(rows, num_heads, head_dim, generator=gen, device=device, dtype=torch.bfloat16)
     key = lib._PlanKey(num_heads, num_kv_heads, head_dim, torch.bfloat16, sm_scale)
-    indices = lib._sampling_device(state, device)
+    indices = lib._sampling_device(state, device, meta)
     prefix_w, tail_w = lib._sampling_wrappers(state, key, meta, device)
     q_grouped = q if indices.perm is None else q.index_select(0, indices.perm)
     p_out, p_lse = prefix_w.run(q_grouped, pool, return_lse=True)
@@ -509,7 +523,7 @@ def test_sampling_merge_is_as_accurate_as_one_decode_kernel():
     state = meta.fmha_plan_caches[lib.SAMPLING_KEY]
     assert state.plan is not None and state.plan.num_groups == 2
     key = lib._PlanKey(num_heads, num_kv_heads, head_dim, torch.bfloat16, sm_scale)
-    indices = lib._sampling_device(state, device)
+    indices = lib._sampling_device(state, device, meta)
     assert indices.perm is None
     prefix_w, tail_w = lib._sampling_wrappers(state, key, meta, device)
     p_out, p_lse = prefix_w.run(q, pool, return_lse=True)
@@ -667,7 +681,11 @@ def test_sampling_plan_reads_kv_manager_v2_block_table():
     host = torch.zeros(1, 4, 2, max_blocks, dtype=torch.int32)
     for slot, table in slot_tables.items():
         host[0, slot, 0, :] = torch.tensor(table)
-    manager = SimpleNamespace(
+
+    class _Manager(SimpleNamespace):  # weak-referenceable, like the real managers
+        pass
+
+    manager = _Manager(
         layer_offsets={7: 0},
         kv_factor=kv_factor,
         max_beam_width=1,
@@ -683,6 +701,7 @@ def test_sampling_plan_reads_kv_manager_v2_block_table():
         kv_lens_runtime=torch.tensor([10, 12, 9]),
         tokens_per_block=tpb,
         num_generations=3,
+        num_tokens=3,
         request_ids=request_ids,
         is_cuda_graph=False,
     )
@@ -1044,7 +1063,7 @@ def test_sampling_cuda_graph_replay_matches_eager_across_steps(
         lib._plan_sampling_step(eager_meta)
         eager_state = eager_meta.fmha_plan_caches[lib.SAMPLING_KEY]
         if eager_state.plan is not None:
-            eager_indices = lib._sampling_device(eager_state, device)
+            eager_indices = lib._sampling_device(eager_state, device, eager_meta)
             eager_wrappers = lib._sampling_wrappers(eager_state, key, eager_meta, device)
             reference_pool = eager_pool.clone()
             reference_out = torch.zeros_like(q)
@@ -1064,3 +1083,293 @@ def test_sampling_cuda_graph_replay_matches_eager_across_steps(
             torch.testing.assert_close(
                 out_static[live].float(), reference_out[live].float(), atol=1e-2, rtol=1e-2
             )
+
+
+# --------------------------------------------------------------------------- #
+# Speculative decoding: q_len = 1 + draft tokens per row
+# --------------------------------------------------------------------------- #
+def _spec_step_tables(prompts, children, first_private, dev_kv_lens, overshoot, tpb):
+    """Block tables for a speculative step.
+
+    Rows of one prompt share its full pages. Each row has the device KV length
+    ``dev_kv_lens[r]`` (this step's tokens included) and a host length that is
+    ``overshoot[r]`` larger, as under the overlap scheduler; its table covers
+    the host length.
+    """
+    tables, host_lens = [], []
+    next_page = first_private
+    for (first, prompt_len), count in zip(prompts, children):
+        full = prompt_len // tpb
+        for _ in range(count):
+            r = len(tables)
+            host = dev_kv_lens[r] + overshoot[r]
+            num_blocks = (host + tpb - 1) // tpb
+            tables.append(
+                list(range(first, first + full))
+                + list(range(next_page, next_page + num_blocks - full))
+            )
+            next_page += num_blocks - full
+            host_lens.append(host)
+    return tables, host_lens
+
+
+def _spec_reference(pool, tables, dev_kv_lens, q, k, v, q_len, num_kv_heads, sm_scale, tpb):
+    """Pool after the K/V writes and the causal dense attention of every token."""
+    ref_pool = pool.clone()
+    rows = len(tables)
+    out = torch.zeros_like(q, dtype=torch.float32)
+    for r in range(rows):
+        for j in range(q_len):
+            pos = dev_kv_lens[r] - q_len + j
+            page = tables[r][pos // tpb]
+            ref_pool[page, 0, :, pos % tpb] = k[r * q_len + j]
+            ref_pool[page, 1, :, pos % tpb] = v[r * q_len + j]
+    for r in range(rows):
+        for j in range(q_len):
+            out[r * q_len + j] = _dense_attention(
+                ref_pool, tables[r], dev_kv_lens[r] - q_len + j + 1, q[r * q_len + j],
+                num_kv_heads, sm_scale,
+            )  # fmt: skip
+    return ref_pool, out
+
+
+def _spec_cases(q_len, tpb):
+    """(prompts, children, device lens, overshoot) of several steps, with tails that
+    end exactly on, one before and one after a page boundary and host lengths
+    that run a whole page ahead of the device."""
+    prompts = [(0, 70), (10, 37), (20, 100)]
+    children = [4, 4, 4]
+    rows = sum(children)
+    cases = []
+    for seed in range(6):
+        gen = torch.Generator().manual_seed(seed)
+        gen_len = torch.randint(q_len, 3 * tpb, (rows,), generator=gen).tolist()
+        dev = []
+        row = 0
+        for (_, prompt_len), count in zip(prompts, children):
+            for _ in range(count):
+                dev.append(prompt_len + gen_len[row])
+                row += 1
+        if seed == 1:
+            # last page exactly full / one token into a page, host a page ahead
+            dev = [((d // tpb) + 1) * tpb for d in dev]
+        elif seed == 2:
+            dev = [((d // tpb) + 1) * tpb + 1 for d in dev]
+        over = torch.randint(0, q_len, (rows,), generator=gen).tolist()
+        if seed >= 3:
+            over = [q_len - 1] * rows
+        cases.append((prompts, children, dev, over))
+    return cases
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("q_len", [2, 3, 4])
+@pytest.mark.parametrize("num_heads, num_kv_heads", [(16, 8), (8, 2), (20, 20)])
+def test_sampling_spec_eager_matches_causal_dense_attention(q_len, num_heads, num_kv_heads):
+    """Speculative step (q_len tokens per row), eager: the K/V of the step's tokens
+    land at the device KV lengths (the host lengths may run ahead by up to the
+    draft length), the draft tokens attend causally to each other, and the
+    shared pages are read once per group."""
+    pytest.importorskip("flashinfer")
+    from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
+
+    device = torch.device("cuda")
+    tpb, head_dim = 16, 128
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    gen = torch.Generator(device=device).manual_seed(3)
+    key = lib._PlanKey(num_heads, num_kv_heads, head_dim, torch.bfloat16, sm_scale, q_len)
+    for prompts, children, dev, over in _spec_cases(q_len, tpb):
+        tables, host = _spec_step_tables(prompts, children, 40, dev, over, tpb)
+        rows = len(tables)
+        num_pages = 40 + sum((h + tpb - 1) // tpb for h in host)
+        pool = torch.randn(
+            num_pages, 2, num_kv_heads, tpb, head_dim, generator=gen, device=device,
+            dtype=torch.bfloat16,
+        )  # fmt: skip
+        q = torch.randn(rows * q_len, num_heads, head_dim, generator=gen, device=device).bfloat16()
+        k = torch.randn(
+            rows * q_len, num_kv_heads, head_dim, generator=gen, device=device
+        ).bfloat16()
+        v = torch.randn(
+            rows * q_len, num_kv_heads, head_dim, generator=gen, device=device
+        ).bfloat16()
+        meta = _fake_sampling_metadata(
+            tables, host, tpb, num_pages, q_len=q_len, device_kv_lens=dev
+        )
+        lib._plan_sampling_step(meta)
+        state = meta.fmha_plan_caches[lib.SAMPLING_KEY]
+        assert state.plan is not None and state.plan.q_len == q_len
+        assert state.plan.grouping.num_sharing == 3
+        indices = lib._sampling_device(state, device, meta)
+        prefix_w, tail_w = lib._sampling_wrappers(state, key, meta, device)
+        out = torch.zeros_like(q)
+        lib.sampling_attention(
+            pool, q, k, v, out, prefix_w, tail_w,
+            write_page=None, write_slot=None, perm=indices.perm,
+            prefix_empty=indices.prefix_empty, q_len=q_len,
+            kv_lens=meta.kv_lens_cuda_runtime, shared=indices.shared, tokens_per_block=tpb,
+        )  # fmt: skip
+        ref_pool, expected = _spec_reference(
+            pool.clone(), tables, dev, q, k, v, q_len, num_kv_heads, sm_scale, tpb
+        )
+        # sampling_attention wrote into ``pool``; compare against the reference writes.
+        assert torch.equal(pool, ref_pool), "K/V landed at the wrong positions"
+        torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("q_len", [2, 4])
+@pytest.mark.parametrize("num_heads, num_kv_heads", [(16, 8), (20, 4)])
+def test_sampling_spec_cuda_graph_replay_matches_eager_and_dense(
+    q_len, num_heads, num_kv_heads, monkeypatch
+):
+    """One CUDA graph of the speculative n-sample attention, replayed over steps whose
+    device KV lengths advance by 1..q_len tokens (accepted drafts), whose host
+    lengths run ahead of the device by up to q_len - 1, and whose tails cross
+    page boundaries (also when only the host length crosses). Every replay must
+    equal an eager call on the same buffers and the dense causal reference, and
+    must write the K/V of the step's tokens at the device positions."""
+    pytest.importorskip("flashinfer")
+    from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
+
+    monkeypatch.setenv(lib.MAX_GROUPS_ENV, "4")
+    device = torch.device("cuda")
+    tpb, head_dim = 16, 128
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    prompts, children = [(0, 70), (10, 37), (20, 100)], [4, 4, 4]
+    rows = sum(children)
+    max_blocks = 20
+    num_pages = 40 + rows * 12
+    gen = torch.Generator(device=device).manual_seed(5)
+    pool = torch.randn(
+        num_pages, 2, num_kv_heads, tpb, head_dim, generator=gen, device=device,
+        dtype=torch.bfloat16,
+    )  # fmt: skip
+    prompt_of = [p for p, c in zip(prompts, children) for _ in range(c)]
+    # Device KV length of row r after each step: prompt + advance of 1..q_len per step.
+    adv = torch.randint(1, q_len + 1, (12, rows), generator=torch.Generator().manual_seed(9))
+    dev_steps, host_steps = [], []
+    cur = [prompt_len + q_len + (r % 3) for r, (_, prompt_len) in enumerate(prompt_of)]
+    for s in range(12):
+        cur = [c + int(a) for c, a in zip(cur, adv[s])]
+        dev_steps.append(list(cur))
+        over = torch.randint(0, q_len, (rows,), generator=torch.Generator().manual_seed(100 + s))
+        host_steps.append([c + int(o) for c, o in zip(cur, over)])
+    # Fixed tables sized for the largest host length: shared prompt pages, private rest.
+    full_tables, next_page = [], 40
+    for (first, prompt_len), count in zip(prompts, children):
+        full = prompt_len // tpb
+        for _ in range(count):
+            need = (max(h[len(full_tables)] for h in host_steps) + tpb - 1) // tpb
+            full_tables.append(
+                list(range(first, first + full)) + list(range(next_page, next_page + need - full))
+            )
+            next_page += need - full
+    assert next_page <= num_pages
+
+    caches = {}
+    key = lib._PlanKey(num_heads, num_kv_heads, head_dim, torch.bfloat16, sm_scale, q_len)
+    q_static = torch.zeros(rows * q_len, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_static = torch.zeros(
+        rows * q_len, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v_static = torch.zeros_like(k_static)
+    out_static = torch.zeros_like(q_static)
+    kv_static = torch.zeros(rows, dtype=torch.int32, device=device)
+    graph = None
+    wrappers = None
+    for step in range(12):
+        dev, host = dev_steps[step], host_steps[step]
+        tables = [t[: (h + tpb - 1) // tpb] for t, h in zip(full_tables, host)]
+        meta = _fake_sampling_metadata(
+            tables, host, tpb, num_pages, max_blocks=max_blocks, is_cuda_graph=True,
+            plan_caches=caches, q_len=q_len, device_kv_lens=dev,
+        )  # fmt: skip
+        lib._plan_sampling_step(meta)
+        state = caches[lib.SAMPLING_KEY]
+        assert state.plan is not None and state.plan.q_len == q_len
+        if wrappers is None:
+            wrappers = lib._graph_wrappers(state, key, meta)
+        else:
+            assert lib._graph_wrappers(state, key, meta) == wrappers
+        buffers = state.graph
+        kv_static.copy_(torch.tensor(dev, dtype=torch.int32))
+        n = rows * q_len
+        q = torch.randn(n, num_heads, head_dim, generator=gen, device=device).bfloat16()
+        k = torch.randn(n, num_kv_heads, head_dim, generator=gen, device=device).bfloat16()
+        v = torch.randn(n, num_kv_heads, head_dim, generator=gen, device=device).bfloat16()
+
+        def run(target_pool, out, q_in, k_in, v_in):
+            lib.step_last_len(kv_static, buffers.perm, buffers.base_len, buffers.tail_last_page_len)
+            lib.sampling_attention(
+                target_pool, q_in, k_in, v_in, out, *wrappers,
+                write_page=None, write_slot=None, perm=buffers.perm,
+                prefix_empty=buffers.empty, q_len=q_len, kv_lens=kv_static,
+                shared=buffers.shared, tokens_per_block=tpb,
+            )  # fmt: skip
+
+        eager_pool = pool.clone()
+        eager_out = torch.zeros_like(q)
+        run(eager_pool, eager_out, q, k, v)
+        if graph is None:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(pool, out_static, q_static, k_static, v_static)
+        q_static.copy_(q)
+        k_static.copy_(k)
+        v_static.copy_(v)
+        before = pool.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out_static, eager_out), f"step {step}: replay differs from eager"
+        assert torch.equal(pool, eager_pool), f"step {step}: replay wrote different K/V"
+        ref_pool, expected = _spec_reference(
+            before, tables, dev, q, k, v, q_len, num_kv_heads, sm_scale, tpb
+        )
+        assert torch.equal(pool, ref_pool), f"step {step}: K/V at wrong positions"
+        torch.testing.assert_close(
+            out_static.float(), expected, atol=2e-2, rtol=2e-2, msg=f"step {step}"
+        )
+
+
+def test_sampling_eligibility_ignores_use_spec_decoding_but_declines_trees():
+    """The model forward leaves ``use_spec_decoding`` set after every speculative step,
+    so it must not decline the next step; draft trees and spec-dec kernels stay declined."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
+
+    class _Manager(SimpleNamespace):
+        pass
+
+    manager = _Manager(
+        get_buffers=lambda layer, kv_layout: None,
+        host_kv_cache_block_offsets=None,
+        kv_factor=2,
+        tokens_per_block=32,
+    )
+
+    def meta(**over):
+        fields = dict(
+            beam_width=1,
+            num_generations=8,
+            num_contexts=0,
+            is_cross=False,
+            enable_helix=False,
+            is_spec_decoding_enabled=False,
+            use_spec_decoding=False,
+            is_spec_dec_tree=False,
+            is_spec_dec_dynamic_tree=False,
+            kv_cache_block_offsets=torch.empty(0),
+            kv_cache_params=SimpleNamespace(use_cache=True, num_extra_kv_tokens=2),
+            kv_cache_manager=manager,
+        )
+        fields.update(over)
+        return SimpleNamespace(**fields)
+
+    pytest.importorskip("flashinfer")
+    assert lib.sampling_metadata_eligible(meta())
+    assert lib.sampling_metadata_eligible(meta(use_spec_decoding=True))
+    assert not lib.sampling_metadata_eligible(meta(is_spec_dec_tree=True))
+    assert not lib.sampling_metadata_eligible(meta(is_spec_dec_dynamic_tree=True))
+    assert not lib.sampling_metadata_eligible(meta(is_spec_decoding_enabled=True))

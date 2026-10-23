@@ -96,7 +96,10 @@ def _merge_scatter_kernel(
     BLOCK_HEADS: tl.constexpr,
     HAS_PERM: tl.constexpr,
     HAS_EMPTY: tl.constexpr,
+    Q_LEN: tl.constexpr,
 ):
+    # One program per grouped query token; token ``row`` belongs to grouped row
+    # ``row // Q_LEN`` (``Q_LEN`` tokens per row, 1 outside speculative decoding).
     row = tl.program_id(0)
     heads = tl.arange(0, BLOCK_HEADS)
     dims = tl.arange(0, HEAD_DIM)
@@ -117,11 +120,11 @@ def _merge_scatter_kernel(
     ]
     if HAS_EMPTY:
         # A placeholder prefix state must not contribute, even if it is not finite.
-        empty = tl.load(empty_ptr + row) != 0
+        empty = tl.load(empty_ptr + row // Q_LEN) != 0
         merged = tl.where(empty, tail_out, merged)
 
     if HAS_PERM:
-        target = tl.load(perm_ptr + row).to(tl.int64)
+        target = tl.load(perm_ptr + row // Q_LEN).to(tl.int64) * Q_LEN + row % Q_LEN
     else:
         target = row.to(tl.int64)
     tl.store(
@@ -194,8 +197,12 @@ def merge_scatter(
     out: torch.Tensor,
     perm: Optional[torch.Tensor],
     prefix_empty: Optional[torch.Tensor],
+    q_len: int = 1,
 ) -> None:
     """Merge two attention states (grouped order) and write ``out[perm]``.
+
+    With ``q_len`` > 1 every grouped row owns ``q_len`` consecutive query tokens;
+    ``perm`` and ``prefix_empty`` index rows, the tensors tokens.
 
     Args:
         prefix_out, tail_out: [rows, heads, head_dim] normalized partial outputs,
@@ -228,6 +235,7 @@ def merge_scatter(
         BLOCK_HEADS=triton.next_power_of_2(num_heads),
         HAS_PERM=perm is not None,
         HAS_EMPTY=prefix_empty is not None,
+        Q_LEN=q_len,
     )
 
 
@@ -277,4 +285,186 @@ def step_slots(
         rows,
         TOKENS_PER_BLOCK=tokens_per_block,
         BLOCK=block,
+    )
+
+
+@triton.jit
+def _write_kv_gather_q_spec_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    q_row_stride,
+    kv_row_stride,
+    pool_ptr,
+    pool_page_stride,
+    pool_kv_stride,
+    pool_head_stride,
+    pool_slot_stride,
+    kv_lens_ptr,
+    perm_ptr,
+    tail_indptr_ptr,
+    shared_ptr,
+    tail_pages_ptr,
+    tail_capacity,
+    q_out_ptr,
+    NUM_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_HEADS: tl.constexpr,
+    BLOCK_KV_HEADS: tl.constexpr,
+    HAS_PERM: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+):
+    # Program ``g`` handles grouped token g: row i = g // Q_LEN of the grouped
+    # order, token j = g % Q_LEN of that row, batch row perm[i].
+    g = tl.program_id(0)
+    i = g // Q_LEN
+    j = g % Q_LEN
+    dims = tl.arange(0, HEAD_DIM)
+    if HAS_PERM:
+        row = tl.load(perm_ptr + i).to(tl.int64)
+    else:
+        row = i.to(tl.int64)
+    token = row * Q_LEN + j
+
+    # The row's tokens of this step sit at kv_len - Q_LEN + j on the device KV
+    # length, which can be below the host length the page tables were built for.
+    kv_len = tl.load(kv_lens_ptr + row).to(tl.int64)
+    pos = kv_len - Q_LEN + j
+    page_in_tail = pos // TOKENS_PER_BLOCK - tl.load(shared_ptr + i).to(tl.int64)
+    entry = tl.load(tail_indptr_ptr + i).to(tl.int64) + page_in_tail
+    valid = (pos >= 0) & (page_in_tail >= 0) & (entry < tail_capacity)
+    page = tl.load(tail_pages_ptr + entry, mask=valid, other=0).to(tl.int64)
+    slot = pos % TOKENS_PER_BLOCK
+
+    kv_heads = tl.arange(0, BLOCK_KV_HEADS)
+    kv_mask = (kv_heads[:, None] < NUM_KV_HEADS) & valid
+    kv_offsets = kv_heads[:, None] * HEAD_DIM + dims[None, :]
+    cache = (
+        pool_ptr
+        + page * pool_page_stride
+        + slot * pool_slot_stride
+        + kv_heads[:, None].to(tl.int64) * pool_head_stride
+        + dims[None, :]
+    )
+    k = tl.load(k_ptr + token * kv_row_stride + kv_offsets, mask=kv_mask)
+    v = tl.load(v_ptr + token * kv_row_stride + kv_offsets, mask=kv_mask)
+    tl.store(cache, k, mask=kv_mask)
+    tl.store(cache + pool_kv_stride, v, mask=kv_mask)
+
+    heads = tl.arange(0, BLOCK_HEADS)
+    q_mask = heads[:, None] < NUM_HEADS
+    q_offsets = heads[:, None] * HEAD_DIM + dims[None, :]
+    q = tl.load(q_ptr + token * q_row_stride + q_offsets, mask=q_mask)
+    tl.store(q_out_ptr + g.to(tl.int64) * (NUM_HEADS * HEAD_DIM) + q_offsets, q, mask=q_mask)
+
+
+def write_kv_gather_q_spec(
+    pool: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_lens: torch.Tensor,
+    perm: Optional[torch.Tensor],
+    tail_indptr: torch.Tensor,
+    shared: torch.Tensor,
+    tail_pages: torch.Tensor,
+    q_len: int,
+    tokens_per_block: int,
+) -> torch.Tensor:
+    """Speculative-decoding variant of ``write_kv_gather_q``: ``q_len`` tokens per row.
+
+    Token ``j`` of batch row ``r`` is stored at position ``kv_lens[r] - q_len + j``
+    (device lengths, which include this step's tokens), in the page that the
+    row's tail table names for it, and the queries are returned in group order.
+
+    Args:
+        q: [rows * q_len, heads, head_dim]; k, v: [rows * q_len, kv_heads, head_dim].
+        kv_lens: [rows] device KV lengths in batch order.
+        perm: [rows] batch row of each grouped row, or None.
+        tail_indptr: [rows + 1] int32: offset of each grouped row's first tail
+            page in ``tail_pages``.
+        shared: [rows] int32, grouped order: shared pages before the tail.
+        tail_pages: int32 pool pages of every row's tail.
+    """
+    tokens, num_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if tensor.stride(2) != 1 or tensor.stride(1) != head_dim:
+            raise ValueError(f"{name} must have contiguous heads, got strides {tensor.stride()}.")
+    if k.stride(0) != v.stride(0):
+        raise ValueError("k and v must share a row stride.")
+    if pool.stride(4) != 1:
+        raise ValueError(f"pool must be contiguous in head_dim, got strides {pool.stride()}.")
+    q_out = torch.empty((tokens, num_heads, head_dim), dtype=q.dtype, device=q.device)
+    if tokens == 0:
+        return q_out
+    _write_kv_gather_q_spec_kernel[(tokens,)](
+        q,
+        k,
+        v,
+        q.stride(0),
+        k.stride(0),
+        pool,
+        pool.stride(0),
+        pool.stride(1),
+        pool.stride(2),
+        pool.stride(3),
+        kv_lens,
+        perm if perm is not None else kv_lens,
+        tail_indptr,
+        shared,
+        tail_pages,
+        tail_pages.numel(),
+        q_out,
+        NUM_HEADS=num_heads,
+        NUM_KV_HEADS=num_kv_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_HEADS=triton.next_power_of_2(num_heads),
+        BLOCK_KV_HEADS=triton.next_power_of_2(num_kv_heads),
+        HAS_PERM=perm is not None,
+        Q_LEN=q_len,
+        TOKENS_PER_BLOCK=tokens_per_block,
+    )
+    return q_out
+
+
+@triton.jit
+def _step_last_len_kernel(
+    kv_lens_ptr,
+    perm_ptr,
+    base_len_ptr,
+    tail_last_page_len_ptr,
+    rows,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < rows
+    source = tl.load(perm_ptr + offsets, mask=mask, other=0)
+    kv_len = tl.load(kv_lens_ptr + source, mask=mask, other=1)
+    base = tl.load(base_len_ptr + offsets, mask=mask, other=0)
+    tl.store(tail_last_page_len_ptr + offsets, (kv_len - base).to(tl.int32), mask=mask)
+
+
+def step_last_len(
+    kv_lens: torch.Tensor,
+    perm: torch.Tensor,
+    base_len: torch.Tensor,
+    tail_last_page_len: torch.Tensor,
+) -> None:
+    """Derive the tail last-page lengths of a speculative step from device KV lengths.
+
+    ``tail_last_page_len[i] = kv_lens[perm[i]] - base_len[i]`` (int32, grouped
+    order), where ``base_len`` is the first position of the row's last host
+    page. The value may be zero or negative when the host page count exceeds
+    what the device length needs; FlashInfer adds it to ``(pages - 1) *
+    page_size`` in unsigned arithmetic, which yields the true length.
+    """
+    rows = kv_lens.numel()
+    if rows == 0:
+        return
+    block = 256
+    _step_last_len_kernel[(triton.cdiv(rows, block),)](
+        kv_lens, perm, base_len, tail_last_page_len, rows, BLOCK=block
     )
