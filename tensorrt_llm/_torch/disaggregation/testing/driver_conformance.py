@@ -166,10 +166,22 @@ def _revoke_again(driver: RegistersRegionsTogether, handle: RegionHandle) -> Non
         pytest.fail(f"a second revocation of the batch raised {error!r}")
 
 
-def _settle_ready(driver: StoreDriver, op: OpHandle, timeout: float) -> None:
-    """Waits for a one-row operation to conclude READY and to end its access."""
+def _prove_registered(driver: StoreDriver, memory: Memory, index: int, timeout: float) -> None:
+    """A row inside ``memory`` moves and its access ends: the region is registered. A probe by
+    registration could not tell, since a driver that takes one batch at a time refuses a new one
+    whatever the region's state."""
+    row = RowIO(key_of(f"R{index}", "t" + secrets.token_hex(4)), (Span(memory.address, SLOT),))
+    try:
+        if driver.capabilities.put:
+            memory.write(b"a" * SLOT, 0)
+            op = driver.put([row])
+        else:
+            op = driver.get([row])
+    except DriverRejected as error:
+        pytest.fail(f"region {index} of the batch takes no row: {error}")
     wait_until(lambda: concluded(driver.poll(op)), "the operation to conclude", timeout)
-    assert statuses(driver, op) == [RowStatus.READY]
+    if driver.capabilities.put:
+        assert statuses(driver, op) == [RowStatus.READY]
     wait_until(lambda: driver.access_ended(op), "access to end", timeout)
 
 
@@ -1122,16 +1134,8 @@ class DriverConformance:
                     continue  # the region is live: it overlaps a new registration
                 driver.unregister_regions(stray)
                 pytest.fail(f"region {index} of the batch was not registered")
-            if driver.capabilities.put:  # the registrations are real: a row inside each moves
-                prefix = "t" + secrets.token_hex(4)
-                for index, region in enumerate(memory):
-                    region.write(b"a" * SLOT, 0)
-                    row = RowIO(key_of(f"R{index}", prefix), (Span(region.address, SLOT),))
-                    try:
-                        op = driver.put([row])
-                    except DriverRejected as error:
-                        pytest.fail(f"region {index} of the batch takes no row: {error}")
-                    _settle_ready(driver, op, self.timeout)
+            for index, region in enumerate(memory):  # the registrations are real: rows move
+                _prove_registered(driver, region, index, self.timeout)
             driver.unregister_regions(handle)
             _revoke_again(driver, handle)
             try:
@@ -1186,13 +1190,8 @@ class DriverConformance:
             assert isinstance(refusal[0], DriverRejected), (
                 f"a busy batch was revoked: {refusal[0]!r}"
             )
-            for index, spec in enumerate(specs[:-1]):  # the idle regions stayed registered too
-                try:
-                    stray = driver.register_regions([spec])
-                except DriverRejected:
-                    continue
-                driver.unregister_regions(stray)
-                pytest.fail(f"idle region {index} was revoked while the batch was busy")
+            for index, region in enumerate(memory[:-1]):  # the idle regions stayed registered
+                _prove_registered(driver, region, index, self.timeout)
             unblock()
             getter.join(self.timeout)
             assert not getter.is_alive(), "the stalled get never returned"

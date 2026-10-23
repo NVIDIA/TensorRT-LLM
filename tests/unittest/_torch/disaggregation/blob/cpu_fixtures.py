@@ -3,9 +3,11 @@
 """CPU stand-ins for the lender side of a blob backend, and ways for a test to steer a driver.
 
 ``Endpoint`` is one side of a transfer: host slots in one registered region, a driver, a region
-binding, a backend and the waits a test lease holder needs. ``KeyGatedStore`` holds store calls
+binding, a backend and the waits a test lease holder needs. ``FakeLeaseHolder`` is that holder:
+one decision per attempt, the lease back on quiescence. ``KeyGatedStore`` holds store calls
 until the test opens its gate. ``DriverSpy`` forwards to a real driver, records every call with its
-thread, and can hold a method on an event or make it raise. Every wait has an upper bound.
+thread, and can hold a method on an event or make it raise. ``in_a_child_process`` runs a test
+that keeps a backend thread for good in a process of its own. Every wait has an upper bound.
 """
 
 from __future__ import annotations
@@ -325,8 +327,9 @@ class Call:
 class DriverSpy:
     """A ``StoreDriver`` that forwards to ``inner`` and records every call with its thread name.
 
-    ``hold(method)`` makes calls of ``method`` wait until the returned event is set;
-    ``fail(method, error, times)`` makes the next ``times`` calls raise ``error`` instead;
+    ``hold(method, after)`` makes calls of ``method`` past the first ``after`` wait until the
+    returned event is set; ``fail(method, error, times)`` makes the next ``times`` calls raise
+    ``error`` instead;
     ``answer(method, value, times)`` makes them return ``value`` without reaching the driver.
     ``ops`` lists every operation ``put``/``get`` returned, with its rows; ``peak_in_flight`` is
     the most ``put``/``get`` calls that were ever inside the driver at once.
@@ -338,13 +341,15 @@ class DriverSpy:
         self.ops: list[tuple[tuple[RowIO, ...], OpHandle]] = []
         self.in_flight = self.peak_in_flight = 0
         self._changed = threading.Condition()
-        self._holds: dict[str, threading.Event] = {}
+        self._holds: dict[str, tuple[threading.Event, int]] = {}  # method -> (gate, after)
         self._failures: dict[str, list] = {}
         self._answers: dict[str, list] = {}
 
-    def hold(self, method: str) -> threading.Event:
-        self._holds[method] = threading.Event()
-        return self._holds[method]
+    def hold(self, method: str, after: int = 0) -> threading.Event:
+        """Makes every call of ``method`` past the first ``after`` wait on the returned event."""
+        gate = threading.Event()
+        self._holds[method] = (gate, after)
+        return gate
 
     def fail(self, method: str, error: Exception, times: int = 1) -> None:
         self._failures[method] = [error, times]
@@ -459,8 +464,9 @@ class DriverSpy:
             else:
                 failure = None
             hold = self._holds.get(method)
-        if hold is not None:
-            hold.wait(HELD_CALL_S)
+            entered = sum(1 for call in self.calls if call.method == method)  # this one included
+        if hold is not None and entered > hold[1]:
+            hold[0].wait(HELD_CALL_S)
         if failure is not None:
             raise failure[0]
 
@@ -566,3 +572,61 @@ class Endpoint:
 
 def _no_keys() -> np.ndarray:
     return np.zeros((0, OBJECT_KEY_WIDTH), dtype=np.uint8)
+
+
+class FakeLeaseHolder:
+    """The runtime's side of an attempt, reduced to what a backend can see of it.
+
+    One lease on the endpoint's slots per submission; one decision per attempt, taken from the
+    outcome once it landed or from nothing at the holder's own deadline, and never revisited; the
+    lease given back only once the attempt quiesced, whatever was decided. The region hold is the
+    manager's: it goes back through the binding, on the manager's thread, once nothing is
+    registered any more. ``on_wake`` is the holder's reaction to a wake; a test calls the steps
+    one by one when it wants them apart.
+    """
+
+    def __init__(self, endpoint: Endpoint) -> None:
+        self.endpoint = endpoint
+        self.attempts: dict[str, BlobAttempt] = {}
+        self.decisions: dict[str, Outcome | None] = {}  # None: the deadline came first
+        self.leased: set[str] = set()  # attempts whose slots the lease still covers
+
+    def fetch(self, *names: str, hint: Hint = None) -> BlobAttempt:
+        return self._submit(self.endpoint.backend.fetch(self.endpoint.view(*names), hint))
+
+    def publish(self, *names: str) -> BlobAttempt:
+        return self._submit(self.endpoint.backend.publish(self.endpoint.view(*names), None))
+
+    def decide(self, attempt: BlobAttempt) -> None:
+        """Takes the outcome as the decision, or nothing when none has landed, as at the
+        holder's deadline. The first decision stands."""
+        self.decisions.setdefault(attempt.label, attempt.poll())
+
+    def delivered(self, attempt: BlobAttempt) -> list[list[bool]] | None:
+        """What the decision counts as delivered; ``None`` when it was taken from nothing."""
+        outcome = self.decisions[attempt.label]
+        return None if outcome is None else masks(outcome)
+
+    def return_lease_if_quiesced(self, attempt: BlobAttempt) -> bool:
+        if attempt.quiesced():
+            self.leased.discard(attempt.label)
+        return attempt.label not in self.leased
+
+    def on_wake(self) -> None:
+        for attempt in self.attempts.values():
+            if attempt.poll() is not None:
+                self.decide(attempt)
+            self.return_lease_if_quiesced(attempt)
+
+    def shut_down(self, budget: float) -> frozenset[str]:
+        """The manager's shutdown: what the backend still holds, and the hold given back only
+        when that is nothing. Called again later when it was not."""
+        labels = self.endpoint.backend.shutdown(budget)
+        if not self.endpoint.binding.live_labels():
+            self.endpoint.binding.release_hold()
+        return labels
+
+    def _submit(self, attempt: BlobAttempt) -> BlobAttempt:
+        self.attempts[attempt.label] = attempt
+        self.leased.add(attempt.label)
+        return attempt

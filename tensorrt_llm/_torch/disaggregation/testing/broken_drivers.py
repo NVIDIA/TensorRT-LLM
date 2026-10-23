@@ -543,6 +543,17 @@ class RevokesTheIdleRegionsOfABusyBatch(TogetherMemoryDriver):
         super().unregister_regions(handle)
 
 
+class RevokesTheIdleRegionsOfABusyBatchOneAtATime(RevokesTheIdleRegionsOfABusyBatch):
+    """The same, in a driver that takes one batch at a time: it refuses a new registration
+    whatever the idle regions' state, so only a row moved through them tells they are gone."""
+
+    def register_regions(self, specs: Sequence[RegionSpec]) -> _Batch:
+        with self._lock:
+            if self.live_batches():
+                raise DriverRejected("one batch at a time")
+        return super().register_regions(specs)
+
+
 class UnregisterRegionsWaitsForTheTransfer(TogetherMemoryDriver):
     """Revokes a busy batch once it is idle, instead of refusing: a caller holding something the
     transfer needs is stuck."""
@@ -585,6 +596,11 @@ BROKEN_TOGETHER_CONFORMANCE: dict[
     ),
     "a busy batch keeps its idle regions": (
         RevokesTheIdleRegionsOfABusyBatch,
+        DEFAULT_CAPABILITIES,
+        "test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy",
+    ),
+    "a busy batch keeps its idle regions, one batch at a time": (
+        RevokesTheIdleRegionsOfABusyBatchOneAtATime,
         DEFAULT_CAPABILITIES,
         "test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy",
     ),

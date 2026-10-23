@@ -12,4 +12,5 @@ Read top down; a fetch or publish flows ``BlobBackend`` -> ``StoreDriver`` -> st
   driver's private format.
 
 No module imports torch, ``tensorrt_llm._torch.pyexecutor`` or a store SDK at import time.
+``README.md`` next to this file says how to write a driver and how to assemble a backend.
 """
