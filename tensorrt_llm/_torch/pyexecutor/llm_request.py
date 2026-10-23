@@ -861,9 +861,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             stop_words_list: list[list[int]] | None = None,
             llm_request: Optional[
                 tensorrt_llm.bindings.internal.batch_manager.LlmRequest] = None,
-            is_draft: bool = False,
             seq_slot: Optional[int] = None,
-            target_seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
@@ -987,11 +985,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_additional_outputs = additional_outputs
 
         self.py_beam_width = cast(int, self.sampling_config.beam_width)
-        self.py_is_draft = is_draft
-        # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
-        self.py_target_seq_slot = target_seq_slot
-        self.use_draft_model = is_draft
-        self.d2t = None
         self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters

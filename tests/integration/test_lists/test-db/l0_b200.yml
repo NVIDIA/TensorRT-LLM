@@ -233,7 +233,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_rejects_direct_metadata_without_fused_finalize
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_direct_metadata_request_fails_without_fused_finalize
   - unittest/_torch/moe/test_moe_backend.py::test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl
-  - unittest/_torch/thop/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
@@ -272,10 +272,14 @@ l0_b200:
   - unittest/_torch/speculative/test_chain_speculative_sampling_op.py
   - unittest/_torch/speculative/test_dynamic_tree_rejection_op.py
   - unittest/_torch/speculative/test_dynamic_tree_sampling_dispatch.py
-  - unittest/_torch/thop/parallel
+  # One-model speculative decoding step-copy kernels and the engine's decode
+  # step that runs them (SM 100; they skip on other GPUs).
+  - unittest/_torch/kernels/test_spec_step_copies.py
+  - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
-  - unittest/_torch/thop/serial
+  - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"

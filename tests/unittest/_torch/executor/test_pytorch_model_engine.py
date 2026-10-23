@@ -78,7 +78,7 @@ _TWO_MODEL_SPEC_MODE = SimpleNamespace(use_one_engine=lambda: False)
 
 def _input_preparer() -> DecoderInputPreparer:
     return DecoderInputPreparer(buffers=None,
-                                config=None,
+                                config=SimpleNamespace(is_spec_decode=False),
                                 mapping=None,
                                 dist=None,
                                 model=None,
@@ -635,6 +635,52 @@ def test_cleanup_releases_runner_model_before_release_gc() -> None:
         engine.cleanup()
 
     release_gc.assert_called_once_with()
+
+
+class GraphOwnerTeardownTestCase(unittest.TestCase):
+
+    def test_cuda_graph_runner_destructor_does_not_release_window_owner(
+            self) -> None:
+        runner = Mock()
+
+        CUDAGraphRunner.__del__(runner)
+
+        runner.clear.assert_called_once_with(release_nccl_window_owners=False)
+
+    def test_engine_graph_ownership_is_split(self) -> None:
+        clear_blocks_graph = Mock()
+        model = Mock()
+        model.modules.return_value = [
+            SimpleNamespace(clear_blocks_cuda_graph=clear_blocks_graph)
+        ]
+        backend = Mock()
+        cuda_runner = Mock()
+        breakable_runner = Mock()
+        decoder_runner = object.__new__(DecoderRunner)
+        decoder_runner._graphs = object.__new__(DecoderCudaGraphs)
+        decoder_runner._graphs.cuda_graph_runner = cuda_runner
+        decoder_runner._graphs.breakable_cuda_graph_runner = breakable_runner
+        engine = SimpleNamespace(
+            model=model,
+            _torch_compile_backend=backend,
+            _runner=decoder_runner,
+        )
+
+        PyTorchModelEngine._release_cuda_graphs(
+            engine, release_nccl_window_owners=False)
+
+        clear_blocks_graph.assert_not_called()
+        backend.clear_piecewise_cuda_graphs.assert_called_once_with(
+            release_nccl_window_owners=False)
+        for runner in (cuda_runner, breakable_runner):
+            runner.clear.assert_called_once_with(
+                release_nccl_window_owners=False)
+
+        PyTorchModelEngine._release_model_owned_cuda_graphs(
+            engine, release_nccl_window_owners=False)
+
+        clear_blocks_graph.assert_called_once_with(
+            release_nccl_window_owners=False)
 
 
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
@@ -1396,7 +1442,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             frozenset())
 
     def test_generation_lora_request_selects_lora_graph(self) -> None:
-        key = (1, 0, False, False, True, True)
+        key = KeyType(batch_size=1, draft_len=0, use_lora_graph=True)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         engine._runner._lora = engine._runner._graphs._lora = SimpleNamespace(
             cuda_graph_manager=object())
@@ -2089,7 +2135,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._init_cuda_graph_lora_manager(Mock())
 
         runner.wait_for_input_copy.assert_called_once_with()
-        runner.release_graphs.assert_called_once_with()
+        runner.release_graphs.assert_called_once_with(
+            release_nccl_window_owners=True)
         runner.init_cuda_graph_lora_manager.assert_not_called()
 
     def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
@@ -2124,8 +2171,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         decoder._inputs._prepare_inputs_event.synchronize.assert_called_once_with(
         )
-        decoder.cuda_graph_runner.clear.assert_called_once_with()
-        decoder.breakable_cuda_graph_runner.clear.assert_called_once_with()
+        decoder.cuda_graph_runner.clear.assert_called_once_with(
+            release_nccl_window_owners=True)
+        decoder.breakable_cuda_graph_runner.clear.assert_called_once_with(
+            release_nccl_window_owners=True)
 
     def test_prepare_inputs_returns_steady_gen_fast_inputs(self) -> None:
         inputs = _input_preparer()
@@ -2310,6 +2359,114 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertFalse(generation.py_needs_onehot_draft_probs)
         spec_metadata.write_padding_onehot_draft_probs.assert_called_once_with(
             [generation.py_seq_slot], 0)
+        kv_cache_manager.shutdown()
+
+    def test_spec_decode_graph_step_gather_kernel_matches_torch_path(
+            self) -> None:
+        """A CUDA graph decode step of a speculative engine whose overlap
+        gathers run as one StepInputGather launch writes what the torch path
+        writes."""
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttentionMetadata
+        from tensorrt_llm._torch.kernels.spec_step_copies import \
+            op as spec_step_copies
+        if not spec_step_copies.is_supported():
+            self.skipTest("the step-copy kernels run on SM 100")
+        max_draft_len = 3
+        tokens_per_step = max_draft_len + 1
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            spec_config=SADecodingConfig(max_draft_len=max_draft_len))
+        inputs = model_engine._runner._inputs
+        buffers = model_engine._runner._buffers
+        step_gather = inputs._step_input_gather
+        self.assertIsNotNone(step_gather)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        # Three requests that ran in the previous step, in slots out of order.
+        slots = [5, 2, 7]
+        requests = kv_cache_manager.add_dummy_requests(
+            [1, 2, 3],
+            token_nums=[10, 17, 33],
+            is_gen=True,
+            max_num_draft_tokens=max_draft_len)
+        for request, slot in zip(requests, slots):
+            request.is_dummy_request = False
+            request.py_seq_slot = slot
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+        attn_metadata = model_engine._runner._metadata.setup_attention(
+            kv_cache_manager)
+        self.assertIs(type(attn_metadata), TrtllmAttentionMetadata)
+        graph_metadata = attn_metadata.create_cuda_graph_metadata(
+            len(requests), False, max_draft_len)
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+
+        # The sampler's slot stores as the previous step left them.
+        num_slots = 8
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        previous = SampleStateTensorsSpec(
+            new_tokens=torch.randint(0,
+                                     1000, (tokens_per_step, num_slots, 1),
+                                     generator=generator,
+                                     dtype=torch.int32,
+                                     device="cuda"),
+            new_tokens_lens=torch.randint(1,
+                                          tokens_per_step + 1, (num_slots, ),
+                                          generator=generator,
+                                          dtype=torch.int32,
+                                          device="cuda"),
+            next_draft_tokens=torch.randint(0,
+                                            1000, (num_slots, max_draft_len),
+                                            generator=generator,
+                                            dtype=torch.int32,
+                                            device="cuda"),
+        )
+
+        def step_inputs(step_input_gather):
+            """The buffers one step writes, from a filler they all start at."""
+            inputs._step_input_gather = step_input_gather
+            for request, slot in zip(requests, slots):
+                request.py_batch_idx = slot
+            written = (buffers.input_ids_cuda, buffers.position_ids_cuda,
+                       buffers.draft_tokens_cuda,
+                       buffers.previous_pos_id_offsets_cuda,
+                       buffers.previous_kv_lens_offsets_cuda)
+            for buffer in written:
+                buffer.fill_(-3)
+            inputs.prepare_inputs(scheduled_requests=batch,
+                                  kv_cache_manager=kv_cache_manager,
+                                  attn_metadata=graph_metadata,
+                                  spec_metadata=spec_metadata,
+                                  new_tensors_device=previous,
+                                  resource_manager=resource_manager,
+                                  enable_spec_decode=True,
+                                  runtime_draft_len=max_draft_len,
+                                  is_dummy=False)
+            torch.cuda.synchronize()
+            return [buffer.clone() for buffer in written]
+
+        torch_path = step_inputs(None)
+        launched = []
+        launch = step_gather.gather
+
+        def recorded_launch(*args, **kwargs):
+            launched.append(launch(*args, **kwargs))
+            return launched[-1]
+
+        with patch.object(step_gather, "gather", side_effect=recorded_launch):
+            kernel_path = step_inputs(step_gather)
+        self.assertEqual(launched, [True])
+        for expected, actual in zip(torch_path, kernel_path):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # The previous rows' input ids came from the stores, by slot.
+        num_tokens = len(requests) * tokens_per_step
+        expected_input_ids = previous.new_tokens[:, slots, 0].t().reshape(-1)
+        self.assertEqual(kernel_path[0][:num_tokens].tolist(),
+                         expected_input_ids.tolist())
         kv_cache_manager.shutdown()
 
     def test_multimodal_encoder_max_seq_len(self) -> None:

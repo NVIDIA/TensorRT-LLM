@@ -21,4 +21,4 @@ l0_gb300_multi_nodes_perf_sanity_ctx3_node2_gpu8_gen1_node4_gpu16:
   # than 16x GB300 can hold and would never open. The ctx_only and
   # gen_only_no_context lanes are in l0_gb300_multi_nodes_perf_sanity_node2_gpu8
   # and l0_gb300_multi_nodes_perf_sanity_gen1_node{2_gpu8,4_gpu16}.
-  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (240)
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (155)
