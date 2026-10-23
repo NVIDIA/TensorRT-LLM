@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod, TensorParallelMode
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.quantization.utils.fp8_utils import Fp8BlockScaleWeightSliceCache
@@ -120,6 +120,28 @@ def test_linear_output_slice_reload(backend):
     actual = linear.forward_slice(inputs, 513, 1107)
     torch.testing.assert_close(actual, linear(inputs)[:, 513:1107], atol=0.005, rtol=0.03)
     assert linear._output_slice_cache is not old_cache
+
+
+@pytest.mark.cpu_only
+def test_prepare_output_slice_rejects_unsupported_projection_before_forward():
+    linear = Linear(
+        8,
+        16,
+        bias=False,
+        dtype=torch.bfloat16,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        quant_config=QuantConfig(),
+        reduce_output=False,
+    )
+
+    linear.lora = object()
+    with pytest.raises(NotImplementedError, match="LoRA"):
+        linear.prepare_output_slice(0, 8)
+
+    linear.lora = None
+    linear.quant_method = NVFP4LinearMethod()
+    with pytest.raises(NotImplementedError, match="FP8 block-scale"):
+        linear.prepare_output_slice(0, 8)
 
 
 @pytest.mark.cpu_only

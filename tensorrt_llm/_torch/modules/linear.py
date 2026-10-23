@@ -4526,6 +4526,11 @@ class Linear(nn.Module):
         Returns:
             A contiguous tensor with shape [..., end - start].
         """
+        self.prepare_output_slice(start, end)
+        return self.quant_method.apply_slice(self, input, start, end)
+
+    def prepare_output_slice(self, start: int, end: int) -> None:
+        """Validate output slicing and prepare FP8 scales after weight transformation."""
         if self.tp_mode == TensorParallelMode.ROW or self.gather_output:
             raise ValueError(
                 "Output slicing requires a local COLUMN projection")
@@ -4540,11 +4545,6 @@ class Linear(nn.Module):
             raise NotImplementedError(
                 "Output slicing supports unquantized and FP8 block-scale projections"
             )
-        self.prepare_output_slice(start, end)
-        return self.quant_method.apply_slice(self, input, start, end)
-
-    def prepare_output_slice(self, start: int, end: int) -> None:
-        """Prepare FP8 slice scales once, after weight transformation."""
         if type(self.quant_method) is not FP8BlockScalesLinearMethod:
             return
         self.transform_weights()
