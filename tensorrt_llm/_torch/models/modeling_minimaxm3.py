@@ -555,6 +555,33 @@ def _build_swiglu_oai_dense_mlp(
     )
 
 
+ROUTER_BF16_SPLIT_TERMS = 3
+"""int: BF16 terms the FP32 router weight is split into for the tensor-core router GEMM."""
+
+
+def split_router_weight_bf16(
+    weight: torch.Tensor, terms: int = ROUTER_BF16_SPLIT_TERMS
+) -> torch.Tensor:
+    """Split the FP32 router weight into BF16 terms laid side by side along K.
+
+    ``weight`` [num_experts, hidden] FP32 becomes [num_experts, terms * hidden] BF16 with
+    ``weight ~= sum_t result[:, t * hidden:(t + 1) * hidden]``; each term is the BF16
+    rounding of what the previous terms left over (three terms carry 24 mantissa bits). A
+    BF16 activation ``y`` then gets FP32-grade logits from one tensor-core GEMM with FP32
+    accumulation, ``cat([y] * terms, -1) @ result.t()``, since BF16 x BF16 products are
+    exact in FP32.
+    """
+    if weight.dim() != 2 or weight.dtype != torch.float32:
+        raise ValueError("router weight must be a 2-D FP32 tensor")
+    pieces = []
+    remainder = weight
+    for _ in range(terms):
+        piece = remainder.to(torch.bfloat16)
+        pieces.append(piece)
+        remainder = remainder - piece.float()
+    return torch.cat(pieces, dim=1).contiguous()
+
+
 class MiniMaxM3Gate(nn.Module):
     """MiniMax-M3 router gate: float32 sigmoid scoring + per-expert bias correction.
 
@@ -586,12 +613,29 @@ class MiniMaxM3Gate(nn.Module):
             torch.empty((num_experts,), dtype=torch.float32),
             requires_grad=False,
         )
+        # ``weight`` as BF16 terms along K (split_router_weight_bf16) for the
+        # tensor-core GEMM on BF16 inputs; built by ``load_weights``, else None.
+        self.register_buffer("split_weight", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang. cublas_mm always computes with
-        # CUBLAS_COMPUTE_32F; F.linear follows torch's fp32 matmul precision,
-        # which is TF32 under TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 (set in the
-        # NGC PyTorch based containers) and then flips near-tied top-k choices.
+        """FP32 router logits ``hidden_states @ weight.t()``.
+
+        BF16 inputs with a split weight run one BF16 tensor-core GEMM over the
+        replicated input and the BF16 terms of the weight, with FP32 accumulation
+        and output. Otherwise the router runs in fp32 to match SGLang: cublas_mm
+        always computes with CUBLAS_COMPUTE_32F, whereas F.linear follows torch's
+        fp32 matmul precision, which is TF32 under TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+        (set in the NGC PyTorch based containers) and then flips near-tied top-k
+        choices.
+        """
+        if self.split_weight is not None and hidden_states.dtype == torch.bfloat16:
+            terms = self.split_weight.shape[1] // self.hidden_size
+            return torch.ops.trtllm.cublas_mm(
+                torch.cat([hidden_states] * terms, dim=-1),
+                self.split_weight.t(),
+                bias=None,
+                out_dtype=torch.float32,
+            )
         return torch.ops.trtllm.cublas_mm(
             hidden_states.to(torch.float32).contiguous(),
             self.weight.t(),
@@ -615,6 +659,7 @@ class MiniMaxM3Gate(nn.Module):
         w = weights[0]
         if "weight" in w:
             self.weight.copy_(w["weight"][:].to(self.weight.dtype))
+            self.split_weight = split_router_weight_bf16(self.weight)
         if "e_score_correction_bias" in w:
             self.e_score_correction_bias.copy_(
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
