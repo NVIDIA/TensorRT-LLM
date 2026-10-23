@@ -197,7 +197,9 @@ retrying the drain and the revocation, and the hold stays with the manager until
   a submission past it is refused with `SubmissionRejected`.
 - **Batch size**: `BlobBackend.batch_size(region_index)` tells a holder how many rows of a
   region one driver call carries, so it can bound what a single call that never proves its
-  access ended would pin; `None` means each group goes in one call.
+  access ended would pin; `None` means no configured or driver-imposed size limit. A repeated
+  key may still split a group into several calls: a view may name one key at two addresses, and
+  a driver refuses a key that appears twice in one call.
 - **A driver out of its protocol** (a raise from `put`/`get` that is not `DriverRejected`, a
   `poll` with the wrong row count) is fenced: nothing new reaches it, queued work concludes
   undispatched, started work is still observed to its end.

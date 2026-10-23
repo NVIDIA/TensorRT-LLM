@@ -3,7 +3,9 @@
 """The blob backend: the public ``base.backend.Backend`` over a private store driver.
 
 Threads. The caller's thread validates a submission and cuts it into batches, one driver call
-each. ``BlobConfig.workers`` worker threads take batches, fetches first, and make the driver calls.
+each and no key twice in one: a view may name one key at two addresses, and a driver refuses a
+key that appears twice in one call. ``BlobConfig.workers`` worker threads take batches, fetches
+first, and make the driver calls.
 One progress thread observes the calls that returned before they settled and, once a shutdown was
 asked and every attempt quiesced, drains the driver and revokes the registrations. All bookkeeping
 is under one lock; neither the driver nor ``wake`` is ever called under it.
@@ -112,10 +114,11 @@ class BlobConfig:
     """How the backend cuts submissions into driver calls and runs them; the ``blob`` section of a
     store config.
 
-    The defaults assume nothing about the driver: one worker, and no limit of the backend's own on
-    a call, so each group of a submission goes in one call unless the driver declares
-    ``max_rows_per_op``. How many calls to overlap and how large to make them depends on the store
-    (whether its calls block, what a call costs), so a store's values come from its store config.
+    The defaults assume nothing about the driver: one worker, and no size limit of the backend's
+    own on a call; the driver's ``max_rows_per_op`` still applies, and a repeated key still splits
+    a group into several calls. How many calls to overlap and how large to make them depends on
+    the store (whether its calls block, what a call costs), so a store's values come from its
+    store config.
 
     Attributes:
         key_prefix: The deployment's key namespace; matches ``[A-Za-z0-9_-]{1,64}``.
@@ -629,7 +632,8 @@ class BlobBackend:
 
     def batch_size(self, region_index: int) -> tuple[int, int] | None:
         """The most rows of region ``region_index`` one driver call carries, and their bytes; None
-        when neither the config nor the driver limits them, so each group goes in one call.
+        means no configured or driver-imposed size limit, while a repeated key may still split a
+        group into several calls.
 
         An attempt quiesces only once every batch it started proved its access ended, so one call
         that never proves it keeps the slots of its whole submission; a holder bounds that by
@@ -725,10 +729,10 @@ class BlobBackend:
         batches = []
         for group, group_rows in enumerate(groups):
             count = len(group_rows.addresses)
-            step = self._rows_per_batch(group_rows.region) or max(count, 1)  # None: the whole group
+            step = self._rows_per_batch(group_rows.region) or max(count, 1)  # None: no size limit
             batches += [
-                _Batch(attempt, group, start, min(start + step, count))
-                for start in range(0, count, step)
+                _Batch(attempt, group, start, stop)
+                for start, stop in _batch_bounds(group_rows.object_keys, step)
             ]
         return batches
 
@@ -1125,6 +1129,28 @@ class BlobBackend:
             self._wake()
         except Exception as error:  # a raising wake must not kill a backend thread
             _warn_once(f"blob backend: wake raised {error!r}", (self._name, "wake", type(error)))
+
+
+def _batch_bounds(keys: np.ndarray, step: int) -> list[tuple[int, int]]:
+    """Consecutive ``[start, stop)`` runs of at most ``step`` rows, none naming a key twice: a
+    driver refuses a key that appears twice in one call, while a view may name one key at two
+    addresses. Distinct keys, the usual case, cut into whole steps without a pass over the rows."""
+    count = len(keys)
+    if count == 0:
+        return []
+    if np.unique(keys, axis=0).shape[0] == count:
+        return [(start, min(start + step, count)) for start in range(0, count, step)]
+    bounds: list[tuple[int, int]] = []
+    seen: set[bytes] = set()
+    start = 0
+    for index in range(count):
+        key = keys[index].tobytes()
+        if index - start == step or key in seen:
+            bounds.append((start, index))
+            start, seen = index, set()
+        seen.add(key)
+    bounds.append((start, count))
+    return bounds
 
 
 def _refuse_shared_destinations(groups: list[_GroupRows]) -> None:

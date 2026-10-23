@@ -169,6 +169,53 @@ def test_batches_respect_rows_bytes_and_driver_limits(store: MemoryStore, case: 
     writer.close()
 
 
+REPEATED_KEYS = {
+    # name: (rows_per_batch, the keys the view names at slots 0, 1, 2, ..., rows in each call)
+    "no_limit": (None, "ABA", [2, 1]),
+    "limit_of_two": (2, "AABC", [1, 2, 1]),
+    "every_row_alike": (None, "AAA", [1, 1, 1]),
+}
+
+
+@pytest.mark.parametrize("direction", ["publish", "fetch"])
+@pytest.mark.parametrize("case", REPEATED_KEYS)
+def test_rows_naming_one_key_at_two_addresses_never_share_a_call(
+    store: MemoryStore, case: str, direction: str
+) -> None:
+    """A view may name one key at two addresses; a driver refuses a key twice in one call."""
+    rows_per_batch, keys, expected = REPEATED_KEYS[case]
+    slots = [f"S{i}" for i in range(len(keys))]  # one slot per row, named apart from the keys
+    endpoint = Endpoint(MemoryDriver(store), slots, rows_per_batch=rows_per_batch)
+    payload = {key: key.encode() * SLOT_BYTES for key in set(keys)}
+    view = CpuView(
+        [
+            Rows(
+                0,
+                np.stack([object_key(key) for key in keys]),
+                endpoint.region.slots(*range(len(keys))),
+                0,
+            )
+        ]
+    )
+    if direction == "publish":
+        for slot, key in zip(slots, keys):
+            endpoint.write(slot, payload[key])
+        attempt = endpoint.backend.publish(view, None)
+    else:
+        published(store, payload)
+        attempt = endpoint.backend.fetch(view, None)
+    outcome = endpoint.wait_outcome(attempt)
+    assert outcome.fault is None and masks(outcome) == [[True] * len(keys)]
+    method = "put" if direction == "publish" else "get"
+    assert [len(call.rows) for call in endpoint.driver.calls_to(method)] == expected
+    if direction == "publish":
+        assert {key: store.committed_payload(store_key(key)) for key in set(keys)} == payload
+    else:
+        assert [endpoint.read(slot) for slot in slots] == [payload[key] for key in keys]
+    endpoint.wait_quiesced(attempt)
+    endpoint.close()
+
+
 def test_capabilities_are_the_driver_directions(store: MemoryStore) -> None:
     driver = MemoryDriver(store, capabilities=replace(DEFAULT_CAPABILITIES, get=False))
     writer = Endpoint(driver, ["A"])
