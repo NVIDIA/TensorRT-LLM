@@ -16,16 +16,26 @@ import json
 from collections import deque
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 
 class _FakeGenerator:
     def __init__(
-        self, stat_batches: list[list[dict]], iter_stats_max_iterations: int | None = None
+        self,
+        stat_batches: list[list[dict]],
+        iter_stats_max_iterations: int | None = None,
+        enable_iter_perf_stats: bool = True,
     ):
-        self.args = SimpleNamespace(iter_stats_max_iterations=iter_stats_max_iterations)
+        self.args = SimpleNamespace(
+            iter_stats_max_iterations=iter_stats_max_iterations,
+            enable_iter_perf_stats=enable_iter_perf_stats,
+            return_perf_metrics=False,
+        )
+        self._executor = SimpleNamespace(resource_governor_queue=None)
         self._stat_batches = deque(stat_batches)
         self.stats_timeouts = []
 
@@ -54,9 +64,12 @@ def _make_server(
     with_stats_buffer: bool = True,
     is_visual_gen: bool = False,
     iter_stats_max_iterations: int | None = None,
+    enable_iter_perf_stats: bool = True,
 ) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
-    server.generator = _FakeGenerator(stat_batches, iter_stats_max_iterations)
+    server.generator = _FakeGenerator(
+        stat_batches, iter_stats_max_iterations, enable_iter_perf_stats
+    )
     server.metrics_collector = _FakeMetricsCollector()
     server._is_visual_gen = is_visual_gen
     max_buffer_size = OpenAIServer._iteration_stats_buffer_maxlen(
@@ -107,6 +120,43 @@ async def test_metrics_endpoint_reads_queue_without_background_buffer():
     assert _response_content(response) == stats
     assert server.generator.stats_timeouts == [2]
     assert server.metrics_collector.logged_stats == []
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_does_not_poll_when_iteration_stats_disabled():
+    server = _make_server([], with_stats_buffer=False, enable_iter_perf_stats=False)
+
+    for _ in range(2):
+        response = await server.get_iteration_stats()
+        assert _response_content(response) == []
+
+    assert server.generator.stats_timeouts == []
+
+
+@pytest.mark.parametrize(
+    "enable_iter_perf_stats,with_stats_buffer",
+    [(False, False), (True, True)],
+)
+@pytest.mark.asyncio
+async def test_metrics_route_does_not_poll_iteration_stats_queue(
+    enable_iter_perf_stats: bool, with_stats_buffer: bool
+):
+    server = _make_server(
+        [],
+        with_stats_buffer=with_stats_buffer,
+        enable_iter_perf_stats=enable_iter_perf_stats,
+    )
+    server.app = FastAPI()
+    server.use_harmony = False
+    server.register_routes()
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.json() == []
+    assert server.generator.stats_timeouts == []
 
 
 @pytest.mark.asyncio
