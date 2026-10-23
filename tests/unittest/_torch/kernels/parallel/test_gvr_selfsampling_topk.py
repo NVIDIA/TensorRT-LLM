@@ -1900,6 +1900,54 @@ def test_selfsampling_varlen_live_admission_policy() -> None:
     assert len(clus) == 1 and _rung_window(clus[0]) == 8192 and not clus[0][5]
 
 
+class _StubDeviceModule:
+    """Stands in for the device module: records every compile request (host-only tests)."""
+
+    STATIC_BYTES = 0
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        if not name.startswith("get_compiled"):
+            raise AttributeError(name)
+
+        def record(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return (name, len(self.calls))
+
+        return record
+
+
+def test_selfsampling_varlen_live_admission_switch(monkeypatch) -> None:
+    """TRTLLM_GVR_V2_LIVE_ADMISSION=0 (parsed into _LIVE_ADMISSION): no family embeds
+    the ladder and the main plan's sampled gate is off; the default embeds both. The
+    launcher runs against a stub device module, so no kernel is compiled."""
+    stub = _StubDeviceModule()
+    monkeypatch.setattr(ss_host, "_dev_mod", stub)
+    main_shape = (12, 262144, 512, 262144, 1, 4)  # rows, npad, k, envelope, next_n, cr
+    clus_shape = (48, 262144, 1024, 262144, 1, 4)
+    try:
+        for enabled in (True, False):
+            monkeypatch.setattr(ss_host, "_LIVE_ADMISSION", enabled)
+            ss_host._VARLEN_CACHE.clear()
+            stub.calls.clear()
+            assert ss_host._live_enabled("main", det=False) is enabled
+            assert ss_host._live_enabled("clus", det=False) is enabled
+            assert ss_host._varlen_launcher(*main_shape)[0] == "main"
+            assert ss_host._varlen_launcher(*clus_shape)[0] == "clus"
+            (name_m, _, kw_m), (name_c, _, kw_c) = stub.calls
+            assert (name_m, name_c) == ("get_compiled", "get_compiled__clus")
+            if enabled:
+                assert len(kw_m["reg_escape"]) == 4 and len(kw_c["reg_escape"]) == 1
+                assert kw_m["live_sample_kmult"] == ss_host._LIVE_SAMPLE_KMULT
+            else:
+                assert kw_m["reg_escape"] is None and kw_c["reg_escape"] is None
+                assert kw_m["live_sample_kmult"] == 0
+    finally:
+        ss_host._VARLEN_CACHE.clear()  # launchers built on the stub must not reach the GPU tests
+
+
 def _check_rows_exact(logits, out, kv_lens, next_n, cr, top_k, tag):
     ref = _reference_varlen_indices(logits, kv_lens, next_n, cr, top_k)
     for r in range(logits.shape[0]):
@@ -1975,7 +2023,7 @@ def test_selfsampling_varlen_live_admission_clus_mixed() -> None:
     torch.cuda.synchronize()
     key = _varlen_cache_key(rows, msl_c, top_k, msl_c, 1, cr)
     fam = ss_host._VARLEN_CACHE[key][0]
-    assert fam in ("clus", "main"), fam  # clus on 148-SM parts; the ladder is embedded either way
+    assert fam == "clus", fam
     _check_rows_exact(logits, out, kv_lens, 1, cr, top_k, f"eager {fam} n={n_rows[:8]}")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

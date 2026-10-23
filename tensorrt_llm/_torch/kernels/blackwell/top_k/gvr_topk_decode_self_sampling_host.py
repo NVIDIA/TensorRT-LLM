@@ -831,39 +831,48 @@ def _live_enabled(family: str, det: bool) -> bool:
     return _LIVE_ADMISSION and not det and family in _LIVE_LADDERS
 
 
+def _reg_flags(
+    num_rows: int, k: int, n_eff: int, blk: int, vpt: int, minb: int, num_sms: int, sm_version: int
+) -> dict[str, object]:
+    """Compile flags of a register-resident engine of CTA shape (blk, vpt, minb) at the
+    window n_eff: the free route's register plan at n_eff = n_kernel, a ladder rung at
+    n_eff = 4*blk*vpt. One copy, so an admitted row runs with the flags the free route
+    gives the same shape."""
+    sm10x = sm_version in (100, 103)
+    stage_output = num_rows > num_sms and not (
+        k <= 512 and n_eff <= 2 * k and num_rows <= 2 * num_sms
+    )
+    if k == 2048 and n_eff > k and num_rows <= num_sms and sm10x:
+        stage_output = True
+    small_k_resident = k == 512 and num_rows > num_sms and n_eff > 4096 and sm10x
+    return {
+        "stage_output": stage_output,
+        "small_k_resident": small_k_resident,
+        "dense_bracket": k <= 512,
+        "dense_lower_bound": k > 512 and n_eff < 2 * k,
+        "bracket_sample_lanes": 32 if (k == 1024 and 6144 < n_eff <= 8192) else 1,
+        "warp_rank": (
+            ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
+            and n_eff > k
+            and sm10x
+        ),
+        "rematerialize_bins": (
+            (small_k_resident and (num_rows > 2 * num_sms or n_eff <= 8192))
+            or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_eff >> 2) <= 2048)
+            or (sm10x and k == 2048 and num_rows > 6 * num_sms and (blk, vpt, minb) == (256, 5, 4))
+        ),
+    }
+
+
 def _reg_engine_cfg(
     num_rows: int, k: int, blk: int, minb: int, vpt: int, deg: bool, num_sms: int, sm_version: int
 ) -> tuple:
-    """One ladder rung: the _varlen_launcher register-branch flags evaluated at this
-    rung's window (n_esc = 4*blk*vpt) with the ENGINE's CTA shape (blk, minb) -- a
-    sub-CTA rung passes its own blk/minb (256/8, 512/4), not the plan's."""
-    n_esc = 4 * blk * vpt
+    """One ladder rung: the register-engine flags at this rung's window (4*blk*vpt)
+    with the ENGINE's CTA shape (blk, minb) -- a sub-CTA rung passes its own blk/minb
+    (256/8, 512/4), not the plan's."""
+    f = _reg_flags(num_rows, k, 4 * blk * vpt, blk, vpt, minb, num_sms, sm_version)
     kpt = 1 if deg else (1 if k <= blk else (2 if k <= 2 * blk else 4))
     nbh = 2 * NB if blk == 1024 else NB
-    stage_output = num_rows > num_sms and not (
-        k <= 512 and n_esc <= 2 * k and num_rows <= 2 * num_sms
-    )
-    if k == 2048 and n_esc > k and num_rows <= num_sms and sm_version in (100, 103):
-        stage_output = True
-    small_k_resident = k == 512 and num_rows > num_sms and n_esc > 4096 and sm_version in (100, 103)
-    dense_bracket = k <= 512
-    dense_lower_bound = k > 512 and n_esc < 2 * k
-    bracket_sample_lanes = 32 if (k == 1024 and 6144 < n_esc <= 8192) else 1
-    warp_rank = (
-        ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
-        and n_esc > k
-        and sm_version in (100, 103)
-    )
-    rematerialize_bins = (
-        (small_k_resident and (num_rows > 2 * num_sms or n_esc <= 8192))
-        or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_esc >> 2) <= 2048)
-        or (
-            sm_version in (100, 103)
-            and k == 2048
-            and num_rows > 6 * num_sms
-            and (blk, vpt, minb) == (256, 5, 4)
-        )
-    )
     return (
         int(blk),
         int(minb),
@@ -871,12 +880,12 @@ def _reg_engine_cfg(
         int(kpt),
         int(nbh),
         bool(deg),
-        bool(stage_output),
-        bool(rematerialize_bins),
-        bool(dense_bracket),
-        bool(warp_rank),
-        int(bracket_sample_lanes),
-        bool(dense_lower_bound),
+        bool(f["stage_output"]),
+        bool(f["rematerialize_bins"]),
+        bool(f["dense_bracket"]),
+        bool(f["warp_rank"]),
+        int(f["bracket_sample_lanes"]),
+        bool(f["dense_lower_bound"]),
         int(k),
     )
 
@@ -1054,15 +1063,11 @@ def _varlen_launcher(
     # size, all safe upper bounds for every per-row n <= envelope; per-row n
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
-        stage_output = num_rows > num_sms and not (
-            k <= 512 and n_kernel <= 2 * k and num_rows <= 2 * num_sms
-        )
-        if k == 2048 and n_kernel > k and num_rows <= num_sms and sm_version in (100, 103):
-            stage_output = True
-        small_k_resident = (
-            k == 512 and num_rows > num_sms and n_kernel > 4096 and sm_version in (100, 103)
-        )
-        static_k = None if k <= 512 and tuple(plan_free["tpl"][:2]) == (1024, 1) else k
+        blk_f, vpt_f, minb_f = plan_free["tpl"][:3]
+        f = _reg_flags(num_rows, k, n_kernel, blk_f, vpt_f, minb_f, num_sms, sm_version)
+        stage_output = f["stage_output"]
+        small_k_resident = f["small_k_resident"]
+        static_k = None if k <= 512 and (blk_f, vpt_f) == (1024, 1) else k
         fn = dev.get_compiled__reg(
             tuple(plan_free["tpl"]),
             varlen=True,
@@ -1076,28 +1081,17 @@ def _varlen_launcher(
             if (
                 k in (1024, 2048)
                 or small_k_resident
-                or (k == 1024 and plan_free["tpl"][0] == 512 and plan_free["tpl"][1] >= 5)
+                or (k == 1024 and blk_f == 512 and vpt_f >= 5)
                 or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
             )
             and n_kernel > k
             and sm_version in (100, 103)
             else None,
-            dense_bracket=k <= 512,
-            dense_lower_bound=k > 512 and n_kernel < 2 * k,
-            bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8192 else 1,
-            warp_rank=(
-                ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
-                and n_kernel > k
-                and sm_version in (100, 103)
-            ),
-            rematerialize_bins=(small_k_resident and (num_rows > 2 * num_sms or n_kernel <= 8192))
-            or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
-            or (
-                sm_version in (100, 103)
-                and k == 2048
-                and num_rows > 6 * num_sms
-                and tuple(plan_free["tpl"][:3]) == (256, 5, 4)
-            ),
+            dense_bracket=f["dense_bracket"],
+            dense_lower_bound=f["dense_lower_bound"],
+            bracket_sample_lanes=f["bracket_sample_lanes"],
+            warp_rank=f["warp_rank"],
+            rematerialize_bins=f["rematerialize_bins"],
         )
         rt_f = plan_free["rt"]
         lc = (
