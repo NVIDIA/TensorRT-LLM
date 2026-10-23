@@ -1019,6 +1019,26 @@ class PrecheckRunner:
             )
         return role_configs[self.role]
 
+    def _provision_rank_info_auth_key(self):
+        """Share one precheck key through the private rendezvous file, then MPI."""
+        result = None
+        if self.is_leader:
+            try:
+                path = os.path.join(self.work_dir, "rendezvous", "rank_info_auth.addr")
+                if self.is_ctx and self.server_idx == 0:
+                    write_addr(path, {"key": secrets.token_hex(32)})
+                payload = wait_for_addr(path, self.plan["setup_timeout_s"])
+                key = bytes.fromhex(payload["key"])
+                if len(key) != 32:
+                    raise ValueError("Invalid precheck RankInfo key length")
+                result = (key, None)
+            except Exception as exc:  # noqa: BLE001 - every rank must reach the broadcast
+                result = (None, f"RankInfo key provisioning failed: {type(exc).__name__}")
+        key, error = self.comm.bcast(result, root=0)
+        if error is not None:
+            raise RuntimeError(error)
+        return key
+
     def setup(self, kv_shape, max_req_len):
         cache_cfg = None
         local_err = None
@@ -1033,6 +1053,7 @@ class PrecheckRunner:
         if any(contract != contracts[0] for contract in contracts[1:]):
             raise RuntimeError(f"resolved transfer contract mismatch within instance: {contracts}")
 
+        cache_cfg._rank_info_auth_key = self._provision_rank_info_auth_key()
         api = load_internal_apis()
         self.llm_request_state = api.LlmRequestState
         par = self.side["parallel"]

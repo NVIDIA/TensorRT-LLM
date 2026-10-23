@@ -256,6 +256,23 @@ generation_servers:
       - "localhost:8003"
 ```
 
+The supplied SLURM benchmark, simple-example, and local Ray/MPI launch scripts
+generate a fresh shared authentication key for each deployment and provision it
+in private worker/proxy configuration files; users do not need to supply a key.
+The service-discovery script already generates a shared key when none is supplied.
+The [local OpenEngine launcher](../../tensorrt_llm/grpc/openengine/README.md#disaggregated-serving)
+also provisions a fresh shared key for its context/generation gRPC pair.
+The shared `disaggregated_mpi_worker` job uses the launcher's key when present;
+otherwise rank 0 generates a native RankInfo key and broadcasts it before the
+job splits into context and generation groups. The generated MPI key is internal
+to those workers, not an HTTP key for a separately started proxy.
+Upgrade communicating workers together because the authenticated RankInfo
+protocol is incompatible with older workers.
+
+Automatic provisioning here covers these launchers, not manual commands or
+Kubernetes. Programmatic native-transceiver callers must still provision matching
+`CacheTransceiverConfig._rank_info_auth_key` bytes before constructing their LLMs.
+
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
 server config and in each context/generation worker config. The proxy signs internal
