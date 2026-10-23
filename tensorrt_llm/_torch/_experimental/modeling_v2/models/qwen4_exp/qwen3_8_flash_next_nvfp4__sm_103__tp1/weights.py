@@ -428,6 +428,64 @@ def _mtp_fc2_s(t: torch.Tensor, core) -> torch.Tensor:
     return t.to(torch.float32).contiguous()
 
 
+#: The layout argument of the draft experts' NVFP4 copy: the draft MoE runs it on trtllm-gen
+#: whatever the trunk's routed backend is.
+_TRTLLM_GEN_LAYOUT = SimpleNamespace(trunk_moe_backend="TRTLLM")
+
+#: `448 * 6`: an NVFP4 global scale is this over the tensor's amax (modelopt's recipe).
+NVFP4_AMAX_TO_GLOBAL = 448.0 * 6.0
+
+
+def _fp8_block_dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """`[E, N, K]` e4m3 codes times their `[E, N/128, K/128]` fp32 block scales, in fp32."""
+    s = scales.repeat_interleave(FP8_BLOCK, 1).repeat_interleave(FP8_BLOCK, 2)
+    return codes.float() * s
+
+
+def mtp_experts_to_nvfp4(fc1_w, fc1_s, fc2_w, fc2_s, chunk: int = 32) -> tuple:
+    """Requantize the draft layer's FP8 128x128 block-scaled experts to NVFP4 in the
+    trunk's trtllm-gen layout (`_expert_fc1_w/_s`, `_expert_fc2_w/_s`).
+
+    Per expert and projection (FC1's up|gate share one, as the fused FC1's alpha
+    requires): dequantize with the block scales, take the global scale
+    `448 * 6 / amax`, then `fp4_quantize` (16-element blocks, e4m3 block scales,
+    linear order), which then gets the trunk's row permutation and 128x4 swizzle.
+    Returns `(fc1_w [E, 2I, H/2], fc1_s [E, 2I, H/16], fc2_w [E, H, I/2],
+    fc2_s [E, H, I/16])` uint8 and the fp32 `[E]` weight global scales `(g1, g2)`;
+    a weight's real value is its NVFP4 reconstruction over its global scale.
+    `fc1_w` / `fc1_s` are the `[up ; gate]` stacks `_mtp_fc1_w` / `_mtp_fc1_s` build."""
+    experts, two_i, hidden = fc1_w.shape
+    inter = two_i // 2
+    dev = fc1_w.device
+    u8 = torch.uint8
+    out = (
+        torch.empty(experts, two_i, hidden // 2, dtype=u8, device=dev),
+        torch.empty(experts, two_i, hidden // SF_VEC, dtype=u8, device=dev),
+        torch.empty(experts, hidden, inter // 2, dtype=u8, device=dev),
+        torch.empty(experts, hidden, inter // SF_VEC, dtype=u8, device=dev),
+    )
+    g1 = torch.empty(experts, dtype=torch.float32, device=dev)
+    g2 = torch.empty(experts, dtype=torch.float32, device=dev)
+    layout = _TRTLLM_GEN_LAYOUT
+    for e0 in range(0, experts, chunk):
+        e1 = min(e0 + chunk, experts)
+        w1 = _fp8_block_dequant(fc1_w[e0:e1], fc1_s[e0:e1])
+        w2 = _fp8_block_dequant(fc2_w[e0:e1], fc2_s[e0:e1])
+        g1[e0:e1] = NVFP4_AMAX_TO_GLOBAL / w1.abs().amax(dim=(1, 2)).clamp_min(1e-30)
+        g2[e0:e1] = NVFP4_AMAX_TO_GLOBAL / w2.abs().amax(dim=(1, 2)).clamp_min(1e-30)
+        w1, w2 = w1.to(torch.bfloat16), w2.to(torch.bfloat16)
+        for j, e in enumerate(range(e0, e1)):
+            q, s = torch.ops.trtllm.fp4_quantize(w1[j], g1[e : e + 1], SF_VEC, False, False)
+            s = s.view(two_i, hidden // SF_VEC)
+            out[0][e] = _expert_fc1_w((q[:inter], q[inter:]), layout)
+            out[1][e] = _expert_fc1_s((s[:inter], s[inter:]), layout)
+            q, s = torch.ops.trtllm.fp4_quantize(w2[j], g2[e : e + 1], SF_VEC, False, False)
+            out[2][e] = _expert_fc2_w(q, layout)
+            out[3][e] = _expert_fc2_s(s.view(hidden, inter // SF_VEC), layout)
+        del w1, w2
+    return (*out, g1, g2)
+
+
 def _materialize(entry) -> torch.Tensor:
     """Realize one checkpoint entry: `[:]` on a lazy safetensors slice, but a
     0-dim tensor (every NVFP4 per-tensor scalar on this checkpoint) rejects that

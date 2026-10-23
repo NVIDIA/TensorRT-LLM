@@ -132,6 +132,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    fp4_quantize,
+)
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -703,6 +706,29 @@ _NVFP4_BLOCK = 16
 #: False: plain `amax / 448` scale (the runner's recipe). True: power-of-two
 #: (UE8M0), a different quantization of the same input.
 _MTP_MOE_USE_UE8M0 = False
+
+#: Set to 1 to run the draft layer's routed experts in NVFP4 on the trunk's trtllm-gen runner:
+#: at load the checkpoint's FP8 128x128 block-scaled experts are requantized (per-expert weight
+#: global scales, 16-element e4m3 block scales) into the trunk's layout and the FP8 copies are
+#: freed. The draft only proposes tokens -- the verify step decides what is emitted -- so this
+#: can change the acceptance length, not outputs. 0 (default): the FP8 block-scale runner.
+_MTP_MOE_NVFP4_ENV = "TRTLLM_MODELING_V2_MTP_MOE_NVFP4"
+
+#: The NVFP4 draft MoE's two activation global scales are static, `448 * 6 / A` with `A` this
+#: factor times the largest calibrated amax of the trunk's routed experts (its `input_scale`s,
+#: FC1 input and FC2 input respectively; the draft layer carries none). A global scale only has
+#: to keep the e4m3 block scales inside their range, whose 3-bit precision is the same from
+#: 2^-6 to 448: a block whose amax exceeds `A` is clipped, one below `A / 28672` loses scale
+#: precision, so the margin costs nothing until blocks are ~1e-3 of `A`.
+_MTP_MOE_NVFP4_FC1_MARGIN = 8.0
+_MTP_MOE_NVFP4_FC2_MARGIN = 4.0
+
+
+def _mtp_moe_nvfp4_enabled() -> bool:
+    mode = os.environ.get(_MTP_MOE_NVFP4_ENV, "0")
+    assert mode in ("0", "1"), f"{_MTP_MOE_NVFP4_ENV}={mode!r}: expected 0 or 1"
+    return mode == "1"
+
 
 #: The history depth of the GDN cached-replay verify path (the manager's
 #: `replay_history_size`). The replay entry is certified at 16 only, and a manager that
@@ -1636,6 +1662,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self.kv_scale_quant_orig: torch.Tensor | None = None
         # MTP module operands; None with speculation off.
         self._mtp: _MtpWeights | None = None
+        # The draft experts' NVFP4 copy (`_mtp_moe_nvfp4`), built once: it frees the FP8 ones.
+        self._mtp_moe_nvfp4: dict | None = None
         self._mtp_cos_sin: torch.Tensor | None = None
         # The verify step's side-cache rollback, registered with the spec worker; None
         # with speculation off.
@@ -1775,6 +1803,10 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self._report_ple_residency()
         if self.mtp_enabled:
             self._mtp = _mtp_views(self)
+            if _mtp_moe_nvfp4_enabled() and device.type == "cuda":
+                if self._mtp_moe_nvfp4 is None:
+                    self._mtp_moe_nvfp4 = _mtp_moe_nvfp4(self)
+                self._mtp = self._mtp._replace(**self._mtp_moe_nvfp4)
 
         self._fuse_hc_first_projections()
         if self.mtp_enabled:
@@ -2509,6 +2541,13 @@ class _MtpWeights(NamedTuple):
     fhc_norm: tuple
     fhc_down: torch.Tensor
     fhc_up: torch.Tensor
+    # With `_MTP_MOE_NVFP4_ENV`, `fc1_w` .. `fc2_s` are the NVFP4 copy in the trunk's
+    # trtllm-gen layout and these are its static activation global scale `[1]` and the
+    # runner's three per-expert scalars; None on the FP8 block-scale path.
+    moe_gscale: torch.Tensor | None = None
+    out1_scale: torch.Tensor | None = None
+    out1_gate_scale: torch.Tensor | None = None
+    out2_scale: torch.Tensor | None = None
 
 
 def _mtp_views(core: Qwen4ExpTp1ModelingV2) -> _MtpWeights:
@@ -2548,6 +2587,82 @@ def _mtp_views(core: Qwen4ExpTp1ModelingV2) -> _MtpWeights:
         fhc_down=w[f"{p}fhc_down"],
         fhc_up=w[f"{p}fhc_up"],
     )
+
+
+def _mtp_moe_nvfp4(core: Qwen4ExpTp1ModelingV2) -> dict:
+    """The draft layer's routed experts requantized to NVFP4 (`_MTP_MOE_NVFP4_ENV`), as the
+    `_MtpWeights` fields `_mtp_routed_nvfp4` reads; frees the FP8 copies.
+
+    The runner's scalars follow `_moe_layer_scalars` (trtllm-gen) with `1 / g_in` and
+    `1 / g_mid` standing for the checkpoint's `input_scale`s and `1 / g_w` for its
+    `weight_scale_2`: `out1_gate = 1 / (g_in * g_w1[e])`, `out1 = out1_gate * g_mid`,
+    `out2 = 1 / (g_mid * g_w2[e])`. The activation scales are static
+    (`_MTP_MOE_NVFP4_FC1_MARGIN` / `_FC2_MARGIN`)."""
+    w = core.w
+    p = f"l{core.mtp_layer_idx}_mtp_"
+    keys = [f"{p}{k}" for k in ("fc1_w", "fc1_s", "fc2_w", "fc2_s")]
+    fc1_w, fc1_s, fc2_w, fc2_s, g_w1, g_w2 = _weights.mtp_experts_to_nvfp4(*(w[k] for k in keys))
+    # Nothing else reads the FP8 experts: `_mtp_views` handed them to `_MtpWeights` only, and
+    # the caller replaces those fields with the NVFP4 copy.
+    for k in keys:
+        w[k].data = w[k].data.new_empty(0)
+    torch.cuda.empty_cache()
+    trunk = range(core.num_layers)
+    in_amax = max(float(w[f"l{i}_e_isc1"].max()) for i in trunk) * _weights.NVFP4_AMAX_TO_GLOBAL
+    mid_amax = max(float(w[f"l{i}_e_isc2"].max()) for i in trunk) * _weights.NVFP4_AMAX_TO_GLOBAL
+    # `1 / g` of each activation quantization.
+    inv_g_in = _MTP_MOE_NVFP4_FC1_MARGIN * in_amax / _weights.NVFP4_AMAX_TO_GLOBAL
+    inv_g_mid = _MTP_MOE_NVFP4_FC2_MARGIN * mid_amax / _weights.NVFP4_AMAX_TO_GLOBAL
+    gate1 = (inv_g_in / g_w1).contiguous()
+    print(
+        f"draft MoE: {len(g_w1)} experts requantized FP8 -> NVFP4 ({_MTP_MOE_NVFP4_ENV}=1), "
+        f"static activation amax FC1 {inv_g_in * _weights.NVFP4_AMAX_TO_GLOBAL:.1f}, "
+        f"FC2 {inv_g_mid * _weights.NVFP4_AMAX_TO_GLOBAL:.1f}",
+        flush=True,
+    )
+    return dict(
+        fc1_w=fc1_w,
+        fc1_s=fc1_s.view(torch.float8_e4m3fn),
+        fc2_w=fc2_w,
+        fc2_s=fc2_s.view(torch.float8_e4m3fn),
+        moe_gscale=torch.full((1,), 1.0 / inv_g_in, dtype=torch.float32, device=fc1_w.device),
+        out1_scale=(gate1 / inv_g_mid).contiguous(),
+        out1_gate_scale=gate1,
+        out2_scale=(inv_g_mid / g_w2).contiguous(),
+    )
+
+
+def _mtp_routed_nvfp4(core: Qwen4ExpTp1ModelingV2, M: _MtpWeights, x: torch.Tensor):
+    """The draft layer's routed experts on their NVFP4 copy: the activation quantized at the
+    static global scale (linear block scales, as the trunk's MoE sites write them), then the
+    trunk's logits-routed trtllm-gen call (its Renormalize routing is the FP8 path's
+    `renorm_moe_routing_op`). Returns the combined `[T, H]` bf16 rows."""
+    logits = cublas_mm(x, M.router)
+    xq, xsf = fp4_quantize(x.contiguous(), M.moe_gscale, _SF_VEC, False, False)
+    return fp4_block_scale_moe_renorm_routed(
+        logits,
+        xq,
+        xsf.view(torch.float8_e4m3fn),
+        M.fc1_w,
+        M.fc1_s,
+        M.fc2_w,
+        M.fc2_s,
+        M.out1_scale,
+        M.out1_gate_scale,
+        M.out2_scale,
+        core.num_experts,
+        core.topk,
+        core.moe_inter,
+    )
+
+
+def _mtp_moe_nvfp4_block(core: Qwen4ExpTp1ModelingV2, M: _MtpWeights, x: torch.Tensor):
+    """The draft layer's MoE on the NVFP4 experts (`_mtp_routed_nvfp4`) plus its bf16 shared
+    expert, combined as on the FP8 path."""
+    routed = _mtp_routed_nvfp4(core, M, x)
+    shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, M.sh_gu)), M.sh_dn)
+    gate_logits = cublas_mm(x, M.sh_gate)
+    return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
 
 class _MtpFused(NamedTuple):
@@ -4348,9 +4463,12 @@ class PrefillTarget:
         straight through; never reshape it. At `tokens == hidden/128` (20, an
         ordinary decode batch) the shapes coincide, so nothing would catch a
         re-materialization. Pre-routed; `routing_bias` must be `None` (the entry
-        refuses one)."""
+        refuses one). With `_MTP_MOE_NVFP4_ENV` the routed experts run NVFP4
+        (`_mtp_moe_nvfp4_block`)."""
         core = self.core
         M = core._mtp
+        if M.moe_gscale is not None:
+            return _mtp_moe_nvfp4_block(core, M, x)
         logits = cublas_mm(x, M.router)
         topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=dt)
         xq, xsf = fp8_quantize_1x128(x, use_ue8m0=_MTP_MOE_USE_UE8M0)
@@ -5933,9 +6051,12 @@ class DecodeTarget:
     # ------------------------------------------------------------- the draft ---
 
     def _mtp_moe_block(self, x, dt) -> torch.Tensor:
-        """FP8 block-scale draft MoE; see `PrefillTarget._mtp_moe_block`."""
+        """FP8 block-scale (or, with `_MTP_MOE_NVFP4_ENV`, NVFP4) draft MoE; see
+        `PrefillTarget._mtp_moe_block`."""
         core = self.core
         M = core._mtp
+        if M.moe_gscale is not None:
+            return _mtp_moe_nvfp4_block(core, M, x)
         logits = cublas_mm(x, M.router)
         topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=dt)
         xq, xsf = fp8_quantize_1x128(x, use_ue8m0=_MTP_MOE_USE_UE8M0)
