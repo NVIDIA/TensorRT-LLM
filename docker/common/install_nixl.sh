@@ -3,17 +3,35 @@
 # SPDX-License-Identifier: Apache-2.0
 set -ex
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Authenticate the github.com clone below; no-op when no token is available.
-source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+source "${SCRIPT_DIR}/github_auth.sh"
 
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
-# Default prefix for AWS EFA bundled with NGC PyTorch images.
-LIBFABRIC_INSTALL_PATH="/opt/amazon/efa"
-if [[ ! -f "${LIBFABRIC_INSTALL_PATH}/include/rdma/fabric.h" ||
-      ! -f "${LIBFABRIC_INSTALL_PATH}/lib/libfabric.so" ]]; then
-    LIBFABRIC_INSTALL_PATH=""
-fi
+
+# Interm build, minimum supported libfabric version the NIXL LIBFABRIC plugin works with, retained for backward compatibility.
+LIBFABRIC_VERSION="v1.21.0"
+LIBFABRIC_INSTALL_PATH="/tmp/libfabric"
+wget "https://github.com/ofiwg/libfabric/releases/download/${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION#v}.tar.bz2" -O libfabric.tar.bz2
+tar xjf libfabric.tar.bz2 && rm libfabric.tar.bz2
+cd libfabric-*
+./autogen.sh
+./configure --prefix=${LIBFABRIC_INSTALL_PATH} \
+            --disable-verbs \
+            --disable-psm3 \
+            --disable-opx \
+            --disable-usnic \
+            --enable-efa \
+            --with-cuda=/usr/local/cuda \
+            --enable-cuda-dlopen \
+            --with-gdrcopy \
+            --enable-gdrcopy-dlopen
+make -j${NPROC:-$(nproc)}
+make install
+cd ../
+rm -rf libfabric*
+
 # NGC PyTorch's default Open MPI comes from HPC-X and is exposed at /usr/local/mpi.
 # Reuse the hwloc bundled with that MPI installation for the EFA plugin.
 HWLOC_INSTALL_PATH="/usr/local/mpi"
@@ -69,6 +87,7 @@ meson setup builddir \
 cd builddir && ninja install
 cd ../..
 rm -rf nixl*  # Remove NIXL source tree to save space
+rm -rf /tmp/libfabric # Remove libfabric interim build
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
 
 # Consumers import `nixl`, but the build above installs the backend as
