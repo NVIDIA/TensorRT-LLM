@@ -50,8 +50,21 @@ when KV-cache block reuse lets them share the parent's blocks. Rows whose block
 tables start with identical pages form a group; the group's common full pages
 are read once for all of its queries and every row attends to its own remaining
 pages (partial prompt block and generated tokens) with a paged decode call. The
-two states are merged as above. This path needs a non-CUDA-graph batch and
-declines (the regular kernel runs) when no group shares a prefix.
+two states are merged as above. An eager batch in which no group shares a
+prefix is declined (the regular kernel runs).
+
+Under CUDA graphs the n-sample path is captured for every generation batch
+size of two or more rows. Each captured batch size owns fixed-address buffers:
+the prefix call is planned for a fixed number of groups (up to
+``TLLM_BEAM_SHARED_PREFIX_MAX_GROUPS`` sharing groups plus one placeholder
+group for the rows without a shared prefix, padded with empty groups), the
+tail call for one entry per row, and the per-step indices (KV write page and
+slot, group order, placeholder mask) live in one device buffer. ``prepare``
+refreshes all of them before every replay with one host-to-device copy, and
+re-plans the FlashInfer work lists only when the grouping or a page count
+changes. The captured kernels read nothing else that changes between steps,
+so any batch of the captured size is served: surplus sharing groups and rows
+without a shared prefix are attended through the tail call alone.
 
 Opt in with ``TLLM_FMHA_LIBS=+beam_shared_prefix``.
 ``TLLM_BEAM_SHARED_PREFIX_MAX_TAIL`` (default 8) bounds how many generated
@@ -61,8 +74,10 @@ loudly at planning time rather than truncated.
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
+import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -74,6 +89,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
@@ -105,6 +121,11 @@ BACKEND_ENV = "TLLM_BEAM_SHARED_PREFIX_BACKEND"
 family the TRTLLM FlashInfer backend pins for paged prefill; ``fa3`` or
 ``auto`` select the Hopper kernels."""
 DEFAULT_BACKEND = "fa2"
+MAX_GROUPS_ENV = "TLLM_BEAM_SHARED_PREFIX_MAX_GROUPS"
+DEFAULT_MAX_GROUPS = 64
+"""Sharing groups the prefix call of a captured n-sample batch can hold (capped
+at half the rows). The FlashInfer work list and its float workspace grow with
+it; the rows of further groups are attended through the tail call alone."""
 CHECK_ENV = "TLLM_BEAM_SHARED_PREFIX_CHECK"
 """Set to 1 to synchronize after every stage of the step and validate the
 page table and the prefix attention against dense references. Debugging aid:
@@ -379,6 +400,12 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     if sampling_metadata_eligible(metadata):
         _plan_sampling_step(metadata)
         return
+    if sampling_state is not None and sampling_state.captured:
+        # A graph captured with the n-sample path would replay stale buffers.
+        raise RuntimeError(
+            f"{LIB_NAME}: CUDA graph metadata captured with the n-sample path no longer "
+            "satisfies its preconditions."
+        )
     if not metadata_eligible(metadata):
         return
     state = metadata.fmha_plan_caches.get(LIB_NAME)
@@ -653,6 +680,212 @@ def merge_prefix_and_tail(
 # n-sample requests (beam_width == 1)
 # --------------------------------------------------------------------------- #
 @dataclass
+class _Grouping:
+    """Row grouping of one batch composition and the page tables derived from it.
+
+    Rows whose block tables start with the same full pages form a sharing group
+    that reads those pages once (``prefix``); every other row joins a single
+    placeholder group whose prefix call runs over one token and is masked out
+    of the merge. Prefix and tail tensors are in ``perm`` order (the rows of a
+    group are contiguous there); the KV write page is in batch order.
+
+    A grouping stays valid while the batch keeps the same rows, each with the
+    same first page and the same number of full pages before its current
+    token: block tables only grow, so nothing it holds can change otherwise.
+    Between two page boundaries only the last-page lengths and the write slots
+    move, and those are derived per step from the KV lengths.
+    """
+
+    version: int
+    num_rows: int
+    table_rows: torch.Tensor
+    """[rows] int64: host block-table row of each batch row."""
+    first_pages: torch.Tensor
+    """[rows] int64: first pool page of each row (cache validation)."""
+    private_from: torch.Tensor
+    """[rows] int64: index of the page holding the current token."""
+    num_groups: int
+    """Groups handed to the prefix call, placeholder and padding groups included."""
+    num_sharing: int
+    """Groups that share at least one page."""
+    num_placeholder_rows: int
+    shared_tokens: int
+    """Prompt tokens read once per group instead of once per row, summed over rows."""
+    perm: torch.Tensor
+    """[rows] int64: batch row of each grouped position."""
+    is_identity: bool
+    qo_indptr: torch.Tensor
+    """[num_groups + 1] int32 host."""
+    prefix_indptr: torch.Tensor
+    prefix_indices: torch.Tensor
+    prefix_last_page_len: torch.Tensor
+    prefix_empty: torch.Tensor
+    """[rows] bool, grouped order: the row sits in the placeholder group."""
+    blocks_g: torch.Tensor
+    """[rows] int64, grouped order: pages up to and including the current token."""
+    tail_indptr: torch.Tensor
+    tail_indices: torch.Tensor
+    write_page: torch.Tensor
+    """[rows] int64, batch order: pool page of the current token."""
+    check_pages: Optional[torch.Tensor] = None
+    """[rows, pages] int64 full page tables; only kept in check mode."""
+
+
+def _build_grouping(
+    version: int,
+    table_rows: torch.Tensor,
+    pages_all: torch.Tensor,
+    kv_lens: torch.Tensor,
+    tokens_per_block: int,
+    *,
+    max_sharing_groups: Optional[int],
+    padded_groups: Optional[int],
+    keep_check_pages: bool,
+) -> _Grouping:
+    """Group rows by common leading pages and build the prefix and tail tables.
+
+    Two rows share a prefix when their block tables start with the same pool
+    page. A group's shared pages are the longest common run of full pages that
+    lie entirely before every member's current token; everything after that
+    run, the current token's page included, stays private to the row.
+
+    Args:
+        pages_all: [rows, pages] int64 page tables covering every row's pages.
+        kv_lens: [rows] int64, >= 1.
+        max_sharing_groups: keep at most this many sharing groups (those that
+            save the most page reads); the rows of the others join the
+            placeholder group. None keeps all of them.
+        padded_groups: with a value, the prefix call always gets exactly this
+            many groups: the sharing groups, the placeholder group (possibly
+            without rows) and empty padding groups. Without one, the
+            placeholder group exists only when it has rows.
+    """
+    rows, width = pages_all.shape
+    i64 = torch.int64
+    row_ids = torch.arange(rows, dtype=i64)
+    num_blocks = (kv_lens + tokens_per_block - 1) // tokens_per_block
+    private_from = (kv_lens - 1) // tokens_per_block
+
+    first_pages = pages_all[:, 0]
+    _, key_of_row = torch.unique(first_pages, return_inverse=True)
+    num_keys = int(key_of_row.max()) + 1
+    leader = torch.full((num_keys,), rows, dtype=i64).scatter_reduce_(
+        0, key_of_row, row_ids, "amin"
+    )
+    members = torch.bincount(key_of_row, minlength=num_keys)
+    cap = torch.full((num_keys,), width, dtype=i64).scatter_reduce_(
+        0, key_of_row, private_from, "amin"
+    )
+    max_cap = int(cap.max())
+    if max_cap > 0:
+        cols = pages_all[:, :max_cap]
+        same = cols == cols[leader[key_of_row]]
+        same &= torch.arange(max_cap, dtype=i64).view(1, -1) < cap[key_of_row].view(-1, 1)
+        run = same.to(torch.int32).cumprod(dim=1).sum(dim=1).to(i64)
+        shared = torch.full((num_keys,), width, dtype=i64).scatter_reduce_(
+            0, key_of_row, run, "amin"
+        )
+        shared = torch.where(members > 1, shared, torch.zeros_like(shared))
+    else:
+        shared = torch.zeros((num_keys,), dtype=i64)
+
+    sharing = torch.nonzero(shared > 0).flatten()
+    if max_sharing_groups is not None and sharing.numel() > max_sharing_groups:
+        saved = shared[sharing] * (members[sharing] - 1)
+        sharing = sharing[torch.topk(saved, max_sharing_groups).indices]
+    # Sharing groups in order of their first row; the placeholder group last.
+    sharing = sharing[torch.argsort(leader[sharing])]
+    num_sharing = int(sharing.numel())
+    rank = torch.full((num_keys,), num_sharing, dtype=i64)
+    rank[sharing] = torch.arange(num_sharing, dtype=i64)
+    row_group = rank[key_of_row]
+    in_sharing = row_group < num_sharing
+    row_shared = torch.where(in_sharing, shared[key_of_row], torch.zeros_like(row_ids))
+    perm = torch.argsort(row_group * rows + row_ids)
+    is_identity = bool(torch.equal(perm, row_ids))
+
+    group_sizes = members[sharing]
+    group_shared = shared[sharing]
+    num_placeholder_rows = rows - int(group_sizes.sum())
+    if num_sharing:
+        lead_pages = pages_all[leader[sharing], : int(group_shared.max())]
+        mask = torch.arange(lead_pages.size(1), dtype=i64).view(1, -1) < group_shared.view(-1, 1)
+        sharing_pages = lead_pages[mask]
+    else:
+        sharing_pages = torch.zeros((0,), dtype=i64)
+    # Any valid page serves the placeholder: its output is masked out.
+    placeholder_page = (
+        int(first_pages[perm[rows - num_placeholder_rows]])
+        if num_placeholder_rows
+        else int(first_pages[0])
+    )
+    if padded_groups is None:
+        extra = 1 if num_placeholder_rows else 0
+        sizes = torch.cat([group_sizes, torch.tensor([num_placeholder_rows] * extra, dtype=i64)])
+    else:
+        extra = padded_groups - num_sharing
+        if extra < 1:
+            raise RuntimeError(
+                f"{LIB_NAME}: {num_sharing} sharing groups leave no room for the placeholder "
+                f"group in {padded_groups} padded groups."
+            )
+        sizes = torch.cat(
+            [
+                group_sizes,
+                torch.tensor([num_placeholder_rows], dtype=i64),
+                torch.zeros((extra - 1,), dtype=i64),
+            ]
+        )
+    num_groups = num_sharing + extra
+    qo_indptr = torch.zeros((num_groups + 1,), dtype=torch.int32)
+    qo_indptr[1:] = torch.cumsum(sizes, dim=0).to(torch.int32)
+    prefix_pages = torch.cat([group_shared, torch.ones((extra,), dtype=i64)])
+    prefix_indptr = torch.zeros((num_groups + 1,), dtype=torch.int32)
+    prefix_indptr[1:] = torch.cumsum(prefix_pages, dim=0).to(torch.int32)
+    prefix_indices = torch.cat(
+        [sharing_pages, torch.full((extra,), placeholder_page, dtype=i64)]
+    ).to(torch.int32)
+    prefix_last_page_len = torch.cat(
+        [
+            torch.full((num_sharing,), tokens_per_block, dtype=torch.int32),
+            torch.ones((extra,), dtype=torch.int32),
+        ]
+    )
+
+    blocks_g = num_blocks[perm]
+    shared_g = row_shared[perm]
+    pages_g = pages_all[perm]
+    block_ids = torch.arange(width, dtype=i64).view(1, -1)
+    in_tail = (block_ids >= shared_g.view(-1, 1)) & (block_ids < blocks_g.view(-1, 1))
+    tail_indptr = torch.zeros((rows + 1,), dtype=torch.int32)
+    tail_indptr[1:] = torch.cumsum(blocks_g - shared_g, dim=0).to(torch.int32)
+
+    return _Grouping(
+        version=version,
+        num_rows=rows,
+        table_rows=table_rows,
+        first_pages=first_pages,
+        private_from=private_from,
+        num_groups=num_groups,
+        num_sharing=num_sharing,
+        num_placeholder_rows=num_placeholder_rows,
+        shared_tokens=int((group_shared * group_sizes).sum()) * tokens_per_block,
+        perm=perm,
+        is_identity=is_identity,
+        qo_indptr=qo_indptr,
+        prefix_indptr=prefix_indptr,
+        prefix_indices=prefix_indices,
+        prefix_last_page_len=prefix_last_page_len,
+        prefix_empty=~in_sharing[perm],
+        blocks_g=blocks_g,
+        tail_indptr=tail_indptr,
+        tail_indices=pages_g[in_tail].to(torch.int32),
+        write_page=pages_all[row_ids, private_from],
+        check_pages=pages_all if keep_check_pages else None,
+    )
+
+
+@dataclass
 class _SamplingPlan:
     """Host-side description of one n-sample generation step, shared by all layers.
 
@@ -662,34 +895,74 @@ class _SamplingPlan:
     """
 
     step: int
-    num_rows: int
-    num_groups: int
-    shared_tokens: int
-    """Prompt tokens read once per group instead of once per row, summed over rows."""
-    perm: Optional[torch.Tensor]
-    """[rows] int64: batch row of each grouped position; None when the batch is already grouped."""
-    qo_indptr: torch.Tensor
-    prefix_indptr: torch.Tensor
-    prefix_indices: torch.Tensor
-    prefix_last_page_len: torch.Tensor
-    prefix_empty: torch.Tensor
-    """[rows] bool, grouped order: the row's group has no shared page and its
-    prefix call runs over a one-token placeholder that the merge drops."""
-    has_empty: bool
-    tail_indptr: torch.Tensor
-    tail_indices: torch.Tensor
+    grouping: _Grouping
     tail_last_page_len: torch.Tensor
-    write_page: torch.Tensor
-    """[rows] int64, batch order: pool page of the current token."""
+    """[rows] int32, grouped order."""
     write_slot: torch.Tensor
-    check_pages: Optional[torch.Tensor] = None
-    """[rows, max_blocks] int64 full page tables; only kept in check mode."""
+    """[rows] int64, batch order: slot of the current token inside its page."""
     check_kv_lens: Optional[torch.Tensor] = None
+
+    @property
+    def num_rows(self) -> int:
+        return self.grouping.num_rows
+
+    @property
+    def num_groups(self) -> int:
+        return self.grouping.num_groups
+
+    @property
+    def shared_tokens(self) -> int:
+        return self.grouping.shared_tokens
+
+    @property
+    def perm(self) -> Optional[torch.Tensor]:
+        """None when the batch is already in grouped order."""
+        return None if self.grouping.is_identity else self.grouping.perm
+
+    @property
+    def qo_indptr(self) -> torch.Tensor:
+        return self.grouping.qo_indptr
+
+    @property
+    def prefix_indptr(self) -> torch.Tensor:
+        return self.grouping.prefix_indptr
+
+    @property
+    def prefix_indices(self) -> torch.Tensor:
+        return self.grouping.prefix_indices
+
+    @property
+    def prefix_last_page_len(self) -> torch.Tensor:
+        return self.grouping.prefix_last_page_len
+
+    @property
+    def prefix_empty(self) -> torch.Tensor:
+        return self.grouping.prefix_empty
+
+    @property
+    def has_empty(self) -> bool:
+        return self.grouping.num_placeholder_rows > 0
+
+    @property
+    def tail_indptr(self) -> torch.Tensor:
+        return self.grouping.tail_indptr
+
+    @property
+    def tail_indices(self) -> torch.Tensor:
+        return self.grouping.tail_indices
+
+    @property
+    def write_page(self) -> torch.Tensor:
+        return self.grouping.write_page
+
+    @property
+    def check_pages(self) -> Optional[torch.Tensor]:
+        return self.grouping.check_pages
 
 
 @dataclass
 class _SamplingDevice:
-    """Device copies of the step's index tensors, made by the first layer."""
+    """Device copies of an eager step's index tensors, made by the first layer."""
 
     step: int
     perm: Optional[torch.Tensor]
@@ -699,30 +972,267 @@ class _SamplingDevice:
     write_slot: torch.Tensor
 
 
+class _PlanWorkspace:
+    """FlashInfer integer workspace shared by every wrapper of one role and shape.
+
+    ``plan`` fills the page-locked buffer on the host and copies it to the
+    device buffer asynchronously, and ``run`` reads the device buffer. All
+    wrappers of a role run on one stream, one step at a time, so they can share
+    both buffers as long as (a) a wrapper re-plans whenever another one planned
+    into the buffer after it (``owner``) and (b) the host does not overwrite the
+    page-locked buffer before the previous copy out of it executed (``copied``).
+    """
+
+    _INT_WORKSPACE_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, device: torch.device):
+        self.int_buffer = torch.empty(self._INT_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        self.pinned_buffer = torch.empty(
+            self._INT_WORKSPACE_BYTES, dtype=torch.uint8, pin_memory=prefer_pinned()
+        )
+        self.copied = torch.cuda.Event()
+        self.pending = False
+        self.owner = 0
+
+    def bind(self, wrapper: Any) -> None:
+        # FlashInfer 0.6 keeps the integer workspace in these two attributes;
+        # reset_workspace_buffer() would allocate a fresh page-locked buffer.
+        for attr in ("_int_workspace_buffer", "_pin_memory_int_workspace_buffer"):
+            if not hasattr(wrapper, attr):
+                raise RuntimeError(f"{LIB_NAME}: unexpected FlashInfer wrapper without {attr}.")
+        wrapper._int_workspace_buffer = self.int_buffer
+        wrapper._pin_memory_int_workspace_buffer = self.pinned_buffer
+
+    def before_plan(self) -> None:
+        if self.pending:
+            self.copied.synchronize()
+
+    def after_plan(self) -> int:
+        self.copied.record()
+        self.pending = True
+        self.owner = next(_PLAN_TOKENS)
+        return self.owner
+
+
+_PLAN_TOKENS = itertools.count(1)
+_plan_workspaces: Dict[tuple, _PlanWorkspace] = {}
+
+
+def _plan_workspace(device: torch.device, role: str, key: _PlanKey) -> _PlanWorkspace:
+    workspace = _plan_workspaces.get((device, role, key))
+    if workspace is None:
+        workspace = _PlanWorkspace(device)
+        _plan_workspaces[(device, role, key)] = workspace
+    return workspace
+
+
+_graph_float_workspace: Dict[torch.device, torch.Tensor] = {}
+
+
+def _get_graph_float_workspace(device: torch.device, nbytes: int) -> torch.Tensor:
+    """Float workspace of the CUDA graph wrappers, at least ``nbytes`` large.
+
+    Under CUDA graphs FlashInfer always splits the KV and reserves partial
+    results for its padded work list, so the requirement grows with the
+    captured batch. A larger request allocates a new buffer for the wrappers
+    created from then on; earlier wrappers (and the graphs captured with them)
+    keep the buffer they were created with.
+    """
+    workspace = _graph_float_workspace.get(device)
+    if workspace is None or workspace.numel() < nbytes:
+        workspace = torch.empty(
+            max(nbytes, _FLOAT_WORKSPACE_BYTES), dtype=torch.uint8, device=device
+        )
+        _graph_float_workspace[device] = workspace
+    return workspace
+
+
+def _prefill_split_bytes(key: _PlanKey, total_rows: int, batch_size: int, num_sms: int) -> int:
+    """Upper bound of the float workspace a CUDA-graph FA2 prefill plan reserves.
+
+    Mirrors FlashInfer's ``PrefillSplitQOKVIndptr`` under CUDA graphs: the query
+    tile follows from the longest possible request (``total_rows - batch_size
+    + 1`` rows), the work list is padded to ``max(2 * SMs / kv_heads, tiles)``,
+    and every padded entry reserves a ``tile x head_dim`` fp32 partial output
+    plus its LSE per query head.
+    """
+    gqa = key.num_heads // key.num_kv_heads
+    max_qo = (total_rows - batch_size + 1) * gqa
+    tile = 128 if max_qo > 64 else (64 if max_qo > 16 else 16)
+    tiles = -(-total_rows * gqa // tile) + batch_size - 1
+    padded = max((2 * num_sms) // key.num_kv_heads, tiles)
+    return key.num_heads * padded * tile * (key.head_dim + 1) * 4
+
+
+def _graph_float_workspace_bytes(
+    key: _PlanKey, rows: int, groups: int, device: torch.device
+) -> int:
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    prefix = _prefill_split_bytes(key, rows, groups, num_sms)
+    if key.num_heads != key.num_kv_heads:
+        tail = _prefill_split_bytes(key, rows, rows, num_sms)
+    else:
+        # Decode kernel: one fp32 partial row per query head and padded work
+        # item, the work list bounded by the resident CTAs of the device.
+        tail = key.num_heads * max(rows, 32 * num_sms) * (key.head_dim + 1) * 4
+    return max(prefix, tail) + (1 << 20)
+
+
+@dataclass
+class _GraphBuffers:
+    """Fixed-address step inputs of one captured batch size.
+
+    One page-locked staging buffer feeds one device buffer per step with a
+    single asynchronous copy; the captured graph reads the device buffer, so
+    the copy has to precede the replay on the stream (``prepare`` runs first).
+    Layout (int32): write page, write slot, perm, tail last-page length (``rows``
+    each), then the prefix and tail page indices of a regrouping step.
+    """
+
+    rows: int
+    num_groups: int
+    prefix_capacity: int
+    tail_capacity: int
+    staging: torch.Tensor
+    device: torch.Tensor
+    empty_staging: torch.Tensor
+    empty: torch.Tensor
+    """[rows] bool, grouped order: the row's prefix state is a placeholder."""
+    copied: torch.cuda.Event
+    pending: bool = False
+    uploaded_version: int = -1
+    prefix_slice: tuple = (0, 0)
+    tail_slice: tuple = (0, 0)
+
+    @classmethod
+    def create(
+        cls, rows: int, num_groups: int, max_pages: int, device: torch.device
+    ) -> "_GraphBuffers":
+        prefix_capacity = (num_groups - 1) * max_pages + num_groups
+        tail_capacity = rows * max_pages
+        size = 4 * rows + prefix_capacity + tail_capacity
+        return cls(
+            rows=rows,
+            num_groups=num_groups,
+            prefix_capacity=prefix_capacity,
+            tail_capacity=tail_capacity,
+            staging=torch.zeros((size,), dtype=torch.int32, pin_memory=prefer_pinned()),
+            device=torch.zeros((size,), dtype=torch.int32, device=device),
+            empty_staging=torch.zeros((rows,), dtype=torch.bool, pin_memory=prefer_pinned()),
+            empty=torch.zeros((rows,), dtype=torch.bool, device=device),
+            copied=torch.cuda.Event(),
+        )
+
+    def view(self, index: int) -> torch.Tensor:
+        return self.device[index * self.rows : (index + 1) * self.rows]
+
+    @property
+    def write_page(self) -> torch.Tensor:
+        return self.view(0)
+
+    @property
+    def write_slot(self) -> torch.Tensor:
+        return self.view(1)
+
+    @property
+    def perm(self) -> torch.Tensor:
+        return self.view(2)
+
+    @property
+    def tail_last_page_len(self) -> torch.Tensor:
+        return self.view(3)
+
+    def upload(self, plan: _SamplingPlan) -> None:
+        """Stage the step's indices and copy them to the device buffer."""
+        grouping = plan.grouping
+        rows = self.rows
+        if self.pending:
+            # The previous step's copy out of the staging buffer must have run.
+            self.copied.synchronize()
+        staging = self.staging
+        staging[:rows].copy_(grouping.write_page)
+        staging[rows : 2 * rows].copy_(plan.write_slot)
+        staging[3 * rows : 4 * rows].copy_(plan.tail_last_page_len)
+        count = 4 * rows
+        regroup = grouping.version != self.uploaded_version
+        if regroup:
+            num_prefix = grouping.prefix_indices.numel()
+            num_tail = grouping.tail_indices.numel()
+            if num_prefix > self.prefix_capacity or num_tail > self.tail_capacity:
+                raise RuntimeError(
+                    f"{LIB_NAME}: step needs {num_prefix} prefix / {num_tail} tail pages but the "
+                    f"CUDA graph buffers hold {self.prefix_capacity} / {self.tail_capacity}."
+                )
+            staging[2 * rows : 3 * rows].copy_(grouping.perm)
+            staging[count : count + num_prefix].copy_(grouping.prefix_indices)
+            self.prefix_slice = (count, count + num_prefix)
+            count += num_prefix
+            staging[count : count + num_tail].copy_(grouping.tail_indices)
+            self.tail_slice = (count, count + num_tail)
+            count += num_tail
+            self.empty_staging.copy_(grouping.prefix_empty)
+            self.empty.copy_(self.empty_staging, non_blocking=True)
+        self.device[:count].copy_(staging[:count], non_blocking=True)
+        self.copied.record()
+        self.pending = True
+        self.uploaded_version = grouping.version
+
+    @property
+    def prefix_indices(self) -> torch.Tensor:
+        return self.device[self.prefix_slice[0] : self.prefix_slice[1]]
+
+    @property
+    def tail_indices(self) -> torch.Tensor:
+        return self.device[self.tail_slice[0] : self.tail_slice[1]]
+
+
 @dataclass
 class _SamplingState:
     pool_index: int
     page_scale: int
     page_div: int
     num_pages: int
+    graph: Optional[_GraphBuffers] = None
+    """Set for the metadata of a captured batch size."""
     plan: Optional[_SamplingPlan] = None
+    grouping: Optional[_Grouping] = None
+    table_rows_key: Optional[tuple] = None
+    table_rows: Optional[torch.Tensor] = None
     prefix_wrappers: Dict[_PlanKey, Any] = field(default_factory=dict)
     tail_wrappers: Dict[_PlanKey, Any] = field(default_factory=dict)
     planned_step: Dict[_PlanKey, int] = field(default_factory=dict)
+    planned_tokens: Dict[_PlanKey, tuple] = field(default_factory=dict)
+    """Graph wrappers: (grouping version, prefix owner token, tail owner token)
+    of their last plan, to skip re-planning while nothing changed."""
     device: Optional[_SamplingDevice] = None
     step_counter: int = 0
+    grouping_counter: int = 0
+    captured: bool = False
     logged: bool = False
     ran: bool = False
 
 
+def _max_groups_from_env() -> int:
+    value = os.environ.get(MAX_GROUPS_ENV)
+    if value is None or not value.strip():
+        return DEFAULT_MAX_GROUPS
+    groups = int(value)
+    if groups < 1:
+        raise ValueError(f"{MAX_GROUPS_ENV} must be >= 1, got {groups}.")
+    return groups
+
+
 def sampling_metadata_eligible(metadata: "TrtllmAttentionMetadata") -> bool:
-    """Batch-level preconditions of the n-sample path."""
+    """Batch-level preconditions of the n-sample path.
+
+    They depend only on the batch shape and the model configuration, so they
+    hold on every replay of a CUDA graph that was captured with this path.
+    """
     return (
         IS_FLASHINFER_AVAILABLE
         and metadata.beam_width == 1
         and metadata.num_generations > 1
         and metadata.num_contexts == 0
-        and not metadata.is_cuda_graph
         and not metadata.is_cross
         and not metadata.enable_helix
         and not metadata.is_spec_decoding_enabled
@@ -735,15 +1245,34 @@ def sampling_metadata_eligible(metadata: "TrtllmAttentionMetadata") -> bool:
     )
 
 
-def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
-    """Group the batch's rows by shared leading KV pages and build the page tables.
+def _sampling_table_rows(
+    state: _SamplingState, metadata: "TrtllmAttentionMetadata", rows: int
+) -> torch.Tensor:
+    """``_table_rows`` cached while the batch keeps the same requests."""
+    if _is_v2_manager(metadata.kv_cache_manager):
+        request_ids = metadata.request_ids
+        cache_key = tuple(request_ids[:rows]) if request_ids is not None else None
+    else:
+        cache_key = (rows,)
+    if cache_key is None or cache_key != state.table_rows_key:
+        state.table_rows = _table_rows(metadata, rows)
+        state.table_rows_key = cache_key
+    assert state.table_rows is not None
+    return state.table_rows
 
-    Two rows share a prefix when their block tables start with the same pool
-    pages. A group's shared pages are the longest common run of full pages that
-    lie entirely before every member's current token. Everything after that
-    run, including the current token's block, stays private to the row.
+
+def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
+    """Plan an n-sample generation step: group the rows and derive the page tables.
+
+    Eager batches without any sharing group are declined (the regular kernel
+    runs). A CUDA graph batch is always planned, because its graph is captured
+    with this path: rows without a shared prefix take the placeholder group.
     """
     state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
+    rows = metadata.num_generations
+    tokens_per_block = int(metadata.tokens_per_block)
+    host_offsets = metadata.host_kv_cache_block_offsets
+    assert host_offsets is not None
     if state is None:
         kv_cache_manager = metadata.kv_cache_manager
         first_layer = min(kv_cache_manager.layer_offsets)
@@ -755,119 +1284,80 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
             page_div=page_div,
             num_pages=int(pool.size(0)),
         )
+        if metadata.is_cuda_graph:
+            num_groups = min(_max_groups_from_env(), rows // 2) + 1
+            state.graph = _GraphBuffers.create(
+                rows, num_groups, int(host_offsets.size(-1)), metadata.kv_cache_block_offsets.device
+            )
         metadata.fmha_plan_caches[SAMPLING_KEY] = state
+    graph = state.graph
+    if graph is not None and rows != graph.rows:
+        raise RuntimeError(
+            f"{LIB_NAME}: CUDA graph metadata planned for {graph.rows} rows got {rows}."
+        )
     state.step_counter += 1
 
-    rows = metadata.num_generations
-    tokens_per_block = int(metadata.tokens_per_block)
-    host_offsets = metadata.host_kv_cache_block_offsets
-    assert host_offsets is not None
-    table_rows = _table_rows(metadata, rows)
-    pages_all = (
-        host_offsets[state.pool_index, table_rows, 0, :].to(torch.int64)
-        * state.page_scale
-        // state.page_div
-    ).clamp(0, state.num_pages - 1)
-    kv_lens = metadata.kv_lens_runtime[:rows].to(torch.int64)
-    num_blocks = (kv_lens + tokens_per_block - 1) // tokens_per_block
-    # Full pages strictly before the current token (position kv_len - 1).
+    check = _check_enabled()
+    kv_lens = metadata.kv_lens_runtime[:rows].to(torch.int64).clamp(min=1)
+    table_rows = _sampling_table_rows(state, metadata, rows)
     private_from = (kv_lens - 1) // tokens_per_block
-
-    by_first_page: Dict[int, list] = {}
-    for row, page in enumerate(pages_all[:, 0].tolist()):
-        by_first_page.setdefault(page, []).append(row)
-
-    groups: list = []
-    shared_blocks: list = []
-    for members in by_first_page.values():
-        shared = 0
-        if len(members) > 1:
-            member_idx = torch.tensor(members, dtype=torch.int64)
-            cap = int(private_from[member_idx].min())
-            if cap > 0:
-                same = (pages_all[member_idx, :cap] == pages_all[members[0], :cap]).all(dim=0)
-                shared = int(torch.cumprod(same.to(torch.int64), dim=0).sum())
-        groups.append(members)
-        shared_blocks.append(shared)
-    if not any(blocks > 0 for blocks in shared_blocks):
+    offsets = host_offsets[state.pool_index, :, 0, :]
+    first_pages = (
+        offsets[table_rows, 0].to(torch.int64) * state.page_scale // state.page_div
+    ).clamp(0, state.num_pages - 1)
+    grouping = state.grouping
+    if (
+        grouping is None
+        or grouping.num_rows != rows
+        or not torch.equal(grouping.table_rows, table_rows)
+        or not torch.equal(grouping.first_pages, first_pages)
+        or not torch.equal(grouping.private_from, private_from)
+        or (check and grouping.check_pages is None)
+    ):
+        width = int(private_from.max()) + 1
+        pages_all = (
+            offsets[table_rows, :width].to(torch.int64) * state.page_scale // state.page_div
+        ).clamp(0, state.num_pages - 1)
+        state.grouping_counter += 1
+        grouping = _build_grouping(
+            state.grouping_counter,
+            table_rows,
+            pages_all,
+            kv_lens,
+            tokens_per_block,
+            max_sharing_groups=None if graph is None else graph.num_groups - 1,
+            padded_groups=None if graph is None else graph.num_groups,
+            keep_check_pages=check,
+        )
+        state.grouping = grouping
+    if graph is None and grouping.num_sharing == 0:
         return
 
-    order = [row for members in groups for row in members]
-    perm = None if order == list(range(rows)) else torch.tensor(order, dtype=torch.int64)
-    qo_indptr = torch.zeros(len(groups) + 1, dtype=torch.int32)
-    qo_indptr[1:] = torch.cumsum(
-        torch.tensor([len(members) for members in groups], dtype=torch.int64), dim=0
-    ).to(torch.int32)
-
-    prefix_pages = []
-    prefix_lens = []
-    prefix_last = []
-    prefix_empty = []
-    row_shared = torch.zeros(rows, dtype=torch.int64)
-    shared_tokens = 0
-    for members, shared in zip(groups, shared_blocks):
-        if shared > 0:
-            prefix_pages.append(pages_all[members[0], :shared])
-            prefix_last.append(tokens_per_block)
-            row_shared[torch.tensor(members, dtype=torch.int64)] = shared
-            shared_tokens += shared * tokens_per_block * len(members)
-        else:
-            prefix_pages.append(pages_all[members[0], :1])
-            prefix_last.append(1)
-        prefix_lens.append(int(prefix_pages[-1].numel()))
-        prefix_empty.extend([shared == 0] * len(members))
-    prefix_indptr = torch.zeros(len(groups) + 1, dtype=torch.int32)
-    prefix_indptr[1:] = torch.cumsum(torch.tensor(prefix_lens, dtype=torch.int64), dim=0).to(
-        torch.int32
-    )
-
-    if perm is None:
-        pages_g, blocks_g, kv_g, shared_g = pages_all, num_blocks, kv_lens, row_shared
-    else:
-        pages_g, blocks_g, kv_g, shared_g = (
-            pages_all[perm],
-            num_blocks[perm],
-            kv_lens[perm],
-            row_shared[perm],
-        )
-    block_ids = torch.arange(pages_all.size(1), dtype=torch.int64).view(1, -1)
-    in_tail = (block_ids >= shared_g.view(-1, 1)) & (block_ids < blocks_g.view(-1, 1))
-    tail_indptr = torch.zeros(rows + 1, dtype=torch.int32)
-    tail_indptr[1:] = torch.cumsum(blocks_g - shared_g, dim=0).to(torch.int32)
-    current = kv_lens - 1
-    write_page = pages_all[torch.arange(rows), current // tokens_per_block]
-
+    kv_g = kv_lens[grouping.perm]
     state.plan = _SamplingPlan(
         step=state.step_counter,
-        num_rows=rows,
-        num_groups=len(groups),
-        shared_tokens=shared_tokens,
-        perm=perm,
-        qo_indptr=qo_indptr,
-        prefix_indptr=prefix_indptr,
-        prefix_indices=torch.cat(prefix_pages).to(torch.int32),
-        prefix_last_page_len=torch.tensor(prefix_last, dtype=torch.int32),
-        prefix_empty=torch.tensor(prefix_empty, dtype=torch.bool),
-        has_empty=any(prefix_empty),
-        tail_indptr=tail_indptr,
-        tail_indices=pages_g[in_tail].to(torch.int32),
-        tail_last_page_len=(kv_g - (blocks_g - 1) * tokens_per_block).to(torch.int32),
-        write_page=write_page,
-        write_slot=current % tokens_per_block,
-        check_pages=pages_all if _check_enabled() else None,
-        check_kv_lens=kv_lens if _check_enabled() else None,
+        grouping=grouping,
+        tail_last_page_len=(kv_g - (grouping.blocks_g - 1) * tokens_per_block).to(torch.int32),
+        write_slot=(kv_lens - 1) % tokens_per_block,
+        check_kv_lens=kv_lens if check else None,
     )
     state.device = None
+    if graph is not None:
+        graph.upload(state.plan)
+        for key in state.prefix_wrappers:
+            _plan_graph_wrappers(state, key, metadata)
     if not state.logged:
         state.logged = True
         logger.info(
-            f"{LIB_NAME}: n-sample step with {rows} rows in {len(groups)} groups, "
-            f"{shared_tokens} prompt tokens read once per group"
+            f"{LIB_NAME}: n-sample step with {rows} rows in {grouping.num_sharing} sharing "
+            f"groups ({grouping.num_placeholder_rows} rows without a shared prefix), "
+            f"{grouping.shared_tokens} prompt tokens read once per group"
+            + ("" if graph is None else f", CUDA graph with {graph.num_groups} prefix groups")
         )
 
 
 def _sampling_device(state: _SamplingState, device: torch.device) -> _SamplingDevice:
-    """Device copies of the step's index tensors, made by the first layer with one transfer."""
+    """Device copies of an eager step's index tensors, made by the first layer with one transfer."""
     plan = state.plan
     assert plan is not None
     cached = state.device
@@ -895,15 +1385,64 @@ def _sampling_device(state: _SamplingState, device: torch.device) -> _SamplingDe
     return state.device
 
 
+def _plan_prefix(
+    wrapper: Any,
+    plan: _SamplingPlan,
+    key: _PlanKey,
+    tokens_per_block: int,
+    indices: torch.Tensor,
+) -> None:
+    grouping = plan.grouping
+    wrapper.plan(
+        grouping.qo_indptr,
+        grouping.prefix_indptr,
+        indices,
+        grouping.prefix_last_page_len,
+        key.num_heads,
+        key.num_kv_heads,
+        key.head_dim,
+        tokens_per_block,
+        causal=False,
+        sm_scale=key.sm_scale,
+        q_data_type=key.dtype,
+        kv_data_type=key.dtype,
+        o_data_type=_partial_out_dtype(key.dtype),
+    )
+
+
+def _plan_tail(
+    wrapper: Any,
+    plan: _SamplingPlan,
+    key: _PlanKey,
+    tokens_per_block: int,
+    indices: torch.Tensor,
+) -> None:
+    wrapper.plan(
+        plan.grouping.tail_indptr,
+        indices,
+        plan.tail_last_page_len,
+        key.num_heads,
+        key.num_kv_heads,
+        key.head_dim,
+        tokens_per_block,
+        q_data_type=key.dtype,
+        kv_data_type=key.dtype,
+        o_data_type=_partial_out_dtype(key.dtype),
+        sm_scale=key.sm_scale,
+    )
+
+
 def _sampling_wrappers(
     state: _SamplingState, key: _PlanKey, metadata: "TrtllmAttentionMetadata", device: torch.device
 ) -> tuple[Any, Any]:
-    """FlashInfer prefix (prefill) and tail (decode) wrappers of a layer shape,
-    planned once per step."""
+    """FlashInfer prefix (prefill) and tail (decode) wrappers of an eager layer
+    shape, planned once per step."""
     plan = state.plan
     assert plan is not None
     prefix = state.prefix_wrappers.get(key)
     tail = state.tail_wrappers.get(key)
+    prefix_ws = _plan_workspace(device, "prefix", key)
+    tail_ws = _plan_workspace(device, "tail", key)
     if prefix is None:
         workspace = _get_float_workspace(device)
         prefix = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -912,40 +1451,166 @@ def _sampling_wrappers(
         tail = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             workspace, "HND", use_tensor_cores=key.num_heads != key.num_kv_heads
         )
+        prefix_ws.bind(prefix)
+        tail_ws.bind(tail)
         state.prefix_wrappers[key] = prefix
         state.tail_wrappers[key] = tail
     if state.planned_step.get(key) != plan.step:
         tokens_per_block = int(metadata.tokens_per_block)
-        prefix.plan(
-            plan.qo_indptr,
-            plan.prefix_indptr,
-            plan.prefix_indices,
-            plan.prefix_last_page_len,
-            key.num_heads,
-            key.num_kv_heads,
-            key.head_dim,
-            tokens_per_block,
-            causal=False,
-            sm_scale=key.sm_scale,
-            q_data_type=key.dtype,
-            kv_data_type=key.dtype,
-            o_data_type=_partial_out_dtype(key.dtype),
-        )
-        tail.plan(
-            plan.tail_indptr,
-            plan.tail_indices,
-            plan.tail_last_page_len,
-            key.num_heads,
-            key.num_kv_heads,
-            key.head_dim,
-            tokens_per_block,
-            q_data_type=key.dtype,
-            kv_data_type=key.dtype,
-            o_data_type=_partial_out_dtype(key.dtype),
-            sm_scale=key.sm_scale,
-        )
+        prefix_ws.before_plan()
+        _plan_prefix(prefix, plan, key, tokens_per_block, plan.prefix_indices)
+        prefix_ws.after_plan()
+        tail_ws.before_plan()
+        _plan_tail(tail, plan, key, tokens_per_block, plan.tail_indices)
+        tail_ws.after_plan()
         state.planned_step[key] = plan.step
     return prefix, tail
+
+
+def _plan_graph_wrappers(
+    state: _SamplingState, key: _PlanKey, metadata: "TrtllmAttentionMetadata"
+) -> None:
+    """Plan the CUDA graph wrappers of a layer shape for the current step.
+
+    ``plan`` rewrites the wrappers' fixed-address index buffers and work lists;
+    the replayed kernels read them. The work lists depend only on page counts,
+    which change at a regrouping (page boundaries included), so the steps in
+    between skip the plan unless another wrapper planned into the shared
+    integer workspace since (the last-page lengths reach the tail call through
+    the uploaded step buffer).
+    """
+    plan = state.plan
+    graph = state.graph
+    assert plan is not None and graph is not None
+    prefix = state.prefix_wrappers[key]
+    tail = state.tail_wrappers[key]
+    device = graph.device.device
+    prefix_ws = _plan_workspace(device, "prefix", key)
+    tail_ws = _plan_workspace(device, "tail", key)
+    current = (plan.grouping.version, prefix_ws.owner, tail_ws.owner)
+    if state.planned_tokens.get(key) != current:
+        tokens_per_block = int(metadata.tokens_per_block)
+        prefix_ws.before_plan()
+        _plan_prefix(prefix, plan, key, tokens_per_block, graph.prefix_indices)
+        prefix_owner = prefix_ws.after_plan()
+        tail_ws.before_plan()
+        _plan_tail(tail, plan, key, tokens_per_block, graph.tail_indices)
+        tail_owner = tail_ws.after_plan()
+        state.planned_tokens[key] = (plan.grouping.version, prefix_owner, tail_owner)
+    state.planned_step[key] = plan.step
+
+
+def _graph_wrappers(
+    state: _SamplingState, key: _PlanKey, metadata: "TrtllmAttentionMetadata"
+) -> tuple[Any, Any]:
+    """CUDA graph wrappers of a layer shape, created on the eager warmup forward
+    that precedes capture and planned for the current step."""
+    plan = state.plan
+    graph = state.graph
+    assert plan is not None and graph is not None
+    prefix = state.prefix_wrappers.get(key)
+    if prefix is not None and state.planned_step.get(key) == plan.step:
+        return prefix, state.tail_wrappers[key]
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{LIB_NAME}: FlashInfer plan requested during CUDA graph capture; the capture "
+            "warmup must run this layer shape first."
+        )
+    if prefix is None:
+        device = graph.device.device
+        workspace = _get_graph_float_workspace(
+            device, _graph_float_workspace_bytes(key, graph.rows, graph.num_groups, device)
+        )
+        groups = graph.num_groups
+        prefix = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace,
+            "HND",
+            backend=_backend_from_env(),
+            use_cuda_graph=True,
+            qo_indptr_buf=torch.zeros((groups + 1,), dtype=torch.int32, device=device),
+            paged_kv_indptr_buf=torch.zeros((groups + 1,), dtype=torch.int32, device=device),
+            paged_kv_indices_buf=torch.zeros(
+                (graph.prefix_capacity,), dtype=torch.int32, device=device
+            ),
+            paged_kv_last_page_len_buf=torch.zeros((groups,), dtype=torch.int32, device=device),
+        )
+        tail = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace,
+            "HND",
+            use_cuda_graph=True,
+            use_tensor_cores=key.num_heads != key.num_kv_heads,
+            paged_kv_indptr_buffer=torch.zeros((graph.rows + 1,), dtype=torch.int32, device=device),
+            paged_kv_indices_buffer=torch.zeros(
+                (graph.tail_capacity,), dtype=torch.int32, device=device
+            ),
+            paged_kv_last_page_len_buffer=graph.tail_last_page_len,
+        )
+        _plan_workspace(device, "prefix", key).bind(prefix)
+        _plan_workspace(device, "tail", key).bind(tail)
+        state.prefix_wrappers[key] = prefix
+        state.tail_wrappers[key] = tail
+    _plan_graph_wrappers(state, key, metadata)
+    return prefix, state.tail_wrappers[key]
+
+
+def sampling_attention(
+    pool: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    prefix_wrapper: Any,
+    tail_wrapper: Any,
+    *,
+    write_page: torch.Tensor,
+    write_slot: torch.Tensor,
+    perm: Optional[torch.Tensor],
+    prefix_empty: Optional[torch.Tensor],
+) -> None:
+    """One layer of the n-sample path on planned wrappers.
+
+    Writes the current token's K/V, runs the prefix and tail calls on the
+    grouped queries, merges the two states and writes ``out`` in batch order.
+    Every launch has a fixed shape and reads its indices from the given
+    tensors, so the call can be captured in a CUDA graph and replayed after
+    the wrappers and index tensors were refreshed in place.
+
+    Args:
+        pool: [pages, 2, kv_heads, tokens_per_block, head_dim] layer KV pool (HND).
+        q: [rows, heads, head_dim]; k, v: [rows, kv_heads, head_dim], batch order.
+        out: [rows, heads, head_dim] output, batch order.
+        write_page, write_slot: [rows] page and slot of each row's current token.
+        perm: [rows] batch row of each grouped position, or None when the batch
+            is in grouped order.
+        prefix_empty: [rows] bool in grouped order, or None: rows whose prefix
+            state is a placeholder and must not contribute.
+    """
+    rows, num_heads, head_dim = q.shape
+    # 1. Persist the current token's K/V in the row's own block.
+    pool.permute(0, 3, 1, 2, 4)[write_page, write_slot] = torch.stack((k, v), dim=1)
+
+    # 2. Shared prefix: the queries of each group against its common pages.
+    q_grouped = q if perm is None else q.index_select(0, perm)
+    partial_dtype = _partial_out_dtype(q.dtype)
+    prefix_out = torch.empty((rows, num_heads, head_dim), dtype=partial_dtype, device=q.device)
+    prefix_lse = torch.empty((rows, num_heads), dtype=torch.float32, device=q.device)
+    prefix_wrapper.run(q_grouped, pool, out=prefix_out, lse=prefix_lse, return_lse=True)
+
+    # 3. Private remainder of every row (current token included), in the same row order.
+    tail_out = torch.empty_like(prefix_out)
+    tail_lse = torch.empty_like(prefix_lse)
+    tail_wrapper.run(q_grouped, pool, out=tail_out, lse=tail_lse, return_lse=True)
+
+    # 4. Merge in place into the prefix result; placeholder rows take the tail
+    # alone (their prefix output is zeroed too, as 0 * NaN would survive the merge).
+    if prefix_empty is not None:
+        prefix_lse.masked_fill_(prefix_empty.view(-1, 1), float("-inf"))
+        prefix_out.masked_fill_(prefix_empty.view(-1, 1, 1), 0.0)
+    flashinfer.merge_state_in_place(prefix_out, prefix_lse, tail_out, tail_lse)
+    if perm is None:
+        out.copy_(prefix_out)
+    else:
+        out[perm] = prefix_out.to(out.dtype)
 
 
 def merge_states(
@@ -1044,6 +1709,17 @@ class BeamSharedPrefixFmha(PhasedFmha):
         self._pool_views: Dict[int, torch.Tensor] = {}
         # (pool index, page stride) of this layer; fixed for the manager lifetime.
         self._layout: Optional[tuple[int, int]] = None
+        # The KV-cache manager the cached pool views and layout belong to. The
+        # executor replaces the manager after memory estimation, and CUDA graph
+        # warmup runs this library with the estimation manager first.
+        self._manager_ref: Optional[weakref.ref] = None
+
+    def _bind_manager(self, metadata: "TrtllmAttentionMetadata") -> None:
+        manager = metadata.kv_cache_manager
+        if self._manager_ref is None or self._manager_ref() is not manager:
+            self._pool_views.clear()
+            self._layout = None
+            self._manager_ref = weakref.ref(manager)
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -1124,6 +1800,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
         return True
 
     def _pool_view(self, metadata: "TrtllmAttentionMetadata") -> torch.Tensor:
+        self._bind_manager(metadata)
         layer_idx = self.attn.layer_idx
         pool = self._pool_views.get(layer_idx)
         if pool is None:
@@ -1158,6 +1835,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 f"{type(self).__name__}: {rows} generation rows do not match the planned "
                 f"{plan.num_requests} x {plan.beam_width} beams."
             )
+        self._bind_manager(metadata)
         if self._layout is None:
             self._layout = _pool_layout(metadata, attn.local_layer_idx)
         pool_index, page_stride = self._layout
@@ -1271,6 +1949,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 f"{type(self).__name__}: {rows} generation rows do not match the planned "
                 f"{plan.num_rows}."
             )
+        self._bind_manager(metadata)
         if self._layout is None:
             self._layout = _page_layout(metadata, attn.layer_idx, attn.local_layer_idx)
         if self._layout != (state.pool_index, state.page_scale, state.page_div):
@@ -1283,43 +1962,48 @@ class BeamSharedPrefixFmha(PhasedFmha):
         sm_scale = 1.0 / (math.sqrt(head_dim) * attn.q_scaling)
         key = _PlanKey(num_heads, num_kv_heads, head_dim, qkv.dtype, sm_scale)
         pool = self._pool_view(metadata)
-        indices = _sampling_device(state, qkv.device)
-        prefix_wrapper, tail_wrapper = _sampling_wrappers(state, key, metadata, qkv.device)
+        graph = state.graph
+        if graph is not None:
+            prefix_wrapper, tail_wrapper = _graph_wrappers(state, key, metadata)
+            write_page, write_slot = graph.write_page, graph.write_slot
+            perm: Optional[torch.Tensor] = graph.perm
+            prefix_empty: Optional[torch.Tensor] = graph.empty
+            if torch.cuda.is_current_stream_capturing():
+                state.captured = True
+        else:
+            indices = _sampling_device(state, qkv.device)
+            prefix_wrapper, tail_wrapper = _sampling_wrappers(state, key, metadata, qkv.device)
+            write_page, write_slot = indices.write_page, indices.write_slot
+            perm, prefix_empty = indices.perm, indices.prefix_empty
 
         q_size = num_heads * head_dim
         kv_size = num_kv_heads * head_dim
         q = qkv[:, :q_size].view(rows, num_heads, head_dim)
         k = qkv[:, q_size : q_size + kv_size].view(rows, num_kv_heads, head_dim)
         v = qkv[:, q_size + kv_size : q_size + 2 * kv_size].view(rows, num_kv_heads, head_dim)
-
-        # 1. Persist the current token's K/V in the row's own block.
-        pool.permute(0, 3, 1, 2, 4)[indices.write_page, indices.write_slot] = torch.stack(
-            (k, v), dim=1
-        )
-
-        # 2. Shared prefix: the queries of each group against its common pages.
-        q_grouped = q if indices.perm is None else q.index_select(0, indices.perm)
-        prefix_out, prefix_lse = prefix_wrapper.run(q_grouped, pool, return_lse=True)
-
-        # 3. Private remainder of every row (current token included), in the same row order.
-        tail_out, tail_lse = tail_wrapper.run(q_grouped, pool, return_lse=True)
-
-        if not state.ran:
-            state.ran = True
-            logger.info(f"{LIB_NAME}: first n-sample attention call (layer {attn.layer_idx})")
         output = params.output
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires an output tensor.")
-        # 4. Merge in place into the prefix result; rows without a shared prefix take the tail alone.
-        if indices.prefix_empty is not None:
-            prefix_lse.masked_fill_(indices.prefix_empty.view(-1, 1), float("-inf"))
-        flashinfer.merge_state_in_place(prefix_out, prefix_lse, tail_out, tail_lse)
         out_view = output.view(rows, num_heads, head_dim)
-        if indices.perm is None:
-            out_view.copy_(prefix_out)
-        else:
-            out_view.index_copy_(0, indices.perm, prefix_out.to(output.dtype))
-        if plan.check_pages is not None:
+        sampling_attention(
+            pool,
+            q,
+            k,
+            v,
+            out_view,
+            prefix_wrapper,
+            tail_wrapper,
+            write_page=write_page,
+            write_slot=write_slot,
+            perm=perm,
+            prefix_empty=prefix_empty,
+        )
+        if not state.ran:
+            state.ran = True
+            logger.info(f"{LIB_NAME}: first n-sample attention call (layer {attn.layer_idx})")
+        # Check mode reads device values, which CUDA graph capture forbids; the
+        # eager warmup that precedes every capture is checked instead.
+        if plan.check_pages is not None and not torch.cuda.is_current_stream_capturing():
             _check_sampling_output(
                 plan,
                 pool,
@@ -1522,5 +2206,6 @@ __all__ = [
     "merge_states",
     "metadata_eligible",
     "plan_step",
+    "sampling_attention",
     "sampling_metadata_eligible",
 ]

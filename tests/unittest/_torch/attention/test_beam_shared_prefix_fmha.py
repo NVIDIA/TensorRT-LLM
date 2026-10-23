@@ -224,12 +224,22 @@ def test_merge_states_matches_dense_attention():
     torch.testing.assert_close(merged, expected, atol=1e-5, rtol=1e-4)
 
 
-def _fake_sampling_metadata(block_tables, kv_lens, tokens_per_block, num_pages):
+def _fake_sampling_metadata(
+    block_tables,
+    kv_lens,
+    tokens_per_block,
+    num_pages,
+    *,
+    max_blocks=None,
+    is_cuda_graph=False,
+    plan_caches=None,
+):
     """Minimal metadata for the host planner: one pool, page stride 2."""
     from types import SimpleNamespace
 
     rows = len(block_tables)
-    max_blocks = max(len(t) for t in block_tables)
+    if max_blocks is None:
+        max_blocks = max(len(t) for t in block_tables)
     offsets = torch.zeros(1, rows, 2, max_blocks, dtype=torch.int32)
     for r, table in enumerate(block_tables):
         offsets[0, r, 0, : len(table)] = torch.tensor(table) * 2
@@ -238,14 +248,17 @@ def _fake_sampling_metadata(block_tables, kv_lens, tokens_per_block, num_pages):
         kv_factor=2,
         get_buffers=lambda layer, kv_layout: torch.empty(num_pages, 1),
     )
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     return SimpleNamespace(
-        fmha_plan_caches={},
+        fmha_plan_caches={} if plan_caches is None else plan_caches,
         kv_cache_manager=manager,
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]]),
         host_kv_cache_block_offsets=offsets,
+        kv_cache_block_offsets=torch.empty((0,), device=device),
         kv_lens_runtime=torch.tensor(kv_lens),
         tokens_per_block=tokens_per_block,
         num_generations=rows,
+        is_cuda_graph=is_cuda_graph,
     )
 
 
@@ -569,6 +582,7 @@ def test_sampling_plan_reads_kv_manager_v2_block_table():
         tokens_per_block=tpb,
         num_generations=3,
         request_ids=request_ids,
+        is_cuda_graph=False,
     )
     lib._plan_sampling_step(meta)
     plan = meta.fmha_plan_caches[lib.SAMPLING_KEY].plan
@@ -585,3 +599,282 @@ def test_sampling_plan_reads_kv_manager_v2_block_table():
         21 * pages_per_base,
         22 * pages_per_base,
     ]
+
+
+def test_sampling_grouping_pads_groups_and_demotes_surplus_sharing_groups():
+    """A CUDA graph batch gets a fixed number of prefix groups: the sharing
+    groups that save the most page reads, the placeholder group (also without
+    rows) and empty padding groups."""
+    from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
+
+    tpb = 4
+    # Group {0, 1} shares two pages, group {2, 3, 4} shares one page (the
+    # current token of row 4 sits in the second), row 5 shares nothing.
+    tables = [[1, 2, 9], [1, 2, 10], [3, 4, 11], [3, 4, 12], [3, 13], [5, 14]]
+    kv_lens = torch.tensor([10, 11, 9, 12, 7, 6])
+    pages = torch.tensor([t + [0] * (3 - len(t)) for t in tables], dtype=torch.int64)
+    rows = len(tables)
+
+    grouping = lib._build_grouping(
+        1,
+        torch.arange(rows),
+        pages,
+        kv_lens,
+        tpb,
+        max_sharing_groups=None,
+        padded_groups=4,
+        keep_check_pages=False,
+    )
+    assert grouping.num_sharing == 2 and grouping.num_groups == 4
+    assert grouping.perm.tolist() == [0, 1, 2, 3, 4, 5]
+    assert grouping.qo_indptr.tolist() == [0, 2, 5, 6, 6]
+    assert grouping.prefix_indptr.tolist() == [0, 2, 3, 4, 5]
+    assert grouping.prefix_indices.tolist()[:3] == [1, 2, 3]
+    assert grouping.prefix_last_page_len.tolist() == [tpb, tpb, 1, 1]
+    assert grouping.prefix_empty.tolist() == [False] * 5 + [True]
+
+    # Room for one sharing group: {0, 1} saves 2 pages, {2, 3, 4} saves 2 x 1.
+    # On a tie the earlier group is not guaranteed, so make {2, 3, 4} lose.
+    grouping = lib._build_grouping(
+        2,
+        torch.arange(rows),
+        pages,
+        torch.tensor([10, 11, 9, 12, 7, 6]),
+        tpb,
+        max_sharing_groups=1,
+        padded_groups=2,
+        keep_check_pages=False,
+    )
+    assert grouping.num_sharing == 1
+    assert grouping.perm.tolist() == [0, 1, 2, 3, 4, 5]
+    assert grouping.qo_indptr.tolist() == [0, 2, 6]
+    assert grouping.prefix_empty.tolist() == [False, False] + [True] * 4
+    # Demoted rows read all their pages through the tail call.
+    assert grouping.tail_indptr.tolist() == [0, 1, 2, 5, 8, 10, 12]
+
+    # No sharing at all still yields the placeholder group plus padding.
+    grouping = lib._build_grouping(
+        3,
+        torch.arange(rows),
+        pages[[0, 2, 5]],
+        kv_lens[[0, 2, 5]],
+        tpb,
+        max_sharing_groups=2,
+        padded_groups=3,
+        keep_check_pages=False,
+    )
+    assert grouping.num_sharing == 0
+    assert grouping.qo_indptr.tolist() == [0, 3, 3, 3]
+    assert grouping.prefix_empty.all()
+
+
+def _dense_attention(pool, table, kv_len, q_row, num_kv_heads, sm_scale):
+    """fp32 attention of one query row over the first ``kv_len`` tokens of its pages."""
+    num_heads, head_dim = q_row.shape
+    group = num_heads // num_kv_heads
+    pages = torch.tensor(table, device=pool.device)
+    kv = pool[pages].permute(0, 3, 1, 2, 4).reshape(-1, 2, num_kv_heads, head_dim)[:kv_len]
+    qr = q_row.float().view(num_kv_heads, group, head_dim)
+    scores = torch.einsum("kgd,tkd->kgt", qr, kv[:, 0].float()) * sm_scale
+    return torch.einsum("kgt,tkd->kgd", torch.softmax(scores, dim=-1), kv[:, 1].float()).reshape(
+        num_heads, head_dim
+    )
+
+
+def _sampling_step_tables(prompts, children, private_pages, first_private, gen_lens, tpb):
+    """Block tables and KV lengths of ``children`` samples per prompt.
+
+    ``prompts`` lists (first page, prompt length) per prompt; the full prompt
+    pages are shared, everything after them is private to the child.
+    """
+    tables, kv_lens = [], []
+    next_page = first_private
+    for (first, prompt_len), count in zip(prompts, children):
+        full = prompt_len // tpb
+        for child in range(count):
+            kv_len = prompt_len + gen_lens[len(kv_lens) % len(gen_lens)] + child % 3
+            num_blocks = (kv_len + tpb - 1) // tpb
+            private = list(range(next_page, next_page + num_blocks - full))
+            next_page += private_pages
+            tables.append(list(range(first, first + full)) + private)
+            kv_lens.append(kv_len)
+    return tables, kv_lens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 2), (20, 20), (20, 4)])
+def test_sampling_cuda_graph_replay_matches_eager_across_steps(
+    num_heads, num_kv_heads, monkeypatch
+):
+    """Capture one CUDA graph around the n-sample attention of a layer and
+    replay it over steps whose plans differ: tails that grow inside a page and
+    across a page boundary, shrinking groups, different group counts, surplus
+    sharing groups, a batch without any sharing, and padded dummy rows.
+
+    Each replay must equal an eager call on the same planned buffers bit for
+    bit (the graph reads the refreshed buffers, not the captured ones), match
+    a dense fp32 reference, and write the current token's K/V like the eager
+    call.
+    """
+    pytest.importorskip("flashinfer")
+    from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
+
+    monkeypatch.setenv(lib.MAX_GROUPS_ENV, "3")
+    device = torch.device("cuda")
+    tpb, head_dim = 16, 128
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    rows, num_pages, max_blocks = 12, 160, 12
+    gen = torch.Generator(device=device).manual_seed(11)
+    pool = torch.randn(
+        num_pages,
+        2,
+        num_kv_heads,
+        tpb,
+        head_dim,
+        generator=gen,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    # Prompt pages 0-29; private pages from 40 on, 8 per row.
+    steps = []
+    # 1. Three prompts x four children with ragged prompts and tails.
+    steps.append(
+        _sampling_step_tables([(0, 70), (10, 37), (20, 100)], [4, 4, 4], 8, 40, [1, 3], tpb)
+    )
+    # 2. Same rows, every tail one token longer (same pages).
+    steps.append((steps[0][0], [n + 1 for n in steps[0][1]]))
+    # 3. Tails across a page boundary.
+    steps.append(
+        _sampling_step_tables([(0, 70), (10, 37), (20, 100)], [4, 4, 4], 8, 40, [12, 14], tpb)
+    )
+    # 4. Fewer, smaller groups: 2 x 3 children, the rest unrelated prompts.
+    tables, kv_lens = _sampling_step_tables([(0, 70), (20, 100)], [3, 3], 8, 40, [5], tpb)
+    for r in range(6):
+        tables.append([30 + r] + list(range(100 + 8 * r, 104 + 8 * r)))
+        kv_lens.append(40 + r)
+    steps.append((tables, kv_lens))
+    # 5. Four sharing groups for three group slots: the smallest saving is demoted.
+    steps.append(
+        _sampling_step_tables(
+            [(0, 70), (10, 37), (20, 100), (5, 17)], [3, 3, 3, 3], 8, 40, [2], tpb
+        )
+    )
+    # 6. No sharing at all.
+    steps.append(
+        (
+            [[30 + r, 100 + 4 * r, 101 + 4 * r] for r in range(rows)],
+            [33 + r for r in range(rows)],
+        )
+    )
+    # 7. Two real groups and padded dummy rows that all map one table (kv_len 1).
+    tables, kv_lens = _sampling_step_tables([(0, 70), (10, 37)], [4, 4], 8, 40, [2], tpb)
+    for _ in range(4):
+        tables.append([150])
+        kv_lens.append(1)
+    steps.append((tables, kv_lens))
+
+    # (sharing groups, rows without a shared prefix) of every step.
+    expected_groups = [(3, 0), (3, 0), (3, 0), (2, 6), (3, 3), (0, 12), (2, 4)]
+    caches = {}
+    key = lib._PlanKey(num_heads, num_kv_heads, head_dim, torch.bfloat16, sm_scale)
+    q_static = torch.zeros(rows, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_static = torch.zeros(rows, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_static = torch.zeros_like(k_static)
+    out_static = torch.zeros_like(q_static)
+    graph = None
+    state = None
+    wrappers = None
+    for step, (tables, kv_lens) in enumerate(steps):
+        assert len(tables) == rows
+        meta = _fake_sampling_metadata(
+            tables,
+            kv_lens,
+            tpb,
+            num_pages,
+            max_blocks=max_blocks,
+            is_cuda_graph=True,
+            plan_caches=caches,
+        )
+        lib._plan_sampling_step(meta)
+        state = caches[lib.SAMPLING_KEY]
+        assert state.plan is not None and state.graph is not None
+        grouping = state.plan.grouping
+        assert (grouping.num_sharing, grouping.num_placeholder_rows) == expected_groups[step]
+        assert grouping.num_groups == state.graph.num_groups == 4
+        if wrappers is None:
+            wrappers = lib._graph_wrappers(state, key, meta)
+        else:
+            assert lib._graph_wrappers(state, key, meta) == wrappers
+        buffers = state.graph
+
+        q = torch.randn(rows, num_heads, head_dim, generator=gen, device=device).bfloat16()
+        k = torch.randn(rows, num_kv_heads, head_dim, generator=gen, device=device).bfloat16()
+        v = torch.randn(rows, num_kv_heads, head_dim, generator=gen, device=device).bfloat16()
+        dummy_rows = [r for r in range(rows) if kv_lens[r] == 1]
+        for r in dummy_rows:
+            # Padding rows repeat one request: identical inputs, one KV slot.
+            q[r], k[r], v[r] = q[dummy_rows[0]], k[dummy_rows[0]], v[dummy_rows[0]]
+
+        def run(target_pool, out, q_in, k_in, v_in):
+            lib.sampling_attention(
+                target_pool,
+                q_in,
+                k_in,
+                v_in,
+                out,
+                *wrappers,
+                write_page=buffers.write_page,
+                write_slot=buffers.write_slot,
+                perm=buffers.perm,
+                prefix_empty=buffers.empty,
+            )
+
+        eager_pool = pool.clone()
+        eager_out = torch.zeros_like(q)
+        run(eager_pool, eager_out, q, k, v)
+
+        if graph is None:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(pool, out_static, q_static, k_static, v_static)
+        q_static.copy_(q)
+        k_static.copy_(k)
+        v_static.copy_(v)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(out_static, eager_out), f"step {step}: replay differs from eager"
+        assert torch.equal(pool, eager_pool), f"step {step}: replay wrote different K/V"
+        for r in range(rows):
+            if r in dummy_rows:
+                continue
+            expected = _dense_attention(pool, tables[r], kv_lens[r], q[r], num_kv_heads, sm_scale)
+            torch.testing.assert_close(
+                out_static[r].float(), expected, atol=2e-2, rtol=2e-2, msg=f"step {step} row {r}"
+            )
+        # An independently planned eager batch agrees within kernel numerics.
+        eager_meta = _fake_sampling_metadata(tables, kv_lens, tpb, num_pages)
+        lib._plan_sampling_step(eager_meta)
+        eager_state = eager_meta.fmha_plan_caches[lib.SAMPLING_KEY]
+        if eager_state.plan is not None:
+            eager_indices = lib._sampling_device(eager_state, device)
+            eager_wrappers = lib._sampling_wrappers(eager_state, key, eager_meta, device)
+            reference_pool = eager_pool.clone()
+            reference_out = torch.zeros_like(q)
+            lib.sampling_attention(
+                reference_pool,
+                q,
+                k,
+                v,
+                reference_out,
+                *eager_wrappers,
+                write_page=eager_indices.write_page,
+                write_slot=eager_indices.write_slot,
+                perm=eager_indices.perm,
+                prefix_empty=eager_indices.prefix_empty,
+            )
+            live = [r for r in range(rows) if r not in dummy_rows]
+            torch.testing.assert_close(
+                out_static[live].float(), reference_out[live].float(), atol=1e-2, rtol=1e-2
+            )
