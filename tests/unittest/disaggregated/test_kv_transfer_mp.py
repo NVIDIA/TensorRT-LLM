@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 import random
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -34,14 +35,43 @@ from kv_cache_manager_v2_test_utils import allocate_request, initialize_cache, r
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
+from tensorrt_llm import DisaggregatedParams, SamplingParams
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import MpiTopology as Mapping
+
+
+class _GlooQuotaSync:
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        self.group = group
+
+    def allreduce(self, value: float, op: object) -> float:
+        del op
+        tensor = torch.tensor(value, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.group)
+        return tensor.item()
+
+
+def _create_cache_manager(group: dist.ProcessGroup, *args, **kwargs) -> KVCacheManagerV2:
+    """Synchronize the V2 constructor's capacity within this instance's Gloo group."""
+    with patch(
+        "tensorrt_llm._torch.distributed.communicator.Distributed.get",
+        return_value=_GlooQuotaSync(group),
+    ):
+        return KVCacheManagerV2(*args, **kwargs)
+
+
+def _instance_mapping(**kwargs) -> Mapping:
+    """Use explicit instance-local ranks for the ctx/gen Gloo process groups."""
+    mapping = object.__new__(Mapping)
+    Mapping.__init__(mapping, **kwargs)
+    return mapping
 
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
@@ -189,7 +219,7 @@ def worker_fn(
         # Create ctx mapping
         _ = local_rank // ctx_tp
         tp_rank = local_rank % ctx_tp
-        mapping = Mapping(
+        mapping = _instance_mapping(
             world_size=ctx_instance_num,
             rank=local_rank,
             tp_size=ctx_tp,
@@ -197,8 +227,9 @@ def worker_fn(
         )
 
         # Create KVCacheManager
-        kv_cache_manager = KVCacheManagerV2(
-            KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -208,6 +239,7 @@ def worker_fn(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
+            vocab_size=32000,
         )
 
         # Initialize with random data
@@ -254,7 +286,7 @@ def worker_fn(
         # Create gen mapping
         _ = local_rank // gen_tp  # pp_rank (unused)
         tp_rank = local_rank % gen_tp
-        mapping = Mapping(
+        mapping = _instance_mapping(
             world_size=gen_instance_num,
             rank=local_rank,
             tp_size=gen_tp,
@@ -262,8 +294,9 @@ def worker_fn(
         )
 
         # Create KVCacheManager
-        kv_cache_manager = KVCacheManagerV2(
-            KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -273,6 +306,7 @@ def worker_fn(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
+            vocab_size=32000,
         )
 
         # Create TransferWorker
@@ -569,6 +603,8 @@ def worker_fn(
         print(f"\n[Rank {rank}] All requests verified successfully!")
 
     # Cleanup
+    transfer_worker.shutdown()
+    kv_cache_manager.shutdown()
     dist.destroy_process_group()
 
 
@@ -631,8 +667,13 @@ MP_TEST_CONFIGS = [
     [(c[0], c[1], c[2], c[3]) for c in MP_TEST_CONFIGS],
     ids=[c[4] for c in MP_TEST_CONFIGS],
 )
-def test_transfer_worker_mp(ctx_tp, ctx_pp, gen_tp, gen_pp):
+def test_transfer_worker_mp(ctx_tp, ctx_pp, gen_tp, gen_pp, monkeypatch):
     """Test transfer worker with multi-process configurations."""
+    # Gloo workers own their rank identities and must not inherit the enclosing MPI job.
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    for name in list(os.environ):
+        if name.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "I_MPI_", "HYDRA_", "MPI_")):
+            monkeypatch.delenv(name)
     # Set multiprocessing start method
     try:
         mp.set_start_method("spawn", force=True)

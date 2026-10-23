@@ -288,6 +288,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -867,6 +874,20 @@
           "title": "Skip Ctx Buffer Budget Check",
           "type": "boolean"
         },
+        "spec_dec_variant": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Version of the DFlash algorithm: 2 for a DFlash 2 draft checkpoint, 1 otherwise. None until the draft checkpoint's config.json has been read, which for a HF repo id happens only after download. Do not set manually.",
+          "title": "Spec Dec Variant"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -1153,6 +1174,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -1388,8 +1416,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "default": false,
-          "description": "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -1560,8 +1588,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "default": false,
-          "description": "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -1746,6 +1774,13 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -2089,6 +2124,13 @@
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with Eagle3 speculative decoding.",
           "status": "beta"
         },
+        "spec_dec_variant": {
+          "default": 3,
+          "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -2366,6 +2408,13 @@
           "default": null,
           "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
           "title": "Num Eagle Layers"
+        },
+        "spec_dec_variant": {
+          "default": 3,
+          "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -2720,6 +2769,19 @@
           "description": "KV cache manager v2 configuration for block reuse policies.",
           "status": "prototype"
         },
+        "cold_tier_offload_min_priority": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Minimum priority for offloading unreferenced blocks from the hot tier to cold tiers. Blocks with priority at or above this value can be offloaded. Defaults to 30 when unset.",
+          "title": "Cold Tier Offload Min Priority"
+        },
         "copy_on_partial_reuse": {
           "default": true,
           "description": "Whether partially matched blocks that are in use can be reused after copying them.",
@@ -3023,7 +3085,12 @@
             }
           ],
           "default": null,
-          "description": "Only blocks with priority > secondary_offload_min_priority can be offloaded to secondary memory.",
+          "deprecated": true,
+          "description": "Deprecated alias for cold_tier_offload_min_priority.",
+          "status": "deprecated",
+          "telemetry": {
+            "exclude": true
+          },
           "title": "Secondary Offload Min Priority"
         },
         "sink_token_length": {
@@ -3593,6 +3660,13 @@
           "default": null,
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with MTP speculative decoding.",
           "status": "beta"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -4432,6 +4506,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -4482,7 +4563,7 @@
       "description": "Configuration for NVFP4 GEMM backend selection.",
       "properties": {
         "allowed_backends": {
-          "description": "List of backends to consider for auto-selection. Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme performance at the cost of longer server launch time.",
+          "description": "List of backends to consider for auto-selection.",
           "items": {
             "enum": [
               "cutlass",
@@ -4681,6 +4762,13 @@
           "default": null,
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with PARD speculative decoding.",
           "status": "beta"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -5383,6 +5471,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -5631,6 +5726,13 @@
           "title": "Output Directory",
           "type": "string"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -5715,7 +5817,7 @@
             }
           ],
           "default": null,
-          "description": "The dynamic batch config to use. This only applies for the TensorRT backend and cannot currently be used with the PyTorch backend."
+          "description": "The dynamic batch configuration used by the scheduler to adjust batch size and token limits at runtime. This option currently has no effect since the scheduler does not support dynamic batch adjustments in the pytorch backend."
         },
         "enable_prefix_aware_scheduling": {
           "default": true,
@@ -6118,6 +6220,13 @@
         "resource_manager": {
           "type": "null"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -6176,7 +6285,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc1/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -7648,6 +7757,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc1 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve --config",
   "type": "object"
 }

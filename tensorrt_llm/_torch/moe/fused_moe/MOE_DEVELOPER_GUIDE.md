@@ -354,7 +354,7 @@ this repo but its lineage is upstream's, which the device code still says
 | `KERNEL_INTERNALS.html` | Reference for the underlying DeepGEMM kernel layout |
 
 The exported CuteDSL kernel sources for `TrtllmCutedslMegaMoeNvfp4Impl` live under
-`tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/`, preserving the upstream
+`tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/`, preserving the upstream
 package structure and `KernelClass` entry points. The runner constructs
 `ProblemDesc` and `ImplDesc` and dispatches internally; the public backend
 remains `MEGAMOE_CUTEDSL`. Rubin's smaller token buckets use the genphase
@@ -537,7 +537,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 FP8 | Y (SM100/103/107) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 MXFP8 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | N | N | Y (SM100/103/107, requires `hidden_size % 512 == 0`) | N | N | N | N |
-| W8A8 MXFP8 MXFP8 | Y (SM100/103) | N | N | N | N | N | N | N | N | N |
+| W8A8 MXFP8 MXFP8 | Y (SM100/103/107) | N | N | N | N | N | N | N | N | N |
 | W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | N |
@@ -657,6 +657,40 @@ and materialization enforces the same contract. CUTLASS opts in because its
 SwiGLU adaptor consumes the mode; its SM120 FP8-block-scale Triton fallback is
 rejected separately because that path does not.
 
+With `USING_OSS_CUTLASS_MOE_GEMM=OFF`, the Torch runner uses the bundled
+internal kernel archive's legacy interfaces. That build supports pre-SiLU
+SwiGLU clamping and rejects post-SiLU clamping, SiTu, Relu2, routed-expert LoRA,
+MXFP8 activations or weights, NVFP4 weight-only MoE, FP8-input W4A8,
+dynamic FC2 scaling, per-expert W4A8 activation scales,
+all-to-all, unpadded output, a separate valid-token count, and unswizzled
+input scales. These features require the open-source kernels. The shared
+MoE kernel tests use the public quantization utilities with either runner;
+post-SiLU, unpadded output, and MXFP8 x MXFP4 cases skip for the internal runner.
+The FP8-input W4A8 fixture and all-to-all variants require the OSS build. The Torch
+boundary translates public activation IDs to the internal enum values.
+When SwiGLU parameters are present, it supplies missing alpha/beta defaults
+as tensors so the legacy archive consumes the clamp limit.
+Public routing helpers remain available in either build.
+The build mode is collected once into `MoEEnvironment.oss_cutlass_moe` and
+included in its fingerprint. Libraries without the build-mode query preserve
+the OSS default. CUTLASS eligibility rejects unavailable activation and
+quantization formats, post-SiLU clamping, dynamic FC2 scaling, and routed-expert
+LoRA. W4A8 AWQ uses per-expert activation-scale buffers and is unavailable in
+the legacy build. The backend exposes `supports_alltoall` before communication
+selection. Unsupported auto-selection falls back to AllGather/ReduceScatter, and
+explicit all-to-all requests fail before allocation. Construction validation
+retains an all-to-all backstop. Input layout and token-count options supplied
+to native operators directly retain runtime guards.
+The neutral SwiGLU tensors are cached by device, expert count and CUDA stream;
+warm eager forwards reuse them without allocations or fill kernels. During CUDA
+graph capture, each forward creates its own defaults and records their fills in
+that graph instead of retaining graph-pool tensors in the runner cache.
+
+The CPU resolution tests run in `l0_cpu.yml`; routing and activation numerics
+run in the H100 and B200 single-GPU lists. The H100 C++ kernel stage discovers
+both OSS and bundled-internal MoE variants through CTest. With OSS kernels
+disabled, `mixtureOfExpertsTest` exercises the bundled runner directly.
+
 Declare `limit_when_absent` only when the ABI has no encoding for "no clamp":
 `CuteDslFusedMoE` passes `float("inf")` because its epilogue always applies the
 clamp functor. It is substituted *before* coercion, so a `PER_EXPERT_TENSOR`
@@ -741,7 +775,7 @@ When adding new components, use these reference implementations:
 | Task | Reference | Key methods to implement |
 |------|-----------|--------------------------|
 | New `EXTERNAL_COMM` Backend | `fused_moe_cutlass.py` (`CutlassFusedMoE`) | Declare `MoEImplBase`; implement `capabilities`, `activation_support`, `can_implement`, `_get_quant_method`, `quantize_input`, `run_moe`; call `apply_moe_impl_construction_state()` in `__init__` (`create_weights` / `load_weights` come from `MoEWeightOwnerMixin` — override only if allocation needs more); then add the class to `moe_resolution.IMPL_PRIORITY` and `BACKEND_FAMILY`, and add a branch in `create_moe_backend`. Declare the `descriptor` and `@register_moe_impl` on the same class that implements those four methods. Split an abstract parent out of it only when several quantization formats are planned — see the one-class-per-identity note below |
-| New `FUSED_COMM` Backend | `mega_moe/mega_moe_deepgemm.py` (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`), `mega_moe/mega_moe_cute_dsl.py` (`TrtllmCutedslMegaMoeNvfp4Impl`) | Same as above + override `scheduler_kind = MoESchedulerKind.FUSED_COMM` and `validate_configurable_moe` for backend-specific constraints. For NVFP4 CuteDSL specifically, mirror the `TrtllmCutedslMegaMoeNvfp4Impl` pattern: capability probe for the CUDA 13 Cutlass DSL runtime, JSON-friendly tactic dict, lazy kernel imports from `cute_dsl_kernels/cutedsl_megamoe/`, and `quantize_input` that short-circuits zero-token input. |
+| New `FUSED_COMM` Backend | `mega_moe/mega_moe_deepgemm.py` (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`), `mega_moe/mega_moe_cute_dsl.py` (`TrtllmCutedslMegaMoeNvfp4Impl`) | Same as above + override `scheduler_kind = MoESchedulerKind.FUSED_COMM` and `validate_configurable_moe` for backend-specific constraints. For NVFP4 CuteDSL specifically, mirror the `TrtllmCutedslMegaMoeNvfp4Impl` pattern: capability probe for the CUDA 13 Cutlass DSL runtime, JSON-friendly tactic dict, lazy kernel imports from `moe/kernels/cutedsl_megamoe/`, and `quantize_input` that short-circuits zero-token input. |
 | New Quantization Method | `quantization.py` → `FP8QDQFusedMoEMethod` | Subclass `FusedMoEMethod`, implement quant/dequant ops |
 | New Communication Strategy | `communication/nvlink_one_sided.py` (`NVLinkOneSided`) | Subclass `Communication`, implement `prepare_dispatch`, `dispatch`, `combine`; also implement `CheckpointableCommunication` when native workspace mappings must follow executor sleep/wakeup |
 | New Scheduler | `moe_scheduler.py` (`ExternalCommMoEScheduler` / `FusedCommMoEScheduler`) | Subclass `MoEScheduler`, implement `forward`; add new `MoESchedulerKind` value and wire into `create_moe_scheduler` factory |

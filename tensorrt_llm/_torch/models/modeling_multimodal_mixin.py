@@ -46,6 +46,7 @@ from tensorrt_llm.inputs.registry import (
 )
 from tensorrt_llm.logger import logger
 
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from .modeling_multimodal_utils import (
     _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
@@ -480,6 +481,17 @@ class MultimodalModelMixin:
         positions but do not have rows here.
         """
         raise NotImplementedError
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission-time validation of one request's multimodal payload.
+
+        Called from `PyExecutor._validate_request` before activation; raise
+        `ValueError` to reject just this request. Conditions a model would
+        reject inside `forward` belong here instead: a forward-time failure
+        is handled batch-wide and fails every request scheduled alongside
+        the bad one. Default: accept everything.
+        """
+        return None
 
     def prepare_multimodal_encoder_inputs(
         self,
@@ -1063,7 +1075,7 @@ class MultimodalModelMixin:
             embedding_layer=self.text_embedding_layer,
             extra_embeds=extra_embeds,
             # `text_token_indices` / `mm_token_indices` are pre-computed by the
-            # executor (see DecoderRunner._prepare_inputs) and must reach
+            # executor (see DecoderInputPreparer.prepare_inputs) and must reach
             # `fuse_input_embeds` to (a) preserve the active-chunk subset
             # contract when MM rows are a subset of visible MM tokens and
             # (b) avoid the torch.where host sync inside
@@ -1748,18 +1760,22 @@ def _dispatch_cross_iter_prefetch(
             # the (possibly new) dict to each request so the next iteration's
             # `_prepare_inputs` sees the cached embedding stamped below. Mirrors
             # the reassignment at the canonical to_device call site in
-            # DecoderRunner._prepare_inputs.
+            # DecoderInputPreparer.prepare_inputs.
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
 
-            if partial_hits and encoder_cache is not None:
-                model._encode_with_partial_cache(partial_hits, encoder_cache)
-            if cache_misses:
-                encoder_output = model.encode_multimodal_inputs(cache_misses)
-                _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
-                if encoder_cache is not None:
-                    for param in cache_misses:
-                        model._write_encoder_cache_entries(param, encoder_cache)
+            # Prefetch runs between executor steps, outside `ModelCaller`, so the vision tower's
+            # TP all-reduces can return NCCL window tensors here. The stored embeddings are read
+            # next iteration, so keep a clone rather than a view of a released window.
+            with discard_nccl_window_tensor_outputs(params_to_transfer):
+                if partial_hits and encoder_cache is not None:
+                    model._encode_with_partial_cache(partial_hits, encoder_cache)
+                if cache_misses:
+                    encoder_output = model.encode_multimodal_inputs(cache_misses).clone()
+                    _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
+                    if encoder_cache is not None:
+                        for param in cache_misses:
+                            model._write_encoder_cache_entries(param, encoder_cache)
 
             # Prefetch only needs to attach each request's embedding. Validate each request
             # independently instead of gathering the unused batch output with `torch.cat`.

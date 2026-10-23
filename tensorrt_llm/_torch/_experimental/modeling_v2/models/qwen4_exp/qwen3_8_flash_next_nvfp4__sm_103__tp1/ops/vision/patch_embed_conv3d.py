@@ -4,7 +4,7 @@
 
 Tier-3 composed: one `torch.nn.functional.conv3d` call between two views that
 launch nothing. No registered op is a 3-D convolution, and the CuTe DSL
-implicit-GEMM conv3d kernels in `cute_dsl_kernels/blackwell/conv/` refuse this
+implicit-GEMM conv3d kernels in `visual_gen/kernels/blackwell/conv/` refuse this
 checkpoint's three input channels (bf16 needs `in_channels % 8 == 0`;
 `can_implement` swallows the refusal and returns False).
 """

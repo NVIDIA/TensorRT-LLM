@@ -1424,6 +1424,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.max_ctx_cached_token_len = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
+            # The indptrs below are read only by the context MLA kernels, and
+            # every batch with context requests rewrites them.
+            return
         torch.cumsum(cached_token_lens[:self.num_contexts],
                      dim=0,
                      dtype=torch.int64,
@@ -1470,7 +1473,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             seqLenQ = self.spec_decoding_packed_mask.shape[
                 1] if self.spec_decoding_packed_mask is not None else 1
             mask_size = torch.ops.trtllm.spec_dec_tree_custom_mask_capacity(
-                self.max_num_requests, seqLenQ, self.num_heads_per_kv)
+                self.max_num_requests, seqLenQ, self.max_num_heads_per_kv)
             self.spec_decoding_bl_tree_mask = torch.zeros(
                 mask_size,
                 dtype=torch.uint32,
