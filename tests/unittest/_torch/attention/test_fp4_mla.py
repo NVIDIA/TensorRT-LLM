@@ -56,7 +56,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
 )
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DFlashDecodingConfig,
+    DSparkDecodingConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -400,6 +405,44 @@ def test_validate_fp4_mla_config_accepts_only_helix_context_parallelism(
     else:
         with pytest.raises(ValueError, match="only through Helix"):
             model_loader.validate_fp4_mla_config(model_config, llm_args)
+
+
+@pytest.mark.parametrize(
+    ("spec_config", "keeps_separate_draft_kv_cache"),
+    [
+        (DSparkDecodingConfig(max_draft_len=5), True),
+        (DFlashDecodingConfig(max_draft_len=7), True),
+        (MTPDecodingConfig(num_nextn_predict_layers=1, max_draft_len=3), False),
+    ],
+    ids=["dspark", "dflash", "mtp"],
+)
+def test_validate_fp4_mla_config_keeps_standalone_drafter_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_config: DecodingBaseConfig,
+    keeps_separate_draft_kv_cache: bool,
+) -> None:
+    """A standalone drafter keeps its own draft KV pool under FP4 MLA.
+
+    Without it the drafter falls back to a context arena that is dense in
+    max_seq_len. Drafters whose layers share the target's FP4 MLA cache
+    (one-model MTP) keep using it.
+    """
+    from tensorrt_llm._torch.pyexecutor import model_loader
+
+    monkeypatch.setattr(model_loader, "supports_fp4_mla_attention", lambda config: True)
+    assert spec_config.spec_dec_mode.use_one_engine()
+    model_config = SimpleNamespace(
+        sparse_attention_config=None,
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True)),
+        mapping=SimpleNamespace(cp_size=1, has_cp_helix=lambda: False),
+        spec_config=spec_config,
+    )
+    llm_args = SimpleNamespace(kv_cache_config=SimpleNamespace(use_kv_cache_manager_v2=True))
+
+    model_loader.validate_fp4_mla_config(model_config, llm_args)
+
+    assert spec_config._allow_separate_draft_kv_cache is keeps_separate_draft_kv_cache
 
 
 def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:

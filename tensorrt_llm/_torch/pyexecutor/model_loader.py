@@ -262,9 +262,14 @@ def validate_fp4_mla_config(model_config: ModelConfig,
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
-        # HP/V-scale side pools are not switched by draft_kv_cache_context.
-        # Set this before models and workers consult the shared predicate.
-        spec_config._allow_separate_draft_kv_cache = False
+        spec_dec_mode = spec_config.spec_dec_mode
+        # A standalone drafter (DFlash, DSpark) keeps its layers in its own
+        # BF16 draft pool, outside the FP4 MLA layout. Without that pool it
+        # falls back to a context arena that is dense in max_seq_len.
+        if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
+            # HP/V-scale side pools are not switched by draft_kv_cache_context.
+            # Set this before models and workers consult the shared predicate.
+            spec_config._allow_separate_draft_kv_cache = False
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
