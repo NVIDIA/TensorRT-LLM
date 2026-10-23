@@ -35,7 +35,7 @@ permissions:
 
 concurrency:
   # Queue rather than cancel: an interrupted run could leave a commit without its notice.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: spec-archive-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
     # SPECS_REMOVAL_BOT_LOGIN is the login that owns SPECS_REMOVAL_TOKEN. Pushes
     # it makes are this workflow's own removal commits and need no second look.
     if: >-
-      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      vars.SPEC_ARCHIVE_ENABLED == 'true' &&
       github.event.pull_request.draft == false &&
       !(github.event.action == 'synchronize' &&
         github.event.sender.login == vars.SPECS_REMOVAL_BOT_LOGIN)
@@ -67,13 +67,20 @@ jobs:
         uses: actions/github-script@v9
         env:
           SPECS_REMOVAL_TOKEN: ${{ secrets.SPECS_REMOVAL_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SPEC_GITHUB_TOKEN: ${{ secrets.SPEC_ARCHIVE_SOURCE_TOKEN }}
+          ARTIFACTORY_URL: ${{ vars.SPEC_ARTIFACTORY_URL }}
+          ARTIFACTORY_REPOSITORY: ${{ vars.SPEC_ARTIFACTORY_REPOSITORY }}
+          ARTIFACTORY_TOKEN: ${{ secrets.SPEC_ARCHIVE_WRITE_TOKEN }}
           SPECS_REMOVAL_SIGNOFF: ${{ vars.SPECS_REMOVAL_SIGNOFF }}
         with:
           script: |
             const { run } = require('./.github/scripts/remove_ready_specs.js');
+            const { archiveSpecs } = require('./.github/scripts/spec_archive/github-archive-bridge.js');
             const token = process.env.SPECS_REMOVAL_TOKEN;
             await run({
               github, context, core,
               pusher: token ? getOctokit(token) : null,
               signoff: process.env.SPECS_REMOVAL_SIGNOFF,
+              archive: archiveSpecs,
             });

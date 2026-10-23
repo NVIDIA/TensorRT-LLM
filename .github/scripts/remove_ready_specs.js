@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Removes the root `specs/` folder (speckit design documents) from a pull
+// Removes the transient spec roots (speckit design documents) from a pull
 // request's branch once the pull request is ready for review, and comments on
 // it. Decisions are pure functions; `run()` is the thin layer that calls the
 // GitHub API. Branch content is never fetched onto the runner or executed:
 // only tree listings and, for restorations, blobs of the target branch are read.
 
-const TARGET_REPOSITORY = 'NVIDIA/TensorRT-LLM';
-const SPEC_ROOT = 'specs';
+const TARGET_REPOSITORY = process.env.GITHUB_REPOSITORY || 'NVIDIA/TensorRT-LLM';
+const SPEC_ROOTS = ['specs', 'openspec/changes'];
 const NOTICE_AUTHOR = 'github-actions[bot]';
 const TRIGGER_ACTIONS = new Set(['opened', 'reopened', 'ready_for_review', 'synchronize']);
 const REMOVAL_MARKER = /<!-- specs-removal:([0-9a-f]{40}) -->/;
@@ -35,14 +35,14 @@ const CREATE_COMMIT = `mutation($input: CreateCommitOnBranchInput!) {
   createCommitOnBranch(input: $input) { commit { oid url author { name email } } }
 }`;
 
-// A path belongs to the spec folder only when its first component is exactly
-// `specs`, compared case-sensitively on the path as git records it. Paths with
+// Only Spec Kit drafts and OpenSpec changes are transient roots. Compare
+// their components case-sensitively on paths as git records them. Paths with
 // a `.github` component are refused even inside the folder, so a widened match
 // can never let this automation touch workflow files.
 function isSpecPath(path) {
   if (typeof path !== 'string') return false;
   const parts = path.split('/');
-  return parts.length >= 2 && parts[0] === SPEC_ROOT &&
+  return SPEC_ROOTS.some(root => path.startsWith(root + '/')) &&
     parts.every(part => part !== '' && part !== '.' && part !== '..') &&
     !parts.some(part => part.toLowerCase() === '.github');
 }
@@ -64,8 +64,9 @@ function decide(payload) {
 }
 
 function featureDir(path) {
-  const parts = path.split('/');
-  return parts.length > 2 ? `${parts[0]}/${parts[1]}/` : `${parts[0]}/`;
+  const root = SPEC_ROOTS.find(root => path.startsWith(root + '/'));
+  const parts = path.slice(root.length + 1).split('/');
+  return parts.length > 1 ? `${root}/${parts[0]}/` : `${root}/`;
 }
 
 // `head` and `base` map spec paths to {sha, mode}. `base` is the merge base, so
@@ -82,12 +83,18 @@ function specChangeSet({head, base = new Map(), changedFiles}) {
   };
   for (const [path, entry] of head) {
     const target = base.get(path);
-    if (target?.sha === entry.sha || !accept(path)) continue;
+    if ((target?.sha === entry.sha && target?.mode === entry.mode) || !accept(path)) continue;
+    if (target && (target.mode !== entry.mode || target.mode !== '100644')) {
+      throw new Error(`Cannot restore spec file mode faithfully through GraphQL: ${path}`);
+    }
     if (target) restorations.push({path, sha: target.sha, inHead: true});
     else deletions.push(path);
   }
   for (const [path, target] of base) {
-    if (!head.has(path) && accept(path)) restorations.push({path, sha: target.sha, inHead: false});
+    if (!head.has(path) && accept(path)) {
+      if (target.mode !== '100644') throw new Error(`Cannot restore spec file mode faithfully through GraphQL: ${path}`);
+      restorations.push({path, sha: target.sha, inHead: false});
+    }
   }
   deletions.sort();
   restorations.sort((a, b) => a.path.localeCompare(b.path));
@@ -180,7 +187,7 @@ function fullRemovalNotice({commit, parentSha, changeSet, baseRef}) {
   return [
     '### Design documents removed from this branch',
     '',
-    `This pull request is ready for review, so CI removed the \`${SPEC_ROOT}/\` folder from its branch in ` +
+    `This pull request is ready for review, so CI removed the \`${SPEC_ROOTS.map(root => root + '/').join(' and ')}\` folder from its branch in ` +
       `${commitLink(commit)}. Those documents are for review while a pull request is a draft; they are kept ` +
       `out of the ready diff and off ${codeSpan(baseRef)}.${whole}`,
     '',
@@ -189,15 +196,16 @@ function fullRemovalNotice({commit, parentSha, changeSet, baseRef}) {
     '**Your local copy is safe, but take these three steps before you pull.** They keep every spec file, ' +
       'including edits you have not committed:',
     '',
-    `    git rm -r --cached ${SPEC_ROOT}`,
-    `    echo '${SPEC_ROOT}/' >> .git/info/exclude`,
+    '    git rm -r --cached --ignore-unmatch specs openspec/changes',
+    '    echo "/specs/" >> "$(git rev-parse --git-path info/exclude)"',
+    '    echo "/openspec/changes/" >> "$(git rev-parse --git-path info/exclude)"',
     '    git pull --ff-only',
     '',
     'The first command stops git tracking the folder without touching your files; the second keeps it out ' +
       'of later commits; the third brings in the removal. Pulling without them deletes the spec files that ' +
       'you have not edited and stops on the ones you have. If that already happened, get them back with:',
     '',
-    `    git restore --source=${parentSha} -- ${SPEC_ROOT}/`,
+    `    git restore --source=${parentSha} -- specs/ openspec/changes/`,
     '',
     `**Pushing a branch that predates ${removal} — for example by amending and ` +
       'force-pushing — brings the folder back**, and CI removes it again.',
@@ -219,7 +227,7 @@ function shortRemovalNotice({commit, changeSet, firstNoticeUrl}) {
   return [
     '### Design documents removed again',
     '',
-    `The \`${SPEC_ROOT}/\` folder came back on this branch, so CI removed it again in ${commitLink(commit)} ` +
+    `The \`${SPEC_ROOTS.map(root => root + '/').join(' and ')}\` folder came back on this branch, so CI removed it again in ${commitLink(commit)} ` +
       `(${fileCount(changeSet.fileCount)}). See the steps in [the first notice](${firstNoticeUrl}) to keep ` +
       'your local copy.',
     '',
@@ -231,13 +239,14 @@ function failureNotice({reason, title}) {
   return [
     '### Could not remove the design documents',
     '',
-    `This pull request is ready for review and its branch still contains a \`${SPEC_ROOT}/\` folder, but CI ` +
+    `This pull request is ready for review and its branch still contains a \`${SPEC_ROOTS.map(root => root + '/').join(' and ')}\` folder, but CI ` +
       `could not remove it: ${REASON_SENTENCES[reason]}`,
     '',
     'Please remove it yourself:',
     '',
-    `    git rm -r --cached ${SPEC_ROOT}`,
-    `    echo '${SPEC_ROOT}/' >> .git/info/exclude`,
+    '    git rm -r --cached --ignore-unmatch specs openspec/changes',
+    '    echo "/specs/" >> "$(git rev-parse --git-path info/exclude)"',
+    '    echo "/openspec/changes/" >> "$(git rev-parse --git-path info/exclude)"',
     `    git commit -m "${titlePrefix(title)} remove design documents from the pull request"`,
     '    git push',
     '',
@@ -294,7 +303,7 @@ function signoffIdentity(viewer, override) {
 function commitMessage(identity) {
   return {
     headline: 'Remove design documents from the pull request',
-    body: `The ${SPEC_ROOT}/ folder holds design documents for review while a pull request is a draft.\n\n` +
+    body: `The ${SPEC_ROOTS.map(root => root + '/').join(' and ')} folder holds design documents for review while a pull request is a draft.\n\n` +
       `Signed-off-by: ${identity.name} <${identity.email}>`,
   };
 }
@@ -302,13 +311,33 @@ function commitMessage(identity) {
 // Lists the blobs under the root spec folder of `treeish`. There is no
 // folder-level delete in the GitHub API, so every path is listed individually.
 async function enumerateSpecBlobs(github, {owner, repo, treeish}) {
-  const {data: root} = await github.rest.git.getTree({owner, repo, tree_sha: treeish});
-  const folder = root.tree.find(entry => entry.path === SPEC_ROOT && entry.type === 'tree');
-  if (!folder) return new Map();
-  const {data: tree} = await github.rest.git.getTree({owner, repo, tree_sha: folder.sha, recursive: '1'});
-  if (tree.truncated) throw new Error(`${owner}/${repo}@${treeish}: the ${SPEC_ROOT}/ tree is too large to list`);
-  return new Map(tree.tree.filter(entry => entry.type === 'blob')
-    .map(entry => [`${SPEC_ROOT}/${entry.path}`, {sha: entry.sha, mode: entry.mode}]));
+  const {data: rootTree} = await github.rest.git.getTree({owner, repo, tree_sha: treeish});
+  if (rootTree.truncated) throw new Error('Root tree was truncated');
+  const blobs = new Map();
+  for (const root of SPEC_ROOTS) {
+    let tree = rootTree;
+    let folder;
+    const parts = root.split('/');
+    for (let index = 0; index < parts.length; index++) {
+      folder = tree.tree.find(entry => entry.path === parts[index]);
+      if (!folder) break;
+      if (folder.type !== 'tree') throw new Error('Spec root is not a directory');
+      if (index < parts.length - 1) {
+        ({data: tree} = await github.rest.git.getTree({owner, repo, tree_sha: folder.sha}));
+        if (tree.truncated) throw new Error('Spec parent tree was truncated');
+      }
+    }
+    if (!folder) continue;
+    const {data: subtree} = await github.rest.git.getTree({owner, repo, tree_sha: folder.sha, recursive: '1'});
+    if (subtree.truncated) throw new Error(`${owner}/${repo}@${treeish}: ${root}/ tree was truncated`);
+    for (const entry of subtree.tree.filter(entry => entry.type !== 'tree')) {
+      if (entry.type !== 'blob' || !['100644', '100755'].includes(entry.mode)) {
+        throw new Error('Refusing symlink or submodule in a spec tree');
+      }
+      blobs.set(`${root}/${entry.path}`, {sha: entry.sha, mode: entry.mode});
+    }
+  }
+  return blobs;
 }
 
 // The number of files a comparison changes, or undefined when its file list is
@@ -346,7 +375,7 @@ async function removeSpecs(pusher, {repositoryNameWithOwner, branchName, expecte
   const paths = [...deletions, ...additions.map(addition => addition.path)];
   if (paths.length === 0) throw new Error('No spec changes to remove');
   const outside = paths.filter(path => !isSpecPath(path));
-  if (outside.length) throw new Error(`Refusing to change paths outside ${SPEC_ROOT}/: ${outside.join(', ')}`);
+  if (outside.length) throw new Error(`Refusing to change paths outside ${SPEC_ROOTS.map(root => root + '/').join(' and ')}: ${outside.join(', ')}`);
   const {createCommitOnBranch} = await pusher.graphql(CREATE_COMMIT, {input: {
     branch: {repositoryNameWithOwner, branchName},
     expectedHeadOid,
@@ -368,7 +397,7 @@ async function postNotice(github, {repo, pr, outcome}) {
   return data;
 }
 
-async function run({github, pusher, context, core, signoff}) {
+async function run({github, pusher, context, core, signoff, archive}) {
   const decision = decide(context.payload);
   core.info(`${decision.act ? 'Acting' : 'Skipped'}: ${decision.reason}`);
   if (!decision.act) return {outcome: 'skipped'};
@@ -380,7 +409,7 @@ async function run({github, pusher, context, core, signoff}) {
   // the run log, which the `unknown` notice points the author to.
   const fail = async (reason, error) => {
     const message = error ? apiErrorMessage(error) : '';
-    core.warning(`Could not remove ${SPEC_ROOT}/ from #${pr.number}: ${reason}${message ? ` (${message})` : ''}`);
+    core.warning(`Could not remove ${SPEC_ROOTS.map(root => root + '/').join(' and ')} from #${pr.number}: ${reason}${message ? ` (${message})` : ''}`);
     await postNotice(github, {repo: baseRepo, pr, outcome: {kind: 'failure', reason}});
     return {outcome: 'failed', reason};
   };
@@ -413,6 +442,14 @@ async function run({github, pusher, context, core, signoff}) {
   let commit;
   for (let attempt = 1; !commit; attempt++) {
     const additions = await restorationContents(github, baseRepo, changeSet.restorations);
+    // Archive this exact candidate head before every removal attempt. A stale
+    // CAS retry reaches this barrier again and archives its new candidate.
+    // A rejected upload or changed/closed PR throws before any branch write.
+    if (typeof archive !== 'function') throw new Error('Archive callback is required before removal');
+    const archived = await archive({number: pr.number, headSha});
+    if (!archived || archived.head_sha !== headSha || !/^[0-9a-f]{64}$/.test(archived.sha256 ?? '')) {
+      throw new Error('Refusing removal without a finalized archive for the exact head');
+    }
     try {
       commit = await removeSpecs(pusher, {
         repositoryNameWithOwner: pr.head.repo.full_name, branchName: pr.head.ref,

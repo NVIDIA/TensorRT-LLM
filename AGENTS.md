@@ -143,7 +143,7 @@ Key files:
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
-- **CI removes `specs/` from ready PRs** — the root `specs/` folder holds design documents for draft-stage review only. When a PR becomes ready for review, CI removes the folder from its branch in a commit of its own (`.github/workflows/remove-ready-specs.yml`) and comments on the PR. Follow that comment's steps before pulling, so your local copy survives.
+- **Archive transient specs before cleanup** — `specs/` and `openspec/changes/` hold draft review documents. When `SPEC_ARCHIVE_ENABLED=true`, the ready-PR workflow uploads the exact head's manifest-bearing archive to Artifactory before restoring these roots to their merge-base state. Upload failure prevents cleanup. `openspec/specs/` remains durable. Follow the workflow comment before pulling so local documents survive; use `git spec pull <PR>` to restore an archive. Configure the archive repository, write token and reader scope before enabling this workflow.
 - **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `BaseLlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 
 ## Development Workflow
@@ -187,6 +187,13 @@ New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
 for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
+
+### Specification archive checks
+
+Run `node .github/scripts/spec_archive.test.js` for the archive-before-removal,
+concurrent-push retry and transient-root boundary regression checks. Shared CLI,
+provider and dashboard tests live in the private `TensorRT/poc/spec-archive`
+tools project and run with `python3 -m unittest discover -s tests -v`.
 
 ### Advisory semantic review
 

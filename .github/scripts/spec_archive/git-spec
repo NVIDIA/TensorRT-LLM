@@ -1,0 +1,763 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Portable specification archives. Requires Python 3.9+, Git, and no packages."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import difflib
+from email.message import Message
+import gzip
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ALLOWED_ROOTS = ("specs/", "openspec/changes/")
+MANIFEST_KEYS = frozenset(("schema_version", "provider", "host", "repo", "repo_url", "pr", "head_sha", "base_sha", "merge_sha", "status", "title", "author", "created", "archived_at", "tool", "paths", "design_docs", "sha256"))
+MAX_ARCHIVE = 64 * 1024 * 1024
+MAX_CONTENT = 128 * 1024 * 1024
+MAX_FILE = 32 * 1024 * 1024
+MAX_FILES = 10000
+
+
+class SpecError(ValueError):
+    pass
+
+
+def json_bytes(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _json(data: bytes | str) -> object:
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise SpecError("duplicate JSON key: " + key)
+            result[key] = value
+        return result
+    try:
+        return json.loads(data, object_pairs_hook=unique)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise SpecError("invalid JSON: " + str(exc)) from exc
+
+
+def _relative(name: object) -> PurePosixPath:
+    if not isinstance(name, str) or not name or "\\" in name or any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise SpecError("unsafe relative path")
+    components = name.split("/")
+    if any(p in ("", ".", "..", ".git") for p in components):
+        raise SpecError("unsafe relative path: " + name)
+    return PurePosixPath(name)
+
+
+def _sha(value: object, nullable: bool = False) -> bool:
+    return (nullable and value is None) or (isinstance(value, str) and re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", value) is not None)
+
+
+def _date(value: object) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", value):
+        raise SpecError("dates must be UTC RFC 3339 ending in Z")
+    try:
+        dt.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise SpecError("invalid date") from exc
+
+
+def validate_manifest(manifest: object, finalized: bool = False) -> dict[str, object]:
+    if not isinstance(manifest, dict):
+        raise SpecError("manifest must be a JSON object")
+    expected = MANIFEST_KEYS | ({"archive_path"} if finalized else set())
+    if set(manifest) != expected:
+        raise SpecError("manifest keys mismatch; missing=%s extra=%s" % (sorted(expected - set(manifest)), sorted(set(manifest) - expected)))
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise SpecError("unsupported manifest schema_version")
+    if manifest["provider"] not in ("github", "gitlab"):
+        raise SpecError("provider must be github or gitlab")
+    host = manifest["host"]
+    if not isinstance(host, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?", host):
+        raise SpecError("invalid forge host")
+    repo = manifest["repo"]
+    if not isinstance(repo, str) or len(repo.split("/")) < 2:
+        raise SpecError("repo must include namespace and repository")
+    _relative(repo)
+    if any(not re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in repo.split("/")):
+        raise SpecError("invalid repository namespace")
+    if manifest["repo_url"] != "https://" + host + "/" + repo:
+        raise SpecError("repo_url must match HTTPS host and repo")
+    if type(manifest["pr"]) is not int or manifest["pr"] < 1:
+        raise SpecError("pr must be a positive PR number or MR IID")
+    if not all(_sha(manifest[k], nullable=(k == "merge_sha")) for k in ("head_sha", "base_sha", "merge_sha")):
+        raise SpecError("invalid Git SHA")
+    if manifest["status"] not in ("open", "merged", "abandoned"):
+        raise SpecError("invalid PR status")
+    for key in ("title", "author"):
+        if not isinstance(manifest[key], str) or not manifest[key] or len(manifest[key]) > 2000 or "\x00" in manifest[key]:
+            raise SpecError("invalid " + key)
+    for key in ("created", "archived_at"):
+        _date(manifest[key])
+    if manifest["tool"] not in ("speckit", "openspec", "mixed"):
+        raise SpecError("invalid specification tool")
+    paths = manifest["paths"]
+    if not isinstance(paths, list) or not paths or any(p not in ALLOWED_ROOTS for p in paths) or len(set(paths)) != len(paths):
+        raise SpecError("paths must contain unique allowed spec roots")
+    docs = manifest["design_docs"]
+    if not isinstance(docs, list) or len(docs) > 100:
+        raise SpecError("design_docs must be a list of HTTPS URLs")
+    for link in docs:
+        if not isinstance(link, str) or len(link) > 2000:
+            raise SpecError("invalid design document URL")
+        parsed = urllib.parse.urlsplit(link)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or any(ord(c) < 32 for c in link):
+            raise SpecError("design_docs permits HTTPS URLs without credentials")
+    if finalized:
+        if not isinstance(manifest["sha256"], str) or not re.fullmatch(r"[a-f0-9]{64}", manifest["sha256"]):
+            raise SpecError("descriptor needs a SHA-256 checksum")
+        if manifest["archive_path"] != archive_path(manifest):
+            raise SpecError("archive_path does not match descriptor identity/checksum")
+    elif manifest["sha256"] is not None:
+        raise SpecError("embedded manifest sha256 must be null (self-hash is impossible)")
+    return manifest
+
+
+def archive_path(manifest: dict[str, object]) -> str:
+    return "%s/%s/%s/pr-%s/%s/%s.tar.gz" % tuple(manifest[k] for k in ("provider", "host", "repo", "pr", "head_sha", "sha256"))
+
+
+def _in_roots(name: str, roots: list[str] | tuple[str, ...]) -> bool:
+    return any(name.startswith(p) for p in roots)
+
+
+def _walk_regular(root: Path, relative: str) -> list[tuple[str, Path]]:
+    target = root.joinpath(*PurePosixPath(relative).parts)
+    if not os.path.lexists(target):
+        return []
+    for ancestor in [target] + list(target.parents):
+        if ancestor == root.parent:
+            break
+        if ancestor.is_symlink():
+            raise SpecError("symlink in spec root: " + str(ancestor))
+    if not target.is_dir():
+        raise SpecError("spec root is not a directory: " + relative)
+    files = []
+    for current, dirs, names in os.walk(target, followlinks=False):
+        for name in dirs + names:
+            path = Path(current) / name
+            mode = path.lstat().st_mode
+            rel = path.relative_to(root).as_posix()
+            _relative(rel)
+            if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                raise SpecError("non-regular spec entry: " + rel)
+            if stat.S_ISREG(mode):
+                files.append((rel, path))
+    return files
+
+
+def build_archive(root: Path | str, manifest: dict[str, object], output: Path | str) -> dict[str, object]:
+    """Write a deterministic gzip/tar snapshot and return its external descriptor."""
+    validate_manifest(manifest)
+    root, output = Path(root).resolve(), Path(output)
+    files = sorted(entry for p in manifest["paths"] for entry in _walk_regular(root, p.rstrip("/")))
+    if not files:
+        raise SpecError("no specification files found")
+    if len(files) > MAX_FILES:
+        raise SpecError("too many specification files")
+    payloads, total = [], 0
+    for name, path in files:
+        if path.stat().st_size > MAX_FILE:
+            raise SpecError("specification file exceeds archive limits")
+        with path.open("rb") as stream:
+            content = stream.read(MAX_FILE + 1)
+        total += len(content)
+        if len(content) > MAX_FILE or total > MAX_CONTENT:
+            raise SpecError("specification content exceeds archive limits")
+        payloads.append((name, content))
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0, filename="") as zipped:
+        with tarfile.open(fileobj=zipped, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+            for name, data in [("spec-manifest.json", json_bytes(manifest))] + payloads:
+                info = tarfile.TarInfo(name)
+                info.size, info.mode, info.mtime = len(data), 0o644, 0
+                tar.addfile(info, io.BytesIO(data))
+    data = buf.getvalue()
+    if len(data) > MAX_ARCHIVE:
+        raise SpecError("compressed archive exceeds size limit")
+    descriptor = dict(manifest, sha256=hashlib.sha256(data).hexdigest())
+    descriptor["archive_path"] = archive_path(descriptor)
+    validate_manifest(descriptor, finalized=True)
+    _atomic_write(output, data)
+    return descriptor
+
+
+def read_archive(data: bytes, descriptor: dict[str, object]) -> dict[str, bytes]:
+    """Validate everything without extracting; return only allowed regular files."""
+    validate_manifest(descriptor, finalized=True)
+    if len(data) > MAX_ARCHIVE or hashlib.sha256(data).hexdigest() != descriptor["sha256"]:
+        raise SpecError("archive SHA-256 checksum mismatch or size limit exceeded")
+    files, seen, embedded, total = {}, set(), None, 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r|gz") as tar:
+            for number, member in enumerate(tar):
+                if number > MAX_FILES:
+                    raise SpecError("too many archive members")
+                name = member.name.rstrip("/") if member.isdir() else member.name
+                _relative(name)
+                if name in seen:
+                    raise SpecError("duplicate archive member: " + name)
+                seen.add(name)
+                if not (member.isfile() or member.isdir()) or member.pax_headers:
+                    raise SpecError("links, special entries and extended headers are forbidden")
+                if member.isdir():
+                    if not any((name + "/").startswith(p) or p.startswith(name + "/") for p in descriptor["paths"]):
+                        raise SpecError("directory outside declared spec roots")
+                    continue
+                if member.mode & 0o111:
+                    raise SpecError("executable archive entries are forbidden")
+                if name != "spec-manifest.json" and not _in_roots(name, descriptor["paths"]):
+                    raise SpecError("file outside declared spec roots: " + name)
+                total += member.size
+                if member.size < 0 or member.size > MAX_FILE or total > MAX_CONTENT:
+                    raise SpecError("archive expansion exceeds limits")
+                content = tar.extractfile(member).read(member.size + 1)
+                if len(content) != member.size:
+                    raise SpecError("truncated archive member")
+                if name == "spec-manifest.json":
+                    embedded = _json(content)
+                else:
+                    files[name] = content
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise SpecError("invalid gzip/tar archive") from exc
+    if embedded is None or not files:
+        raise SpecError("archive requires a manifest and specification files")
+    validate_manifest(embedded)
+    for key in MANIFEST_KEYS - {"sha256", "status", "merge_sha"}:
+        if embedded[key] != descriptor[key]:
+            raise SpecError("embedded manifest differs from descriptor: " + key)
+    for name in seen:
+        if any(parent.as_posix() in files for parent in PurePosixPath(name).parents):
+            raise SpecError("archive file/directory path conflict")
+    return files
+
+
+def _atomic_write(path: Path | str, data: bytes) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".git-spec-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self: _SafeRedirect,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: Message | dict[str, str],
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if (old.scheme, old.netloc) != (new.scheme, new.netloc):
+            raise SpecError("refusing Artifactory redirect to another origin")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _property_value(value: object) -> str:
+    if value is None or isinstance(value, (list, dict, bool)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return str(value)
+
+
+class Client:
+    """A generic Artifactory repository, or a filesystem store for offline use."""
+    def __init__(
+        self: Client,
+        store: Path | str | None = None,
+        url: str | None = None,
+        repository: str | None = None,
+        token: str | None = None,
+    ) -> None:
+        self.store = Path(store).absolute() if store is not None else None
+        self.url, self.repository, self.token = (url or "").rstrip("/"), repository, token
+        self._opener = urllib.request.build_opener(_SafeRedirect())
+        if self.store is None:
+            parsed = urllib.parse.urlsplit(self.url)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise SpecError("ARTIFACTORY_URL must be HTTPS without credentials, query or fragment")
+            if not repository or not re.fullmatch(r"[A-Za-z0-9_.-]+", repository) or repository in (".", ".."):
+                raise SpecError("configure ARTIFACTORY_REPOSITORY (generic local repository key)")
+
+    @classmethod
+    def from_env(cls: type[Client]) -> Client:
+        url, token = os.environ.get("ARTIFACTORY_URL"), os.environ.get("ARTIFACTORY_TOKEN")
+        selected = None
+        config_path = Path(os.environ.get("JFROG_CLI_HOME_DIR", str(Path.home() / ".jfrog"))) / "jfrog-cli.conf.v6"
+        if config_path.exists():
+            config = _json(config_path.read_bytes())
+            servers = config.get("servers", [])
+            server_id = os.environ.get("ARTIFACTORY_SERVER_ID")
+            candidates = [s for s in servers if isinstance(s, dict) and ((server_id and s.get("serverId") == server_id) or (not server_id and url and (s.get("artifactoryUrl") or s.get("url", "").rstrip("/") + "/artifactory").rstrip("/") == url.rstrip("/")) or (not server_id and not url and s.get("isDefault")))]
+            if not candidates and not url and not server_id and len(servers) == 1:
+                candidates = servers
+            if len(candidates) == 1:
+                selected = candidates[0]
+            elif len(candidates) > 1:
+                raise SpecError("ambiguous JFrog servers; set ARTIFACTORY_SERVER_ID")
+        if selected:
+            url = url or selected.get("artifactoryUrl") or selected.get("url", "").rstrip("/") + "/artifactory"
+            token = token or selected.get("accessToken")
+        if not token:
+            raise SpecError("set your personal ARTIFACTORY_TOKEN or configure a JFrog accessToken")
+        return cls(url=url, repository=os.environ.get("ARTIFACTORY_REPOSITORY"), token=token)
+
+    def _local(self: Client, path: str) -> Path:
+        relative = _relative(path)
+        destination = self.store.joinpath(*relative.parts)
+        for ancestor in [destination] + list(destination.parents):
+            if ancestor.is_symlink():
+                raise SpecError("symlink in artifact store")
+            if ancestor == self.store:
+                break
+        return destination
+
+    def archive_url(self: Client, path: str) -> str | None:
+        _relative(path)
+        return None if self.store is not None else self.url + "/" + urllib.parse.quote(self.repository, safe="") + "/" + urllib.parse.quote(path, safe="/")
+
+    def _request(
+        self: Client,
+        method: str,
+        path: str,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        limit: int = MAX_ARCHIVE,
+    ) -> bytes:
+        url = self.url + "/" + path
+        request_headers = {"Authorization": "Bearer " + self.token} if self.token else {}
+        request_headers.update(headers or {})
+        req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+        try:
+            with self._opener.open(req, timeout=60) as response:
+                body = response.read(limit + 1)
+                if len(body) > limit:
+                    raise SpecError("Artifactory response exceeds size limit")
+                return body
+        except urllib.error.HTTPError as exc:
+            raise SpecError("Artifactory HTTP %s during %s (check URL, repository and personal permissions)" % (exc.code, method)) from exc
+        except urllib.error.URLError as exc:
+            raise SpecError("Artifactory request failed: " + str(exc.reason)) from exc
+
+    def search(
+        self: Client,
+        repo: str | None = None,
+        pr: int | None = None,
+        author: str | None = None,
+        provider: str | None = None,
+        host: str | None = None,
+    ) -> list[dict[str, object]]:
+        filters = {key: value for key, value in {"repo": repo, "pr": pr, "author": author, "provider": provider, "host": host}.items() if value is not None}
+        results = []
+        if self.store is not None:
+            if self.store.is_symlink():
+                raise SpecError("symlink in artifact store")
+            for path in sorted(self.store.rglob("*.tar.gz.json")):
+                safe = self._local(path.relative_to(self.store).as_posix())
+                descriptor = _json(safe.read_bytes())
+                validate_manifest(descriptor, finalized=True)
+                if path.relative_to(self.store).as_posix() != descriptor["archive_path"] + ".json":
+                    raise SpecError("descriptor sidecar identity/path mismatch")
+                if all(descriptor[k] == v for k, v in filters.items()):
+                    results.append(descriptor)
+        else:
+            criteria = {"repo": {"$eq": self.repository}, "type": "file", "name": {"$match": "*.tar.gz"}, "@spec.schema_version": {"$eq": "1"}}
+            criteria.update({"@spec." + k: {"$eq": str(v)} for k, v in filters.items()})
+            offset, page_size = 0, 200
+            while True:
+                query = "items.find(%s).include(\"repo\",\"path\",\"name\").sort({\"$asc\":[\"path\",\"name\"]}).offset(%d).limit(%d)" % (json.dumps(criteria), offset, page_size)
+                page = _json(self._request("POST", "api/search/aql", query.encode(), {"Content-Type": "text/plain"}))
+                items = page.get("results", [])
+                if not isinstance(items, list):
+                    raise SpecError("invalid AQL response")
+                for item in items:
+                    path = item["name"] if item["path"] == "." else item["path"] + "/" + item["name"]
+                    _relative(path)
+                    if item["repo"] != self.repository:
+                        raise SpecError("AQL returned another artifact repository")
+                    stored = _json(self._request("GET", "api/storage/" + urllib.parse.quote(self.repository, safe="") + "/" + urllib.parse.quote(path, safe="/") + "?properties"))
+                    descriptor = {}
+                    for key, values in stored.get("properties", {}).items():
+                        if not key.startswith("spec."):
+                            continue
+                        key = key[5:]
+                        if not isinstance(values, list) or len(values) != 1:
+                            raise SpecError("expected one value per spec property")
+                        value = values[0]
+                        descriptor[key] = _json(value) if key in ("schema_version", "pr", "paths", "design_docs") or (key == "merge_sha" and value == "null") else value
+                    descriptor["archive_path"] = path
+                    validate_manifest(descriptor, finalized=True)
+                    if all(descriptor[k] == v for k, v in filters.items()):
+                        results.append(descriptor)
+                offset += page_size
+                total = page.get("range", {}).get("total")
+                if (isinstance(total, int) and offset >= total) or (total is None and len(items) < page_size):
+                    break
+                if offset > 1000000:
+                    raise SpecError("Artifactory search exceeds one million entries; narrow filters")
+        return sorted(results, key=lambda d: (d["archived_at"], d["archive_path"]), reverse=True)
+
+    def download(self: Client, path: str) -> bytes:
+        _relative(path)
+        if self.store is not None:
+            target = self._local(path)
+            if not target.is_file() or target.stat().st_size > MAX_ARCHIVE:
+                raise SpecError("missing or oversized archive: " + path)
+            return target.read_bytes()
+        return self._request("GET", urllib.parse.quote(self.repository, safe="") + "/" + urllib.parse.quote(path, safe="/"))
+
+    def _properties(self: Client, path: str, properties: dict[str, object]) -> None:
+        # JSON PATCH avoids the REST query format's comma/pipe/backslash escaping.
+        body = json_bytes({"props": {"spec." + k: _property_value(v) for k, v in properties.items()}})
+        self._request("PATCH", "api/metadata/" + urllib.parse.quote(self.repository, safe="") + "/" + urllib.parse.quote(path, safe="/") + "?recursiveProperties=0&atomicProperties=1", body, {"Content-Type": "application/json"})
+
+    def upload(self: Client, data: bytes, descriptor: dict[str, object]) -> dict[str, object]:
+        read_archive(data, descriptor)
+        path = descriptor["archive_path"]
+        pointer = path.rsplit("/", 2)[0] + "/latest.json"
+        if self.store is not None:
+            target, sidecar, latest = self._local(path), self._local(path + ".json"), self._local(pointer)
+            if target.exists() and target.read_bytes() != data:
+                raise SpecError("immutable archive path already holds different bytes")
+            _atomic_write(target, data)
+            _atomic_write(sidecar, json_bytes(descriptor))
+            _atomic_write(latest, json_bytes(descriptor))
+        else:
+            self._request("PUT", urllib.parse.quote(self.repository, safe="") + "/" + urllib.parse.quote(path, safe="/"), data, {"X-Checksum-Sha256": descriptor["sha256"], "Content-Type": "application/gzip"})
+            self._properties(path, descriptor)
+            self._request("PUT", urllib.parse.quote(self.repository, safe="") + "/" + urllib.parse.quote(pointer, safe="/"), json_bytes(descriptor), {"Content-Type": "application/json"})
+        return descriptor
+
+    def update_status(
+        self: Client,
+        identity: dict[str, object],
+        status: str,
+        merge_sha: str | None = None,
+    ) -> int:
+        if status not in ("open", "merged", "abandoned") or not _sha(merge_sha, nullable=True):
+            raise SpecError("invalid lifecycle update")
+        if not all(k in identity for k in ("provider", "host", "repo", "pr")):
+            raise SpecError("lifecycle update requires full PR/MR identity")
+        versions = self.search(**{k: identity[k] for k in ("provider", "host", "repo", "pr")})
+        updated = []
+        for descriptor in versions:
+            descriptor = dict(descriptor, status=status, merge_sha=merge_sha)
+            validate_manifest(descriptor, finalized=True)
+            if self.store is not None:
+                _atomic_write(self._local(descriptor["archive_path"] + ".json"), json_bytes(descriptor))
+            else:
+                self._properties(descriptor["archive_path"], {"status": status, "merge_sha": merge_sha})
+            updated.append(descriptor)
+        if updated:
+            pointer = updated[0]["archive_path"].rsplit("/", 2)[0] + "/latest.json"
+            if self.store is not None:
+                _atomic_write(self._local(pointer), json_bytes(updated[0]))
+            else:
+                self._request("PUT", urllib.parse.quote(self.repository, safe="") + "/" + urllib.parse.quote(pointer, safe="/"), json_bytes(updated[0]), {"Content-Type": "application/json"})
+        return len(updated)
+
+
+def _git(*args: str, cwd: Path | str | None = None, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    command = ["git"] + list(args)
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
+    try:
+        result = subprocess.run(command, cwd=cwd, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        if check:
+            raise SpecError("git %s timed out" % args[0]) from exc
+        return subprocess.CompletedProcess(command, 124, b"", b"Git operation timed out")
+    if check and result.returncode:
+        raise SpecError("git %s failed: %s" % (args[0], result.stderr.decode("utf-8", "replace").strip()))
+    return result
+
+
+def _identity(override: str | None = None) -> dict[str, str]:
+    origin = override or _git("remote", "get-url", "origin").stdout.decode().strip()
+    if override and "://" not in origin:
+        origin = "https://" + origin
+    if re.match(r"^[^/@:]+@[^/:]+:", origin):
+        origin = "ssh://" + origin.replace(":", "/", 1)
+    parsed = urllib.parse.urlsplit(origin)
+    host = (parsed.hostname or "").lower()
+    if parsed.port and parsed.scheme != "ssh":
+        host += ":" + str(parsed.port)
+    repo = parsed.path.strip("/")
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    _relative(repo)
+    if not host or len(repo.split("/")) < 2:
+        raise SpecError("cannot infer repository from origin; use --repo HOST/NAMESPACE/REPO")
+    provider = "github" if host == "github.com" or "github" in host else "gitlab"
+    return {"provider": provider, "host": host, "repo": repo}
+
+
+def _warn(message: str) -> None:
+    print("warning: " + message, file=sys.stderr)
+
+
+def _clean(root: Path) -> None:
+    if _git("status", "--porcelain=v1", "--untracked-files=all", cwd=root).stdout:
+        raise SpecError("branch switching requires a clean checkout, including untracked files")
+
+
+def _preflight(root: Path, files: dict[str, bytes], roots: list[str], force: bool) -> None:
+    # Validate entire declared trees, including ignored/untracked entries, before writing.
+    for relative in roots:
+        existing = _walk_regular(root, relative.rstrip("/"))
+        if existing and not force:
+            dirty = _git("status", "--porcelain=v1", "--untracked-files=all", "--", relative, cwd=root).stdout
+            if dirty:
+                raise SpecError("uncommitted spec files in %s; use --force to overwrite regular files" % relative)
+        for name, path in existing:
+            if not force and (name not in files or path.read_bytes() != files[name]):
+                raise SpecError("existing spec file differs: %s; use --force" % name)
+    for name in files:
+        target = root.joinpath(*_relative(name).parts)
+        for ancestor in [target] + list(target.parents):
+            if ancestor == root.parent:
+                break
+            if os.path.lexists(ancestor):
+                mode = ancestor.lstat().st_mode
+                if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    raise SpecError("unsafe restore destination: " + str(ancestor))
+                if ancestor == target and not stat.S_ISREG(mode):
+                    raise SpecError("restore file collides with a directory: " + name)
+                if ancestor != target and not stat.S_ISDIR(mode):
+                    raise SpecError("restore parent is not a directory: " + str(ancestor))
+        if target.exists() and not force and target.read_bytes() != files[name]:
+            raise SpecError("existing spec file differs: " + name)
+
+
+def _preflight_commit(root: Path, commit: str, files: dict[str, bytes], roots: list[str], force: bool) -> None:
+    """Inspect the destination tree before a branch switch changes any files."""
+    entries = _git("ls-tree", "-r", "-z", commit, cwd=root).stdout.split(b"\x00")
+    for entry in entries:
+        if not entry:
+            continue
+        metadata, raw_name = entry.split(b"\t", 1)
+        name = raw_name.decode("utf-8")
+        if not any(name.startswith(p) or p.startswith(name + "/") for p in roots):
+            continue
+        mode, kind, object_id = metadata.decode("ascii").split(" ")
+        _relative(name)
+        if mode not in ("100644", "100755") or kind != "blob":
+            raise SpecError("unsafe entry in destination Git tree: " + name)
+        if not _in_roots(name, roots):
+            raise SpecError("destination spec root has a non-directory ancestor: " + name)
+        if not force:
+            if name not in files or _git("cat-file", "blob", object_id, cwd=root).stdout != files[name]:
+                raise SpecError("destination branch has different spec files: %s; use --force" % name)
+
+
+def _switch(
+    root: Path,
+    descriptor: dict[str, object],
+    at_head: bool,
+    onto: str | None,
+    files: dict[str, bytes],
+    force: bool,
+) -> None:
+    if not at_head and not onto:
+        return
+    _clean(root)
+    if onto:
+        _git("check-ref-format", "--branch", onto, cwd=root)
+        if _git("show-ref", "--verify", "--quiet", "refs/heads/" + onto, cwd=root, check=False).returncode:
+            raise SpecError("--onto requires an existing local branch: " + onto)
+        _preflight_commit(root, "refs/heads/" + onto, files, descriptor["paths"], force)
+        _git("switch", "--no-overwrite-ignore", onto, cwd=root)
+        return
+    for key in ("head_sha", "merge_sha", "base_sha"):
+        sha = descriptor[key]
+        if not sha:
+            continue
+        if _git("cat-file", "-e", sha + "^{commit}", cwd=root, check=False).returncode:
+            # Retained forge PR/MR refs can recover heads unavailable to SHA fetch.
+            if key == "head_sha":
+                ref = "refs/pull/%s/head" % descriptor["pr"] if descriptor["provider"] == "github" else "refs/merge-requests/%s/head" % descriptor["pr"]
+                _git("fetch", "--no-tags", "origin", ref, cwd=root, check=False)
+            if _git("cat-file", "-e", sha + "^{commit}", cwd=root, check=False).returncode:
+                _git("fetch", "--no-tags", "origin", sha, cwd=root, check=False)
+        if _git("cat-file", "-e", sha + "^{commit}", cwd=root, check=False).returncode:
+            _warn("cannot fetch archived " + key + "; trying the next recorded commit")
+            continue
+        if key != "head_sha":
+            _warn("archived head unavailable; restoring beside %s %s" % (key, sha))
+        branch = "spec/pr-%s-%s" % (descriptor["pr"], descriptor["head_sha"][:8])
+        original, suffix = branch, 2
+        while not _git("show-ref", "--verify", "--quiet", "refs/heads/" + branch, cwd=root, check=False).returncode:
+            branch = original + "-" + str(suffix)
+            suffix += 1
+        _preflight_commit(root, sha, files, descriptor["paths"], force)
+        _git("switch", "--no-overwrite-ignore", "-c", branch, sha, cwd=root)
+        return
+    raise SpecError("none of the archived head, merge or base commits is available")
+
+
+def restore(
+    descriptor: dict[str, object],
+    files: dict[str, bytes],
+    force: bool = False,
+    at_head: bool = False,
+    onto: str | None = None,
+) -> Path:
+    root = Path(_git("rev-parse", "--show-toplevel").stdout.decode().strip())
+    _preflight(root, files, descriptor["paths"], force)
+    _switch(root, descriptor, at_head, onto, files, force)
+    _preflight(root, files, descriptor["paths"], force)
+    excluded = Path(_git("rev-parse", "--git-path", "info/exclude", cwd=root).stdout.decode().strip())
+    if not excluded.is_absolute():
+        excluded = root / excluded
+    if excluded.is_symlink() or excluded.parent.is_symlink() or (excluded.exists() and not excluded.is_file()):
+        raise SpecError("unsafe Git exclude file")
+    # Resolve and validate exclude storage before any spec file is written.
+    if not excluded.parent.exists():
+        excluded.parent.mkdir(parents=True, exist_ok=True)
+    old = excluded.read_bytes() if excluded.exists() else b""
+    lines = old.decode("utf-8").splitlines()
+    additions = ["/" + p for p in descriptor["paths"] if "/" + p not in lines]
+    tracked = _git("ls-files", "-z", "--", *descriptor["paths"], cwd=root).stdout
+    if tracked:
+        _warn("some restored spec files are tracked; .git/info/exclude cannot prevent their commits; CI remains the backstop")
+    for name, content in sorted(files.items()):
+        _atomic_write(root.joinpath(*PurePosixPath(name).parts), content)
+    if additions:
+        data = old + (b"\n" if old and not old.endswith(b"\n") else b"") + ("\n".join(additions) + "\n").encode()
+        _atomic_write(excluded, data)
+    return root
+
+
+def make_client(args: argparse.Namespace) -> Client:
+    return Client(store=args.store) if args.store else Client.from_env()
+
+
+def _arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument("--store", help="offline filesystem artifact store", default=argparse.SUPPRESS)
+    shared.add_argument("--repo", help="override identity: HOST/NAMESPACE/REPO", default=argparse.SUPPRESS)
+    shared.add_argument("--provider", choices=("github", "gitlab"), help="override forge provider", default=argparse.SUPPRESS)
+    parser.add_argument("--store")
+    parser.add_argument("--repo")
+    parser.add_argument("--provider", choices=("github", "gitlab"))
+    sub = parser.add_subparsers(dest="command", required=True)
+    listing = sub.add_parser("list", parents=[shared], help="list all matching archive versions")
+    listing.add_argument("--pr", type=int)
+    listing.add_argument("--author")
+    listing.add_argument("--json", action="store_true")
+    pulling = sub.add_parser("pull", parents=[shared], help="restore latest verified specifications")
+    pulling.add_argument("pr", type=int)
+    mode = pulling.add_mutually_exclusive_group()
+    mode.add_argument("--at", choices=("head",))
+    mode.add_argument("--onto", metavar="BRANCH")
+    pulling.add_argument("--force", action="store_true")
+    diffing = sub.add_parser("diff", parents=[shared], help="diff the two newest archived versions")
+    diffing.add_argument("pr", type=int)
+    packing = sub.add_parser("pack", parents=[shared], help="developer: build an archive from a manifest")
+    packing.add_argument("--manifest", required=True)
+    packing.add_argument("--root", default=".")
+    packing.add_argument("--output", required=True)
+    packing.add_argument("--upload", action="store_true")
+    uploading = sub.add_parser("upload", parents=[shared], help="developer: upload a verified archive and descriptor")
+    uploading.add_argument("archive")
+    uploading.add_argument("--descriptor", required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _arguments()
+    try:
+        if args.command == "pack":
+            descriptor = build_archive(Path(args.root), _json(Path(args.manifest).read_bytes()), Path(args.output))
+            _atomic_write(Path(args.output + ".json"), json_bytes(descriptor))
+            if args.upload:
+                make_client(args).upload(Path(args.output).read_bytes(), descriptor)
+            print(json_bytes(descriptor).decode(), end="")
+            return 0
+        client = make_client(args)
+        if args.command == "upload":
+            descriptor = _json(Path(args.descriptor).read_bytes())
+            client.upload(Path(args.archive).read_bytes(), descriptor)
+            print(descriptor["archive_path"])
+            return 0
+        identity = _identity(args.repo or os.environ.get("SPEC_REPO"))
+        if args.provider:
+            identity["provider"] = args.provider
+        matches = client.search(**identity, pr=args.pr, author=getattr(args, "author", None))
+        if args.command == "list":
+            if args.json:
+                print(json_bytes(matches).decode(), end="")
+            else:
+                for d in matches:
+                    print("%s/%s %s%s %-9s %-8s %s %s %s" % (d["host"], d["repo"], "#" if d["provider"] == "github" else "!", d["pr"], d["status"], d["tool"], d["archived_at"], d["author"], d["title"]))
+            return 0
+        if not matches:
+            raise SpecError("no archives match this repository and PR/MR")
+        newest = matches[0]
+        latest_files = read_archive(client.download(newest["archive_path"]), newest)
+        if args.command == "pull":
+            root = restore(newest, latest_files, args.force, args.at == "head", args.onto)
+            print("Restored %d files for %s/%s PR/MR %s into %s" % (len(latest_files), newest["host"], newest["repo"], newest["pr"], root))
+        else:
+            if len(matches) < 2:
+                raise SpecError("diff requires at least two archived versions")
+            older = matches[1]
+            older_files = read_archive(client.download(older["archive_path"]), older)
+            for name in sorted(set(older_files) | set(latest_files)):
+                left, right = older_files.get(name, b""), latest_files.get(name, b"")
+                if left == right:
+                    continue
+                try:
+                    before, after = left.decode("utf-8").splitlines(keepends=True), right.decode("utf-8").splitlines(keepends=True)
+                except UnicodeDecodeError:
+                    print("Binary files differ: " + name)
+                    continue
+                for line in difflib.unified_diff(before, after, fromfile="a/" + name if name in older_files else "/dev/null", tofile="b/" + name if name in latest_files else "/dev/null"):
+                    sys.stdout.write(line)
+                    if not line.endswith("\n"):
+                        sys.stdout.write("\n\\ No newline at end of file\n")
+        return 0
+    except (SpecError, OSError, UnicodeError, KeyError, TypeError) as exc:
+        print("git spec: " + str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
