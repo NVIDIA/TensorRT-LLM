@@ -75,6 +75,8 @@ def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     This is a pure dispatch check; no CUDA required.
     """
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    # GPUs that can only use FlashInfer default to it; check the native default.
+    monkeypatch.setattr(linear_module, "_mxfp8_flashinfer_only", lambda: False)
     qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     method = get_quant_method(qc)
     assert isinstance(method, MXFP8LinearMethod)
