@@ -1644,7 +1644,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             use_variable_window = (
                 is_sm_100f()
                 and isinstance(attn_metadata, TrtllmAttentionMetadata)
-                and not getattr(attn_metadata, "is_cuda_graph", False)
+                and not attn_metadata.is_cuda_graph
                 and not is_torch_compiling()
                 and self._supports_variable_window_attention(attn_metadata)
             )
@@ -1655,6 +1655,8 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                     effective_sliding_window=self.config.sliding_window,
                 )
                 # A paged sliding cache cannot serve KV indices beyond its retained window.
+                # Media blob lengths are input-dependent, so this device-to-host check deliberately
+                # validates the packed batch once before passing its bounds to the kernel.
                 window = self.config.sliding_window
                 use_variable_window = (
                     window is None or not torch.any(ends - starts + 1 > window).item()

@@ -101,6 +101,21 @@ endif()
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_tllm_gtest(
+  fmhaDispatcherTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDispatcherTest.cpp
+  LINK_LIBRARIES
+  kernels_src
+  context_attention_src
+  trtllm_gen_fmha
+  ${CUDA_DRV_LIB}
+  tllm::common_environment
+  tllm::common_logging
+  LABELS
+  "unit;kernel;host")
 
 set(NVFP4_COLD_PAGE_KERNEL_TEST_SRC
     nvfp4ColdPageKernelsTest.cpp
