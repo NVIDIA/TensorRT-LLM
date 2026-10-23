@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -113,6 +113,30 @@ void CUDAVirtualMemoryChunk::_release(bool destructing)
         mState = INVALID_STATE;
         std::rethrow_exception(ePtr);
     }
+}
+
+void CUDAVirtualMemoryChunk::detachHostBackups(std::vector<IBuffer::UniquePtr>& backups)
+{
+    TLLM_CHECK_WITH_INFO(status() == MATERIALIZED, "Host backups require materialized allocations");
+    // Reserve before detaching so a vector allocation cannot free a backup under the manager lock.
+    backups.reserve(backups.size() + mConfigurators.size());
+    for (auto& configurator : mConfigurators)
+    {
+        auto backup = configurator->detachHostBackup();
+        if (backup != nullptr)
+        {
+            backups.push_back(std::move(backup));
+        }
+    }
+}
+
+IBuffer::UniquePtr OffloadConfigurator::detachHostBackup()
+{
+    if (mBackedStorage != nullptr)
+    {
+        TLLM_CU_CHECK(cuStreamSynchronize(mStream));
+    }
+    return std::move(mBackedStorage);
 }
 
 void OffloadConfigurator::setup(CUmemGenericAllocationHandle)
@@ -318,6 +342,29 @@ size_t CudaVirtualMemoryManager::materializeWithTag(std::string const& tag)
 
         throw;
     }
+    return count;
+}
+
+size_t CudaVirtualMemoryManager::releaseHostBackupsWithTag(std::string const& tag)
+{
+    std::vector<IBuffer::UniquePtr> backups;
+    {
+        std::unique_lock lock(mMutex);
+        auto const [begin, end] = mEntries.equal_range(tag);
+        for (auto it = begin; it != end; ++it)
+        {
+            auto const& memory = it->second->second.mMemory;
+            TLLM_CHECK_WITH_INFO(memory.status() == CUDAVirtualMemoryChunk::MATERIALIZED,
+                "Host backups can only be released after restoring all allocations for the tag");
+        }
+        for (auto it = begin; it != end; ++it)
+        {
+            it->second->second.mMemory.detachHostBackups(backups);
+        }
+    }
+    // Pinned-memory deallocation can be slow; do not hold the shared manager lock.
+    auto const count = backups.size();
+    backups.clear();
     return count;
 }
 
