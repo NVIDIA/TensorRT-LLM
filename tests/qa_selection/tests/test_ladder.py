@@ -123,12 +123,17 @@ def test_unmarked_means_one_gpu(selection):
 
 
 def test_leftover_machine_list_is_an_orphan(selection):
-    """A leftover `<machine>.ids` is an orphan: every list a run writes names its rung."""
+    """A leftover `<machine>.ids` is an orphan: every list a run writes names its rung.
+
+    No `--ladder`, so the run writes B200's profile ladder, 1,4,8.
+    """
     selection.out_dir.mkdir()
     (selection.out_dir / "B200.ids").write_text("")
 
     run = selection.refuse(DeviceCases.MODULE, "--machine=B200", "--selection-out-dir={out}")
 
     run.result.stderr.fnmatch_lines(
-        ["*already holds B200.ids for B200*writes B200.json, B200-8gpu.ids*"]
+        [
+            "*already holds B200.ids for B200*writes B200.json, B200-1gpu.ids, B200-4gpu.ids, B200-8gpu.ids.*"
+        ]
     )

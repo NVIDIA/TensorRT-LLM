@@ -211,7 +211,8 @@ class SelectionOptions:
             metavar="RUNGS",
             default=None,
             help="ascending allocation sizes, comma separated, e.g. 1,4,8. "
-            "Defaults to one rung of the machine's GPUs per node. One rung "
+            "Defaults to the machine profile's ladder, or to one rung of its "
+            "GPUs per node when the profile has none. One rung "
             "asks what a single allocation of that size can run; several "
             "divide the machine by an allocation policy, each test landing "
             "on the smallest rung that holds it. A test needing more GPUs "

@@ -14,12 +14,15 @@
 # limitations under the License.
 """AC-4: a machine and a ladder are the whole command.
 
-Each criterion collects `DeviceCases.MODULE` for B200 (8 GPUs/node) into an
-output directory. The ladder chooses the question:
+Each criterion collects `DeviceCases.MODULE` into an output directory, for B200
+(8 GPUs/node) unless it names another machine. The ladder chooses the question:
 
-    what can this machine run?                 --machine=B200                 B200-8gpu.ids
+    what can this machine run?                 --machine=B200 --ladder=8      B200-8gpu.ids
     what can one N-GPU allocation of it run?   --machine=B200 --ladder=N      one list
     how does an allocation policy divide it?   --machine=B200 --ladder=1,4,8  one list per rung
+
+Without `--ladder`, the profile's ladder asks: 1,4,8 for B200, and the first
+question for a machine whose profile has none, such as A100.
 
 Every kept test is in exactly one published list, and nothing else is kept.
 """
@@ -28,8 +31,8 @@ from mocks import DeviceCases
 
 
 def test_whole_node_by_default(selection):
-    """Without `--ladder`, the ladder is one rung of the machine's GPUs per node."""
-    run = selection.run(DeviceCases.MODULE, "--machine=B200", "--selection-out-dir={out}")
+    """Without `--ladder` or a profile ladder, the ladder is one rung of the machine's node."""
+    run = selection.run(DeviceCases.MODULE, "--machine=A100", "--selection-out-dir={out}")
 
     assert run.selected == [
         DeviceCases.UNMARKED,
@@ -37,7 +40,7 @@ def test_whole_node_by_default(selection):
         DeviceCases.EIGHT_GPUS,
         DeviceCases.EIGHT_RANKS,
     ]
-    assert run.written == ["B200-8gpu.ids", "B200.json"]
+    assert run.written == ["A100-8gpu.ids", "A100.json"]
     assert run.record["ladder"] == [8]
 
 
