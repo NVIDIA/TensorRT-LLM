@@ -179,7 +179,6 @@ from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
 from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
-from .ops.gemm.fp8_gemv import MAX_ROWS as _FP8_GEMV_HEAD_ROWS
 from .ops.gemm.fp8_gemv import (
     fp8_gemv_conv1d_op,
     fp8_gemv_conv1d_verify_op,
@@ -637,8 +636,22 @@ def _dense_fp8_enabled() -> bool:
 #: output and shared-expert projections from two: at one row the bf16 `bf16_gemv_pdl` hides
 #: more of itself behind its PDL neighbours (STP con1 capture: 1.7 us of exclusive time a call
 #: against 2.4 for fp8_gemv), from two rows the bf16 entry is the slower low-M GEMM (micro:
-#: out/o 5.8 vs 4.3 us, gate|up 4.4 vs 2.1, down 3.2 vs 1.5 at 4 rows).
-_FP8_GEMV_ROWS = {"in": (1, 16), "out": (2, 8), "sh_gu": (2, 32), "sh_dn": (2, 8)}  # dispatch
+#: out/o 5.8 vs 4.3 us, gate|up 4.4 vs 2.1, down 3.2 vs 1.5 at 4 rows). The upper ends are each
+#: kind's crossover (GB300 micro, us, fp8_gemv against the next entry): in/attention-in 11.0 vs
+#: 12.8 per-tensor FP8 at 24 rows (even at 32); out/o 6.4 vs 8.4 bf16 at 16 rows, 9.3 vs 8.8
+#: at 20; gate|up 2.6 vs 4.0 at 16, 4.6 vs 4.1 at 20; down 1.7 vs 2.9 at 8, 2.3 vs 2.0 at 12.
+_FP8_GEMV_ROWS = {"in": (1, 24), "out": (2, 16), "sh_gu": (2, 16), "sh_dn": (2, 8)}  # dispatch
+
+#: Rows up to which a verify step's conv runs in the in_proj GEMV's epilogue
+#: (`fp8_gemv_conv1d_verify`, certified at 2..16 rows); more rows take the Triton conv.
+_VERIFY_CONV_FUSED_MAX_ROWS = 16  # capacity: fixed: the entry's certified rows
+
+
+#: Rows up to which the vocabulary projection (the draft head; under the dense FP8 mode the
+#: verify head too) runs `fp8_gemv` on the packed copy; more rows take cuBLASLt over the
+#: per-row-scaled copy. GB300, 248320 x 2560: fp8_gemv 86-98 us at 1-16 rows against 107-134,
+#: then 142 at 20 rows and 172 at 32 against a flat ~108.
+_FP8_GEMV_HEAD_ROWS = 16  # capacity: fixed: a dispatch threshold, at most fp8_gemv's MAX_ROWS
 
 
 def _gemv_ready(x: torch.Tensor) -> bool:
@@ -5621,7 +5634,7 @@ class DecodeTarget:
         its batch.
 
         A graph-captured verify step whose in_proj takes `fp8_gemv` (dense FP8 mode, up to
-        `_FP8_GEMV_ROWS["in"]` rows) runs the multi-token conv step -- window snapshots and
+        `_VERIFY_CONV_FUSED_MAX_ROWS` rows) runs the multi-token conv step -- window snapshots and
         the pool advance included -- as that GEMM's epilogue too (`fp8_gemv_conv1d_verify`,
         bitwise the projection + `causal_conv1d_triton_update` it replaces); the conv output
         is its own contiguous buffer, and z, a and b are column views of the rest."""
@@ -5638,7 +5651,7 @@ class DecodeTarget:
             and is_verify
             and L.in_proj_g is not None
             and _gemv_ready(x)
-            and num_tokens <= _FP8_GEMV_ROWS["in"][1]
+            and num_tokens <= min(_FP8_GEMV_ROWS["in"][1], _VERIFY_CONV_FUSED_MAX_ROWS)
         )
         mq_out = None
         if verify_fused:
