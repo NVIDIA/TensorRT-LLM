@@ -7,10 +7,11 @@ from pathlib import Path
 
 import pytest
 import torch
-from test_prefill_decode_consistency_gpu import _configure_determinism, _make_checkpoint
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.sampling_params import LogitsProcessor
+
+from .test_prefill_decode_consistency_gpu import _configure_determinism, _make_checkpoint
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 
