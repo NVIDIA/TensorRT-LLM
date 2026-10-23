@@ -4563,7 +4563,7 @@
       "description": "Configuration for NVFP4 GEMM backend selection.",
       "properties": {
         "allowed_backends": {
-          "description": "List of backends to consider for auto-selection. Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme performance at the cost of longer server launch time.",
+          "description": "List of backends to consider for auto-selection.",
           "items": {
             "enum": [
               "cutlass",
@@ -6285,7 +6285,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc1/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -7757,6 +7757,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc1 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve --config",
   "type": "object"
 }
