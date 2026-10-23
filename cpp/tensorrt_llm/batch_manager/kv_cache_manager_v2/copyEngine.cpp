@@ -24,6 +24,10 @@
 
 #include "tensorrt_llm/common/assert.h"
 
+#if defined(TORCH_CUDA)
+#include "tensorrt_llm/batch_manager/kvCacheTransferProfiler.h"
+#endif
+
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -136,6 +140,19 @@ void CopyEngine::transfer(
     constexpr auto G = CacheTier::GPU_MEM;
     constexpr auto H = CacheTier::HOST_MEM;
     constexpr auto D = CacheTier::DISK;
+
+#if defined(TORCH_CUDA)
+    common::RecordFunctionWithMetadata scope{common::ProfilerRegion::kKv};
+    if ((dstTier == H && srcTier == G) || (dstTier == G && srcTier == H))
+    {
+        scope.startWithLazyName([&] { return dstTier == H ? "trtllm::kv_cache_offload" : "trtllm::kv_cache_restore"; },
+            [&](common::ProfilerMetadata& metadata)
+            {
+                ::tensorrt_llm::batch_manager::detail::addKvTransferMetadata(
+                    metadata, dstTier == H, "v2", numBytes, tasks.size(), stream);
+            });
+    }
+#endif
 
     if (dstTier == G && srcTier == G)
         dispatchCopy<G, G>(tasks, numBytes, stream);

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,9 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
+#if TRTLLM_ENABLE_NCCL_PROFILING
+#include "tensorrt_llm/common/profiler.h"
+#endif
 #include "tensorrt_llm/kernels/helixAllToAll.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -66,6 +69,29 @@ public:
         }
         std::vector<torch::Tensor> output_list(static_cast<size_t>(num_lists_));
         auto stream = at::cuda::getCurrentCUDAStream(input_list[0].get_device());
+#if TRTLLM_ENABLE_NCCL_PROFILING
+        common::RecordFunctionWithMetadata profiler{common::ProfilerRegion::kNccl};
+        profiler.startWithLazyName([]() -> std::string { return "trtllm::nccl_metadata"; },
+            [&](common::ProfilerMetadata& metadata)
+            {
+                std::vector<std::int64_t> const group(mGroup.begin(), mGroup.end());
+                std::int64_t logicalBytes{0};
+                std::vector<std::int64_t> splitSizes;
+                splitSizes.reserve(input_list.size());
+                for (auto const& input : input_list)
+                {
+                    logicalBytes += input.numel() * static_cast<std::int64_t>(input.element_size());
+                    splitSizes.push_back(input.numel());
+                }
+                common::addNcclMetadata(metadata, "all_to_all", group, COMM_SESSION.getRank(), "unknown", "collective",
+                    logicalBytes, stream.stream());
+                metadata.add("nccl.input_split_sizes", splitSizes);
+                metadata.add("nccl.output_split_sizes", splitSizes);
+                metadata.add("nccl.strategy", "nccl_send_recv");
+                metadata.add("nccl.requested_strategy", "all_to_all");
+                metadata.add("nccl.selected_strategy", "nccl_send_recv");
+            });
+#endif
         ncclGroupStart();
         for (int il = 0; il < num_lists_; ++il)
         {

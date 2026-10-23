@@ -23,6 +23,23 @@ add_gtest(contextProgressTest contextProgressTest.cu)
 add_gtest(contextTransferCoordinatorTest contextTransferCoordinatorTest.cpp)
 add_gtest(evictionPolicyTest evictionPolicyTest.cpp)
 add_gtest(kvCacheManagerTest kvCacheManagerTest.cpp)
+if(BUILD_PYT)
+  add_tllm_gtest(
+    kvOffloadProfilerTest
+    FULL_STACK
+    REQUIRES_GPU
+    OWNER
+    batch-manager
+    SOURCES
+    kvOffloadProfilerTest.cpp
+    LINK_LIBRARIES
+    ${TORCH_LIBRARIES}
+    LABELS
+    "unit;batch-manager;gpu")
+  target_include_directories(
+    kvOffloadProfilerTest
+    PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+endif()
 add_gtest(kvCacheManagerFabricMemoryTest kvCacheManagerFabricMemoryTest.cpp)
 add_gtest(kvCacheManagerV2ConfigTest
           "kvCacheManagerV2ConfigTest.cpp;kvCacheManagerV2PoisonCheck.cpp")

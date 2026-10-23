@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._profiler import record_moe_routing
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -480,6 +481,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             assert token_selected_experts.shape[1] == moe.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
             assert token_selected_experts.dtype == torch.int32
+
+            record_moe_routing(
+                moe.layer_idx, moe.num_experts, token_selected_experts, token_final_scales
+            )
 
             # Backends disagree on routing-scale precision, so the requirement
             # names the dtype instead of the backend class.
@@ -1459,6 +1464,9 @@ class FusedCommMoEScheduler(MoEScheduler):
             route_capture = get_active_route_capture()
             if route_capture is not None:  # R3: in-graph device-buffer capture
                 route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
+            record_moe_routing(
+                moe.layer_idx, moe.num_experts, token_selected_experts, token_final_scales
+            )
             token_final_scales = token_final_scales.to(torch.float32)
         else:
             device = x.device
@@ -1471,6 +1479,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 (0, moe.routing_method.experts_per_token),
                 dtype=torch.float32,
                 device=device,
+            )
+            record_moe_routing(
+                moe.layer_idx, moe.num_experts, token_selected_experts, token_final_scales
             )
 
         # ----- EPLB: update stats + remap expert ids -> slot ids -----

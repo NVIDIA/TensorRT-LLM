@@ -98,6 +98,40 @@ Append “python-gil” to Nsys “-t” option.
 1. Set environment variable `TLLM_PROFILE_START_STOP=A-B` to specify the range of the iterations to be collected.
 2. Set environment variable `TLLM_TORCH_PROFILE_TRACE=<path>`, and the results will be saved to `<path>`.
 
+For the LLM PyTorch executor, set `TLLM_TORCH_EXECUTION_TRACE=<path>` to
+collect a PyTorch execution trace over the same iteration ranges. Either output
+can be enabled independently; both require `TLLM_PROFILE_START_STOP`. For example:
+
+```bash
+TLLM_PROFILE_START_STOP=1-100,400-500 \
+TLLM_TORCH_PROFILE_TRACE=chrome.json \
+TLLM_TORCH_EXECUTION_TRACE=execution.json \
+trtllm-serve <model>
+```
+
+On rank 0, this writes `chrome-rank-0-iterations-1-100.json` and
+`chrome-rank-0-iterations-400-500.json`, plus one `execution-rank-0.json`
+aggregating both ranges. A single range preserves `chrome-rank-0.json`.
+The start iteration is included; capture stops before the stop iteration's
+workload. Each rank writes independently using its global rank, without adding
+collectives or changing TP, PP, CP, or EP groups.
+
+Capture starts lazily on the executor thread. Warmup-skipped starts install no
+observer and produce no trace. Early exit flushes the active range; cleanup
+unregisters the process-wide execution observer without replacing a workload
+exception. The aggregated execution file is finalized when the executor's
+profiling context exits, not at each range's stop. Do not run another execution
+observer concurrently in the same process. Runtime `/start_profile` and
+`/stop_profile` keep their existing Chrome-trace API and executor-thread ownership;
+these environment variables add no endpoint parameters.
+
+Capture adds overhead and trace size, especially with shape recording and the
+execution observer enabled. CUDA synchronization events are requested when
+supported by PyTorch. CUDA graph replay does not expose every logical operator
+as a distinct execution node. Custom-region selection is independent of these
+output paths; see [profiler regions](../advanced/workflow-profiler-regions.md)
+for metadata and selection semantics.
+
 For VisualGen, use `TLLM_PROFILE_VISUAL_GEN_START_STOP` instead. Numeric ranges select
 per-request denoise steps, while `predenoise`, `postdenoise`, and `all` select the
 corresponding generation phases. For example:

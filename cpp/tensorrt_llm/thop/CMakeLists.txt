@@ -177,6 +177,15 @@ set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
+target_compile_definitions(
+  th_common
+  PUBLIC TRTLLM_ENABLE_NCCL_PROFILING=$<BOOL:${ENABLE_NCCL_PROFILING}>)
+target_compile_definitions(
+  th_common_distributed
+  PRIVATE TRTLLM_ENABLE_NCCL_PROFILING=$<BOOL:${ENABLE_NCCL_PROFILING}>)
+if(ENABLE_NCCL_PROFILING)
+  target_link_libraries(th_common PRIVATE CUDA::cudart)
+endif()
 
 if(BUILD_DEEP_GEMM)
   target_compile_definitions(th_common_decoding
