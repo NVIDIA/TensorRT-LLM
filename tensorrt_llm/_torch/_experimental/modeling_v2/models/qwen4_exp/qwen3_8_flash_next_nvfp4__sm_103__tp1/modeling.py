@@ -189,6 +189,8 @@ from .ops.gemm.fp8_gemv import (
 )
 from .ops.gemm.fp8_per_tensor_mm import amax_partials, fp8_per_tensor_mm, fp8_per_tensor_weight
 from .ops.gemm.low_m_bf16_mm import low_m_bf16_mm
+from .ops.gemm.mid_rows_mm import MidWeight, mid_rows_mm_op
+from .ops.gemm.mid_rows_mm import precompile as mid_rows_precompile
 from .ops.gemm.nvfp4_gemv import nvfp4_gemv_op
 from .ops.gemm.nvfp4_gemv import pack_from_bf16 as nvfp4_pack_from_bf16
 from .ops.gemm.nvfp4_gemv import precompile as nvfp4_gemv_precompile
@@ -660,10 +662,10 @@ def _dense_fp8_enabled() -> bool:
 #: more of itself behind its PDL neighbours (STP con1 capture: 1.7 us of exclusive time a call
 #: against 2.4 for fp8_gemv), from two rows the bf16 entry is the slower low-M GEMM (micro:
 #: out/o 5.8 vs 4.3 us, gate|up 4.4 vs 2.1, down 3.2 vs 1.5 at 4 rows). The upper ends are each
-#: kind's crossover (GB300 micro, us, fp8_gemv against the next entry): in/attention-in 11.0 vs
-#: 12.8 per-tensor FP8 at 24 rows (even at 32); out/o 6.4 vs 8.4 bf16 at 16 rows, 9.3 vs 8.8
+#: kind's crossover (GB300 micro, us, fp8_gemv against the next entry): in/attention-in 8.7 vs
+#: ~9 `mid_rows_mm` at 16 rows, 10.9 vs 9.1 at 17; out/o 6.4 vs 8.4 bf16 at 16 rows, 9.3 vs 8.8
 #: at 20; gate|up 2.6 vs 4.0 at 16, 4.6 vs 4.1 at 20; down 1.7 vs 2.9 at 8, 2.3 vs 2.0 at 12.
-_FP8_GEMV_ROWS = {"in": (1, 24), "out": (2, 16), "sh_gu": (2, 16), "sh_dn": (2, 8)}  # dispatch
+_FP8_GEMV_ROWS = {"in": (1, 16), "out": (2, 16), "sh_gu": (2, 16), "sh_dn": (2, 8)}  # dispatch
 
 #: Rows up to which a verify step's conv runs in the in_proj GEMV's epilogue
 #: (`fp8_gemv_conv1d_verify`, certified at 2..16 rows); more rows take the Triton conv.
@@ -676,6 +678,38 @@ _VERIFY_CONV_FUSED_MAX_ROWS = 16  # capacity: fixed: the entry's certified rows
 #: then 142 at 20 rows and 172 at 32 against a flat ~108.
 _FP8_GEMV_HEAD_ROWS = 16  # capacity: fixed: a dispatch threshold, at most fp8_gemv's MAX_ROWS
 
+#: Rows up to which the FP8 vocabulary projection's rows past `_FP8_GEMV_HEAD_ROWS` run
+#: `mid_rows_mm` over the per-row-scaled copy (activation quantized per row); more rows keep
+#: cuBLASLt. GB300, 248320 x 2560, us at 17 / 32 / 64 / 128 rows: 99.7 / 101.5 / 106.0 / 125.8
+#: against 110.0 / 111.9 / 107.7 / 137.5; at 256 rows 158 against 150.
+_MID_HEAD_ROWS = 128  # capacity: fixed: a dispatch threshold, at most mid_rows_mm's MAX_ROWS
+
+
+#: Row ranges `(lo, hi)` in which a decode projection runs `mid_rows_mm` (tcgen05, the weight
+#: streamed before the PDL wait; at most its MAX_ROWS): the dense FP8 projections over their
+#: per-tensor e4m3 codes with the activation quantized per row (`fp8_row_quant`, one launch),
+#: the shared expert and the router over their bf16 weights. Each range is where it beat the
+#: kind's previous entry in the GB300 micro-bench (CUDA-graph chain over HBM-cold weights,
+#: quantization launch included; us at 17 / 32 / 64 / 128 / 256 rows): GDN in_proj 9.1 / 9.3
+#: / 9.9 / 11.4 / 13.8 against 10.9 (fp8_gemv) / 12.4 / 12.8 / 13.7 / 15.4 (per-tensor FP8),
+#: attention in-proj 8.9 / 9.1 / 9.2 / 10.3 / 13.4 against 9.7 / 12.0 / 12.4 / 13.2 / 14.0,
+#: out/o 5.6 / 6.1 / 7.0 / 8.7 against 6.7 / 6.7 / 9.3 / 9.5 bf16 (10.1 vs 12.5 at 256), the
+#: router 2.3 / 2.5 / 2.9 against 2.4 / 2.6 / 4.8 (equal at 128), gate|up 2.9 / 3.3 / 3.7
+#: against 4.4 / 4.5 / 4.5 (behind from 128); the shared expert's down projection never won by
+#: more than noise. An empty range `(0, -1)` keeps the kind off it.
+_MID_MM_ROWS = {
+    "in": (17, 256),
+    "out": (17, 128),
+    "sh_gu": (17, 64),
+    "sh_dn": (0, -1),
+    "router": (17, 64),
+}  # capacity: fixed: dispatch thresholds
+
+
+def _mid_rows(kind: str, rows: int) -> bool:
+    lo, hi = _MID_MM_ROWS[kind]
+    return lo <= rows <= hi
+
 
 def _gemv_ready(x: torch.Tensor) -> bool:
     """`fp8_gemv`'s activation layout: unit column stride, rows 16-byte aligned."""
@@ -683,20 +717,52 @@ def _gemv_ready(x: torch.Tensor) -> bool:
 
 
 def _dense_mm(
-    x: torch.Tensor, weight_t: torch.Tensor, fp8, gemm, kind: str, packed=None, amax_parts=None
+    x: torch.Tensor,
+    weight_t: torch.Tensor,
+    fp8,
+    gemm,
+    kind: str,
+    packed=None,
+    amax_parts=None,
+    mid=None,
 ) -> torch.Tensor:
     """A dense projection under the dense FP8 mode: `fp8_gemv` over the packed decode copy
-    (`packed`) within `_FP8_GEMV_ROWS[kind]` rows, the per-tensor FP8 GEMM (`fp8` =
-    `(codes_t, scale)`) from `_DENSE_FP8_MIN_ROWS[kind]` rows, else the step's bf16 entry
-    `gemm` -- which is every call with the mode off (both copies None). `amax_parts` are the
-    partial maxima `x`'s producer folded (`_fp8_amax_parts`) for the FP8 GEMM."""
+    (`packed`) within `_FP8_GEMV_ROWS[kind]` rows, `mid_rows_mm` over `mid` (a `MidWeight`)
+    within `_MID_MM_ROWS[kind]` rows, the per-tensor FP8 GEMM (`fp8` = `(codes_t, scale)`) from
+    `_DENSE_FP8_MIN_ROWS[kind]` rows, else the step's bf16 entry `gemm` -- which is every call
+    with the mode off (all copies None). `amax_parts` are the partial maxima `x`'s producer
+    folded (`_fp8_amax_parts`) for the FP8 GEMM."""
     rows = x.shape[0]
-    lo, hi = _FP8_GEMV_ROWS[kind]
+    lo, hi = _FP8_GEMV_ROWS.get(kind, (1, 0))
     if packed is not None and lo <= rows <= hi and _gemv_ready(x):
         return fp8_gemv_op(x, packed)
+    if mid is not None and _mid_rows(kind, rows) and (not mid.fp8 or _gemv_ready(x)):
+        return mid_rows_mm_op(x, mid)
     if fp8 is not None and rows >= _DENSE_FP8_MIN_ROWS[kind]:
         return fp8_per_tensor_mm(x, *fp8, amax_parts)
     return gemm(x, weight_t)
+
+
+#: `_mid` weight-name patterns -> the `_MID_MM_ROWS` kind their projections dispatch as.
+_MID_KINDS = (
+    (r"l\d+_(attn_in_w|in_proj_w)", "in"),
+    (r"l\d+_(o_w|out_w)", "out"),
+    (r"l\d+_sh_gu", "sh_gu"),
+    (r"l\d+_sh_dn", "sh_dn"),
+    (r"l\d+_router", "router"),
+)
+
+
+def _precompile_mid(mid: dict) -> None:
+    """Compile every `mid_rows_mm` variant the decode dispatch can reach now, once per weight
+    geometry: a variant first met by a serving step would stall it for the compile."""
+    seen = {}
+    for name, mw in mid.items():
+        kind = next(k for rx, k in _MID_KINDS if re.fullmatch(rx, name))
+        lo, hi = _MID_MM_ROWS[kind]
+        key = (mw.n, mw.k, mw.fp8, None if mw.scale is None else mw.scale.numel())
+        if lo <= hi and key not in seen:
+            seen[key] = mid_rows_precompile(mw, max(lo, 1), hi)
 
 
 def _fp8_amax_parts(rows: int, fp8, kind: str, device) -> torch.Tensor | None:
@@ -1881,16 +1947,27 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # ... and packed FP8 copies with 128x128 block scales for the decode-row `fp8_gemv`
         # (the shared expert's gate|up without its gate-logit row, which stays bf16).
         self._gemv8 = {}
+        # ... and `mid_rows_mm`'s view of the same weights for decode rows in `_MID_MM_ROWS`:
+        # the per-tensor e4m3 codes above, the shared expert's and the router's bf16 weights
+        # (no new copies).
+        self._mid = {}
         if _dense_fp8_enabled():
             for name in w:
                 if re.fullmatch(r"l\d+_(attn_in_w|o_w|in_proj_w|out_w)", name):
                     codes, scale = fp8_per_tensor_weight(w[name])
                     self._dense8[name] = (codes.t(), scale)
                     self._gemv8[name] = pack_from_bf16(w[name])
+                    self._mid[name] = MidWeight(codes, scale)
                 elif re.fullmatch(r"l\d+_sh_gu", name):
                     self._gemv8[name] = pack_from_bf16(w[name][: 2 * self.shared_inter])
+                    self._mid[name] = MidWeight(w[name][: 2 * self.shared_inter])
                 elif re.fullmatch(r"l\d+_sh_dn", name):
                     self._gemv8[name] = pack_from_bf16(w[name])
+                    self._mid[name] = MidWeight(w[name])
+                elif re.fullmatch(r"l\d+_router", name):
+                    self._mid[name] = MidWeight(w[name])
+            if device.type == "cuda":
+                _precompile_mid(self._mid)
 
         # The CPU-only load checks build the targets over host weights; they launch nothing.
         self._side_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -2404,6 +2481,14 @@ class _LayerWeights(NamedTuple):
     out_g: object | None = None
     sh_gu_g: object | None = None
     sh_dn_g: object | None = None
+    # `mid_rows_mm` views (`MidWeight`) under the same mode, for `_MID_MM_ROWS` decode rows.
+    attn_in_m: object | None = None
+    o_m: object | None = None
+    in_proj_m: object | None = None
+    out_m: object | None = None
+    sh_gu_m: object | None = None
+    sh_dn_m: object | None = None
+    router_m: object | None = None
     # `1 + ahc_norm` / `1 + mhc_norm` in fp32, the rstd mixers' operand
     # (`qwen4_exp_hc_up_gate_mean_rstd`); set by `PrefillTarget` only.
     ahc_norm_w1: torch.Tensor | None = None
@@ -2515,6 +2600,13 @@ def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
                 out_g=getattr(core, "_gemv8", {}).get(f"l{i}_out_w"),
                 sh_gu_g=getattr(core, "_gemv8", {}).get(f"l{i}_sh_gu"),
                 sh_dn_g=getattr(core, "_gemv8", {}).get(f"l{i}_sh_dn"),
+                attn_in_m=getattr(core, "_mid", {}).get(f"l{i}_attn_in_w"),
+                o_m=getattr(core, "_mid", {}).get(f"l{i}_o_w"),
+                in_proj_m=getattr(core, "_mid", {}).get(f"l{i}_in_proj_w"),
+                out_m=getattr(core, "_mid", {}).get(f"l{i}_out_w"),
+                sh_gu_m=getattr(core, "_mid", {}).get(f"l{i}_sh_gu"),
+                sh_dn_m=getattr(core, "_mid", {}).get(f"l{i}_sh_dn"),
+                router_m=getattr(core, "_mid", {}).get(f"l{i}_router"),
             )
         )
     return layers
@@ -5283,12 +5375,14 @@ class DecodeTarget:
         # and the next layer's fork orders any reuse of those blocks after that.
         side.wait_stream(main)
         with torch.cuda.stream(side):
-            gu = _dense_mm(x, L.sh_gu, None, gemm, "sh_gu", L.sh_gu_g)
-            shared = _dense_mm(flashinfer_silu_and_mul(gu), L.sh_dn, None, gemm, "sh_dn", L.sh_dn_g)
+            gu = _dense_mm(x, L.sh_gu, None, gemm, "sh_gu", L.sh_gu_g, mid=L.sh_gu_m)
+            shared = _dense_mm(
+                flashinfer_silu_and_mul(gu), L.sh_dn, None, gemm, "sh_dn", L.sh_dn_g, mid=L.sh_dn_m
+            )
             gate_logits = gemm(x, L.sh_gate)
         # The routing reads its logits as a dense row-major buffer from data_ptr() and
-        # ignores strides; both projection entries allocate them contiguous.
-        logits = gemm(x, L.router)
+        # ignores strides; every projection entry allocates them contiguous.
+        logits = _dense_mm(x, L.router, None, gemm, "router", mid=L.router_m)
         if core.trunk_moe_backend == "CUTEDSL":
             routed = _cute_dsl_routed(core, L, logits, xq, xsf, routed_out)
             main.wait_stream(side)
@@ -5452,7 +5546,7 @@ class DecodeTarget:
             side.wait_stream(main)
             with torch.cuda.stream(side):
                 core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
-        proj = _dense_mm(x, L.attn_in, L.attn_in8, gemm, "in", L.attn_in_g)
+        proj = _dense_mm(x, L.attn_in, L.attn_in8, gemm, "in", L.attn_in_g, mid=L.attn_in_m)
         qkv_view, gate, index_view = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
@@ -5665,7 +5759,7 @@ class DecodeTarget:
             )
         if not gated:
             fused_sigmoid_mul_inplace(out, gate)
-        return _dense_mm(out, L.o, L.o8, gemm, "out", L.o_g)
+        return _dense_mm(out, L.o, L.o8, gemm, "out", L.o_g, mid=L.o_m)
 
     def _gdn_verify(
         self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p, replay, mq_out=None
@@ -5810,7 +5904,7 @@ class DecodeTarget:
                 True,
             )
         else:
-            proj = _dense_mm(x, L.in_proj, L.in_proj8, gemm, "in", L.in_proj_g)
+            proj = _dense_mm(x, L.in_proj, L.in_proj8, gemm, "in", L.in_proj_g, mid=L.in_proj_m)
         if verify_fused:
             mixed_qkv = None
             z, a, b = torch.split(zab, core.in_proj_split[1:], 1)
@@ -5837,7 +5931,7 @@ class DecodeTarget:
                 core.num_k_heads,
                 core.head_k_dim,
             )
-            return _dense_mm(o, L.out, L.out8, gemm, "out", L.out_g)
+            return _dense_mm(o, L.out, L.out8, gemm, "out", L.out_g, mid=L.out_m)
         if is_verify:
             # The CuTe replay kernel reads `a`/`b` through their row stride: no copies.
             strided_ab = replay is not None and core._bound.replay.cute
@@ -5883,7 +5977,7 @@ class DecodeTarget:
             core.num_k_heads,
             core.head_k_dim,
         )
-        return _dense_mm(o, L.out, L.out8, gemm, "out", L.out_g)
+        return _dense_mm(o, L.out, L.out8, gemm, "out", L.out_g, mid=L.out_m)
 
     def _gdn_epilogue(self, out, z, L, num_tokens, gemm=cublas_mm) -> torch.Tensor:
         """Gated RMS norm (sigmoid gate, plain non-gemma weight) and output projection
@@ -5898,7 +5992,7 @@ class DecodeTarget:
             gate_activation="sigmoid",
         )
         o = torch.reshape(o, [num_tokens, core.value_dim])
-        return _dense_mm(o, L.out, L.out8, gemm, "out", L.out_g)
+        return _dense_mm(o, L.out, L.out8, gemm, "out", L.out_g, mid=L.out_m)
 
     def _ple_block(self, hc, input_ids, ple_state, next_norm, stage, gemm=cublas_mm) -> tuple:
         """The n-gram side path on one decoder layer, added into the stream and
@@ -7469,13 +7563,18 @@ class _Fp8DraftHead:
     ) -> None:
         self.weight_fp8, self.weight_scale, self.packed = weight_fp8, weight_scale, packed
         self.nv = nv
+        # The same per-row copy as `mid_rows_mm` reads it (views).
+        self.mid = _head_mid(weight_fp8, weight_scale)
 
     def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.shape[0] <= _FP8_GEMV_HEAD_ROWS and _gemv_ready(hidden_states):
+        rows = hidden_states.shape[0]
+        if rows <= _FP8_GEMV_HEAD_ROWS and _gemv_ready(hidden_states):
             if self.nv is not None:
                 return nvfp4_gemv_op(hidden_states, self.nv)
             if self.packed is not None:
                 return fp8_gemv_op(hidden_states, self.packed)
+        if rows <= _MID_HEAD_ROWS and _gemv_ready(hidden_states):
+            return mid_rows_mm_op(hidden_states, self.mid)
         x8, xs = torch.ops.tensorrt_llm.quantize_e4m3_activation(hidden_states)
         return torch._scaled_mm(
             x8,
@@ -7484,6 +7583,11 @@ class _Fp8DraftHead:
             scale_b=self.weight_scale,
             out_dtype=hidden_states.dtype,
         )
+
+
+def _head_mid(weight_fp8: torch.Tensor, weight_scale: torch.Tensor) -> MidWeight:
+    """`mid_rows_mm`'s view of a per-row-scaled e4m3 head copy (`_fp8_rowwise`)."""
+    return MidWeight(weight_fp8, weight_scale.reshape(-1))
 
 
 def _fp8_rowwise(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -7991,6 +8095,9 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             self.model._lm_head_g = pack_from_bf16(self.lm_head.weight.data)
         if _dense_fp8_enabled():
             self.logits_processor.fp8_head = (rowwise, self.model._lm_head_g)
+        if rowwise is not None and self.lm_head.weight.is_cuda:
+            # Every head variant decode rows past the GEMV reach, compiled now.
+            mid_rows_precompile(_head_mid(*rowwise), _FP8_GEMV_HEAD_ROWS + 1, _MID_HEAD_ROWS)
         if draft_nv:
             self._build_draft_head_nvfp4(self.lm_head.weight.data)
         vocab = _mtp_draft_vocab()
@@ -8026,6 +8133,9 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         rows = torch.cat([torch.arange(vocab), torch.arange(tail, full)]).to(weight.device)
         codes, scale = rowwise
         self.model._mtp_head_fp8 = (codes[rows], scale[:, rows].contiguous())
+        mid_rows_precompile(
+            _head_mid(*self.model._mtp_head_fp8), _FP8_GEMV_HEAD_ROWS + 1, _MID_HEAD_ROWS
+        )
         if self.model._mtp_head_nv is not None:
             self._build_draft_head_nvfp4(weight[rows])
         else:
