@@ -373,8 +373,7 @@ class DisaggTransferCoordinator:
 
         Scheduler V2 allocates KV while evaluating generation-init requests.
         This reconciliation is required both after transfer-window admission
-        and when a PP follower's local candidates differ from the canonical
-        schedule propagated by rank 0.
+        and when PP or CP ranks reconcile their local candidates.
         """
         if not (self._is_kv_manager_v2 and candidates):
             return
@@ -388,13 +387,7 @@ class DisaggTransferCoordinator:
             if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                 with disagg_diagnostics.suppress_diagnostic_errors():
                     for request in deferred_requests:
-                        disagg_diagnostics.emit_request_event(
-                            "gen_kv_rollback",
-                            request,
-                            side="gen",
-                            dist=self._dist,
-                            reason=reason,
-                        )
+                        disagg_diagnostics.emit_kv_rollback(request, dist=self._dist, reason=reason)
 
     @nvtx_range("align_gen_admission_across_cp")
     def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
@@ -426,7 +419,7 @@ class DisaggTransferCoordinator:
         if len(common_ids) == len(local_ids):
             return admitted
         aligned = [request for request in admitted if request.py_request_id in common_ids]
-        self.revert_deferred_gen_init(admitted, aligned)
+        self.revert_deferred_gen_init(admitted, aligned, reason="cp_reconciliation")
         return aligned
 
     def _transfer_window_is_active(self) -> bool:
@@ -454,6 +447,13 @@ class DisaggTransferCoordinator:
         # does not block this thread on them; publication polls them instead.
         fences = self._take_receive_fences(admitted) if defer_unready else {}
         self._effects.prepare_gen_resources(admitted)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and self._is_kv_manager_v2:
+            # Selection and resource preparation are committed; receive
+            # publication may still wait for destination readiness below.
+            for req in admitted:
+                disagg_diagnostics.emit_kv_admission_result(
+                    req, self._kv_cache_manager, admitted=True, dist=self._dist
+                )
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.

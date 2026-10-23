@@ -221,6 +221,56 @@ def test_timeout_observation_and_idle_cancellation_preserve_trace(diagnostics, c
         assert observed["elapsed_ms"] == 2000.0
 
 
+@pytest.mark.parametrize("cancellation_first", [False, True])
+def test_gen_timeout_sweeps_share_one_observation(
+    diagnostics, monkeypatch, clock, cancellation_first: bool
+) -> None:
+    """Both timeout entry points share one event without changing clock sampling."""
+    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: True)
+    h = _harness(
+        FakeDistGroup(world_size=1, tp_size=1),
+        kv_transfer_timeout_ms=1000,
+        supports_inflight_cancellation=True,
+    )
+    start = clock["t"]
+    req = _request(
+        h,
+        is_context_only_request=False,
+        is_disagg_generation_transmission_in_progress=True,
+        py_kv_transfer_start_time=start,
+    )
+    h.transceiver.request_and_receive_async(req)
+    clock["t"] += 2.0
+    monotonic = Mock(return_value=clock["t"])
+    monkeypatch.setattr(coordinator_module.time, "monotonic", monotonic)
+    sweeps = [h.coordinator.check_transfer_timeouts, h.coordinator._cancel_timed_out_gen_transfers]
+    if cancellation_first:
+        sweeps.reverse()
+
+    for sweep in sweeps * 2:
+        sweep()
+
+    assert monotonic.call_count == 4
+    assert req.py_kv_transfer_timed_out
+    assert req.py_kv_transfer_start_time == start
+    assert h.transceiver.call_log.count("cancel_request:7") == 1
+    assert h.effects.failed == []
+    enabled, emit = diagnostics
+    if not enabled:
+        emit.assert_not_called()
+        return
+    emit.assert_called_once()
+    assert emit.call_args.args == ("transfer_timeout_observed",)
+    observed = emit.call_args.kwargs
+    assert observed["side"] == "gen"
+    assert observed["request_id"] == 7007
+    assert observed["local_request_id"] == 7
+    assert observed["timer_start_monotonic_ns"] == int(start * 1_000_000_000)
+    assert observed["elapsed_ms"] == 2000.0
+    assert observed["timeout_ms"] == 1000
+    assert observed["cancellation_requested"] is True
+
+
 @pytest.mark.parametrize("bypass", [False, True])
 def test_admission_diagnostics_preserve_admitted_batch_and_kv_rollback(
     diagnostics, bypass: bool

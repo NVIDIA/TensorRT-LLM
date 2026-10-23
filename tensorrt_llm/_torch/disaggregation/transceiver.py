@@ -1169,7 +1169,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session: Optional[object],
         outcome: str,
     ) -> None:
-        """Report the caller-proven retirement without polling lifecycle state."""
+        """Report session retirement, not physical drain, without polling state."""
         with disagg_diagnostics.suppress_diagnostic_errors():
             request_id_scope = "unknown"
             if req is not None:
@@ -1191,7 +1191,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 rank=self._mapping.rank,
                 instance=self._instance_name,
                 outcome=outcome,
-                resources_drained=True,
+                session_retired=True,
                 tp_rank=self._mapping.tp_rank,
                 pp_rank=self._mapping.pp_rank,
                 cp_rank=self._mapping.cp_rank,
@@ -1410,8 +1410,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             fetches = self._open_peer_source(req)
             if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                 with disagg_diagnostics.suppress_diagnostic_errors():
-                    diagnostic_transfer_bytes = (
-                        self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
+                    diagnostic_transfer_bytes = self._request_kv_bytes(
+                        req, paged_bytes, state_bytes
                     )
                     self._emit_receive_start(req, diagnostic_transfer_bytes, timeout_expected=False)
             receive_started = True

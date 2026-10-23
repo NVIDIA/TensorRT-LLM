@@ -1279,7 +1279,6 @@ def test_kv_payload_snapshot_is_shared_and_survives_same_peer_redispatch(
     sender = _make_owned_sender()
     sender._enforce_physical_ownership = False
     sender._device_id = 0
-    sender._bounce = Mock()
     sender._agent = SimpleNamespace(
         submit_transfer_requests=Mock(return_value=SimpleNamespace(wait=Mock(return_value=True)))
     )
@@ -1377,7 +1376,7 @@ def test_kv_payload_snapshot_is_shared_and_survives_same_peer_redispatch(
     sender._send_task_queues[0].put(None)
     sender._process_task_queue(0)
 
-    result = transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])
+    result = transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])
     # Successful wire reports attest the completed descriptor's bytes even
     # when neither diagnostics nor performance logging is enabled.
     assert result[5] == 0x180
@@ -1491,9 +1490,6 @@ def test_writer_result_correlation_uses_session_provenance_not_wire_id(
             0,
             True,
             AgentResult.SUCCESS,
-            dst_ptrs=None,
-            sizes=None,
-            src_base=None,
             transfer_size=256,
         )
 

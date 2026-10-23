@@ -3987,7 +3987,9 @@ class RxSession(RxSessionBase):
                                 "gen_destination_complete",
                                 side="gen",
                                 request_id=self.disagg_request_id,
-                                request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
+                                request_id_scope=disagg_diagnostics.get_request_id_scope(
+                                    task._params
+                                ),
                                 local_request_id=self.request_id,
                                 rank_info=ri,
                                 slice_id=receiver_slice_id,
