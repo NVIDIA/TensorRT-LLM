@@ -25,7 +25,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     RxSessionBase,
@@ -42,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
@@ -62,12 +63,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManager,
-    MambaHybridCacheManagerV2,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvtx_range
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
@@ -194,7 +192,7 @@ def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
 
 def _validate_fp4_mla_bridge_profile(
     mapping: Mapping,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: KVCacheManagerV2,
     cache_transceiver_config: CacheTransceiverConfig,
 ) -> bool:
     """Select the bridge only for its explicit no-retry FP4-MLA deployment cell."""
@@ -239,9 +237,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self,
         mapping: Mapping,
         dist: Distributed,
-        kv_cache_manager: KVCacheManager,
+        kv_cache_manager: KVCacheManagerV2,
         cache_transceiver_config: CacheTransceiverConfig,
     ):
+        if not isinstance(kv_cache_manager, KVCacheManagerV2):
+            raise ValueError(
+                "KvCacheTransceiverV2 does not support KV cache manager V1. "
+                f"Selected manager: {type(kv_cache_manager).__name__}. "
+                "Use a compatible KVCacheManagerV2 configuration for "
+                "transceiver_runtime='PYTHON'; enabling "
+                "use_kv_cache_manager_v2=True does not override incompatible "
+                "model features. To use V1, select transceiver_runtime='CPP' "
+                "with use_kv_cache_manager_v2=False for a model that supports V1."
+            )
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._dist: Distributed = dist
@@ -405,10 +413,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
-            self._kv_cache_manager, MambaHybridCacheManagerV2
-        ):
-            layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
@@ -504,8 +508,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             if self._kv_cache_manager.local_num_mamba_layers > 0:
                 return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
-        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
         return None
 
     def _create_chunk(self, req: LlmRequest) -> Chunk:
@@ -1475,19 +1477,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         V2 scheduler can deadlock under high concurrency (e.g., benchmark
         fill-phase).
 
-        No-op for V1 managers (which lack ``get_history_length``) and for
-        V2 caches with only full-context life cycles (where the watermark
-        has no allocation effect).
         """
-        get_history = getattr(self._kv_cache_manager, "get_history_length", None)
-        if get_history is None:
-            return
         prompt_len = getattr(req, "py_csa2_remote_tail_start", None)
         if prompt_len is None:
             prompt_len = getattr(req, "prompt_len", None)
         if not prompt_len or prompt_len <= 0:
             return
-        history = get_history(req)
+        history = self._kv_cache_manager.get_history_length(req)
         if history is None:
             # Cache was already released (e.g., cancelled mid-transfer); nothing to verify.
             return
@@ -1610,7 +1606,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"the Python bounce buffer (kv_cache_bounce_size_mb="
                 f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
             )
-        if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             blockers.append("a Mamba/hybrid cache manager")
         # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees
         # a piece short of the whole prompt, so a prompt that fits one chunk would slip past it.
@@ -1621,8 +1617,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # rebases it onto that request's page and frees ours, which an earlier chunk's
         # in-flight read may still be sourcing from.
         if (
-            isinstance(self._kv_cache_manager, KVCacheManagerV2)
-            and self._kv_cache_manager.enable_block_reuse
+            self._kv_cache_manager.enable_block_reuse
             and self._kv_cache_manager.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
         ):
             blockers.append(
