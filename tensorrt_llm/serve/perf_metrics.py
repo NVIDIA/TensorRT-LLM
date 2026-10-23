@@ -874,5 +874,9 @@ class PerfMetricsMiddleware:
                         return
             await send(message)
 
-        with _input_processing_context(scope["state"], self._input_processing_observer):
+        # Keep liveness probes out of the input-processing histograms.
+        input_observer = (
+            self._input_processing_observer if scope.get("path") != "/health_generate" else None
+        )
+        with _input_processing_context(scope["state"], input_observer):
             await self._app(scope, receive, send_metrics)

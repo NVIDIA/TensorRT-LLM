@@ -1242,8 +1242,8 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         """
         parsed = urlparse(url)
         if parsed.scheme in ("http", "https"):
+            session = await _get_aiohttp_session()
             with _time_input_processing("download", self._modality):
-                session = await _get_aiohttp_session()
                 data = await _safe_aiohttp_get(url, session=session)
             return await self._run_in_executor(self.load_bytes, data)
         elif parsed.scheme == "data":
