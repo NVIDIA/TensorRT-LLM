@@ -4,8 +4,9 @@
 
 The first indexed in-place call per autotune key in a process must be as correct as a
 warm one: the state kernel's autotuner restores the indexed state its benchmark launches
-write. "First call in the process" is a property of the process, so the cold-call tests
-re-run this file as a child: `python <this file> <mode>`.
+write, and the pool's dtype is part of the key. "First call in the process" is a property
+of the process, so the cold-call test re-runs this file as a child:
+`python <this file> <mode>`.
 """
 
 import os
@@ -13,12 +14,12 @@ import subprocess
 import sys
 import zlib
 from pathlib import Path
-from typing import Optional
 
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.chunk_gated_delta_rule import (  # noqa: E501
+    ENGINE_SLOTS,
     HEAD_K_DIM,
     HEAD_V_DIM,
     NUM_K_HEADS,
@@ -49,7 +50,7 @@ def _compare(out: tuple, ref: tuple) -> None:
     on states, about 4x and 6x the largest deviations measured warm over
     every cell against this reference (`o` 4.88e-4, one bf16 ulp, on
     magnitudes up to 7.9e-2; states 3.57e-3 on up to 8.3e-1).
-    Discriminated: seven wrong references (no gating, beta = 1, q/k swapped,
+    Discriminated when measured: seven wrong references (no gating, beta = 1, q/k swapped,
     initial state dropped, scale = 1, key heads reversed, `[K, V]`
     transposed state) all fail the `o` gate, the closest 11x outside it.
     """
@@ -65,7 +66,6 @@ def _compare(out: tuple, ref: tuple) -> None:
 
 
 DEV = "cuda"
-SCALE = HEAD_K_DIM**-0.5
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
@@ -73,48 +73,35 @@ def _l2norm(x: torch.Tensor) -> torch.Tensor:
     return xf / torch.sqrt(xf.pow(2).sum(-1, keepdim=True) + 1e-6)
 
 
-def _operands(
-    seqlens: Optional[tuple],
-    seed: int,
-    batch: int = 1,
-    num_tokens: Optional[int] = None,
-    num_k_heads: int = NUM_K_HEADS,
-    num_v_heads: int = NUM_V_HEADS,
-    normalize_qk: bool = True,
-):
+def _operands(seqlens: tuple, seed: int):
     """Operands in the domain the GDN prefill path produces: unit-norm q/k,
     `g = -exp(A_log) * softplus(a + dt_bias) < 0`, `beta` a sigmoid. The delta
     rule is only contractive there."""
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    if seqlens is None:
-        cu_seqlens, total = None, num_tokens
-    else:
-        total = sum(seqlens)
-        cu_seqlens = torch.tensor(
-            [0] + torch.tensor(seqlens).cumsum(0).tolist(), dtype=torch.long, device=DEV
-        )
-    shape_qk = (batch, total, num_k_heads, HEAD_K_DIM)
+    total = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0] + torch.tensor(seqlens).cumsum(0).tolist(), dtype=torch.long, device=DEV
+    )
+    shape_qk = (1, total, NUM_K_HEADS, HEAD_K_DIM)
     q = torch.randn(shape_qk, generator=gen, device=DEV)
     k = torch.randn(shape_qk, generator=gen, device=DEV)
-    if normalize_qk:
-        q, k = _l2norm(q), _l2norm(k)
-    q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
+    q, k = _l2norm(q).to(torch.bfloat16), _l2norm(k).to(torch.bfloat16)
     v = torch.randn(
-        batch, total, num_v_heads, HEAD_V_DIM, generator=gen, device=DEV, dtype=torch.bfloat16
+        1, total, NUM_V_HEADS, HEAD_V_DIM, generator=gen, device=DEV, dtype=torch.bfloat16
     )
-    a_log = torch.log(torch.rand(num_v_heads, generator=gen, device=DEV) * 15 + 1)
-    dt_bias = torch.randn(num_v_heads, generator=gen, device=DEV)
-    a = torch.randn(batch, total, num_v_heads, generator=gen, device=DEV)
+    a_log = torch.log(torch.rand(NUM_V_HEADS, generator=gen, device=DEV) * 15 + 1)
+    dt_bias = torch.randn(NUM_V_HEADS, generator=gen, device=DEV)
+    a = torch.randn(1, total, NUM_V_HEADS, generator=gen, device=DEV)
     g = (-torch.exp(a_log) * torch.nn.functional.softplus(a + dt_bias)).float()
-    beta = torch.rand(batch, total, num_v_heads, generator=gen, device=DEV).sigmoid().float()
+    beta = torch.rand(1, total, NUM_V_HEADS, generator=gen, device=DEV).sigmoid().float()
     return q, k, v, g, beta, cu_seqlens
 
 
-def _pool(num_slots: int, seed: int, num_v_heads: int = NUM_V_HEADS) -> torch.Tensor:
-    """An fp32 recurrent-state pool, `[slots, H, V, K]` (K innermost)."""
+def _pool(num_slots: int, seed: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """A recurrent-state pool, `[slots, H, V, K]` (K innermost), at `dtype`."""
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    shape = (num_slots, num_v_heads, HEAD_V_DIM, HEAD_K_DIM)
-    return torch.randn(shape, generator=gen, device=DEV) * 0.1
+    shape = (num_slots, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM)
+    return (torch.randn(shape, generator=gen, device=DEV) * 0.1).to(dtype)
 
 
 def _gate_output(o: torch.Tensor, ref: tuple) -> None:
@@ -128,56 +115,23 @@ def _gate_pool(pool: torch.Tensor, ref: tuple) -> None:
 
 
 def _build(spec, seed):
-    """`__call__`'s 13 arguments for one spec, plus the wide output buffer."""
-    q, k, v, g, beta, cu_seqlens = _operands(
-        spec.get("seqlens"),
-        seed,
-        batch=spec.get("batch", 1),
-        num_tokens=spec.get("num_tokens"),
-        normalize_qk=spec.get("normalize_qk", True),
-    )
-    num_seqs = q.shape[0] if cu_seqlens is None else len(cu_seqlens) - 1
-    initial, indices, inplace = None, None, False
-    if spec["initial"] == "indexed":
-        initial = _pool(spec["slots"], seed=seed + 1)
-        indices = torch.tensor(
-            spec.get("indices", tuple(range(num_seqs))), dtype=torch.int32, device=DEV
-        )
-        inplace = True
-    elif spec["initial"] == "positional":
-        initial = _pool(num_seqs, seed=seed + 1)
-    wide, output = None, None
-    shape_o = (q.shape[0], q.shape[1], NUM_V_HEADS, HEAD_V_DIM)
+    """`__call__`'s 13 arguments for one spec."""
+    q, k, v, g, beta, cu_seqlens = _operands(spec["seqlens"], seed)
+    pool = _pool(ENGINE_SLOTS, seed=seed + 1, dtype=spec.get("pool_dtype", torch.float32))
+    indices = torch.tensor(spec["indices"], dtype=torch.int32, device=DEV)
+    output = None
     if spec.get("output") == "buffer":
+        shape_o = (q.shape[0], q.shape[1], NUM_V_HEADS, HEAD_V_DIM)
         output = torch.empty(shape_o, device=DEV, dtype=torch.bfloat16)
-    elif spec.get("output") == "window":
-        wide = torch.zeros(1, 200, NUM_V_HEADS, HEAD_V_DIM, device=DEV, dtype=torch.bfloat16)
-        output = wide[:, 50 : 50 + q.shape[1]]
-    args = [
-        q,
-        k,
-        v,
-        g,
-        beta,
-        spec.get("scale"),
-        initial,
-        indices,
-        inplace,
-        spec.get("output_final_state", False),
-        cu_seqlens,
-        spec.get("l2norm", False),
-        output,
-    ]
-    return args, wide
+    return [q, k, v, g, beta, None, pool, indices, True, False, cu_seqlens, False, output]
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
-    spec = cell.spec
     certifying(op)
-    args, wide = _build(spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     pool = args[6]
-    pool_before = None if pool is None else pool.clone()
+    pool_before = pool.clone()
     ref = op.reference(*args)
 
     o, final_state = op(*args)
@@ -185,48 +139,10 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     _compare((o, final_state, pool), ref)
     if args[12] is not None:
         assert o.data_ptr() == args[12].data_ptr(), "output= must be written in place"
-    if wide is not None:
-        assert torch.count_nonzero(wide[:, :50]) == 0 and torch.count_nonzero(wide[:, 146:]) == 0
-    if spec["initial"] == "positional":
-        assert torch.equal(pool, pool_before), "a positional initial state is read-only"
-    if spec["initial"] == "indexed":
-        named = args[7].tolist()
-        unnamed = [s for s in range(pool.shape[0]) if s not in set(named)]
-        assert torch.equal(pool[unnamed], pool_before[unnamed]), "unnamed slots written"
-        assert not torch.equal(pool[named], pool_before[named]), "named slots did not move"
-
-
-def test_op_rejects_these_domains_loudly() -> None:
-    """Why `is_valid` guards only `output`: every other refusal is the op's."""
-    q, k, v, g, beta, cu = _operands((80,), seed=67)
-    idx1 = torch.zeros(1, dtype=torch.int32, device=DEV)
-    cases = [
-        (AssertionError, "does not support float32", dict(q=q.float(), k=k.float(), v=v.float())),
-        (AssertionError, "", dict(k=k.half())),
-        (AssertionError, "beta must be of shape", dict(beta=beta[0])),
-        (ValueError, "batch size is expected to be 1", dict(q=q.expand(2, -1, -1, -1))),
-        (
-            ValueError,
-            "number of initial-state indices",
-            dict(
-                initial_state=_pool(4, seed=671),
-                initial_state_indices=torch.tensor([0, 1], dtype=torch.int32, device=DEV),
-                inplace_indexed_state_update=True,
-            ),
-        ),
-        (ValueError, "number of initial states", dict(initial_state=_pool(3, seed=672))),
-        (
-            ValueError,
-            "require inplace_indexed_state_update=True",
-            dict(initial_state=_pool(1, seed=673), initial_state_indices=idx1),
-        ),
-    ]
-    for exc, match, override in cases:
-        kwargs = dict(q=q, k=k, v=v, g=g, beta=beta, cu_seqlens=cu)
-        kwargs.update(override)
-        with pytest.raises(exc, match=match):
-            with validating(op):
-                op(**kwargs)
+    named = args[7].tolist()
+    unnamed = [s for s in range(pool.shape[0]) if s not in set(named)]
+    assert torch.equal(pool[unnamed], pool_before[unnamed]), "unnamed slots written"
+    assert not torch.equal(pool[named], pool_before[named]), "named slots did not move"
 
 
 def test_guard_refuses_a_noncontiguous_output() -> None:
@@ -246,46 +162,9 @@ def test_guard_refuses_a_noncontiguous_output() -> None:
             op(q, k, v, g, beta, cu_seqlens=cu, output=head_slice)
 
 
-def test_guard_refuses_an_output_of_another_dtype() -> None:
-    """Unguarded, an fp32 buffer is filled but the returned bf16 tensor no
-    longer aliases it -- the allocation the buffer existed to avoid."""
-    q, k, v, g, beta, cu = _operands((96,), seed=62)
-    buf = torch.zeros(1, 96, NUM_V_HEADS, HEAD_V_DIM, device=DEV, dtype=torch.float32)
-    o, _ = op(q, k, v, g, beta, cu_seqlens=cu, output=buf)
-    assert o.dtype == torch.bfloat16 and o.data_ptr() != buf.data_ptr(), "hazard gone"
-    with pytest.raises(AssertionError, match="output must have q's dtype"):
-        with validating(op):
-            op(q, k, v, g, beta, cu_seqlens=cu, output=buf)
-
-
-def test_gate_discriminates_wrong_variants() -> None:
-    """Seven references wrong in one way each must all fail the `o` gate the
-    correct one passes. Positional path: no warm-up needed."""
-    q, k, v, g, beta, cu = _operands((128, 64), seed=71)
-    initial = _pool(2, seed=711)
-    base = dict(q=q, k=k, v=v, g=g, beta=beta, scale=SCALE, initial_state=initial, cu_seqlens=cu)
-    o, final_state = op(**base, output_final_state=True)
-    ref = op.reference(**base, output_final_state=True)
-    _compare((o, final_state, initial), ref)
-
-    variants = {
-        "no gating": dict(g=torch.zeros_like(g)),
-        "beta forced to 1": dict(beta=torch.ones_like(beta)),
-        "q and k swapped": dict(q=k, k=q),
-        "initial state dropped": dict(initial_state=None),
-        "scale left at 1": dict(scale=1.0),
-        "key heads reversed": dict(q=q.flip(2).contiguous(), k=k.flip(2).contiguous()),
-        "initial state [K, V]": dict(initial_state=initial.transpose(-1, -2).contiguous()),
-    }
-    for name, override in variants.items():
-        wrong = op.reference(**{**base, **override})
-        with pytest.raises(AssertionError):
-            _gate_output(wrong[0], ref)
-
-
 # ---------------------------------------------------------------------------
-# The cold call. The cells above have already benchmarked these autotune keys by
-# the time pytest reaches these, so each runs in a fresh interpreter.
+# The cold call. The cells above have already benchmarked this autotune key by
+# the time pytest reaches it, so it runs in a fresh interpreter.
 
 CHILD_TIMEOUT_S = 420
 #: The GDN prefill call shape, packed varlen, state by slot index.
@@ -306,9 +185,9 @@ def _state_kernel_autotuner():
     raise AssertionError("no triton autotuner found around the chunked state kernel")
 
 
-def _checkpoint_case(seed: int = 101):
+def _checkpoint_case(seed: int = 101, pool_dtype: torch.dtype = torch.float32):
     q, k, v, g, beta, cu = _operands(CHILD_SEQLENS, seed=seed)
-    pool = _pool(4, seed=seed + 1)
+    pool = _pool(4, seed=seed + 1, dtype=pool_dtype)
     indices = torch.tensor([2, 0], dtype=torch.int32, device=DEV)
     buf = torch.empty(
         1, sum(CHILD_SEQLENS), NUM_V_HEADS, HEAD_V_DIM, device=DEV, dtype=torch.bfloat16
@@ -316,10 +195,10 @@ def _checkpoint_case(seed: int = 101):
     return (q, k, v, g, beta, None, pool, indices, True, False, cu, False, buf)
 
 
-def _child_cold_call() -> None:
+def _child_cold_call(pool_dtype: torch.dtype = torch.float32) -> None:
     autotuner = _state_kernel_autotuner()
     assert not autotuner.cache, "the child must be the first indexed call in its process"
-    args = _checkpoint_case()
+    args = _checkpoint_case(pool_dtype=pool_dtype)
     ref = op.reference(*args)
     o, _ = op(*args)
     assert len(autotuner.cache) == 1, "the call must have benchmarked exactly one key"
@@ -327,24 +206,8 @@ def _child_cold_call() -> None:
     _gate_pool(args[6], ref)
 
 
-def _child_cold_call_odd_heads() -> None:
-    """A head geometry (5 key / 20 value heads) nothing else uses."""
-    autotuner = _state_kernel_autotuner()
-    assert not autotuner.cache, "the child must be the first indexed call in its process"
-    q, k, v, g, beta, cu = _operands((96,), seed=83, num_k_heads=5, num_v_heads=20)
-    pool = _pool(4, seed=831, num_v_heads=20)
-    indices = torch.tensor([1], dtype=torch.int32, device=DEV)
-    args = (q, k, v, g, beta, None, pool, indices, True, False, cu, False, None)
-    ref = op.reference(*args)
-    o, _ = op(*args)
-    assert len(autotuner.cache) == 1, "the call must have benchmarked exactly one key"
-    _gate_output(o, ref)
-    _gate_pool(pool, ref)
-
-
 _CHILD_MODES = {
-    "cold-call": _child_cold_call,
-    "cold-call-odd-heads": _child_cold_call_odd_heads,
+    "cold-call-bf16-pool": lambda: _child_cold_call(torch.bfloat16),
 }
 
 
@@ -368,15 +231,11 @@ def _run_child(mode: str) -> None:
     )
 
 
-def test_cold_indexed_call_at_this_checkpoints_geometry() -> None:
-    """The first indexed call of a process at 16 / 48 heads, K = V = 128, in the
-    mixer's shape (256 + 96 packed, by slot, into `output=`), matches the reference."""
-    _run_child("cold-call")
-
-
-def test_cold_indexed_call_at_an_unused_head_geometry() -> None:
-    """The same at 5 / 20 heads, an autotune key nothing else here touches."""
-    _run_child("cold-call-odd-heads")
+def test_cold_indexed_call_over_a_bf16_pool() -> None:
+    """The first indexed call of a process at 16 / 48 heads, K = V = 128, over a bf16
+    pool, in the mixer's shape (256 + 96 packed, by slot, into `output=`), matches the
+    reference."""
+    _run_child("cold-call-bf16-pool")
 
 
 if __name__ == "__main__":

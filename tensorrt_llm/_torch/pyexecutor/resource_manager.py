@@ -44,8 +44,7 @@ from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
 # isort: on
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
-                       nvtx_range)
+from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
 from .config_utils import uses_vswa_kv_cache_layout
@@ -1638,6 +1637,15 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        # py_kv_reuse_poisoned: failed before completing its first context
+        # chunk, so the blocks were never written. remove_sequence has no
+        # no-store variant, so move the cursor off position 0: usable-token
+        # accounting then yields zero and releaseBlocks' legacy position-0
+        # fallback (which would store the unwritten blocks under the
+        # prompt's keys) no longer applies.
+        if (getattr(request, 'py_kv_reuse_poisoned', False)
+                and request.context_current_position == 0):
+            request.context_current_position = 1
         result = self.impl.remove_sequence(request.py_request_id, request,
                                            pin_on_release)
         self._preprepared_dummy_request_ids.discard(request.py_request_id)
@@ -3246,9 +3254,9 @@ class PeftCacheManager(BaseResourceManager):
                  peft_cache_config: PeftCacheConfig,
                  lora_config: LoraConfig,
                  model_config: ModelConfigCpp,
+                 lora_model_config: LoraModelConfig,
                  world_config: WorldConfig | None = None,
                  execution_stream: Optional[torch.cuda.Stream] = None,
-                 lora_target_modules: Optional[List[str]] = None,
                  initial_data_type: Optional[torch.dtype] = None):
         import tensorrt_llm.bindings as _tb
 
@@ -3288,12 +3296,7 @@ class PeftCacheManager(BaseResourceManager):
             self.impl.configure_data_type(
                 torch_dtype_to_binding(initial_data_type))
         self._lora_config = lora_config
-        self._lora_model_config = LoraModelConfig(
-            lora_target_modules if lora_target_modules is not None else
-            lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
-            binding_to_str_dtype(model_config.data_type),
-            lora_config.swap_gate_up_proj_lora_b_weight)
+        self._lora_model_config = lora_model_config
         mapping = Mapping(
             world_size=world_config.size,
             rank=world_config.rank,

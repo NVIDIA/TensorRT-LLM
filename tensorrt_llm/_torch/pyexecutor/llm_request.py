@@ -791,6 +791,8 @@ class LlmResult:
         # totals from the PyTorch executor; used to backfill
         # RequestPerfMetrics.speculative_decoding on the client side
         # (GenerationResultBase._handle_sequence). None when no drafting ran.
+        self.per_pos_drafted: Optional[List[int]] = None
+        self.per_pos_accepted: Optional[List[int]] = None
         self.spec_dec_totals = None
         # Context-worker usage for gen-first disagg, delivered via the
         # KV-transfer aux buffer (see _maybe_attach_ctx_usage).
@@ -861,9 +863,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             stop_words_list: list[list[int]] | None = None,
             llm_request: Optional[
                 tensorrt_llm.bindings.internal.batch_manager.LlmRequest] = None,
-            is_draft: bool = False,
             seq_slot: Optional[int] = None,
-            target_seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
@@ -893,15 +893,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_mm_encoder_state: Optional[MultimodalEncoderRequestState] = None
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
-        # Python-side handle to the encoder feature tensor (audio enc-dec
-        # models): the C++ binding takes the kwarg but exposes no getter, so
-        # the encoder step reads it here. Kept for the request's lifetime —
-        # pause() re-enters ENCODER_INIT and re-runs the encoder from it.
-        self.py_encoder_input_features = kwargs.get("encoder_input_features")
-        return_encoder_output = bool(kwargs.get("return_encoder_output", False))
-        if return_encoder_output:
-            kwargs["return_encoder_output"] = False
+        # Python owns the feature payload; native scheduling only needs its
+        # length. Keep the payload across pause() so the encoder can run again.
+        encoder_input_features = kwargs.pop("encoder_input_features", None)
+        self.py_encoder_input_features: Optional[
+            torch.Tensor] = encoder_input_features
+        if encoder_input_features is not None:
+            kwargs["encoder_input_length"] = encoder_input_features.shape[0]
+        return_encoder_output = bool(kwargs.pop("return_encoder_output", False))
         if (llm_request is None and encoder_input_tokens is not None
+                and self.py_encoder_input_features is None
                 and encoder_output_len is None):
             encoder_output_len = len(encoder_input_tokens)
             kwargs["encoder_output_len"] = encoder_output_len
@@ -916,9 +917,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             super().__init__(llm_request)
         else:
             super().__init__(*args,
-                             return_log_probs=return_log_probs,
-                             return_context_logits=False,
-                             return_generation_logits=False,
                              return_perf_metrics=return_perf_metrics,
                              **kwargs)
         if encoder_output_len is not None and not hasattr(
@@ -987,11 +985,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_additional_outputs = additional_outputs
 
         self.py_beam_width = cast(int, self.sampling_config.beam_width)
-        self.py_is_draft = is_draft
-        # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
-        self.py_target_seq_slot = target_seq_slot
-        self.use_draft_model = is_draft
-        self.d2t = None
         self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters
@@ -1189,23 +1182,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 return self.context_current_position + self.context_chunk_size == end
         return super().is_last_context_chunk
 
-    def create_response(self,
-                        use_fast_logits=False,
-                        mpi_world_rank=0) -> LlmResponse | None:
+    def create_response(self) -> LlmResponse | None:
         """Create an LlmResponse from the current request state.
 
         This method generates a response containing the request's execution results,
         including generated tokens, logits, and completion status. It wraps the
         parent class's serialized result in a PyTorch-specific LlmResponse object.
-
-        Args:
-            use_fast_logits (bool, optional, default=False): Only applicable for TRT-backend with speculative decoding enabled. When returning generation logits under speculative decoding,
-            `use_fast_logits=True` replaces tensor payloads with tiny metadata so the target pulls logits
-            directly (zero-copy/IPC), reducing overhead; ignored on PyTorch.
-            mpi_world_rank (int, optional, default=0): Only applicable for TRT-backend, with speculative decoding
-            enabled, and `use_fast_logits=True`. Contains the MPI world rank of the process containing the draft
-            model, that produces the generation logits. This helps transfer logits from the draft model to the
-            target model without going through the serialization/transport path.
 
         Returns:
             LlmResponse | None: An LlmResponse object containing the request results
@@ -1219,8 +1201,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             Returns None if the serialized result is empty (len(result) == 0),
             indicating no output was generated for this request iteration.
         """
-        result, is_final = super().create_serialized_result(
-            use_fast_logits, mpi_world_rank)
+        result, is_final = super().create_serialized_result()
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.
@@ -1239,7 +1220,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self.py_result._log_probs = LogProbStorage()
                 # Initialize the storage and adjust the cum_log_probs to the previous value
                 self.py_result._log_probs._init(py_result.log_probs)
-                self.py_result._log_probs.cum_log_probs = py_result.cum_log_probs
+                self.py_result._log_probs.cum_log_probs = copy(
+                    py_result.cum_log_probs)
 
             # Perform copies of py_result._generation_logits
             if need_deep_copy_generation_logits:
@@ -1307,9 +1289,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child = super().create_child_request(child_id)
         py_request = LlmRequest(llm_request=child)
 
-        # Copy all py_* attributes from parent to child
+        # Encoder features are shared read-only. Before an in-place mutation,
+        # clone and reassign the tensor on the request being modified.
+        # Deep-copy other py_* attributes to preserve child independence.
         for attr_name, attr_value in self.__dict__.items():
-            if attr_name.startswith('py_'):
+            if attr_name == 'py_encoder_input_features':
+                py_request.py_encoder_input_features = attr_value
+            elif attr_name.startswith('py_'):
                 attr_value = getattr(self, attr_name)
                 setattr(py_request, attr_name, deepcopy(attr_value))
             elif attr_name in [
@@ -1696,10 +1682,9 @@ def executor_request_to_llm_request(
         agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
 
     # Audio encoder-decoder models (e.g. Whisper) carry the encoder input as a
-    # feature tensor, not encoder token ids. Route it into the request's native
-    # encoder_input_features / encoder_output_len fields so the C++ state machine
-    # admits it to the encoder step and cross-KV sizing sees the post-encoder
-    # length rather than a token count.
+    # feature tensor, not encoder token ids. Python owns the payload; native
+    # encoder input/output lengths drive admission and post-encoder cross-KV
+    # sizing.
     encoder_input_features = None
     encoder_output_len = None
     py_mm_data = py_multimodal_data or {}

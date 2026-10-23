@@ -323,6 +323,14 @@ class TransformersTokenizer(TokenizerBase):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
+        # AutoTokenizer resolves the checkpoint config first, so any model_type
+        # TRT-LLM overrides or gap-fills has to be in CONFIG_MAPPING by now; the
+        # registration is an import side effect of tensorrt_llm._torch.configs.
+        # Without this, nemotron_h checkpoints whose hybrid_override_pattern
+        # carries "-" MLP layers reach the stock transformers config and die
+        # with KeyError: '-' before the model is ever built.
+        import tensorrt_llm._torch.configs  # noqa: F401
+
         try:
             with _hf_remote_code_guard(kwargs.get('trust_remote_code', False)):
                 tokenizer = AutoTokenizer.from_pretrained(
