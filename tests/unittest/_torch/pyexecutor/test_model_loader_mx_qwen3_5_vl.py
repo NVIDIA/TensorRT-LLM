@@ -38,11 +38,12 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_qwen3_5 as modeling_qwen3_5_mod
 from tensorrt_llm._torch.models import modeling_qwen3_next as modeling_qwen3_next_mod
 from tensorrt_llm._torch.models import modeling_qwen3vl as modeling_qwen3vl_mod
+from tensorrt_llm._torch.models.checkpoints import model_hooks as model_hooks_mod
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loading_mod
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
-from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -201,7 +202,7 @@ def _hf_checkpoint_loader(state_dict: dict[str, torch.Tensor]):
 
 def _qualify(model: nn.Module):
     """Qualify `model` with the identity that `ModelLoader` captures before construction."""
-    return ModelLoader._qualify_post_transform_profile(
+    return mx_loading_mod.qualify_post_transform_profile(
         model,
         config_identity=_CONFIG_IDENTITY,
         speculative_mode=None,
@@ -381,7 +382,7 @@ def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> N
     decision = _qualify(receiver)
     assert decision.transform_abi_id == QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1
     assert (
-        ModelLoader._post_transform_transfer_scope(receiver)
+        mx_loading_mod.get_post_transform_transfer_scope(receiver)
         is PostTransformTransferScope.COMPLETE_MODEL
     )
     assert _runtime_config(producer) == _qwen3_5_vl_runtime_config()
@@ -420,14 +421,14 @@ def test_qwen3_5_vl_mx_tensor_catalog_is_complete_and_stable(tmp_path: Path) -> 
     checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
     producer = _tiny_qwen3_5_vl_model(checkpoint_dir)
     _hf_checkpoint_loader(_tiny_hf_state_dict())(producer)
-    ModelLoader._walk_full_post_load(producer)
+    model_hooks_mod.walk_full_post_load(producer)
     receiver = _tiny_qwen3_5_vl_model(checkpoint_dir)
 
-    ModelLoader._setup_aliases(receiver)
+    model_hooks_mod.setup_aliases(receiver)
     registered_catalog = mx_canonical_parameter_catalog(receiver)
-    ModelLoader._setup_aliases(receiver)
-    ModelLoader._mark_weights_transformed(receiver)
-    ModelLoader._walk_cache_state(receiver)
+    model_hooks_mod.setup_aliases(receiver)
+    model_hooks_mod.mark_weights_transformed(receiver)
+    model_hooks_mod.walk_cache_state(receiver)
     published_catalog = mx_canonical_parameter_catalog(receiver)
 
     assert published_catalog == registered_catalog
@@ -470,7 +471,7 @@ def test_qwen3_5_vl_qualification_requires_preconstruction_identity(tmp_path: Pa
     model = _tiny_qwen3_5_vl_model(_write_tiny_checkpoint_config(tmp_path / "ckpt"))
 
     post_construction_identity = PostTransformConfigIdentity.from_model_config(model.model_config)
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         model,
         config_identity=post_construction_identity,
         speculative_mode=None,
@@ -560,7 +561,7 @@ def test_qwen3_5_vl_without_local_encoder_falls_back(
 
     assert model.mm_encoder is None
     assert (
-        ModelLoader._post_transform_transfer_scope(model)
+        mx_loading_mod.get_post_transform_transfer_scope(model)
         is PostTransformTransferScope.LANGUAGE_MODEL
     )
     assert _qualify(model).reason is PostTransformQualificationReason.TRANSFER_SCOPE_NOT_REGISTERED
@@ -598,12 +599,12 @@ def _qualify_registry(**overrides: object):
         "architecture": "Qwen3_5ForConditionalGeneration",
         "model_type": "qwen3_5",
         "speculative_mode": None,
-        "protocol_version": ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        "protocol_version": mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         "transfer_scope": PostTransformTransferScope.COMPLETE_MODEL,
         "runtime_config": _qwen3_5_vl_runtime_config(),
     }
     arguments.update(overrides)
-    return ModelLoader._post_transform_profile_registry().qualify(**arguments)
+    return mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(**arguments)
 
 
 @pytest.mark.cpu_only
