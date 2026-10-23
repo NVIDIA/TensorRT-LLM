@@ -14,9 +14,11 @@
 
 import copy
 import dataclasses
+import math
 import os
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+import numpy as np
 import torch
 
 import tensorrt_llm
@@ -1027,9 +1029,12 @@ class KvCacheCreator:
                                 is_draft: bool = False,
                                 mapping=None,
                                 include_request_cost: bool = False,
+                                tokens_per_block: Optional[int] = None,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
+        tokens_per_block = (tokens_per_block if tokens_per_block is not None
+                            else self._tokens_per_block)
         if not is_draft:
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
@@ -1044,7 +1049,7 @@ class KvCacheCreator:
             manager_cls.get_cache_size_per_token(
                 model_config,
                 mapping if mapping is not None else self._mapping,
-                tokens_per_block=self._tokens_per_block,
+                tokens_per_block=tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
                 max_num_tokens=self._max_num_tokens,
@@ -1221,13 +1226,25 @@ class KvCacheCreator:
                 draft_kv_cache_manager_cls, effective_draft_config,
                 draft_kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
-                # External drafter: layers start from 0, normal PP distribution
+                # External drafter: layers start from 0, normal PP distribution.
+                # Costed at the page size its pool is carved with.
+                draft_tokens_per_block = self._draft_tokens_per_block()
+                if self._is_standalone_draft_pool():
+                    per_token_cost = self._standalone_draft_per_token_cost(
+                        draft_kv_cache_manager_cls, effective_draft_config,
+                        draft_kv_cache_config, draft_mapping,
+                        draft_tokens_per_block)
+                    return scaled(
+                        self._standalone_draft_pool_cost(
+                            per_token_cost, kv_cache_config,
+                            draft_tokens_per_block))
                 return scaled(
                     self._per_manager_cache_cost(
                         draft_kv_cache_manager_cls,
                         effective_draft_config,
                         draft_kv_cache_config,
                         mapping=draft_mapping,
+                        tokens_per_block=draft_tokens_per_block,
                         is_draft=True,
                         include_request_cost=include_request_cost))
             elif self._mapping.is_last_pp_rank():
@@ -2034,6 +2051,10 @@ class KvCacheCreator:
         """
         if not self._is_kv_cache_manager_v2:
             return False
+        if self._draft_tokens_per_block() != self._tokens_per_block:
+            # KVCacheV2Scheduler._try_allocate_generation pairs the two pools
+            # block for block, which needs one page size.
+            return False
         lookahead = draft_prompt_lookahead(self._speculative_config)
         if lookahead is None:
             return False
@@ -2046,6 +2067,49 @@ class KvCacheCreator:
             # every backoff-sized path stays a no-op and the pairing is safe.
             return False
         return True
+
+    def _draft_tokens_per_block(self) -> int:
+        """Page size of the separate one-model draft KV pool.
+
+        The target's, unless the drafter reading the pool cannot address pages
+        of that size. A standalone DFlash/DSpark drafter on the TRTLLM backend
+        runs the shared trtllm-gen op set, which accepts only
+        ``FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK``, while the
+        target's page size follows the target (MiniMax-M3 MSA and FP4 MLA pin
+        128). The drafter validates the page size of the pool it is handed
+        (``validate_dflash_trtllm_gen_runtime``) once that pool is carved, so
+        the pool is carved at the largest size it accepts instead.
+
+        The two page sizes are independent: the draft manager mirrors the
+        target per token (``KVCacheManagerV2._prepare_draft_resources``) and
+        the drafter builds its block tables from its own pool
+        (``DFlashDrafter._init_ctx_block_tables``). Joint block reuse is the
+        one pairing that assumes equal page sizes; ``_joint_reuse_supported``
+        declines it when they differ.
+        """
+        tokens_per_block = self._tokens_per_block
+        draft_model = getattr(self._model_engine.model, "draft_model", None)
+        if draft_model is None:
+            return tokens_per_block
+        # Only drafters running the shared DFlash op sets read pages with
+        # trtllm-gen; the MLA DSpark drafter names its own kernels "TRTLLM".
+        if not getattr(draft_model, "_uses_worker_attention_backend", False):
+            return tokens_per_block
+        if getattr(draft_model, "dflash_attention_backend", None) != "TRTLLM":
+            return tokens_per_block
+        from ..attention.backends.fmha.flashinfer_trtllm_gen import \
+            FlashInferTrtllmGenFmha
+        supported = FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK
+        if tokens_per_block in supported:
+            return tokens_per_block
+        smaller = [size for size in supported if size < tokens_per_block]
+        draft_tokens_per_block = max(smaller) if smaller else min(supported)
+        logger.info_once(
+            f"Separate draft KV cache uses tokens_per_block="
+            f"{draft_tokens_per_block}: the DFlash TRTLLM attention backend "
+            f"supports {sorted(supported)}, not the target's {tokens_per_block}.",
+            key="draft_tokens_per_block")
+        return draft_tokens_per_block
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -2135,6 +2199,149 @@ class KvCacheCreator:
             self._get_num_draft_layers(),
         )
 
+    def _is_standalone_draft_pool(self) -> bool:
+        """Whether the separate draft pool belongs to a standalone drafter.
+
+        True for the DFlash/DSpark drafter. Its pool mirrors the target per
+        request (``KVCacheManagerV2._prepare_draft_resources``) and is never
+        shared between requests: block reuse lets the target hold a prompt
+        prefix once for every request that matches it, while each mirror
+        stores the drafter's K/V for that prefix privately. The target's
+        per-token funding therefore does not bound the mirrors, and the pool
+        is funded as a fixed cost for ``max_batch_size`` of them
+        (``_standalone_draft_pool_cost``).
+        """
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        return spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()
+
+    def _standalone_draft_mirror_window(
+            self, kv_cache_config: KvCacheConfig) -> Optional[int]:
+        """The largest attention window the standalone drafter's pool keeps,
+        as the manager will hold it, or None when a layer attends to the whole
+        context.
+
+        The manager extends sliding windows by the reuse-match backoff under
+        block reuse (``KVCacheManagerV2.__init__``), so the funded window
+        does the same.
+        """
+        from .kv_cache.kv_cache_manager_v2 import _extend_swa_windows_for_reuse
+        windows = self._get_draft_max_attention_window(self._max_seq_len,
+                                                       kv_cache_config)
+        if windows is None:
+            return None
+        if kv_cache_config.enable_block_reuse:
+            windows = _extend_swa_windows_for_reuse(
+                windows,
+                draft_prompt_lookahead(self._speculative_config) or 0,
+                self._max_seq_len)
+        if any(window is None or window >= self._max_seq_len
+               for window in windows):
+            return None
+        return max(windows)
+
+    def _standalone_draft_per_token_cost(self, manager_cls, model_config,
+                                         draft_kv_cache_config: KvCacheConfig,
+                                         mapping,
+                                         tokens_per_block: int) -> CacheCost:
+        """The standalone drafter's KV bytes per token, as a pure slope.
+
+        Costed with its windows, the drafter's pool is a window-sized fixed
+        cost with no per-token slope (``get_cache_size_per_token`` charges a
+        sliding-window layer per request, not per token), which is not what
+        ``_standalone_draft_pool_cost`` multiplies by. The same layers costed
+        without windows give the bytes one token of drafter K/V occupies, on
+        the same manager class and dtype path the pool is allocated with.
+        """
+        return self._per_manager_cache_cost(
+            manager_cls,
+            model_config,
+            draft_kv_cache_config.model_copy(
+                update={"max_attention_window": None}),
+            mapping=mapping,
+            tokens_per_block=tokens_per_block,
+            is_draft=True)
+
+    def _standalone_draft_pool_cost(self, per_token_cost: CacheCost,
+                                    kv_cache_config: KvCacheConfig,
+                                    tokens_per_block: int) -> CacheCost:
+        """Funding for the standalone drafter's pool.
+
+        ``per_token_cost`` is the drafter's KV cost per token
+        (``_standalone_draft_per_token_cost``): a slope and no fixed part.
+
+        The pool carries the drafter's attention windows, so a mirror's live
+        pages are bounded by what its window keeps plus what it is computing:
+        the manager releases pages below ``history + 1 - window`` on every
+        resize (``AttnLifeCycle::getStaleRange``), and the mirror carries the
+        chunk start as its history on each context resize and the generated
+        length on each generation update. The chunk is at most
+        ``max_num_tokens``; the generation headroom is counted twice because
+        the first generation step grows the mirror by another step before
+        ``update_resources`` advances its history; one page covers the live
+        interval straddling page boundaries at both ends. The number of such
+        mirrors is the number of requests that can hold KV at once
+        (``max_admissible_sequences``): ``max_batch_size`` per pipeline
+        stage, doubled under the overlap scheduler or disaggregated serving,
+        where requests finishing in one iteration keep their pages until the
+        next iteration's batch has been prepared. The same bound holds with
+        or without block reuse.
+
+        Without a window a mirror keeps its whole context. Then the target's
+        per-token funding bounds the mirrors as long as the target holds every
+        token itself, and under block reuse the pool is funded for that many
+        full-length mirrors instead.
+        """
+        from .kv_cache.kv_cache_manager_v2 import (_get_generation_kv_capacity,
+                                                   max_admissible_sequences)
+        if per_token_cost.slope <= 0 or per_token_cost.intercept != 0:
+            # A windowed cost (slope 0, fixed part) would fund the pool with
+            # zero bytes and the executor would fail to create the KV cache.
+            raise ValueError(
+                "Standalone draft pool funding needs the drafter's bytes per "
+                f"token as a pure slope, got {per_token_cost}.")
+        _, headroom = _get_generation_kv_capacity(self._speculative_config,
+                                                  is_draft=True)
+        num_mirrors = max_admissible_sequences(
+            self._max_batch_size,
+            self._mapping,
+            is_disagg=self._is_disagg,
+            disable_overlap_scheduler=self._disable_overlap_scheduler)
+        window = self._standalone_draft_mirror_window(kv_cache_config)
+        if window is None:
+            if not kv_cache_config.enable_block_reuse:
+                return per_token_cost
+            tokens_per_mirror = self._max_seq_len + headroom
+            reason = ("block reuse lets the target share prompt tokens the "
+                      "drafter stores per request")
+        else:
+            tokens_per_mirror = (window + self._max_num_tokens + 2 * headroom +
+                                 tokens_per_block)
+            reason = (f"the drafter's {window}-token window bounds what a "
+                      "mirror keeps beyond the chunk it is computing")
+        cost = self.standalone_draft_pool_worst_case_cost(
+            per_token_cost.slope, tokens_per_block, tokens_per_mirror,
+            num_mirrors, kv_cache_config.max_util_for_resume)
+        logger.info_once(
+            "Separate draft KV cache of the standalone drafter is funded for "
+            f"{num_mirrors} mirrors of {tokens_per_mirror} tokens "
+            f"({cost.intercept / GB:.2f} GiB): {reason}.",
+            key="draft_pool_funding")
+        return cost
+
+    @staticmethod
+    def standalone_draft_pool_worst_case_cost(
+            bytes_per_token: int, tokens_per_block: int,
+            tokens_per_request: int, num_mirrors: int,
+            max_util_for_resume: float) -> CacheCost:
+        """``num_mirrors`` mirrors of ``tokens_per_request`` tokens, page
+        rounded per request and scaled to the resume watermark like the
+        manager's fixed costs (``KVCacheManagerV2.get_cache_size_per_token``)."""
+        pages = num_mirrors * math.ceil(tokens_per_request / tokens_per_block)
+        resume_util = float(np.float32(max_util_for_resume))
+        return CacheCost(slope=0,
+                         intercept=math.ceil(pages / resume_util) *
+                         tokens_per_block * bytes_per_token)
+
     def _get_one_model_draft_kv_cache_config(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2146,9 +2353,11 @@ class KvCacheCreator:
         # Estimation uses a small max_tokens-sized temporary draft cache before
         # the measured GPU budget is available to split. Applying VSWA there
         # would size every window pool from the unsplit free-memory budget.
-        max_attention_window = (None if estimating_kv_cache else
-                                self._get_draft_max_attention_window(
-                                    max_seq_len, kv_cache_config))
+        if estimating_kv_cache:
+            max_attention_window = None
+        else:
+            max_attention_window = self._get_draft_max_attention_window(
+                max_seq_len, kv_cache_config)
         return kv_cache_config.model_copy(
             update={"max_attention_window": max_attention_window})
 
@@ -2231,7 +2440,7 @@ class KvCacheCreator:
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=draft_mapping,
             kv_cache_config=draft_kv_config,
-            tokens_per_block=self._tokens_per_block,
+            tokens_per_block=self._draft_tokens_per_block(),
             max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,

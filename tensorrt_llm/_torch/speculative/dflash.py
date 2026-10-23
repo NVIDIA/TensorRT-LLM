@@ -519,6 +519,21 @@ def dflash_allocated_ctx_limit(
     return (block_counts * page_size - block_size).clamp(min=0)
 
 
+def dflash_rebased_ctx_rows(rows: torch.Tensor, base_pages: torch.Tensor) -> torch.Tensor:
+    """Block-table rows shifted left by ``base_pages`` entries each.
+
+    Entry ``j`` of the result names the page entry ``j + base`` of the input
+    row named, so a reader that numbers positions from ``base * page_size``
+    reaches the same physical pages as one numbering from 0 and never
+    addresses an entry below ``base``. Entries shifted in from past the row's
+    end repeat the last entry; a reader never dereferences them because its
+    sequence length is shortened by the same ``base * page_size``.
+    """
+    width = rows.size(1)
+    index = torch.arange(width, device=rows.device).unsqueeze(0) + base_pages.view(-1, 1)
+    return rows.gather(1, index.clamp_(max=width - 1))
+
+
 @dataclass
 class DFlashSpecMetadata(SpecMetadata):
     """Metadata for DFlash speculative decoding.
@@ -746,6 +761,14 @@ class DFlashWorker(SpecWorkerBase):
         # manager it is replaced by _ctx_block_tables, refreshed per iteration.
         self._ctx_page_table = None
         self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
+        # The block table the block decode reads: each row of _ctx_block_tables
+        # shifted left by that slot's _ctx_base_pages, so a prefix the target
+        # reused (no drafter K/V stored for it) is not addressable.
+        self._ctx_block_tables_read = None
+        self._ctx_base_pages = None  # [max_batch+1] pages below the first stored position
+        self._ctx_base_host = None
+        self._saved_ctx_base = None
+        self._saved_ctx_base_host = None
         self._ctx_block_indptr = None
         # Pages the manager handed this request, per batch row. Saturates at
         # the table width on the default backend -- dflash_allocated_ctx_limit.
@@ -990,6 +1013,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables = torch.zeros(
             (num_slots, max_blocks), dtype=torch.int32, device="cuda"
         )
+        self._ctx_block_tables_read = torch.zeros_like(self._ctx_block_tables)
         self._ctx_block_indptr = torch.arange(
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
@@ -1059,6 +1083,7 @@ class DFlashWorker(SpecWorkerBase):
         # pass falling back to the arena still rebinds once the real pool lands.
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
+        self._ctx_block_tables_read = None
         self._ctx_block_counts = None
         max_batch = spec_metadata.max_num_requests
 
@@ -1114,6 +1139,8 @@ class DFlashWorker(SpecWorkerBase):
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
+        self._ctx_base_pages = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._ctx_base_host = [0] * num_slots
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
@@ -1285,6 +1312,37 @@ class DFlashWorker(SpecWorkerBase):
             indptr = self._ctx_kv_indptr
         return table.flatten().contiguous(), indptr
 
+    def _ctx_store_start(self, cur: int, first_pos: int) -> int:
+        """Position at which a context chunk's drafter K/V is stored.
+
+        ``cur`` is the slot's stored length, ``first_pos`` the chunk's first
+        target position. They differ only when block reuse let the target skip
+        [0, first_pos), so just the tail reaches the capture buffer.
+
+        On the managed pool the block table is indexed by target position, so
+        the tail is stored at ``first_pos``. The private arena numbers every
+        request from 0, where the tail is all the context there is.
+        """
+        if cur == 0 and first_pos > 0 and self._ctx_block_tables is not None:
+            return first_pos
+        return cur
+
+    def _ctx_base_for_store(self, cur: int, start: int) -> Optional[int]:
+        """Pages the block decode must not read for a slot whose first stored
+        position is ``start``, or None when the slot numbers from ``cur``.
+
+        A pool paired with the target's reuse holds the prefix's drafter K/V
+        below ``start``, so it stays readable. An unpaired pool holds no drafter
+        K/V there: the block decode is handed the slot's block-table row shifted
+        past those pages (``dflash_rebased_ctx_rows``) and a context length
+        shortened by the same amount, so a tail shorter than the drafter's
+        window attends only to itself. ``start`` is rounded up to a page
+        boundary; the tail tokens inside that page stay stored but unread.
+        """
+        if start == cur or self._ctx_reuse_addressable:
+            return None
+        return -(-start // self._ctx_page_size)
+
     def _assign_slot(self, req_id: int, reset: bool = False, updates: Optional[dict] = None):
         """Get (or refresh) this request's context slot; None when none is free.
 
@@ -1417,29 +1475,50 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_len.clamp_(max=self._max_ctx)
         self._ctx_len[self._dummy_slot].zero_()
 
-    def _write_ctx_len(self, updates: dict[int, int]) -> None:
-        """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
-        if not updates:
+    def _write_ctx_len(
+        self, updates: dict[int, int], base_updates: Optional[dict[int, int]] = None
+    ) -> None:
+        """Apply slot-to-length (and slot-to-base-page) mappings in one async
+        scatter each. A slot reset to length 0 also drops its base pages, and
+        that reset wins over a base recorded for the same slot in
+        ``base_updates`` (a chunk's base is recorded before the overflow check
+        that may reset the slot)."""
+        if not updates and not base_updates:
             return
+        bases = dict(base_updates or {})
+        bases.update({slot: 0 for slot, value in updates.items() if value == 0})
         for slot, value in updates.items():  # Update host side mirror
             self._ctx_len_host[slot] = value
+        for slot, value in bases.items():
+            self._ctx_base_host[slot] = value
 
-        slots, values = zip(*updates.items())
         pinned = prefer_pinned()
-        slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
-        vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
-        self._ctx_len.index_copy_(
-            0,
-            slots_pinned.to("cuda", non_blocking=True),
-            vals_pinned.to("cuda", non_blocking=True),
-        )
+        for target, mapping in ((self._ctx_len, updates), (self._ctx_base_pages, bases)):
+            if not mapping:
+                continue
+            slots, values = zip(*mapping.items())
+            slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
+            vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
+            target.index_copy_(
+                0,
+                slots_pinned.to(target.device, non_blocking=True),
+                vals_pinned.to(target.device, non_blocking=True),
+            )
 
     def _restore_ctx_len_host(self) -> None:
         """Roll the host shadows back to their pre-forward snapshot."""
         if self._saved_ctx_len_host is not None:
             self._ctx_len_host = list(self._saved_ctx_len_host)
+        if self._saved_ctx_base_host is not None:
+            self._ctx_base_host = list(self._saved_ctx_base_host)
         if self._saved_req_ctx_pos is not None:
             self._req_ctx_pos = dict(self._saved_req_ctx_pos)
+
+    def _restore_ctx_len_device(self) -> None:
+        """Roll _ctx_len and _ctx_base_pages back to their pre-forward snapshot."""
+        self._ctx_len.copy_(self._saved_ctx_len)
+        if self._saved_ctx_base is not None:
+            self._ctx_base_pages.copy_(self._saved_ctx_base)
 
     def _store_prefill_context(
         self,
@@ -1480,6 +1559,7 @@ class DFlashWorker(SpecWorkerBase):
         # the same values, but reading it costs a D2H sync per request.
         host_pos = spec_metadata.host_position_ids
         ctx_len_updates = {}
+        ctx_base_updates = {}
         offset = 0
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
@@ -1518,11 +1598,11 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._req_to_slot[req_id]
             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
-            if cur == 0 and first_pos > 0 and self._ctx_reuse_addressable:
-                # Reuse let the target skip [0, first_pos), so only the tail
-                # reaches the capture buffer. The prefix K/V are still in the
-                # paired pool: precompute_context_kv is per-token in (hidden, p).
-                cur = first_pos
+            start = self._ctx_store_start(cur, first_pos)
+            base = self._ctx_base_for_store(cur, start)
+            if base is not None:
+                ctx_base_updates[slot] = base
+            cur = start
             if cur + slen > cap:
                 # Request-level, like the no-free-slots path above: truncating
                 # would silently draft from a stale prefix, but killing the
@@ -1581,7 +1661,7 @@ class DFlashWorker(SpecWorkerBase):
                         self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
-        self._write_ctx_len(ctx_len_updates)
+        self._write_ctx_len(ctx_len_updates, ctx_base_updates)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         # Restore first (in warmup mode kv_lens_cuda was saved and comes back
@@ -1601,7 +1681,7 @@ class DFlashWorker(SpecWorkerBase):
         ):
             # A failed forward must not keep this iteration's in-place
             # _ctx_len updates: roll back to the pre-forward snapshot.
-            self._ctx_len.copy_(self._saved_ctx_len)
+            self._restore_ctx_len_device()
             self._restore_ctx_len_host()
             self._ctx_len_restore_pending = False
 
@@ -1657,6 +1737,8 @@ class DFlashWorker(SpecWorkerBase):
             # mutate _ctx_len until replay.
             self._saved_ctx_len = self._ctx_len.clone()
             self._saved_ctx_len_host = list(self._ctx_len_host)
+            self._saved_ctx_base = self._ctx_base_pages.clone()
+            self._saved_ctx_base_host = list(self._ctx_base_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
 
@@ -1854,7 +1936,7 @@ class DFlashWorker(SpecWorkerBase):
 
         # Restore context lengths after warmup; real runs keep the updates.
         if is_warmup:
-            self._ctx_len.copy_(self._saved_ctx_len)
+            self._restore_ctx_len_device()
             self._restore_ctx_len_host()
         self._ctx_len_restore_pending = False
 
@@ -2188,6 +2270,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._advance_ctx_len(slots, gen_num_accepted_long)
 
             num_ctx_per_req_t = self._ctx_len[slots]
+            ctx_page_table = self._ctx_page_table
             if self._ctx_block_tables is not None:
                 # The write above clamps columns to the request's allocation, so
                 # a context that outruns it has its tail written over the last
@@ -2197,6 +2280,17 @@ class DFlashWorker(SpecWorkerBase):
                     self._ctx_block_counts, self._ctx_page_size, block_size
                 )
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
+                # Pages below a slot's base hold no drafter K/V (a prefix the
+                # target reused): the read numbers from the base instead, see
+                # _ctx_base_for_store. Writes above keep the absolute table.
+                base_pages = self._ctx_base_pages[slots]
+                num_ctx_per_req_t = (num_ctx_per_req_t - base_pages * self._ctx_page_size).clamp_(
+                    min=0
+                )
+                self._ctx_block_tables_read[gen_rows_out] = dflash_rebased_ctx_rows(
+                    self._ctx_block_tables[gen_rows_out], base_pages
+                )
+                ctx_page_table = self._ctx_block_tables_read
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 
@@ -2213,6 +2307,11 @@ class DFlashWorker(SpecWorkerBase):
             slots = torch.empty(0, dtype=torch.long, device="cuda")
             gen_rows_out = slots
             bonus = torch.empty(0, dtype=torch.long, device="cuda")
+            ctx_page_table = (
+                self._ctx_block_tables_read
+                if self._ctx_block_tables is not None
+                else self._ctx_page_table
+            )
 
         return {
             "lilicorr_anchor": lilicorr_anchor,
@@ -2228,9 +2327,6 @@ class DFlashWorker(SpecWorkerBase):
             # token. The dspark Markov chain conditions its first step on it.
             "first_prev_tokens": bonus,
             "ctx_kv_cache": self._ctx_kv_buf,
-            "ctx_page_table": (
-                self._ctx_block_tables
-                if self._ctx_block_tables is not None
-                else self._ctx_page_table
-            ),
+            # The manager-bound table is the read view rebased per slot above.
+            "ctx_page_table": ctx_page_table,
         }

@@ -10,10 +10,12 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -30,12 +32,18 @@ from tensorrt_llm._torch.pyexecutor._util import (
     get_mla_context_workspace_kv_len_cap,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _get_generation_kv_capacity,
+    max_admissible_sequences,
+)
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
+    DFlashDecodingConfig,
+    DSparkDecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     MultimodalConfig,
@@ -1469,6 +1477,423 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     assert create_manager.call_args.kwargs["max_cuda_graph_batch_size"] == 4
     assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio
+
+
+def _dflash_draft_model(uses_worker_backend: bool, backend: str) -> SimpleNamespace:
+    """The two attributes KvCacheCreator._draft_tokens_per_block reads off the
+    built draft model: whether it runs the shared DFlash op sets, and the
+    resolved attention backend."""
+    return SimpleNamespace(
+        _uses_worker_attention_backend=uses_worker_backend,
+        dflash_attention_backend=backend,
+    )
+
+
+def _page_size_creator(tokens_per_block: int, draft_model) -> KvCacheCreator:
+    creator = object.__new__(KvCacheCreator)
+    creator._tokens_per_block = tokens_per_block
+    creator._model_engine = Mock(_max_cuda_graph_batch_size=4)
+    creator._model_engine.model = SimpleNamespace(draft_model=draft_model)
+    return creator
+
+
+class TestDraftPoolPageSize:
+    """A standalone DFlash/DSpark drafter on the TRTLLM backend reads its pool
+    with trtllm-gen, which accepts fewer page sizes than a target may pin
+    (MiniMax-M3 MSA: 128), so the separate draft pool is carved at the largest
+    size the drafter accepts and joint block reuse is declined when the two
+    pools differ."""
+
+    def test_premise_trtllm_gen_page_sizes(self):
+        from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+            FlashInferTrtllmGenFmha,
+        )
+
+        supported = FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK
+        assert 128 not in supported
+        assert max(size for size in supported if size < 128) == 64
+
+    @pytest.mark.parametrize(
+        "tokens_per_block, draft_model, expected",
+        [
+            (128, _dflash_draft_model(True, "TRTLLM"), 64),
+            (128, _dflash_draft_model(True, "VANILLA"), 128),
+            (128, _dflash_draft_model(True, "FA4"), 128),
+            # The MLA DSpark drafter brings its own kernels under the same name.
+            (128, _dflash_draft_model(False, "TRTLLM"), 128),
+            # No drafter at all (MTP / Eagle3 draft layers).
+            (128, None, 128),
+            (64, _dflash_draft_model(True, "TRTLLM"), 64),
+            (32, _dflash_draft_model(True, "TRTLLM"), 32),
+        ],
+    )
+    def test_draft_tokens_per_block(self, tokens_per_block, draft_model, expected):
+        creator = _page_size_creator(tokens_per_block, draft_model)
+        assert creator._draft_tokens_per_block() == expected
+
+    def test_separate_draft_manager_is_carved_at_the_draft_page_size(self):
+        creator = _page_size_creator(128, _dflash_draft_model(True, "TRTLLM"))
+        creator._kv_cache_config = KvCacheConfig(max_attention_window=None)
+        creator._max_seq_len = 9472
+        creator._max_batch_size = 8
+        creator._max_num_tokens = 9472
+        creator._max_beam_width = 1
+        creator._kv_connector_manager = None
+        creator._skip_est = False
+        creator._execution_stream = None
+        creator._is_disagg = False
+        creator._cache_transceiver_config = None
+        creator._mapping = Mock()
+        creator._mapping.has_cp_helix.return_value = False
+        creator._speculative_config = Mock()
+        creator._disable_overlap_scheduler = False
+
+        effective_draft_config = Mock()
+        effective_draft_config.pretrained_config.torch_dtype = "bfloat16"
+        effective_draft_config.sparse_attention_config = None
+
+        with (
+            patch.object(creator, "_get_num_draft_layers", return_value=5),
+            patch.object(creator, "_get_one_model_draft_layer_mask", return_value=[True] * 5),
+            patch.object(
+                creator,
+                "_get_effective_draft_config",
+                return_value=effective_draft_config,
+            ),
+            patch.object(creator, "_enable_kv_cache_stats", return_value=False),
+            patch.object(
+                creator,
+                "_validate_or_fallback_kv_cache_manager_v2",
+                return_value=KVCacheManagerV2,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util._derive_draft_max_attention_window",
+                return_value=None,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+                return_value=KVCacheManagerV2,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+                return_value=Mock(),
+            ) as create_manager,
+        ):
+            creator._create_one_model_draft_kv_cache_manager(
+                creator._max_seq_len, estimating_kv_cache=False
+            )
+
+        assert create_manager.call_args.kwargs["tokens_per_block"] == 64
+        assert create_manager.call_args.kwargs["is_draft"] is True
+        # The target's own page size is untouched.
+        assert creator._tokens_per_block == 128
+
+    @pytest.mark.parametrize("tokens_per_block, expected", [(128, False), (64, True)])
+    def test_joint_reuse_needs_one_page_size(self, tokens_per_block, expected):
+        creator = _page_size_creator(tokens_per_block, _dflash_draft_model(True, "TRTLLM"))
+        creator._is_kv_cache_manager_v2 = True
+        creator._kv_cache_manager_cls = KVCacheManagerV2
+        # Standalone DSpark: lookahead 0, so only the page sizes decide.
+        creator._speculative_config = DSparkDecodingConfig(max_draft_len=4)
+        assert creator._joint_reuse_supported() is expected
+
+
+class _StandaloneDrafterConfig:
+    """KV geometry of a five-layer GQA drafter with one KV head per TP rank
+    (4 KV heads over TP4, head_dim 128, bf16): 512 bytes per layer and token,
+    2560 per token."""
+
+    quant_config = None
+    pretrained_config = SimpleNamespace(
+        hidden_size=6144,
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        layer_types=["sliding_attention"] * 5,
+        sliding_window=4096,
+    )
+
+    def get_num_attention_layers(self) -> int:
+        return 5
+
+
+def _standalone_drafter_cost(max_attention_window) -> CacheCost:
+    mapping = Mock(enable_attention_dp=False, tp_size=4)
+    mapping.pp_layers.return_value = [0, 1, 2, 3, 4]
+    return CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            _StandaloneDrafterConfig(),
+            mapping,
+            tokens_per_block=64,
+            max_seq_len=1048576,
+            max_batch_size=8,
+            max_num_tokens=16384,
+            kv_cache_config=KvCacheConfig(
+                max_attention_window=max_attention_window, max_util_for_resume=0.95
+            ),
+            spec_config=DSparkDecodingConfig(max_draft_len=7),
+            is_draft=True,
+        )
+    )
+
+
+class TestStandaloneDraftPoolFunding:
+    """The standalone DFlash/DSpark drafter's pool keeps the drafter's attention
+    windows, so a mirror holds its window plus the chunk it is computing and the
+    pool is funded for max_batch_size such mirrors as a fixed cost, with or
+    without block reuse. A drafter without a window keeps whole contexts: the
+    target's per-token funding bounds the mirrors without block reuse, and with
+    it the pool is funded for max_batch_size full-length mirrors."""
+
+    @staticmethod
+    def _creator(
+        spec_config,
+        *,
+        max_seq_len,
+        max_batch_size,
+        max_num_tokens=16384,
+        disable_overlap_scheduler=False,
+        is_disagg=False,
+        mapping=None,
+    ):
+        creator = object.__new__(KvCacheCreator)
+        creator._speculative_config = spec_config
+        creator._max_seq_len = max_seq_len
+        creator._max_batch_size = max_batch_size
+        creator._max_num_tokens = max_num_tokens
+        creator._disable_overlap_scheduler = disable_overlap_scheduler
+        creator._is_disagg = is_disagg
+        creator._mapping = mapping if mapping is not None else Mapping()
+        return creator
+
+    @staticmethod
+    def _fixed_cost(bytes_per_token, tokens_per_mirror, num_mirrors, tokens_per_block=64):
+        pages = num_mirrors * math.ceil(tokens_per_mirror / tokens_per_block)
+        slots = math.ceil(pages / float(np.float32(0.95)))
+        return CacheCost(slope=0, intercept=slots * tokens_per_block * bytes_per_token)
+
+    @pytest.mark.parametrize(
+        "disable_overlap_scheduler, is_disagg, mapping, expected",
+        [
+            # Overlap scheduler: requests retiring from iteration n keep their
+            # pages while iteration n+1 admits new ones in their place.
+            (False, False, Mapping(), 16),
+            (True, False, Mapping(), 8),
+            (True, True, Mapping(), 16),
+            # Pipeline parallelism: one batch per stage, no retiring overlap.
+            (False, False, Mapping(world_size=2, pp_size=2), 16),
+        ],
+    )
+    def test_mirrors_follow_the_manager_admissible_sequences(
+        self, disable_overlap_scheduler, is_disagg, mapping, expected
+    ):
+        assert (
+            max_admissible_sequences(
+                8, mapping, is_disagg=is_disagg, disable_overlap_scheduler=disable_overlap_scheduler
+            )
+            == expected
+        )
+        spec = DSparkDecodingConfig(max_draft_len=7)
+        creator = self._creator(
+            spec,
+            max_seq_len=65536,
+            max_batch_size=8,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            is_disagg=is_disagg,
+            mapping=mapping,
+        )
+        _, headroom = _get_generation_kv_capacity(spec, is_draft=True)
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=[4096] * 5):
+            cost = creator._standalone_draft_pool_cost(
+                CacheCost(slope=2560), KvCacheConfig(max_util_for_resume=0.95), 64
+            )
+        assert cost == self._fixed_cost(2560, 4096 + 16384 + 2 * headroom + 64, expected)
+
+    def test_per_token_cost_comes_from_the_windowless_manager_cost(self):
+        # Through the real KVCacheManagerV2.get_cache_size_per_token: costed
+        # with its windows the drafter's pool is a fixed cost with slope 0
+        # (a funding that multiplies by it funds the pool with 0 bytes); the
+        # same layers costed without windows give the
+        # 2560 bytes one token of drafter K/V occupies at TP4.
+        mapping = Mock(enable_attention_dp=False, tp_size=4)
+        mapping.pp_layers.return_value = [0, 1, 2, 3, 4]
+        creator = self._creator(
+            DSparkDecodingConfig(max_draft_len=7), max_seq_len=1048576, max_batch_size=8
+        )
+        creator._kv_cache_config = KvCacheConfig(max_util_for_resume=0.95)
+        creator._tokens_per_block = 128
+        windowed = KvCacheConfig(max_attention_window=[4096] * 5, max_util_for_resume=0.95)
+        windowed_cost = creator._per_manager_cache_cost(
+            KVCacheManagerV2,
+            _StandaloneDrafterConfig(),
+            windowed,
+            mapping=mapping,
+            tokens_per_block=64,
+            is_draft=True,
+        )
+        assert windowed_cost.slope == 0 and windowed_cost.intercept > 0
+        per_token = creator._standalone_draft_per_token_cost(
+            KVCacheManagerV2, _StandaloneDrafterConfig(), windowed, mapping, 64
+        )
+        assert per_token == CacheCost(slope=2560, intercept=0)
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=[4096] * 5):
+            cost = creator._standalone_draft_pool_cost(
+                per_token, KvCacheConfig(enable_block_reuse=True, max_util_for_resume=0.95), 64
+            )
+        assert cost.slope == 0 and cost.intercept > 2560 * 64 * 16 * 4096 // 64
+
+    def test_pool_cost_rejects_a_cost_that_is_not_a_per_token_slope(self):
+        creator = self._creator(
+            DSparkDecodingConfig(max_draft_len=7), max_seq_len=1048576, max_batch_size=8
+        )
+        for bad in (
+            CacheCost(slope=0, intercept=826 * 64 * 2560),
+            CacheCost(slope=2560, intercept=1),
+        ):
+            with pytest.raises(ValueError, match="pure slope"):
+                creator._standalone_draft_pool_cost(bad, KvCacheConfig(), 64)
+
+    @pytest.mark.parametrize("enable_block_reuse", [True, False])
+    def test_windowed_mirrors_are_funded_for_window_plus_chunk(self, enable_block_reuse):
+        # TP2: 5 layers x 4 KV heads x 128 x bf16 K+V = 5120 B/token/rank,
+        # max_batch_size 30 at 1M max_seq_len and 16384-token chunks, overlap
+        # scheduler on (60 admissible mirrors). 30 full-length mirrors alone
+        # would cost ~160 GiB per rank, more than the whole KV budget; 60
+        # window-plus-chunk mirrors cost a few GiB.
+        spec = DSparkDecodingConfig(max_draft_len=3)
+        creator = self._creator(spec, max_seq_len=1048576, max_batch_size=30)
+        _, headroom = _get_generation_kv_capacity(spec, is_draft=True)
+        config = KvCacheConfig(enable_block_reuse=enable_block_reuse, max_util_for_resume=0.95)
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=[4096] * 5):
+            cost = creator._standalone_draft_pool_cost(CacheCost(slope=5120), config, 64)
+        tokens_per_mirror = 4096 + 16384 + 2 * headroom + 64
+        assert cost == self._fixed_cost(5120, tokens_per_mirror, 60)
+        assert 6 < cost.intercept / 2**30 < 8
+        # The window is the drafter's, read from its own derived layout, so
+        # the cost does not move with the context length.
+        creator._max_seq_len = 65536
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=[4096] * 5):
+            assert creator._standalone_draft_pool_cost(CacheCost(slope=5120), config, 64) == cost
+
+    def test_windowed_funding_covers_the_live_page_geometry(self):
+        # TP4, batch 8, 1M context, K=7, 16384-token chunks, overlap scheduler
+        # on: the windowed pool holds up to 841 live pages, against the 826 the
+        # manager's own SWA cost funds
+        # (test_premise_windowed_funding_is_a_fixed_cost).
+        spec = DSparkDecodingConfig(max_draft_len=7)
+        creator = self._creator(spec, max_seq_len=1048576, max_batch_size=8)
+        _, headroom = _get_generation_kv_capacity(spec, is_draft=True)
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=[4096] * 5):
+            cost = creator._standalone_draft_pool_cost(
+                CacheCost(slope=2560), KvCacheConfig(enable_block_reuse=True), 64
+            )
+        assert cost == self._fixed_cost(2560, 4096 + 16384 + 2 * headroom + 64, 16)
+        assert cost.intercept // (64 * 2560) > 841
+        assert cost.intercept / 2**30 < 1
+
+    def test_windowless_drafter_under_reuse_funds_max_batch_size_full_length_mirrors(self):
+        spec = DSparkDecodingConfig(max_draft_len=7)
+        creator = self._creator(spec, max_seq_len=1048576, max_batch_size=8)
+        _, headroom = _get_generation_kv_capacity(spec, is_draft=True)
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=None):
+            cost = creator._standalone_draft_pool_cost(
+                CacheCost(slope=2560),
+                KvCacheConfig(enable_block_reuse=True, max_util_for_resume=0.95),
+                64,
+            )
+        # 16 admissible mirrors (overlap scheduler) x 1M tokens at 2560 B:
+        # about 42 GiB, which is why a windowless drafter cannot serve long
+        # context under block reuse at any useful batch size.
+        assert cost == self._fixed_cost(2560, 1048576 + headroom, 16)
+        assert 41 < cost.intercept / 2**30 < 43
+
+    def test_windowless_drafter_without_reuse_keeps_the_per_token_funding(self):
+        creator = self._creator(
+            DSparkDecodingConfig(max_draft_len=7), max_seq_len=1048576, max_batch_size=8
+        )
+        per_token = CacheCost(slope=2560)
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=None):
+            cost = creator._standalone_draft_pool_cost(
+                per_token, KvCacheConfig(enable_block_reuse=False), 64
+            )
+        assert cost == per_token
+
+    @pytest.mark.parametrize(
+        "windows, max_seq_len, expected",
+        [
+            ([4096] * 5, 1048576, 4096),
+            ([4096], 1048576, 4096),
+            # A layer attending to the whole context makes the mirror full-length.
+            ([4096, 1048576], 1048576, None),
+            ([4096] * 5, 4096, None),
+            (None, 1048576, None),
+        ],
+    )
+    def test_standalone_draft_mirror_window(self, windows, max_seq_len, expected):
+        creator = self._creator(
+            DSparkDecodingConfig(max_draft_len=7), max_seq_len=max_seq_len, max_batch_size=8
+        )
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=windows):
+            window = creator._standalone_draft_mirror_window(KvCacheConfig(enable_block_reuse=True))
+        assert window == expected
+
+    def test_shared_prefix_mirrors_fit_the_reuse_funding_not_the_per_token_one(self):
+        # Two requests sharing a 32768-token prefix, 128 new tokens and 7
+        # drafts each: the target holds the prefix once, the unpaired mirrors
+        # hold it twice.
+        prefix, tail, draft = 32768, 128, 7
+        target_tokens = prefix + 2 * (tail + draft)
+        mirror_tokens = 2 * (prefix + tail + draft)
+        per_token = CacheCost(slope=2560)
+        assert (
+            per_token.tokens_for_budget(per_token.bytes_for_tokens(target_tokens)) < mirror_tokens
+        )
+        bound = KvCacheCreator.standalone_draft_pool_worst_case_cost(
+            2560, 64, prefix + tail + draft, 2, 1.0
+        )
+        assert bound.intercept // 2560 >= mirror_tokens
+
+    def test_premise_windowed_funding_is_a_fixed_cost(self):
+        # Five 4096-token windows: 66 pages per request x 8 requests plus one
+        # max_num_tokens of context, rounded to 64-token slots at the resume
+        # watermark. 826 slots = 0.13 GiB, independent of max_seq_len.
+        assert _standalone_drafter_cost([4096] * 5) == CacheCost(slope=0, intercept=826 * 2560 * 64)
+
+    def test_full_context_funding_is_per_token(self):
+        assert _standalone_drafter_cost(None) == CacheCost(slope=2560, intercept=0)
+
+    @pytest.mark.parametrize(
+        "spec_config",
+        [
+            DSparkDecodingConfig(max_draft_len=7),
+            DFlashDecodingConfig(max_draft_len=7),
+            MTPDecodingConfig(max_draft_len=1),
+        ],
+    )
+    def test_draft_pool_keeps_the_drafter_windows(self, spec_config):
+        # The standalone drafter's pool trims below the window like any other;
+        # only the estimation pass carves without windows.
+        creator = object.__new__(KvCacheCreator)
+        creator._speculative_config = spec_config
+        with patch.object(creator, "_get_draft_max_attention_window", return_value=[4096] * 5):
+            draft_kv_config = creator._get_one_model_draft_kv_cache_config(KvCacheConfig(), 1048576)
+            estimation_config = creator._get_one_model_draft_kv_cache_config(
+                KvCacheConfig(), 1048576, estimating_kv_cache=True
+            )
+        assert draft_kv_config.max_attention_window == [4096] * 5
+        assert estimation_config.max_attention_window is None
+
+    def test_full_context_share_of_the_budget(self):
+        # The price of the per-token funding: 2560 of every 8640 + 2560 bytes
+        # per token, 22.9 % of a 181 GiB GPU budget (41.4 GiB).
+        creator = object.__new__(KvCacheCreator)
+        total = 181 * 2**30
+        target_budget, draft_budget = creator._compute_draft_budget_shares(
+            total, CacheCost(slope=8640), CacheCost(slope=2560)
+        )
+        assert draft_budget == total * 2560 // 11200
+        assert target_budget + draft_budget == total
+        assert 41.3 < draft_budget / 2**30 < 41.5
 
 
 # ---------------------------------------------------------------------------
