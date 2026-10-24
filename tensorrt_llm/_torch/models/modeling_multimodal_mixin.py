@@ -28,6 +28,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Sequence,
     Tuple,
@@ -53,6 +54,7 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+from .multimodal import EncoderParallelMode
 
 
 class MultimodalEncoderContractError(ValueError):
@@ -420,8 +422,8 @@ class EncoderCachePartition:
 class MultimodalModelMixin:
     """Template-method mixin for PyTorch multimodal causal LM models.
 
-    Concrete model forwards can call `prepare_multimodal_inputs` while keeping their explicit
-    language-model delegation.
+    Implements ``SupportsMultimodal``. Concrete model forwards can call
+    `prepare_multimodal_inputs` while keeping their explicit language-model delegation.
 
     Current limitations:
 
@@ -433,6 +435,9 @@ class MultimodalModelMixin:
       layouts; models with other layouts override that method.
     """
 
+    supports_multimodal: ClassVar[Literal[True]] = True
+    """Opt in to the shared model contract without requiring mixin inheritance."""
+
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
 
@@ -442,8 +447,45 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_encoder_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    supports_encoder_attention_backend: ClassVar[bool] = False
+    """Whether the model honors per-encoder attention backend configuration."""
+
+    support_mm_disagg: ClassVar[bool] = False
+    """Set by ``supports_multimodal_disagg`` after validating the processor hook."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
+
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        """Return supported parallel modes for each enabled logical encoder.
+
+        An empty mapping leaves explicit encoder parallelism unsupported. Implementations
+        inspect the checkpoint config without constructing weights.
+        """
+        return {}
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for each enabled logical encoder.
+
+        An empty mapping declares no configurable encoder backends. Implementations
+        identify enabled logical encoders from the checkpoint config.
+        """
+        return {}
+
+    @property
+    def multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:
+        """Expose the existing model-owned encoder cache without transferring ownership."""
+        return self._multimodal_encoder_cache
+
+    def initialize_multimodal_encoder_cache(self, max_bytes: int) -> Optional[TensorLRUCache]:
+        """Initialize the encoder output cache through the existing implementation hook."""
+        return self._initialize_multimodal_encoder_cache(max_bytes)
 
     @classmethod
     def _cast_multimodal_encoder_dtype(

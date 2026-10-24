@@ -761,7 +761,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             multimodal_input=residual_input,
         )
 
-    def encode_multimodal_inputs(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
+    def encode_multimodal_inputs(
+        self, multimodal_params: Sequence[MultimodalParams]
+    ) -> torch.Tensor:
         """Encode uncached Gemma4 image, video, and audio payloads."""
         modality_inputs = (
             ("image", "pixel_values"),

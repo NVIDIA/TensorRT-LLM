@@ -853,6 +853,7 @@ show_error_codes = true
 # scripts/run_mypy.sh directly) and the local pre-commit hook run mypy without
 # explicit paths (the hook sets `pass_filenames: false`), so both read this list.
 files = [
+    "tensorrt_llm/_torch/models/multimodal.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/sampler_common.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/sampling_resolution.py",

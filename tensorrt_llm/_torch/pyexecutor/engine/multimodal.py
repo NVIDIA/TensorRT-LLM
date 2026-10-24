@@ -16,11 +16,9 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalEncoderContractError,
-    MultimodalModelMixin,
-)
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalEncoderContractError
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+from tensorrt_llm._torch.models.multimodal import SupportsMultimodal, is_multimodal_model
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
@@ -84,17 +82,15 @@ def validate_mm_encoder_scheduling_compatibility(
 def is_multimodal(model: nn.Module, input_processor: InputProcessor) -> bool:
     """True iff this engine drives a multimodal model.
 
-    Primary signal: ``MultimodalModelMixin`` is the canonical marker --
-    multimodal LM classes inherit from it. Until every model has migrated
-    (Mistral done; Qwen-VL, Nemotron, Gemma, Phi-4-MM, etc. pending), fall back
-    to whether the input processor subclasses ``BaseMultimodalInputProcessor``,
-    which every multimodal model necessarily provides at the data boundary.
+    Models opt in to ``SupportsMultimodal`` independently of their implementation
+    hierarchy. Until every model implements that contract, retain the input-processor
+    fallback for models that have not migrated.
 
-    TODO(TRTLLM-13542): Once all multimodal models inherit
-    ``MultimodalModelMixin``, drop the input-processor fallback so the model
+    TODO(TRTLLM-13542): Once all multimodal models implement
+    ``SupportsMultimodal``, drop the input-processor fallback so the model
     class itself is the single source of truth.
     """
-    if isinstance(model, MultimodalModelMixin):
+    if is_multimodal_model(model):
         return True
     return isinstance(input_processor, BaseMultimodalInputProcessor)
 
@@ -102,7 +98,7 @@ def is_multimodal(model: nn.Module, input_processor: InputProcessor) -> bool:
 def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool:
     """Whether the item-scheduling wiring is engaged this run.
 
-    Item scheduling is declared once, as a model capability (the ``MultimodalModelMixin``
+    Item scheduling is declared once, as a model capability (the ``SupportsMultimodal``
     ClassVar). This is the actionable flag derived from it: the engine stores it because
     the executor and the scheduler wrap both read it back off the engine, and the setup
     below, the scheduler wrap and the executor encoder step must all agree. Both
@@ -122,7 +118,7 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
     )
     enabled = (
         not llm_args.disable_mm_encoder
-        and isinstance(model, MultimodalModelMixin)
+        and is_multimodal_model(model)
         and model.supports_mm_encoder_item_scheduling
         and policy != MultimodalEncoderSchedulingPolicy.DISABLED
     )
@@ -154,7 +150,7 @@ def use_mrope(model: nn.Module) -> bool:
 
 def mm_encoder_cache_enabled(model: nn.Module) -> bool:
     """Whether the multimodal encoder cache is active for this model."""
-    return isinstance(model, MultimodalModelMixin) and model.encoder_cache_active
+    return is_multimodal_model(model) and model.encoder_cache_active
 
 
 def setup_mm_encoder_attn_metadata(
@@ -194,13 +190,13 @@ def setup_mm_encoder_attn_metadata(
         module.set_attn_max_seq_len(max_seq_len)
 
 
-def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
+def resolve_bytes_per_mm_encoder_embedding(model: SupportsMultimodal) -> int:
     """Bytes occupied by one multimodal encoder output embedding.
 
-    Prefers the mixin's explicit ``embedding_dim``/``embedding_dtype`` contract, then the
+    Prefers the model's explicit ``embedding_dim``/``embedding_dtype`` contract, then the
     text embedding layer's weight, then the pretrained config's hidden size with the
-    loaded weights' dtype -- both mixin properties are optional and most VLMs implement
-    neither.
+    loaded weights' dtype. The common mixin permits those properties to raise
+    ``NotImplementedError`` when the fallback supplies them.
     """
     embedding_dim = None
     try:
@@ -236,7 +232,7 @@ def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
 def resolve_mm_encoder_output_budget(
     input_processor: BaseMultimodalDummyInputsBuilder,
     encoder_max_num_tokens: int,
-    model: MultimodalModelMixin,
+    model: SupportsMultimodal,
 ) -> tuple[int, int]:
     """Resolve ``(output_budget_bytes, bytes_per_embedding)`` for resident MM encoder outputs.
 
@@ -287,7 +283,7 @@ class MultimodalItemScheduler:
     def __init__(
         self,
         *,
-        model: MultimodalModelMixin,
+        model: SupportsMultimodal,
         input_processor: BaseMultimodalDummyInputsBuilder | None = None,
         attention_metadata_capacity: dict[str, int] | None = None,
         encoder_max_num_tokens: int | None = None,
@@ -324,7 +320,7 @@ class MultimodalItemScheduler:
         validate_mm_encoder_scheduling_compatibility(llm_args, enabled)
         if not enabled:
             return None
-        assert isinstance(model, MultimodalModelMixin)  # narrowed by the predicate
+        assert is_multimodal_model(model)  # narrowed by the predicate
         return cls.create(
             model=model,
             input_processor=input_processor,
@@ -336,7 +332,7 @@ class MultimodalItemScheduler:
     def create(
         cls,
         *,
-        model: MultimodalModelMixin,
+        model: SupportsMultimodal,
         input_processor: BaseMultimodalDummyInputsBuilder,
         encoder_max_num_tokens: int | None,
         configured_encoder_max_num_tokens: int | None,
@@ -427,7 +423,7 @@ class MultimodalItemScheduler:
     @property
     def encoder_cache(self) -> TensorLRUCache[Any] | None:
         """The one model-owned encoder-output cache used by item scheduling."""
-        return self.model._multimodal_encoder_cache
+        return self.model.multimodal_encoder_cache
 
     def item_cache_keys(self, request: LlmRequest) -> list[Hashable] | None:
         """Return stable per-item cache keys, or ``None`` for request-local keys."""
@@ -466,9 +462,6 @@ class MultimodalItemScheduler:
         """Encode selected producer items into their reserved cache entries."""
         if not scheduled_items:
             return
-        if not isinstance(self.model, MultimodalModelMixin):
-            raise TypeError("Item-level MM scheduling requires MultimodalModelMixin")
-
         encoder_cache = self.encoder_cache
         if encoder_cache is None:
             raise RuntimeError("MM item scheduling requires a model-owned encoder cache")
