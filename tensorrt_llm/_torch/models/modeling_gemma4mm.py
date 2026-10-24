@@ -23,7 +23,7 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from itertools import accumulate, groupby
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
@@ -42,7 +42,6 @@ from ...inputs import (
     BaseMultimodalInputProcessor,
     ContentFormat,
     ExtraProcessedInputs,
-    MultimodalEncoderItemMetadata,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     TextPrompt,
@@ -215,18 +214,22 @@ def _gemma4_input_partitions(
     multimodal_data: dict[str, Any],
     metadata: MultimodalItemMetadata,
 ) -> dict[str, dict[str, MultimodalItemPartition]]:
-    """Declare item-major fields; video frame grouping stays model-owned."""
+    """Declare item-major inputs and the packed frame spans of whole videos."""
     partitions = {}
     for modality, fields in (
         ("image", ("pixel_values", "image_position_ids", "image_seq_lens")),
+        ("video", ("pixel_values", "image_position_ids", "image_seq_lens")),
         ("audio", ("audio_features", "audio_features_mask")),
     ):
         data = multimodal_data.get(modality)
         if not isinstance(data, dict):
             continue
         item_count = sum(m == modality for m, _ in metadata.item_refs)
+        frame_counts = data.get("num_frames") if modality == "video" else None
+        item_lengths = tuple(frame_counts) if frame_counts is not None else None
+        field_count = sum(item_lengths) if item_lengths is not None else item_count
         value = data.get(fields[0])
-        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == item_count:
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == field_count:
             modality_partitions = {}
             for name in fields:
                 value = data.get(name)
@@ -238,11 +241,13 @@ def _gemma4_input_partitions(
                     size = len(value)
                 else:
                     size = None
-                if size != item_count:
+                if size != field_count:
                     raise ValueError(
-                        f"{modality}.{name} must have {item_count} items on its leading axis"
+                        f"{modality}.{name} must have {field_count} entries on its leading axis"
                     )
-                modality_partitions[name] = MultimodalItemPartition()
+                modality_partitions[name] = MultimodalItemPartition(item_lengths=item_lengths)
+            if frame_counts is not None:
+                modality_partitions["num_frames"] = MultimodalItemPartition()
             partitions[modality] = modality_partitions
     return partitions
 
@@ -254,17 +259,6 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     transformers; otherwise falls back to manual tokenization + image
     processing using the image processor saved in the model directory.
     """
-
-    def get_mm_item_metadata(
-        self,
-        prompt_token_ids: List[int],
-        multimodal_data: Dict[str, Any],
-        mm_item_order: Optional[List[Dict[str, Any]]] = None,
-    ) -> Optional[MultimodalItemMetadata]:
-        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
-        if metadata is not None:
-            metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
-        return metadata
 
     # Default class-level fallback. Real value computed per-instance below
     # from text_config.use_bidirectional_attention. Only 26B/31B set
@@ -443,25 +437,26 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         audio_seq_length = getattr(self._processor, "audio_seq_length", None)
         return None if audio_seq_length is None else int(audio_seq_length)
 
-    def get_mm_encoder_item_metadata(
+    def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalEncoderItemMetadata]:
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
         """Return one encoder item per image, video, or audio clip.
 
         An item costs its padded encoder input, because the vision tower's per-image tensors grow
         with the padded patch count rather than the valid one. It yields one embedding row per
         pooled soft token, or per subsampled audio frame, that covers valid input.
         """
-        del prompt_token_ids
+        prepared = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
         modalities = [
             modality
             for modality in ("image", "video", "audio")
             if isinstance(multimodal_data.get(modality), dict)
         ]
         if not modalities:
-            return None
+            return prepared
         if len(modalities) > 1:
             raise ValueError(
                 "Gemma4 requests containing multiple multimodal input types are not supported."
@@ -475,11 +470,20 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             encoder_token_lengths, output_embedding_lengths = self._vision_item_lengths(
                 multimodal_data[modality]
             )
-        return MultimodalEncoderItemMetadata(
-            item_refs=[(modality, item_idx) for item_idx in range(len(encoder_token_lengths))],
-            encoder_token_lengths=encoder_token_lengths,
-            output_embedding_lengths=output_embedding_lengths,
+        if mm_item_order:
+            item_refs = [(entry["modality"], entry["index"]) for entry in mm_item_order]
+        elif prepared is not None:
+            item_refs = prepared.item_refs
+        else:
+            item_refs = [(modality, item_idx) for item_idx in range(len(encoder_token_lengths))]
+        metadata = MultimodalItemMetadata(
+            item_refs=item_refs,
+            encoder_token_lengths=[encoder_token_lengths[i] for _, i in item_refs],
+            output_embedding_lengths=[output_embedding_lengths[i] for _, i in item_refs],
+            input_partitions=prepared.input_partitions if prepared is not None else None,
         )
+        metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
+        return metadata
 
     def _vision_item_lengths(self, modality_data: Dict[str, Any]) -> Tuple[List[int], List[int]]:
         """Return the patch cost and soft-token count of every image or video.
@@ -1017,41 +1021,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         if metadata is None:
             return None
         return _gemma4_input_partitions(param.multimodal_data, metadata).get(modality)
-
-    @staticmethod
-    def _build_video_encoder_input(
-        param: MultimodalParams, item_indices: Sequence[int]
-    ) -> MultimodalParams:
-        """Slice whole videos: each one is the run of frames that its `num_frames` entry declares."""
-        video_data = param.multimodal_data["video"]
-        if not isinstance(video_data, dict):
-            raise TypeError(
-                f"multimodal_data['video'] must be a dict, got {type(video_data).__name__}"
-            )
-        frames_per_item = video_data["num_frames"]
-        frame_starts = list(accumulate(frames_per_item, initial=0))
-        frame_indices = [
-            frame_idx
-            for item_idx in item_indices
-            for frame_idx in range(frame_starts[item_idx], frame_starts[item_idx + 1])
-        ]
-        sliced = {
-            "pixel_values": video_data["pixel_values"][frame_indices],
-            "num_frames": [frames_per_item[item_idx] for item_idx in item_indices],
-        }
-        position_ids = video_data.get("image_position_ids")
-        if position_ids is not None:
-            sliced["image_position_ids"] = position_ids[frame_indices]
-        seq_lens = video_data.get("image_seq_lens")
-        if seq_lens is not None:
-            sliced["image_seq_lens"] = [seq_lens[frame_idx] for frame_idx in frame_indices]
-        residual_input = (
-            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
-        )
-        return MultimodalParams(
-            multimodal_data={**param.multimodal_data, "video": {**video_data, **sliced}},
-            multimodal_input=residual_input,
-        )
 
     def encode_multimodal_inputs(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         """Encode uncached Gemma4 image, video, and audio payloads."""

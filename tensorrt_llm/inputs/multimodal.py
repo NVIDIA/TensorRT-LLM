@@ -41,7 +41,7 @@ class MultimodalItemPartition(NamedTuple):
 
     ``item_axis`` identifies the item axis of a batched tensor, or is ``None``
     for a value shared by every item. Lists and tuples have item axis zero.
-    ``item_lengths`` partitions a packed tensor along that axis, for example
+    ``item_lengths`` partitions a packed input along that axis, for example
     patch counts for vision or frame counts for audio. Lengths are host-side
     metadata, independent of the payload tensor's device.
     """
@@ -107,8 +107,17 @@ class MultimodalItemPartition(NamedTuple):
             index[axis] = indices
             return value[tuple(index)]
 
-        if (isinstance(value, (list, tuple)) and axis == 0 and lengths is None):
-            return type(value)(value[i] for i in item_indices)
+        if isinstance(value, (list, tuple)) and axis == 0:
+            if lengths is None:
+                return type(value)(value[i] for i in item_indices)
+            offsets = list(accumulate(lengths, initial=0))
+            if offsets[-1] != len(value):
+                raise ValueError(
+                    "Packed field size does not match its item lengths")
+            item_range = range(len(lengths))
+            indices = [item_range[i] for i in item_indices]
+            return type(value)(element for i in indices
+                               for element in value[offsets[i]:offsets[i + 1]])
         raise TypeError(
             "Item fields must be tensors or lists/tuples on item axis zero")
 

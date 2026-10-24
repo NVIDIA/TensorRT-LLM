@@ -180,10 +180,10 @@ def test_processors_use_the_common_metadata_hook(model, custom):
         )
 
 
-def test_gemma_processor_describes_image_and_audio_without_encoder_costs():
-    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+def test_gemma_unified_processor_describes_image_and_audio_without_encoder_costs():
+    from tensorrt_llm._torch.models.modeling_gemma4_unified import Gemma4UnifiedInputProcessor
 
-    processor = object.__new__(Gemma4InputProcessor)
+    processor = object.__new__(Gemma4UnifiedInputProcessor)
     data = {
         "image": {
             "pixel_values": torch.zeros(1, 4, 6),
@@ -212,12 +212,12 @@ def test_gemma_processor_describes_image_and_audio_without_encoder_costs():
         ("audio", "audio_features_mask", torch.ones(2, 5)),
     ],
 )
-def test_gemma_processor_rejects_misaligned_sibling_items(
+def test_gemma_unified_processor_rejects_misaligned_sibling_items(
     modality: str, field: str, value: torch.Tensor | list[int]
 ) -> None:
-    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+    from tensorrt_llm._torch.models.modeling_gemma4_unified import Gemma4UnifiedInputProcessor
 
-    processor = object.__new__(Gemma4InputProcessor)
+    processor = object.__new__(Gemma4UnifiedInputProcessor)
     primary = "pixel_values" if modality == "image" else "audio_features"
     data = {
         modality: {primary: torch.zeros(1, 4, 6), field: value},
@@ -226,7 +226,7 @@ def test_gemma_processor_rejects_misaligned_sibling_items(
         ),
     }
 
-    with pytest.raises(ValueError, match=rf"{modality}\.{field} must have 1 items"):
+    with pytest.raises(ValueError, match=rf"{modality}\.{field} must have 1 "):
         processor.get_mm_item_metadata([], data)
 
 
