@@ -710,6 +710,9 @@ def _reapply_current_thread_affinity_to_all_threads() -> tuple[int, int]:
     return _set_affinity_all_threads(cpus)
 
 
+_configured_cpu_affinity: tuple[int, frozenset[int]] | None = None
+
+
 def configure_cpu_affinity(device_id: int) -> None:
     """Probe and configure the CPU affinity of the calling process based on NUMA topology.
 
@@ -724,19 +727,26 @@ def configure_cpu_affinity(device_id: int) -> None:
         Configuration is handled as follows:
             TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
                 -> Affinity is automatically configured if it is unconstrained,
+                   reapplied if this process configured it previously,
                    and deleted if it is constrained externally by the user.
             TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
                 -> Affinity is unconditionally auto-configured.
             TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
                 -> Affinity is unconditionally _not_ auto-configured.
     """
+    global _configured_cpu_affinity
     pid = os.getpid()
     process = psutil.Process(pid)
     cpu_affinity = process.cpu_affinity()
+    owns_affinity = _configured_cpu_affinity == (pid, frozenset(cpu_affinity))
+    if not owns_affinity:
+        # A fork or an external mask change invalidates our previous ownership.
+        _configured_cpu_affinity = None
 
     all_cpus = list(range(psutil.cpu_count()))
 
-    constrained_affinity = (cpu_affinity != all_cpus)
+    constrained_affinity = (set(cpu_affinity) != set(all_cpus)
+                            and not owns_affinity)
     numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
 
     # If affinity is constrained but the user hasn't explicitly
@@ -761,17 +771,23 @@ def configure_cpu_affinity(device_id: int) -> None:
     # optimal affinity based upon the NUMA topology
     if ((numa_aware_affinity is None and not constrained_affinity)
             or (numa_aware_affinity == "1")):
-        bound, attempted = _set_affinity_all_threads(
-            get_numa_aware_cpu_affinity(device_id))
+        numa_cpus = get_numa_aware_cpu_affinity(device_id)
+        bound, attempted = _set_affinity_all_threads(numa_cpus)
         if bound == 0:
             logger.warning(
                 f"Worker process {pid} could not set the NUMA-aware CPU "
                 f"affinity of any thread. It will run without NUMA pinning, "
                 f"which may impact performance.")
         else:
+            effective_affinity = process.cpu_affinity()
+            # Other threads may bind successfully even if the main thread did
+            # not. Record only a read-back mask consistent with our request.
+            if effective_affinity and set(effective_affinity).issubset(
+                    numa_cpus):
+                _configured_cpu_affinity = (pid, frozenset(effective_affinity))
             logger.info(
                 f"Worker process {pid} CPU affinity set to "
-                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling "
+                f"{effective_affinity} for optimal NUMA-aware scheduling "
                 f"({bound}/{attempted} threads).")
 
 
