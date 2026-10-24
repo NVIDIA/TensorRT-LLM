@@ -374,6 +374,42 @@ class TestCreateKvSliceBlockSpan:
         expected = np.concatenate([np.full(stale_end, -1, dtype=np.int64), block_ids[:-1]])
         np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], expected)
 
+    def test_dspark_gen_init_draft_reserve_block_is_trimmed(self):
+        # A DSpark gen-init request reserves room for its draft tokens past the
+        # prompt. Here only that reserve spills into a new block: the prompt
+        # plus num_extra_kv_tokens still ends inside the last prompt block. The
+        # spilled block must be dropped without shifting the in-window SWA
+        # blocks that are paired with the ctx side.
+        prompt_len = 1144
+        tokens_per_block = 128
+        num_extra_kv_tokens = 4
+        num_draft_tokens = num_extra_kv_tokens + 1  # max_draft_len, as the helper models it
+        sliding_window_size = 128 + 5
+        prompt_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
+        assert (prompt_len + num_extra_kv_tokens - 1) // tokens_per_block == prompt_blocks - 1
+        assert (
+            prompt_len + num_extra_kv_tokens + num_draft_tokens - 1
+        ) // tokens_per_block == prompt_blocks
+
+        stale_end = max(0, (prompt_len + 1 - sliding_window_size) // tokens_per_block)
+        valid_prompt_blocks = prompt_blocks - stale_end
+        # The in-window prompt blocks followed by the draft-reserve block.
+        block_ids = np.arange(200, 200 + valid_prompt_blocks + 1, dtype=np.int64)
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=num_extra_kv_tokens,
+            prompt_len=prompt_len,
+            tokens_per_block=tokens_per_block,
+            block_ids=block_ids,
+            sliding_window_size=sliding_window_size,
+            is_generation_only=True,
+        )
+        assert len(req.py_draft_tokens) == num_draft_tokens
+
+        kv_slice = transceiver._create_chunk(req)
+
+        expected = np.concatenate([np.full(stale_end, -1, dtype=np.int64), block_ids[:-1]])
+        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], expected)
+
 
 class TestKvSliceProperty:
     """Randomized differential test of _create_chunk.
