@@ -142,6 +142,17 @@ def test_config_validation(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("section", ["block_reuse_config", "mamba_state_config"])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
+def test_branch_snapshot_field_types(
+    schemas: dict[str, dict], filename: str, section: str, value: bool | str, valid: bool
+) -> None:
+    config = {"kv_cache_config": {section: {"enable_branch_snapshot": value}}}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
     """Check literal top-level config accesses, without tracing aliases or dynamic keys."""
     function = next(

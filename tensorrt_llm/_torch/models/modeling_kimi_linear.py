@@ -18,7 +18,7 @@ TRT-LLM PyTorch-backend flow (``LLM(model=<ckpt>) -> generate``):
 
 Caching
 -------
-KDA states use ``MambaHybridCacheManagerV2`` with the ``KvCacheConfig``
+KDA states use ``KimiK3HybridCacheManager`` with the ``KvCacheConfig``
 default ``use_kv_cache_manager_v2=True`` (selected in ``pyexecutor/_util.py``).
 Setting this field to ``"auto"`` falls back to V1 for
 ``KimiLinearForCausalLM``, which declares no V2 model preference.

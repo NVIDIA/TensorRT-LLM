@@ -94,7 +94,6 @@ full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8] SKIP (https://nvbugs/6770978)
 full:B300/kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke SKIP (https://nvbugs/6782589)
-full:CPU/unittest/executor/test_forward_error_survival.py SKIP (https://nvbugs/6981910)
 full:CPU/unittest/scripts/test_subprocess_timeouts.py::test_every_subprocess_run_call_in_test_code_must_set_timeout SKIP (https://nvbugs/6929769)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6633268)
 full:DGX_B200/unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP (https://nvbugs/6669275)

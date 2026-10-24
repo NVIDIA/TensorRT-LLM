@@ -1870,18 +1870,19 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         )
         _require(
             cm,
-            ("get_intermediate_conv_states", "get_intermediate_ssm_states"),
-            "binds its per-step state buffers",
+            ("mamba_layer_cache", "get_replay_state_update_metadata"),
+            "binds its per-step state buffers and replay metadata",
         )
-        # `get_intermediate_*` builds a fresh view per call, so bind them here.
-        int_conv = {i: cm.get_intermediate_conv_states(i) for i in self.gdn_layers}
+        # Bind the per-layer views once for subsequent forwards.
+        layer_caches = {i: cm.mamba_layer_cache(i) for i in self.gdn_layers}
+        int_conv = {i: cache.intermediate_conv_window for i, cache in layer_caches.items()}
         int_idx = getattr(cm, "intermediate_state_indices", None)
         g0 = self.gdn_layers[0]
         check_step_buffers(g, int_conv[g0], conv0, int_idx)
-        int_ssm0 = cm.get_intermediate_ssm_states(g0)
-        if not getattr(cm, "use_replay_state_update", False):
+        int_ssm0 = layer_caches[g0].intermediate_ssm
+        if cm.get_replay_state_update_metadata() is None:
             check_legacy_state(g, int_ssm0, ssm0)
-            int_ssm = {i: cm.get_intermediate_ssm_states(i) for i in self.gdn_layers}
+            int_ssm = {i: cache.intermediate_ssm for i, cache in layer_caches.items()}
             return dict(int_idx=int_idx, int_conv=int_conv, int_ssm=int_ssm)
         assert int_ssm0 is None, (
             "the cache manager runs the cached-replay verify path and also allocated a "
@@ -1893,7 +1894,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         """The cached-replay history buffers and bookkeeping of one manager."""
         meta = cm.get_replay_state_update_metadata()
         assert meta is not None, (
-            "use_replay_state_update is True but the manager returns no replay metadata "
+            "the cached-replay binding requires replay metadata "
             "(prev_num_accepted_tokens / cache_buf_idx / widths)"
         )
         history, width = meta.replay_history_size, meta.replay_step_width

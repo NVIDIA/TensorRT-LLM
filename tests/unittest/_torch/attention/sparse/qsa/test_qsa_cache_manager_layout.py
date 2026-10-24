@@ -15,10 +15,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.qsa import QSAMambaHybridCacheManagerV2
-from tensorrt_llm._torch.attention.backends.sparse.qsa.cache_manager import (
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     QSA_INDEX_POSITION,
     QSA_SIDE_PLANES,
+    Qwen4ExpHybridCacheManager,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
@@ -44,7 +44,7 @@ _POSITION_PAGE = 3 * 4 * _TPB
 
 def _manager(
     dtype: DataType, *, draft: bool, tp_size: int = 1, attention_dp: bool = False
-) -> QSAMambaHybridCacheManagerV2:
+) -> Qwen4ExpHybridCacheManager:
     """The trunk or the separate MTP draft manager, as the engine builds them (rank 0 of
     `tp_size`, with attention data parallelism when `attention_dp`)."""
     if draft:
@@ -53,7 +53,7 @@ def _manager(
     else:
         attention_mask = [layer in _QSA_LAYERS for layer in range(_TRUNK_LAYERS)]
         mamba_mask = [not attention for attention in attention_mask]
-    return QSAMambaHybridCacheManagerV2(
+    return Qwen4ExpHybridCacheManager(
         mamba_d_state=8,
         mamba_d_conv=4,
         mamba_num_heads=4,

@@ -260,11 +260,13 @@ l0_b200:
   # UUID KV-event tests hardcode Qwen3-VL-2B (no model_dir fixture id), so they
   # are excluded by the qwen3_30b_a3b_fp8 filter above; select them explicitly.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "test_kv_event_mm_keys and uuid"
+  # Run beam-search end-to-end tests in a separate sampler invocation.
+  - unittest/_torch/sampler/test_beam_search.py
   # test_speculative_d2h_parity_real_predictor (both no_stop_token and
   # stop_token_15) is a HW-agnostic sampler D2H-parity invariant (plain CUDA
   # stream/event, no SM gating), covered on A30 pre-merge; drop that whole
   # function's leaves on Blackwell, keep the rest of the sampler dir.
-  - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
+  - unittest/_torch/sampler --ignore=unittest/_torch/sampler/test_beam_search.py -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_lilicorr_loading.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
