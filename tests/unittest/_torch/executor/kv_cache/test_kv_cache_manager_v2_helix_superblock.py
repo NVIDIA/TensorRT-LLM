@@ -310,6 +310,64 @@ def test_v1_helix_capacity_config_rejected() -> None:
         KvCacheCreator.configure_kv_cache_capacity(c)
 
 
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_kv_pool_rebalance_rejected_under_helix(is_disagg: bool) -> None:
+    """A KV pool rebalance resizes pools per rank, outside the cross-rank
+    quota agreement, so the manager rejects it under helix at construction."""
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+
+    mapping = Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+    with pytest.raises(ValueError, match="does not support KV pool rebalance"):
+        KVCacheManagerV2(
+            KvCacheConfig(enable_block_reuse=False, enable_kv_pool_rebalance=True),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=mapping,
+            is_disagg=is_disagg,
+        )
+
+
+@pytest.mark.parametrize(
+    "config_kwargs, connector, match",
+    [
+        ({"host_cache_size": 1 << 30}, None, "cache tiers below GPU"),
+        ({"disk_cache_size": 1 << 30, "disk_cache_path": "/tmp"}, None, "cache tiers below GPU"),
+        ({}, SimpleNamespace(capacity_only=True), "KV cache connector"),
+    ],
+    ids=["host_tier", "disk_tier", "connector"],
+)
+def test_lower_tier_and_connector_rejected_under_agg_helix(
+    config_kwargs: dict, connector: object, match: str
+) -> None:
+    """Aggregated helix relieves pool pressure only by preemption, which makes
+    the same decisions on every CP rank; lower cache tiers and connectors are
+    rejected at construction."""
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+
+    mapping = Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+    with pytest.raises(ValueError, match=match):
+        KVCacheManagerV2(
+            KvCacheConfig(enable_block_reuse=False, **config_kwargs),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=mapping,
+            kv_connector_manager=connector,
+            is_disagg=False,
+        )
+
+
 def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     """Helix disables estimation; with a V2 manager it must also promote
     _skip_est so build_managers() calls configure_kv_cache_capacity().
@@ -341,43 +399,80 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     assert c._skip_est is False
 
 
-def test_scheduler_allocation_failure_raises_under_helix() -> None:
-    """Precedent-consistent no-evict stance: allocation failure under helix
-    raises instead of entering the (unvalidated-under-helix) eviction path."""
-    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
-        KVCacheV2Scheduler,
-        _RecomputePauseState,
-    )
+def _failing_gen_scheduler(enable_recompute_pause: bool, ladder_calls: list) -> SimpleNamespace:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
     sched = SimpleNamespace(
         has_cp_helix=True,
-        kv_cache_manager=SimpleNamespace(try_allocate_generation=lambda req: False),
+        enable_recompute_pause=enable_recompute_pause,
+        kv_cache_manager=SimpleNamespace(
+            try_allocate_generation=lambda req: False,
+            is_request_active=lambda request_id: True,
+        ),
         draft_kv_cache_manager=None,
         enable_joint_kv_cache_reuse=False,
     )
     sched._try_allocate_generation = types.MethodType(
         KVCacheV2Scheduler._try_allocate_generation, sched
     )
+    sched._try_evict_for_gen = lambda req, requests_list, req_it, req_it_end, *args: (
+        ladder_calls.append("evict") or (req_it_end, False)
+    )
+    sched._try_recompute_pause_for_gen = lambda req, requests_list, req_it, req_it_end, *args: (
+        ladder_calls.append("recompute_pause") or (req_it_end, False)
+    )
+    sched._has_pending_connector_load = lambda req: False
+    sched._suspend_request = lambda req: ladder_calls.append("self_suspend")
+    return sched
+
+
+def _schedule_failing_gen(sched: SimpleNamespace):
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+        KVCacheV2Scheduler,
+        _RecomputePauseState,
+    )
+
     req = SimpleNamespace(
         py_request_id=7,
         get_beam_width_by_iter=lambda for_next_iteration: 1,
         py_draft_tokens=None,
     )
-    budget = SimpleNamespace(can_fit_tokens=lambda n: True)
-    with pytest.raises(RuntimeError, match="eviction is disabled under helix"):
-        KVCacheV2Scheduler._try_schedule_generation(
-            sched,
-            req,
-            budget,
-            requests_list=[req],
-            req_it=0,
-            req_it_end=1,
-            recompute_pause_state=_RecomputePauseState(1),
-            evicted=[],
-            recompute_paused=[],
-            inflight_request_ids=set(),
-            scheduled_beam_width=0,
-        )
+    return KVCacheV2Scheduler._try_schedule_generation(
+        sched,
+        req,
+        SimpleNamespace(can_fit_tokens=lambda n: True),
+        requests_list=[req],
+        req_it=0,
+        req_it_end=1,
+        recompute_pause_state=_RecomputePauseState(1),
+        evicted=[],
+        recompute_paused=[],
+        inflight_request_ids=set(),
+        scheduled_beam_width=0,
+    )
+
+
+def test_scheduler_allocation_failure_raises_under_disagg_helix() -> None:
+    """A disaggregated helix generation server cannot replay a prefill, so a
+    generation allocation failure raises instead of entering eviction."""
+    ladder_calls = []
+    sched = _failing_gen_scheduler(enable_recompute_pause=False, ladder_calls=ladder_calls)
+    with pytest.raises(RuntimeError, match="cannot preempt"):
+        _schedule_failing_gen(sched)
+    assert ladder_calls == []
+
+
+def test_scheduler_allocation_failure_preempts_under_agg_helix() -> None:
+    """Aggregated helix can replay a prefill and has a single hot GPU pool,
+    where suspending frees nothing, so a generation allocation failure goes
+    straight to recompute-pause."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
+
+    ladder_calls = []
+    sched = _failing_gen_scheduler(enable_recompute_pause=True, ladder_calls=ladder_calls)
+    action, *_ = _schedule_failing_gen(sched)
+    assert action is ScheduleAction.STOP
+    assert ladder_calls == ["recompute_pause"]
 
 
 def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:
@@ -427,6 +522,88 @@ def test_resize_context_rejects_disagg_helix_request(prompt_len: int) -> None:
         KVCacheManagerV2.resize_context(
             _context_resize_mgr(is_disagg=True, resizes=[]), req, num_tokens=32
         )
+
+
+def _rank_batch(
+    victim_id: int = 3, prompt_len: int = 200, decode_group_index: int = 5
+) -> SimpleNamespace:
+    """One CP rank's scheduled batch: a context chunk, a decode step and a
+    recompute-paused victim."""
+    ctx = SimpleNamespace(
+        py_request_id=1,
+        context_current_position=64,
+        context_chunk_size=32,
+        prompt_len=prompt_len,
+        total_input_len_cp=200,
+    )
+    gen = SimpleNamespace(py_request_id=2, py_helix_decode_group_index=decode_group_index)
+    return SimpleNamespace(
+        context_requests=[ctx],
+        generation_requests=[gen],
+        paused_requests=[],
+        recompute_paused_requests=[SimpleNamespace(py_request_id=victim_id)],
+    )
+
+
+def _check_schedules(rank_batches: list) -> None:
+    """Run the executor's helix schedule check on every simulated CP rank, with
+    an allgather that hands each rank the summaries of all of them."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    summaries = []
+    collect = SimpleNamespace(
+        dist=SimpleNamespace(cp_allgather=lambda s: summaries.append(s) or [s])
+    )
+    for batch in rank_batches:
+        PyExecutor._check_helix_schedule_consistency(collect, batch)
+    gather = SimpleNamespace(dist=SimpleNamespace(cp_allgather=lambda s: list(summaries)))
+    for batch in rank_batches:
+        PyExecutor._check_helix_schedule_consistency(gather, batch)
+
+
+def test_helix_schedule_check_passes_identical_ranks() -> None:
+    _check_schedules([_rank_batch(), _rank_batch()])
+
+
+@pytest.mark.parametrize(
+    "rank1_batch",
+    [_rank_batch(victim_id=4), _rank_batch(decode_group_index=6)],
+    ids=["different_victim", "different_decode_step"],
+)
+def test_helix_schedule_check_raises_on_divergence(rank1_batch: SimpleNamespace) -> None:
+    """Ranks that preempt different requests or disagree on a decode step
+    would desynchronize the next CP collective."""
+    with pytest.raises(RuntimeError, match="disagree on the schedule"):
+        _check_schedules([_rank_batch(), rank1_batch])
+
+
+def test_helix_schedule_check_raises_on_sliced_prompt() -> None:
+    """A context request holding only a per-rank slice of its prompt would
+    under-size the global ledger, even when every rank agrees."""
+    with pytest.raises(RuntimeError, match=r"without the full prompt: \[1\]"):
+        _check_schedules([_rank_batch(prompt_len=100), _rank_batch(prompt_len=100)])
+
+
+def test_reset_for_recompute_restarts_helix_decode_state() -> None:
+    """A re-prefilled request decodes from its new prompt end, so the helix
+    decode counter and inactive-rank flag restart with it."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+
+    req = LlmRequest(
+        request_id=1,
+        max_new_tokens=8,
+        input_tokens=list(range(96)),
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    req.py_helix_decode_group_index = 5
+    req.py_helix_is_inactive_rank = True
+
+    req.reset_for_recompute(max_input_len=1 << 20)
+
+    assert req.py_helix_decode_group_index == 0
+    assert not req.py_helix_is_inactive_rank
+    assert req.total_input_len_cp == req.prompt_len
 
 
 def test_dummy_frozen_fields_sum_invariant() -> None:
