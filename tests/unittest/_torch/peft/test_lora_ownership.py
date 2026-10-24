@@ -117,7 +117,7 @@ def _make_runtime(
         owner=owner,
     )
     runner = object.__new__(DecoderRunner)
-    runner.model = model
+    runner._model = model
     runner._lora = LoraParamBuilder(attn_backend=object(), cuda_graph_manager=None)
     runner.lora_model_config = model_config
     runner._graphs = SimpleNamespace(enabled=graphs)
