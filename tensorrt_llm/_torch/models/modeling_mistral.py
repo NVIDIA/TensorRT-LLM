@@ -40,6 +40,7 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -906,6 +907,14 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     @property
     def language_model(self) -> torch.nn.Module:
         return self.llm
+
+    @property
+    def lora_owner(self) -> DecoderLoraOwner:
+        if not isinstance(self.llm, MistralForCausalLM):
+            raise NotImplementedError(
+                f"{type(self.llm).__name__} does not support decoder LoRA forwarding"
+            )
+        return DecoderLoraOwner(module_path="language_model")
 
     @property
     def multimodal_token_ids(self) -> torch.Tensor:

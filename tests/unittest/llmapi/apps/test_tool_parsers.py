@@ -1142,6 +1142,631 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert "<tool_call>" not in parser._buffer
 
 
+class TestQwen3CoderRequiredTools:
+
+    @staticmethod
+    def _call(name, parameter="", value=""):
+        body = f"<parameter={parameter}>{value}</parameter>\n" if parameter else ""
+        return f"<tool_call>\n<function={name}>\n{body}</function>\n</tool_call>"
+
+    @pytest.fixture
+    def compiler(self):
+        import xgrammar
+
+        tokenizer = xgrammar.TokenizerInfo([bytes([i])
+                                            for i in range(256)] + [b"<EOS>"],
+                                           stop_token_ids=[256])
+        return xgrammar.GrammarCompiler(tokenizer)
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_required_grammar_accepts_model_template(self, compiler, thinking):
+        from pathlib import Path
+
+        import xgrammar
+        from jinja2 import Environment
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="f",
+                                         parameters={
+                                             "type": "object",
+                                             "properties": {
+                                                 "location": {
+                                                     "type": "string"
+                                                 },
+                                                 "unit": {
+                                                     "type": "string"
+                                                 }
+                                             },
+                                             "required": ["location"]
+                                         }))
+        ]
+        template = Environment().from_string(
+            (Path(__file__).parent / "data" /
+             "nemotron_super_vl_chat_template.jinja").read_text())
+        rendered = template.render(
+            messages=[{
+                "role": "user",
+                "content": "Weather?"
+            }, {
+                "role":
+                "assistant",
+                "content":
+                "",
+                "reasoning_content":
+                "Checking." if thinking else "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "f",
+                        "arguments": {
+                            "location": "Denver",
+                            "unit": "celsius"
+                        }
+                    }
+                }]
+            }],
+            tools=[tool.model_dump(exclude_none=True) for tool in tools],
+            add_generation_prompt=False)
+        output = rendered.rsplit("<|im_start|>assistant\n",
+                                 1)[1].split("<|im_end|>", 1)[0]
+        prefill = "<think>" if thinking else "<think></think>"
+        assert output.startswith(prefill)
+        output = output[len(prefill):]
+        matcher = xgrammar.GrammarMatcher(
+            compiler.compile_structural_tag(
+                Qwen3CoderToolParser().build_required_structural_tag(
+                    tools, thinking=thinking)))
+        assert matcher.accept_string(output) and matcher.accept_token(256)
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    @pytest.mark.parametrize("required",
+                             [["location"], ["location", "unit"], []])
+    def test_required_grammar_accepts_parameter_whitespace(
+            self, compiler, thinking, required):
+        import xgrammar
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="get_weather",
+                                         parameters={
+                                             "type": "object",
+                                             "properties": {
+                                                 "location": {
+                                                     "type": "string"
+                                                 },
+                                                 "unit": {
+                                                     "type": "string"
+                                                 }
+                                             },
+                                             "required": required,
+                                             "additionalProperties": False
+                                         }))
+        ]
+        fmt = Qwen3CoderToolParser().build_required_structural_tag(
+            tools, thinking=thinking)
+        compiled = compiler.compile_structural_tag(fmt)
+        prefix = "Checking.</think>" if thinking else ""
+        for whitespace in ("", "\n", "\n\t ", "\r\n"):
+            body = ("<parameter=location>Denver</parameter>" + whitespace +
+                    "<parameter=unit>celsius</parameter>" + whitespace)
+            text = prefix + whitespace + "<tool_call>\n<function=get_weather>\n" + body + "</function>\n</tool_call>"
+            matcher = xgrammar.GrammarMatcher(compiled)
+            assert matcher.accept_string(text)
+            assert matcher.accept_token(256)
+            parsed = Qwen3CoderToolParser().detect_and_parse(
+                text[len(prefix):], tools)
+            assert json.loads(parsed.calls[0].parameters) == {
+                "location": "Denver",
+                "unit": "celsius"
+            }
+        for body, accepted in [("", not required),
+                               ("<parameter=location>Denver</parameter>\n",
+                                "unit" not in required)]:
+            matcher = xgrammar.GrammarMatcher(compiled)
+            text = prefix + "\n<tool_call>\n<function=get_weather>\n" + body + "</function>\n</tool_call>"
+            assert (matcher.accept_string(text)
+                    and matcher.accept_token(256)) is accepted
+        matcher = xgrammar.GrammarMatcher(compiled)
+        assert matcher.accept_string(prefix + "\n ")
+        assert not matcher.accept_token(256)
+
+    @pytest.mark.parametrize("schema", [
+        {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True
+        },
+        {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {}
+        },
+        {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+                "type": "string"
+            }
+        },
+        {
+            "type": "object",
+            "required": "x"
+        },
+        {
+            "type": "object",
+            "minProperties": "bad"
+        },
+        {
+            "type": "object",
+            "properties": {},
+            "required": ["x"]
+        },
+        {
+            "type": "object",
+            "properties": {},
+            "minProperties": 1
+        },
+    ])
+    def test_required_grammar_rejects_unsupported_schemas(self, schema):
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="f", parameters=schema))
+        ]
+        with pytest.raises(ValueError) as exc:
+            Qwen3CoderToolParser().build_required_structural_tag(tools,
+                                                                 thinking=False)
+        assert "EBNF" not in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["a</tool_call>b", "a<tool_call>b", "a</think>b", "a</function>b"])
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_grammar_accepted_delimiters_preserve_arguments(
+            self, compiler, value, chunk_size):
+        import xgrammar
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="f",
+                                         parameters={
+                                             "type": "object",
+                                             "properties": {
+                                                 "x": {
+                                                     "type": "string"
+                                                 }
+                                             },
+                                             "required": ["x"]
+                                         }))
+        ]
+        text = self._call("f", "x", value) + "\n" + self._call(
+            "f", "x", "second")
+        parser = Qwen3CoderToolParser()
+        matcher = xgrammar.GrammarMatcher(
+            compiler.compile_structural_tag(
+                parser.build_required_structural_tag(tools, thinking=False)))
+        assert matcher.accept_string(text) and matcher.accept_token(256)
+        whole = parser.detect_and_parse(text, tools)
+        assert [json.loads(call.parameters) for call in whole.calls] == [{
+            "x":
+            value
+        }, {
+            "x":
+            "second"
+        }]
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(tools)]
+        arguments = {}
+        for result in results:
+            for call in result.calls:
+                arguments[call.tool_index] = arguments.get(call.tool_index,
+                                                           "") + call.parameters
+        assert [json.loads(arguments[i]) for i in range(2)] == [{
+            "x": value
+        }, {
+            "x": "second"
+        }]
+        assert "".join(result.normal_text for result in results) == "\n"
+
+    def test_incomplete_function_header_is_not_a_call(self, sample_tools):
+        text = "<tool_call><function=f</function></tool_call>"
+        parser = Qwen3CoderToolParser()
+        assert parser.detect_and_parse(text, sample_tools).calls == []
+        assert parser.parse_streaming_increment(text, sample_tools).calls == []
+        assert parser.finish(sample_tools).calls == []
+
+    @pytest.mark.timeout(3)
+    @pytest.mark.parametrize("name", ["", " ", "\t"])
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    @pytest.mark.parametrize("body", [
+        "",
+        "<parameter=location>a</tool_call><tool_call>b</parameter>",
+    ])
+    def test_empty_function_name_recovers(
+            self, sample_tools: list[ChatCompletionToolsParam], name: str,
+            chunk_size: int, body: str) -> None:
+        text = (f"<tool_call><function={name}>{body}</function></tool_call>" +
+                self._call("get_weather", "location", "Denver"))
+        parser = Qwen3CoderToolParser()
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size],
+                                             sample_tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(sample_tools)]
+        calls = [call for result in results for call in result.calls]
+        assert "".join(result.normal_text for result in results) == ""
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+        assert {call.tool_index for call in calls} == {0}
+        assert json.loads("".join(call.parameters for call in calls)) == {
+            "location": "Denver"
+        }
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_empty_function_name_preserves_surrounding_output(
+            self, sample_tools: list[ChatCompletionToolsParam],
+            chunk_size: int) -> None:
+        text = ("before" + self._call("get_weather", "location", "Taipei") +
+                "between<tool_call><function= ></function></tool_call>" +
+                self._call("get_weather", "location", "Denver") + "after")
+        parser = Qwen3CoderToolParser()
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size],
+                                             sample_tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(sample_tools)]
+        calls = [call for result in results for call in result.calls]
+        assert "".join(result.normal_text
+                       for result in results) == "beforebetweenafter"
+        assert [(call.tool_index, call.name) for call in calls
+                if call.name] == [(0, "get_weather"), (1, "get_weather")]
+        for index, location in enumerate(["Taipei", "Denver"]):
+            assert json.loads("".join(call.parameters for call in calls
+                                      if call.tool_index == index)) == {
+                                          "location": location
+                                      }
+
+    @pytest.mark.parametrize("body", [
+        "",
+        "<parameter=location>a</tool_call>b",
+        "<parameter=location>Denver</parameter></function></tool_",
+    ])
+    def test_unterminated_empty_function_name_does_not_leak(
+            self, sample_tools: list[ChatCompletionToolsParam],
+            body: str) -> None:
+        parser = Qwen3CoderToolParser()
+        result = parser.parse_streaming_increment(
+            "<tool_call><function= >" + body, sample_tools)
+        assert result.normal_text == ""
+        assert result.calls == []
+        tail = parser.finish(sample_tools)
+        assert tail.normal_text == ""
+        assert tail.calls == []
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_required_grammar_rejects_empty_and_unknown_calls(
+            self, sample_tools, compiler, thinking):
+        import xgrammar
+
+        fmt = Qwen3CoderToolParser().build_required_structural_tag(
+            sample_tools, thinking=thinking)
+        compiled = compiler.compile_structural_tag(fmt)
+        prefix = "Check the available tools.</think>" if thinking else ""
+        weather = self._call("get_weather", "location", "Denver")
+        search = self._call("search_web", "query", "weather")
+        for text, expected in [
+            ("", False),
+            (prefix, False),
+            (prefix + "Hello.", False),
+            (prefix + weather, True),
+            (prefix + weather + "\n", True),
+            (prefix + weather + "\n\n", True),
+            (prefix + search, True),
+            (prefix + weather + "\n" + search, True),
+            (prefix + weather + "\n\n" + search, True),
+            (prefix + self._call("unknown", "location", "Denver"), False),
+            (prefix + weather + "\n" +
+             self._call("unknown", "location", "Denver"), False),
+            (prefix + self._call("get_weather"), False),
+            (prefix + weather[:-12], False),
+        ]:
+            matcher = xgrammar.GrammarMatcher(compiled)
+            accepted = matcher.accept_string(text) and matcher.accept_token(256)
+            assert accepted == expected, text
+        if thinking:
+            matcher = xgrammar.GrammarMatcher(compiled)
+            assert not matcher.accept_string("Consider <tool_call>")
+
+    @pytest.mark.parametrize("parameters", [
+        None, {}, {
+            "type": "object"
+        }, {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False
+        }
+    ])
+    def test_required_grammar_supports_parameterless_tools(
+            self, compiler, parameters):
+        import xgrammar
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="ping", parameters=parameters))
+        ]
+        fmt = Qwen3CoderToolParser().build_required_structural_tag(
+            tools, thinking=False)
+        matcher = xgrammar.GrammarMatcher(compiler.compile_structural_tag(fmt))
+        assert matcher.accept_string(self._call("ping"))
+        assert matcher.accept_token(256)
+        assert tools[0].function.parameters == parameters
+
+    @pytest.mark.parametrize("parameters,value", [
+        ({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                }
+            },
+            "required": ["x"]
+        }, "[1,2]"),
+        ({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {
+                            "type": "boolean"
+                        }
+                    }
+                }
+            },
+            "required": ["x"]
+        }, '{"ok":true}'),
+        ({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "anyOf": [{
+                        "type": "string"
+                    }, {
+                        "type": "null"
+                    }]
+                }
+            },
+            "required": ["x"]
+        }, "null"),
+    ])
+    def test_required_grammar_supports_nested_and_nullable_arguments(
+            self, compiler, parameters, value):
+        import xgrammar
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="f", parameters=parameters))
+        ]
+        fmt = Qwen3CoderToolParser().build_required_structural_tag(
+            tools, thinking=False)
+        matcher = xgrammar.GrammarMatcher(compiler.compile_structural_tag(fmt))
+        text = self._call("f", "x", value)
+        assert matcher.accept_string(text)
+        assert matcher.accept_token(256)
+        assert json.loads(Qwen3CoderToolParser().detect_and_parse(
+            text, tools).calls[0].parameters) == {
+                "x": json.loads(value)
+            }
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_required_stream_matches_complete_response(self, sample_tools,
+                                                       thinking, chunk_size):
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        tools = sample_tools + [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(name="ping"))
+        ]
+        text = ("Checking.</think>" if thinking else "") + "\n".join([
+            self._call("get_weather", "location", "}"),
+            self._call("search_web", "query", "weather"),
+            self._call("ping")
+        ])
+
+        def make_args():
+            args = TestForcedToolChoicePostprocessing._make_args(
+                tools, tool_parser="qwen3_coder")
+            args.tool_choice = "required"
+            args.tool_parser_grammar_constrained = True
+            args.reasoning_parser = "nemotron-v3"
+            args.chat_template_kwargs = {"enable_thinking": thinking}
+            return args
+
+        whole = chat_response_post_processor(
+            TestForcedToolChoicePostprocessing._fake_response(text),
+            make_args())
+        chunks = [
+            text[i:i + chunk_size] for i in range(0, len(text), chunk_size)
+        ]
+        streamed = TestForcedToolChoicePostprocessing._stream_deltas(
+            make_args(), chunks)
+        calls = {}
+        reasoning = ""
+        for payload in streamed:
+            for choice in payload["choices"]:
+                delta = choice["delta"]
+                reasoning += delta.get("reasoning_content") or ""
+                for call in delta.get("tool_calls") or []:
+                    item = calls.setdefault(call["index"], {
+                        "name": "",
+                        "arguments": "",
+                        "ids": []
+                    })
+                    item["name"] += call["function"].get("name") or ""
+                    item["arguments"] += call["function"].get("arguments") or ""
+                    if call.get("id"):
+                        item["ids"].append(call["id"])
+        expected = whole.choices[0]
+        assert len(calls) == len(expected.message.tool_calls) == 3
+        for index, call in enumerate(expected.message.tool_calls):
+            assert calls[index]["name"] == call.function.name
+            assert json.loads(calls[index]["arguments"]) == json.loads(
+                call.function.arguments)
+            assert len(calls[index]["ids"]) == 1
+        assert reasoning == (expected.message.reasoning_content or "")
+        assert streamed[-1]["choices"][0][
+            "finish_reason"] == expected.finish_reason == "tool_calls"
+
+    def test_required_truncation_preserves_finish_reason(self, sample_tools):
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        text = self._call("get_weather", "location", "Denver")[:-12]
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser="qwen3_coder")
+        args.tool_choice = "required"
+        whole = chat_response_post_processor(
+            TestForcedToolChoicePostprocessing._fake_response(text, "length"),
+            args)
+        assert whole.choices[0].finish_reason == "length"
+        assert not whole.choices[0].message.tool_calls
+        streamed = TestForcedToolChoicePostprocessing._stream_deltas(
+            args, [text], "length")
+        assert streamed[-1]["choices"][0]["finish_reason"] == "length"
+
+
+class TestQwen3CoderParameterRecovery:
+    FIRST = "<tool_call><function=f><parameter=x>abc</function></tool_call>"
+    SECOND = "<tool_call><function=g><parameter=y>1</parameter></function></tool_call>"
+
+    @pytest.fixture
+    def tools(self):
+        return [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name=name,
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            parameter: {
+                                "type": "string"
+                            }
+                        },
+                    },
+                ),
+            ) for name, parameter in [("f", "x"), ("g", "y")]
+        ]
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    @pytest.mark.parametrize("suffix,expected", [
+        ("", [("f", {
+            "x": "abc"
+        })]),
+        (SECOND, [("f", {
+            "x": "abc"
+        }), ("g", {
+            "y": "1"
+        })]),
+        ("<tool_call><function=g></function></tool_call>", [("f", {
+            "x": "abc"
+        }), ("g", {})]),
+    ])
+    def test_missing_parameter_closer_recovers_calls(self, tools, chunk_size,
+                                                     suffix, expected):
+        text = self.FIRST + suffix
+        parser = Qwen3CoderToolParser()
+        whole = parser.detect_and_parse(text, tools)
+        assert whole.normal_text == ""
+        assert [(call.name, json.loads(call.parameters))
+                for call in whole.calls] == expected
+
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(tools)]
+        calls = {}
+        for result in results:
+            for call in result.calls:
+                item = calls.setdefault(call.tool_index, {
+                    "name": "",
+                    "arguments": ""
+                })
+                item["name"] += call.name or ""
+                item["arguments"] += call.parameters
+        assert [(item["name"], json.loads(item["arguments"]))
+                for item in calls.values()] == expected
+        assert "".join(result.normal_text for result in results) == ""
+        assert parser.finish(tools).calls == []
+
+    @pytest.mark.parametrize("constrained", [False, True])
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_chat_recovery_policy_preserves_required_arguments(
+            self, tools, constrained, chunk_size):
+        import xgrammar
+
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        value = "abc</function>\n</tool_call>\n<tool_call>\n<function=g>\n<parameter=y>1"
+        text = "<tool_call>\n<function=f>\n<parameter=x>" + value + "</parameter>\n</function>\n</tool_call>"
+        compiler = xgrammar.GrammarCompiler(
+            xgrammar.TokenizerInfo([bytes([i])
+                                    for i in range(256)] + [b"<EOS>"],
+                                   stop_token_ids=[256]))
+        matcher = xgrammar.GrammarMatcher(
+            compiler.compile_structural_tag(
+                Qwen3CoderToolParser().build_required_structural_tag(
+                    tools, thinking=False)))
+        assert matcher.accept_string(text) and matcher.accept_token(256)
+
+        def make_args():
+            args = TestForcedToolChoicePostprocessing._make_args(
+                tools, tool_parser="qwen3_coder")
+            args.tool_choice = "required" if constrained else "auto"
+            args.tool_parser_grammar_constrained = constrained
+            return args
+
+        expected = [("f", {
+            "x": value
+        })] if constrained else [("f", {
+            "x": "abc"
+        }), ("g", {
+            "y": "1"
+        })]
+        whole = chat_response_post_processor(
+            TestForcedToolChoicePostprocessing._fake_response(text),
+            make_args())
+        assert [(call.function.name, json.loads(call.function.arguments))
+                for call in whole.choices[0].message.tool_calls] == expected
+        payloads = TestForcedToolChoicePostprocessing._stream_deltas(
+            make_args(),
+            [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)])
+        calls = {}
+        for payload in payloads:
+            for choice in payload["choices"]:
+                for call in choice["delta"].get("tool_calls") or []:
+                    item = calls.setdefault(call["index"], {
+                        "name": "",
+                        "arguments": ""
+                    })
+                    item["name"] += call["function"].get("name") or ""
+                    item["arguments"] += call["function"].get("arguments") or ""
+        assert [(item["name"], json.loads(item["arguments"]))
+                for item in calls.values()] == expected
+
+
 class TestQwen3CoderToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3CoderToolParser class."""
 
