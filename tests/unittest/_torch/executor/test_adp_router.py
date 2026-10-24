@@ -25,6 +25,7 @@ Tests for:
 import inspect
 from unittest.mock import MagicMock, Mock
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
@@ -487,6 +488,21 @@ class TestDefaultADPRouter:
             "ConversationAwareADPRouter",
         }
 
+    def test_router_factory_uses_default_router_for_kv_cache_aware_routing_under_helix(self):
+        attention_dp_config = Mock(
+            kv_cache_routing_conversation_affinity=False,
+            enable_kv_cache_aware_routing=True,
+        )
+
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_size=2, has_cp_helix=True),
+            has_seq_slot_headroom=False,
+            kv_cache_manager=Mock(enable_block_reuse=True),
+            attention_dp_config=attention_dp_config,
+        )
+
+        assert type(router) is DefaultADPRouter
+
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)
         router = DefaultADPRouter(dist=dist)
@@ -539,6 +555,77 @@ class TestDefaultADPRouter:
         assert states[0] == expected_local
         assert states[1] == rank1
         dist.tp_allgather.assert_called_once_with(expected_local.serialize())
+
+    def test_gather_all_rank_states_takes_max_load_across_helix_cp(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=True)
+        # One row per CP rank: [num_active_requests, num_active_tokens] of this
+        # DP rank. The peer CP rank still holds a 20-token request that this CP
+        # rank already retired.
+        dist.cp_allgather_int64.return_value = np.array([[1, 10], [2, 30]])
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+        router = DefaultADPRouter(dist=dist)
+
+        [state] = router.gather_all_rank_states([Mock(total_input_len_cp=10)])
+
+        dist.cp_allgather_int64.assert_called_once_with([1, 10])
+        assert state == RankState(rank=0, num_active_requests=2, num_active_tokens=30)
+
+    def test_gather_all_rank_states_skips_cp_gather_without_helix(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
+        dist.tp_allgather.return_value = [[0, 1, 10], [1, 2, 20]]
+        router = DefaultADPRouter(dist=dist)
+
+        router.gather_all_rank_states([Mock(py_orig_prompt_len=10)])
+
+        dist.cp_allgather_int64.assert_not_called()
+
+    def test_helix_cp_ranks_route_a_new_request_to_the_same_dp_rank(self):
+        # Token counts of the active requests on each (CP rank, DP rank). A
+        # rank-local cancel retired a DP rank 0 request on CP rank 0 only, so
+        # CP rank 1 still sees DP rank 0 as full.
+        active_tokens = {
+            (0, 0): [10],
+            (0, 1): [50],
+            (1, 0): [10, 10],
+            (1, 1): [50],
+        }
+        cp_ranks = dp_ranks = (0, 1)
+        max_num_active_requests = 2
+
+        def route(states):
+            dist = _mock_dist(tp_rank=0, tp_size=len(dp_ranks))
+            assigned, _ = DefaultADPRouter(dist=dist).route_requests(
+                states, [_make_request_item(7)], max_num_active_requests
+            )
+            return {dp_rank: [req.id for req in reqs] for dp_rank, reqs in assigned.items()}
+
+        def own_state(cp_rank, dp_rank):
+            tokens = active_tokens[(cp_rank, dp_rank)]
+            return RankState(
+                rank=dp_rank, num_active_requests=len(tokens), num_active_tokens=sum(tokens)
+            )
+
+        def gathered_state(cp_rank, dp_rank):
+            """The state that (cp_rank, dp_rank) contributes to its TP gather."""
+            dist = _mock_dist(tp_rank=dp_rank, tp_size=len(dp_ranks), has_cp_helix=True)
+            dist.cp_allgather_int64.return_value = np.array(
+                [
+                    [len(active_tokens[(cp, dp_rank)]), sum(active_tokens[(cp, dp_rank)])]
+                    for cp in cp_ranks
+                ]
+            )
+            dist.tp_allgather.side_effect = lambda payload: [payload]
+            requests = [Mock(total_input_len_cp=t) for t in active_tokens[(cp_rank, dp_rank)]]
+            [state] = DefaultADPRouter(dist=dist).gather_all_rank_states(requests)
+            return state
+
+        # Routing on each CP rank's own view splits the request.
+        own_routes = [route([own_state(cp, dp) for dp in dp_ranks]) for cp in cp_ranks]
+        assert own_routes == [{0: [7], 1: []}, {0: [], 1: [7]}]
+
+        # With the CP-max load, both CP ranks see DP rank 0 as full and pick DP rank 1.
+        cp_max_routes = [route([gathered_state(cp, dp) for dp in dp_ranks]) for cp in cp_ranks]
+        assert cp_max_routes == [{0: [], 1: [7]}] * len(cp_ranks)
 
     def test_kv_load_payload_only_changes_wire_shape_when_enabled(self):
         payload = RankIterStatsPayload(
