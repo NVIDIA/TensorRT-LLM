@@ -550,9 +550,14 @@ def get_attention_workspace_fixed_bytes(model_config, mapping,
                                         **capacities) -> int:
     """Capacity-sized reserve declared by the model's selected backend."""
     from ..attention.backends.utils import get_attention_backend
-    return get_attention_backend(
-        model_config.attn_backend).runtime_workspace_fixed_bytes(
-            model_config, mapping, **capacities)
+    backend = get_attention_backend(model_config.attn_backend)
+    if config_utils.is_glm5_next(model_config.pretrained_config):
+        # glm5_next layers select the glm_kpool sparse backend themselves, so
+        # model_config carries no sparse_attention_config naming it.
+        from ..attention.backends.sparse.glm_kpool import \
+            GlmKpoolSparseAttention as backend
+    return backend.runtime_workspace_fixed_bytes(model_config, mapping,
+                                                 **capacities)
 
 
 def get_overlap_headroom_penalty_workspace_bytes(
