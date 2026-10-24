@@ -32,6 +32,7 @@ from transformers import (AutoProcessor, PretrainedConfig,
 
 from ..logger import logger
 from ..sampling_params import SamplingParams
+from . import multimodal
 from .content_format import ContentFormat
 from .data import TextPrompt
 from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
@@ -217,6 +218,26 @@ class BaseMultimodalInputProcessor(ABC):
     # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
+
+    def get_disagg_prefill_inputs(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_params: multimodal.MultimodalParams,
+    ) -> Optional[multimodal.DisaggPrefillMultimodalInputs]:
+        """Export exact encoder-side prompt layout for models that preserve it.
+
+        Returning None keeps the model's existing prefill reconstruction path.
+        Models that return a layout accept it as ``encoder_inputs`` in their
+        ``build_disagg_prefill_multimodal_inputs`` method.
+
+        Args:
+            prompt_token_ids: Fully expanded prompt produced by preprocessing.
+            multimodal_params: Processed media and layout metadata for the prompt.
+
+        Returns:
+            Encoder layout to carry to prefill, or None to use reconstruction.
+        """
+        return None
 
     def get_mm_encoder_item_metadata(
         self,

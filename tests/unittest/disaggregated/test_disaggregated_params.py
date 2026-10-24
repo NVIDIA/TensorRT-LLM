@@ -22,6 +22,7 @@ import torch
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor.result import GenerationResultBase, Logprob
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -245,6 +246,17 @@ def test_context_only_response_carries_the_first_token_logprobs_and_logits():
         id=1,
         sampling_params=SamplingParams(max_tokens=4, logprobs=1, return_generation_logits=True),
     )
+    result._disaggregated_params = DisaggregatedParams(
+        multimodal_embedding_handles=[{"tensor_size": [1, 16]}],
+        multimodal_input_layout=DisaggPrefillMultimodalInputs(
+            prompt_token_ids=[1, 2, 3],
+            multimodal_positions=[1],
+            multimodal_lengths=[1],
+            multimodal_embedding_lengths=[1],
+        ),
+        mrope_position_ids_handle={"tensor_size": [3, 1, 3]},
+        mrope_position_deltas_handle={"tensor_size": [1, 1]},
+    )
     first_token_logprob = {7: Logprob(logprob=-0.5, rank=1)}
     first_logits = torch.arange(6, dtype=torch.float32).reshape(1, 1, 6)
     context_result = SimpleNamespace(
@@ -281,5 +293,9 @@ def test_context_only_response_carries_the_first_token_logprobs_and_logits():
     assert params.request_type == "context_only"
     assert params.first_gen_tokens == [7]
     assert params.first_gen_log_probs == [first_token_logprob]
+    assert params.multimodal_embedding_handles is None
+    assert params.multimodal_input_layout is None
+    assert params.mrope_position_ids_handle == {"tensor_size": [3, 1, 3]}
+    assert params.mrope_position_deltas_handle == {"tensor_size": [1, 1]}
     (logits,) = params.first_gen_logits
     assert torch.equal(logits, first_logits[0, :1])
