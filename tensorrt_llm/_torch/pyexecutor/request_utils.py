@@ -5,7 +5,7 @@
 
 import os
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .scheduler import WaitingQueue
@@ -143,6 +143,7 @@ def get_from_waiting_queue(
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[List[int]] = None,
+    admission_rank: Optional[Callable[[Any], Optional[int]]] = None,
 ) -> List:
     """Get requests from the waiting queue.
 
@@ -152,6 +153,9 @@ def get_from_waiting_queue(
         enable_attention_dp: Whether to enable attention DP scheduling.
         max_num_active_requests: Maximum number of active requests per rank.
         all_ranks_num_active_requests: Number of active requests for each rank.
+        admission_rank: Attention DP only. Maps a request to the only rank that
+            may admit it, or None for any rank. A request whose rank is full
+            stays queued and counts the deferral in ``adp_affinity_deferrals``.
 
     Returns:
         List of requests that can be processed.
@@ -175,13 +179,23 @@ def get_from_waiting_queue(
             break
         req_item = waiting_queue.pop_request()
 
-        can_process = (
-            can_process_attention_dp_request(
+        pinned_rank = (
+            admission_rank(req_item) if enable_attention_dp and admission_rank is not None else None
+        )
+        if pinned_rank is not None:
+            can_process = scheduling_all_ranks_num_active_requests[pinned_rank] < (
+                max_num_active_requests
+            )
+            if can_process:
+                scheduling_all_ranks_num_active_requests[pinned_rank] += 1
+            else:
+                req_item.adp_affinity_deferrals += 1
+        elif enable_attention_dp:
+            can_process = can_process_attention_dp_request(
                 req_item, scheduling_all_ranks_num_active_requests, max_num_active_requests
             )
-            if enable_attention_dp
-            else True
-        )
+        else:
+            can_process = True
 
         if can_process:
             items.append(req_item)

@@ -469,6 +469,7 @@ class TestDefaultADPRouter:
                 kv_cache_routing_max_sessions=1 << 16,
                 kv_cache_routing_fair_share_multiplier=2.0,
                 kv_cache_routing_new_conv_placement="round_robin",
+                kv_cache_routing_strict_conversation_affinity=False,
             ),
         ]
         built = set()
@@ -1634,6 +1635,48 @@ class TestConversationAwareADPRouter:
         self._route(router, self._states(2), [child_turn2])
         assert child_turn2.request.py_uncached_prefill_tokens == 500
 
+    def test_strict_affinity_admission_rank(self):
+        """Strict affinity names a known conversation's rank until it waits too long."""
+        router = ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=4), strict_affinity_max_wait_iters=3
+        )
+        first = _make_conv_request_item(1, "A")
+        home = self._route(router, self._states(4), [first])[1]
+
+        later = _make_conv_request_item(2, "A")
+        later.adp_affinity_deferrals = 0
+        assert router.admission_rank(later) == home
+        later.adp_affinity_deferrals = 3
+        assert router.admission_rank(later) is None
+
+        unknown = _make_conv_request_item(3, "B")
+        unknown.adp_affinity_deferrals = 0
+        assert router.admission_rank(unknown) is None
+
+        lenient = self._router(tp_size=4)
+        self._route(lenient, self._states(4), [_make_conv_request_item(4, "A")])
+        assert lenient.admission_rank(later) is None
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_strict_affinity_places_pinned_requests_first(self, strict: bool) -> None:
+        """A new conversation must not take the slot admission reserved for a pin."""
+        router = ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=2), strict_affinity_max_wait_iters=10 if strict else 0
+        )
+        assert self._route(router, self._states(2), [_make_conv_request_item(1, "A")])[1] == 0
+
+        # Both ranks have one free slot, and round robin would offer rank 0 to
+        # whichever request it places first.
+        router._round_robin_cursor = 0
+        new_conv = _make_conv_request_item(2, "N")
+        pinned = _make_conv_request_item(3, "A")
+        pos = self._route(router, self._states(2, active=[1, 1]), [new_conv, pinned], cap=2)
+        if strict:
+            assert pos == {3: 0, 2: 1}
+        else:
+            # Without strict affinity the pinned turn overflows off its rank.
+            assert pos == {2: 0, 3: 1}
+
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
         items = [_make_conv_request_item(i, None) for i in range(8)]
@@ -1743,6 +1786,21 @@ class TestConversationAwareADPRouter:
         assert router._max_sessions == 8
         # A mocked (non-string) placement value must fall back to round_robin.
         assert router._new_conv_placement == "round_robin"
+
+    @pytest.mark.parametrize("strict, expected_wait", [(False, 0), (True, 7)])
+    def test_factory_passes_strict_affinity(self, strict: bool, expected_wait: int) -> None:
+        cfg = AttentionDpConfig(
+            kv_cache_routing_conversation_affinity=True,
+            kv_cache_routing_strict_conversation_affinity=strict,
+            kv_cache_routing_strict_affinity_max_wait_iters=7,
+        )
+        router = ADPRouter.create(
+            dist=_mock_dist(),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=AttentionDpConfig.model_validate(cfg.model_dump()),
+        )
+        assert router._strict_affinity_max_wait_iters == expected_wait
 
     @staticmethod
     def _lq_router(tp_size=4):

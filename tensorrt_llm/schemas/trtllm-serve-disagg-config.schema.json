@@ -123,6 +123,21 @@
           "title": "Kv Cache Routing New Conv Placement",
           "type": "string"
         },
+        "kv_cache_routing_strict_affinity_max_wait_iters": {
+          "default": 2000,
+          "description": "Number of admission passes that may defer a request under strict conversation affinity before it may be placed on any rank. Only used when kv_cache_routing_strict_conversation_affinity is True.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Kv Cache Routing Strict Affinity Max Wait Iters",
+          "type": "integer"
+        },
+        "kv_cache_routing_strict_conversation_affinity": {
+          "default": false,
+          "description": "Keep a request of a pinned conversation in the waiting queue while its rank is full, instead of placing it on another rank where its KV-cache prefix is not cached. Requests without a pin are admitted as before. Only used when kv_cache_routing_conversation_affinity is True.",
+          "status": "prototype",
+          "title": "Kv Cache Routing Strict Conversation Affinity",
+          "type": "boolean"
+        },
         "timeout_iters": {
           "default": 50,
           "description": "The number of iterations to timeout.",

@@ -58,6 +58,9 @@ class RequestQueueItem:
     # original arrival on the same clock.
     admit_arrival: Optional[float] = None
     admit_orig_arrival: Optional[float] = None
+    # Admission passes that left this request queued because its pinned
+    # attention-DP rank was full (strict conversation affinity).
+    adp_affinity_deferrals: int = 0
 
     @property
     def is_shutdown_request(self):

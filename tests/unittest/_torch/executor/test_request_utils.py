@@ -1451,6 +1451,46 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     assert req1 not in result
 
 
+def test_get_from_waiting_queue_keeps_requests_of_full_admission_ranks(
+    attention_dp_config, all_ranks_num_active_requests
+):
+    max_num_active_requests = attention_dp_config["max_num_active_requests"]
+    pinned_to_full = RequestQueueItem(1, Mock())
+    pinned_to_open = RequestQueueItem(2, Mock())
+    second_to_open = RequestQueueItem(3, Mock())
+    unpinned = RequestQueueItem(4, Mock())
+    pins = {1: 0, 2: 1, 3: 1}
+
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.extend([pinned_to_full, pinned_to_open, second_to_open, unpinned])
+    all_ranks_num_active_requests[0] = max_num_active_requests
+    all_ranks_num_active_requests[1] = max_num_active_requests - 1
+    counts_before = list(all_ranks_num_active_requests)
+
+    result = get_from_waiting_queue(
+        waiting_queue,
+        4,
+        True,
+        max_num_active_requests,
+        all_ranks_num_active_requests,
+        admission_rank=lambda req_item: pins.get(req_item.id),
+    )
+
+    # Rank 1 has one slot: the first request pinned to it takes it. Requests
+    # whose pinned rank is full stay queued in order and count the deferral;
+    # the unpinned request may go to any rank.
+    assert result == [pinned_to_open, unpinned]
+    assert [waiting_queue.pop_request() for _ in range(len(waiting_queue))] == [
+        pinned_to_full,
+        second_to_open,
+    ]
+    assert pinned_to_full.adp_affinity_deferrals == 1
+    assert second_to_open.adp_affinity_deferrals == 1
+    assert pinned_to_open.adp_affinity_deferrals == 0
+    # Reservations are made on a copy; the caller's counts stay as they were.
+    assert all_ranks_num_active_requests == counts_before
+
+
 def test_can_process_attention_dp_request(attention_dp_config):
     max_num_active_requests = attention_dp_config["max_num_active_requests"]
 

@@ -79,6 +79,16 @@
     {
       "capture_policy": "int",
       "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_strict_affinity_max_wait_iters"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_strict_conversation_affinity"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
       "path": "attention_dp_config.timeout_iters"
     },
     {
