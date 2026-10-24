@@ -624,9 +624,9 @@ class PyResult:
         mrope_position_ids: torch.Tensor,
         mrope_position_deltas: torch.Tensor,
     ):
-        self._mrope_position_ids = SharedTensorContainer.from_tensor(
+        self._mrope_position_ids = SharedTensorContainer.from_tensor_bytes(
             mrope_position_ids).dump_to_dict()
-        self._mrope_position_deltas = SharedTensorContainer.from_tensor(
+        self._mrope_position_deltas = SharedTensorContainer.from_tensor_bytes(
             mrope_position_deltas).dump_to_dict()
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
