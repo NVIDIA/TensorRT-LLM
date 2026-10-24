@@ -129,9 +129,6 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         sparse_attention_config=None,
     )
     for name in (
-        "should_enable_adp_dummy_fixes",
-        "should_enable_scheduler_aware_adp_dummy",
-        "should_enable_non_overlap_adp_forward_intent",
         "should_enable_overlap_headroom",
         "resolved_kv_cache_manager_is_v2",
     ):
@@ -330,10 +327,10 @@ def test_prefill_compile_scopes_whole_model_forward(
     with torch_compiling(True), bypass_scope:
         if raises:
             with pytest.raises(RuntimeError, match="epilogue failure"):
-                DecoderRunner.model_forward(engine, is_dummy=False, attn_metadata=Mock())
+                DecoderRunner._model_forward(engine, is_dummy=False, attn_metadata=Mock())
         else:
             assert (
-                DecoderRunner.model_forward(engine, is_dummy=False, attn_metadata=Mock()) == "done"
+                DecoderRunner._model_forward(engine, is_dummy=False, attn_metadata=Mock()) == "done"
             )
         assert is_torch_compiling()
     expected = eligible if prefill_only else True
@@ -393,7 +390,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
             spec_config=None,
         ),
         _completed_autotuner_warmup_num_tokens=None,
-        _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
         _moe_workspace_reclaimer=None,
         is_warmup=True,
@@ -407,7 +403,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
         ),
         mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
         dist=object(),
-        kv_cache_manager_key="kv_cache",
         is_draft_model=False,
         guided_decoder=None,
         _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True),
@@ -427,7 +422,9 @@ def test_compiled_mxfp8_warmup_backend_selection(
     engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
     cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
     resources = SimpleNamespace(
-        get_resource_manager=lambda key: cache if key == "kv_cache" else None
+        get_resource_manager=lambda key: cache
+        if key == ResourceManagerType.KV_CACHE_MANAGER
+        else None
     )
     tuner = Mock(profiling_cache={})
     monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", lambda: tuner)
@@ -449,7 +446,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
             "get_per_request_prefill_cuda_graph_flag",
             lambda: batch.num_gen_requests == 0,
         )
-        return DecoderRunner.model_forward(engine, is_dummy=True, attn_metadata=batch)
+        return DecoderRunner._model_forward(engine, is_dummy=True, attn_metadata=batch)
 
     engine._forward_warmup.side_effect = forward
     with torch_compiling(compile_enabled):
@@ -517,7 +514,6 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
         model=SimpleNamespace(modules=lambda: []),
         mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
         dist=object(),
-        kv_cache_manager_key="kv_cache",
         guided_decoder=None,
         _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=False),
         _dummy_requests=SimpleNamespace(
@@ -533,7 +529,9 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
     )
     cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
     resources = SimpleNamespace(
-        get_resource_manager=lambda key: cache if key == "kv_cache" else None
+        get_resource_manager=lambda key: cache
+        if key == ResourceManagerType.KV_CACHE_MANAGER
+        else None
     )
     tuner = Mock(profiling_cache={})
     get_tuner = Mock(return_value=tuner)
@@ -569,7 +567,6 @@ def test_draft_length_resolution_resyncs_dynamic_buffers(config_cls):
         spec_config=config,
         max_draft_len=3,
         max_total_draft_tokens=config.tokens_per_gen_step - 1,
-        runtime_draft_len=3,
     )
     requests = [
         SimpleNamespace(
@@ -583,9 +580,8 @@ def test_draft_length_resolution_resyncs_dynamic_buffers(config_cls):
     def resolve(**kwargs):
         return resolve_draft_len(config, batch, max_draft_len=3, static_draft_len=3, **kwargs)
 
-    # Normal iteration selects K=2 and stores it on the engine.
-    update_draft_len(engine, batch)
-    assert engine.runtime_draft_len == 2
+    # Normal iteration selects K=2.
+    assert update_draft_len(engine, batch) == 2
     assert all(request.py_draft_tokens[:2] == [7, 8] for request in requests)
     # Each explicit warmup shape resynchronizes the buffers and returns its
     # length, even when the batch size is unchanged.
@@ -724,10 +720,10 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
         max_total_draft_tokens=config.tokens_per_gen_step - 1,
         max_draft_loop_tokens=config.tokens_per_gen_step - 1,
     )
-    runner.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
+    runner._get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
     requests = runner._dummy_requests
     requests._config = runner._config
-    requests.get_runtime_tokens_per_gen_step = runner.get_runtime_tokens_per_gen_step
+    requests.get_runtime_tokens_per_gen_step = runner._get_runtime_tokens_per_gen_step
     # Profiling a batch of two leaves K=2; every requested warmup shape below
     # differs from that value and must synchronize the requests.
     batch_size = 2
@@ -1011,8 +1007,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine._metrics = {}
-        model_engine.is_warmup = False
-        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._warmup_depth = 0
         model_engine._runner = Mock(spec=NoKVCacheRunner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -1031,8 +1026,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine._metrics = {}
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
-        model_engine.is_warmup = False
-        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._warmup_depth = 0
         model_engine._runner = Mock(spec=NoKVCacheRunner)
         runner = model_engine._runner
         runner._validate_resources = NoKVCacheRunner._validate_resources.__get__(runner)
@@ -1054,7 +1048,6 @@ class TestWarmupCleanup(unittest.TestCase):
         runner = object.__new__(DecoderRunner)
         warmup = runner._warmup = object.__new__(DecoderWarmup)
         warmup._warmup_timer = _WarmupTimer(rank=0)
-        warmup.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         warmup.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
         warmup._config = SimpleNamespace(
             dtype=torch.float16, cuda_graph_batch_sizes=[1, 4], enable_in_graph_sampling=False
@@ -1062,8 +1055,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._metrics = warmup._metrics = {}
         model_engine.moe_load_balancer = None
-        model_engine.is_warmup = False
-        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._warmup_depth = 0
         model_engine._runner = runner
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -1137,16 +1129,22 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
         model_engine.moe_load_balancer = None
-        model_engine.is_warmup = False
+        model_engine._warmup_depth = 0
         model_engine._runner = Mock(spec=EncoderDecoderRunner)
+        warmup_depths = []
+        model_engine._runner.warmup_encoder.side_effect = lambda _: warmup_depths.append(
+            model_engine._warmup_depth
+        )
         resource_manager = object()
 
-        model_engine._warmup_encoder_cuda_graphs_enc_dec(resource_manager)
+        model_engine.warmup_encoder(resource_manager)
 
         self.assertEqual(
             model_engine._runner.method_calls,
             [call.warmup_encoder(resource_manager)],
         )
+        self.assertEqual(warmup_depths, [1])
+        self.assertEqual(model_engine._warmup_depth, 0)
 
     @pytest.mark.cpu_only
     def test_cuda_graph_metrics_exclude_piecewise_stages(self) -> None:
@@ -1161,7 +1159,6 @@ class TestWarmupCleanup(unittest.TestCase):
             model=SimpleNamespace(modules=lambda: []),
             sparse_attention_config=None,
             metrics={},
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             dummy_requests=None,
             agreement=None,
             metadata=None,
@@ -1372,7 +1369,6 @@ class TestWarmupCleanup(unittest.TestCase):
             ),
             _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=False),
             model=SimpleNamespace(modules=lambda: []),
-            kv_cache_manager_key="kv_cache",
             mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
             dist=object(),
             guided_decoder=None,
@@ -1390,7 +1386,9 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         kv_cache_manager = SimpleNamespace(get_num_available_tokens=get_num_available_tokens)
         resource_manager = SimpleNamespace(
-            get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
+            get_resource_manager=lambda key: kv_cache_manager
+            if key == ResourceManagerType.KV_CACHE_MANAGER
+            else None
         )
 
         with (
@@ -1526,7 +1524,6 @@ class TestWarmupCleanup(unittest.TestCase):
                         SimpleNamespace(quant_method=method),
                     ]
                 ),
-                kv_cache_manager_key="kv_cache",
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
@@ -1554,7 +1551,9 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
+                get_resource_manager=lambda key: kv_cache_manager
+                if key == ResourceManagerType.KV_CACHE_MANAGER
+                else None
             )
 
             with (
@@ -1655,7 +1654,6 @@ class TestWarmupCleanup(unittest.TestCase):
                         SimpleNamespace(quant_method=method),
                     ]
                 ),
-                kv_cache_manager_key="kv_cache",
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
@@ -1683,7 +1681,9 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
+                get_resource_manager=lambda key: kv_cache_manager
+                if key == ResourceManagerType.KV_CACHE_MANAGER
+                else None
             )
 
             with (
@@ -1769,7 +1769,6 @@ class TestWarmupCleanup(unittest.TestCase):
                         SimpleNamespace(quant_method=method),
                     ]
                 ),
-                kv_cache_manager_key="kv_cache",
                 mapping=SimpleNamespace(tp_size=2, has_pp=lambda: True),
                 dist=dist,
                 guided_decoder=None,
@@ -1790,7 +1789,9 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
+                get_resource_manager=lambda key: kv_cache_manager
+                if key == ResourceManagerType.KV_CACHE_MANAGER
+                else None
             )
 
             with (

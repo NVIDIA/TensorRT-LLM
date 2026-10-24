@@ -448,7 +448,10 @@ def test_generate_with_stop_words():
         model=llama_model_path,
         kv_cache_config=global_kvcache_config,
     )
-    stop_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
+    # The model continues "A B C" with space-separated letters, so the token
+    # it generates for N is the space-prefixed " N"; with BPE tokenizers
+    # (e.g. Qwen3) that differs from the token of a bare "N".
+    stop_id = llm.tokenizer.encode(" N", add_special_tokens=False)[-1]
 
     llm_check_output(llm,
                      prompts, ["D E F G H I J K L M"],
