@@ -558,11 +558,9 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
             f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
 
 
-# Default for the plain `trtllm-serve` subcommand. At high concurrency one
-# serving process is host-bound (a single asyncio loop parses every request
-# and writes every streamed chunk), so several frontends per executor pay off
-# by default. The LlmArgs field itself keeps default 1: a bare LLM() has no
-# HTTP frontends to fan out to, and only trtllm-serve can spawn them.
+# One serving process is host-bound at high concurrency (a single asyncio loop
+# parses every request and streams every chunk). LlmArgs keeps default 1:
+# only trtllm-serve spawns frontends.
 DEFAULT_NUM_SERVE_FRONTENDS = 8
 
 
@@ -572,20 +570,16 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
                                          enable_sleep_mode: bool,
                                          metadata_server: bool,
                                          disagg_cluster: bool) -> None:
-    """Fall back to one frontend when the *default* count does not apply.
+    """Fall back to one frontend where the default count cannot run.
 
-    The default is sized for the OpenAI HTTP server on the classic IPC
-    executor path on a fixed port. When the user did not ask for a specific
-    count (neither on the CLI nor in the --config YAML / --set) and the
-    configuration can only run a single frontend, or serves gRPC, run one
-    instead of failing at startup. An explicit request keeps the loud error
-    from the guard that owns the incompatibility.
+    An explicit count (CLI, --config YAML or --set) is left alone, so the
+    guard that owns the conflict still rejects it.
     """
     num_frontends = llm_args.get("num_serve_frontends", 1)
     if requested or num_frontends <= 1:
         return
     if grpc:
-        # OpenEngine can run several frontends, but only when asked to.
+        # OpenEngine supports several frontends, but only when asked to.
         reason = "--grpc"
     elif port == 0 or report_addr:
         reason = "--port 0 / --report_addr"
@@ -596,9 +590,7 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
     elif enable_sleep_mode:
         reason = "--enable_sleep_mode"
     elif metadata_server or disagg_cluster:
-        # Every frontend registers the server under its own process identity
-        # (llm_id, DisaggClusterWorker id), which would list it once per
-        # frontend.
+        # Every frontend would register the server under its own identity.
         reason = ("--metadata_server_config_file"
                   if metadata_server else "the disagg_cluster config")
     else:
@@ -1614,9 +1606,6 @@ def serve(
         if enable_sleep_mode and llm_args.get("sleep_config") is None:
             llm_args["sleep_config"] = SleepConfig()
 
-        # The multi-frontend default only applies where it can run; an
-        # explicit CLI flag, YAML key or --set override is honored as-is (and
-        # may fail loudly).
         _resolve_default_num_serve_frontends(
             llm_args,
             requested=("num_serve_frontends" in explicit_cli_keys
