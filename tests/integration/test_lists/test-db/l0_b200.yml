@@ -269,6 +269,9 @@ l0_b200:
   - unittest/_torch/speculative/test_lilicorr_loading.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
+  # The DFlash TRTLLM block attention runs on trtllm-gen, which is SM100-only;
+  # the rest of the file runs on the Hopper hw_agnostic stage.
+  - unittest/_torch/speculative/hw_agnostic/test_kimi_k3_dspark_semantics.py -k "trtllm_block_decode"
   # On-device suffix-automaton spec-dec kernel tests (CUDA graph capture;
   # cuda-availability skipif like the sibling KDA parity tests; relocated
   # from tests/torch/ which test-db cannot list).

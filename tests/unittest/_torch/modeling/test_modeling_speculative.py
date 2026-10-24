@@ -489,6 +489,27 @@ def test_dflash_trtllm_gen_buffers_reuse_and_grow():
         get_props.assert_called_once_with(torch.device("cpu"))
 
 
+# block_size 4: every request at or below the decode-rows ceiling (32) becomes
+# 4 rows; above it the rows form is never used, but the buffers stay sized for
+# the largest batch that does use it.
+@pytest.mark.parametrize(
+    "max_batch_size,max_num_requests", [(1, 4), (2, 8), (32, 128), (33, 128), (200, 200)]
+)
+def test_dflash_trtllm_gen_buffers_cover_noncausal_decode_rows(max_batch_size, max_num_requests):
+    wrapper = _fake_dflash_buffer_wrapper()
+    device_properties = SimpleNamespace(multi_processor_count=148)
+
+    with (
+        patch("torch.cuda.get_device_properties", return_value=device_properties),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        _prepare_dflash_buffers(wrapper, max_batch_size)
+
+    ops = wrapper._dflash_trtllm_gen_ops
+    assert ops.get_workspace_size.call_args.kwargs["max_num_requests"] == max_num_requests
+    assert ops.get_multi_ctas_kv_counter_size.call_args.args[1] == max_num_requests
+
+
 def test_dflash_trtllm_gen_buffers_reject_capture_time_allocation():
     wrapper = _fake_dflash_buffer_wrapper()
     device_properties = SimpleNamespace(multi_processor_count=148)
@@ -500,8 +521,10 @@ def test_dflash_trtllm_gen_buffers_reject_capture_time_allocation():
         _prepare_dflash_buffers(wrapper, 2)
 
     with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+        # 16 requests exceed the 2 * block_size decode rows the first call can
+        # have sized for, so the workspace must grow whatever the rows ceiling.
         with pytest.raises(RuntimeError, match="workspace.*before CUDA graph capture"):
-            _prepare_dflash_buffers(wrapper, 4)
+            _prepare_dflash_buffers(wrapper, 16)
 
         wrapper._dflash_trtllm_gen_counters = torch.empty(16, dtype=torch.uint8, device="meta")
         with pytest.raises(RuntimeError, match="counter buffer.*before CUDA graph capture"):
