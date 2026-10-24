@@ -22,8 +22,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_buffers
   LABELS
-  "unit;runtime;gpu"
-  REQUIRES_GPU)
+  "unit;runtime;gpu")
 add_tllm_gtest(
   cudaMemPoolTest
   OWNER
@@ -33,8 +32,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_memory
   LABELS
-  "unit;runtime;gpu"
-  REQUIRES_GPU)
+  "unit;runtime;gpu")
 add_tllm_gtest(gdrcopyTest SOURCES gdrcopyTest.cpp FULL_STACK LABELS
                "unit;full-stack;gpu")
 add_tllm_gtest(
@@ -110,8 +108,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_buffers
   LABELS
-  "unit;runtime;gpu"
-  REQUIRES_GPU)
+  "unit;runtime;gpu")
 add_tllm_gtest(transposeKVKernelTest SOURCES transposeKVKernelTest.cpp
                FULL_STACK LABELS "unit;full-stack;gpu")
 add_tllm_gtest(utilsTest SOURCES utilsTest.cpp FULL_STACK LABELS
@@ -125,8 +122,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_buffers
   LABELS
-  "unit;runtime;gpu"
-  REQUIRES_GPU)
+  "unit;runtime;gpu")
 add_tllm_gtest(workerPoolTest SOURCES workerPoolTest.cpp FULL_STACK LABELS
                "unit;full-stack;host")
 add_tllm_gtest(

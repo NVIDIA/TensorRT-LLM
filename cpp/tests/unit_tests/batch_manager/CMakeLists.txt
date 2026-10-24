@@ -64,8 +64,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   bufferIndexHolderTest
@@ -76,8 +75,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   capacitySchedulerTest
@@ -88,8 +86,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::batch_scheduler
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   contextProgressTest
@@ -100,8 +97,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::batch_scheduler
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   contextTransferCoordinatorTest SOURCES contextTransferCoordinatorTest.cpp
@@ -127,8 +123,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 # GDS partial-copy cases load the NIXL wrapper at runtime.
 if(TARGET tensorrt_llm_nixl_wrapper)
@@ -148,8 +143,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2ConfigTest
@@ -173,8 +167,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2ColdPageTest
@@ -186,8 +179,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   coldPageCodecTest
@@ -198,8 +190,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2TypedIndexTest
@@ -223,8 +214,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2HostMemBackingTest
@@ -236,8 +226,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2StagingBufferTest
@@ -249,8 +238,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2StatsTest
@@ -262,8 +250,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2SlotAllocatorTest
@@ -299,8 +286,7 @@ add_tllm_gtest(
   tllm::kv_cache
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2DigestPoolTest
@@ -323,8 +309,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   llmRequestTest
@@ -335,8 +320,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   microBatchSchedulerTest
@@ -347,8 +331,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::batch_scheduler
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(peftCacheManagerTest SOURCES peftCacheManagerTest.cpp FULL_STACK
                LABELS "unit;full-stack;gpu")
@@ -376,5 +359,4 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kv_cache_legacy
   LABELS
-  "unit;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;batch-manager;gpu")
