@@ -259,6 +259,20 @@ set_target_properties(
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Keep host code, unwind tables, and the GOT within PC-relative addressing
+  # range by placing large CUDA payloads after host data.
+  set(CUDA_FATBIN_LINKER_SCRIPT
+      "${PROJECT_SOURCE_DIR}/cmake/templates/cuda_fatbin.ld")
+  foreach(target ${SHARED_TARGET} ${DECODER_SHARED_TARGET_0}
+                 ${DECODER_SHARED_TARGET_1})
+    target_link_options(${target} PRIVATE
+                        "LINKER:-T,${CUDA_FATBIN_LINKER_SCRIPT}")
+    set_property(TARGET ${target} APPEND
+                 PROPERTY LINK_DEPENDS "${CUDA_FATBIN_LINKER_SCRIPT}")
+  endforeach()
+endif()
+
 # Keep statically linked NVRTC symbols local so they cannot be interposed by a
 # dynamic NVRTC loaded elsewhere in the process.
 if(NOT WIN32 AND NOT NVRTC_DYNAMIC_LINKING)
@@ -270,15 +284,43 @@ endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
-target_link_libraries(
-  ${SHARED_TARGET}
-  PRIVATE
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_common_cuda,tllm_executor_types,tllm_executor_serialization,tllm_runtime_memory,tllm_runtime_buffers,tllm_runtime_distributed,tllm_runtime_topology>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_environment,tllm_executor_values,tllm_executor_transfer_agent,tllm_kv_cache_host_memory,tllm_kv_cache,tllm_kv_cache_legacy,tllm_batch_scheduler,tllm_kernel_kv_cache_copy>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+foreach(
+  component
+  tllm_common_error
+  tllm_common_logging
+  tllm_common_cuda
+  tllm_executor_types
+  tllm_executor_serialization
+  tllm_runtime_memory
+  tllm_runtime_buffers
+  tllm_runtime_distributed
+  tllm_runtime_topology
+  tllm_common_cublas
+  tllm_common_environment
+  tllm_executor_values
+  tllm_executor_transfer_agent
+  tllm_kv_cache_host_memory
+  tllm_kv_cache
+  tllm_kv_cache_legacy
+  tllm_batch_scheduler
+  tllm_kernel_kv_cache_copy
+  ${BATCH_MANAGER_TARGET}
+  ${EXECUTOR_TARGET}
+  fp8_blockscale_gemm_src
+  ${INTERNAL_CUTLASS_KERNELS_TARGET})
+  target_link_libraries(${SHARED_TARGET}
+                        PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
+endforeach()
+
+foreach(component IN LISTS TLLM_KERNEL_COMPONENT_TARGETS)
+  target_link_libraries(${SHARED_TARGET}
+                        PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
+  set_property(TARGET ${SHARED_TARGET}
+               PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
+endforeach()
+
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_cublas WHOLE_ARCHIVE)
 
 # Components also link each other normally; retain all component exports here.
 set_property(TARGET ${SHARED_TARGET}
