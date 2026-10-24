@@ -26,6 +26,11 @@
 #include <torch/extension.h>
 #include <unordered_map>
 
+#include <algorithm>
+#include <cstring>
+#include <map>
+#include <tuple>
+
 using torch::Tensor;
 
 TRTLLM_NAMESPACE_BEGIN
@@ -184,9 +189,75 @@ inline at::Tensor const& getWorkspaceTensor(c10::Device device, cudaStream_t str
     return workspace_tensors[key];
 }
 
+// Candidate algorithms for one small-M BF16 GEMM on SM 121, indexed by the autotuner's tactic.
+struct BF16Tactics
+{
+    bool hasLegacy; // index 0 is a table algorithm that passed cublasLtMatmulAlgoCheck
+    std::vector<cublasLtMatmulAlgo_t> algorithms;
+};
+
+using BF16TacticKey = std::tuple<int, int32_t, int32_t, int32_t, bool>; // device, m, n, k, bias
+
+std::map<BF16TacticKey, BF16Tactics>& getBF16TacticCache()
+{
+    thread_local std::map<BF16TacticKey, BF16Tactics> cache;
+    return cache;
+}
+
+// Tactics are used only where they were measured: BF16 without scales, M <= 16, SM 121, packed aligned operands.
+bool useBF16Tactics(torch::Tensor const& out, torch::Tensor const& a, torch::Tensor const& b, bool use_scale)
+{
+    auto const aligned = [](torch::Tensor const& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 256 == 0; };
+    return a.scalar_type() == at::kBFloat16 && b.scalar_type() == at::kBFloat16 && out.scalar_type() == at::kBFloat16
+        && !use_scale && a.size(0) <= 16 && tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 121
+        && a.stride(0) == a.size(1) && b.stride(1) == b.size(0) && out.stride(0) == out.size(1) && aligned(a)
+        && aligned(b) && aligned(out);
+}
+
+// Tactic 0 is today's choice, the rest are cuBLASLt's distinct heuristic answers that fit the workspace.
+// Built on first use from the wrapper's descriptors for this GEMM.
+BF16Tactics const& getBF16Tactics(
+    CublasMMWrapper& wrapper, BF16TacticKey const& key, cublasLtMatmulAlgo_t const& algo, bool has_algo)
+{
+    auto& cache = getBF16TacticCache();
+    if (auto it = cache.find(key); it != cache.end())
+    {
+        return it->second;
+    }
+    int32_t const m = std::get<1>(key);
+    int32_t const n = std::get<2>(key);
+    int32_t const k = std::get<3>(key);
+    BF16Tactics tactics{has_algo && wrapper.checkTactic(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, algo), {algo}};
+    for (auto const& heuristic : wrapper.getTactics(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, /*maxAlgorithms=*/64))
+    {
+        // An unchecked index 0 runs without an algorithm, so it cannot be a duplicate.
+        bool const duplicate
+            = std::any_of(tactics.algorithms.begin() + (tactics.hasLegacy ? 0 : 1), tactics.algorithms.end(),
+                [&](cublasLtMatmulAlgo_t const& candidate)
+                { return std::memcmp(&candidate, &heuristic.algo, sizeof(candidate)) == 0; });
+        if (heuristic.state == CUBLAS_STATUS_SUCCESS && heuristic.workspaceSize <= CUBLAS_WORKSPACE_SIZE && !duplicate)
+        {
+            tactics.algorithms.push_back(heuristic.algo);
+        }
+    }
+    return cache.emplace(key, std::move(tactics)).first->second;
+}
+
+// An out-of-range tactic keeps today's choice.
+void selectBF16Tactic(
+    CublasMMWrapper& wrapper, BF16TacticKey const& key, int64_t tactic, cublasLtMatmulAlgo_t& algo, bool& has_algo)
+{
+    auto const& tactics = getBF16Tactics(wrapper, key, algo, has_algo);
+    if (tactic < static_cast<int64_t>(tactics.algorithms.size()))
+    {
+        algo = tactics.algorithms[tactic];
+        has_algo = tactic != 0 || tactics.hasLegacy;
+    }
+}
+
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b,
-    std::optional<at::Tensor> const& bias, bool fast_acc = false)
+    std::optional<at::Tensor> const& bias, bool fast_acc = false, int64_t tactic = -1)
 {
     bool use_scale = false;
     if (scale_a.has_value() && scale_b.has_value())
@@ -257,6 +328,10 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
         cublasWrapper->setScaleDescriptors(a_scale, b_scale);
     if (use_bias)
         cublasWrapper->setBiasDescriptor(bias_ptr);
+    if (tactic >= 0 && useBF16Tactics(out, a, b, use_scale))
+    {
+        selectBF16Tactic(*cublasWrapper, {a.get_device(), m, n, k, use_bias}, tactic, algo, has_algo);
+    }
     cublasWrapper->Gemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*A=*/b_ptr, /*lda=*/k, /*B=*/a_ptr, /*ldb=*/k, out_ptr,
         /*ldc=*/n, 1.0F, 0.0F, algo, has_algo, true);
     cublasWrapper->destroyDescriptors();
@@ -340,6 +415,35 @@ Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Ten
     return cublas_mm_out(mat_a, mat_b, bias, out);
 }
 
+// cublas_mm with an autotuner tactic; -1 runs exactly what cublas_mm runs.
+Tensor cublas_mm_tactic(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias,
+    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind, c10::optional<torch::List<int64_t>> group,
+    int64_t tactic)
+{
+    CHECK_TH_CUDA(mat_a);
+    CHECK_TH_CUDA(mat_b);
+    TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && mat_a.sizes()[1] == mat_b.sizes()[0]);
+    TORCH_CHECK(mat_a.strides()[1] == 1 && mat_b.strides()[0] == 1);
+    auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
+    std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
+    auto [out, _] = torch_ext::allocate_output(
+        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+    cublas_gemm_caller(out, mat_a, mat_b, at::nullopt, at::nullopt, bias, false, tactic);
+    return out;
+}
+
+int64_t cublas_mm_num_tactics(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias)
+{
+    // Builds the candidate list through the normal call path, so counting runs one GEMM, during tuning only.
+    cublas_mm_tactic(mat_a, mat_b, bias, std::nullopt, /*output_buffer_kind=*/0, std::nullopt, /*tactic=*/0);
+    int32_t const m = mat_a.sizes()[0];
+    int32_t const n = mat_b.sizes()[1];
+    int32_t const k = mat_a.sizes()[1];
+    auto const& cache = getBF16TacticCache();
+    auto const it = cache.find({mat_a.get_device(), m, n, k, bias.has_value()});
+    return it == cache.end() ? 0 : static_cast<int64_t>(it->second.algorithms.size());
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -353,10 +457,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype,"
         " int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
+    m.def(
+        "cublas_mm_tactic(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype,"
+        " int output_buffer_kind, int[]? group, int tactic) -> (Tensor out)");
+    m.def("cublas_mm_num_tactics(Tensor mat_a, Tensor mat_b, Tensor? bias) -> int");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("cublas_scaled_mm", &tensorrt_llm::torch_ext::cublas_scaled_mm);
     m.impl("cublas_mm", &tensorrt_llm::torch_ext::cublas_mm);
+    m.impl("cublas_mm_tactic", &tensorrt_llm::torch_ext::cublas_mm_tactic);
+    m.impl("cublas_mm_num_tactics", &tensorrt_llm::torch_ext::cublas_mm_num_tactics);
 }

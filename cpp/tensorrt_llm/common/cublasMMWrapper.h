@@ -115,11 +115,12 @@ public:
         int const lda, int const ldb, int const ldc, cublasLtMatmulAlgo_t const& algo);
 
     std::vector<cublasLtMatmulHeuristicResult_t> getTactics(cublasOperation_t transa, cublasOperation_t transb,
-        int const m, int const n, int const k, int const lda, int const ldb, int const ldc);
+        int const m, int const n, int const k, int const lda, int const ldb, int const ldc,
+        int const maxAlgorithms = 200);
 
     std::vector<cublasLtMatmulHeuristicResult_t> getTactics(cublasLtHandle_t lightHandle,
         cublasLtMatmulDesc_t computeDesc, cublasLtMatrixLayout_t Adesc, cublasLtMatrixLayout_t Bdesc,
-        cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc);
+        cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc, int const maxAlgorithms = 200);
 
     using MatrixLayout = std::tuple<cudaDataType_t, cublasLtOrder_t, uint64_t, uint64_t>;
     using cache_idx_t = std::tuple<cublasLtMatmulDesc_t, std::array<MatrixLayout, 4>>;
