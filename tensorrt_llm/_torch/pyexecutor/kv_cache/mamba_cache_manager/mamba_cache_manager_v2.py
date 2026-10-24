@@ -522,22 +522,32 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
-        """Describe per-layer recurrent geometry for resharding across TP."""
+        """Describe per-layer recurrent geometry for resharding across TP.
+
+        With the FP4 MLA cache layout, the policy's HP ring geometry joins
+        them.
+        """
+        layouts = {}
+        if self._attention_cache_layout_policy is not None:
+            layouts.update(self._fp4_mla_disagg_role_layouts())
         if self.local_num_mamba_layers == 0:
-            return {}
+            return layouts
         d_conv_m1 = int(self.conv_state_shape[1])
         _, head_dim, d_state = self.ssm_state_shape
-        return {
-            MambaRole.CONV_STATE: RoleLayout(
-                section_bytes=tuple(
-                    int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
-                    for dim in self.conv_section_dims
-                )
-            ),
-            MambaRole.SSM_STATE: RoleLayout(
-                bytes_per_head=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
-            ),
-        }
+        layouts.update(
+            {
+                MambaRole.CONV_STATE: RoleLayout(
+                    section_bytes=tuple(
+                        int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
+                        for dim in self.conv_section_dims
+                    )
+                ),
+                MambaRole.SSM_STATE: RoleLayout(
+                    bytes_per_head=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
+                ),
+            }
+        )
+        return layouts
 
     def _extra_scratch_bytes_per_slot(self) -> int:
         return 0

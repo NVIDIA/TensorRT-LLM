@@ -67,7 +67,10 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 )
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    AttentionPolicy,
+    RingMapper,
+)
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
@@ -1348,6 +1351,16 @@ class Sender(SenderBase):
         fall out of the same intersection without any per-case arithmetic.
         Ordinals below ``dst_start_block`` are excluded as well.
         """
+        idx = Sender._paired_ordinals(src_block_ids, dst_block_ids, dst_start_block)
+        return src_block_ids[idx], dst_block_ids[idx]
+
+    @staticmethod
+    def _paired_ordinals(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        dst_start_block: int = 0,
+    ) -> np.ndarray:
+        """Table positions where both sides hold a block (see ``_pair_ordinals``)."""
         if src_block_ids.size != dst_block_ids.size:
             raise ValueError(
                 f"positional block tables differ in length: src={src_block_ids.size} "
@@ -1356,8 +1369,28 @@ class Sender(SenderBase):
         mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
         if dst_start_block > 0:
             mask[:dst_start_block] = False
-        idx = np.flatnonzero(mask)
-        return src_block_ids[idx], dst_block_ids[idx]
+        return np.flatnonzero(mask)
+
+    @staticmethod
+    def _ring_position_ranges(
+        global_ordinals: np.ndarray,
+        tokens_per_block: int,
+        end_position: int,
+        retained_positions: int,
+    ) -> list[tuple[int, int]]:
+        """Most recent positions each ring page holds at ``end_position``.
+
+        A ring page holds only the positions of its own block, and of those
+        only the last ``retained_positions`` before ``end_position`` survive
+        in both rings.
+        """
+        first = max(0, end_position - retained_positions)
+        ranges = []
+        for ordinal in global_ordinals:
+            start = max(first, int(ordinal) * tokens_per_block)
+            end = min(end_position, (int(ordinal) + 1) * tokens_per_block)
+            ranges.append((start, max(start, end)))
+        return ranges
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1424,7 +1457,8 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
+                helix_stride = peer_ri.cp_size > 1 and self_ri.cp_size == 1
+                if helix_stride:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
@@ -1438,9 +1472,10 @@ class Sender(SenderBase):
                 # held), so pairing is a plain intersection: SWA eviction, prefix
                 # reuse, and pipelined chunk bounds are all already encoded as
                 # holes by whichever side owns that state.
-                src_block_ids, dst_block_ids = Sender._pair_ordinals(
+                paired = Sender._paired_ordinals(
                     src_block_ids, dst_block_ids, dst_start_block=dst_start_block
                 )
+                src_block_ids, dst_block_ids = src_block_ids[paired], dst_block_ids[paired]
                 if src_block_ids.size == 0:
                     continue
                 src_region = extractor.extract(src_block_ids, self_lg, self_pi)
@@ -1448,7 +1483,24 @@ class Sender(SenderBase):
 
             # Map and collect fragments (same for all layer types)
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-            region_pair = mapper.map(src_region, dst_region)
+            if isinstance(mapper, RingMapper):
+                # A ring holds positions, not a region: move the positions both
+                # rings retain at the end of this piece into each side's slots.
+                global_ordinals = (
+                    paired * peer_ri.cp_size + peer_ri.cp_rank if helix_stride else paired
+                )
+                region_pair = mapper.map_positions(
+                    src_region.memory.ptrs,
+                    dst_region.memory.ptrs,
+                    Sender._ring_position_ranges(
+                        global_ordinals,
+                        tpb,
+                        int(token_range.end),
+                        mapper.retained_positions,
+                    ),
+                )
+            else:
+                region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
             for rp in region_pairs:
                 src_frag_parts.append(rp.src.memory.ptrs)

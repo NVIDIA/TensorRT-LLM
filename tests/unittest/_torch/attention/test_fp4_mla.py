@@ -1473,6 +1473,82 @@ def test_fp4_mla_disagg_import_rebuild_matches_context_cache_update(
         manager.shutdown()
 
 
+def test_fp4_mla_hp_ring_content_depends_only_on_position(monkeypatch) -> None:
+    """A context prefill leaves the same BF16 tail in rings of different sizes.
+
+    A context worker without speculative decoding keeps a 16-slot HP ring and a
+    generation worker with five draft tokens keeps 21 slots. The disaggregated
+    transfer moves each retained position from slot ``p % 16`` to slot
+    ``p % 21``; that reproduces the generation worker's own prefill only if the
+    ring holds the same values at those slots, which this checks against a
+    generation-shaped manager prefilling the same latents.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FP4 MLA (NVFP4 KV cache) requires Blackwell or newer")
+    _reset_triton_allocator()
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    torch.manual_seed(0)
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    # Partial tiles of 1 and 15 tokens, one ending in a later page, and an
+    # exact tile multiple that leaves no tail.
+    seq_lens = [page_size + 1, 2 * page_size - 1, 37, 48]
+    num_pages = sum((seq_len + page_size - 1) // page_size for seq_len in seq_lens)
+    managers = []
+    try:
+        for spec_config in (None, MTPDecodingConfig(max_draft_len=5)):
+            manager = _create_fp4_mla_v2_manager(
+                max_tokens=num_pages * page_size,
+                max_seq_len=2 * page_size,
+                max_batch_size=len(seq_lens),
+                spec_config=spec_config,
+            )
+            managers.append(manager)
+            manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
+            for pool in manager._iter_fp4_mla_physical_pool_views():
+                pool.view(torch.uint8).zero_()
+        ctx, gen = managers
+        assert ctx.fp4_mla_hp_pool_size == HP_BLOCK_SIZE
+        assert gen.fp4_mla_hp_pool_size == HP_BLOCK_SIZE + 5
+
+        latent = (
+            torch.randn(sum(seq_lens), 576, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        for manager in managers:
+            scatter_fp4_mla_kv_cache(
+                _build_multi_seq_metadata(manager, seq_lens=seq_lens, page_size=page_size),
+                latent,
+                layer_idx=0,
+                token_offset=0,
+                phase="context",
+                local_layer=0,
+                v_head_dim=512,
+            )
+        torch.cuda.synchronize()
+
+        def ring_tokens(manager, request_id, seq_len):
+            page = manager._get_batch_cache_indices_by_pool_id(
+                [request_id],
+                pool_id=manager.get_fp4_mla_page_table_spec(0).hp_pool_id,
+                is_kv_aggregate=False,
+            )[0][(seq_len - 1) // page_size]
+            ring = manager.get_fp4_mla_hp_pool()[page, 0, 0].view(-1, 576)
+            tail = range(seq_len - seq_len % HP_BLOCK_SIZE, seq_len)
+            return ring[[p % manager.fp4_mla_hp_pool_size for p in tail]], tail
+
+        for request_id, seq_len in enumerate(seq_lens):
+            ctx_tail, tail = ring_tokens(ctx, request_id, seq_len)
+            gen_tail, _ = ring_tokens(gen, request_id, seq_len)
+            assert len(tail) == seq_len % HP_BLOCK_SIZE
+            # Every tail token was written, so the comparison is not vacuous.
+            assert gen_tail.ne(0).any(dim=1).all()
+            assert torch.equal(ctx_tail, gen_tail)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        for manager in managers:
+            manager.shutdown()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
