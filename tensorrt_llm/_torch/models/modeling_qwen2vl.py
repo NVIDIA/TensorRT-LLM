@@ -1621,6 +1621,22 @@ class Qwen2_5_VLVisionAttention(Attention):
             k.copy_(
                 RotaryEmbedding.apply_rotary_pos_emb(
                     k.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
+        elif (q.shape == k.shape and q.stride() == k.stride()
+              and q.dtype == k.dtype and q.device == k.device
+              and q.stride(1) == self.head_dim and q.stride(2) == 1 and
+              (seq_len == 1 or q.stride(0) >= 2 * q.shape[1] * self.head_dim)
+              and q.untyped_storage().data_ptr()
+              == k.untyped_storage().data_ptr() and k.storage_offset()
+              == q.storage_offset() + q.shape[1] * self.head_dim):
+            # Adjacent Q/K heads share one projection buffer; V is untouched.
+            qk = q.as_strided(
+                (1, seq_len, 2 * q.shape[1], self.head_dim),
+                (seq_len * q.stride(0), q.stride(0), self.head_dim, 1))
+            _flash_attn_apply_rotary(qk,
+                                     cos,
+                                     sin,
+                                     interleaved=False,
+                                     inplace=True)
         else:
             # flash_attn Triton kernel: single launch per tensor. cos/sin
             # are expected as `[seqlen, head_dim/2]`. The PyTorch path

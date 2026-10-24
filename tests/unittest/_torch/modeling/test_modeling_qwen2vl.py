@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionPatchEmbed
@@ -10,6 +12,7 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VisionModel,
     Qwen2_5_VLVisionAttention,
 )
+from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionAttention
 
 
 @pytest.mark.cpu_only
@@ -58,9 +61,13 @@ def test_qwen2_5_vision_patch_projection_matches_conv3d(monkeypatch) -> None:
 
 
 def _make_vision_attention(
-    fused_qkv: torch.Tensor, *, head_dim: int, support_fused_qkv: bool
+    fused_qkv: torch.Tensor,
+    *,
+    head_dim: int,
+    support_fused_qkv: bool,
+    attention_cls: type[Qwen2_5_VLVisionAttention] = Qwen2_5_VLVisionAttention,
 ) -> tuple[Qwen2_5_VLVisionAttention, dict[str, object]]:
-    attention = Qwen2_5_VLVisionAttention.__new__(Qwen2_5_VLVisionAttention)
+    attention = attention_cls.__new__(attention_cls)
     torch.nn.Module.__init__(attention)
     attention.head_dim = head_dim
     attention.q_size = fused_qkv.shape[-1] // 3
@@ -77,6 +84,87 @@ def _make_vision_attention(
     attention.forward_impl = forward_impl
     attention.o_proj = lambda output, layer_idx: output
     return attention, forwarded
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(modeling_qwen2vl._flash_attn_apply_rotary is None, reason="flash_attn required")
+@pytest.mark.parametrize("attention_cls", [Qwen2_5_VLVisionAttention, Qwen3VLVisionAttention])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(1, 1, 72), (7, 4, 80), (128, 16, 72), (513, 16, 80)])
+@pytest.mark.parametrize("row_step", [1, 2])
+def test_qwen_vl_vision_packed_rope_cuda(
+    attention_cls: type[Qwen2_5_VLVisionAttention],
+    dtype: torch.dtype,
+    shape: tuple[int, int, int],
+    row_step: int,
+) -> None:
+    seq_len, num_heads, head_dim = shape
+    # Include a nonzero storage offset and padding between projection rows.
+    storage = torch.randn(
+        seq_len * row_step + 1, 3 * num_heads * head_dim, device="cuda", dtype=dtype
+    )
+    original = storage.clone()
+    fused_qkv = storage[1::row_step]
+    expected_qkv = original[1::row_step]
+    attention, _ = _make_vision_attention(
+        fused_qkv, head_dim=head_dim, support_fused_qkv=True, attention_cls=attention_cls
+    )
+    cos = torch.randn(seq_len, head_dim // 2, device="cuda", dtype=dtype)
+    sin = torch.randn_like(cos)
+    rotary = modeling_qwen2vl._flash_attn_apply_rotary
+    for tensor in expected_qkv.split(num_heads * head_dim, dim=-1)[:2]:
+        rotary(
+            tensor.view(1, seq_len, num_heads, head_dim), cos, sin, interleaved=False, inplace=True
+        )
+
+    with patch.object(modeling_qwen2vl, "_flash_attn_apply_rotary", wraps=rotary) as calls:
+        attention.apply_rope(
+            *fused_qkv.split(num_heads * head_dim, dim=-1),
+            position_embeddings=(cos, sin),
+        )
+    assert torch.equal(storage, original)
+    assert calls.call_count == 1
+    assert calls.call_args.args[0].shape == (1, seq_len, 2 * num_heads, head_dim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(modeling_qwen2vl._flash_attn_apply_rotary is None, reason="flash_attn required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["separate", "gap", "dim_stride", "different_stride"])
+def test_qwen_vl_vision_rope_layout_fallback_cuda(dtype: torch.dtype, layout: str) -> None:
+    seq_len, num_heads, head_dim = 7, 4, 80
+    fused_qkv = torch.randn(seq_len, 3, num_heads, head_dim, device="cuda", dtype=dtype)
+    if layout == "dim_stride":
+        fused_qkv = fused_qkv[..., ::2]
+    q, k, v = fused_qkv.unbind(dim=1)
+    if layout == "separate":
+        q, k = (
+            torch.empty_strided(t.shape, t.stride(), device=t.device, dtype=t.dtype).copy_(t)
+            for t in (q, k)
+        )
+    elif layout == "gap":
+        k, v = v, k
+    elif layout == "different_stride":
+        k = k.clone()
+    original_v = v.clone()
+    expected_q, expected_k = q.clone(), k.clone()
+    cos = torch.randn(seq_len, q.shape[-1] // 2, device="cuda", dtype=dtype)
+    sin = torch.randn_like(cos)
+    rotary = modeling_qwen2vl._flash_attn_apply_rotary
+    for tensor in (expected_q, expected_k):
+        rotary(tensor.unsqueeze(0), cos, sin, interleaved=False, inplace=True)
+    attention = Qwen2_5_VLVisionAttention.__new__(Qwen2_5_VLVisionAttention)
+    torch.nn.Module.__init__(attention)
+    attention.head_dim = q.shape[-1]
+
+    with patch.object(modeling_qwen2vl, "_flash_attn_apply_rotary", wraps=rotary) as calls:
+        actual = attention.apply_rope(
+            q.flatten(1), k.flatten(1), v.flatten(1), position_embeddings=(cos, sin)
+        )
+    assert calls.call_count == 2
+    for tensor, expected in zip(actual, (expected_q, expected_k, original_v)):
+        assert torch.equal(tensor, expected.flatten(1))
+    assert torch.equal(v, original_v)
 
 
 @pytest.mark.cpu_only
@@ -169,7 +257,7 @@ def test_qwen2_5_vision_attention_reuses_fused_qkv(
     torch.testing.assert_close(actual_q.reshape_as(expected_q), expected_q)
     torch.testing.assert_close(actual_k.reshape_as(expected_k), expected_k)
     torch.testing.assert_close(actual_v, original_v)
-    assert len(kernel_calls) == {"torch": 0, "flash_attn": 2, "flashinfer": 1}[rope_impl]
+    assert len(kernel_calls) == {"torch": 0, "flash_attn": 1, "flashinfer": 1}[rope_impl]
     if support_fused_qkv:
         assert forwarded["q"] is fused_qkv
         assert forwarded["k"] is None
