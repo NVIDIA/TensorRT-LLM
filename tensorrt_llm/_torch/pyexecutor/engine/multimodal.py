@@ -21,6 +21,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
@@ -138,6 +139,17 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
         )
         return False
     return enabled
+
+
+def use_mrope(model: nn.Module) -> bool:
+    """Whether the model's rope scaling is multimodal RoPE."""
+    use_mrope = False
+    try:
+        use_mrope = model.model_config.pretrained_config.rope_scaling["type"] == "mrope"
+    except Exception:
+        pass
+    logger.debug(f"Detected use_mrope: {use_mrope}")
+    return use_mrope
 
 
 def mm_encoder_cache_enabled(model: nn.Module) -> bool:
@@ -520,44 +532,59 @@ class MultimodalItemScheduler:
                 target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
             )
 
-        try:
-            outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
-        except MultimodalEncoderContractError as error:
-            raise MultimodalEncoderRequestError(
-                str(error), request_ids=producer_request_ids
-            ) from error
-        if len(outputs) != len(output_targets):
-            raise MultimodalEncoderRequestError(
-                "MM item encoder must return one output per item",
-                request_ids=producer_request_ids,
-            )
-
-        expected_dtype, expected_width = self._embedding_dtype_and_width()
-
-        # Validate the entire batch before publishing any output. Otherwise a
-        # bad later item could leave earlier items READY and later requests
-        # admitted to prefill without committed outputs.
-        for output, (item_idx, cache_key, expected_rows) in zip(
-            outputs, output_targets, strict=True
-        ):
-            if (
-                not isinstance(output, torch.Tensor)
-                or output.shape != (expected_rows, expected_width)
-                or output.dtype != expected_dtype
-            ):
-                actual = (
-                    f"a {output.dtype} tensor with shape {tuple(output.shape)}"
-                    if isinstance(output, torch.Tensor)
-                    else type(output).__name__
+        # The vision tower runs outside ModelCaller, so its TP all-reduces can
+        # return NCCL window tensors here. The cache stores clones, so every
+        # window lease produced by this batch ends with the scope. Request-level
+        # failures are raised only after the forward returned and are identical
+        # on every rank, so they are raised once the scope has closed normally:
+        # a failed scope would quarantine this batch's window buffers for the
+        # communicator's lifetime while the executor keeps serving.
+        pending_error: MultimodalEncoderRequestError | None = None
+        with discard_nccl_window_tensor_outputs(encoder_inputs):
+            try:
+                outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
+            except MultimodalEncoderContractError as error:
+                pending_error = MultimodalEncoderRequestError(
+                    str(error), request_ids=producer_request_ids
                 )
-                raise MultimodalEncoderRequestError(
-                    f"MM item {item_idx} must produce a {expected_dtype} tensor "
-                    f"with shape ({expected_rows}, {expected_width}), got {actual}",
-                    request_ids=requests_using_cache_keys({cache_key}),
+                pending_error.__cause__ = error
+            if pending_error is None and len(outputs) != len(output_targets):
+                pending_error = MultimodalEncoderRequestError(
+                    "MM item encoder must return one output per item",
+                    request_ids=producer_request_ids,
                 )
 
-        for output, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
-            encoder_cache.commit(cache_key, output)
+            if pending_error is None:
+                expected_dtype, expected_width = self._embedding_dtype_and_width()
+
+                # Validate the entire batch before publishing any output. Otherwise a
+                # bad later item could leave earlier items READY and later requests
+                # admitted to prefill without committed outputs.
+                for output, (item_idx, cache_key, expected_rows) in zip(
+                    outputs, output_targets, strict=True
+                ):
+                    if (
+                        not isinstance(output, torch.Tensor)
+                        or output.shape != (expected_rows, expected_width)
+                        or output.dtype != expected_dtype
+                    ):
+                        actual = (
+                            f"a {output.dtype} tensor with shape {tuple(output.shape)}"
+                            if isinstance(output, torch.Tensor)
+                            else type(output).__name__
+                        )
+                        pending_error = MultimodalEncoderRequestError(
+                            f"MM item {item_idx} must produce a {expected_dtype} tensor "
+                            f"with shape ({expected_rows}, {expected_width}), got {actual}",
+                            request_ids=requests_using_cache_keys({cache_key}),
+                        )
+                        break
+
+            if pending_error is None:
+                for output, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
+                    encoder_cache.commit(cache_key, output)
+        if pending_error is not None:
+            raise pending_error
 
         # Every scheduled key is now committed. One pass over the requests
         # also marks the items of requests that only share a committed entry.

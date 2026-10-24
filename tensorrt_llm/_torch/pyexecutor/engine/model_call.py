@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import (
     get_model_extra_attrs,
     get_per_request_prefill_cuda_graph_flag,
@@ -75,6 +76,11 @@ class ModelCaller:
             else contextlib.nullcontext()
         )
         with compile_scope:
-            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-                return trace_func(self._model.forward)(**kwargs)
-            return self._model.forward(**kwargs)
+            # This boundary stays outside torch.compile, so one lease scope covers
+            # eager, compiled, and CUDA-graph model execution.
+            with nccl_window_tensor_scope(kwargs) as scope:
+                if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                    outputs = trace_func(self._model.forward)(**kwargs)
+                else:
+                    outputs = self._model.forward(**kwargs)
+                return scope.escape(outputs)

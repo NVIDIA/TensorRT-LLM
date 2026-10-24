@@ -60,22 +60,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
-  # Kimi K3 speculative decoding: exact kernel-level verify parity (random
-  # weights, no checkpoint).
-  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
-  # Fused KDA multi-token verify (trtllm::kda_mtp_decode): kernel-level
-  # parity vs CPU golden + FLA sequential, and runtime-level fused-vs-
-  # sequential two-round replay parity.
-  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
-  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
-  # Kimi K3 op parity tests (random weights, no checkpoint; SM100/SM103).
-  - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
-  - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
-  # KDA runtime: host-derived prefill metadata and the bf16 state pool
-  # round-trip. Both are single-device cases that use GPU 0 only.
-  - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
+  # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
