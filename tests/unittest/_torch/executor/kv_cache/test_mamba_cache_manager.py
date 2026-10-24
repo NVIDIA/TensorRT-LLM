@@ -85,6 +85,7 @@ from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     CacheTransceiverConfig,
@@ -420,6 +421,33 @@ def test_kimi_explicit_v2_manager_enables_owned_kda_replay_policy(
     assert policy.num_speculative_tokens == spec_config.tokens_per_gen_step - 1
     assert kwargs["conv_state_layout"] == "q_k_v"
     assert "kda_replay_num_spec" not in kwargs
+    assert "kda_draft_records" not in kwargs
+
+
+@pytest.mark.parametrize("backbone_asks", [True, False])
+def test_kimi_explicit_v2_manager_kda_draft_records_follow_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+    backbone_asks: bool,
+) -> None:
+    """The factory asks the V2 manager for per-token KDA verify states only when
+    the model's backbone sets ``kda_draft_records``."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        lambda: True,
+    )
+    backbone = SimpleNamespace(kda_draft_records=True) if backbone_asks else SimpleNamespace()
+    model_engine = SimpleNamespace(
+        model=SimpleNamespace(model=backbone),
+        max_cuda_graph_batch_size=4,
+        input_processor=MagicMock(spec=BaseMultimodalInputProcessor),
+    )
+
+    _, kwargs = _capture_kimi_v2_manager_ctor(
+        monkeypatch, MTPDecodingConfig(max_draft_len=3), model_engine
+    )
+
+    assert "kda_replay_num_spec" not in kwargs
+    assert kwargs.get("kda_draft_records", False) is backbone_asks
 
 
 @pytest.mark.parametrize("max_draft_len, replay_enabled", [(7, True), (8, False)])
@@ -5462,32 +5490,6 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
 
     # Reset 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4 and 2; 7 untouched.
     assert policy.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 0, 8]
-
-
-@pytest.mark.parametrize("backbone_asks", [True, False])
-def test_kimi_explicit_v2_manager_kda_draft_records_follow_the_model(
-    monkeypatch: pytest.MonkeyPatch,
-    backbone_asks: bool,
-) -> None:
-    """The factory asks the V2 manager for per-token KDA verify states only when
-    the model's backbone sets ``kda_draft_records``."""
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
-        lambda: True,
-    )
-    backbone = SimpleNamespace(kda_draft_records=True) if backbone_asks else SimpleNamespace()
-    model_engine = SimpleNamespace(
-        model=SimpleNamespace(model=backbone),
-        _max_cuda_graph_batch_size=4,
-        is_multimodal=True,
-    )
-
-    _, kwargs = _capture_kimi_v2_manager_ctor(
-        monkeypatch, MTPDecodingConfig(max_draft_len=3), model_engine
-    )
-
-    assert "kda_replay_num_spec" not in kwargs
-    assert kwargs.get("kda_draft_records", False) is backbone_asks
 
 
 @skip_no_cuda

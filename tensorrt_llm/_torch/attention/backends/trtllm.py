@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
                     List, Optional, Tuple)
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -139,6 +140,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
+    # Block offsets of the mixed-precision staging cache, swapped in for
+    # kv_cache_block_offsets while a mixed-precision layer runs.
+    _mixed_precision_block_offsets: Optional[torch.Tensor] = field(
+        init=False, default=None, repr=False, compare=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -1144,6 +1149,48 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
+
+        if self._has_mixed_precision_kv():
+            # Native BF16 paged-context FMHA reads 32-token pages.
+            self.prepare_mixed_precision_kv(
+                "HND", min(self.kv_cache_manager.tokens_per_block, 32))
+
+    def _on_mixed_precision_kv_prepared(self, view) -> None:
+        """Lay out the staging pages as TRTLLM block offsets for this batch."""
+        batch = len(view.page_counts)
+        # Filled with numpy on a pinned host table: per-step torch CPU ops
+        # each open an OpenMP parallel region, which stalls on a busy host.
+        host = torch.full((1, batch, 2, view.max_blocks_per_seq),
+                          -1,
+                          dtype=torch.int32,
+                          pin_memory=prefer_pinned())
+        table = host.numpy()
+        for row, (start,
+                  count) in enumerate(zip(view.page_starts, view.page_counts)):
+            pages = np.arange(start, start + count,
+                              dtype=np.int32) * view.kv_factor
+            table[0, row, 0, :count] = pages
+            table[0, row, 1, :count] = pages + view.kv_factor - 1
+        block_offsets = view.buffers.get_buffer(
+            (1, view.rows, 2, view.max_blocks_per_seq),
+            torch.int32,
+            "mixed_block_offsets",
+            self.is_cuda_graph,
+        )[:, :batch]
+        block_offsets.copy_(host, non_blocking=True)
+        self._mixed_precision_block_offsets = block_offsets
+
+    def _swap_mixed_precision_kv(self, view) -> tuple:
+        """Also point the block offsets at the staging pages."""
+        saved = (*super()._swap_mixed_precision_kv(view),
+                 self.kv_cache_block_offsets)
+        self.kv_cache_block_offsets = self._mixed_precision_block_offsets
+        return saved
+
+    def _restore_mixed_precision_kv(self, saved: tuple) -> None:
+        """Undo _swap_mixed_precision_kv, block offsets included."""
+        super()._restore_mixed_precision_kv(saved[:2])
+        self.kv_cache_block_offsets = saved[2]
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
