@@ -2777,6 +2777,37 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         mgr.shutdown()
 
 
+def test_v2_hybrid_fp4_mla_snapshot_realignment_logs_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
+
+    messages = []
+    monkeypatch.setattr(mamba_cache_manager.logger, "info", messages.append)
+    mgr = SimpleNamespace(
+        _attention_cache_layout_policy=object(),
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        _fp4_mla_snapshot_realignment_logged=False,
+    )
+    align = MambaHybridCacheManagerV2._align_fp4_mla_snapshot_points
+
+    aligned = SimpleNamespace(py_request_id=1, expect_snapshot_points=[128, 256])
+    align(mgr, aligned)
+    assert aligned.expect_snapshot_points == [128, 256]
+    assert messages == []
+
+    moved = SimpleNamespace(py_request_id=2, expect_snapshot_points=[100, 1000])
+    align(mgr, moved)
+    assert moved.expect_snapshot_points == [896]
+    assert len(messages) == 1
+    assert "[100, 1000] -> [896]" in messages[0]
+
+    again = SimpleNamespace(py_request_id=3, expect_snapshot_points=[300])
+    align(mgr, again)
+    assert again.expect_snapshot_points == [256]
+    assert len(messages) == 1
+
+
 @skip_no_cuda
 def test_v2_hybrid_fp4_mla_reuses_prefix_at_aligned_snapshot(
     monkeypatch: pytest.MonkeyPatch,
