@@ -948,13 +948,7 @@ def _tool_call_chunk(index, call_id, name, arguments):
 
 
 def test_stream_whitespace_between_blocks_opens_no_text_block():
-    """Layout between blocks is not a text block of its own.
-
-    DeepSeek-V4.1 writes newlines before and after its tool calls; streamed
-    as text they became whitespace-only text blocks, which Anthropic clients
-    drop when they send the turn back, so the replayed turn differed from the
-    one served.
-    """
+    """Whitespace-only text between blocks opens no text block of its own."""
     events = run_reframer(
         [
             chunk({"reasoning_content": "check the weather"}),
