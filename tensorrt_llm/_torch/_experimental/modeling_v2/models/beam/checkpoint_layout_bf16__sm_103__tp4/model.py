@@ -278,7 +278,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                 )
             catalog = SafetensorsCatalog(checkpoint_dir)
             catalog.validate(tensor_specs(self.config), complete=True)
-        except (OSError, ValueError) as exc:
+        except Exception as exc:  # Keep rank-local failures inside the collective protocol.
             error = exc
         if not self._agree(error is None):
             raise LoadError(
@@ -288,8 +288,10 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.usable = False
         self.load_record = None
         coverage = OrderedDict()
-        reader = TileReader()
+        reader = None
+        bytes_read = reads = 0
         try:
+            reader = TileReader()
             order = sorted(
                 self.specs.values(),
                 key=lambda s: (catalog.entries[s.name].path, catalog.entries[s.name].begin),
@@ -306,11 +308,16 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                     "bank": spec.bank,
                     "slot": spec.expert,
                 }
-        except (OSError, ValueError, RuntimeError) as exc:
+        except Exception as exc:  # Every rank must reach the completion agreement.
             error = exc
         finally:
-            bytes_read, reads = reader.bytes_read, reader.reads
-            reader.close()
+            if reader is not None:
+                bytes_read, reads = reader.bytes_read, reader.reads
+                try:
+                    reader.close()
+                except Exception as exc:  # Cleanup failure must also reach the agreement.
+                    if error is None:
+                        error = exc
         complete = error is None and list(coverage) == [s.name for s in order]
         if not self._agree(complete):
             raise LoadError(

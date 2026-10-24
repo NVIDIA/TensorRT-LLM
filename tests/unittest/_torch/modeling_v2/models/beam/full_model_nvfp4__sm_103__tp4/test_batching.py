@@ -39,6 +39,8 @@ GENERATIONS = ((100, 1), (7, 1))
 @contextlib.contextmanager
 def prepared_step(contexts, generations, *, cache_reuse=True):
     """A one-layer BF16 KVCacheManagerV2 and prepared metadata for one engine step."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
     requests = list(contexts) + list(generations)
     mgr = KVCacheManagerV2(
         KvCacheConfig(max_tokens=64 * TOKENS_PER_BLOCK * len(requests), enable_block_reuse=False),

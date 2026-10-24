@@ -199,8 +199,11 @@ def llm_args(
     """
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
+    from .model import MAX_NUM_TOKENS
     from .weights import BeamNvfp4CheckpointLoader
 
+    if not 1 <= max_num_tokens <= MAX_NUM_TOKENS:
+        raise ValueError(f"max_num_tokens must be in [1, {MAX_NUM_TOKENS}], got {max_num_tokens}")
     return {
         "model": checkpoint,
         "tokenizer": load_tokenizer(checkpoint),

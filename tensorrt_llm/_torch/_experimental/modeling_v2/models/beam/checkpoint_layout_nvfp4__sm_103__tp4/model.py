@@ -326,7 +326,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
             recipe = check_recipe(quant, full)
             catalog = SafetensorsCatalog(checkpoint_dir)
             validate(catalog, stored_entries(full), complete=True)
-        except (OSError, ValueError) as exc:
+        except Exception as exc:  # Keep rank-local failures inside the collective protocol.
             error = exc
         if not self._agree(error is None):
             raise LoadError(
@@ -338,18 +338,20 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self._shared_fc1 = {}
         coverage = OrderedDict()
         scalars = OrderedDict()
-        reader = TileReader()
+        reader = None
+        bytes_read = reads = 0
 
         def first_entry(spec):
             return catalog.entries[
                 spec.name + ".weight" if isinstance(spec, QuantSpec) else spec.name
             ]
 
-        order = sorted(
-            self.specs.values(), key=lambda s: (first_entry(s).path, first_entry(s).begin)
-        )
-        sparse = [layer for layer in self.layers if self.schedule.is_sparse(layer)]
         try:
+            reader = TileReader()
+            order = sorted(
+                self.specs.values(), key=lambda s: (first_entry(s).path, first_entry(s).begin)
+            )
+            sparse = [layer for layer in self.layers if self.schedule.is_sparse(layer)]
             for spec in order:
                 digest = hashlib.sha256() if record_digests else None
                 if isinstance(spec, QuantSpec):
@@ -365,11 +367,16 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
                 }
             for layer in sparse:
                 scalars[layer] = self._load_scalars(catalog, reader, layer)
-        except (OSError, ValueError, RuntimeError) as exc:
+        except Exception as exc:  # Every rank must reach the completion agreement.
             error = exc
         finally:
-            bytes_read, reads = reader.bytes_read, reader.reads
-            reader.close()
+            if reader is not None:
+                bytes_read, reads = reader.bytes_read, reader.reads
+                try:
+                    reader.close()
+                except Exception as exc:  # Cleanup failure must also reach the agreement.
+                    if error is None:
+                        error = exc
         complete = (
             error is None and list(coverage) == [s.name for s in order] and list(scalars) == sparse
         )

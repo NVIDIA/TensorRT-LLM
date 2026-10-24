@@ -134,6 +134,7 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
             assert fallback.is_supported(q, None, None, metadata, forward_args, phase=phase)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fallback_has_kernel", [True, False])
 def test_small_paged_context_uses_fallback_only_with_a_fused_kernel(
     monkeypatch: pytest.MonkeyPatch, fallback_has_kernel: bool
@@ -149,6 +150,7 @@ def test_small_paged_context_uses_fallback_only_with_a_fused_kernel(
         return fallback_has_kernel
 
     monkeypatch.setattr(flashinfer_trtllm_gen, "_fallback_has_paged_context_kernel", kernel_exists)
+    monkeypatch.setattr(flashinfer_trtllm_gen, "get_sm_version", lambda: 100)
     attn = FakeAttention()
     attn.head_dim = 128
     attn.sparse_params = None

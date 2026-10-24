@@ -183,6 +183,7 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
         for name, shape in self._shapes.items():
             tensor = torch.empty(shape, dtype=torch.bfloat16, device=device)
             self.register_parameter(_attribute(name), nn.Parameter(tensor, requires_grad=False))
+        self._loaded = False
 
     def checkpoint_tensors(self) -> "OrderedDict[str, torch.Tensor]":
         """The block's tensors by checkpoint name, in checkpoint order."""
@@ -191,17 +192,26 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
     @torch.no_grad()
     def load_weights(self, weights: Mapping[str, torch.Tensor]) -> None:
         """Copy exactly the block's fifteen tensors, by checkpoint name, BF16, [out, in]."""
+        if not isinstance(weights, Mapping):
+            raise TypeError("weights must be a mapping")
         missing = [n for n in self._shapes if n not in weights]
         unexpected = sorted(n for n in weights if n not in self._shapes)
         if missing or unexpected:
             raise ValueError(f"block weights mismatch: missing {missing}, unexpected {unexpected}")
         for name, shape in self._shapes.items():
             tensor = weights[name]
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor")
             if tuple(tensor.shape) != shape or tensor.dtype != torch.bfloat16:
                 raise ValueError(
                     f"{name}: got {tuple(tensor.shape)} {tensor.dtype}, need {shape} torch.bfloat16"
                 )
-            getattr(self, _attribute(name)).copy_(tensor)
+            if tensor.layout != torch.strided or tensor.device.type not in ("cpu", "cuda"):
+                raise ValueError(f"{name} must be a dense host or CUDA tensor")
+        self._loaded = False
+        for name in self._shapes:
+            getattr(self, _attribute(name)).copy_(weights[name])
+        self._loaded = True
 
     def _check_step(
         self, hidden_states: torch.Tensor, position_ids: torch.Tensor, md: TrtllmAttentionMetadata
@@ -218,6 +228,8 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
             device=self.input_layernorm.device,
             max_tokens=MAX_TOKENS,
         )
+        if not self._loaded:
+            raise ValueError("load_weights must complete before running the block")
 
     @property
     def hidden_size(self) -> int:

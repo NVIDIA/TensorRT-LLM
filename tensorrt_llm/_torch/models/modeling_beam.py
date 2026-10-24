@@ -694,6 +694,11 @@ class BeamForCausalLM(DecoderModelForCausalLM[BeamModel, BeamConfig]):
         """Load a reference-layout state dict exactly (values and dtypes, no casts)."""
         if weight_mapper is not None or params_map or skip_modules or allow_partial_loading:
             raise ValueError("BeamForCausalLM loads complete reference-layout state dicts only")
+        if self.model_config.mapping.tp_size > 1:
+            raise ValueError(
+                "BeamForCausalLM loads unsharded state dicts; use tp_size=1 or the "
+                "ModelingV2 TP4 target"
+            )
         load_beam_state_dict(self, weights)
 
 

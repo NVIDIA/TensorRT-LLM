@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests of the Beam NVFP4 target's channel parser and family routing (generated inputs)."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget, routing_module
@@ -163,3 +165,52 @@ def test_engine_resolver_honors_effective_kv_format(
     else:
         with pytest.raises(ValueError, match="KV cache"):
             _router_index.modeling_v2_resolve(config, args)
+
+
+@pytest.mark.parametrize("max_num_tokens", [0, -1, 8193, 16384])
+def test_launch_rejects_unsupported_token_budget_before_tokenizer(monkeypatch, max_num_tokens):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+        serving,
+    )
+
+    def unexpected_tokenizer(*args):
+        pytest.fail("invalid budget must be rejected before reading the checkpoint")
+
+    monkeypatch.setattr(serving, "load_tokenizer", unexpected_tokenizer)
+    with pytest.raises(ValueError, match="max_num_tokens"):
+        serving.llm_args("unused", max_num_tokens=max_num_tokens)
+
+
+@pytest.mark.parametrize("max_num_tokens", [1, 8192])
+def test_launch_accepts_token_budget_boundaries(monkeypatch, max_num_tokens):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+        serving,
+    )
+
+    tokenizer = object()
+    monkeypatch.setattr(serving, "load_tokenizer", lambda path: tokenizer)
+    args = serving.llm_args("unused", max_num_tokens=max_num_tokens)
+    assert args["max_num_tokens"] == max_num_tokens
+    assert args["tokenizer"] is tokenizer
+
+
+def test_load_pretrained_config_preserves_beam_rope(tmp_path):
+    from tensorrt_llm._torch.models.modeling_beam import BeamConfig
+    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+
+    rope = {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": None,
+    }
+    config = {
+        "model_type": "beam",
+        "num_hidden_layers": 6,
+        "torch_dtype": "bfloat16",
+        "rope_parameters": rope,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    loaded = load_pretrained_config(str(tmp_path))
+    assert isinstance(loaded, BeamConfig)
+    assert loaded.name_or_path == str(tmp_path)
+    assert loaded.torch_dtype == torch.bfloat16
+    assert loaded.rope_parameters == rope
