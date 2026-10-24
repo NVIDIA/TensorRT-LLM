@@ -491,6 +491,13 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
             if real_tokens > bucket.total_tokens:
                 continue
             if seq_lengths is not None and not self._io_adapter.can_replay(bucket, seq_lengths):
+                if isinstance(self._io_adapter, PackedEncoderGraphIOAdapter):
+                    logger.debug_once(
+                        "Multimodal encoder CUDA graph padding guard: running eager because "
+                        f"padding {(bucket.total_tokens / real_tokens - 1) * 100:.2f}% > 25%",
+                        key="multimodal_encoder_padding_guard",
+                    )
+                    return None
                 continue
             if self._config.enable_padding:
                 # Padding path: exact num_contexts match and real_tokens <= bucket budget.

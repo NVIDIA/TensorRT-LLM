@@ -1022,3 +1022,26 @@ def test_packed_padding_guard_preserves_small_calls_and_multi_context(lengths, c
     runner._buckets = [EncoderGraphKey(capacity, len(lengths))]
     bucket = runner._select_bucket(len(lengths), sum(lengths), lengths)
     assert (bucket is not None) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lengths", [[4096], [2048, 2048]])
+def test_padding_guard_logs_once_without_consuming_missing_bucket_warning(lengths):
+    runner = _make_logic_runner(buckets=[EncoderGraphKey(8192, len(lengths))])
+    logger = encoder_graph_module.logger
+    with (
+        mock.patch.object(logger, "log") as log,
+        mock.patch.object(logger, "_appeared_keys", set()),
+    ):
+        for _ in range(2):
+            assert runner.maybe_run(seq_lengths=lengths, inputs={}) is None
+        log.assert_called_once_with(
+            logger.VERBOSE,
+            "Multimodal encoder CUDA graph padding guard: running eager because "
+            "padding 100.00% > 25%",
+        )
+        assert not runner._warned_no_bucket_match
+        assert runner.maybe_run(seq_lengths=[8193] * len(lengths), inputs={}) is None
+        assert log.call_count == 2
+        assert log.call_args.args[0] == logger.WARNING
+        assert "no configured bucket matches" in log.call_args.args[1]
