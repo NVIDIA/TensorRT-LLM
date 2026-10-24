@@ -17,6 +17,10 @@ write after a fault, an operation whose end can never be proven, and registratio
 Transfers copy and call the store outside the driver's lock, so queries never wait on the store
 and one blocked operation never delays another. Each submission check is its own method, so a
 test can subclass the driver and disable exactly one rule.
+
+``TogetherMemoryDriver`` is the same driver registering regions in batches, for the optional
+``RegistersRegionsTogether`` protocol; its single-region ``register`` and ``unregister`` are
+rejected, as for a store that opens its client with the memory it will use.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import enum
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, NoReturn
 
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.store import (
@@ -37,6 +41,7 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     ProbeStatus,
     RegionHandle,
     RegionLayout,
+    RegionSpec,
     RegistrationError,
     RowIO,
     RowResult,
@@ -270,19 +275,8 @@ class MemoryDriver:
         return self._capabilities
 
     def register(self, address: int, nbytes: int, layout: RegionLayout) -> _Registration:
-        try:
-            span = Span(address, nbytes)
-        except ValueError as error:
-            raise DriverRejected(str(error)) from None
-        if layout.nbytes > nbytes:
-            raise DriverRejected(f"layout needs {layout.nbytes} bytes, region has {nbytes}")
-        self._check_region_kind(layout)
         with self._lock:
-            self._require_accepting()
-            for other in self._registrations:
-                if other.live and other.span.overlaps(span):
-                    raise DriverRejected(f"region {span} overlaps a live registration {other.span}")
-            registration = _Registration(span, layout)
+            registration = _Registration(self._validate_region(address, nbytes, layout, ()), layout)
             if self._register_failure is not None:
                 reason, escaped = self._register_failure
                 self._register_failure = None
@@ -548,6 +542,27 @@ class MemoryDriver:
         if layout.memory_kind is MemoryKind.DEVICE and not self._capabilities.device_memory:
             raise DriverRejected("this driver registers host memory only")
 
+    def _validate_region(
+        self, address: int, nbytes: int, layout: RegionLayout, taken: Sequence[Span]
+    ) -> Span:
+        """The span this driver would register for the region, or DriverRejected. ``taken`` are
+        the spans of the same batch, which count as live registrations."""
+        try:
+            span = Span(address, nbytes)
+        except ValueError as error:
+            raise DriverRejected(str(error)) from None
+        if layout.nbytes > nbytes:
+            raise DriverRejected(f"layout needs {layout.nbytes} bytes, region has {nbytes}")
+        self._check_region_kind(layout)
+        self._require_accepting()
+        for other in self._registrations:
+            if other.live and other.span.overlaps(span):
+                raise DriverRejected(f"region {span} overlaps a live registration {other.span}")
+        for other_span in taken:
+            if other_span.overlaps(span):
+                raise DriverRejected(f"region {span} overlaps another of the batch {other_span}")
+        return span
+
     def _check_registered(self, rows: Sequence[RowIO]) -> None:
         for io in rows:
             for span in io.spans:
@@ -755,3 +770,90 @@ class MemoryDriver:
     @staticmethod
     def _indexes(op: MemoryOp, rows: Iterable[int] | None) -> list[int]:
         return list(range(len(op.rows))) if rows is None else list(rows)
+
+
+@dataclass(eq=False)
+class _Batch:
+    """The handle of one ``register_regions`` call: its registrations, revoked together."""
+
+    registrations: list[_Registration]
+    live: bool = True
+
+
+class TogetherMemoryDriver(MemoryDriver):
+    """The in-memory driver as a ``RegistersRegionsTogether``: regions come and go in batches,
+    one handle per ``register_regions`` call, and the single-region ``register`` and
+    ``unregister`` are rejected. Everything else is the in-memory driver's, controls included."""
+
+    def __init__(self, store: MemoryStore, **options: Any) -> None:
+        super().__init__(store, **options)
+        self._batches: list[_Batch] = []
+        self._batch_failure: tuple[str, bool] | None = None
+        self._revocation_failure: str | None = None
+
+    def register(self, address: int, nbytes: int, layout: RegionLayout) -> NoReturn:
+        raise DriverRejected("this driver registers regions together; use register_regions")
+
+    def unregister(self, handle: RegionHandle) -> NoReturn:
+        raise DriverRejected("this driver revokes regions together; use unregister_regions")
+
+    def register_regions(self, specs: Sequence[RegionSpec]) -> _Batch:
+        if not specs:
+            raise DriverRejected("a batch registers at least one region")
+        with self._lock:
+            spans: list[Span] = []
+            for spec in specs:  # all checked before any is kept: a rejection escapes nothing
+                spans.append(self._validate_region(spec.address, spec.nbytes, spec.layout, spans))
+            batch = _Batch(
+                [_Registration(span, spec.layout) for span, spec in zip(spans, specs, strict=True)]
+            )
+            if self._batch_failure is not None:
+                reason, escaped = self._batch_failure
+                self._batch_failure = None
+                if not escaped:
+                    raise RegistrationError(reason)
+                self._keep(batch)  # the store kept the batch before it answered
+                raise RegistrationError(reason, batch)
+            self._keep(batch)
+            return batch
+
+    def unregister_regions(self, handle: RegionHandle) -> None:
+        with self._lock:
+            batch = self._batch(handle)
+            if not batch.live:
+                return
+            for registration in batch.registrations:
+                self._check_region_idle(registration)
+            if self._revocation_failure is not None:
+                reason, self._revocation_failure = self._revocation_failure, None
+                raise StoreError(reason)
+            for registration in batch.registrations:
+                registration.live = False
+            batch.live = False
+
+    # Controls.
+
+    def fail_next_register_regions(self, reason: str, *, escaped: bool) -> None:
+        """Make the next ``register_regions`` raise; with ``escaped`` the store keeps the batch
+        anyway and the error carries its handle."""
+        self._batch_failure = (reason, escaped)
+
+    def fail_next_unregister_regions(self, reason: str) -> None:
+        """Make the next ``unregister_regions`` of a live batch raise, the batch staying live."""
+        self._revocation_failure = reason
+
+    def live_batches(self) -> list[_Batch]:
+        with self._lock:
+            return [batch for batch in self._batches if batch.live]
+
+    # Internals.
+
+    def _keep(self, batch: _Batch) -> None:
+        self._registrations.extend(batch.registrations)
+        self._batches.append(batch)
+
+    def _batch(self, handle: RegionHandle) -> _Batch:
+        self._require_not_closed()
+        if not isinstance(handle, _Batch) or handle not in self._batches:
+            raise ValueError("handle does not belong to this driver")
+        return handle

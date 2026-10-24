@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The in-memory driver: the shared conformance checks run four ways, its controlled mode, and
-proof that every check fails against a driver that breaks exactly the rule it guards."""
+"""The in-memory driver: the shared conformance checks run several ways, its controlled mode, its
+batch-registering variant, and proof that every check fails against a driver that breaks exactly
+the rule it guards."""
 
 from __future__ import annotations
 
@@ -20,7 +21,9 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     Hint,
     OpHandle,
     ProbeStatus,
+    RegionHandle,
     RegionLayout,
+    RegionSpec,
     RegistrationError,
     RowIO,
     RowStatus,
@@ -33,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
 from tensorrt_llm._torch.disaggregation.testing.broken_drivers import (
     BROKEN_ASYNC_CONFORMANCE,
     BROKEN_CONFORMANCE,
+    BROKEN_TOGETHER_CONFORMANCE,
 )
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import (
     SLOT,
@@ -43,10 +47,16 @@ from tensorrt_llm._torch.disaggregation.testing.driver_conformance import (
     Harness,
     Unblock,
     key_of,
+    specs_of,
     statuses,
     wait_until,
 )
-from tensorrt_llm._torch.disaggregation.testing.host_memory import GUARD, HostBuffer, MemoryWindow
+from tensorrt_llm._torch.disaggregation.testing.host_memory import (
+    GUARD,
+    HostBuffer,
+    Memory,
+    MemoryWindow,
+)
 from tensorrt_llm._torch.disaggregation.testing.memory_store import (
     DEFAULT_CAPABILITIES,
     MAX_PROBES_IN_FLIGHT,
@@ -56,6 +66,7 @@ from tensorrt_llm._torch.disaggregation.testing.memory_store import (
     MemoryOp,
     MemoryStore,
     StoredObject,
+    TogetherMemoryDriver,
 )
 from tensorrt_llm._torch.disaggregation.testing.object_trailer import encode_trailer
 
@@ -257,11 +268,14 @@ class TestPoolDriverConformance(DriverConformance):
     def make_driver(self) -> StoreDriver:
         driver = self.pool_driver()
         self.pool = HostBuffer(self.POOL_BYTES)
-        self.handle = driver.register(
-            self.pool.address, self.pool.nbytes, RegionLayout(4, self.POOL_BYTES // 4, "pool")
+        self.handle: RegionHandle = driver.register(
+            self.pool.address, self.pool.nbytes, self.pool_layout()
         )
         self.next_offset = 0
         return driver
+
+    def pool_layout(self) -> RegionLayout:
+        return RegionLayout(4, self.POOL_BYTES // 4, "pool")
 
     def allocate(self, nbytes: int, fill: int, memory_kind: MemoryKind) -> Allocation:
         start = self.next_offset + GUARD  # host memory stands in for either kind in-process
@@ -271,6 +285,137 @@ class TestPoolDriverConformance(DriverConformance):
 
     def shutdown(self, driver: StoreDriver) -> None:
         driver.unregister(self.handle)
+        driver.close()
+
+
+class TestTogetherDriverConformance(TestPoolDriverConformance):
+    """The pool registered as one batch through ``RegistersRegionsTogether``, plus the batch
+    scenarios the in-memory driver can stage."""
+
+    registers_together = True
+    driver_cls: type[TogetherMemoryDriver] = TogetherMemoryDriver
+    capabilities = DEFAULT_CAPABILITIES
+
+    def pool_driver(self) -> TogetherMemoryDriver:
+        return self.driver_cls(MemoryStore(), capabilities=self.capabilities)
+
+    def make_driver(self) -> StoreDriver:
+        driver = self.pool_driver()
+        self.pool = HostBuffer(self.POOL_BYTES)
+        spec = RegionSpec(self.pool.address, self.pool.nbytes, self.pool_layout())
+        self.handle = driver.register_regions([spec])
+        self.next_offset = 0
+        return driver
+
+    def shutdown(self, driver: StoreDriver) -> None:
+        assert isinstance(driver, TogetherMemoryDriver)
+        driver.unregister_regions(self.handle)
+        driver.close()
+
+    def make_together_registration(self) -> tuple[StoreDriver, list[Memory]]:
+        return self.pool_driver(), [HostBuffer(2 * SLOT), HostBuffer(2 * SLOT)]
+
+    def make_failing_together_registrations(self) -> list[tuple[StoreDriver, list[Memory]]]:
+        staged: list[tuple[StoreDriver, list[Memory]]] = []
+        for escaped in (False, True):
+            driver = self.pool_driver()
+            driver.fail_next_register_regions("store refused", escaped=escaped)
+            staged.append((driver, [HostBuffer(2 * SLOT), HostBuffer(2 * SLOT)]))
+        return staged
+
+    def make_busy_together_registration(
+        self,
+    ) -> tuple[StoreDriver, list[Memory], str, threading.Event, Unblock]:
+        store = GatedStore(held={STAGED_KEY})
+        store.gate.clear()
+        driver = self.driver_cls(store, capabilities=self.capabilities)
+        memory: list[Memory] = [HostBuffer(2 * SLOT), HostBuffer(2 * SLOT)]
+        return driver, memory, STAGED_KEY, store.waiting, store.gate.set
+
+
+class TestTogetherMemoryDriver:
+    """What only the batch-registering in-memory driver's controls can stage."""
+
+    def _driver(self, **kwargs: object) -> TogetherMemoryDriver:
+        return TogetherMemoryDriver(MemoryStore(), **kwargs)  # type: ignore[arg-type]
+
+    def test_single_region_calls_are_rejected(self) -> None:
+        driver = self._driver()
+        memory = HostBuffer(SLOT)
+        with pytest.raises(DriverRejected):
+            driver.register(memory.address, SLOT, RegionLayout(SLOT, 1))
+        handle = driver.register_regions(specs_of([memory]))
+        with pytest.raises(DriverRejected):
+            driver.unregister(handle)
+        assert driver.live_batches() == [handle]
+        driver.unregister_regions(handle)
+        assert driver.drain(TIMEOUT) is True
+        driver.close()
+
+    def test_a_batch_is_checked_whole_before_anything_is_registered(self) -> None:
+        driver = self._driver()
+        memory = HostBuffer(2 * SLOT)
+        inside = RegionSpec(memory.address + SLOT, SLOT, RegionLayout(SLOT, 1))
+        with pytest.raises(DriverRejected):
+            driver.register_regions([*specs_of([memory]), inside])  # overlap within the batch
+        with pytest.raises(DriverRejected):
+            driver.register_regions([])
+        assert driver.live_registrations() == [] and driver.live_batches() == []
+        host_only = DriverCapabilities(
+            get=True, put=True, cancel=False, probe=False, max_rows_per_op=None
+        )
+        driver = self._driver(capabilities=host_only)
+        device = RegionSpec(memory.address, SLOT, RegionLayout(SLOT, 1, "kv", MemoryKind.DEVICE))
+        with pytest.raises(DriverRejected):
+            driver.register_regions([device])
+        assert driver.live_registrations() == [] and driver.live_batches() == []
+
+    def test_a_busy_batch_is_not_revoked(self) -> None:
+        driver = self._driver(controlled=True)
+        memory = HostBuffer(SLOT)
+        handle = driver.register_regions(specs_of([memory]))
+        memory.write(b"a" * SLOT, 0)
+        op = driver.put([RowIO(KEY_A, (Span(memory.address, SLOT),))])
+        with pytest.raises(DriverRejected):
+            driver.unregister_regions(handle)
+        driver.transfer(op)
+        driver.publish_results(op)
+        driver.end_access(op)
+        driver.unregister_regions(handle)
+        assert driver.drain(TIMEOUT) is True
+        driver.close()
+
+    @pytest.mark.parametrize("escaped", [True, False])
+    def test_a_failed_batch_hands_out_its_handle_only_when_something_may_be_registered(
+        self, escaped: bool
+    ) -> None:
+        driver = self._driver()
+        memory = HostBuffer(2 * SLOT)
+        driver.fail_next_register_regions("store refused", escaped=escaped)
+        with pytest.raises(RegistrationError) as caught:
+            driver.register_regions(specs_of([memory]))
+        if escaped:
+            assert caught.value.handle is not None
+            assert len(driver.live_registrations()) == 1
+            driver.unregister_regions(caught.value.handle)
+        else:
+            assert caught.value.handle is None
+        assert driver.live_registrations() == []
+        assert driver.drain(TIMEOUT) is True
+        driver.close()
+
+    def test_a_failed_revocation_keeps_the_batch_live_for_a_retry(self) -> None:
+        driver = self._driver()
+        memory = HostBuffer(SLOT)
+        handle = driver.register_regions(specs_of([memory]))
+        driver.fail_next_unregister_regions("rpc timeout")
+        with pytest.raises(StoreError):
+            driver.unregister_regions(handle)
+        assert driver.live_batches() == [handle]
+        assert driver.drain(TIMEOUT) is True
+        with pytest.raises(DriverRejected):
+            driver.close()  # a registration is still live
+        driver.unregister_regions(handle)
         driver.close()
 
 
@@ -1087,7 +1232,7 @@ def _run_check(suite: object, check: str) -> None:
 def _conformance(
     driver_cls: type[MemoryDriver],
     caps: DriverCapabilities,
-    base: type[TestMemoryDriverConformance] = TestMemoryDriverConformance,
+    base: type[DriverConformance] = TestMemoryDriverConformance,
 ) -> DriverConformance:
     suite = type("Suite", (base,), {"driver_cls": driver_cls, "capabilities": caps, "timeout": 0.3})
     return suite()  # type: ignore[no-any-return]
@@ -1114,6 +1259,17 @@ def test_each_async_conformance_check_passes_the_driver_and_fails_the_one_breaki
         _run_check(_conformance(broken, capabilities, asynchronous), check)
 
 
+@pytest.mark.parametrize("rule", sorted(BROKEN_TOGETHER_CONFORMANCE))
+def test_each_together_conformance_check_passes_the_driver_and_fails_the_one_breaking_its_rule(
+    rule: str,
+) -> None:
+    broken, capabilities, check = BROKEN_TOGETHER_CONFORMANCE[rule]
+    together = TestTogetherDriverConformance
+    _run_check(_conformance(TogetherMemoryDriver, capabilities, together), check)
+    with pytest.raises(CHECK_FAILED):
+        _run_check(_conformance(broken, capabilities, together), check)
+
+
 @pytest.mark.parametrize("rule", sorted(BROKEN_MEMORY))
 def test_each_memory_driver_check_fails_the_driver_breaking_its_rule(rule: str) -> None:
     broken, check = BROKEN_MEMORY[rule]
@@ -1133,7 +1289,11 @@ def test_a_skip_on_the_broken_side_is_not_an_expected_failure() -> None:
 
 
 def test_each_broken_driver_breaks_one_rule_and_names_an_existing_check() -> None:
-    pairings = [*BROKEN_CONFORMANCE.values(), *BROKEN_ASYNC_CONFORMANCE.values()]
+    pairings = [
+        *BROKEN_CONFORMANCE.values(),
+        *BROKEN_ASYNC_CONFORMANCE.values(),
+        *BROKEN_TOGETHER_CONFORMANCE.values(),
+    ]
     conformance = [cls for cls, _, _ in pairings]
     memory = [cls for cls, _ in BROKEN_MEMORY.values()]
     assert len(set(conformance + memory)) == len(conformance) + len(memory)

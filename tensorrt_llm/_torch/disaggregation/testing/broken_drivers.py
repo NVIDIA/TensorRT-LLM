@@ -22,6 +22,8 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     ProbeStatus,
     RegionHandle,
     RegionLayout,
+    RegionSpec,
+    RegistrationError,
     RowIO,
     RowResult,
     RowStatus,
@@ -30,7 +32,17 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     faulted,
 )
 
-from .memory_store import DEFAULT_CAPABILITIES, Kind, MemoryDriver, MemoryOp, MemoryStore, _scatter
+from .memory_store import (
+    DEFAULT_CAPABILITIES,
+    Kind,
+    MemoryDriver,
+    MemoryOp,
+    MemoryStore,
+    TogetherMemoryDriver,
+    _Batch,
+    _Registration,
+    _scatter,
+)
 
 _MISS = RowResult(RowStatus.MISS)
 _READY = RowResult(RowStatus.READY)
@@ -465,5 +477,136 @@ BROKEN_ASYNC_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities
         CancelEndsAccessWithTheRowInTheStore,
         DEFAULT_CAPABILITIES,
         "test_cancel_of_a_get_inside_the_store_neither_waits_nor_lies",
+    ),
+}
+
+
+# Drivers breaking a rule of the optional RegistersRegionsTogether protocol.
+
+
+class KeepsTheBatchAfterAFailure(TogetherMemoryDriver):
+    """A failed ``register_regions`` that certifies nothing is registered while the store kept
+    the batch: the memory is now registered with nothing to revoke it by."""
+
+    def register_regions(self, specs: Sequence[RegionSpec]) -> _Batch:
+        try:
+            return super().register_regions(specs)
+        except RegistrationError as error:
+            if error.handle is None:
+                with self._lock:
+                    self._keep(_Batch([_Registration(spec.span, spec.layout) for spec in specs]))
+            raise
+
+
+class RevokesABatchOnlyOnce(TogetherMemoryDriver):
+    def unregister_regions(self, handle: RegionHandle) -> None:
+        with self._lock:
+            if not self._batch(handle).live:
+                raise StoreError("the batch was already revoked")
+        super().unregister_regions(handle)
+
+
+class RevocationKeepsTheRange(TogetherMemoryDriver):
+    def unregister_regions(self, handle: RegionHandle) -> None:
+        with self._lock:
+            batch = self._batch(handle)
+            for registration in batch.registrations:
+                self._check_region_idle(registration)
+            batch.live = False  # its registrations stay live: the range is never freed
+
+
+class RegistersOnlyTheFirstRegion(TogetherMemoryDriver):
+    def register_regions(self, specs: Sequence[RegionSpec]) -> _Batch:
+        return super().register_regions(specs[:1])
+
+
+class RevokesBusyBatches(TogetherMemoryDriver):
+    def _check_region_idle(self, registration: _Registration) -> None:
+        pass
+
+
+class RevokesTheIdleRegionsOfABusyBatch(TogetherMemoryDriver):
+    """Refuses a busy batch, but has already let its idle regions go."""
+
+    def unregister_regions(self, handle: RegionHandle) -> None:
+        with self._lock:
+            busy = 0
+            for registration in self._batch(handle).registrations:
+                try:
+                    self._check_region_idle(registration)
+                except DriverRejected:
+                    busy += 1
+                else:
+                    registration.live = False
+            if busy:
+                raise DriverRejected(f"{busy} region(s) of the batch are busy")
+        super().unregister_regions(handle)
+
+
+class RevokesTheIdleRegionsOfABusyBatchOneAtATime(RevokesTheIdleRegionsOfABusyBatch):
+    """The same, in a driver that takes one batch at a time: it refuses a new registration
+    whatever the idle regions' state, so only a row moved through them tells they are gone."""
+
+    def register_regions(self, specs: Sequence[RegionSpec]) -> _Batch:
+        with self._lock:
+            if self.live_batches():
+                raise DriverRejected("one batch at a time")
+        return super().register_regions(specs)
+
+
+class UnregisterRegionsWaitsForTheTransfer(TogetherMemoryDriver):
+    """Revokes a busy batch once it is idle, instead of refusing: a caller holding something the
+    transfer needs is stuck."""
+
+    def unregister_regions(self, handle: RegionHandle) -> None:
+        with self._lock:
+            self._lock.wait_for(lambda: all(op.access_ended for op in self._ops))
+        super().unregister_regions(handle)
+
+
+# The same, for the checks of RegistersRegionsTogether; the pairing test runs these against the
+# in-memory driver that registers in batches.
+BROKEN_TOGETHER_CONFORMANCE: dict[
+    str, tuple[type[TogetherMemoryDriver], DriverCapabilities, str]
+] = {
+    "a failed batch certifies only what is true": (
+        KeepsTheBatchAfterAFailure,
+        DEFAULT_CAPABILITIES,
+        "test_a_failed_batch_registration_is_revocable_or_left_nothing_behind",
+    ),
+    "unregister_regions is idempotent": (
+        RevokesABatchOnlyOnce,
+        DEFAULT_CAPABILITIES,
+        "test_regions_registered_together_are_revoked_together_and_the_range_freed",
+    ),
+    "unregister_regions frees the range": (
+        RevocationKeepsTheRange,
+        DEFAULT_CAPABILITIES,
+        "test_regions_registered_together_are_revoked_together_and_the_range_freed",
+    ),
+    "every region of a batch is registered": (
+        RegistersOnlyTheFirstRegion,
+        DEFAULT_CAPABILITIES,
+        "test_regions_registered_together_are_revoked_together_and_the_range_freed",
+    ),
+    "a busy batch is not revoked": (
+        RevokesBusyBatches,
+        DEFAULT_CAPABILITIES,
+        "test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy",
+    ),
+    "a busy batch keeps its idle regions": (
+        RevokesTheIdleRegionsOfABusyBatch,
+        DEFAULT_CAPABILITIES,
+        "test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy",
+    ),
+    "a busy batch keeps its idle regions, one batch at a time": (
+        RevokesTheIdleRegionsOfABusyBatchOneAtATime,
+        DEFAULT_CAPABILITIES,
+        "test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy",
+    ),
+    "unregister_regions never waits for the store": (
+        UnregisterRegionsWaitsForTheTransfer,
+        DEFAULT_CAPABILITIES,
+        "test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy",
     ),
 }

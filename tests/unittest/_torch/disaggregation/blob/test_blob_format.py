@@ -12,6 +12,7 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
     RegionLayout,
+    RegionSpec,
     RowIO,
     RowResult,
     RowStatus,
@@ -85,6 +86,15 @@ def test_span_and_layout_validate_their_numbers() -> None:
     assert RegionLayout(8, 4).nbytes == 32
     assert RegionLayout(8, 4).memory_kind is MemoryKind.HOST
     assert RegionLayout(8, 4, "kv", MemoryKind.DEVICE).memory_kind is MemoryKind.DEVICE
+
+
+def test_a_region_spec_is_a_valid_span_whose_layout_fits() -> None:
+    spec = RegionSpec(0x1000, 32, RegionLayout(8, 4))
+    assert spec.span == Span(0x1000, 32)
+    with pytest.raises(ValueError):
+        RegionSpec(0x1000, 0, RegionLayout(8, 4))
+    with pytest.raises(ValueError):
+        RegionSpec(0x1000, 24, RegionLayout(8, 4))  # the layout needs 32 bytes
 
 
 def test_a_row_is_a_key_and_disjoint_spans_in_the_order_given() -> None:

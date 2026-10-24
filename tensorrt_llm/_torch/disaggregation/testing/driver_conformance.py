@@ -36,6 +36,8 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     ProbeStatus,
     RegionHandle,
     RegionLayout,
+    RegionSpec,
+    RegistersRegionsTogether,
     RegistrationError,
     RowIO,
     RowResult,
@@ -151,6 +153,43 @@ class Endpoint:
 # Endpoints whose memory a driver may still touch or still holds registered when a check ends.
 # Never freed.
 UNRELEASED_ENDPOINTS: list[Endpoint] = []
+
+# Memory a batch registration may still hold when a check ends. Never freed.
+UNRELEASED_MEMORY: list[Memory] = []
+
+
+def _revoke_again(driver: RegistersRegionsTogether, handle: RegionHandle) -> None:
+    """A second ``unregister_regions`` of a revoked batch; any raise breaks idempotency."""
+    try:
+        driver.unregister_regions(handle)
+    except Exception as error:  # noqa: BLE001 - the rule allows no raise at all
+        pytest.fail(f"a second revocation of the batch raised {error!r}")
+
+
+def _prove_registered(driver: StoreDriver, memory: Memory, index: int, timeout: float) -> None:
+    """A row inside ``memory`` moves and its access ends: the region is registered. A probe by
+    registration could not tell, since a driver that takes one batch at a time refuses a new one
+    whatever the region's state."""
+    row = RowIO(key_of(f"R{index}", "t" + secrets.token_hex(4)), (Span(memory.address, SLOT),))
+    try:
+        if driver.capabilities.put:
+            memory.write(b"a" * SLOT, 0)
+            op = driver.put([row])
+        else:
+            op = driver.get([row])
+    except DriverRejected as error:
+        pytest.fail(f"region {index} of the batch takes no row: {error}")
+    wait_until(lambda: concluded(driver.poll(op)), "the operation to conclude", timeout)
+    if driver.capabilities.put:
+        assert statuses(driver, op) == [RowStatus.READY]
+    wait_until(lambda: driver.access_ended(op), "access to end", timeout)
+
+
+def specs_of(memory: Sequence[Memory], slot: int = SLOT) -> list[RegionSpec]:
+    """One region per memory, laid out in slots of ``slot`` bytes, for ``register_regions``."""
+    return [
+        RegionSpec(m.address, m.nbytes, RegionLayout(slot, m.nbytes // slot, "kv")) for m in memory
+    ]
 
 
 class Harness:
@@ -350,6 +389,10 @@ class DriverConformance:
 
     timeout = 5.0
     registers_on_demand = True  # endpoints register fresh memory; a pool driver sets False
+    # The driver implements RegistersRegionsTogether and, with registers_on_demand False, the
+    # handle allocate hands out is the batch its memory was registered as; the suite then revokes
+    # through unregister_regions, never through unregister.
+    registers_together = False
     handles_before_completion = False  # put/get return their handle before the store answers
 
     def make_driver(self) -> StoreDriver:
@@ -413,6 +456,25 @@ class DriverConformance:
     def make_unprovable_get(self) -> tuple[StoreDriver, Callable[[OpHandle], None]] | None:
         """A driver and a callable that, given the handle of a get just submitted, concludes
         it while the driver can never prove that its access ended."""
+        return None
+
+    def make_together_registration(self) -> tuple[StoreDriver, list[Memory]] | None:
+        """A fresh driver implementing ``RegistersRegionsTogether`` with no batch live, and
+        unregistered memory for one batch of at least two regions."""
+        return None
+
+    def make_failing_together_registrations(self) -> list[tuple[StoreDriver, list[Memory]]]:
+        """Fresh drivers whose next ``register_regions`` of the returned memory fails after the
+        store was asked, one per failure shape the store can stage; empty when it can stage
+        none."""
+        return []
+
+    def make_busy_together_registration(
+        self,
+    ) -> tuple[StoreDriver, list[Memory], str, threading.Event, Unblock] | None:
+        """As ``make_together_registration``, plus a key whose get stalls in the store until the
+        callable runs, and an event set once a get of it is stalled. The event is required: the
+        check decides nothing by waiting; a suite that cannot give the signal returns ``None``."""
         return None
 
     @contextlib.contextmanager
@@ -1023,14 +1085,19 @@ class DriverConformance:
     # Registration, drain and close.
 
     def test_unregister_is_idempotent(self) -> None:
-        """Also for a driver whose memory was registered up front: its one registration is
-        unregistered twice, and the suite's shutdown hook must cope with that."""
+        """Also for a driver whose memory was registered up front: its one registration, or the
+        batch it was registered as, is revoked twice through the call that made it, and the
+        suite's shutdown hook must cope with that."""
         with self.harness() as h:
             endpoint = h.endpoint(["A"])
             assert endpoint.handle is not None
             assert h.driver.drain(self.timeout) is True
-            h.driver.unregister(endpoint.handle)
-            h.driver.unregister(endpoint.handle)
+            revoke = h.driver.unregister
+            if self.registers_together and not self.registers_on_demand:
+                assert isinstance(h.driver, RegistersRegionsTogether)
+                revoke = h.driver.unregister_regions
+            revoke(endpoint.handle)
+            revoke(endpoint.handle)
             endpoint.released = True  # the harness must not give pool memory back twice
 
     def test_unregister_frees_the_range_for_a_new_registration(self) -> None:
@@ -1045,6 +1112,140 @@ class DriverConformance:
             except DriverRejected as error:
                 pytest.fail(f"the range stayed registered: {error}")
             h.driver.unregister(handle)
+
+    def test_regions_registered_together_are_revoked_together_and_the_range_freed(self) -> None:
+        """Through the optional ``RegistersRegionsTogether``: every region of a batch is live once
+        registered, each overlaps a new registration until the batch is revoked, revocation is
+        idempotent, and the whole range is free after."""
+        staged = self.make_together_registration()
+        if staged is None:
+            pytest.skip("this suite stages no batch registration")
+        driver, memory = staged
+        assert isinstance(driver, RegistersRegionsTogether)
+        assert len(memory) >= 2, "a batch check needs at least two regions"
+        specs = specs_of(memory)
+        released = False
+        try:
+            handle = driver.register_regions(specs)
+            for index, spec in enumerate(specs):
+                try:
+                    stray = driver.register_regions([spec])
+                except DriverRejected:
+                    continue  # the region is live: it overlaps a new registration
+                driver.unregister_regions(stray)
+                pytest.fail(f"region {index} of the batch was not registered")
+            for index, region in enumerate(memory):  # the registrations are real: rows move
+                _prove_registered(driver, region, index, self.timeout)
+            driver.unregister_regions(handle)
+            _revoke_again(driver, handle)
+            try:
+                again = driver.register_regions(specs)
+            except DriverRejected as error:
+                pytest.fail(f"the revoked batch kept its range: {error}")
+            driver.unregister_regions(again)
+            assert driver.drain(self.timeout) is True
+            driver.close()
+            released = True
+        finally:
+            if not released:
+                UNRELEASED_MEMORY.extend(memory)
+
+    def test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy(self) -> None:
+        """``unregister_regions`` refuses while an operation may still touch any region of the
+        batch and leaves every region registered, the idle ones included; once access ended it
+        succeeds, idempotently."""
+        staged = self.make_busy_together_registration()
+        if staged is None:
+            pytest.skip("this suite stages no batch with a stalled get")
+        driver, memory, key, blocked, unblock = staged
+        assert isinstance(driver, RegistersRegionsTogether)
+        assert len(memory) >= 2, "a batch check needs at least two regions"
+        if not driver.capabilities.get:
+            pytest.skip("this driver declares no get")
+        specs = specs_of(memory)
+        slow: dict[str, OpHandle] = {}
+        row = RowIO(key, (Span(memory[-1].address, SLOT),))  # the last region is the busy one
+        getter = threading.Thread(target=lambda: slow.update(op=driver.get([row])), daemon=True)
+        refusal: list[BaseException | None] = []
+
+        def revoke_while_busy() -> None:
+            try:
+                driver.unregister_regions(handle)
+            except BaseException as error:  # noqa: BLE001 - judged on the main thread
+                refusal.append(error)
+            else:
+                refusal.append(None)
+
+        # Off this thread: a revocation that waits for the transfer would wait for the gate this
+        # thread holds, and must be a failure rather than a hang.
+        revoker = threading.Thread(target=revoke_while_busy, daemon=True)
+        released = False
+        try:
+            handle = driver.register_regions(specs)
+            getter.start()  # a blocking driver's get returns only once the store lets it
+            assert blocked.wait(self.timeout), "the get never reached the store"
+            revoker.start()
+            revoker.join(self.timeout)
+            assert not revoker.is_alive(), "unregister_regions waited for the transfer"
+            assert isinstance(refusal[0], DriverRejected), (
+                f"a busy batch was revoked: {refusal[0]!r}"
+            )
+            for index, region in enumerate(memory[:-1]):  # the idle regions stayed registered
+                _prove_registered(driver, region, index, self.timeout)
+            unblock()
+            getter.join(self.timeout)
+            assert not getter.is_alive(), "the stalled get never returned"
+            wait_until(lambda: driver.access_ended(slow["op"]), "access to end", self.timeout)
+            driver.unregister_regions(handle)
+            _revoke_again(driver, handle)
+            assert driver.drain(self.timeout) is True
+            driver.close()
+            released = True
+        finally:
+            unblock()
+            for worker in (getter, revoker):
+                if worker.ident is not None:  # started: let it leave before the check ends
+                    worker.join(self.timeout)
+            if not released:
+                UNRELEASED_MEMORY.extend(memory)
+
+    def test_a_failed_batch_registration_is_revocable_or_left_nothing_behind(self) -> None:
+        """A ``register_regions`` that fails after the store was asked either certifies that
+        nothing of the batch is registered, so the same memory registers again at once, or
+        hands out a handle that revokes whatever is, idempotently. A failure of any other shape
+        is allowed and leaves the memory protected; nothing more is checked for it."""
+        staged = self.make_failing_together_registrations()
+        if not staged:
+            pytest.skip("this suite stages no failing batch registration")
+        for driver, memory in staged:
+            assert isinstance(driver, RegistersRegionsTogether)
+            specs = specs_of(memory)
+            released = False
+            try:
+                try:
+                    driver.register_regions(specs)
+                except DriverRejected:
+                    handle = None
+                except RegistrationError as error:
+                    handle = error.handle
+                except Exception:  # noqa: BLE001 - some of the batch may be registered for good
+                    continue
+                else:
+                    pytest.fail("the staged registration did not fail")
+                if handle is not None:
+                    driver.unregister_regions(handle)
+                    _revoke_again(driver, handle)
+                try:
+                    again = driver.register_regions(specs)
+                except DriverRejected as error:
+                    pytest.fail(f"something of the failed batch stayed registered: {error}")
+                driver.unregister_regions(again)
+                assert driver.drain(self.timeout) is True
+                driver.close()
+                released = True
+            finally:
+                if not released:
+                    UNRELEASED_MEMORY.extend(memory)
 
     def test_drain_is_one_way(self) -> None:
         with self.harness() as h:
