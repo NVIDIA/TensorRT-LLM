@@ -3760,6 +3760,18 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         get_sm_version() not in (100, 103, 107),
         reason="TRTLLM Gen MoE supports SM100, SM103 and SM107 only")
 
+    def _fixed_date_evaluator_kwargs(self, llm: LLM) -> dict:
+        chat_template = llm.tokenizer.get_chat_template()
+        date_expression = 'strftime_now("%Y-%m-%d")'
+        assert chat_template.count(date_expression) == 1
+        chat_template = chat_template.replace(date_expression, '"2026-10-21"')
+        return {
+            **self.extra_evaluator_kwargs,
+            "chat_template_kwargs": {
+                "chat_template": chat_template
+            },
+        }
+
     def _create_1gpu_llm(self, kv_cache_config: KvCacheConfig, moe_backend: str,
                          **kwargs) -> LLM:
         return LLM(self.MODEL_PATH,
@@ -4240,16 +4252,18 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/120B-MXFP4"
+            extra_evaluator_kwargs = self._fixed_date_evaluator_kwargs(llm)
 
             # GSM8K
             task = GSM8K(model_name)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+            task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
             task = GPQADiamond(model_name)
 
-            chat_template_kwargs = dict(reasoning_effort="medium")
+            chat_template_kwargs = dict(
+                **extra_evaluator_kwargs["chat_template_kwargs"],
+                reasoning_effort="medium")
             extra_evaluator_kwargs = {
                 **self.extra_evaluator_kwargs, "chat_template_kwargs":
                 chat_template_kwargs
@@ -4467,16 +4481,18 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/120B-MXFP4"
+            extra_evaluator_kwargs = self._fixed_date_evaluator_kwargs(llm)
 
             # GSM8K
             task = GSM8K(model_name)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+            task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
 
             # GPQA Medium Reasoning
             task = GPQADiamond(model_name)
 
-            chat_template_kwargs = dict(reasoning_effort="medium")
+            chat_template_kwargs = dict(
+                **extra_evaluator_kwargs["chat_template_kwargs"],
+                reasoning_effort="medium")
             extra_evaluator_kwargs = {
                 **self.extra_evaluator_kwargs, "chat_template_kwargs":
                 chat_template_kwargs
