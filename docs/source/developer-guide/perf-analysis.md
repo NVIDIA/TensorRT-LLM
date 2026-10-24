@@ -98,6 +98,55 @@ Append “python-gil” to Nsys “-t” option.
 1. Set environment variable `TLLM_PROFILE_START_STOP=A-B` to specify the range of the iterations to be collected.
 2. Set environment variable `TLLM_TORCH_PROFILE_TRACE=<path>`, and the results will be saved to `<path>`.
 
+For the LLM PyTorch executor, set PyTorch's existing
+`ENABLE_PYTORCH_EXECUTION_TRACE=1` to collect an execution trace over the same
+iteration ranges. Environment-controlled capture requires `TLLM_PROFILE_START_STOP`;
+`TLLM_TORCH_PROFILE_TRACE` is optional and enables Chrome output independently.
+Create the desired temporary directory before launching Python and set `TMPDIR`
+to control where PyTorch creates its execution files. For example:
+
+```bash
+mkdir -p traces
+TMPDIR="$PWD/traces" \
+TLLM_PROFILE_START_STOP=1-100,400-500 \
+TLLM_TORCH_PROFILE_TRACE=chrome.json \
+ENABLE_PYTORCH_EXECUTION_TRACE=1 \
+trtllm-serve <model>
+```
+
+On rank 0, this writes `chrome-rank-0-iterations-1-100.json` and
+`chrome-rank-0-iterations-400-500.json`. A single range preserves
+`chrome-rank-0.json`. PyTorch creates an automatically named `*.et.json` file in
+the temporary directory for each rank process. The execution file's `pid` can be
+matched to the CPU process in that rank's Chrome trace. Each process's file
+aggregates both ranges; ranks write separate files.
+The start iteration is included; capture stops before the stop iteration's
+workload, without adding collectives or changing TP, PP, CP, or EP groups.
+
+For execution-trace output alone, set `TLLM_PROFILE_START_STOP` and
+`ENABLE_PYTORCH_EXECUTION_TRACE=1`, leaving `TLLM_TORCH_PROFILE_TRACE` unset.
+PyTorch also controls the optional `ENABLE_PYTORCH_EXECUTION_TRACE_EXTRAS`
+behavior.
+
+Capture starts lazily on the executor thread. Warmup-skipped starts install no
+observer and produce no trace. The executor retains the first profiler's
+execution observer across fresh profiler instances for later windows. Early exit
+flushes the active range; executor cleanup unregisters the process-wide observer
+and finalizes the aggregated execution file without replacing a workload
+exception. Wait for this cleanup before reading the complete file; stopping an
+individual range does not finalize it. Do not run another execution observer
+concurrently in the same process. Runtime `/start_profile` and `/stop_profile`
+keep their existing Chrome-trace API and executor-thread ownership. With the
+PyTorch flag enabled, those runtime windows also collect execution traces without
+requiring `TLLM_PROFILE_START_STOP`.
+
+Capture adds overhead and trace size, especially with shape recording and the
+execution observer enabled. CUDA synchronization events are requested when
+supported by PyTorch. CUDA graph replay does not expose every logical operator
+as a distinct execution node. Custom-region selection is independent of these
+capture settings; see [profiler regions](../advanced/workflow-profiler-regions.md)
+for metadata and selection semantics.
+
 For VisualGen, use `TLLM_PROFILE_VISUAL_GEN_START_STOP` instead. Numeric ranges select
 per-request denoise steps, while `predenoise`, `postdenoise`, and `all` select the
 corresponding generation phases. For example:
