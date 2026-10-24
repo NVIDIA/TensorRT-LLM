@@ -216,6 +216,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_enumerate_megamoe_candidate_tactics_curated_space
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
