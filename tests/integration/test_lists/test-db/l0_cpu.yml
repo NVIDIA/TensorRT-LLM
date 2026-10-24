@@ -237,6 +237,8 @@ l0_cpu:
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
+  # Reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.
+  - unittest/llmapi/test_musespark_open_tokenizer.py
   - unittest/llmapi/test_llm_quant.py
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py
