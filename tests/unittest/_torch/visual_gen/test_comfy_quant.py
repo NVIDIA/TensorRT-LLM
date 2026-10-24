@@ -20,6 +20,7 @@ from tensorrt_llm._torch.visual_gen.checkpoints.comfy_quant import (
 )
 from tensorrt_llm._torch.visual_gen.checkpoints.weight_loader import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.models.flux import checkpoint as flux_checkpoint
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import _split_nvfp4_projection
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import checkpoint as h3_checkpoint
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.adaln_curves import interpolate_adaln_curve
@@ -899,3 +900,162 @@ def test_adapter_options_use_normal_validation_and_user_precedence(tmp_path, mon
     assert inferred == {"workflow": "ref2va"}
     with pytest.raises(ValueError, match="Unknown pipeline_config keys"):
         loader._resolve_pipeline_config(str(tmp_path), {"unknown_adapter_option": True})
+
+
+@pytest.fixture(params=[1, 2])
+def native_flux_directory(request, tmp_path, monkeypatch):
+    version = request.param
+    directory = tmp_path / "unlabelled"
+    directory.mkdir()
+    packed, _ = _checkpoint(192, 64)
+    source = {
+        name.replace("proj.", "double_blocks.0.img_attn.qkv."): value
+        for name, value in packed.items()
+        if name.startswith("proj.")
+    }
+    source.update(
+        {
+            "img_in.weight": torch.ones(64, 64),
+            "txt_in.weight": torch.ones(64, 128),
+            "final_layer.linear.weight": torch.ones(64, 64),
+            "guidance_in.in_layer.weight": torch.ones(64, 256),
+            "single_blocks.0.linear2.weight": torch.ones(64, 320),
+        }
+    )
+    if version == 1:
+        source["vector_in.in_layer.weight"] = torch.ones(64, 32)
+    else:
+        source.update(
+            {
+                "double_stream_modulation_img.lin.weight": torch.ones(384, 64),
+                "double_stream_modulation_txt.lin.weight": torch.ones(384, 64),
+                "single_stream_modulation.lin.weight": torch.ones(192, 64),
+            }
+        )
+    # Packed signature projection verifies that matching uses logical dimensions.
+    packed_img, _ = _checkpoint(64, 64)
+    source.update(
+        {
+            name.replace("proj.", "img_in."): value
+            for name, value in packed_img.items()
+            if name.startswith("proj.")
+        }
+    )
+    save_file(
+        {"model.diffusion_model." + key: value for key, value in source.items()},
+        directory / "weights.safetensors",
+    )
+    base = tmp_path / "base-revision"
+    (base / "transformer").mkdir(parents=True)
+    architecture = "FluxTransformer2DModel" if version == 1 else "Flux2Transformer2DModel"
+    config = {
+        "_class_name": architecture,
+        "num_attention_heads": 1,
+        "attention_head_dim": 64,
+        "in_channels": 64,
+        "out_channels": 64,
+        "joint_attention_dim": 128,
+        "pooled_projection_dim": 32,
+        "num_layers": 1,
+        "num_single_layers": 1,
+        "guidance_embeds": True,
+        "patch_size": 1,
+    }
+    (base / "transformer" / "config.json").write_text(json.dumps(config))
+    (base / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "FluxPipeline" if version == 1 else "Flux2Pipeline",
+                "transformer": ["diffusers", architecture],
+            }
+        )
+    )
+    (base / "text_encoder").mkdir()
+    (base / "text_encoder" / "marker").write_text("supporting component")
+    calls = []
+
+    def download(model, allow_patterns, revision=None):
+        calls.append((model, allow_patterns, revision))
+        return base
+
+    monkeypatch.setattr(flux_checkpoint, "download_hf_partial", download)
+    monkeypatch.setattr(flux_checkpoint, "HF_HUB_CACHE", str(tmp_path / "cache" / "hub"))
+    return directory, base, calls, version
+
+
+def test_native_flux_directory_resolution(native_flux_directory):
+    directory, base, calls, version = native_flux_directory
+    resolved = resolve_checkpoint(str(directory), {})
+    selected = Path(resolved.path) / "transformer" / "diffusion_pytorch_model.safetensors"
+    assert selected.resolve() == directory / "weights.safetensors"
+    assert (Path(resolved.path) / "text_encoder" / "marker").read_text() == "supporting component"
+    assert resolved.pipeline_config == {}
+    assert calls[0][0] == f"black-forest-labs/FLUX.{version}-dev"
+    assert calls[1][2] == base.name
+    assert "transformer/*" not in calls[1][1]
+    assert ("text_encoder_2/*" in calls[1][1]) == (version == 1)
+    assert resolve_checkpoint(str(directory), {}).path == resolved.path
+    config = DiffusionPipelineConfig.from_pretrained(resolved.path, device="cpu")
+    assert config.model_configs["transformer"].quant_config.quant_algo == QuantAlgo.NVFP4
+
+
+def test_native_flux_normal_loader_routes_before_config(native_flux_directory, monkeypatch):
+    directory, _, _, version = native_flux_directory
+
+    class ConfigReached(Exception):
+        pass
+
+    def inspect_config(path, args, pipeline_config):
+        manifest = json.loads(Path(path, "model_index.json").read_text())
+        assert manifest["_class_name"] == ("FluxPipeline" if version == 1 else "Flux2Pipeline")
+        assert Path(path, "transformer", "diffusion_pytorch_model.safetensors").is_file()
+        raise ConfigReached
+
+    monkeypatch.setattr(DiffusionPipelineConfig, "from_pretrained", inspect_config)
+    with pytest.raises(ConfigReached):
+        PipelineLoader(VisualGenArgs(model=str(directory)), device="cpu").load(skip_warmup=True)
+
+
+@pytest.mark.parametrize("field,value", [("in_channels", 32), ("num_layers", 2)])
+def test_native_flux_rejects_wrong_base_before_component_download(
+    native_flux_directory, field, value
+):
+    directory, base, calls, _ = native_flux_directory
+    path = base / "transformer" / "config.json"
+    config = json.loads(path.read_text())
+    config[field] = value
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="do not match"):
+        resolve_checkpoint(str(directory), {})
+    assert len(calls) == 1
+
+
+def test_native_flux_rejects_ambiguous_directory(native_flux_directory):
+    directory, _, calls, _ = native_flux_directory
+    (directory / "second.safetensors").symlink_to(directory / "weights.safetensors")
+    with pytest.raises(ValueError, match="Multiple FLUX checkpoints"):
+        resolve_checkpoint(str(directory), {})
+    assert not calls
+
+
+def test_native_flux_rejects_unsupported_variant(native_flux_directory):
+    directory, _, calls, _ = native_flux_directory
+    path = directory / "weights.safetensors"
+    weights = load_file(path)
+    del weights["model.diffusion_model.guidance_in.in_layer.weight"]
+    save_file(weights, path)
+    with pytest.raises(ValueError, match="not a supported dev variant"):
+        resolve_checkpoint(str(directory), {})
+    assert not calls
+
+
+def test_native_flux_nested_directory(native_flux_directory):
+    directory, _, _, _ = native_flux_directory
+    nested = directory / "diffusion_models"
+    nested.mkdir()
+    (directory / "weights.safetensors").rename(nested / "weights.safetensors")
+    resolved = resolve_checkpoint(str(directory), {})
+    assert (
+        Path(resolved.path, "transformer", "diffusion_pytorch_model.safetensors").resolve()
+        == nested / "weights.safetensors"
+    )
