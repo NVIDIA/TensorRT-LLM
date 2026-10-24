@@ -573,9 +573,11 @@ private:
         // registration threshold used by the input path. Smaller messages use a
         // regular output tensor and skip the window allocation path.
         torch::Tensor outputTensor;
+        tensorrt_llm::common::nccl_util::NCCLWindowBuffer windowBuffer1;
         if (bufferSizeBytes >= minRegistrationThreshold)
         {
-            auto [windowOutput, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
+            torch::Tensor windowOutput;
+            std::tie(windowOutput, windowBuffer1) = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
             if (windowBuffer1.isValid())
             {
                 outputTensor = windowOutput;
