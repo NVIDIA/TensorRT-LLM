@@ -1296,6 +1296,30 @@ class KvCacheCreator:
                 model.model_config.multimodal_config.encoder_cache_max_bytes)
         return unprofiled_output_bytes + cache_bytes
 
+    def _get_logits_memory_reserve(self) -> int:
+        """Return the eager-step logits working set absent from the measured peak.
+
+        The profiling forward is a context-only dummy that produces a single
+        logits row, while a serving step outside CUDA graphs produces one row
+        per scheduled request and draft token. ``LogitsProcessor`` keeps the
+        model-dtype logits alive while it materializes their float32 copy, so
+        both are resident at the peak of such a step.
+        """
+        if not self._mapping.is_last_pp_rank():
+            return 0
+        model = self._model_engine.model
+        vocab_size = getattr(model, "vocab_size_padded", None)
+        if not vocab_size:
+            return 0
+        tokens_per_step = (1 if self._speculative_config is None else
+                           self._speculative_config.tokens_per_gen_step)
+        num_rows = min(
+            self._max_num_tokens,
+            self._max_batch_size * self._max_beam_width * tokens_per_step)
+        bytes_per_row = vocab_size * (model.model_config.torch_dtype.itemsize +
+                                      torch.float32.itemsize)
+        return num_rows * bytes_per_row
+
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
         if 'cp_type' in self._mapping.cp_config:
@@ -1604,6 +1628,14 @@ class KvCacheCreator:
             logger.info(
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
+
+        logits_memory_reserve = self._get_logits_memory_reserve()
+        peak_memory += logits_memory_reserve
+        if logits_memory_reserve > 0:
+            logger.info(
+                f"Reserving {logits_memory_reserve / GB:.2f} GiB for the "
+                "logits of a full-batch step, which the profiling run does "
+                "not materialize.")
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,

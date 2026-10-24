@@ -553,6 +553,60 @@ def test_reserve_adds_only_unprofiled_output_capacity():
     assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
 
 
+def _make_logits_reserve_creator(
+    *,
+    vocab_size_padded=1000,
+    max_batch_size=8,
+    max_num_tokens=64,
+    max_beam_width=1,
+    speculative_config=None,
+    mapping=None,
+) -> KvCacheCreator:
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            vocab_size_padded=vocab_size_padded,
+            model_config=SimpleNamespace(torch_dtype=torch.bfloat16),
+        )
+    )
+    creator._mapping = mapping or Mapping()
+    creator._max_batch_size = max_batch_size
+    creator._max_num_tokens = max_num_tokens
+    creator._max_beam_width = max_beam_width
+    creator._speculative_config = speculative_config
+    return creator
+
+
+def test_logits_reserve_covers_full_batch_model_and_float_logits():
+    creator = _make_logits_reserve_creator()
+
+    # One row per request; bf16 logits plus their float32 copy.
+    assert creator._get_logits_memory_reserve() == 8 * 1000 * (2 + 4)
+
+
+def test_logits_reserve_is_bounded_by_max_num_tokens():
+    creator = _make_logits_reserve_creator(max_batch_size=512, max_num_tokens=64)
+
+    assert creator._get_logits_memory_reserve() == 64 * 1000 * (2 + 4)
+
+
+def test_logits_reserve_counts_beams_and_draft_tokens():
+    spec = SimpleNamespace(tokens_per_gen_step=4)
+    creator = _make_logits_reserve_creator(
+        max_batch_size=4, max_num_tokens=1024, max_beam_width=2, speculative_config=spec
+    )
+
+    assert creator._get_logits_memory_reserve() == 4 * 2 * 4 * 1000 * (2 + 4)
+
+
+def test_logits_reserve_skips_ranks_without_lm_head():
+    mapping = Mapping(world_size=2, rank=0, pp_size=2)
+    creator = _make_logits_reserve_creator(mapping=mapping)
+
+    assert not mapping.is_last_pp_rank()
+    assert creator._get_logits_memory_reserve() == 0
+
+
 # ---------------------------------------------------------------------------
 # VSWA hybrid attention pool-group scaling (Gemma4 hybrid MMMU Pro hang fix)
 # ---------------------------------------------------------------------------
@@ -1185,6 +1239,8 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     # A bare Mock would auto-create the attribute; real engines set it to
     # None unless the model opted into MM item scheduling.
     model_engine.mm_encoder_output_budget_bytes = None
+    # Likewise for the vocabulary size that sizes the logits reserve.
+    model_engine.model.vocab_size_padded = None
     llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=chunked_prefill)
 
     with patch.object(
