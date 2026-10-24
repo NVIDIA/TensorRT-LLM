@@ -8,6 +8,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 
@@ -329,3 +333,39 @@ def test_decode_kv_lengths_keep_one_pointer_per_step(num_contexts: int) -> None:
     if generation_lengths.data_ptr() % 16 == 0:
         assert first_layer is generation_lengths
         assert not hasattr(meta, "_cute_dsl_mla_kv_lens_staging")
+
+
+@pytest.mark.parametrize(
+    "num_contexts, num_generations, fallback_layer, admitted",
+    [
+        (2, 4, True, True),
+        (2, 4, False, False),
+        (2, 0, True, False),
+    ],
+    ids=["mixed_fallback", "mixed_non_fallback", "no_generations"],
+)
+def test_mixed_batch_gate_admits_only_nvfp4_fallback_layers(
+    num_contexts: int, num_generations: int, fallback_layer: bool, admitted: bool
+) -> None:
+    fmha = SimpleNamespace(_is_nvfp4_manager_fallback_layer=lambda attn, meta: fallback_layer)
+    meta = SimpleNamespace(
+        num_contexts=num_contexts,
+        num_generations=num_generations,
+        beam_width=1,
+        helix_position_offsets=None,
+        # Stops the check right after the batch-shape gates.
+        kv_cache_manager=None,
+    )
+    fwd = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    # 128 heads stay off the wide-head verify carve-outs; a fallback layer
+    # also skips the perf gate.
+    attn = SimpleNamespace(num_heads=128)
+    q = torch.empty(max(num_generations, 1), 8)
+
+    supported, reason = CuteDslMlaFmha._is_supported_with_reason(fmha, q, attn, meta, fwd)
+
+    assert not supported
+    if admitted:
+        assert reason == "KV cache manager is required."
+    else:
+        assert reason == "CuTe DSL MLA FMHA only supports decode-only batches."
