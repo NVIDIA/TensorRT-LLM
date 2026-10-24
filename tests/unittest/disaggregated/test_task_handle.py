@@ -529,6 +529,7 @@ def _wired_sender() -> Sender:
     sender._sessions = {}
     sender._sessions_lock = threading.Lock()
     sender._pre_cancelled_rids = {}
+    sender._retired_rids = {}
     sender._shutdown = True
     sender._shutdown_requested = False
     sender._peer_requests = {}
