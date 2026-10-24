@@ -4959,14 +4959,20 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         //    are merged only at testcase granularity.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
         def stageNamePattern = getTestReuseStagePattern(stageName)
-        sh """
+        def queryStatus = sh(returnStatus: true, script: """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
             --stage-name-pattern '${stageNamePattern}' \
             --output-file ${passedTestListFile}
-        """
-        if (fileExists(passedTestListFile)) {
+        """)
+        // Exit code 3 indicates validated partial output from an incomplete query.
+        if (queryStatus in [0, 3] && fileExists(passedTestListFile)) {
+            if (queryStatus == 3) {
+                echo "OpenSearch passed-test lookup incomplete; reusing only results from successful pages"
+            }
             reusedTests += readFile(file: passedTestListFile).readLines().collect { it.trim() }.findAll { it }
+        } else if (queryStatus != 0) {
+            echo "OpenSearch passed-test lookup failed; ignoring DB reuse results and continuing with prior-attempt recovery"
         }
 
         // 2. Prior-attempt recovery -- tests that PASSED in an earlier attempt
