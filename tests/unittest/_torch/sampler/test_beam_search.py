@@ -51,6 +51,7 @@ from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig)
+from tensorrt_llm.sampling_params import LogitsProcessor
 
 
 @pytest.fixture(scope="module")
@@ -2162,6 +2163,141 @@ def test_gather_beam_path_follows_cache_indirection():
     torch.testing.assert_close(
         _gather_beam_path(current_path=current_path,
                           cache_indirection=identity), current_path)
+
+
+def test_beam_histories_follow_beam_reordering():
+    """Mid-flight histories are the beams' hypotheses, not the per-slot appends.
+
+    Each step is applied to the store the way a beam-search step leaves it:
+    every slot writes its token to original_tokens at the step's position, and
+    cache_indirection takes the row of the slot's predecessor plus a pointer to
+    itself at that position.
+    """
+    test_params = GeneralTestParams()
+    sampler = create_default_sampler(test_params)
+    store = sampler.store.beam_search_store
+    assert store is not None
+    A, B, C, D, E, F, G, H, K, L = range(100, 110)
+
+    def apply_steps(slot: int, prompt_len: int,
+                    steps: list[tuple[list[int], list[int]]]) -> None:
+        for step, (tokens, predecessors) in enumerate(steps):
+            position = prompt_len + step
+            store.original_tokens[slot, :len(tokens),
+                                  position] = torch.tensor(tokens,
+                                                           dtype=torch.int32)
+            rows = store.cache_indirection[slot,
+                                           predecessors, :position].clone()
+            store.cache_indirection[slot, :len(tokens), :position] = rows
+            store.cache_indirection[slot, :len(tokens),
+                                    position] = torch.arange(len(tokens),
+                                                             dtype=torch.int32)
+
+    def stub_request(slot: int, prompt_len: int, num_tokens: int) -> LlmRequest:
+        # Only the attributes start_beam_histories reads.
+        return cast(
+            LlmRequest,
+            types.SimpleNamespace(
+                py_seq_slot=slot,
+                py_prompt_len=prompt_len,
+                max_beam_num_tokens=num_tokens,
+                get_beam_width_by_iter=lambda for_next_iteration=False: 2,
+            ))
+
+    # Issue #19902: both survivors of step 1 descend from the second step-0
+    # candidate, so slot 0's appended list [A, C] was never a hypothesis.
+    apply_steps(4, 5, [([A, B], [0, 0]), ([C, D], [1, 1])])
+    # A swap, then both survivors descend from slot 0; a shorter prompt in a
+    # different slot also checks the per-request offsets of the batched gather.
+    apply_steps(1, 3, [([E, F], [0, 0]), ([G, H], [1, 0]), ([K, L], [0, 0])])
+
+    # Both requests are narrower than the store. The rows above their width
+    # are never written by a step, so fill them with values no live row holds
+    # and check that the gather neither reads them as indices nor returns them.
+    max_beam_width = store.cache_indirection.size(1)
+    assert max_beam_width > 2
+    store.cache_indirection[[4, 1], 2:, :] = 10**6
+    store.original_tokens[[4, 1], 2:, :] = -1
+
+    histories = sampler.start_beam_histories(
+        [stub_request(4, 5, 7), stub_request(1, 3, 6)]).wait()
+
+    assert histories == [[[B, C], [B, D]], [[F, G, K], [F, G, L]]]
+
+
+class _HistoryCheckingProcessor(LogitsProcessor):
+    """Steers a beam search from the histories it is given, and records them.
+
+    Each row may only continue with three tokens derived from its own history,
+    scored so that the ranking between beams changes from step to step and the
+    search keeps reordering them. If a history were not a real hypothesis, a
+    later step would show a token that its predecessor history never allowed.
+    """
+
+    def __init__(self, prompt_len: int, vocab_size: int):
+        self.prompt_len = prompt_len
+        self.vocab_size = vocab_size
+        self.steps: list[list[list[int]]] = []
+
+    def allowed(self, history: list[int]) -> dict[int, float]:
+        seed = sum((i + 1) * t for i, t in enumerate(history)) + len(history)
+        return {
+            (seed * 7 + 13 * k + 1) % self.vocab_size: -float(
+                (seed + k * 5) % 7)
+            for k in range(3)
+        }
+
+    def __call__(self, req_id, logits, token_ids, stream_ptr, client_id):
+        histories = [list(ids[self.prompt_len:]) for ids in token_ids]
+        self.steps.append(histories)
+        rows = logits.view(-1, logits.shape[-1])
+        for row, history in zip(rows, histories):
+            row.fill_(float("-inf"))
+            for token, score in self.allowed(history).items():
+                row[token] = score
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_logits_processor_sees_beam_hypotheses(
+    llm: LLM,
+    fixed_params,
+    input_prompts,
+    single_process: bool,
+    with_cuda_graph_and_overlap: bool,
+) -> None:
+    """Under beam search, logits processors get each live beam's real history."""
+    if not single_process:
+        pytest.skip("the processor's records stay in the worker process")
+    if with_cuda_graph_and_overlap:
+        pytest.skip("with the overlap scheduler, processors run a step behind")
+    prompt = input_prompts[0]
+    processor = _HistoryCheckingProcessor(len(prompt), DummyConfig().vocab_size)
+    sampling_params = SamplingParams(
+        max_tokens=fixed_params["max_tokens"],
+        n=fixed_params["max_beam_width"],
+        best_of=fixed_params["max_beam_width"],
+        use_beam_search=True,
+        end_id=-1,
+        logits_processor=processor,
+    )
+
+    output = llm.generate(prompt, sampling_params)
+    assert not isinstance(output, list)
+
+    steps = processor.steps
+    assert len(steps) == fixed_params["max_tokens"]
+    for previous, current in zip(steps, steps[1:]):
+        for history in current:
+            parent = history[:-1]
+            assert parent in previous, (
+                f"{history} does not extend any of the previous step's {previous}"
+            )
+            assert history[-1] in processor.allowed(parent)
+    final = []
+    for beam in output.outputs:
+        assert beam.token_ids is not None
+        final.append(beam.token_ids[:-1])
+    assert sorted(final) == sorted(steps[-1])
 
 
 def test_cba_finalize_merges_pool_and_orders_by_score():

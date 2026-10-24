@@ -807,6 +807,11 @@ class PyTorchModelEngine(ModelEngine):
         if isinstance(self._runner, DecoderRunner):
             self._runner.sample_in_graph_callable = callable
 
+    def register_beam_histories_callable(self, callable: Optional[Callable]):
+        """Register where logits post-processors get live beam histories."""
+        if isinstance(self._runner, DecoderRunner):
+            self._runner.start_beam_histories_callable = callable
+
     def register_sample_type_resolver(self,
                                       resolver: Optional[Callable],
                                       stage: Optional[Callable] = None):

@@ -49,6 +49,7 @@ from .beam_search import (
     BeamSearchParams,
     BeamSearchStep,
     BeamSearchStore,
+    PendingBeamHistories,
     finalize_beam,
     prepare_beam_search,
 )
@@ -507,6 +508,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if (beam_search_store := self.store.beam_search_store) is not None:
             return beam_search_store.cache_indirection
         return None
+
+    def start_beam_histories(self, requests: list[LlmRequest]) -> PendingBeamHistories:
+        """Start copying the generated tokens of each live beam of each beam-search request.
+
+        See ``BeamSearchHandler.start_beam_histories``; used by the model engine
+        to give logits post-processors each beam's real hypothesis.
+        """
+        return self._beam_search.start_beam_histories(requests)
 
     @override
     def is_generation_model(self) -> bool:
