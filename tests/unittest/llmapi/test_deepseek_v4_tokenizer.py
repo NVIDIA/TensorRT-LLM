@@ -353,6 +353,39 @@ def test_deepseek_v4_chat_template_uses_v4_tool_prompt_from_request_tools():
     assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
 
 
+def test_deepseek_v4_chat_template_attaches_request_tools_to_leading_system_message():
+    """`tools=` renders as if the tools were set on the caller's system message."""
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    messages = [
+        {
+            "role": "system",
+            "content": "sys",
+        },
+        {
+            "role": "user",
+            "content": "hello",
+        },
+    ]
+
+    prompt = tokenizer.apply_chat_template(messages, tools=tools, tokenize=False)
+
+    assert prompt == tokenizer.apply_chat_template(
+        [{**messages[0], "tools": tools}, messages[1]], tokenize=False
+    )
+    assert prompt.startswith("<｜begin▁of▁sentence｜>sys\n\n## Tools")
+    assert "tools" not in messages[0]
+
+
 def test_deepseek_v4_chat_template_renders_tool_call_history():
     tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
     messages = [
