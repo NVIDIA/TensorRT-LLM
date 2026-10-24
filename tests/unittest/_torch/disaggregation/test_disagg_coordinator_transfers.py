@@ -355,6 +355,71 @@ def test_post_batch_timeout_check_is_gated_on_an_inflight_context_send(clock) ->
     assert gen.py_kv_transfer_timed_out
 
 
+def test_context_timeout_does_not_count_the_wait_for_the_peer_to_ask(clock) -> None:
+    """Nothing is written until the generation peer asks, and under load its
+    request can queue past the timeout; that wait must not expire the send
+    (nvbugs/6621362). Once the peer has asked, the transfer gets the full
+    budget."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: True
+    req = _Request(1)
+    h.send(req)
+    clock["t"] += 2.0
+
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    peer_ready_at = clock["t"]
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: False
+    h.transceiver.context_transfer_peer_ready_time = lambda req: peer_ready_at
+    clock["t"] += 0.5
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 1.0
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
+def test_context_transfer_is_timed_from_when_its_peers_asked(clock) -> None:
+    """Peers that ask between two checks start the transfer clock themselves.
+
+    The check may first see the send only after the peers asked, e.g. after a
+    long executor iteration; the time before they asked is still not charged.
+    """
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    req = _Request(1)
+    h.send(req)
+    peer_ready_at = clock["t"] + 2.5
+    h.transceiver.context_transfer_peer_ready_time = lambda req: peer_ready_at
+    clock["t"] += 3.0
+
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 0.6
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
+def test_context_send_whose_peer_never_asks_still_times_out(clock) -> None:
+    """The deadline is the only thing that ends a send whose peer never asks,
+    so the peer wait is bounded."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: True
+    req = _Request(1)
+    h.send(req)
+    ceiling_s = coordinator_module._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER * 1.0
+
+    clock["t"] += ceiling_s
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 1.5
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
 def test_timeout_check_is_inert_without_a_configured_timeout(clock) -> None:
     h = _Harness(kv_transfer_timeout_ms=None)
     req = _Request(1)
