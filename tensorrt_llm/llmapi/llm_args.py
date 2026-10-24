@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, Callable, ClassVar, Dict,
-                    List, Literal, Optional, Set, Tuple, Type, TypeAlias,
-                    TypeVar, Union, get_args, get_origin)
+                    List, Literal, NamedTuple, Optional, Set, Tuple, Type,
+                    TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -3392,14 +3392,17 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
             "speculators DSpark drafters are supported with a qwen3 backbone; "
             f"this one has model_type {layer.get('model_type')!r}")
     aux_layer_ids = config_dict.get("aux_hidden_state_layer_ids")
-    if not aux_layer_ids or min(aux_layer_ids) < 1:
+    if (not isinstance(aux_layer_ids, list) or not aux_layer_ids or any(
+            type(layer_id) is not int or layer_id < 1
+            for layer_id in aux_layer_ids)):
         raise ValueError(
-            "a speculators DSpark drafter needs aux_hidden_state_layer_ids >= 1 "
+            "a speculators DSpark drafter needs aux_hidden_state_layer_ids to be "
+            "a non-empty list of positive integers (>= 1, excluding bool) "
             "(layer 0's input is the embedding output, which is not captured); "
             f"got {aux_layer_ids}")
     num_layers = layer["num_hidden_layers"]
     dflash_config = {
-        "target_layer_ids": [int(layer_id) - 1 for layer_id in aux_layer_ids]
+        "target_layer_ids": [layer_id - 1 for layer_id in aux_layer_ids]
     }
     if config_dict.get("mask_token_id") is not None:
         dflash_config["mask_token_id"] = config_dict["mask_token_id"]
@@ -4628,15 +4631,12 @@ class MambaStateConfig(StrictBaseModel):
 
     enable_branch_snapshot: bool = Field(
         default=False,
-        status="prototype",
-        telemetry=True,
-        description=
-        "Snapshot the Mamba recurrent state where a request's content "
-        "diverges from the prefix cache, so that later requests sharing the "
-        "same prefix can reuse up to the fork instead of being truncated to "
-        "an earlier snapshot. If no periodic or additional snapshot point "
-        "applies to the prompt, the prompt end is snapshotted as a fallback. "
-        "Requires KV cache manager V2.")
+        status="deprecated",
+        telemetry=False,
+        exclude=True,
+        description="Deprecated alias for "
+        "kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes "
+        "effect only when block reuse is enabled.")
 
 
 class KVEventsConfig(StrictBaseModel):
@@ -4738,6 +4738,22 @@ class BlockReuseConfig(StrictBaseModel):
         "This preference does not guarantee residency or change attention windows "
         "or prefix matching. Dummy and draft requests are excluded.")
 
+    enable_branch_snapshot: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Keep reusable state where a request's prompt diverges from the prefix "
+        "cache, so later requests sharing that prefix can reuse up to the fork. "
+        "For sliding-window attention (SWA), the SWA window at the fork is "
+        "committed. This helps when only the SWA window at a chunk end is kept: "
+        "policy 'per_request' or 'per_conversation', or SWA scratch reuse. The "
+        "fork is aligned down to a block boundary and becomes a forced context "
+        "chunk boundary. SWA layers skip this with joint target/draft KV cache "
+        "reuse. For hybrid Mamba models, the recurrent state is snapshotted at "
+        "the fork. If no periodic or additional snapshot point applies to the "
+        "prompt, the prompt end is snapshotted as a fallback. Requires KV cache "
+        "manager v2 and block reuse.")
+
     @model_validator(mode="after")
     def validate_swa_endpoint_policy(self) -> 'BlockReuseConfig':
         if self.swa_endpoint_rewind_tokens > 0 and self.policy != "all_reusable":
@@ -4806,6 +4822,23 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         description=
         "Number of PyExecutor iterations between checks of whether a pool rebalance "
         "should be attempted.")
+
+
+# Mixed-precision KV dtype: "mixed_<history dtype>_<retained dtype>". The
+# first/last retained tokens and the attention inputs use the second dtype;
+# the full history is stored in the first. Requires KV cache manager V2.
+_MIXED_PRECISION_KV_DTYPE = re.compile(
+    r"^mixed_(?P<low>nvfp4)_(?P<high>fp8|float16|bfloat16)$")
+_MIXED_PRECISION_KV_DTYPES = tuple(f"mixed_nvfp4_{high}"
+                                   for high in ("fp8", "float16", "bfloat16"))
+
+
+class MixedPrecisionKV(NamedTuple):
+    """Layout of a mixed-precision KV cache, parsed from KvCacheConfig."""
+    low: str
+    high: str
+    first_n: int
+    last_n: int
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -4925,12 +4958,31 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and "
+        "keeps the first and last N tokens of every sequence in <dtype> "
+        "('fp8', 'float16' or 'bfloat16'), N from mixed_precision_first_n and "
+        "mixed_precision_last_n; requires KV cache manager V2. "
         "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32", "fp8", "fp8_ds_mla",
-                                             "nvfp4"))
+                                             "nvfp4",
+                                             *_MIXED_PRECISION_KV_DTYPES))
+
+    mixed_precision_first_n: NonNegativeInt = Field(
+        default=256,
+        status="prototype",
+        description=
+        "Mixed-precision KV only: number of leading tokens per sequence kept at the "
+        "retained dtype. Retention follows the cache page granularity.")
+
+    mixed_precision_last_n: NonNegativeInt = Field(
+        default=256,
+        status="prototype",
+        description=
+        "Mixed-precision KV only: number of most recent tokens per sequence kept at "
+        "the retained dtype. Retention follows the cache page granularity.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -5149,10 +5201,23 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if v in ("auto", "fp8", "fp8_ds_mla",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
+        if _MIXED_PRECISION_KV_DTYPE.match(v):
+            return v
 
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
-            '"nvfp4", or valid torch.dtype string')
+            '"nvfp4", "mixed_nvfp4_<fp8|float16|bfloat16>", or valid '
+            'torch.dtype string')
+
+    @property
+    def mixed_precision_kv(self) -> Optional[MixedPrecisionKV]:
+        """Layout of a mixed-precision KV cache, else None."""
+        match = _MIXED_PRECISION_KV_DTYPE.match(self.dtype)
+        if match is None:
+            return None
+        return MixedPrecisionKV(match["low"], match["high"],
+                                self.mixed_precision_first_n,
+                                self.mixed_precision_last_n)
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -5204,6 +5269,43 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             if self.use_kv_cache_manager_v2 is False:
                 raise ValueError(
                     "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
+        return self
+
+    @model_validator(mode='after')
+    def migrate_mamba_branch_snapshot(self) -> 'KvCacheConfig':
+        """Copy the deprecated Mamba branch snapshot flag into block_reuse_config.
+
+        Runs before validate_branch_snapshot. The old flag had no effect
+        without block reuse, so it is not copied then rather than rejected.
+        """
+        if not self.mamba_state_config.enable_branch_snapshot:
+            return self
+        if ("enable_branch_snapshot" in self.block_reuse_config.model_fields_set
+                and not self.block_reuse_config.enable_branch_snapshot):
+            raise ValueError(
+                "Cannot set both 'kv_cache_config.mamba_state_config."
+                "enable_branch_snapshot=True' and 'kv_cache_config."
+                "block_reuse_config.enable_branch_snapshot=False'.")
+        logger.warning(
+            "'kv_cache_config.mamba_state_config.enable_branch_snapshot' is "
+            "deprecated; use 'kv_cache_config.block_reuse_config."
+            "enable_branch_snapshot' instead.")
+        if self.enable_block_reuse:
+            self.block_reuse_config = self.block_reuse_config.model_copy(
+                update={"enable_branch_snapshot": True})
+        return self
+
+    @model_validator(mode='after')
+    def validate_branch_snapshot(self) -> 'KvCacheConfig':
+        if self.block_reuse_config.enable_branch_snapshot:
+            if not self.enable_block_reuse:
+                raise ValueError(
+                    "block_reuse_config.enable_branch_snapshot requires "
+                    "kv_cache_config.enable_block_reuse=True.")
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "block_reuse_config.enable_branch_snapshot requires "
                     "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
@@ -5273,6 +5375,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
         return v
+
+    @model_validator(mode='after')
+    def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
+        """A mixed-precision cache must retain at least one token per sequence."""
+        if (self.mixed_precision_kv is not None and self.mixed_precision_first_n
+                == self.mixed_precision_last_n == 0):
+            raise ValueError(
+                "Mixed-precision KV requires mixed_precision_first_n or "
+                "mixed_precision_last_n to be greater than zero.")
+        return self
 
     @field_validator('pool_ratio')
     @classmethod
@@ -6430,6 +6542,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Separated-routing MoE backends only.",
         status="beta")
 
+    lm_head_output_dtype: Literal["auto", "float32"] = Field(
+        default="auto",
+        description=
+        "Output dtype written by the LM head GEMM. 'auto' uses the model "
+        "dtype before logits are upcast to float32. 'float32' writes the "
+        "float32 accumulator directly, avoiding intermediate bf16/fp16 "
+        "rounding of logits before logprob computation. Weights and inputs "
+        "remain in the model dtype. Only supported for unquantized LM heads "
+        "of decoder-only models.",
+        status="prototype",
+        json_schema_extra={"type": "Literal['auto', 'float32']"})
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
@@ -7007,6 +7131,38 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
+        """Reject runtime features the mixed-precision KV cache does not support."""
+        if self.kv_cache_config.mixed_precision_kv is None:
+            return self
+        if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
+            raise ValueError(
+                "Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."
+            )
+        # get_attention_backend matches the name case-insensitively.
+        if self.attn_backend.upper() not in ("TRTLLM", "FLASHINFER"):
+            raise ValueError(
+                "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
+                f"backends; got attn_backend={self.attn_backend!r}.")
+        if self.sparse_attention_config is not None:
+            raise ValueError(
+                "Mixed-precision KV is not supported together with sparse attention."
+            )
+        # The connector layout maps every cache layer to one model layer; the
+        # retained-token layers break that mapping.
+        if self.kv_connector_config is not None:
+            raise ValueError(
+                "Mixed-precision KV is not supported together with a KV connector."
+            )
+        if (self.speculative_config is not None
+                or self.kv_cache_compression_config is not None
+                or self.max_beam_width != 1):
+            raise ValueError(
+                "Mixed-precision KV currently requires single-beam execution "
+                "without speculative decoding or cold-page compression.")
+        return self
+
+    @model_validator(mode="after")
     def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
         if (self.disable_mm_encoder
                 and self.multimodal_config.encoder_cache_max_bytes != 0):
@@ -7226,6 +7382,21 @@ class TorchLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     f"Speculation type {self.speculative_config.decoding_type} does not "
                     f"support backend {self.backend}")
+
+            if isinstance(self.speculative_config, NGramDecodingConfig):
+                logger.warning_once(
+                    "NGramDecodingConfig (decoding_type 'NGram') is deprecated "
+                    "and will be removed in January 2027. Use SADecodingConfig "
+                    "(decoding_type 'SA', suffix automaton speculative "
+                    "decoding) instead.",
+                    key="deprecated_ngram_decoding_config")
+            elif isinstance(self.speculative_config,
+                            UserProvidedDecodingConfig):
+                logger.warning_once(
+                    "UserProvidedDecodingConfig (decoding_type "
+                    "'User_Provided') is deprecated and will be removed in "
+                    "January 2027.",
+                    key="deprecated_user_provided_decoding_config")
 
             # If user passed decoding_type: Eagle on pytorch, convert to Eagle3 with warning
             if type(self.speculative_config) is EagleDecodingConfig:
@@ -7722,10 +7893,15 @@ class TorchLlmArgs(BaseLlmArgs):
         assert self.quant_config is not None
         if self.kv_cache_config.dtype == "auto":
             return self
-        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla'):
+        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla',
+                                            'mixed_nvfp4_fp8'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        elif self.kv_cache_config.dtype in ('mixed_nvfp4_float16',
+                                            'mixed_nvfp4_bfloat16'):
+            # Retained tokens stay in the model dtype: no KV quantization.
+            self.quant_config.kv_cache_quant_algo = None
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "

@@ -16,7 +16,7 @@ import threading
 import time
 import types
 from contextlib import nullcontext
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
@@ -68,6 +68,48 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    ("shutdown_method", "releases_model_owned_graphs"),
+    [
+        ("shutdown", True),
+        ("shutdown_for_kv_cache_estimation", False),
+    ],
+)
+def test_shutdown_graph_lifecycle(shutdown_method, releases_model_owned_graphs):
+    engine = Mock()
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = Mock()
+    executor.dist = types.SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.encoder_launch_executor = None
+    executor.kv_connector_manager = None
+    executor.model_engine = engine
+    executor.draft_model_engine = None
+    executor.resource_manager = types.SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.sampler = object()
+    executor.dwdp_manager = None
+    executor._profile_manager = Mock()
+
+    with patch("torch.cuda.is_available", return_value=False):
+        getattr(executor, shutdown_method)()
+
+    executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
+    executor._profile_manager.cleanup.assert_called_once()
+    engine._release_cuda_graphs.assert_called_once()
+    if releases_model_owned_graphs:
+        assert engine.method_calls[:2] == [
+            call._release_model_owned_cuda_graphs(),
+            call._release_cuda_graphs(),
+        ]
+    else:
+        engine._release_model_owned_cuda_graphs.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -527,6 +569,93 @@ def test_model_without_remote_tail_does_not_inspect_request() -> None:
     executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=None))
 
     PyExecutor._configure_csa2_remote_tail(executor, types.SimpleNamespace())
+
+
+def _make_admission_executor(model, requests):
+    """An executor whose `_fetch_and_activate_new_requests` and `_validate_request` are the
+    real ones, over a model engine holding `model`; everything else they touch is a stub."""
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(model=model),
+        _is_kv_manager_v2=False,
+        kv_cache_manager=None,
+        kv_cache_transceiver=None,
+        max_beam_width=1,
+        sampler=Mock(),
+        waiting_queue=object(),
+        active_requests=[],
+        _mm_encoder_item_scheduling_enabled=False,
+        _fetch_new_requests=Mock(return_value=requests),
+        _configure_csa2_remote_tail=Mock(),
+        _validate_token_id_range=Mock(),
+        _validate_request_budget=Mock(),
+        _handle_errors=Mock(),
+    )
+    executor._validate_request = types.MethodType(PyExecutor._validate_request, executor)
+    return executor
+
+
+def _make_admission_request(request_id: int) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        request_id=request_id,
+        py_disaggregated_params=None,
+        sampling_config=None,
+        kv_cache_retention_config=None,
+    )
+
+
+def test_model_validation_fails_only_the_request_it_rejects() -> None:
+    requests = [_make_admission_request(i) for i in range(3)]
+
+    def validate_request(request) -> None:
+        if request.request_id == 1:
+            raise ValueError("frame too large")
+
+    model = types.SimpleNamespace(validate_request=Mock(side_effect=validate_request))
+    executor = _make_admission_executor(model, requests)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == [requests[0], requests[2]]
+    assert executor.active_requests == [requests[0], requests[2]]
+    executor._handle_errors.assert_called_once_with(
+        "frame too large", requests=[requests[1]], charge_budget=False
+    )
+    assert [call.args[0] for call in model.validate_request.call_args_list] == requests
+    # The checks after the model's still run for the requests it admitted.
+    assert executor._validate_request_budget.call_count == 2
+
+
+def test_model_validation_runs_after_the_sampler_and_before_the_budget() -> None:
+    order = []
+    model = types.SimpleNamespace(validate_request=lambda request: order.append("model"))
+    executor = _make_admission_executor(model, [])
+    executor.sampler.validate_request.side_effect = lambda request: order.append("sampler")
+    executor._validate_request_budget.side_effect = lambda request: order.append("budget")
+
+    PyExecutor._validate_request(executor, _make_admission_request(0))
+
+    assert order == ["sampler", "model", "budget"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        types.SimpleNamespace(),
+        Mock(spec=DecoderModelForCausalLM),
+        types.SimpleNamespace(validate_request=None),
+        None,
+    ],
+    ids=["no_attribute", "spec_mock", "none_attribute", "no_model"],
+)
+def test_models_without_the_validation_hook_are_unaffected(model) -> None:
+    requests = [_make_admission_request(i) for i in range(2)]
+    executor = _make_admission_executor(model, requests)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == requests
+    assert executor.active_requests == requests
+    executor._handle_errors.assert_not_called()
 
 
 @pytest.mark.parametrize("mode", ["standalone", "generation", "disabled"])
@@ -2464,6 +2593,7 @@ class _StubADPExecutor:
         )
         kv_cache_manager.num_extra_kv_tokens = 0
         kv_cache_manager.tokens_per_block = 128
+        kv_cache_manager.kda_context_only = False
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -3368,6 +3498,42 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
 
+def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.kda_context_only = True
+    stub.max_total_draft_tokens = 3
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 1
+    assert scheduled_batch.generation_requests == []
+    assert len(scheduled_batch.context_requests) == 1
+    dummy = scheduled_batch.context_requests[0]
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy in stub.active_requests
+    call = stub.add_dummy_calls[0]
+    assert call["is_gen"] is False
+    assert call["token_nums"] == [1]
+    assert call["max_num_draft_tokens"] == 0
+    assert stub._pending_adp_dummy_request is dummy
+
+
+def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.kda_context_only = True
+    stub.max_total_draft_tokens = 3
+    # The dummy role can still say generation when no transceiver drives it.
+    stub._adp_dummy_is_gen = True
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 1
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=1, max_num_draft_tokens=0
+    )
+    assert len(scheduled_batch.context_requests) == 1
+
+
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():
     stub, scheduled_batch = _unfittable_rank()
     scheduled_batch.context_requests_chunking = [
@@ -4075,9 +4241,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
         py_result=py_result,
         py_disaggregated_params=types.SimpleNamespace(**transferred),
     )
-    request.create_response = lambda _use_fast_logits, _rank: LlmResponse(
-        request_id=rid, result=LlmResult(b"", py_result)
-    )
+    request.create_response = lambda: LlmResponse(request_id=rid, result=LlmResult(b"", py_result))
     return request
 
 

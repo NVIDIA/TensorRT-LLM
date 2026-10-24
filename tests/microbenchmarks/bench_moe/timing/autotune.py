@@ -24,6 +24,7 @@ from typing import List
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 
 
 def _run_autotune(
@@ -56,8 +57,11 @@ def _run_autotune(
 
     cache_path = os.path.join(tempfile.gettempdir(), "bench_moe_autotuner_cache.json")
     try:
+        # ``forward`` runs outside ``ModelCaller``, so this harness owns the
+        # NCCL-window lease scope for the discarded TP all-reduce output.
         with torch.inference_mode(), autotune(cache_path=cache_path):
-            moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
+            with discard_nccl_window_tensor_outputs((x, router_logits)):
+                moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
         torch.cuda.synchronize()
         return "success:fast" if fast_autotune else "success"
     finally:

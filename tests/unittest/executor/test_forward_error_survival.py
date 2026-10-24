@@ -50,6 +50,7 @@ class _RejectingModel(MultimodalModelMixin):
 
 def _request(mm_data=None):
     return SimpleNamespace(
+        kv_cache_retention_config=None,
         py_disaggregated_params=None,
         sampling_config=None,
         py_multimodal_data=mm_data,

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/config.h"
 #include <algorithm>
 #include <cfloat>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -635,6 +636,23 @@ public:
             options.mNumInstsQ = kernelMeta.mStepQ / kernelMeta.mTileSizeQ;
             options.mNumInstsKv = kernelMeta.mStepKv / kernelMeta.mTileSizeKv;
 
+            int32_t vTokenStrideElements = 0;
+            if (isSeparateQkv(options.mQkvLayout) && params.mVTokenStrideInBytes != 0)
+            {
+                TLLM_CHECK_WITH_INFO(params.mVTokenStrideInBytes > 0, "V token stride must be positive");
+                constexpr int32_t kTmaAlignmentBytes = 16;
+                TLLM_CHECK_WITH_INFO(params.mVTokenStrideInBytes % kTmaAlignmentBytes == 0,
+                    "V token stride must be 16-byte aligned for TMA");
+                TLLM_CHECK_WITH_INFO(
+                    reinterpret_cast<std::uintptr_t>(fmhaData.mInputBuffers.vBasePtr) % kTmaAlignmentBytes == 0,
+                    "V pointer must be 16-byte aligned for TMA");
+                int32_t const elementBits = tg::dtypeGetNumBits(options.mDtypeV);
+                TLLM_CHECK_WITH_INFO(params.mVTokenStrideInBytes
+                        <= std::numeric_limits<int32_t>::max() * static_cast<int64_t>(elementBits) / 8,
+                    "V token stride exceeds the supported range");
+                int64_t const strideElements = params.mVTokenStrideInBytes * 8 / elementBits;
+                vTokenStrideElements = static_cast<int32_t>(strideElements);
+            }
             KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
                 fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
                 fmhaData.mInputBuffers.qBasePtr, fmhaData.mInputBuffers.kBasePtr, fmhaData.mInputBuffers.vBasePtr,
@@ -653,7 +671,7 @@ public:
                 fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
                 fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mMetaData.skipCorrThreshold,
                 fmhaData.mScales.kvSfScale, fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO,
-                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx);
+                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx, vTokenStrideElements);
 
             launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
