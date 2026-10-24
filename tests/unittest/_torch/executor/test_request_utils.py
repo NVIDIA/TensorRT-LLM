@@ -13,6 +13,7 @@ import pickle
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     get_from_waiting_queue,
     merge_helix_requests,
     merge_requests,
+    partition_context_for_helix,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import SlotSamplingParams
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
@@ -780,6 +782,47 @@ def test_merge_helix_requests_empty_ranks_with_padding():
         # total_input_len_cp is always the full prompt length.
         assert llm_request.total_input_len_cp == len(input_tokens)
         assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
+
+
+def _partition_by_blocks(input_tokens, cp_rank, cp_size, tokens_per_block):
+    """Round-robin block ownership spelled out block by block."""
+    input_len = len(input_tokens)
+    num_blocks = -(-input_len // tokens_per_block)
+    token_ids, position_ids = [], []
+    for block in range(cp_rank, num_blocks, cp_size):
+        for position in range(
+            block * tokens_per_block, min((block + 1) * tokens_per_block, input_len)
+        ):
+            token_ids.append(input_tokens[position])
+            position_ids.append(position)
+    return token_ids, position_ids, input_len, -input_len % tokens_per_block
+
+
+@pytest.mark.parametrize("tokens_per_block", [1, 4, 32])
+@pytest.mark.parametrize("cp_size", [1, 3, 4, 8])
+@pytest.mark.parametrize("input_len", [1, 31, 32, 33, 257, 4097])
+def test_partition_context_for_helix_matches_block_layout(input_len, cp_size, tokens_per_block):
+    rng = np.random.default_rng(input_len)
+    input_tokens = rng.integers(0, 1 << 20, size=input_len, dtype=np.int32)
+    for cp_rank in range(cp_size):
+        expected = _partition_by_blocks(input_tokens.tolist(), cp_rank, cp_size, tokens_per_block)
+        assert (
+            partition_context_for_helix(input_tokens, cp_rank, cp_size, tokens_per_block)
+            == expected
+        )
+
+
+def test_request_input_token_ids_array_matches_prompt():
+    input_tokens = [5, 7, 11, 13, (1 << 31) - 1]
+    executor_request = trtllm.Request(input_token_ids=input_tokens, max_tokens=1)
+
+    tokens = executor_request.get_input_token_ids_array()
+
+    assert tokens.dtype == np.int32
+    assert tokens.tolist() == input_tokens == executor_request.input_token_ids
+    # The array owns its tokens.
+    del executor_request
+    assert tokens.tolist() == input_tokens
 
 
 @patch("tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request")
