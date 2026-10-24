@@ -34,6 +34,9 @@ _INT32_MAX = 2**31 - 1
 #: `(min_rows, splits)`, largest first: chunks a row by the row count, so that a launch has
 #: ~1000-4000 programs. GB300 sweep over splits x block x warps at 64-1024 rows of 248320.
 _SPLITS = ((1024, 1), (512, 2), (256, 8), (128, 16), (0, 32))
+#: The table for 16-bit logits (half the bytes a chunk): GB300 sweep over splits x block x
+#: warps at 64-1024 rows of 248320 bf16, at this block and warp count.
+_SPLITS_16BIT = ((512, 4), (128, 8), (64, 16), (0, 32))
 #: Most rows `small_rows` callers route to the Triton kernels below `MIN_NUMEL`.
 SMALL_ROWS = 16
 #: Chunks a row for `small_rows` launches (GB300 graph replay, 248320 fp32 columns, 1-16 rows:
@@ -96,10 +99,14 @@ def _argmax_final_kernel(val_ptr, idx_ptr, out_ptr, SPLITS: tl.constexpr):
     tl.store(out_ptr + row, best_i.to(out_ptr.dtype.element_ty))
 
 
-def _splits(rows: int, n_cols: int) -> int:
+def _table(dtype: torch.dtype) -> tuple:
+    return _SPLITS if dtype == torch.float32 else _SPLITS_16BIT
+
+
+def _splits(rows: int, n_cols: int, dtype: torch.dtype = torch.float32) -> int:
     if rows * n_cols < MIN_NUMEL:
         return _SMALL_SPLITS
-    return next(splits for min_rows, splits in _SPLITS if rows >= min_rows)
+    return next(splits for min_rows, splits in _table(dtype) if rows >= min_rows)
 
 
 def _buffers(rows: int, splits: int, out: torch.Tensor):
@@ -123,7 +130,7 @@ def _warm(logits: torch.Tensor, out_dtype: torch.dtype) -> None:
         return
     n_cols = logits.shape[1]
     out = torch.empty(1, dtype=out_dtype, device=logits.device)
-    for splits in sorted({s for _, s in _SPLITS} | {_SMALL_SPLITS}):
+    for splits in sorted({s for _, s in _table(logits.dtype)} | {_SMALL_SPLITS}):
         val, idx = _buffers(1, splits, out)
         chunk = triton.cdiv(triton.cdiv(n_cols, splits), _BLOCK) * _BLOCK
         _argmax_chunk_kernel.warmup(
@@ -173,7 +180,7 @@ def greedy_argmax(
     _warm(logits, out_dtype)
     rows, n_cols = logits.shape
     out = torch.empty(rows, dtype=out_dtype, device=logits.device)
-    splits = _splits(rows, n_cols)
+    splits = _splits(rows, n_cols, logits.dtype)
     chunk = triton.cdiv(triton.cdiv(n_cols, splits), _BLOCK) * _BLOCK
     val, idx = _buffers(rows, splits, out)
     _argmax_chunk_kernel[(rows, splits)](

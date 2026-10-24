@@ -7395,7 +7395,13 @@ class MTPLayer:
         if core._mtp_head_fp8 is not None:
             packed = core._mtp_head_g if core._mtp_head_g is not None else core._lm_head_g
             lm_head = _Fp8DraftHead(*core._mtp_head_fp8, packed, core._mtp_head_nv)
-        return self.logits_processor.forward(final, lm_head, attn_metadata, return_context_logits)
+        return self.logits_processor.forward(
+            final,
+            lm_head,
+            attn_metadata,
+            return_context_logits,
+            widen=not getattr(self.logits_processor, "draft_argmax_only", False),
+        )
 
     def forward(
         self,
@@ -7766,18 +7772,56 @@ class _Fp8VerifyHead:
 
 class _WideningLogitsProcessor(LogitsProcessor):
     """The shell's logits processor (its row gather, its fp32 logits) over `_WidenedHead`;
-    with `fp8_head` set (the dense FP8 mode) the target's own head runs `_Fp8VerifyHead`."""
+    with `fp8_head` set (the dense FP8 mode) the target's own head runs `_Fp8VerifyHead`.
+
+    `widen=False` (with `return_context_logits`, the speculative paths) returns the head's
+    own bf16 logits: for a consumer that only takes their row argmax, which is the same
+    token over bf16 as over their exact fp32 widening (same order, ties, NaN and +-0)."""
 
     fp8_head = None  # (rowwise copy, packed copy) under the dense FP8 mode
+    #: Set by the shell's forward each engine step: the step's draft logits feed only the
+    #: greedy draft sampler's argmax (see `_spec_argmax_only`).
+    draft_argmax_only = False
 
     def forward(
-        self, hidden_states, lm_head, attn_metadata, return_context_logits: bool = False
+        self,
+        hidden_states,
+        lm_head,
+        attn_metadata,
+        return_context_logits: bool = False,
+        widen: bool = True,
     ) -> torch.Tensor:
         if self.fp8_head is not None and not isinstance(lm_head, _Fp8DraftHead):
             lm_head = _Fp8VerifyHead(*self.fp8_head)
+        if not widen and return_context_logits:
+            return lm_head(hidden_states)
         return super().forward(
             hidden_states, _WidenedHead(lm_head), attn_metadata, return_context_logits
         )
+
+
+def _spec_argmax_only(spec_worker, spec_metadata) -> tuple[bool, bool]:
+    """`(verify, draft)`: whether this step's verify / draft logits are consumed only by a
+    row argmax, so they can stay bf16.
+
+    Both need no guided decoder (it edits the logits). The draft logits then feed only
+    the draft sampler, an argmax unless rejection sampling runs on a non-greedy batch. The
+    verify logits are also the step's `logits` output and the occurrence penalties' and
+    relaxed acceptance's input; the one-model speculative sampler admits no request
+    asking for logits or log probabilities, so they stay bf16 only for an all-greedy batch
+    with the penalties off (a deploy-time flag) and strict acceptance. Every input is a
+    deploy-time constant or `is_all_greedy_sample`, part of the CUDA graph key."""
+    if getattr(spec_worker, "guided_decoder", None) is not None:
+        return False, False
+    draft = not spec_metadata.wants_advanced_draft_sampling
+    verify = (
+        spec_metadata.is_all_greedy_sample
+        and not getattr(spec_metadata, "enable_penalty", False)
+        and not getattr(
+            getattr(spec_worker, "spec_config", None), "use_relaxed_acceptance_for_thinking", False
+        )
+    )
+    return verify, draft
 
 
 class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
@@ -8200,12 +8244,16 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             )
         )
         # `gather_ids`: one row per context request, `runtime_draft_len + 1` per
-        # generation request.
+        # generation request. Logits only an argmax reads stay bf16.
+        verify_argmax_only, self.logits_processor.draft_argmax_only = _spec_argmax_only(
+            self.spec_worker, spec_metadata
+        )
         logits = self.logits_processor.forward(
             nn.functional.embedding(spec_metadata.gather_ids, final),
             self.lm_head,
             attn_metadata,
             True,
+            widen=not verify_argmax_only,
         )
         # A prefill CUDA graph pads the step's rows; the worker reshapes generation rows per
         # request, so it takes the batch's own.
