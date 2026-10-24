@@ -1,11 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What this engine can actually do, defined once for Generate and Control.
+"""Shared capability resolution for OpenEngine Control and Generate."""
 
-Control advertises from this table and Generate enforces it, so a client can
-never discover a capability that Generate then rejects.
-"""
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Collection, Mapping
+
+from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    BaseMultimodalInputProcessor,
+)
 
 # Guides each grammar backend can build, keyed by the `GuidedDecoding` oneof
 # field name. Control advertises from this table and Generate enforces it, so
@@ -16,6 +22,30 @@ GUIDE_SUPPORT_BY_BACKEND: dict[str, frozenset[str]] = {
     ),
     "llguidance": frozenset({"json_schema", "regex", "ebnf_grammar", "json_object"}),
 }
+
+
+@dataclass(frozen=True)
+class MediaCapabilities:
+    """Media support shared by Control and Generate."""
+
+    placeholder_templates: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "placeholder_templates", MappingProxyType(dict(self.placeholder_templates))
+        )
+
+    def __hash__(self) -> int:
+        return hash(frozenset(self.placeholder_templates.items()))
+
+    @property
+    def modalities(self) -> frozenset[str]:
+        """Modalities supported by both the model and request mapper."""
+        return frozenset(self.placeholder_templates)
+
+    def placeholder(self, modality: str, item_number: int) -> str:
+        """Format the model placeholder for a one-based media item."""
+        return self.placeholder_templates[modality].format(item_number)
 
 
 def supported_guides(backend: str | None) -> frozenset[str]:
@@ -32,7 +62,56 @@ def supported_guides(backend: str | None) -> frozenset[str]:
     return GUIDE_SUPPORT_BY_BACKEND.get(backend.lower(), frozenset())
 
 
+def _loaded_model_type(llm: Any) -> str:
+    """Return the top-level model type for the loaded input processor."""
+    input_processor = getattr(llm, "input_processor", None)
+    config = getattr(input_processor, "config", None) or getattr(llm, "_hf_model_config", None)
+    if config is None:
+        return ""
+    return resolve_top_level_model_type(config)
+
+
+def resolve_media_capabilities(
+    llm: Any, implemented_modalities: Collection[str]
+) -> MediaCapabilities:
+    """Intersect model support with implemented request handlers.
+
+    A live registered processor prevents registry-only false positives.
+    """
+    input_processor = getattr(llm, "input_processor", None)
+    model_type = _loaded_model_type(llm)
+    if not model_type:
+        return MediaCapabilities({})
+    if not isinstance(input_processor, BaseMultimodalInputProcessor):
+        registered_model_type = getattr(type(input_processor), "_registered_model_type", None)
+        if registered_model_type != model_type:
+            return MediaCapabilities({})
+        if not callable(input_processor):
+            return MediaCapabilities({})
+
+    placeholders = {
+        modality: MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(model_type, modality)
+        for modality in implemented_modalities
+        if MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality)
+    }
+    # Gemma4 checkpoints may omit the audio encoder despite sharing a model type.
+    if model_type == "gemma4" and getattr(input_processor.config, "audio_config", None) is None:
+        placeholders.pop("audio", None)
+    # Fail startup before Control advertises a malformed template.
+    for modality, template in placeholders.items():
+        try:
+            template.format(1)
+        except (IndexError, KeyError, ValueError) as error:
+            raise RuntimeError(
+                f"invalid multimodal placeholder for model type '{model_type}' "
+                f"and modality '{modality}': {error}"
+            ) from error
+    return MediaCapabilities(placeholders)
+
+
 __all__ = [
     "GUIDE_SUPPORT_BY_BACKEND",
+    "MediaCapabilities",
+    "resolve_media_capabilities",
     "supported_guides",
 ]

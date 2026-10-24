@@ -598,6 +598,9 @@ class WhisperInputProcessor(InputProcessor):
     # Marks this model as feature-driven for the encoder side: prompts
     # without audio cannot be served and are rejected at submission.
     requires_encoder_features = True
+    # The text prompt selects the decoder language/task; pre-tokenized prompt
+    # IDs are not consumed by this processor.
+    supports_token_ids_input = False
 
     def __init__(self, model_path, config, tokenizer, trust_remote_code: bool = True, **kwargs):
         self.model_path = model_path

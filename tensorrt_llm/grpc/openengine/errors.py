@@ -8,6 +8,10 @@ class UnsupportedFeatureError(ValueError):
     """Raised when OpenEngine requests a feature this adapter cannot map."""
 
 
+class MediaUnavailableError(RuntimeError):
+    """Raised when fetching remote request media fails transiently."""
+
+
 class AbortFailedError(RuntimeError):
     """Raised when an active request could not be aborted on the engine."""
 
@@ -18,5 +22,6 @@ class AbortFailedError(RuntimeError):
 
 __all__ = [
     "AbortFailedError",
+    "MediaUnavailableError",
     "UnsupportedFeatureError",
 ]

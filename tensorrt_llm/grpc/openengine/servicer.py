@@ -25,13 +25,14 @@ from .coordinator import (
     Reservation,
 )
 from .disagg import disaggregated_params_from_request
-from .errors import AbortFailedError, UnsupportedFeatureError
+from .errors import AbortFailedError, MediaUnavailableError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
 from .request_mapping import (
     _input_from_request,
     _metadata_from_context,
     conversation_affinity_enabled,
     conversation_params_from_request,
+    media_capabilities_for_model,
     sampling_params_from_request,
 )
 from .streaming import (
@@ -41,6 +42,24 @@ from .streaming import (
     _format_result,
     _OpenEngineFormatState,
 )
+
+
+class _LocalRequest:
+    """Abort-aware local request state spanning mapping and generation."""
+
+    def __init__(self) -> None:
+        self.handle: Any = None
+        self.aborted = False
+
+    def bind(self, handle: Any) -> None:
+        self.handle = handle
+        if self.aborted:
+            handle.abort()
+
+    def abort(self) -> None:
+        if self.handle is not None:
+            self.handle.abort()
+        self.aborted = True
 
 
 class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
@@ -62,8 +81,14 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         # context worker uses. The actual transfer is driven by opaque_state.
         self._kv_transfer_backend = kv_transfer_backend
         self._guided_backend = llm.args.guided_decoding_backend
+        self._media_capabilities = media_capabilities_for_model(llm)
         self.subagent_affinity_auth_key = subagent_affinity_auth_key
         self._active_requests: dict[str, Any] = {}
+
+    @property
+    def supported_media_modalities(self) -> frozenset[str]:
+        """Cached media modalities."""
+        return self._media_capabilities.modalities
 
     def active_request_count(self) -> int:
         """Requests accepted and not yet completed."""
@@ -120,15 +145,26 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         request: generation_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[generation_pb2.GenerateResponse]:
+        local_request = None
+        registration = None
         reservation = None
         try:
+            if not request.request_id:
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT, "request_id must be non-empty"
+                )
+            local_request = _LocalRequest()
+            registration = ActiveRequest(self._active_requests, request.request_id, local_request)
+            if not registration.register():
+                await context.abort(
+                    grpc.StatusCode.ALREADY_EXISTS,
+                    f"request_id '{request.request_id}' is already active",
+                )
             if self._frontend is not None:
-                if not request.request_id:
-                    await context.abort(
-                        grpc.StatusCode.INVALID_ARGUMENT, "request_id must be non-empty"
-                    )
                 reservation = await self._frontend.reserve(request.request_id)
-            async with aclosing(self._generate(request, context, reservation)) as responses:
+            async with aclosing(
+                self._generate(request, context, local_request, registration, reservation)
+            ) as responses:
                 async for response in responses:
                     yield response
         except DuplicateRequestError as error:
@@ -138,6 +174,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         except CoordinationError as error:
             await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
         finally:
+            if registration is not None:
+                registration.release()
             if reservation is not None:
                 try:
                     await asyncio.shield(reservation.release())
@@ -151,33 +189,25 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         self,
         request: generation_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
+        local_request: _LocalRequest,
+        registration: ActiveRequest,
         reservation: Reservation | None = None,
     ) -> AsyncIterator[generation_pb2.GenerateResponse]:
         """Run a server-streaming OpenEngine generation request."""
         request_id = request.request_id
         try:
-            if not request_id:
-                raise ValueError("request_id must be non-empty")
             if not request.model:
                 raise ValueError("model must be non-empty")
             # Like the HTTP /v1/completions single-model server, any non-empty
             # model name is accepted and served by the loaded model (no NOT_FOUND
             # on a mismatch) so the two transports behave consistently.
-            if request_id in self._active_requests:
-                await context.abort(
-                    grpc.StatusCode.ALREADY_EXISTS,
-                    f"request_id '{request_id}' is already active",
-                )
-                return
-            if request.media:
-                raise UnsupportedFeatureError("multimodal media is not supported")
             if request.lora_name:
                 raise UnsupportedFeatureError("LoRA selection is not supported")
             if request.HasField("kv"):
                 if request.kv.HasField("bypass_prefix_cache") and request.kv.bypass_prefix_cache:
                     raise UnsupportedFeatureError("prefix cache bypass is not supported")
 
-            inputs = _input_from_request(request)
+            inputs = await _input_from_request(request, self._llm, self._media_capabilities)
             sampling_params = sampling_params_from_request(request, self._guided_backend)
             trace_headers, target_dp_rank, affinity_headers = _metadata_from_context(context)
             conversation_params = conversation_params_from_request(request)
@@ -232,6 +262,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         except UnsupportedFeatureError as error:
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, str(error))
             return
+        except MediaUnavailableError as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            return
         except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
             return
@@ -249,7 +282,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             tokenizer=self._llm.tokenizer,
         )
 
-        if reservation is not None and reservation.aborted:
+        if local_request.aborted or (reservation is not None and reservation.aborted):
             await context.abort(grpc.StatusCode.CANCELLED, "Request aborted before submission")
 
         try:
@@ -283,12 +316,12 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             await context.abort(grpc.StatusCode.INTERNAL, str(error))
             return
 
+        local_request.bind(result_handle)
         if reservation is not None:
             reservation.bind(result_handle)
 
         engine_terminal = False
         abort_requested = False
-        registration = ActiveRequest(self._active_requests, request_id, result_handle)
 
         def abort_request(reason: str) -> None:
             nonlocal abort_requested
@@ -333,13 +366,6 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         rpc_task.add_done_callback(on_rpc_done)
 
         try:
-            # Register inside the try so the finally below always releases the
-            # id. There is no await between the duplicate-id check above and
-            # here, so the asyncio single-thread atomicity that makes that check
-            # correct still holds, while an exception before streaming can no
-            # longer leak the id (which would make it permanently un-reusable,
-            # since re-submits are rejected with ALREADY_EXISTS).
-            registration.register()
             watchdog.start()
             async for result in result_handle:
                 if context.cancelled():
