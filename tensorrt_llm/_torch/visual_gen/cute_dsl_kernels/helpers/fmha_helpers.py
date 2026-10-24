@@ -31,10 +31,12 @@
 import enum
 from typing import Tuple, Optional
 import cutlass
-from cutlass.cute.typing import Boolean
-from cutlass._mlir.dialects import llvm, vector
+from cutlass.cute.typing import Boolean, Float16, Int64
+from cutlass._mlir import ir as _mlir_ir
+from cutlass._mlir.dialects import llvm, nvvm as _nvvm, vector
 
 from cutlass.cutlass_dsl import (
+    Int16,
     Int32,
     Float32,
     T,
@@ -46,6 +48,7 @@ from cutlass.cutlass_dsl import (
 from cutlass.utils.hardware_info import HardwareInfo
 from .static_persistent_tile_scheduler import WorkTileInfo
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import tcgen05
 
 
 ##############################################################################
@@ -63,12 +66,15 @@ class FmhaStaticTileSchedulerParams:
     :type is_persistent: bool
     :ivar problem_shape_mhb: Problem shape in (M, H, B) format.
     :type problem_shape_mhb: cute.Shape
+    :ivar persistent_raster_order: Linearization order for persistent work indices.
+    :type persistent_raster_order: str
     """
 
     def __init__(
         self,
         is_persistent: bool,
         problem_shape_mhb: cute.Shape,
+        persistent_raster_order: str = "mhb",
         *,
         loc=None,
         ip=None,
@@ -80,9 +86,20 @@ class FmhaStaticTileSchedulerParams:
         :type is_persistent: bool
         :param problem_shape_mhb: Problem shape in (M, H, B) format.
         :type problem_shape_mhb: cute.Shape
+        :param persistent_raster_order: Persistent work-index linearization.
+                                        ``mhb`` keeps the existing M-fastest
+                                        order; ``compact`` enumerates only
+                                        valid ragged Q tiles.
+        :type persistent_raster_order: str
         """
+        if persistent_raster_order not in ("mhb", "compact"):
+            raise ValueError(
+                "persistent_raster_order must be 'mhb' or 'compact', "
+                f"got {persistent_raster_order!r}"
+            )
         self.is_persistent = is_persistent
         self.problem_shape_mhb = problem_shape_mhb
+        self.persistent_raster_order = persistent_raster_order
         self._loc = loc
         self._ip = ip
 
@@ -99,7 +116,76 @@ class FmhaStaticTileSchedulerParams:
         for obj, n_items in zip([self.problem_shape_mhb], self._values_pos):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return FmhaStaticTileSchedulerParams(self.is_persistent, *(tuple(obj_list)), loc=self._loc)
+        return FmhaStaticTileSchedulerParams(
+            self.is_persistent, *obj_list, self.persistent_raster_order, loc=self._loc
+        )
+
+
+@cute.jit
+def _warp_inclusive_prefix_sum_i32(value: Int32, lane_idx: Int32) -> Int32:
+    """Return an inclusive Int32 prefix sum across one full warp."""
+    offset = 1
+    result = value
+    while cutlass.const_expr(offset < cute.arch.WARP_SIZE):
+        shuffled = cute.arch.shuffle_sync_up(result, offset, mask_and_clamp=0)
+        if lane_idx >= offset:
+            result += shuffled
+        offset = offset << 1
+    return result
+
+
+@cute.jit
+def _map_compact_ragged_fmha_work(
+    current_work_linear_idx: Int32,
+    cum_seqlen_q: cute.Tensor,
+    problem_h: Int32,
+    problem_b: Int32,
+    q_tile_size: int,
+) -> Tuple[cute.Coord, Boolean]:
+    # Batch is outermost; within one batch, M is fastest and H is next:
+    #   local_id = m + num_m_tiles * head
+    # This matches the production ragged scheduler's work-index mapping.
+    lane_idx = cute.arch.lane_idx()
+    work_searched = Int32(0)
+    search_begin = Int32(0)
+    batch_idx = Int32(0)
+    m_idx = Int32(0)
+    head_idx = Int32(0)
+    found = Boolean(False)
+
+    # Search 32 batches at a time. Each lane loads one request and the warp
+    # computes its prefix collectively, instead of every lane serially
+    # reloading the same cumulative-length entries. Reloading the compact
+    # metadata at each work-index mapping keeps it out of the long-lived FMHA
+    # register set and avoids compiler-generated local-memory spills.
+    while not found and search_begin < problem_b:
+        candidate_batch = search_begin + lane_idx
+        batch_tiles = Int32(0)
+        if candidate_batch < problem_b:
+            seqlen_q = cum_seqlen_q[candidate_batch + 1] - cum_seqlen_q[candidate_batch]
+            batch_tiles = cute.ceil_div(seqlen_q, q_tile_size)
+        batch_work_end = work_searched + _warp_inclusive_prefix_sum_i32(
+            batch_tiles * problem_h, lane_idx
+        )
+
+        batch_before_target = current_work_linear_idx >= batch_work_end
+        target_lane = cute.arch.popc(cute.arch.vote_ballot_sync(batch_before_target))
+        window_missed = target_lane == cute.arch.WARP_SIZE
+        if not window_missed:
+            target_work_begin = work_searched
+            if target_lane > 0:
+                target_work_begin = cute.arch.shuffle_sync(batch_work_end, target_lane - 1)
+            target_batch_tiles = cute.arch.shuffle_sync(batch_tiles, target_lane)
+            local_work_idx = current_work_linear_idx - target_work_begin
+            batch_idx = search_begin + target_lane
+            m_idx = local_work_idx % target_batch_tiles
+            head_idx = local_work_idx // target_batch_tiles
+            found = Boolean(True)
+
+        if window_missed:
+            work_searched = cute.arch.shuffle_sync(batch_work_end, cute.arch.WARP_SIZE - 1)
+            search_begin += cute.arch.WARP_SIZE
+    return (m_idx, head_idx, batch_idx), found
 
 
 class FmhaStaticTileScheduler:
@@ -135,6 +221,8 @@ class FmhaStaticTileScheduler:
         current_work_linear_idx: Int32,
         blk_coord: cute.Coord,
         grid_shape: cute.Shape,
+        cum_seqlen_q: Optional[cute.Tensor] = None,
+        q_tile_size: int = 1,
         *,
         loc=None,
         ip=None,
@@ -156,6 +244,10 @@ class FmhaStaticTileScheduler:
         self._grid_shape = grid_shape
         self._is_persistent = params.is_persistent
         self._current_work_linear_idx = current_work_linear_idx
+        self._cum_seqlen_q = cum_seqlen_q
+        self._q_tile_size = q_tile_size
+        if params.persistent_raster_order == "compact" and cum_seqlen_q is None:
+            raise ValueError("compact ragged scheduling requires cum_seqlen_q")
         self._problem_shape_mhb = cute.make_layout(params.problem_shape_mhb, loc=loc, ip=ip)
         self._num_blocks = cute.size(self._problem_shape_mhb, loc=loc, ip=ip)
         self._is_first_block = True
@@ -168,6 +260,7 @@ class FmhaStaticTileScheduler:
     def get_grid_shape(
         params: FmhaStaticTileSchedulerParams,
         *,
+        sm_count: int | None = None,
         loc=None,
         ip=None,
     ) -> cute.Shape:
@@ -185,8 +278,9 @@ class FmhaStaticTileScheduler:
         :rtype: cute.Shape
         """
         if params.is_persistent:
-            hardware_info = HardwareInfo()
-            sm_count = hardware_info.get_device_multiprocessor_count()
+            if sm_count is None:
+                hardware_info = HardwareInfo()
+                sm_count = hardware_info.get_device_multiprocessor_count()
             return (
                 min(sm_count, cute.size(params.problem_shape_mhb, loc=loc, ip=ip)),
                 1,
@@ -229,21 +323,26 @@ class FmhaStaticTileScheduler:
         :return: WorkTileInfo containing tile coordinates and validity flag.
         :rtype: WorkTileInfo
         """
-        is_valid = (
-            self._current_work_linear_idx < self._num_blocks
-            if self._is_persistent
-            else self._is_first_block
-        )
-
         blk_coord = (0, 0, 0)
-        if self._is_persistent:
+        if self._is_persistent and self._params.persistent_raster_order == "compact":
+            _, problem_h, problem_b = self._params.problem_shape_mhb
+            blk_coord, is_valid = _map_compact_ragged_fmha_work(
+                self._current_work_linear_idx,
+                self._cum_seqlen_q,
+                problem_h,
+                problem_b,
+                self._q_tile_size,
+            )
+        elif self._is_persistent:
+            is_valid = self._current_work_linear_idx < self._num_blocks
             blk_coord = self._problem_shape_mhb.get_hier_coord(
                 self._current_work_linear_idx, loc=loc, ip=ip
             )
         else:
+            is_valid = self._is_first_block
             blk_coord = self._blk_coord
 
-        # cur_tile_coord is (mid, 0, (bid, hid))
+        # cur_tile_coord is (mid, 0, (hid, bid))
         cur_tile_coord = (
             blk_coord[0],
             0,
@@ -275,6 +374,11 @@ class FmhaStaticTileScheduler:
             self._current_work_linear_idx += advance_count * self.num_persistent_sm
         self._is_first_block = False
 
+    def set_current_work_linear_idx(self, work_idx: Int32):
+        """Replace the persistent work index with an externally scheduled one."""
+        self._current_work_linear_idx = work_idx
+        self._is_first_block = False
+
     def __extract_mlir_values__(self):
         # Only pass mutable per-iteration state as scf.while block arguments.
         # _params and _grid_shape are loop-invariant and captured from outer
@@ -290,7 +394,12 @@ class FmhaStaticTileScheduler:
         )
         new_blk_coord = new_from_mlir_values(self._blk_coord, values[1:4])
         return FmhaStaticTileScheduler(
-            self._params, new_current_work_linear_idx, new_blk_coord, self._grid_shape
+            self._params,
+            new_current_work_linear_idx,
+            new_blk_coord,
+            self._grid_shape,
+            self._cum_seqlen_q,
+            self._q_tile_size,
         )
 
 
@@ -298,6 +407,8 @@ def create_fmha_static_tile_scheduler(
     params: FmhaStaticTileSchedulerParams,
     blk_coord: cute.Coord,
     grid_shape: cute.Shape,
+    cum_seqlen_q: Optional[cute.Tensor] = None,
+    q_tile_size: int = 1,
 ) -> FmhaStaticTileScheduler:
     """
     Create a new FMHA static tile scheduler.
@@ -312,12 +423,42 @@ def create_fmha_static_tile_scheduler(
     :return: New FmhaStaticTileScheduler instance.
     :rtype: FmhaStaticTileScheduler
     """
-    return FmhaStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
+    return FmhaStaticTileScheduler(
+        params,
+        blk_coord[0],
+        blk_coord,
+        grid_shape,
+        cum_seqlen_q,
+        q_tile_size,
+    )
+
+
+@cute.jit
+def fmha_work_tile_info_from_clc_response(result_addr: cute.Pointer) -> WorkTileInfo:
+    """Decode one hardware CLC response into FMHA's nested tile coordinate."""
+    m_idx, h_idx, b_idx, is_valid = cute.arch.clc_response(result_addr)
+    # CLC writes through the async proxy and the response is read through the
+    # generic proxy. Fence before the stage can be reused by the producer.
+    cute.arch.fence_proxy("async.shared", space="cta")
+    return WorkTileInfo((m_idx, 0, (h_idx, b_idx)), is_valid)
+
+
+@cute.jit
+def fmha_work_tile_info_from_dynamic_response(
+    result_addr: cute.Pointer,
+) -> WorkTileInfo:
+    """Decode one software work-index response from shared memory."""
+    m_idx = cute.arch.load(result_addr + 0, Int32, ss="cta")
+    h_idx = cute.arch.load(result_addr + 1, Int32, ss="cta")
+    b_idx = cute.arch.load(result_addr + 2, Int32, ss="cta")
+    is_valid = cute.arch.load(result_addr + 3, Int32, ss="cta") != 0
+    return WorkTileInfo((m_idx, 0, (h_idx, b_idx)), is_valid)
 
 
 def create_fmha_static_tile_scheduler_params(
     is_persistent: bool,
     problem_shape_mhb: cute.Shape,
+    persistent_raster_order: str = "mhb",
 ) -> FmhaStaticTileSchedulerParams:
     """
     Create FMHA static tile scheduler parameters.
@@ -326,11 +467,17 @@ def create_fmha_static_tile_scheduler_params(
     :type is_persistent: bool
     :param problem_shape_mhb: Problem shape in (M, H, B) format.
     :type problem_shape_mhb: cute.Shape
+    :param persistent_raster_order: Persistent work-index linearization.
+    :type persistent_raster_order: str
 
     :return: New FmhaStaticTileSchedulerParams instance.
     :rtype: FmhaStaticTileSchedulerParams
     """
-    return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mhb)
+    return FmhaStaticTileSchedulerParams(
+        is_persistent,
+        problem_shape_mhb,
+        persistent_raster_order,
+    )
 
 
 def compute_grid(
@@ -338,6 +485,7 @@ def compute_grid(
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
     is_2cta: bool = False,
+    persistent_raster_order: str = "mhb",
 ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
     """
     Compute grid parameters for FMHA operation.
@@ -361,6 +509,10 @@ def compute_grid(
     :type is_persistent: bool
     :param is_2cta: Whether to use 2CTA mode.
     :type is_2cta: bool
+    :param persistent_raster_order: Persistent work-index linearization. ``mhb``
+                                    preserves the existing M-fastest order;
+                                    ``compact`` enumerates valid ragged tiles.
+    :type persistent_raster_order: str
 
     :return: Tuple of (scheduler_params, grid_shape).
     :rtype: Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]
@@ -372,6 +524,7 @@ def compute_grid(
             cute.size(o_shape[2][0]),
             cute.size(o_shape[2][1]),
         ),
+        persistent_raster_order,
     )
     grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
 
@@ -399,6 +552,215 @@ class MaskEnum(enum.Enum):
     WINDOW_MASK_INFERENCE = enum.auto()
     WINDOW_MASK_BWD = enum.auto()
     WINDOW_MASK_BWD_INFERENCE = enum.auto()
+
+
+@dsl_user_op
+def _causal_mask_32_regs_setp_selp(
+    regs,
+    last_valid_k: Int32,
+    group_start: cutlass.Constexpr,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Apply a causal suffix mask with scalar ``setp.ge``/``selp`` pairs.
+
+    Each output is tied to its input register, so the inline PTX requests one
+    scalar 32-bit select instead of leaving the compiler to construct
+    pair-valued SSA merges for the conditional assignments in ``apply_mask``,
+    which lower poorly on some architectures.
+    """
+    reg_count = 32
+    last_valid_operand = reg_count * 2
+    reg_values = [Float32(regs[i]).ir_value(loc=loc, ip=ip) for i in range(reg_count)]
+    blocks = []
+    for block_start in range(0, reg_count, 4):
+        compares = "\n".join(
+            f"    setp.ge.s32 p{i - block_start}, ${last_valid_operand}, {group_start + i};"
+            for i in range(block_start, block_start + 4)
+        )
+        selects = "\n".join(
+            f"    selp.b32 ${i}, ${reg_count + i}, 0xff800000, p{i - block_start};"
+            for i in range(block_start, block_start + 4)
+        )
+        blocks.append(f"{compares}\n{selects}")
+    asm = f"""{{
+    .reg .pred p<4>;
+{chr(10).join(blocks)}
+    }}"""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * reg_count),
+        reg_values + [Int32(last_valid_k).ir_value(loc=loc, ip=ip)],
+        asm,
+        ",".join(["=f"] * reg_count + [str(i) for i in range(reg_count)] + ["r"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip)) for i in range(reg_count)
+    )
+
+
+@dsl_user_op
+def _band_mask_32_regs_setp_selp(
+    regs,
+    first_valid_k: Int32,
+    last_valid_k: Int32,
+    group_start: cutlass.Constexpr,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Apply a two-sided (band) mask with scalar ``setp``/``and``/``selp``.
+
+    The sliding-window variant of :func:`_causal_mask_32_regs_setp_selp`:
+    element ``k`` survives iff ``first_valid_k <= k <= last_valid_k``.
+    """
+    reg_count = 32
+    last_valid_operand = reg_count * 2
+    first_valid_operand = reg_count * 2 + 1
+    reg_values = [Float32(regs[i]).ir_value(loc=loc, ip=ip) for i in range(reg_count)]
+    blocks = []
+    for block_start in range(0, reg_count, 4):
+        lines = []
+        for i in range(block_start, block_start + 4):
+            j = i - block_start
+            lines.append(f"    setp.ge.s32 p{j}, ${last_valid_operand}, {group_start + i};")
+            lines.append(f"    setp.le.s32 q{j}, ${first_valid_operand}, {group_start + i};")
+            lines.append(f"    and.pred p{j}, p{j}, q{j};")
+        lines.extend(
+            f"    selp.b32 ${i}, ${reg_count + i}, 0xff800000, p{i - block_start};"
+            for i in range(block_start, block_start + 4)
+        )
+        blocks.append("\n".join(lines))
+    asm = f"""{{
+    .reg .pred p<4>;
+    .reg .pred q<4>;
+{chr(10).join(blocks)}
+    }}"""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * reg_count),
+        reg_values
+        + [
+            Int32(last_valid_k).ir_value(loc=loc, ip=ip),
+            Int32(first_valid_k).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        ",".join(["=f"] * reg_count + [str(i) for i in range(reg_count)] + ["r", "r"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip)) for i in range(reg_count)
+    )
+
+
+class PrefixWindowKv:
+    """Key range of a sequence attending to a shared prefix and a window of the KV address space.
+
+    A sequence sees the logical key positions ``[0, prefix)`` and ``[start, start + length)``,
+    where ``start`` is arbitrary (not a prefix sum of the lengths) and may lie inside the prefix.
+    Positions are absolute: tile ``t`` covers ``[t * tile_kv, (t + 1) * tile_kv)``.
+
+    The tiles that hold any visible position are visited in a virtual order that puts every tile
+    needing the element mask (the prefix's last partial tile, and the window's first and last tile
+    when they are partial) first, then the tiles that are entirely visible. Softmax does not depend
+    on the order in which keys are visited. ``plan`` counts the tiles; ``tile_of`` maps a virtual
+    index to a tile; the masked tiles take the element mask ``pos < prefix or lo <= pos < hi``,
+    with ``prefix``, ``lo`` and ``hi`` from ``visible_range``.
+
+    The plan is a tuple whose first two entries are the number of masked tiles and of all tiles.
+    """
+
+    @staticmethod
+    @cute.jit
+    def plan(prefix: Int32, start: Int32, length: Int32, tile_kv: int):
+        """Tile counts and boundaries of one sequence."""
+        # Positions of the window below the prefix are visible through the prefix.
+        lo = max(start, prefix)
+        hi = max(start + length, lo)
+        n_a = cute.ceil_div(prefix, tile_kv)  # tiles holding prefix positions
+        n_a_full = prefix // tile_kv  # of them, entirely inside the prefix
+        a_partial = n_a - n_a_full  # the prefix's last tile, shared with what follows
+        # The window's first tile is the prefix's partial tile when they share one; the masked
+        # prefix tile then covers both, as the element mask takes both ranges.
+        win_first = max(lo // tile_kv, n_a)
+        win_end = cute.ceil_div(hi, tile_kv)
+        win_last = win_end - 1
+        nonempty = Int32(0)
+        if hi > lo:
+            if win_first < win_end:
+                nonempty = Int32(1)
+        first_masked = Int32(0)
+        last_masked = Int32(0)
+        if nonempty == 1:
+            if win_first == lo // tile_kv:
+                if lo % tile_kv != 0:
+                    first_masked = Int32(1)
+            if win_first == win_last:
+                if hi % tile_kv != 0:
+                    first_masked = Int32(1)
+            else:
+                if hi % tile_kv != 0:
+                    last_masked = Int32(1)
+        n_masked = a_partial + first_masked + last_masked
+        win_inner_start = win_first + first_masked
+        n_win_inner = Int32(0)
+        if nonempty == 1:
+            n_win_inner = max(win_last + 1 - last_masked - win_inner_start, 0)
+        n_total = n_masked + n_a_full + n_win_inner
+        return (
+            n_masked,
+            n_total,
+            n_a,
+            n_a_full,
+            a_partial,
+            first_masked,
+            win_first,
+            win_last,
+            win_inner_start,
+            prefix,
+            lo,
+            hi,
+        )
+
+    @staticmethod
+    @cute.jit
+    def tile_of(plan: Tuple, v: Int32) -> Int32:
+        """Tile index of the ``v``-th tile in the virtual order."""
+        n_masked = plan[0]
+        n_a = plan[2]
+        n_a_full = plan[3]
+        a_partial = plan[4]
+        first_masked = plan[5]
+        win_first = plan[6]
+        win_last = plan[7]
+        win_inner_start = plan[8]
+        tile = Int32(0)
+        if v < n_masked:
+            if a_partial == 1 and v == 0:
+                tile = n_a - 1
+            else:
+                tile = win_last
+                if first_masked == 1 and v - a_partial == 0:
+                    tile = win_first
+        else:
+            w = v - n_masked
+            tile = w
+            if w >= n_a_full:
+                tile = win_inner_start + (w - n_a_full)
+        return tile
+
+    @staticmethod
+    def visible_range(plan: Tuple) -> Tuple[Int32, Int32, Int32]:
+        """``(prefix, lo, hi)``: positions below ``prefix`` and in ``[lo, hi)`` are visible."""
+        return plan[9], plan[10], plan[11]
 
 
 class FusedMask:
@@ -993,6 +1355,7 @@ class FusedMask:
             index_q,
             index_k,
         ),
+        use_causal_setp_selp_inline: cutlass.Constexpr = False,
     ):
         """
         Apply the appropriate mask to the attention scores.
@@ -1014,7 +1377,52 @@ class FusedMask:
         :type window_size_left: Optional[int]
         :param window_size_right: Right-side sliding window size for attention masking.
         :type window_size_right: Optional[int]
+        :param use_causal_setp_selp_inline: Whether to use the Rubin right-only
+            causal ``setp.ge``/``selp`` specialization.
+        :type use_causal_setp_selp_inline: cutlass.Constexpr
         """
+
+        if cutlass.const_expr(use_causal_setp_selp_inline):
+            offset = 0
+            if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
+                offset = seqlen_k - seqlen_q
+            index_q0, index_k0 = index_transform(*index_qk[0])
+            if cutlass.const_expr(window_size_right is not None):
+                valid_k = index_q0 + offset + window_size_right + 1 - index_k0
+                valid_k = min(valid_k, seqlen_k - index_k0)
+            else:
+                # Residual-only mask: the valid range is bounded by seqlen_k.
+                valid_k = seqlen_k - index_k0
+            if index_q0 >= seqlen_q:
+                valid_k = Int32(0)
+            valid_k = max(valid_k, Int32(0))
+            last_valid_k = valid_k - Int32(1)
+
+            if cutlass.const_expr(window_size_left is not None):
+                # Two-sided (sliding-window) mask: also bound the band start.
+                # A negative first_valid_k simply leaves the prefix unmasked;
+                # invalid rows are handled by last_valid_k = -1 above.
+                first_valid_k = index_q0 + offset - window_size_left - index_k0
+                for group_start in cutlass.range_constexpr(0, cute.size(acc_qk), 32):
+                    masked = _band_mask_32_regs_setp_selp(
+                        tuple(acc_qk[group_start + j] for j in range(32)),
+                        first_valid_k,
+                        last_valid_k,
+                        group_start,
+                    )
+                    for j in cutlass.range_constexpr(32):
+                        acc_qk[group_start + j] = masked[j]
+                return
+
+            for group_start in cutlass.range_constexpr(0, cute.size(acc_qk), 32):
+                masked = _causal_mask_32_regs_setp_selp(
+                    tuple(acc_qk[group_start + j] for j in range(32)),
+                    last_valid_k,
+                    group_start,
+                )
+                for j in cutlass.range_constexpr(32):
+                    acc_qk[group_start + j] = masked[j]
+            return
 
         tidx, tidy, tidx = cute.arch.thread_idx()
         offset = 0
@@ -1140,32 +1548,38 @@ def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, *, loc=None, ip=None):
     src2 = Float32(vector.extract(src_vec4, [], [2])).ir_value(loc=loc, ip=ip)
     src3 = Float32(vector.extract(src_vec4, [], [3])).ir_value(loc=loc, ip=ip)
 
-    cvt_instruction = ""
-    if cutlass.const_expr(fp8_type == cutlass.Float8E4M3FN):
-        cvt_instruction = "cvt.rn.satfinite.e4m3x2.f32"
-    else:
+    if cutlass.const_expr(fp8_type != cutlass.Float8E4M3FN):
         assert False, "Unsupported fp8 element type"
 
-    asm_tmpl = (
-        "{\n"
-        "  .reg .b16 lo;\n"
-        "  .reg .b16 hi;\n"
-        f"  {cvt_instruction} lo, $2, $1;\n"
-        f"  {cvt_instruction} hi, $4, $3;\n"
-        "  mov.b32 $0, {lo, hi};\n"
-        "}"
+    # The x2 op places its first source in the high byte. Reverse each pair so
+    # the packed i32 retains the input's little-endian lane order.
+    packed_lo = _nvvm.convert_f32x2_to_f8x2(
+        Int16.mlir_type,
+        src1,
+        src0,
+        dst_ty=fp8_type.mlir_type,
+        rnd=_nvvm.FPRoundingMode.RN,
+        sat=_nvvm.SaturationMode.SATFINITE,
+        loc=loc,
+        ip=ip,
     )
-    packed_i32 = llvm.inline_asm(
-        T.i32(),
-        [src0, src1, src2, src3],
-        asm_tmpl,
-        "=r,f,f,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
+    packed_hi = _nvvm.convert_f32x2_to_f8x2(
+        Int16.mlir_type,
+        src3,
+        src2,
+        dst_ty=fp8_type.mlir_type,
+        rnd=_nvvm.FPRoundingMode.RN,
+        sat=_nvvm.SaturationMode.SATFINITE,
+        loc=loc,
+        ip=ip,
     )
-
-    return packed_i32
+    packed_vec = vector.from_elements(
+        _mlir_ir.VectorType.get([2], Int16.mlir_type, loc=loc),
+        [packed_lo, packed_hi],
+        loc=loc,
+        ip=ip,
+    )
+    return llvm.bitcast(T.i32(), packed_vec, loc=loc, ip=ip)
 
 
 @cute.jit
@@ -1174,3 +1588,186 @@ def cvt_f32x4_to_f8x4(fp32x4, fp8x4, *, loc=None, ip=None):
     fp8x4_i32 = cute.recast_tensor(fp8x4, cutlass.Int32)
     fp8x4_i32[0] = cutlass.Int32(packed_i32)
     return
+
+
+@dsl_user_op
+def _f32x2_pair_to_i64(a: Float32, b: Float32, *, loc=None, ip=None):
+    """Pack 2 Float32 values into a single .b64 (Int64) via vector<2xf32>."""
+    vec_ty = _mlir_ir.VectorType.get([2], Float32.mlir_type, loc=loc)
+    vec = vector.from_elements(
+        vec_ty,
+        [
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+        ],
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(llvm.bitcast(Int64.mlir_type, vec, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _i64_to_f32x2_pair(val_i64, *, loc=None, ip=None):
+    """Unpack .b64 (Int64) into 2 Float32 via vector<2xf32>."""
+    vec_ty = _mlir_ir.VectorType.get([2], Float32.mlir_type, loc=loc)
+    vec = llvm.bitcast(
+        vec_ty,
+        Int64(val_i64).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(vector.extract(vec, [], [0], loc=loc, ip=ip)),
+        Float32(vector.extract(vec, [], [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _f16x2_pair_to_i32(a: Float16, b: Float16, *, loc=None, ip=None):
+    """Pack 2 Float16 values into a single .b32 (Int32) via vector<2xf16>."""
+    vec_ty = _mlir_ir.VectorType.get([2], Float16.mlir_type, loc=loc)
+    vec = vector.from_elements(
+        vec_ty,
+        [
+            Float16(a).ir_value(loc=loc, ip=ip),
+            Float16(b).ir_value(loc=loc, ip=ip),
+        ],
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(llvm.bitcast(Int32.mlir_type, vec, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _i32_to_f16x2_pair(val_i32, *, loc=None, ip=None):
+    """Unpack .b32 (Int32) into 2 Float16 via vector<2xf16>."""
+    vec_ty = _mlir_ir.VectorType.get([2], Float16.mlir_type, loc=loc)
+    vec = llvm.bitcast(
+        vec_ty,
+        Int32(val_i32).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float16(vector.extract(vec, [], [0], loc=loc, ip=ip)),
+        Float16(vector.extract(vec, [], [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def add_packed_f32x2_f16x2_f32x2(src_a, src_b, *, loc=None, ip=None):
+    """Add packed FP16 and FP32 pairs and return a packed FP32 pair."""
+    a0, a1 = src_a  # Float16
+    b0, b1 = src_b  # Float32
+    a_i32 = _f16x2_pair_to_i32(a0, a1, loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    b_i64 = _f32x2_pair_to_i64(b0, b1, loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    res_i64 = llvm.inline_asm(
+        T.i64(),
+        [a_i32, b_i64],
+        "add.f32x2.f16x2.f32x2 $0, $1, $2;",
+        "=l,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return _i64_to_f32x2_pair(Int64(res_i64), loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cvt_packed_f16x2_f32x2(src_a, *, loc=None, ip=None):
+    """Round two FP32 values into one packed FP16 pair."""
+    a0, a1 = src_a
+    res_i32 = llvm.inline_asm(
+        T.i32(),
+        [
+            Float32(a0).ir_value(loc=loc, ip=ip),
+            Float32(a1).ir_value(loc=loc, ip=ip),
+        ],
+        "cvt.rn.f16x2.f32 $0, $2, $1;",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return _i32_to_f16x2_pair(Int32(res_i32), loc=loc, ip=ip)
+
+
+@cute.jit
+def cvt_f16x4_to_f8x4_pack_i32(fp16x4_tensor, fp8_type, *, loc=None, ip=None):
+    """Convert an FP16x4 tensor to a packed FP8x4 Int32 value."""
+    fp16x4 = fp16x4_tensor.load()
+    src_vec = fp16x4.ir_value(loc=loc, ip=ip) if hasattr(fp16x4, "ir_value") else fp16x4
+
+    # Pack adjacent fp16 pairs into two .b32 registers (f16x2).
+    h0 = Float16(vector.extract(src_vec, [], [0]))
+    h1 = Float16(vector.extract(src_vec, [], [1]))
+    h2 = Float16(vector.extract(src_vec, [], [2]))
+    h3 = Float16(vector.extract(src_vec, [], [3]))
+    lo_i32 = _f16x2_pair_to_i32(h0, h1, loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    hi_i32 = _f16x2_pair_to_i32(h2, h3, loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+
+    cvt_instruction = ""
+    if cutlass.const_expr(fp8_type == cutlass.Float8E4M3FN):
+        cvt_instruction = "cvt.rn.satfinite.e4m3x2.f16x2"
+    else:
+        assert False, "Unsupported fp8 element type"
+
+    asm_tmpl = (
+        "{\n"
+        "  .reg .b16 lo;\n"
+        "  .reg .b16 hi;\n"
+        f"  {cvt_instruction} lo, $1;\n"
+        f"  {cvt_instruction} hi, $2;\n"
+        "  mov.b32 $0, {lo, hi};\n"
+        "}"
+    )
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [lo_i32, hi_i32],
+        asm_tmpl,
+        "=r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return packed_i32
+
+
+@cute.jit
+def cvt_f16x4_to_f8x4(fp16x4_tensor, fp8x4_tensor, *, loc=None, ip=None):
+    """Store an FP16x4 tensor into an FP8x4 tensor."""
+    packed_i32 = cvt_f16x4_to_f8x4_pack_i32(fp16x4_tensor, fp8x4_tensor.element_type)
+    fp8x4_i32 = cute.recast_tensor(fp8x4_tensor, cutlass.Int32)
+    fp8x4_i32[0] = cutlass.Int32(packed_i32)
+    return
+
+
+def with_collector_op(
+    tiled_mma: cute.TiledMma,
+    a_collector_op: tcgen05.CollectorOp,
+    b_collector_op: tcgen05.CollectorOp,
+):
+    """Clone a tiled MMA with operand-collector reuse controls when supported."""
+    ref_op: tcgen05.MmaOp = tiled_mma.op
+    if not (hasattr(ref_op, "a_collector_op") and hasattr(ref_op, "b_collector_op")):
+        return tiled_mma
+
+    op_cls: type[tcgen05.MmaOp] = type(ref_op)
+    new_op = op_cls(
+        ref_op.a_dtype,
+        ref_op.b_dtype,
+        ref_op.acc_dtype,
+        ref_op.shape_mnk,
+        ref_op.cta_group,
+        ref_op.a_src,
+        ref_op.a_major_mode,
+        ref_op.b_major_mode,
+        a_collector_op,
+        b_collector_op,
+    )
+    thr_layout_vmnk = tiled_mma.thr_layout_vmnk
+    return cute.make_tiled_mma(
+        cute.make_mma_atom(new_op),
+        atom_layout_mnk=cute.select(thr_layout_vmnk, (1, 2, 3)),
+        permutation_mnk=tiled_mma.permutation_mnk,
+    )

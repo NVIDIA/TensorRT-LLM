@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,4 +79,10 @@ class AttentionBackend(ABC):
     @classmethod
     def support_lse(cls) -> bool:
         """Whether the backend supports returning the softmax log-sum-exp (LSE) of the attention weights."""
+        return False
+
+    def support_kv_cache(self) -> bool:
+        """Whether ``forward`` accepts a ``CausalKVCacheManager`` as ``kv_cache``. A backend
+        without support would silently drop the keyword through ``**kwargs``, so callers
+        must check before passing one."""
         return False
