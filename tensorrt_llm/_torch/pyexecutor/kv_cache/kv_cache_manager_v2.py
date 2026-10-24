@@ -3201,6 +3201,33 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return the resident generation requests used for SWA sizing."""
         return self.max_batch_size
 
+    def _retained_turn_endpoints(self, kv_cache_config: KvCacheConfig) -> List[KVCacheDesc]:
+        """Descriptors for the earlier turns one conversation keeps reusable.
+
+        Under ``per_conversation``, a conversation keeps the committed SWA window
+        of up to ``max_num_turns`` turns. The typical generation request accounts
+        for the latest one; each earlier one adds a window of pages to every
+        windowed pool but almost nothing to full-attention pools, whose blocks the
+        turns share. Each descriptor ends mid-block, as prompts do, and spans
+        the widest retention window plus one ledger block, so its windows straddle
+        a block boundary the way a real endpoint's do.
+        """
+        if not kv_cache_config.enable_block_reuse or (
+            self.block_reuse_policy != BlockReusePolicy.PER_CONVERSATION
+        ):
+            return []
+        extra_turns = kv_cache_config.block_reuse_config.max_num_turns - 1
+        _, windows = self._get_runtime_cache_size_layer_components()
+        widest = max(
+            (w for w in windows if w is not None and 0 < w < self.max_seq_len), default=None
+        )
+        if extra_turns <= 0 or widest is None:
+            return []
+        block = self._ledger_tokens_per_block
+        capacity = (math.ceil(widest / block) + 1) * block
+        history_length = capacity - block // 2 - 1
+        return [KVCacheDesc(capacity=capacity, history_length=history_length)] * extra_turns
+
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
         tokens = self._get_max_tokens_from_quota_impl(quota)
@@ -3688,6 +3715,8 @@ class KVCacheManagerV2(BaseResourceManager):
                             beam_width=beam_width,
                         )
                     ]
+                    * (generation_request_capacity - 1)
+                    + self._retained_turn_endpoints(kv_cache_config)
                     * (generation_request_capacity - 1)
                 )
 
