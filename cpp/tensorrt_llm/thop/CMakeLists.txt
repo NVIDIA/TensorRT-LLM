@@ -139,7 +139,8 @@ add_th_common_family(
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  dwdpFabricGatherOp.cpp)
 
 add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
@@ -151,6 +152,7 @@ add_th_common_family(
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
+  sageQuantizeOp.cpp
   blockCausalLayoutOp.cpp
   rotateRowsOp.cpp
   scatterKvSlotsOp.cpp)
@@ -167,6 +169,10 @@ add_th_common_family(
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
+
+# GLM bindings keep their existing family targets; source lists live with the
+# model.
+add_subdirectory(glmMoeDsa)
 
 add_library(
   th_common SHARED

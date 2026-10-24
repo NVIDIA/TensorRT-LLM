@@ -26,7 +26,6 @@ from cutlass import Float32, Int32, Uint32
 from cutlass.experimental import primitives as prims
 
 from ..fmha_decode_config import FmhaDecodeConfig
-from ..fmha_decode_constants import FP8_P_QUANT_SCALE
 from .helpers_common import (
     Constexpr,
     fadd2,
@@ -412,7 +411,7 @@ def _attention_sink_for_local_head(
         fastmath=True,
     )
     if cutlass.const_expr(cfg.use_fp8_pv):
-        sink_exp = sink_exp * Float32(FP8_P_QUANT_SCALE)
+        sink_exp = sink_exp * Float32(cfg.fp8_p_quant_scale)
     return sink_exp
 
 

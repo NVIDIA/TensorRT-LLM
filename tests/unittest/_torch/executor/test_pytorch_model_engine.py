@@ -6,7 +6,7 @@ import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
@@ -25,8 +25,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
-from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
-    setup_mm_encoder_attn_metadata
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
+    is_multimodal, setup_mm_encoder_attn_metadata)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs, _make_single_token_context_graph_batch)
@@ -59,6 +59,7 @@ from utils.util import skip_pre_blackwell_unittest, skip_ray
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import \
     TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import \
     INVALID_PROMPT_LOOKAHEAD_TOKEN
@@ -67,7 +68,8 @@ from tensorrt_llm._torch.speculative.spec_sampler_base import \
 from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor)
-from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
+from tensorrt_llm.llmapi import (CudaGraphConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, SADecodingConfig,
                                  SamplingParams)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import CpType, Mapping
@@ -78,7 +80,7 @@ _TWO_MODEL_SPEC_MODE = SimpleNamespace(use_one_engine=lambda: False)
 
 def _input_preparer() -> DecoderInputPreparer:
     return DecoderInputPreparer(buffers=None,
-                                config=None,
+                                config=SimpleNamespace(is_spec_decode=False),
                                 mapping=None,
                                 dist=None,
                                 model=None,
@@ -352,12 +354,11 @@ def _make_forward_only_engine(
 ) -> tuple[PyTorchModelEngine, Mock, Mock, Mock, dict[str, object]]:
     engine = object.__new__(PyTorchModelEngine)
     decoder = object.__new__(DecoderRunner)
-    engine.model = decoder.model = SimpleNamespace(
+    engine.model = decoder._model = SimpleNamespace(
         extra_attrs={},
         model_config=SimpleNamespace(pretrained_config=SimpleNamespace(
             rope_scaling=None)))
-    decoder.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-    engine.enable_spec_decode = False
+    engine._warmup_depth = 0
     decoder._config = SimpleNamespace(
         compile_only_piecewise_graphs=False,
         disable_overlap_scheduler=True,
@@ -372,17 +373,17 @@ def _make_forward_only_engine(
         spec_config=None,
     )
     engine.llm_args = SimpleNamespace(mm_encoder_only=False)
-    engine.mapping = decoder.mapping = SimpleNamespace(
+    engine.mapping = decoder._mapping = SimpleNamespace(
         cp_size=1,
         enable_lm_head_tp_in_adp=False,
     )
-    decoder.dist = None
-    engine.runtime_draft_len = 0
-    decoder.get_runtime_tokens_per_gen_step = Mock(return_value=1)
-    engine.iter_states = decoder.iter_states = {}
+    decoder._dist = None
+    get_runtime_tokens_per_gen_step = Mock(return_value=1)
+    decoder._get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
+    engine.iter_states = decoder._iter_states = {}
     decoder.forward_pass_callable = None
     decoder._stage_in_graph_sampling = None
-    decoder.moe_load_balancer = None
+    decoder._moe_load_balancer = None
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
     decoder._trtllm_gen_jit_warmup = False
@@ -430,15 +431,14 @@ def _make_forward_only_engine(
         cuda_graph_runner=runner,
         breakable_cuda_graph_runner=None,
         config=decoder._config,
-        mapping=decoder.mapping,
-        model=decoder.model,
+        mapping=decoder._mapping,
+        model=decoder._model,
         sparse_attention_config=None,
         metrics={},
-        kv_cache_manager_key=decoder.kv_cache_manager_key,
         dummy_requests=None,
         agreement=None,
         metadata=decoder._metadata,
-        get_runtime_tokens_per_gen_step=decoder.get_runtime_tokens_per_gen_step,
+        get_runtime_tokens_per_gen_step=get_runtime_tokens_per_gen_step,
         dynamic_draft_len_mapping=None,
         lora=decoder._lora,
         forward_warmup=decoder._forward_warmup,
@@ -479,7 +479,7 @@ def test_decoder_forward_routes_compile_bypass(enabled: bool,
     compiled.forward = Mock(return_value=outputs)
     wrapper = PrefillCompiledModel(eager, compiled)
     engine._runner._config.compile_only_piecewise_graphs = enabled
-    engine._runner.model.model = wrapper
+    engine._runner._model.model = wrapper
     engine._runner._forward_step.side_effect = lambda *args, **kwargs: wrapper()
     graph_runner.needs_capture.return_value = ordinary_capture
     graph_runner.is_warmup_only = ordinary_capture
@@ -561,7 +561,7 @@ def _resize_input_buffers(runner: DecoderRunner, max_num_tokens: int) -> None:
     """Reallocate the runner's input buffers for ``max_num_tokens`` tokens."""
     buffers = DecoderInputBuffers.for_config(
         replace(runner._config, max_num_tokens=max_num_tokens),
-        runner.use_beam_search)
+        runner._use_beam_search)
     runner._buffers = runner._inputs._buffers = runner._metadata._buffers = buffers
 
 
@@ -609,6 +609,7 @@ def _install_graph_runner_stub(runner: DecoderRunner,
     return stub
 
 
+@pytest.mark.cpu_only
 def test_cleanup_releases_runner_model_before_release_gc() -> None:
 
     class Model:
@@ -622,6 +623,8 @@ def test_cleanup_releases_runner_model_before_release_gc() -> None:
     engine._runner = SimpleNamespace(_model=model)
     engine._model_caller = ModelCaller(model)
     engine._mm_item_scheduler = None
+    engine._lora_model = model
+    engine._lora_owner = None
     engine.model = model
     engine._release_cuda_graphs = Mock()
     engine.input_processor = None
@@ -635,6 +638,67 @@ def test_cleanup_releases_runner_model_before_release_gc() -> None:
         engine.cleanup()
 
     release_gc.assert_called_once_with()
+
+
+class GraphOwnerTeardownTestCase(unittest.TestCase):
+
+    def test_cuda_graph_runner_destructor_does_not_release_window_owner(
+            self) -> None:
+        runner = Mock()
+
+        CUDAGraphRunner.__del__(runner)
+
+        runner.clear.assert_called_once_with(release_nccl_window_owners=False)
+
+    def test_engine_graph_ownership_is_split(self) -> None:
+        clear_blocks_graph = Mock()
+        model = Mock()
+        model.modules.return_value = [
+            SimpleNamespace(clear_blocks_cuda_graph=clear_blocks_graph)
+        ]
+        backend = Mock()
+        cuda_runner = Mock()
+        breakable_runner = Mock()
+        decoder_runner = object.__new__(DecoderRunner)
+        decoder_runner._graphs = object.__new__(DecoderCudaGraphs)
+        decoder_runner._graphs.cuda_graph_runner = cuda_runner
+        decoder_runner._graphs.breakable_cuda_graph_runner = breakable_runner
+        engine = SimpleNamespace(
+            model=model,
+            _torch_compile_backend=backend,
+            _runner=decoder_runner,
+        )
+
+        PyTorchModelEngine._release_cuda_graphs(
+            engine, release_nccl_window_owners=False)
+
+        clear_blocks_graph.assert_not_called()
+        backend.clear_piecewise_cuda_graphs.assert_called_once_with(
+            release_nccl_window_owners=False)
+        for runner in (cuda_runner, breakable_runner):
+            runner.clear.assert_called_once_with(
+                release_nccl_window_owners=False)
+
+        PyTorchModelEngine._release_model_owned_cuda_graphs(
+            engine, release_nccl_window_owners=False)
+
+        clear_blocks_graph.assert_called_once_with(
+            release_nccl_window_owners=False)
+
+    def test_executor_release_clears_model_owned_graphs_first(self) -> None:
+        for release_model_owned_graphs in (True, False):
+            with self.subTest(
+                    release_model_owned_graphs=release_model_owned_graphs):
+                engine = Mock()
+
+                PyTorchModelEngine.release_executor_resources(
+                    engine,
+                    release_model_owned_graphs=release_model_owned_graphs)
+
+                expected = [call._release_cuda_graphs()]
+                if release_model_owned_graphs:
+                    expected.insert(0, call._release_model_owned_cuda_graphs())
+                self.assertEqual(engine.method_calls, expected)
 
 
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
@@ -1179,7 +1243,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs._make_single_token_context_graph_batch"
         ) as promote:
             actual_outputs = engine.forward(batch, resource_manager)
-            self.assertEqual(actual_outputs, outputs)
+            self.assertEqual(actual_outputs, {
+                **outputs, "runtime_draft_len": 0
+            })
             self.assertIs(actual_outputs["logits"], outputs["logits"])
         promote.assert_not_called()
         runner.replay.assert_not_called()
@@ -1192,7 +1258,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         key = KeyType(batch_size=2, draft_len=0)
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(key)
-        engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=True,
@@ -1212,9 +1277,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch, resource_manager)
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            enable_spec_decode=True)
 
-        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})
         self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context, generation])
@@ -1239,7 +1306,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             self) -> None:
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(None)
-        engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=True,
@@ -1251,9 +1317,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch, resource_manager)
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            enable_spec_decode=True)
 
-        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})
         self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context])
@@ -1269,7 +1337,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             self) -> None:
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(None)
-        engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=False,
@@ -1284,9 +1351,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch, resource_manager)
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            enable_spec_decode=True)
 
-        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})
         self.assertIsNot(actual_outputs, outputs)
         lookup = runner.maybe_get_cuda_graph.call_args
         self.assertIs(lookup.args[0], batch)
@@ -1363,7 +1432,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                         resource_manager,
                     )
 
-                self.assertEqual(actual_outputs, outputs)
+                self.assertEqual(actual_outputs, {
+                    **outputs, "runtime_draft_len": 0
+                })
                 self.assertIsNot(actual_outputs, outputs)
                 if return_context_logits:
                     breakable_runner.execute.assert_not_called()
@@ -1396,7 +1467,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             frozenset())
 
     def test_generation_lora_request_selects_lora_graph(self) -> None:
-        key = (1, 0, False, False, True, True)
+        key = KeyType(batch_size=1, draft_len=0, use_lora_graph=True)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         engine._runner._lora = engine._runner._graphs._lora = SimpleNamespace(
             cuda_graph_manager=object())
@@ -1434,11 +1505,12 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             with self.subTest(case=case):
                 engine, runner, resource_manager, _, _ = \
                     _make_forward_only_engine(None)
+                spec_state = {}
                 if case == "graphs_disabled":
                     runner.enabled = False
                 elif case == "speculative_nonzero_runtime_draft":
-                    engine.enable_spec_decode = True
-                    engine.runtime_draft_len = 1
+                    spec_state = dict(enable_spec_decode=True,
+                                      runtime_draft_len=1)
                     engine._runner._config.spec_config = SimpleNamespace(
                         spec_dec_mode=_TWO_MODEL_SPEC_MODE,
                         is_linear_tree=True,
@@ -1463,10 +1535,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 with patch(
                         "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                         return_value=Mock()):
-                    engine.forward(
-                        batch,
-                        resource_manager,
-                    )
+                    engine.forward(batch, resource_manager, **spec_state)
 
                 lookup = runner.maybe_get_cuda_graph.call_args
                 self.assertIs(lookup.args[0], batch)
@@ -1480,8 +1549,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             self) -> None:
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(None)
-        engine.enable_spec_decode = True
-        engine.runtime_draft_len = 2
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=False,
@@ -1498,9 +1565,12 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch, resource_manager)
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            enable_spec_decode=True,
+                                            runtime_draft_len=2)
 
-        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 7})
         self.assertEqual(runner.pad_batch.call_args.args[2], 2)
         self.assertTrue(
             runner.maybe_get_cuda_graph.call_args.kwargs["enable_spec_decode"])
@@ -1514,7 +1584,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             (step_kwargs["enable_spec_decode"],
              step_kwargs["runtime_draft_len"], step_kwargs["is_dummy"]),
             (True, 7, False))
-        self.assertEqual(engine.runtime_draft_len, 7)
 
 
 class DecoderForwardTestCase(unittest.TestCase):
@@ -1606,7 +1675,7 @@ class DecoderForwardTestCase(unittest.TestCase):
         self.assertEqual(replayed["input_ids"].tolist(), [44, 60])
         self.assertEqual(replayed["position_ids"].flatten().tolist(), [3, 5])
         self.assertEqual(len(engine.model.recorded_kwargs), num_model_calls)
-        self.assertEqual(set(outputs), {"logits"})
+        self.assertEqual(set(outputs), {"logits", "runtime_draft_len"})
         self.assertEqual(engine.attn_metadata.num_contexts, 0)
         self.assertEqual(engine.iter_states['num_ctx_requests'], 1)
         self.assertEqual(engine.iter_states['num_ctx_tokens'], 1)
@@ -1917,8 +1986,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._metadata = DecoderMetadata(config=engine._config,
                                            mapping=None,
                                            model=None,
-                                           buffers=None)
-        engine.kv_cache_manager_key = "kv"
+                                           buffers=None,
+                                           attention_runtime_features=None)
         metadata = Mock(spec=DSAtrtllmAttentionMetadata)
 
         def build(kv_cache_manager, draft_kv_cache_manager):
@@ -1949,7 +2018,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._metadata = DecoderMetadata(config=engine._config,
                                            mapping=None,
                                            model=None,
-                                           buffers=None)
+                                           buffers=None,
+                                           attention_runtime_features=None)
         engine._metadata.setup_attention = Mock()
 
         engine._ensure_dsa_attn_metadata_for_warmup(Mock())
@@ -1965,7 +2035,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
             disable_mm_encoder=False)
 
-        self.assertTrue(engine.is_multimodal)
+        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         with self.assertRaisesRegex(ValueError, "multimodal models"):
             engine._validate_breakable_cuda_graph_compatibility()
 
@@ -1978,7 +2048,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
             disable_mm_encoder=False)
 
-        self.assertTrue(engine.is_multimodal)
+        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         engine._validate_breakable_cuda_graph_compatibility()
 
     def test_breakable_allows_multimodal_wrapper_in_text_only_mode(
@@ -1992,8 +2062,133 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
             disable_mm_encoder=True)
 
-        self.assertTrue(engine.is_multimodal)
+        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_restore_after_refit_rewraps_without_recapture(self) -> None:
+        """Restore re-wraps torch.compile and does nothing else.
+
+        Refit moves no tensor, so the piecewise captures stay valid across it;
+        recapturing them costs a full re-capture per refit and leaves PWCG cold
+        in between. This pins the cheap path -- reintroducing the recapture,
+        the torch.compiler.reset() or the gc.collect() fails here.
+
+        Replaces test_piecewise_refit_recapture_preserves_padding_dummy_requests,
+        which asserted the refit path recaptures. That path no longer exists.
+        """
+        cuda_graph_runner = SimpleNamespace(
+            padding_dummy_requests={0: object()},
+            allow_capture=lambda: nullcontext(),
+        )
+        model_engine = SimpleNamespace(
+            warmup_scope=nullcontext,
+            _torch_compile_backend=object(),
+            llm_args=SimpleNamespace(torch_compile_config=SimpleNamespace(
+                enable_fullgraph=False)),
+            cuda_graph_runner=cuda_graph_runner,
+            _apply_torch_compile=Mock(),
+            _capture_piecewise_cuda_graphs=Mock(),
+        )
+
+        with patch("torch.compiler.reset") as reset, \
+                patch("gc.collect") as collect:
+            PyTorchModelEngine.restore_compiled_model_after_refit(
+                model_engine, resource_manager=object())
+
+        model_engine._apply_torch_compile.assert_called_once()
+        model_engine._capture_piecewise_cuda_graphs.assert_not_called()
+        reset.assert_not_called()
+        # No full collection either: it ran for seconds inside the refit
+        # bubble and the replaced wrapper is freed by reference count.
+        collect.assert_not_called()
+
+    def test_restore_after_refit_noop_when_torch_compile_disabled(self) -> None:
+        """An eager engine must not be silently handed a compiled wrapper."""
+        model_engine = SimpleNamespace(
+            _torch_compile_backend=None,
+            _apply_torch_compile=Mock(),
+        )
+        PyTorchModelEngine.restore_compiled_model_after_refit(
+            model_engine, resource_manager=object())
+        model_engine._apply_torch_compile.assert_not_called()
+
+    def test_restore_after_refit_never_touches_the_kv_cache(self) -> None:
+        """The re-wrap hook must not run the warm-up KV-cache cleanup.
+
+        ``warmup_with_kv_cache_cleanup`` ends with
+        ``check_invalid_values_in_kv_cache(fill_with_zero=True)``, which
+        zero-fills every attention KV pool whether or not it found a NaN. That
+        is right after a capture warm-up that ran forwards on placeholder
+        inputs; restore never runs a forward, and under an in-flight weight
+        update the zero-fill would wipe the KV of the requests kept across the
+        refit. So the fully decorated hook must never even look up the KV cache
+        manager -- with torch.compile on or off.
+        """
+        for compile_enabled in (True, False):
+            with self.subTest(compile_enabled=compile_enabled):
+                resource_manager = Mock()
+                model_engine = SimpleNamespace(
+                    warmup_scope=nullcontext,
+                    _torch_compile_backend=Mock() if compile_enabled else None,
+                    llm_args=SimpleNamespace(
+                        torch_compile_config=SimpleNamespace(
+                            enable_fullgraph=False)),
+                    _apply_torch_compile=Mock(),
+                )
+                with patch("gc.collect"):
+                    PyTorchModelEngine.restore_compiled_model_after_refit(
+                        model_engine, resource_manager)
+                resource_manager.get_resource_manager.assert_not_called()
+                self.assertEqual(model_engine._apply_torch_compile.call_count,
+                                 1 if compile_enabled else 0)
+
+    def test_unwrap_for_refit_gates_on_torch_compile_not_piecewise(
+            self) -> None:
+        """Compile-on/piecewise-off must still unwrap.
+
+        This is the original defect: the hook was gated on the piecewise flag,
+        so TorchCompileConfig() -- compile on, piecewise off -- got no refit
+        lifecycle and refit loaded into a wrapped model, matching nothing.
+        """
+        for piecewise in (True, False):
+            with self.subTest(piecewise=piecewise):
+                model_engine = SimpleNamespace(
+                    llm_args=SimpleNamespace(prefill_cuda_graph_backend=(
+                        PrefillCudaGraphBackend.PIECEWISE if piecewise else None
+                    )),
+                    _torch_compile_backend=Mock(),
+                    _remove_torch_compile=Mock(),
+                )
+                unwrap_core = (
+                    PyTorchModelEngine.unwrap_compiled_model_for_refit)
+                with patch("torch.cuda.synchronize"):
+                    unwrap_core(model_engine)
+                model_engine._remove_torch_compile.assert_called_once()
+                # The captures are kept, not cleared: refit moves no tensor, so
+                # clearing them only forces PWCG cold for no benefit.
+                model_engine._torch_compile_backend \
+                    .clear_piecewise_cuda_graphs.assert_not_called()
+
+        # Eager engine: the hook must be a no-op.
+        eager = SimpleNamespace(
+            _torch_compile_backend=None,
+            _remove_torch_compile=Mock(),
+        )
+        PyTorchModelEngine.unwrap_compiled_model_for_refit(eager)
+        eager._remove_torch_compile.assert_not_called()
+
+    def test_refit_lifecycle_aliases_point_at_renamed_hooks(self) -> None:
+        """NeMo-RL resolves these with getattr() and falls back to doing nothing.
+
+        Dropping an alias would therefore not raise -- it would silently skip
+        the unwrap and reintroduce the refit corruption.
+        """
+        self.assertIs(
+            PyTorchModelEngine.release_piecewise_cuda_graphs_for_refit,
+            PyTorchModelEngine.unwrap_compiled_model_for_refit)
+        self.assertIs(
+            PyTorchModelEngine.recapture_piecewise_cuda_graphs_after_refit,
+            PyTorchModelEngine.restore_compiled_model_after_refit)
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
@@ -2085,11 +2280,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._torch_compile_backend = None
 
         engine.wait_for_input_copy()
-        engine._release_cuda_graphs()
-        engine._init_cuda_graph_lora_manager(Mock())
+        engine.release_executor_resources(release_model_owned_graphs=False)
+        engine.init_cuda_graph_lora_manager(Mock())
 
         runner.wait_for_input_copy.assert_called_once_with()
-        runner.release_graphs.assert_called_once_with()
+        runner.release_graphs.assert_called_once_with(
+            release_nccl_window_owners=True)
         runner.init_cuda_graph_lora_manager.assert_not_called()
 
     def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
@@ -2107,7 +2303,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             model=None,
             sparse_attention_config=None,
             metrics={},
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             dummy_requests=None,
             agreement=None,
             metadata=None,
@@ -2118,14 +2313,18 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             torch_compile_bypass=nullcontext,
             context_promotion_supported=True,
         )
+        decoder._metadata = SimpleNamespace(attn_metadata=Mock())
 
         engine.wait_for_input_copy()
-        engine._release_cuda_graphs()
+        engine.release_executor_resources(release_model_owned_graphs=False)
 
         decoder._inputs._prepare_inputs_event.synchronize.assert_called_once_with(
         )
-        decoder.cuda_graph_runner.clear.assert_called_once_with()
-        decoder.breakable_cuda_graph_runner.clear.assert_called_once_with()
+        decoder.cuda_graph_runner.clear.assert_called_once_with(
+            release_nccl_window_owners=True)
+        decoder._graphs.breakable_cuda_graph_runner.clear.assert_called_once_with(
+            release_nccl_window_owners=True)
+        self.assertIsNone(decoder.attn_metadata)
 
     def test_prepare_inputs_returns_steady_gen_fast_inputs(self) -> None:
         inputs = _input_preparer()
@@ -2310,6 +2509,114 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertFalse(generation.py_needs_onehot_draft_probs)
         spec_metadata.write_padding_onehot_draft_probs.assert_called_once_with(
             [generation.py_seq_slot], 0)
+        kv_cache_manager.shutdown()
+
+    def test_spec_decode_graph_step_gather_kernel_matches_torch_path(
+            self) -> None:
+        """A CUDA graph decode step of a speculative engine whose overlap
+        gathers run as one StepInputGather launch writes what the torch path
+        writes."""
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttentionMetadata
+        from tensorrt_llm._torch.kernels.spec_step_copies import \
+            op as spec_step_copies
+        if not spec_step_copies.is_supported():
+            self.skipTest("the step-copy kernels run on SM 100")
+        max_draft_len = 3
+        tokens_per_step = max_draft_len + 1
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            spec_config=SADecodingConfig(max_draft_len=max_draft_len))
+        inputs = model_engine._runner._inputs
+        buffers = model_engine._runner._buffers
+        step_gather = inputs._step_input_gather
+        self.assertIsNotNone(step_gather)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        # Three requests that ran in the previous step, in slots out of order.
+        slots = [5, 2, 7]
+        requests = kv_cache_manager.add_dummy_requests(
+            [1, 2, 3],
+            token_nums=[10, 17, 33],
+            is_gen=True,
+            max_num_draft_tokens=max_draft_len)
+        for request, slot in zip(requests, slots):
+            request.is_dummy_request = False
+            request.py_seq_slot = slot
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+        attn_metadata = model_engine._runner._metadata.setup_attention(
+            kv_cache_manager)
+        self.assertIs(type(attn_metadata), TrtllmAttentionMetadata)
+        graph_metadata = attn_metadata.create_cuda_graph_metadata(
+            len(requests), False, max_draft_len)
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+
+        # The sampler's slot stores as the previous step left them.
+        num_slots = 8
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        previous = SampleStateTensorsSpec(
+            new_tokens=torch.randint(0,
+                                     1000, (tokens_per_step, num_slots, 1),
+                                     generator=generator,
+                                     dtype=torch.int32,
+                                     device="cuda"),
+            new_tokens_lens=torch.randint(1,
+                                          tokens_per_step + 1, (num_slots, ),
+                                          generator=generator,
+                                          dtype=torch.int32,
+                                          device="cuda"),
+            next_draft_tokens=torch.randint(0,
+                                            1000, (num_slots, max_draft_len),
+                                            generator=generator,
+                                            dtype=torch.int32,
+                                            device="cuda"),
+        )
+
+        def step_inputs(step_input_gather):
+            """The buffers one step writes, from a filler they all start at."""
+            inputs._step_input_gather = step_input_gather
+            for request, slot in zip(requests, slots):
+                request.py_batch_idx = slot
+            written = (buffers.input_ids_cuda, buffers.position_ids_cuda,
+                       buffers.draft_tokens_cuda,
+                       buffers.previous_pos_id_offsets_cuda,
+                       buffers.previous_kv_lens_offsets_cuda)
+            for buffer in written:
+                buffer.fill_(-3)
+            inputs.prepare_inputs(scheduled_requests=batch,
+                                  kv_cache_manager=kv_cache_manager,
+                                  attn_metadata=graph_metadata,
+                                  spec_metadata=spec_metadata,
+                                  new_tensors_device=previous,
+                                  resource_manager=resource_manager,
+                                  enable_spec_decode=True,
+                                  runtime_draft_len=max_draft_len,
+                                  is_dummy=False)
+            torch.cuda.synchronize()
+            return [buffer.clone() for buffer in written]
+
+        torch_path = step_inputs(None)
+        launched = []
+        launch = step_gather.gather
+
+        def recorded_launch(*args, **kwargs):
+            launched.append(launch(*args, **kwargs))
+            return launched[-1]
+
+        with patch.object(step_gather, "gather", side_effect=recorded_launch):
+            kernel_path = step_inputs(step_gather)
+        self.assertEqual(launched, [True])
+        for expected, actual in zip(torch_path, kernel_path):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # The previous rows' input ids came from the stores, by slot.
+        num_tokens = len(requests) * tokens_per_step
+        expected_input_ids = previous.new_tokens[:, slots, 0].t().reshape(-1)
+        self.assertEqual(kernel_path[0][:num_tokens].tolist(),
+                         expected_input_ids.tolist())
         kv_cache_manager.shutdown()
 
     def test_multimodal_encoder_max_seq_len(self) -> None:
@@ -2898,11 +3205,15 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             actual_seq_lens = attn_metadata.seq_lens.cpu().tolist()
             self.assertEqual(actual_seq_lens, expected_seq_lens)
 
-    def _setup_mrope_engine(self, max_num_tokens: int = 32):
+    def _setup_mrope_engine(self,
+                            max_num_tokens: int = 32,
+                            spec_config: DecodingBaseConfig | None = None):
         """Build a DummyModelEngine that takes the MRoPE path, plus its KV cache
         manager and attention metadata."""
         llm_args = TorchLlmArgs(model="dummy")
-        model_engine = DummyModelEngine(llm_args, dtype=torch.half)
+        model_engine = DummyModelEngine(llm_args,
+                                        dtype=torch.half,
+                                        spec_config=spec_config)
         model_engine.model.model_config.pretrained_config.rope_scaling = {
             "type": "mrope"
         }
@@ -2930,6 +3241,362 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         _set_runner_config(model_engine._runner, max_num_tokens=max_num_tokens)
         _resize_input_buffers(model_engine._runner, max_num_tokens)
         return model_engine, kv_cache_manager, attn_metadata
+
+    @staticmethod
+    def _make_mrope_gen_request(num_tokens: int, req_id: int, seq_slot: int,
+                                delta):
+        """Generation request carrying an MRoPE delta when `delta` is not None,
+        and no multimodal data at all otherwise (a text-only prompt)."""
+        request = _create_request(num_tokens, req_id)
+        request.py_prompt_len = num_tokens
+        request.py_batch_idx = None
+        request.py_seq_slot = seq_slot
+        request.sampling_config.beam_width = 1
+        if delta is None:
+            request.py_multimodal_data = {}
+        else:
+            request.py_multimodal_data = {
+                "mrope_config": {
+                    "mrope_position_deltas":
+                    torch.tensor([[delta]], dtype=torch.int32)
+                },
+            }
+        return request
+
+    def _make_mrope_spec_batch(self, previous_batch: bool):
+        """Two multimodal verify groups around a text-only one, plus a CUDA graph
+        padding dummy, each carrying one draft token.
+
+        Returns the scheduled batch and the multimodal requests."""
+        # (num_tokens, req_id, seq_slot, delta); the middle request is text-only.
+        requests = [
+            self._make_mrope_gen_request(4, 1, 0, 10),
+            self._make_mrope_gen_request(5, 2, 1, None),
+            self._make_mrope_gen_request(6, 3, 2, 20),
+        ]
+        for request in requests:
+            request.py_draft_tokens = [7]
+            if previous_batch:
+                # The overlap scheduler's previous step ran these requests at
+                # their current slots, which also seeded the delta cache.
+                request.py_batch_idx = request.py_seq_slot
+                if request.py_multimodal_data:
+                    request.py_mrope_delta_cache_slot = request.py_seq_slot
+        # The padding dummy carries the zero delta that `add_dummy_requests`
+        # attaches on MRoPE models.
+        dummy = self._make_mrope_gen_request(2, 4, 3, 0)
+        dummy.is_cuda_graph_dummy = True
+        dummy.py_draft_tokens = [0]
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = requests + [dummy]
+        return scheduled_requests, [requests[0], requests[2]]
+
+    def test_prepare_inputs_spec_decode_adds_mrope_delta(self) -> None:
+        """One-model speculative verify groups get the request's MRoPE delta.
+
+        Every token a generation step feeds is text after the prompt's vision
+        spans, so its three coordinates are `seq_index + delta`, as for an
+        ordinary generation request. Read slots stay dense, one per verify
+        group, and a generation-only request seeds the delta cache.
+        """
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+            spec_config=SADecodingConfig(max_draft_len=1))
+        scheduled_requests, multimodal_requests = self._make_mrope_spec_batch(
+            previous_batch=False)
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+
+        result = model_engine._runner._inputs.prepare_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            enable_spec_decode=True,
+            runtime_draft_len=1,
+            is_dummy=False).kwargs
+
+        # Each verify group is [last token, draft token] at past_seen + 0/1;
+        # the text-only request and the zero-delta dummy keep the scalar
+        # positions.
+        position_ids = result["position_ids"]
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 8))
+        expected = torch.tensor([[[13, 14, 4, 5, 25, 26, 1, 2]]] * 3,
+                                dtype=torch.int32,
+                                device='cuda')
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        # Slot 32 is the reserved zero slot (max_num_tokens * pp_size).
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0, 32, 2, 32])
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0, 2])
+        self.assertEqual([
+            request.py_mrope_delta_cache_slot for request in multimodal_requests
+        ], [0, 2])
+        kv_cache_manager.shutdown()
+
+    def test_prepare_inputs_spec_decode_overlap_keeps_mrope_delta(self) -> None:
+        """Under the overlap scheduler the accepted-token correction applied in
+        `preprocess_inputs` lands on top of the delta, on all three axes."""
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+            spec_config=SADecodingConfig(max_draft_len=1))
+        scheduled_requests, _ = self._make_mrope_spec_batch(previous_batch=True)
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+        # The previous step accepted 2, 1 and 2 tokens in slots 0, 1 and 2.
+        overlap_state = SampleStateTensorsSpec(
+            new_tokens=torch.zeros((2, 4, 1), dtype=torch.int32, device="cuda"),
+            new_tokens_lens=torch.tensor([2, 1, 2, 1],
+                                         dtype=torch.int32,
+                                         device="cuda"),
+            next_draft_tokens=torch.zeros((4, 1),
+                                          dtype=torch.int32,
+                                          device="cuda"),
+        )
+
+        inputs = model_engine._runner._inputs.prepare_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            new_tensors_device=overlap_state,
+            enable_spec_decode=True,
+            runtime_draft_len=1,
+            is_dummy=False).kwargs
+
+        # The host packs positions from the stale base (past_seen + delta).
+        stale = torch.tensor([[[13, 14, 4, 5, 25, 26, 1, 2]]] * 3,
+                             dtype=torch.int32,
+                             device='cuda')
+        torch.testing.assert_close(inputs["position_ids"],
+                                   stale,
+                                   atol=0,
+                                   rtol=0)
+        self.assertEqual(inputs["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0, 32, 2, 32])
+        # The delta cache already holds both multimodal requests' deltas.
+        self.assertNotIn("mrope_delta_write_seq_slots", inputs)
+
+        inputs = model_engine._runner._inputs.preprocess_inputs(
+            inputs, enable_spec_decode=True, runtime_draft_len=1)
+        corrected = torch.tensor([[[15, 16, 5, 6, 27, 28, 1, 2]]] * 3,
+                                 dtype=torch.int32,
+                                 device='cuda')
+        torch.testing.assert_close(inputs["position_ids"],
+                                   corrected,
+                                   atol=0,
+                                   rtol=0)
+        kv_cache_manager.shutdown()
+
+    @staticmethod
+    def _make_mrope_ctx_request(num_tokens: int, req_id: int, seq_slot: int,
+                                delta: int):
+        """Single-chunk context request carrying MRoPE metadata.
+
+        Its position on axis `a` of token `i` is `100 + 1000 * a + i`, so a
+        spliced span says which axis and token it came from."""
+        request = _create_request(num_tokens, req_id)
+        request.py_prompt_len = num_tokens
+        request.py_batch_idx = None
+        request.py_seq_slot = seq_slot
+        request.context_current_position = 0
+        request.context_chunk_size = num_tokens
+        request.sampling_config.beam_width = 1
+        positions = (100 + 1000 * torch.arange(3).view(3, 1, 1) +
+                     torch.arange(num_tokens).view(1, 1, -1)).to(torch.int32)
+        request.py_multimodal_data = {
+            "mrope_config": {
+                "mrope_position_ids": positions,
+                "mrope_position_deltas": torch.tensor([[delta]],
+                                                      dtype=torch.int32),
+            },
+        }
+        return request
+
+    @staticmethod
+    def _prepare_mrope_spec_inputs(model_engine, kv_cache_manager,
+                                   attn_metadata, scheduled_requests):
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+        result = model_engine._runner._inputs.prepare_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            enable_spec_decode=True,
+            runtime_draft_len=1,
+            is_dummy=False).kwargs
+        return result
+
+    def _assert_mrope_positions(self, result, rows) -> None:
+        """`rows` is one list for all three axes, or one list per axis."""
+        if not isinstance(rows[0], list):
+            rows = [rows] * 3
+        position_ids = result["position_ids"]
+        self.assertEqual(tuple(position_ids.shape), (3, 1, len(rows[0])))
+        expected = torch.tensor([rows[0:1], rows[1:2], rows[2:3]],
+                                dtype=torch.int32,
+                                device='cuda')
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+
+    def test_prepare_inputs_spec_decode_mrope_plain_rows_follow_verify_groups(
+            self) -> None:
+        """Verify groups are packed ahead of plain generation requests, and the
+        MRoPE delta read slots follow that packing rather than scheduler order.
+
+        The attention kernel indexes the deltas by generation batch index: row
+        i of the packed generation batch must read the delta of the request
+        packed i-th, so a verify group's slot comes before every plain
+        request's, whatever order the scheduler listed them in.
+        """
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+            spec_config=MTPDecodingConfig(max_draft_len=1))
+        # `verify_*` carry a draft token, `plain_*` do not; `*_mm` have an
+        # MRoPE delta, `*_text` none.
+        plain_mm = self._make_mrope_gen_request(6, 1, 0, 20)
+        verify_mm = self._make_mrope_gen_request(4, 2, 1, 10)
+        plain_text = self._make_mrope_gen_request(5, 3, 2, None)
+        verify_text = self._make_mrope_gen_request(3, 4, 3, None)
+        verify_mm.py_draft_tokens = [7]
+        verify_text.py_draft_tokens = [7]
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = [
+            plain_mm, verify_mm, plain_text, verify_text
+        ]
+        result = self._prepare_mrope_spec_inputs(model_engine, kv_cache_manager,
+                                                 attn_metadata,
+                                                 scheduled_requests)
+
+        # Packed order: verify_mm, verify_text, plain_mm, plain_text. The
+        # verify groups hold two rows each, the plain requests one.
+        self._assert_mrope_positions(result, [13, 14, 2, 3, 25, 4])
+        # Slot 32 is the reserved zero slot (max_num_tokens * pp_size) read by
+        # the text-only requests.
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [1, 32, 0, 32])
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [1, 0])
+        kv_cache_manager.shutdown()
+
+    def test_prepare_inputs_spec_decode_mrope_context_takes_no_read_slot(
+            self) -> None:
+        """A context request packs ahead of the verify groups with its own
+        MRoPE positions and takes no generation read slot, so the verify
+        groups' slots start the list."""
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+            spec_config=MTPDecodingConfig(max_draft_len=1))
+        # A context request with multimodal content takes the placeholder-token
+        # split, which reads the vocabulary size.
+        model_engine.model.config.vocab_size = 1000
+        context = self._make_mrope_ctx_request(5, 1, 0, 30)
+        verify_mm = self._make_mrope_gen_request(4, 2, 1, 10)
+        verify_mm.py_draft_tokens = [7]
+        plain_mm = self._make_mrope_gen_request(6, 3, 2, 20)
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = [context]
+        scheduled_requests.generation_requests = [plain_mm, verify_mm]
+        result = self._prepare_mrope_spec_inputs(model_engine, kv_cache_manager,
+                                                 attn_metadata,
+                                                 scheduled_requests)
+
+        # The context span keeps the processor's per-axis positions; the
+        # generation rows after it are text at position + delta on all axes.
+        self._assert_mrope_positions(result, [
+            [100, 101, 102, 103, 104, 13, 14, 25],
+            [1100, 1101, 1102, 1103, 1104, 13, 14, 25],
+            [2100, 2101, 2102, 2103, 2104, 13, 14, 25],
+        ])
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [1, 2])
+        # The context request seeds the delta cache first, then the verify
+        # group and the plain request seed theirs.
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0, 1, 2])
+        self.assertEqual(context.py_mrope_delta_cache_slot, 0)
+        kv_cache_manager.shutdown()
+
+    def _setup_extend_as_context_engine(self):
+        """A two-model draft mode on an attention backend that runs verify groups
+        as chunked context rows.
+
+        `extend_ctx` is False for every one-model mode and for the TRTLLM
+        backend below sm_120, so this takes a drafter-based mode and swaps in
+        the vanilla backend.
+        """
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+            spec_config=NGramDecodingConfig(max_draft_len=1))
+        _set_runner_config(model_engine._runner,
+                           attention_backend=VanillaAttention,
+                           disable_overlap_scheduler=True)
+        spec_config = model_engine._runner._config.spec_config
+        self.assertTrue(spec_config.spec_dec_mode.extend_ctx(VanillaAttention))
+        self.assertTrue(spec_config.is_linear_tree)
+        return model_engine, kv_cache_manager, attn_metadata
+
+    def test_prepare_inputs_mrope_verify_as_context_takes_no_read_slot(
+            self) -> None:
+        """When the kernel runs verify groups as chunked context rows, their
+        rotary comes from `position_ids` alone and only the plain generation
+        requests take read slots."""
+        model_engine, kv_cache_manager, attn_metadata = (
+            self._setup_extend_as_context_engine())
+        verify_mm = self._make_mrope_gen_request(4, 1, 0, 10)
+        verify_text = self._make_mrope_gen_request(3, 2, 1, None)
+        plain_mm = self._make_mrope_gen_request(6, 3, 2, 20)
+        plain_text = self._make_mrope_gen_request(5, 4, 3, None)
+        verify_mm.py_draft_tokens = [7]
+        verify_text.py_draft_tokens = [7]
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = [
+            verify_mm, verify_text, plain_mm, plain_text
+        ]
+        result = self._prepare_mrope_spec_inputs(model_engine, kv_cache_manager,
+                                                 attn_metadata,
+                                                 scheduled_requests)
+
+        self._assert_mrope_positions(result, [13, 14, 2, 3, 25, 4])
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [2, 32])
+        # The verify group still seeds the delta cache for the plain steps
+        # that follow it.
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0, 2])
+        kv_cache_manager.shutdown()
+
+    def test_prepare_inputs_mrope_verify_as_context_alone_emits_no_read_slots(
+            self) -> None:
+        """A batch whose only delta carriers are verify groups run as context
+        rows has nothing for the generation-indexed read."""
+        model_engine, kv_cache_manager, attn_metadata = (
+            self._setup_extend_as_context_engine())
+        verify_mm = self._make_mrope_gen_request(4, 1, 0, 10)
+        verify_mm.py_draft_tokens = [7]
+        plain_text = self._make_mrope_gen_request(5, 2, 1, None)
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = [verify_mm, plain_text]
+        result = self._prepare_mrope_spec_inputs(model_engine, kv_cache_manager,
+                                                 attn_metadata,
+                                                 scheduled_requests)
+
+        self._assert_mrope_positions(result, [13, 14, 4])
+        self.assertNotIn("mrope_delta_read_seq_slots", result)
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0])
+        kv_cache_manager.shutdown()
 
     @skip_pre_blackwell_unittest
     def test_ced_warmup_passes_dummy_context_requests(self) -> None:
@@ -3221,6 +3888,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case):
                 engine, _, _, _, _ = _make_forward_only_engine(key)
+                enable_spec_decode = False
                 metadata = self._metadata()
                 batch = ScheduledRequests()
                 batch.generation_requests = [_make_request_stub(1)]
@@ -3236,7 +3904,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                 elif case == "promoted_context":
                     promoted = frozenset({1})
                 elif case == "speculative":
-                    engine.enable_spec_decode = True
+                    enable_spec_decode = True
                 elif case == "beam":
                     engine._runner._config.max_beam_width = 2
                 elif case == "encoder_decoder":
@@ -3250,7 +3918,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                         selected,
                         batch,
                         promoted,
-                        enable_spec_decode=engine.enable_spec_decode):
+                        enable_spec_decode=enable_spec_decode):
                     self.assertEqual(metadata._csa2_defer_decode_outputs, case
                                      in ("ordinary", "ordinary_overlap"))
                 self.assertFalse(metadata._csa2_defer_decode_outputs)
@@ -3295,7 +3963,9 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                             engine.forward(batch, resource_manager)
                     else:
                         actual_outputs = engine.forward(batch, resource_manager)
-                        self.assertEqual(actual_outputs, outputs)
+                        self.assertEqual(actual_outputs, {
+                            **outputs, "runtime_draft_len": 0
+                        })
                         self.assertIs(actual_outputs["logits"],
                                       outputs["logits"])
                 self.assertFalse(metadata._csa2_defer_decode_outputs)

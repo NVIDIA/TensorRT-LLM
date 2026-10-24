@@ -15,7 +15,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -70,6 +70,72 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 pytestmark = pytest.mark.cpu_only
 
 
+def _forward_step_executor(engine, *, enable_spec_decode=False, runtime_draft_len=0):
+    return types.SimpleNamespace(
+        model_engine=engine,
+        resource_manager=object(),
+        iter_counter=0,
+        enable_spec_decode=enable_spec_decode,
+        runtime_draft_len=runtime_draft_len,
+        sampler=Mock(get_cache_indirection=Mock(return_value=object())),
+        execution_stream=Mock(),
+        _iter_adp_dummy_ctx_tokens=0,
+        _iter_adp_dummy_gen_tokens=0,
+        _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
+        _maybe_record_hang_diagnostic_phase=Mock(),
+        _attach_encoder_output_to_execution_stream=Mock(),
+        _mark_cross_kv_projection_consumed=Mock(),
+        _kv_connector_wait_for_save=Mock(),
+        _handle_errors=Mock(),
+    )
+
+
+def _run_forward_step(executor, batch, new_tensors=None):
+    with (
+        patch("torch.cuda.current_stream", return_value=Mock()),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
+    ):
+        return PyExecutor._forward_step(executor, batch, new_tensors)
+
+
+@pytest.mark.parametrize(
+    ("shutdown_method", "releases_model_owned_graphs"),
+    [
+        ("shutdown", True),
+        ("shutdown_for_kv_cache_estimation", False),
+    ],
+)
+def test_shutdown_graph_lifecycle(shutdown_method, releases_model_owned_graphs):
+    engine = Mock()
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = Mock()
+    executor.dist = types.SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.encoder_launch_executor = None
+    executor.kv_connector_manager = None
+    executor.model_engine = engine
+    executor.draft_model_engine = None
+    executor.resource_manager = types.SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.sampler = object()
+    executor.dwdp_manager = None
+    executor._profile_manager = Mock()
+
+    with patch("torch.cuda.is_available", return_value=False):
+        getattr(executor, shutdown_method)()
+
+    executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
+    executor._profile_manager.cleanup.assert_called_once()
+    engine.release_executor_resources.assert_called_once_with(
+        release_model_owned_graphs=releases_model_owned_graphs
+    )
+
+
 @pytest.mark.parametrize(
     "request_flags, expected_gather",
     [
@@ -93,32 +159,12 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
     }
     engine = object.__new__(PyTorchModelEngine)
     engine._runner = runner
-    engine.enable_spec_decode = False
-    engine.runtime_draft_len = 0
-    resources = object()
-    cache_indirection = object()
+    engine._warmup_depth = 0
+    engine.route_capture = None
     new_tensors = object()
-    executor = types.SimpleNamespace(
-        model_engine=engine,
-        resource_manager=resources,
-        iter_counter=0,
-        sampler=Mock(get_cache_indirection=Mock(return_value=cache_indirection)),
-        execution_stream=Mock(),
-        _iter_adp_dummy_ctx_tokens=0,
-        _iter_adp_dummy_gen_tokens=0,
-        _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
-        _maybe_record_hang_diagnostic_phase=Mock(),
-        _attach_encoder_output_to_execution_stream=Mock(),
-        _mark_cross_kv_projection_consumed=Mock(),
-        _kv_connector_wait_for_save=Mock(),
-        _handle_errors=Mock(),
-    )
-    with (
-        patch("torch.cuda.current_stream", return_value=Mock()),
-        patch("torch.cuda.stream", return_value=nullcontext()),
-        patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
-    ):
-        outputs = PyExecutor._forward_step(executor, batch, new_tensors)
+    executor = _forward_step_executor(engine)
+
+    outputs = _run_forward_step(executor, batch, new_tensors)
 
     executor._handle_errors.assert_not_called()
     runner.forward.assert_called_once()
@@ -126,9 +172,43 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
     assert inputs.batch is batch
     assert inputs.gather_context_logits is expected_gather
     assert inputs.new_tensors_device is new_tensors
-    assert inputs.cache_indirection_buffer is cache_indirection
-    assert runner.forward.call_args.kwargs["resource_manager"] is resources
+    assert inputs.cache_indirection_buffer is executor.sampler.get_cache_indirection()
+    assert runner.forward.call_args.kwargs["resource_manager"] is executor.resource_manager
     torch.testing.assert_close(outputs["logits"], logits if expected_gather else logits[2::3])
+
+
+@pytest.mark.parametrize(
+    "outputs, expected_draft_len",
+    [
+        ({"logits": None}, 2),
+        ({"logits": None, "runtime_draft_len": 0}, 0),
+        (torch.tensor([1.0]), 2),
+    ],
+    ids=["no-update", "update", "raw-output"],
+)
+def test_forward_step_passes_spec_state_and_takes_length_update(outputs, expected_draft_len):
+    engine = Mock(route_capture=None)
+    engine.forward.return_value = outputs
+    executor = _forward_step_executor(engine, enable_spec_decode=True, runtime_draft_len=2)
+
+    assert _run_forward_step(executor, ScheduledRequests()) is outputs
+
+    assert engine.forward.call_args.kwargs["enable_spec_decode"] is True
+    assert engine.forward.call_args.kwargs["runtime_draft_len"] == 2
+    assert executor.runtime_draft_len == expected_draft_len
+    if isinstance(outputs, dict):
+        assert "runtime_draft_len" not in outputs
+
+
+def test_forward_step_keeps_draft_len_when_forward_fails():
+    engine = Mock(route_capture=None)
+    engine.forward.side_effect = RuntimeError("decoder failure")
+    executor = _forward_step_executor(engine, enable_spec_decode=True, runtime_draft_len=2)
+
+    assert _run_forward_step(executor, ScheduledRequests()) is None
+
+    executor._handle_errors.assert_called_once()
+    assert executor.runtime_draft_len == 2
 
 
 @pytest.mark.parametrize("end_id", [None, -1, 0, 127])
@@ -529,6 +609,93 @@ def test_model_without_remote_tail_does_not_inspect_request() -> None:
     PyExecutor._configure_csa2_remote_tail(executor, types.SimpleNamespace())
 
 
+def _make_admission_executor(model, requests):
+    """An executor whose `_fetch_and_activate_new_requests` and `_validate_request` are the
+    real ones, over a model engine holding `model`; everything else they touch is a stub."""
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(model=model),
+        _is_kv_manager_v2=False,
+        kv_cache_manager=None,
+        kv_cache_transceiver=None,
+        max_beam_width=1,
+        sampler=Mock(),
+        waiting_queue=object(),
+        active_requests=[],
+        _mm_encoder_item_scheduling_enabled=False,
+        _fetch_new_requests=Mock(return_value=requests),
+        _configure_csa2_remote_tail=Mock(),
+        _validate_token_id_range=Mock(),
+        _validate_request_budget=Mock(),
+        _handle_errors=Mock(),
+    )
+    executor._validate_request = types.MethodType(PyExecutor._validate_request, executor)
+    return executor
+
+
+def _make_admission_request(request_id: int) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        request_id=request_id,
+        py_disaggregated_params=None,
+        sampling_config=None,
+        kv_cache_retention_config=None,
+    )
+
+
+def test_model_validation_fails_only_the_request_it_rejects() -> None:
+    requests = [_make_admission_request(i) for i in range(3)]
+
+    def validate_request(request) -> None:
+        if request.request_id == 1:
+            raise ValueError("frame too large")
+
+    model = types.SimpleNamespace(validate_request=Mock(side_effect=validate_request))
+    executor = _make_admission_executor(model, requests)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == [requests[0], requests[2]]
+    assert executor.active_requests == [requests[0], requests[2]]
+    executor._handle_errors.assert_called_once_with(
+        "frame too large", requests=[requests[1]], charge_budget=False
+    )
+    assert [call.args[0] for call in model.validate_request.call_args_list] == requests
+    # The checks after the model's still run for the requests it admitted.
+    assert executor._validate_request_budget.call_count == 2
+
+
+def test_model_validation_runs_after_the_sampler_and_before_the_budget() -> None:
+    order = []
+    model = types.SimpleNamespace(validate_request=lambda request: order.append("model"))
+    executor = _make_admission_executor(model, [])
+    executor.sampler.validate_request.side_effect = lambda request: order.append("sampler")
+    executor._validate_request_budget.side_effect = lambda request: order.append("budget")
+
+    PyExecutor._validate_request(executor, _make_admission_request(0))
+
+    assert order == ["sampler", "model", "budget"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        types.SimpleNamespace(),
+        Mock(spec=DecoderModelForCausalLM),
+        types.SimpleNamespace(validate_request=None),
+        None,
+    ],
+    ids=["no_attribute", "spec_mock", "none_attribute", "no_model"],
+)
+def test_models_without_the_validation_hook_are_unaffected(model) -> None:
+    requests = [_make_admission_request(i) for i in range(2)]
+    executor = _make_admission_executor(model, requests)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == requests
+    assert executor.active_requests == requests
+    executor._handle_errors.assert_not_called()
+
+
 @pytest.mark.parametrize("mode", ["standalone", "generation", "disabled"])
 def test_full_model_requests_without_remote_handoff_are_unchanged(mode: str) -> None:
     executor, request = _make_remote_tail_executor_and_request(context_only=False)
@@ -589,7 +756,8 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         prepare_disagg_generation_request=lambda req: events.append(("draft", req))
     )
     executor = types.SimpleNamespace(
-        model_engine=types.SimpleNamespace(model=target, enable_spec_decode=False),
+        model_engine=types.SimpleNamespace(model=target),
+        enable_spec_decode=False,
         draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=types.SimpleNamespace(
             resource_managers={ResourceManagerType.SEQ_SLOT_MANAGER: Mock()}
@@ -639,7 +807,7 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
         )
     )
     executor = types.SimpleNamespace(
-        model_engine=types.SimpleNamespace(enable_spec_decode=False),
+        enable_spec_decode=False,
         resource_manager=types.SimpleNamespace(
             resource_managers={
                 ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
@@ -884,9 +1052,46 @@ def test_encoder_graph_warmup_uses_runtime_encoder_stream():
 
     set_device.assert_called_once_with(3)
     cuda_stream.assert_called_once_with(executor.encoder_stream)
-    executor.model_engine._warmup_encoder_cuda_graphs_enc_dec.assert_called_once_with(
-        executor.resource_manager
-    )
+    executor.model_engine.warmup_encoder.assert_called_once_with(executor.resource_manager)
+
+
+def test_warmup_scope_enters_every_engine_and_nests():
+    """Both engines warm up inside the executor's scope; a failing inner scope keeps the outer one."""
+    events = []
+
+    class _Engine:
+        def __init__(self, name):
+            self.name = name
+
+        @contextmanager
+        def warmup_scope(self):
+            events.append(("enter", self.name))
+            try:
+                yield
+            finally:
+                events.append(("exit", self.name))
+
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = _Engine("target")
+    executor.draft_model_engine = _Engine("draft")
+
+    with executor.warmup_scope():
+        with pytest.raises(RuntimeError):
+            with executor.warmup_scope():
+                raise RuntimeError("warmup failure")
+        assert executor.is_warmup
+
+    assert not executor.is_warmup
+    assert events == [
+        ("enter", "target"),
+        ("enter", "draft"),
+        ("enter", "target"),
+        ("enter", "draft"),
+        ("exit", "draft"),
+        ("exit", "target"),
+        ("exit", "draft"),
+        ("exit", "target"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2464,6 +2669,7 @@ class _StubADPExecutor:
         )
         kv_cache_manager.num_extra_kv_tokens = 0
         kv_cache_manager.tokens_per_block = 128
+        kv_cache_manager.kda_context_only = False
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -3368,6 +3574,42 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
 
+def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.kda_context_only = True
+    stub.max_total_draft_tokens = 3
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 1
+    assert scheduled_batch.generation_requests == []
+    assert len(scheduled_batch.context_requests) == 1
+    dummy = scheduled_batch.context_requests[0]
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy in stub.active_requests
+    call = stub.add_dummy_calls[0]
+    assert call["is_gen"] is False
+    assert call["token_nums"] == [1]
+    assert call["max_num_draft_tokens"] == 0
+    assert stub._pending_adp_dummy_request is dummy
+
+
+def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.kda_context_only = True
+    stub.max_total_draft_tokens = 3
+    # The dummy role can still say generation when no transceiver drives it.
+    stub._adp_dummy_is_gen = True
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 1
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=1, max_num_draft_tokens=0
+    )
+    assert len(scheduled_batch.context_requests) == 1
+
+
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():
     stub, scheduled_batch = _unfittable_rank()
     scheduled_batch.context_requests_chunking = [
@@ -3825,7 +4067,7 @@ class TestOneModelMTPDraftTokenScheduling:
         disaggregated serving in one shot.
 
         The fix's state filter is {GENERATION_IN_PROGRESS,
-        DISAGG_GENERATION_INIT}, mirroring the two-model normalization, so a
+        DISAGG_GENERATION_INIT}, mirroring the drafter normalization, so a
         single fix covers the aggregated decode path (GENERATION_IN_PROGRESS)
         and the disagg decode-worker path (DISAGG_GENERATION_INIT). Context
         requests (CONTEXT_INIT) are not generation requests and must be left
@@ -3871,7 +4113,7 @@ class TestOneModelMTPDraftTokenScheduling:
         batch.append_generation_request(gen)
         ex._handle_dynamic_draft_len(batch)
 
-        assert ex.model_engine.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
+        assert ex.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
         assert gen.py_needs_onehot_draft_probs
         assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
 
@@ -4075,9 +4317,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
         py_result=py_result,
         py_disaggregated_params=types.SimpleNamespace(**transferred),
     )
-    request.create_response = lambda _use_fast_logits, _rank: LlmResponse(
-        request_id=rid, result=LlmResult(b"", py_result)
-    )
+    request.create_response = lambda: LlmResponse(request_id=rid, result=LlmResult(b"", py_result))
     return request
 
 

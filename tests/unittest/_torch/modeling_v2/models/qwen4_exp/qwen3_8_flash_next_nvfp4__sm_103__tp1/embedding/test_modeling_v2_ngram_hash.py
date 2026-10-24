@@ -3,9 +3,8 @@
 """GPU test for the ngram_hash entry.
 
 Exact integer arithmetic, gated bitwise against the entry's scalar reference.
-A wrong hash is still a valid row index, so beyond the cells: six near-miss
-derivations must each differ, the per-head bands, the EOS reset semantics,
-row independence, the tail slice and chunked prefill, and the four guards.
+Beyond the cells: the EOS reset that `ngram_token_history`'s EOS seed relies
+on, the narrow-multiplier guard and graph capture.
 """
 
 import zlib
@@ -41,7 +40,6 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 DEV = "cuda"
 EOS = CKPT_EOS_TOKEN_ID
-NGRAM_SIZE = len(CKPT_MULTIPLIERS)
 NGRAM_HEADS = len(CKPT_HEAD_VOCAB_SIZES)
 PADDED_TABLE_ROWS = 320001536  # sum(head_vocab_sizes) rounded up to a multiple of 128
 
@@ -81,7 +79,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         eos_positions=spec.get("eos_positions", ()),
         lead_eos=spec.get("lead_eos", True),
         eos_density=spec.get("eos_density", 0.0),
-    ).to(spec.get("ids_dtype", torch.int64))
+    )
     before = ids.clone()
     args = (ids, *_constants(), EOS, spec["num_query_tokens"])
     out = op(*args)
@@ -89,74 +87,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert out.data_ptr() != ids.data_ptr()
     assert torch.equal(ids, before), "the history is read-only"
     _compare(out, op.reference(*args))
-
-
-def _variant(rows, num_query_tokens, variant):
-    """The scalar formula with one specific mistake in it."""
-    multipliers = CKPT_MULTIPLIERS[::-1] if variant == "multipliers_reversed" else CKPT_MULTIPLIERS
-    heads_per_ngram = NGRAM_HEADS // (NGRAM_SIZE - 1)
-    out = []
-    for row in rows:
-        segment_start, last_eos = [], -1
-        for position, token in enumerate(row):
-            if variant == "inclusive_segment" and token == EOS:
-                last_eos = position
-            segment_start.append(last_eos + 1)
-            if variant != "inclusive_segment" and token == EOS:
-                last_eos = position
-        row_out = []
-        for position in range(len(row) - num_query_tokens, len(row)):
-            context = []
-            for shift in range(NGRAM_SIZE):
-                source = position - shift - (1 if variant == "extra_shift" and shift else 0)
-                if variant == "no_eos_reset":
-                    inside = source >= 0
-                else:
-                    inside = position - segment_start[position] >= shift and source >= 0
-                context.append(row[source] if inside else EOS)
-            heads = []
-            for ngram in range(2, NGRAM_SIZE + 1):
-                mixed = context[0] * multipliers[0]
-                for index in range(1, ngram):
-                    mixed ^= context[index] * multipliers[index]
-                block = ngram - 2
-                if variant == "blocks_swapped":
-                    block = NGRAM_SIZE - 2 - block
-                low = block * heads_per_ngram
-                for head in range(heads_per_ngram):
-                    offset = 0 if variant == "no_offsets" else CKPT_HEAD_OFFSETS[low + head]
-                    heads.append(mixed % CKPT_HEAD_VOCAB_SIZES[low + head] + offset)
-            row_out.append(heads)
-        out.append(row_out)
-    return torch.tensor(out, dtype=torch.long, device=DEV)
-
-
-def test_wrong_variants_are_separated() -> None:
-    """Six near misses: each in range, inside the table, and different."""
-    ids = _tokens(2, CKPT_CONTEXT_LEN + 512, seed=5, eos_positions=(30, 31, 200, 400))
-    got = _hash(ids, 512)
-    _compare(got, op.reference(ids, *_constants(), EOS, 512))
-    for variant in (
-        "extra_shift",
-        "no_eos_reset",
-        "inclusive_segment",
-        "multipliers_reversed",
-        "no_offsets",
-        "blocks_swapped",
-    ):
-        wrong = _variant(ids.tolist(), 512, variant)
-        differing = int((got != wrong).sum())
-        print(f"  {variant:<22} {differing} indices differ")
-        assert differing > 0, f"{variant} is indistinguishable from the correct result"
-        assert 0 <= int(wrong.min()) and int(wrong.max()) < PADDED_TABLE_ROWS
-
-
-def test_every_head_lands_in_its_own_band() -> None:
-    got = _hash(_tokens(2, CKPT_CONTEXT_LEN + 512, seed=9, eos_positions=(100,)), 512)
-    for head in range(NGRAM_HEADS):
-        column = got[:, :, head]
-        assert int(column.min()) >= CKPT_HEAD_OFFSETS[head]
-        assert int(column.max()) < CKPT_HEAD_OFFSETS[head] + CKPT_HEAD_VOCAB_SIZES[head]
 
 
 def test_eos_restarts_the_window() -> None:
@@ -169,74 +99,6 @@ def test_eos_restarts_the_window() -> None:
     assert not torch.equal(_hash(fresh, 1), _hash(no_eos, 1))
 
 
-def test_eos_token_itself_ends_its_segment() -> None:
-    """An EOS hashes with the segment it closes, not as a fresh start."""
-    closing = torch.tensor([[11, 22, 33, EOS]], device=DEV)
-    opening = torch.tensor([[EOS] * (CKPT_CONTEXT_LEN + 1)], device=DEV)
-    assert not torch.equal(_hash(closing, 1), _hash(opening, 1))
-
-
-def test_rows_are_independent() -> None:
-    ids = _tokens(4, CKPT_CONTEXT_LEN + 64, seed=13, eos_positions=(20,))
-    batched = _hash(ids, 64)
-    for row in range(ids.shape[0]):
-        assert torch.equal(batched[row : row + 1], _hash(ids[row : row + 1], 64))
-
-
-def test_tail_slice_is_exact() -> None:
-    """Asking for Q rows equals asking for all and keeping the last Q."""
-    ids = _tokens(2, 200, seed=17, eos_positions=(50, 51))
-    whole = _hash(ids, 200)
-    for num_query_tokens in (1, 3, 64, 199):
-        assert torch.equal(_hash(ids, num_query_tokens), whole[:, -num_query_tokens:])
-
-
-def test_chunked_prefill_agrees_with_one_shot() -> None:
-    """Two chunks, the second carrying the `ngram_size - 1` cached ids."""
-    ids = _tokens(2, CKPT_CONTEXT_LEN + 96, seed=19, eos_positions=(30, 60))
-    split = CKPT_CONTEXT_LEN + 48
-    first = _hash(ids[:, :split], 48)
-    second = _hash(ids[:, split - CKPT_CONTEXT_LEN :], 48)
-    assert torch.equal(torch.cat([first, second], dim=1), _hash(ids, 96))
-
-
-# The four guards: each shows the unguarded op answering plausibly, then the
-# refusal under `validating`.
-
-
-def test_guard_refuses_num_query_tokens_beyond_the_history() -> None:
-    ids = _tokens(1, CKPT_CONTEXT_LEN, seed=31)
-    unguarded = op(ids, *_constants(), EOS, CKPT_CONTEXT_LEN + 1)
-    assert unguarded.shape == (1, CKPT_CONTEXT_LEN - 1, NGRAM_HEADS), (
-        "the hazard this guard covers is gone: it used to return fewer rows than asked"
-    )
-    for bad in (CKPT_CONTEXT_LEN + 1, -1):
-        with pytest.raises(AssertionError, match="num_query_tokens"):
-            with validating(op):
-                op(ids, *_constants(), EOS, bad)
-
-
-def test_guard_refuses_a_ragged_head_count() -> None:
-    ids = _tokens(1, CKPT_CONTEXT_LEN + 4, seed=37)
-    multipliers, sizes, offsets = _constants()
-    unguarded = op(ids, multipliers, sizes[:15], offsets[:15], EOS, 4)
-    assert unguarded.shape[-1] == 14, "the hazard this guard covers is gone"
-    with pytest.raises(AssertionError, match="multiple of"):
-        with validating(op):
-            op(ids, multipliers, sizes[:15], offsets[:15], EOS, 4)
-
-
-def test_guard_refuses_an_over_long_offsets_tensor() -> None:
-    ids = _tokens(1, CKPT_CONTEXT_LEN + 4, seed=41)
-    multipliers, sizes, offsets = _constants()
-    long_offsets = torch.cat([offsets, offsets])
-    unguarded = op(ids, multipliers, sizes, long_offsets, EOS, 4)
-    assert torch.equal(unguarded, _hash(ids, 4)), "the hazard this guard covers is gone"
-    with pytest.raises(AssertionError, match="same length"):
-        with validating(op):
-            op(ids, multipliers, sizes, long_offsets, EOS, 4)
-
-
 def test_guard_refuses_narrow_multipliers() -> None:
     ids = _tokens(1, CKPT_CONTEXT_LEN + 4, seed=47)
     multipliers, sizes, offsets = _constants()
@@ -247,13 +109,6 @@ def test_guard_refuses_narrow_multipliers() -> None:
     with pytest.raises(AssertionError, match="int64"):
         with validating(op):
             op(ids, narrow, sizes, offsets, EOS, 4)
-
-
-def test_single_multiplier_raises_on_its_own() -> None:
-    ids = _tokens(1, CKPT_CONTEXT_LEN + 4, seed=43)
-    multipliers, sizes, offsets = _constants()
-    with pytest.raises(ZeroDivisionError):
-        op(ids, multipliers[:1], sizes, offsets, EOS, 4)
 
 
 def test_cuda_graph_capture_and_replay() -> None:

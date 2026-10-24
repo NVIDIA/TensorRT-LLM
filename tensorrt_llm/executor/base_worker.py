@@ -333,6 +333,7 @@ class BaseWorker(GenerationExecutor):
                          result_wait_queue=None) -> int:
         assert request.id is not None
         py_lora_path = None
+        py_lora_ckpt_source = None
         if self._lora_manager is not None and request.lora_request is not None:
             try:
                 # Each rank loads independently from disk via py_lora_path in
@@ -344,6 +345,7 @@ class BaseWorker(GenerationExecutor):
                     weights=None,
                     config=self._lora_manager.cpp_lora_config[uid])
                 py_lora_path = request.lora_request.lora_path
+                py_lora_ckpt_source = request.lora_request.ckpt_source
             except Exception as e:
                 raise RequestError(f"Failed to load LoRA adapter: {e}") from e
         else:
@@ -483,6 +485,7 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
+            executor_request.py_lora_ckpt_source = py_lora_ckpt_source
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
@@ -1094,12 +1097,8 @@ class BaseWorker(GenerationExecutor):
 
         startup_metrics = {}
         executor_metrics = dict(getattr(self.engine, "metrics", {}))
-        for model_engine_stage in (
-                "initial_model_engine",
-                "final_model_engine",
-                "initial_draft_model_engine",
-                "final_draft_model_engine",
-        ):
+        for model_engine_stage in ("initial_model_engine",
+                                   "final_model_engine"):
             model_engine_metrics = executor_metrics.pop(model_engine_stage,
                                                         None)
             if model_engine_metrics is not None:
