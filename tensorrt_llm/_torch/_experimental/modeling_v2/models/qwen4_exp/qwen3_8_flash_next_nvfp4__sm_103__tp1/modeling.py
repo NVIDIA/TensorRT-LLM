@@ -179,6 +179,8 @@ from .ops.attention.qwen4_exp_attn_decode_prologue import SCORE_ROWS as _PROLOGU
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
 from .ops.attention.spec_rollback_commit import spec_rollback_commit, spec_rollback_stage
+from .ops.attention.verify_step_setup import _BLOCK_S as _VERIFY_SETUP_MAX_SEQS
+from .ops.attention.verify_step_setup import verify_step_setup
 from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.gemm.bf16_gemv_pdl import MAX_ROWS as _GEMV_MAX_ROWS
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
@@ -5194,6 +5196,23 @@ class PrefillTarget:
         return x if keep is None else out.index_copy_(0, keep, x)
 
 
+def _position_key(position_ids: torch.Tensor) -> tuple:
+    """What identifies a step's positions buffer: its storage, dtype and `[3, N]` layout."""
+    view = torch.reshape(position_ids, [_QSA_POSITION_AXES, -1])
+    return (view.data_ptr(), view.dtype, tuple(view.shape), view.stride())
+
+
+def _copy_positions(position_ids: torch.Tensor) -> torch.Tensor:
+    """A fresh contiguous int32 `[3, N]` copy of the step's mRoPE positions."""
+    pos3 = torch.empty(
+        [_QSA_POSITION_AXES, position_ids.numel() // _QSA_POSITION_AXES],
+        dtype=torch.int32,
+        device=position_ids.device,
+    )
+    pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
+    return pos3
+
+
 class DecodeTarget:
     """Generation-only batches (no context rows): drops the context-row recurrent
     ops and adds the fused single-token recurrence."""
@@ -5211,6 +5230,9 @@ class DecodeTarget:
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
         self._mtp_unfused = os.environ.get(_MTP_UNFUSED_ENV, "0") == "1"
+        # `(position key, pos3)` of the last trunk step: the first draft step of the same
+        # forward reads the trunk's positions buffer and reuses its int32 copy.
+        self._trunk_pos3: tuple | None = None
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast; see PrefillTarget._check_step_contract."""
@@ -6193,15 +6215,22 @@ class DecodeTarget:
         # (`_decode_projection`); an eager step keeps cuBLAS.
         gemm = _decode_projection if md.is_cuda_graph else cublas_mm
 
+        # A captured verify step builds `pos3`, the PLE segmentation vector and the
+        # rollback's staging in one launch (`verify_step_setup`, below).
+        rollback = core.spec_rollback
+        fused_setup = (
+            md.is_cuda_graph
+            and spec_metadata is not None
+            and 0 < md.num_seqs < _VERIFY_SETUP_MAX_SEQS
+            and position_ids.shape[-1] > md.num_seqs
+            and position_ids.stride(-1) == 1
+            and rollback is not None
+            and rollback.index_planes is not None
+        )
         # Two views of one `[3, 1, T]` buffer (see PrefillTarget.forward): contiguous
         # `pos3` and `coords`.
         coords = torch.transpose(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]), 0, 1)
-        pos3 = torch.empty(
-            [_QSA_POSITION_AXES, position_ids.shape[-1]],
-            dtype=torch.int32,
-            device=position_ids.device,
-        )
-        pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
+        pos3 = None if fused_setup else _copy_positions(position_ids)
 
         h = nn.functional.embedding(input_ids, core.w["embed"])
         num_tokens = h.shape[0]
@@ -6260,14 +6289,27 @@ class DecodeTarget:
                 replay = _replay_work(core, mm, batch)
         gdn_state = (si_all, is_verify, batch, gen_p, int_idx, replay)
 
-        # Every generation sequence carries its n-gram history; the engine's
-        # `has_initial_states` covers the context prefix only (empty here).
-        ple_carry = torch.ones(
-            [batch], dtype=mm.has_initial_states.dtype, device=mm.has_initial_states.device
-        )
         # PLE segmentation vector: rebuilt from `seq_lens_cuda` when `gen_p > 1` (see
-        # PrefillTarget.prepare).
-        if gen_p == 1:
+        # PrefillTarget.prepare). Every generation sequence carries its n-gram history, so
+        # the PLE block takes no carry flags.
+        fused_setup = fused_setup and is_verify
+        if pos3 is None and not fused_setup:
+            pos3 = _copy_positions(position_ids)
+        if fused_setup:
+            planes = rollback.index_planes
+            (pos3, ple_qsl, staged_slots, staged_pages, staged_within, staged_index) = (
+                verify_step_setup(
+                    position_ids,
+                    md.seq_lens_cuda[:batch],
+                    si_all,
+                    md.qsa_req_idx_per_token[:num_tokens],
+                    md.qsa_logical_positions[:num_tokens],
+                    md.qsa_block_table,
+                    md.tokens_per_block,
+                    *planes,
+                )
+            )
+        elif gen_p == 1:
             ple_qsl = qsl_long
         else:
             ple_qsl = cu_seqlens_from_seq_lens(md.seq_lens_cuda[:batch], torch.int64)
@@ -6275,10 +6317,11 @@ class DecodeTarget:
             core._bound.ple_state[0],
             core._bound.ple_state[1],
             si_all,
-            ple_carry,
+            None,
             ple_qsl,
             gen_p,
         )
+        self._trunk_pos3 = (_position_key(position_ids), pos3)
 
         # Dense/sparse decision once per forward, from a host-side metadata read: a
         # per-capture constant matching the engine's short/long decode graph families.
@@ -6301,10 +6344,18 @@ class DecodeTarget:
         # Staging for the speculative rollback, as on the prefill target (see
         # PrefillTarget.prepare); every row here is a generation row.
         stage = is_verify
-        rollback = core.spec_rollback
         if rollback is not None:
             rollback.discard()
-        if stage:
+        if fused_setup:
+            rollback.begin_staged(
+                num_gens=batch,
+                rows_per_gen=gen_p,
+                slots=staged_slots,
+                pages=staged_pages,
+                within=staged_within,
+                index_all=staged_index,
+            )
+        elif stage:
             rollback.begin(
                 num_contexts=0,
                 prefix_tokens=0,
@@ -6847,13 +6898,17 @@ class DecodeTarget:
             f"expected the mRoPE position layout with {_QSA_POSITION_AXES} "
             f"coordinate rows, got {tuple(position_ids.shape)}"
         )
-        pos3 = torch.empty(
-            [_QSA_POSITION_AXES, position_ids.numel() // _QSA_POSITION_AXES],
-            dtype=torch.int32,
-            device=position_ids.device,
-        )
-        pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
-        # The trunk's two other views, from the copy: `pos` (coordinate 0 alone, which the
+        # The first draft step reads the trunk's positions buffer, whose int32 copy the trunk
+        # made (taken once); a contiguous int32 `position_ids` (every later draft step) is
+        # read in place. The step's ops only read positions.
+        trunk, self._trunk_pos3 = self._trunk_pos3, None
+        if trunk is not None and trunk[0] == _position_key(position_ids):
+            pos3 = trunk[1]
+        elif position_ids.dtype == torch.int32 and position_ids.is_contiguous():
+            pos3 = torch.reshape(position_ids, [_QSA_POSITION_AXES, -1])
+        else:
+            pos3 = _copy_positions(position_ids)
+        # The trunk's two other views, from `pos3`: `pos` (coordinate 0 alone, which the
         # index rope reads) and `coords` (the `[N, 3]` transpose the position plane stores).
         pos = torch.reshape(torch.split(pos3, [1, _QSA_POSITION_AXES - 1], 0)[0], [-1])
         coords = torch.transpose(pos3, 0, 1)
@@ -7488,6 +7543,48 @@ class SpeculativeRollback:
         # plane, once the cache manager is bound: `begin` then gathers all of them at once and
         # the commit restores them in one launch (`ops/attention/qsa_rollback_planes`).
         self._planes: tuple | None = None
+
+    @property
+    def index_planes(self) -> tuple | None:
+        """`(base addresses, page strides, plane count)` of the bound index-K planes."""
+        return self._planes
+
+    def begin_staged(
+        self,
+        *,
+        num_gens: int,
+        rows_per_gen: int,
+        slots: torch.Tensor,
+        pages: torch.Tensor,
+        within: torch.Tensor,
+        index_all: torch.Tensor,
+    ) -> None:
+        """Open a generation-only verify step's staging from what `verify_step_setup`
+        resolved: the requests' int64 recurrent slots, the rows' int64 QSA pages and offsets,
+        and every bound index-K plane at them. The PLE staging and the commit are the
+        one-launch ones (`begin(..., fused=True)`)."""
+        n, p = num_gens, rows_per_gen
+        assert n > 0 and p > 1, (
+            f"a verify step stages generation requests carrying drafts; got {n} "
+            f"requests of {p} rows"
+        )
+        assert pages.shape[0] == n * p and index_all.shape[1] == n * p, (
+            f"{n} generation requests of {p} rows are {n * p} rows; got {pages.shape[0]} slots"
+        )
+        self._pending = dict(
+            num_contexts=0,
+            prefix=0,
+            n=n,
+            p=p,
+            slots=slots,
+            pages=pages,
+            within=within,
+            index=[],
+            position=None,
+            index_all=index_all,
+            fused=True,
+            ngram_stream=None,
+        )
 
     def set_index_planes(self, planes: list) -> None:
         """Bind the attention layers' index-K planes (static for the manager's lifetime)."""

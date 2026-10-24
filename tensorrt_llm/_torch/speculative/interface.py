@@ -34,7 +34,7 @@ from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import ResourceManagerType
-from . import fused_accept
+from . import draft_loop_ops, fused_accept
 from .greedy_argmax import greedy_argmax
 
 if TYPE_CHECKING:
@@ -3172,9 +3172,13 @@ class SpecWorkerBase(nn.Module, ABC):
         if self.guided_decoder is not None:
             self.guided_decoder.rollback_rejected_batch(num_accepted_tokens)
 
-    def _prepare_next_new_tokens(self, accepted_tokens, next_draft_tokens,
-                                 batch_indices_cuda, batch_size,
-                                 num_accepted_tokens):
+    def _prepare_next_new_tokens(self,
+                                 accepted_tokens,
+                                 next_draft_tokens,
+                                 batch_indices_cuda,
+                                 batch_size,
+                                 num_accepted_tokens,
+                                 fused: bool = False):
         """
         Prepare next_new_tokens for overlap scheduler support.
 
@@ -3184,10 +3188,21 @@ class SpecWorkerBase(nn.Module, ABC):
             batch_indices_cuda: Batch indices tensor
             batch_size: Number of requests
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
+            fused: One launch (``draft_loop_ops.next_new_tokens``) for a step
+                a CUDA graph captures; same values.
 
         Returns:
             next_new_tokens: [batch_size, runtime_draft_len + 1] - Input tokens for next iteration
         """
+        if (fused and next_draft_tokens.dim() == 2
+                and 0 < batch_size <= draft_loop_ops.MAX_REQUESTS
+                and num_accepted_tokens.shape[0] == batch_size
+                and accepted_tokens.dtype == next_draft_tokens.dtype
+                and accepted_tokens.stride(1) == 1
+                and next_draft_tokens.stride(1) == 1):
+            return draft_loop_ops.next_new_tokens(
+                accepted_tokens, next_draft_tokens,
+                batch_indices_cuda[:batch_size], num_accepted_tokens)
         next_new_tokens = accepted_tokens[batch_indices_cuda[:batch_size],
                                           num_accepted_tokens - 1].unsqueeze(1)
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
