@@ -127,6 +127,8 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         create_waiting_queue)
 from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
                                    count_retiring_requests)
+from .scheduler.gen_admission_queue import (GenAdmissionConfig,
+                                            GenAdmissionWaitingQueue)
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -992,6 +994,8 @@ class PyExecutor:
                                               self.hang_detector,
                                               torch.cuda.Event)
 
+        self._gen_admission = GenAdmissionConfig.from_env()
+
         # request fetcher initialization
         self._set_global_steady_clock_offset()
         self.executor_request_queue = ExecutorRequestQueue(
@@ -999,6 +1003,7 @@ class PyExecutor:
             max_batch_size=max_batch_size,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            stamp_admission_times=self._gen_admission.enabled,
         )
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # _sample_async is called twice before the first call to update_requests:
@@ -1020,12 +1025,18 @@ class PyExecutor:
         self.request_accumulated: List[RequestQueueItem] = []
         self.new_active_requests_queue_latency_ms = 0.0
         self._disable_mpi = mpi_disabled()
-        self.request_broadcaster = RequestBroadcaster(self.dist,
-                                                      self.hang_detector)
+        self.request_broadcaster = RequestBroadcaster(
+            self.dist,
+            self.hang_detector,
+            sync_clock=self._gen_admission.needs_clock)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
-            waiting_queue_policy)
+            waiting_queue_policy, gen_admission=self._gen_admission)
+        self._first_token_timer = None
+        if self.dist.rank == 0 and isinstance(self.waiting_queue,
+                                              GenAdmissionWaitingQueue):
+            self._first_token_timer = self.waiting_queue.enable_rank0()
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -6600,6 +6611,11 @@ class PyExecutor:
                     RequestQueueItem(PREFIX_LOAD_COMPLETION_REQUEST_ID,
                                      finished_prefix_load_ids=completed))
 
+        first_token_timer = getattr(self, "_first_token_timer", None)
+        if first_token_timer is not None:
+            first_token_timer.observe(self.active_requests, time.monotonic())
+            self.request_broadcaster.aux = first_token_timer.value
+
         # Broadcast requests and handle Python objects. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
         # empty iterations.
@@ -6611,6 +6627,12 @@ class PyExecutor:
         # replicated waiting queue.
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
             new_requests, prefer_cpu=idle)
+        if isinstance(waiting_queue, GenAdmissionWaitingQueue):
+            if self._gen_admission.needs_clock:
+                waiting_queue.set_now(self.request_broadcaster.rank0_now,
+                                      self.request_broadcaster.rank0_aux)
+            else:
+                waiting_queue.set_now(time.monotonic())
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
@@ -9567,6 +9589,11 @@ class PyExecutor:
             else:
                 new_active_requests.append(request)
 
+        # A request can finish in the iteration of its first token: sample
+        # it before it leaves active_requests.
+        first_token_timer = getattr(self, "_first_token_timer", None)
+        if first_token_timer is not None and requests_to_terminate:
+            first_token_timer.observe(requests_to_terminate, time.monotonic())
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
