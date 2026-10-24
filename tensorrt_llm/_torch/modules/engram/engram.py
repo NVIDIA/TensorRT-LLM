@@ -40,7 +40,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm._torch.host_staging import copy_host_to_device
 from tensorrt_llm._utils import prefer_pinned
 
-from ._decode_hash import _decode_hash_kernel
+from ._decode_hash import _decode_hash_kernel, _history_scatter_kernel
 
 # Default Engram embedding vocabulary size per n-gram level.
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
@@ -820,6 +820,132 @@ class EngramHashProvider:
         self._cached_hashes = cached
         return cached
 
+    def _compute_history_hashes(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        request_ids: list[int] | None,
+        seq_lens_host: torch.Tensor | None,
+        max_seq_len: int | None,
+        token_mask: torch.Tensor | None,
+        padded_num_tokens: int | None,
+    ) -> dict[int, torch.Tensor] | None:
+        """Request-history hashes for any number of tokens per request.
+
+        Produces the same hashes, history contents and cached buffers as the general
+        history path of :meth:`compute_hashes`. Every token of this forward is first
+        written into its request's history row; ``_decode_hash_kernel`` with
+        ``READ_CURRENT_HISTORY`` then gathers all n-gram sources of each layer,
+        including earlier tokens of the same forward, from that history. Aliased
+        request IDs and token masks use the PyTorch scatter, unique rows the
+        ``_history_scatter_kernel``.
+
+        Returns ``None`` when the inputs do not fit this path; the caller then uses
+        the general path.
+        """
+        if (
+            not input_ids.is_cuda
+            or input_ids.ndim != 1
+            or not input_ids.is_contiguous()
+            or input_ids.dtype not in (torch.int32, torch.int64)
+            or position_ids is None
+            or position_ids.device != input_ids.device
+            or not position_ids.is_contiguous()
+            or position_ids.numel() != input_ids.numel()
+            or position_ids.dtype not in (torch.int32, torch.int64)
+            or request_ids is None
+            or not request_ids
+            or seq_lens_host is None
+            or seq_lens_host.device.type != "cpu"
+            or seq_lens_host.ndim != 1
+            or seq_lens_host.numel() < len(request_ids)
+            or seq_lens_host.dtype not in (torch.int32, torch.int64)
+            or type(max_seq_len) is not int
+            or max_seq_len <= 0
+            or self.config.max_ngram_size < 2
+            or self.config.n_head_per_ngram < 1
+            or not self.config.layer_ids
+            or self._pad_id is None
+            or (token_mask is not None and not token_mask.is_contiguous())
+        ):
+            return None
+        lengths = seq_lens_host[: len(request_ids)].to(torch.long)
+        num_tokens = input_ids.numel()
+        if int(lengths.sum()) != num_tokens or bool((lengths < 0).any()):
+            return None
+        if self._history is not None and self._history.device != input_ids.device:
+            return None
+        num_output_tokens = padded_num_tokens if padded_num_tokens is not None else num_tokens
+        num_heads = (self.config.max_ngram_size - 1) * self.config.n_head_per_ngram
+        shape_key = ((num_output_tokens, num_heads),) * len(self.config.layer_ids)
+        cached = self._cached_hashes_store.get(shape_key)
+        if cached is not None and any(
+            value.device != input_ids.device for value in cached.values()
+        ):
+            return None
+
+        device = input_ids.device
+        rows = self._reserve_history_rows(request_ids, max_seq_len, device)
+        self._consume_history_seeds(request_ids, rows)
+        row_of_token = self._upload_history_tensor(
+            "token_rows",
+            torch.repeat_interleave(torch.tensor(rows, dtype=torch.long, device="cpu"), lengths),
+        )
+        if token_mask is not None or len(set(request_ids)) != len(request_ids):
+            ids = input_ids.long().view(-1)
+            compressed = self._lookup_table[ids.clamp(0, self._lookup_table.shape[0] - 1)]
+            if token_mask is not None:
+                compressed = torch.where(token_mask.to(device=device), compressed, self._DEAD)
+            self._history[row_of_token, position_ids.view(-1).long()] = compressed.to(torch.int32)
+        elif num_tokens:
+            block = 128
+            _history_scatter_kernel[(triton.cdiv(num_tokens, block),)](
+                input_ids,
+                position_ids,
+                row_of_token,
+                self._lookup_table,
+                self._history,
+                num_tokens,
+                self._history.shape[1],
+                VOCAB_SIZE=self._lookup_table.numel(),
+                BLOCK=block,
+                num_warps=4,
+            )
+        if cached is None:
+            cached = {
+                layer_id: torch.empty(
+                    (num_output_tokens, num_heads), dtype=torch.long, device=device
+                )
+                for layer_id in self.config.layer_ids
+            }
+            self._cached_hashes_store[shape_key] = cached
+        for layer_id in self.config.layer_ids:
+            _decode_hash_kernel[(num_output_tokens,)](
+                input_ids,
+                position_ids,
+                row_of_token,
+                None,
+                self._lookup_table,
+                self._history,
+                self._multipliers[layer_id],
+                cached[layer_id],
+                num_tokens,
+                self._history.shape[1],
+                VOCAB_SIZE=self._lookup_table.numel(),
+                PAD_ID=self._pad_id,
+                DEAD=self._DEAD,
+                MODULI=tuple(tuple(moduli) for moduli in self._moduli_ints[layer_id]),
+                N_HEAD=self.config.n_head_per_ngram,
+                MAX_NGRAM=self.config.max_ngram_size,
+                WRITE_HISTORY=False,
+                READ_CURRENT_HISTORY=True,
+                HAS_MASK=False,
+                BLOCK_HEAD=triton.next_power_of_2(self.config.n_head_per_ngram),
+                num_warps=1,
+            )
+        self._cached_hashes = cached
+        return cached
+
     def compute_hashes(
         self,
         input_ids: torch.Tensor,
@@ -896,6 +1022,17 @@ class EngramHashProvider:
         )
         if decoded is not None:
             return decoded
+        multi = self._compute_history_hashes(
+            input_ids,
+            position_ids,
+            request_ids,
+            seq_lens_host,
+            max_seq_len,
+            token_mask,
+            padded_num_tokens,
+        )
+        if multi is not None:
+            return multi
 
         # 1. Compress token ids via lookup table (1-D)
         ids = input_ids.long().view(-1)
