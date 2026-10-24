@@ -310,6 +310,9 @@ class GenAdmissionWaitingQueue(WaitingQueue):
 
     Entries are sorted by ``(orig_arrival, seq)``; prepended requests get a
     negative ``seq`` so they sort ahead of every request with the same key.
+    The admission order only changes with the clock or the entries, so it is
+    built once and popped from until then: a pass that pops and puts back
+    many requests (attention-DP rank full) does not rescan per pop.
     """
 
     def __init__(self, config: GenAdmissionConfig) -> None:
@@ -324,6 +327,10 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._last_stats_log = -math.inf
         # Sorted list of (orig_arrival, seq, gen_arrival, keyed, item).
         self._entries: list[tuple] = []
+        # Admission order of the entries as (entry, tier), reversed; None when stale.
+        self._order: Optional[list[tuple]] = None
+        # seqs popped from _order but not yet dropped from _entries.
+        self._popped: set[int] = set()
         self._counter = itertools.count()
         self._prepend_counter = itertools.count(-1, -1)
         self._now: Optional[float] = None
@@ -346,6 +353,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
     def set_now(self, now: Optional[float], s2f_s: Optional[float] = None) -> None:
         """Set rank 0's clock and s2f (None keeps it); once per iteration, before the pops."""
         self._now = now
+        self._order = None
         if self.adaptive is not None and s2f_s is not None:
             self.adaptive.s2f_s = s2f_s
         if now is None:
@@ -370,33 +378,47 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._last_key = max(self._last_key, gen_arrival)
         return (orig, seq, gen_arrival, keyed, item)
 
+    def _compact(self) -> None:
+        if self._popped:
+            self._entries = [e for e in self._entries if e[1] not in self._popped]
+            self._popped.clear()
+
     def _insert(self, entry: tuple) -> None:
+        self._compact()
+        self._order = None
         bisect.insort(self._entries, entry, key=lambda e: (e[0], e[1]))
 
-    def _select(self) -> tuple[int, str]:
-        """Index of the entry to admit next, and its tier."""
+    def _build_order(self) -> list[tuple]:
+        """(entry, tier) in admission order: each one is the pick once those before it are gone."""
         entries = self._entries
         ada = self.adaptive
         now = self._now
         if ada is None:
-            return 0, TIER_OLDEST
+            return [(e, TIER_OLDEST) for e in entries]
         if now is None:
-            return 0, TIER_LATE
+            return [(e, TIER_LATE) for e in entries]
         if ada.X is None:
-            best = min(range(len(entries)), key=lambda i: (entries[i][2], entries[i][1]))
-            return best, TIER_WARMUP
+            return [(e, TIER_WARMUP) for e in sorted(entries, key=lambda e: (e[2], e[1]))]
+        # Guard (GEN wait >= G), then feasible, then late; each in original-arrival order.
         deadline = ada.X - ada.s2f_s
-        first_feasible = -1
-        for i, (orig, _, gen_arrival, keyed, _) in enumerate(entries):
-            # In original-arrival order: the first aged entry is the oldest one.
+        guard, slack, late = [], [], []
+        for e in entries:
+            orig, _, gen_arrival, keyed, _ = e
             if now - gen_arrival >= ada.G:
-                return i, TIER_GUARD
-            if first_feasible < 0 and (not keyed or now - orig <= deadline):
-                first_feasible = i
-        if first_feasible >= 0:
-            keyed = entries[first_feasible][3]
-            return first_feasible, (TIER_SLACK if keyed else TIER_UNKEYED)
-        return 0, TIER_LATE
+                guard.append((e, TIER_GUARD))
+            elif not keyed:
+                slack.append((e, TIER_UNKEYED))
+            elif now - orig <= deadline:
+                slack.append((e, TIER_SLACK))
+            else:
+                late.append((e, TIER_LATE))
+        return guard + slack + late
+
+    def _next(self) -> tuple:
+        if self._order is None:
+            self._compact()
+            self._order = self._build_order()[::-1]
+        return self._order[-1]
 
     def mark_admitted(self, items: Iterable) -> None:
         now = self._now
@@ -429,18 +451,19 @@ class GenAdmissionWaitingQueue(WaitingQueue):
             self.add_request(request)
 
     def pop_request(self):
-        if not self._entries:
+        if not self:
             raise IndexError("pop from an empty queue")
-        idx, tier = self._select()
-        item = self._entries.pop(idx)[4]
+        entry, tier = self._next()
+        self._order.pop()
+        self._popped.add(entry[1])
+        item = entry[4]
         item._gen_admission_tier = tier
         return item
 
     def peek_request(self):
-        if not self._entries:
+        if not self:
             raise IndexError("peek from an empty queue")
-        idx, _ = self._select()
-        return self._entries[idx][4]
+        return self._next()[0][4]
 
     def prepend_request(self, request) -> None:
         self._insert(self._make_entry(request, next(self._prepend_counter)))
@@ -451,18 +474,22 @@ class GenAdmissionWaitingQueue(WaitingQueue):
             self.prepend_request(request)
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
+        self._compact()
+        self._order = None
         self._entries = [e for e in self._entries if e[4].id not in request_ids]
 
     def __bool__(self) -> bool:
-        return len(self._entries) > 0
+        return len(self) > 0
 
     def __len__(self) -> int:
-        return len(self._entries)
+        return len(self._entries) - len(self._popped)
 
     def __iter__(self) -> Iterator:
+        self._compact()
         return iter([e[4] for e in self._entries])
 
     def stats_line(self, now: float) -> str:
+        self._compact()
         parts = [
             f"[gen_admission] p{self.config.ttft_percentile:g} policy={self.config.policy} "
             f"qlen={len(self._entries)}"

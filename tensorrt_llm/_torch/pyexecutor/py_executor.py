@@ -9589,6 +9589,11 @@ class PyExecutor:
             else:
                 new_active_requests.append(request)
 
+        # A request can finish in the iteration of its first token: sample
+        # it before it leaves active_requests.
+        first_token_timer = getattr(self, "_first_token_timer", None)
+        if first_token_timer is not None and requests_to_terminate:
+            first_token_timer.observe(requests_to_terminate, time.monotonic())
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.

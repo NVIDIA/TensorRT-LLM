@@ -763,3 +763,77 @@ def test_get_from_waiting_queue_respects_capacity_and_order():
     got = get_from_waiting_queue(q, 3, enable_attention_dp=False, max_num_active_requests=128)
     assert [r.id for r in got] == [4, 5, 0]
     assert len(q) == 3
+
+
+def test_adp_put_backs_build_the_order_once():
+    """Requests pinned to a full attention-DP rank are popped and put back
+    without rescanning the queue per pop: one order build per pass."""
+    q = fixed_slack(14.0, 20.0)
+    now = 100.0
+    for i in range(50):
+        item = make_item(i, gen_arrival=now - 1, orig_arrival=now - 30 + 0.1 * i)
+        item.request.py_scheduling_params = SimpleNamespace(
+            attention_dp_rank=0 if i < 49 else 1, attention_dp_relax=False
+        )
+        q.add_request(item)
+    q.set_now(now, 0.0)
+    with patch.object(q, "_build_order", wraps=q._build_order) as build:
+        got = get_from_waiting_queue(q, 2, True, 1, all_ranks_num_active_requests=[1, 0])
+        assert build.call_count == 1
+    assert [r.id for r in got] == [49]
+    assert len(q) == 49 and [r.id for r in q] == list(range(49))
+    assert drain(q) == list(range(49))
+
+
+def test_pops_interleaved_with_changes():
+    q = fixed_slack(14.0, 20.0)
+    now = 100.0
+    # ages 20, 18, 16, 12 (feasible), 10 (feasible)
+    q.add_requests(
+        make_item(i, gen_arrival=now - 1, orig_arrival=now - a)
+        for i, a in enumerate([20, 18, 16, 12, 10])
+    )
+    q.set_now(now, 0.0)
+    assert admit(q).id == 3
+    q.add_request(make_item(5, gen_arrival=now, orig_arrival=now - 13))  # feasible, older
+    assert q.peek_request().id == 5 and len(q) == 5
+    q.remove_by_ids({5, 4})
+    assert [r.id for r in q] == [0, 1, 2]
+    q.add_request(make_item(6, gen_arrival=now - 25, orig_arrival=now - 25))  # guard
+    assert drain(q) == [6, 0, 1, 2]
+
+
+def test_request_finishing_on_its_first_token_is_sampled():
+    """max_tokens=2 without overlap: token 1 is imported and token 2 finishes
+    the request in one iteration, so it leaves before the next fetch."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    request = Mock()
+    request.py_request_id = 7
+    request.is_attention_dp_dummy = False
+    request.py_kv_transfer_timed_out = False
+    request.is_generation_only_request = True
+    request.is_finished = True
+    request.py_decoding_iter = 1
+    request.return_perf_metrics = False
+    request.py_total_draft_tokens = 0
+    request.is_disagg_context_complete_state = False
+    request.is_disagg_context_transmission_state = False
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [request]
+    executor.dist = SimpleNamespace(rank=0, world_size=1)
+    executor.perf_manager = Mock()
+    executor.iter_counter = 1
+    executor.stream_interval = 1
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor._disagg_coordinator = Mock()
+    executor._enqueue_responses = Mock()
+    executor._terminate_request = Mock()
+    executor._first_token_timer = FirstTokenTimer(seed_s=0.0, alpha=1.0)
+    executor._first_token_timer.on_pop(7, 10.0)
+    with patch("time.monotonic", return_value=10.3):
+        PyExecutor._handle_responses(executor)
+    executor._terminate_request.assert_called_once_with(request)
+    assert executor.active_requests == []
+    assert executor._first_token_timer.n_samples == 1
+    assert executor._first_token_timer.value == pytest.approx(0.3)
