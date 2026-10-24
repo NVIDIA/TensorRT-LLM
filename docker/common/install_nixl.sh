@@ -1,11 +1,46 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -ex
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Authenticate the github.com clone below; no-op when no token is available.
-source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+source "${SCRIPT_DIR}/github_auth.sh"
 
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
+
+# Interm build, minimum supported libfabric version the NIXL LIBFABRIC plugin works with, retained for backward compatibility.
+LIBFABRIC_VERSION="v1.21.0"
+LIBFABRIC_INSTALL_PATH="/tmp/libfabric"
+wget "https://github.com/ofiwg/libfabric/releases/download/${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION#v}.tar.bz2" -O libfabric.tar.bz2
+tar xjf libfabric.tar.bz2 && rm libfabric.tar.bz2
+cd libfabric-*
+./autogen.sh
+./configure --prefix=${LIBFABRIC_INSTALL_PATH} \
+            --disable-verbs \
+            --disable-psm3 \
+            --disable-opx \
+            --disable-usnic \
+            --enable-efa \
+            --with-cuda=/usr/local/cuda \
+            --enable-cuda-dlopen \
+            --with-gdrcopy \
+            --enable-gdrcopy-dlopen
+make -j${NPROC:-$(nproc)}
+make install
+cd ../
+rm -rf libfabric*
+
+# NGC PyTorch's default Open MPI comes from HPC-X and is exposed at /usr/local/mpi.
+# Reuse the hwloc bundled with that MPI installation for the EFA plugin.
+HWLOC_INSTALL_PATH="/usr/local/mpi"
+if [[ -n "${LIBFABRIC_INSTALL_PATH}" &&
+      -f "${HWLOC_INSTALL_PATH}/include/hwloc.h" &&
+      -f "${HWLOC_INSTALL_PATH}/lib/libhwloc.so" &&
+      -f "${HWLOC_INSTALL_PATH}/lib/pkgconfig/hwloc.pc" ]]; then
+    export PKG_CONFIG_PATH="${HWLOC_INSTALL_PATH}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+fi
 CUDA_PATH="/usr/local/cuda"
 NIXL_VERSION="v1.5.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
@@ -36,8 +71,10 @@ fi
 CUDA_SO_PATH=$(dirname $CUDA_SO_PATH)
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_SO_PATH
+# An empty libfabric_path uses optional system detection; no match skips the plugin.
 meson setup builddir \
     -Ducx_path=$UCX_INSTALL_PATH \
+    -Dlibfabric_path="${LIBFABRIC_INSTALL_PATH}" \
     -Dcudapath_lib="$CUDA_PATH/lib64" \
     -Dcudapath_inc="$CUDA_PATH/include" \
     -Dgds_path="$GDS_PATH" \
@@ -50,6 +87,7 @@ meson setup builddir \
 cd builddir && ninja install
 cd ../..
 rm -rf nixl*  # Remove NIXL source tree to save space
+rm -rf /tmp/libfabric # Remove libfabric interim build
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
 
 # Consumers import `nixl`, but the build above installs the backend as
