@@ -43,25 +43,6 @@ Install deps from the repo root: `pip install -r requirements-dev.txt`.
 
 Output: `.png` for image models; `.mp4` for video models when FFmpeg is installed (otherwise `.avi`).
 
-### MiniMax-H3 checkpoint discovery
-
-Use the same `--model /path/to/checkpoint` argument for a pipeline directory or
-an unambiguous native H3 Comfy NVFP4 checkpoint directory. No preparation command,
-format flag, or explicit base-model argument is needed. The loader identifies
-native H3 from tensor keys, reads the quantization metadata, and converts the
-packed weight layout internally without rewriting or requantizing the checkpoint.
-
-For a native transformer-only checkpoint, supporting components and configuration
-come from the cached/downloaded `MiniMaxAI/MiniMax-H3` snapshot; the original base
-transformer weights are excluded from the download. Loading logs identify the H3
-workflow, encoding, selected transformer, and supporting-component source.
-
-FL2VA/Ref2VA is read from workflow metadata or the publisher's workflow-labelled
-filename, or supplied through the existing `pipeline_config.workflow` setting.
-Their tensor shapes alone cannot distinguish the tasks. Multiple checkpoints
-matching the requested workflow are rejected with the candidates listed; keep one
-matching variant in the supplied directory. Unsupported encodings fail explicitly.
-
 ### MiniMax-H3 reference-to-video-and-audio
 
 Ref2VA loads `transformer_ref/`; FL2VA and text-only generation use `transformer/`.
