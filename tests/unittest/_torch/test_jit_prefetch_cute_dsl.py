@@ -996,3 +996,64 @@ def test_moe_gemm_provider_plans_a_constructed_layer():
     assert any(s["kernel"] == "cute_dsl_moe_fc2_finalize" for s in specs)
     no_finalize = jcd.MoeGemmProvider(layer(moe_disable_finalize_fusion=True))
     assert {json.loads(s)["kernel"] for s in no_finalize.specs} == {"cute_dsl_moe_fc1_gather_act"}
+
+
+def test_fi_mxfp8_gemm_exports_are_what_flashinfer_runs(tmp_path):
+    """FlashInfer's CuTe DSL MXFP8 GEMM kernels the provider plans (the
+    default tactic of every power-of-two token bucket), compiled by the helper
+    (no visible GPU) and loaded through the wrapped compile, give bitwise
+    FlashInfer's own output for row counts selecting each of them, and
+    FlashInfer compiles nothing."""
+    gemm_base = pytest.importorskip("flashinfer.gemm.gemm_base")
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops as tco
+
+    if not tco.IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+        pytest.skip("needs FlashInfer's CuTe DSL MXFP8 GEMM")
+    specs = jcd.FlashInferMxfp8GemmProvider.kernel_specs(["bfloat16"], 256)
+    # A low-M swap-AB tile per row band up to 32 rows, the default tile above.
+    assert len(specs) == 4, specs
+    replies = _helper_build(str(tmp_path / "aot"), specs)
+    assert all(r["ok"] and r["built"] for r in replies), [r for r in replies if not r["ok"]][:3]
+
+    n, k = 1024, 512
+    g = torch.Generator(device="cuda").manual_seed(0)
+    weight, weight_sf = torch.ops.trtllm.mxfp8_quantize(
+        torch.randn(n, k, generator=g, device="cuda").to(torch.bfloat16), True
+    )
+    data = []
+    for m in (1, 5, 13, 16, 24, 32, 100, 256):
+        act, act_sf = torch.ops.trtllm.mxfp8_quantize(
+            torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16), True
+        )
+        data.append([act, act_sf, weight, weight_sf])
+    runner = tco.FlashInferMXFP8GemmRunner(torch.bfloat16)
+
+    def run():
+        outs = [runner(x, tactic=runner.CUTE_DSL).clone() for x in data]
+        torch.cuda.synchronize()
+        return outs
+
+    cache = gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE
+    saved = dict(cache)
+    try:
+        cache.clear()
+        jcd._fi_mxfp8_loader = None
+        ref = run()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, str(tmp_path / "aot"))
+            loads.append((fn is not None, spec))
+            return fn
+
+        cache.clear()
+        assert jcd.install_fi_mxfp8_gemm_loader(loader)
+        got = run()
+    finally:
+        jcd._fi_mxfp8_loader = None
+        cache.clear()
+        cache.update(saved)
+    missing = [spec for ok, spec in loads if not ok]
+    assert sorted(spec for _, spec in loads) == sorted(specs) and not missing, missing
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)

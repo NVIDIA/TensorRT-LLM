@@ -58,6 +58,9 @@ Covered kernels, each a builder in ``_BUILDERS`` / ``_PRECOMPILED``:
   FC1's gather + GEMM + activation and FC2's GEMM + finalize, for every tile
   size and tactic their autotuners benchmark. Extents are runtime scalars and
   operands pointers, so the layer's constants and the tactic select each.
+* FlashInfer's CuTe DSL MXFP8 GEMM (``FlashInferMxfp8GemmProvider``), which
+  the MXFP8 Linears' warmup pass races against CUTLASS with FlashInfer's
+  default tactic per token bucket (TVM-FFI, shape-generic, no disk cache).
 
 A spec is canonical JSON naming the kernel and its compile-time arguments;
 its SHA-1 is the file name, so helper and executor agree without sharing
@@ -860,6 +863,75 @@ def _build_lowm_direct(s: Dict[str, Any]):
     return cute_ext.compile(kernel, t((m, k)), t((n, k)), t((m, n)), stream, options=options)
 
 
+# FlashInfer's CuTe DSL MXFP8 GEMM (``gemm_base``'s ``CuteDSLMxfp8GemmRunner``),
+# keyed like FlashInfer's ``_CUTE_DSL_MM_MXFP8_KERNEL_CACHE`` plus the cluster
+# occupancy it compiles with. FlashInfer keeps these kernels in memory only.
+_FI_MXFP8_GEMM = "flashinfer_mxfp8_gemm"
+
+
+def fi_mxfp8_gemm_spec(cache_key: tuple, max_active_clusters: int) -> str:
+    """Spec for one FlashInfer MXFP8 GEMM kernel from its kernel-cache key
+    (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
+    enable_pdl, out_dtype, split_k_slices)."""
+    sf_vec_size, tiler, cluster, swap_ab, use_prefetch, pdl, out_dtype, split_k = cache_key
+    return json.dumps(
+        {
+            "kernel": _FI_MXFP8_GEMM,
+            "sf_vec_size": int(sf_vec_size),
+            "mma_tiler": [int(x) for x in tiler],
+            "cluster": [int(x) for x in cluster],
+            "swap_ab": bool(swap_ab),
+            "use_prefetch": bool(use_prefetch),
+            "pdl": bool(pdl),
+            "out_dtype": str(out_dtype).removeprefix("torch."),
+            "split_k": int(split_k),
+            "max_active_clusters": int(max_active_clusters),
+        },
+        sort_keys=True,
+    )
+
+
+def _build_fi_mxfp8_gemm(s: Dict[str, Any]):
+    """Compile one FlashInfer MXFP8 GEMM the way ``_compile_block_scaled_gemm``
+    does, through FlashInfer's own compile closure (TVM-FFI, fake operands
+    with symbolic extents); the scale-factor extents are runtime arguments,
+    so placeholders compile the same kernel."""
+    import cutlass
+    import torch
+    from flashinfer.cute_dsl.utils import torch_to_cutlass_dtype
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _make_blockscaled_gemm_compile_fn
+
+    tiler, cluster = tuple(s["mma_tiler"]), tuple(s["cluster"])
+    if s["split_k"] > 1:
+        from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk import (
+            Sm100BlockScaledSplitKGemmKernel,
+        )
+
+        gemm = Sm100BlockScaledSplitKGemmKernel(s["sf_vec_size"], tiler, s["split_k"], s["pdl"])
+    else:
+        from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100 import (
+            Sm100BlockScaledPersistentDenseGemmKernel,
+        )
+
+        gemm = Sm100BlockScaledPersistentDenseGemmKernel(
+            s["sf_vec_size"], tiler, cluster, s["use_prefetch"], s["pdl"]
+        )
+    compile_kernel = _make_blockscaled_gemm_compile_fn(
+        gemm,
+        ab_cutlass_dtype=cutlass.Float8E4M3FN,
+        sf_dtype=cutlass.Float8E8M0FNU,
+        c_cutlass_dtype=torch_to_cutlass_dtype(getattr(torch, s["out_dtype"])),
+        ab_assumed_align=16,
+        swap_ab=s["swap_ab"],
+        sf_m=1,
+        sf_n=1,
+        sf_k=1,
+        batch_size=1,
+        max_active_clusters=s["max_active_clusters"],
+    )
+    return compile_kernel()
+
+
 _BUILDERS = {
     _K123: _build_k123,
     _K4: _build_k4,
@@ -871,9 +943,13 @@ _BUILDERS = {
     _MOE_FC2: _build_moe_fc2,
 }
 # Builders that return an already compiled kernel instead of (fn, args, options).
-_PRECOMPILED = {_TOPK: _build_topk, _LOWM_DIRECT: _build_lowm_direct}
+_PRECOMPILED = {
+    _TOPK: _build_topk,
+    _LOWM_DIRECT: _build_lowm_direct,
+    _FI_MXFP8_GEMM: _build_fi_mxfp8_gemm,
+}
 # Kernels compiled with TVM-FFI are loaded as TVM-FFI functions.
-_TVM_FFI = {_FI_NORM, _TOPK, _FP8_GEMM, _NVFP4_GEMM}
+_TVM_FFI = {_FI_NORM, _TOPK, _FP8_GEMM, _NVFP4_GEMM, _FI_MXFP8_GEMM}
 
 
 def build(spec: str, gpu_arch: str, out_dir: str) -> bool:
@@ -1654,6 +1730,153 @@ def install_lowm_direct_loader(loader: Callable[[str], Optional[Callable]]) -> b
     getter._jitp_wrapped = True
     d._get_compiled_direct_kernel = getter
     return True
+
+
+# The loader FlashInfer's wrapped MXFP8 compile consults (None: compile in
+# place), and the thread-local key capture the provider enumerates with.
+_fi_mxfp8_loader: Optional[Callable[[str], Optional[Callable]]] = None
+
+
+def _wrap_fi_mxfp8_compile() -> bool:
+    """Wrap ``gemm_base._compile_block_scaled_gemm`` once: for the MXFP8
+    kernel cache it records the key and stops under ``_KeyCapture``, and
+    otherwise consults ``_fi_mxfp8_loader`` before compiling; other callers
+    (mm_fp4) pass through. False if FlashInfer's MXFP8 GEMM is unavailable."""
+    try:
+        import torch
+        from flashinfer.gemm import gemm_base
+    except ImportError:
+        return False
+    orig = getattr(gemm_base, "_compile_block_scaled_gemm", None)
+    cache = getattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", None)
+    if orig is None or cache is None:
+        return False
+    if getattr(orig, "_jitp_wrapped", False):
+        return True
+
+    def _compile(kernel_cache, cache_key, *args, **kwargs):
+        if kernel_cache is cache:
+            capture = _KeyCapture.active()
+            if capture is not None:
+                capture.append(("fi_mxfp8", cache_key))
+                raise _KeyCaptured()
+            device_index = kwargs.get("device_index")
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            loader = _fi_mxfp8_loader
+            if loader is not None and (device_index, cache_key) not in kernel_cache:
+                from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+                cluster, split_k = cache_key[2], cache_key[7]
+                occupancy = get_max_active_clusters(cluster[0] * cluster[1] * split_k)
+                fn = loader(fi_mxfp8_gemm_spec(cache_key, occupancy))
+                if fn is not None:
+                    kernel_cache[(device_index, cache_key)] = (fn, occupancy)
+        return orig(kernel_cache, cache_key, *args, **kwargs)
+
+    _compile._jitp_wrapped = True
+    gemm_base._compile_block_scaled_gemm = _compile
+    return True
+
+
+def install_fi_mxfp8_gemm_loader(loader: Callable[[str], Optional[Callable]]) -> bool:
+    """Route FlashInfer's CuTe DSL MXFP8 GEMM compiles through
+    ``loader(spec)``: a helper-exported kernel, stored in FlashInfer's kernel
+    cache, or None to compile in place as before."""
+    global _fi_mxfp8_loader
+    if not _wrap_fi_mxfp8_compile():
+        return False
+    _fi_mxfp8_loader = loader
+    return True
+
+
+class FlashInferMxfp8GemmProvider:
+    """Every FlashInfer CuTe DSL MXFP8 GEMM kernel the MXFP8 Linears' warmup
+    pass compiles.
+
+    Unless ``TRTLLM_MXFP8_GEMM_BACKEND`` fixes the backend, that pass switches
+    every MXFP8 Linear with CUTLASS-layout operands to FlashInfer and races
+    FlashInfer's CUTLASS and CuTe DSL MXFP8 GEMMs per token bucket on it, the
+    CuTe DSL one with FlashInfer's default tactic, which depends
+    on the bucket's row count alone (a low-M swap-AB tile up to 32 rows, the
+    default tile above); the kernel is shape-generic, so a handful per output
+    dtype covers every layer. The provider runs FlashInfer's own runner on
+    ``meta`` operands for every power-of-two bucket up to ``max_num_tokens``,
+    with the compile capturing its key instead of compiling. ``races`` is
+    whether warmup runs that pass with the CuTe DSL backend
+    (``jit_prefetch.tunes_flashinfer_mxfp8_at_load`` and no pipeline
+    parallelism, as warmup decides it).
+    """
+
+    def __init__(self, model, max_num_tokens: int, races: bool):
+        self.specs: List[str] = []
+        self.out_dtypes: List[str] = []
+        if not races or not max_num_tokens or "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+            return
+        import torch
+
+        from .._utils import get_sm_version
+        from .custom_ops.torch_custom_ops import IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+        from .modules.linear import Linear, MXFP8LinearMethod
+
+        if not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+            return
+        self.out_dtypes = sorted(
+            {
+                str(mod.dtype).removeprefix("torch.")
+                for mod in model.modules()
+                if isinstance(mod, Linear)
+                and isinstance((method := getattr(mod, "quant_method", None)), MXFP8LinearMethod)
+                and method.use_cutlass
+                and mod.dtype in (torch.bfloat16, torch.float16)
+            }
+        )
+        if self.out_dtypes:
+            self.specs = self.kernel_specs(self.out_dtypes, int(max_num_tokens))
+
+    def __bool__(self):
+        return bool(self.specs)
+
+    @staticmethod
+    def kernel_specs(out_dtypes, max_num_tokens: int) -> List[str]:
+        """The specs of FlashInfer's default-tactic kernels for every
+        power-of-two token bucket up to ``max_num_tokens``, per output dtype
+        name, with this device's cluster occupancy."""
+        import torch
+        from flashinfer.cute_dsl.utils import get_max_active_clusters
+        from flashinfer.gemm import gemm_base
+
+        if not _wrap_fi_mxfp8_compile():
+            return []
+        major, minor = torch.cuda.get_device_capability()
+        meta = torch.device("meta")
+        n = k = 4096  # any operand shape: the default tactic follows from M
+        keys = []
+        for name in out_dtypes:
+            out_dtype = getattr(torch, name)
+            runner = gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype)
+            m = 1
+            while m <= max_num_tokens:
+                a = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=meta)
+                b = torch.empty(n, k, dtype=torch.float8_e4m3fn, device=meta).t()
+                sf = torch.empty(1, dtype=torch.uint8, device=meta)
+                out = torch.empty(m, n, dtype=out_dtype, device=meta)
+                with _KeyCapture() as captured:
+                    try:
+                        runner.forward([a, b, sf, sf, out_dtype, out, None], tactic=-1)
+                    except _KeyCaptured:
+                        pass
+                keys += [key for kind, key in captured if kind == "fi_mxfp8"]
+                m *= 2
+        specs = []
+        for key in dict.fromkeys(keys):
+            cluster, split_k = key[2], key[7]
+            occupancy = get_max_active_clusters(cluster[0] * cluster[1] * split_k)
+            specs.append(fi_mxfp8_gemm_spec(key, occupancy))
+        return specs
+
+    def enumerate_specs(self) -> List[str]:
+        return list(self.specs)
 
 
 def _modules_with_attention_backends(model) -> List[Any]:

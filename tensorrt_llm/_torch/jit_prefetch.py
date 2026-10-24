@@ -541,8 +541,10 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
       O-LoRA projection), the NVFP4 dense GEMM tactics the NVFP4 GEMM's
       autotuner races (``Nvfp4GemmProvider``, M buckets up to the engine's
       ``max_num_tokens``), the CuTe DSL MoE's NVFP4 grouped GEMM tactics
-      (``MoeGemmProvider``), the KDA prefill kernel (``KdaPrefillProvider``)
-      and FlashInfer's CuTe DSL RMSNorm variants (``FlashInferNormProvider``);
+      (``MoeGemmProvider``), the KDA prefill kernel (``KdaPrefillProvider``),
+      FlashInfer's CuTe DSL RMSNorm variants (``FlashInferNormProvider``) and,
+      with that MXFP8 pass, FlashInfer's CuTe DSL MXFP8 GEMMs it races
+      (``FlashInferMxfp8GemmProvider``);
       the CuTe DSL helpers start here, so their start-up overlaps the weight
       load;
     * MiniMax-M3's MSA ``fmha_sm100`` kernels (:class:`FmhaSm100Builds`),
@@ -585,11 +587,11 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
             logger.warning(
                 f"[JIT prefetch] FlashInfer sampling build not planned: {type(e).__name__}: {e}"
             )
+    mxfp8_pass = False
     if llm_args is not None:
         try:
-            started = (
-                start_mxfp8_tune_builds(tunes_flashinfer_mxfp8_at_load(model, llm_args)) or started
-            )
+            mxfp8_pass = tunes_flashinfer_mxfp8_at_load(model, llm_args)
+            started = start_mxfp8_tune_builds(mxfp8_pass) or started
         except Exception as e:  # noqa: BLE001 - warmup then starts them
             logger.warning(
                 f"[JIT prefetch] FlashInfer MXFP8 builds not planned: {type(e).__name__}: {e}"
@@ -611,7 +613,17 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
             kda_provider = jcd.KdaPrefillProvider(model)
             norm_provider = jcd.FlashInferNormProvider(model)
             moe_provider = jcd.MoeGemmProvider(model)
-            if gemm_provider or nvfp4_provider or kda_provider or norm_provider or moe_provider:
+            # Warmup races FlashInfer's CuTe DSL MXFP8 GEMM in that pass,
+            # except under pipeline parallelism.
+            mapping = getattr(getattr(model, "model_config", None), "mapping", None)
+            mxfp8_provider = jcd.FlashInferMxfp8GemmProvider(
+                model,
+                getattr(llm_args, "max_num_tokens", None) or 0,
+                races=mxfp8_pass and not (mapping is not None and mapping.has_pp()),
+            )
+            providers = (gemm_provider, nvfp4_provider, kda_provider, norm_provider, moe_provider,
+                         mxfp8_provider)  # fmt: skip
+            if any(providers):
                 prefetcher = JitPrefetcher.init(rank)
                 if prefetcher is not None:
                     # Queued in the order warmup needs them: the norms in the
@@ -626,6 +638,8 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
                         started = prefetcher.enable_nvfp4_gemm(nvfp4_provider) or started
                     if moe_provider:
                         started = prefetcher.enable_moe_gemm(moe_provider) or started
+                    if mxfp8_provider:
+                        started = prefetcher.enable_fi_mxfp8_gemm(mxfp8_provider) or started
     except Exception as e:  # noqa: BLE001 - the kernels then compile in place
         logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
     if llm_args is not None and FmhaSm100Builds.get() is None:
@@ -1271,6 +1285,7 @@ class JitPrefetcher:
         self._fp8_gemm = False  # the FP8 blockwise GEMM loader is installed
         self._nvfp4_gemm = False  # the NVFP4 dense GEMM loader is installed
         self._moe_gemm = False  # the CuTe DSL MoE grouped GEMM loader is installed
+        self._fi_mxfp8_gemm = False  # FlashInfer's CuTe DSL MXFP8 GEMM loader is installed
         self._lowm = False  # the low-M direct GEMM loader is installed
         self._fi_norm = False  # the FlashInfer norm loader is installed
 
@@ -2106,6 +2121,27 @@ class JitPrefetcher:
         self._event(
             f"CuTe DSL MoE grouped GEMM prefetch: {len(moe_provider.layers)} layer "
             f"configuration(s), {len(moe_provider.specs)} tactic(s)"
+        )
+        return True
+
+    def enable_fi_mxfp8_gemm(self, mxfp8_provider) -> bool:
+        """Compile FlashInfer's CuTe DSL MXFP8 GEMM kernels that the MXFP8
+        Linears' warmup pass races (one per default tactic and output dtype)
+        in the CuTe DSL helpers, and have FlashInfer's compile load them.
+        Called right after the model is constructed (``start_model_builds``).
+        """
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if self._fi_mxfp8_gemm or not mxfp8_provider or not self._start_cute_dsl_helpers():
+            return False
+        if not jcd.install_fi_mxfp8_gemm_loader(self._cute_dsl_load):
+            return False
+        self._fi_mxfp8_gemm = True
+        for spec in mxfp8_provider.enumerate_specs():
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(
+            f"FlashInfer MXFP8 GEMM prefetch: {len(mxfp8_provider.out_dtypes)} output dtype(s), "
+            f"{len(mxfp8_provider.specs)} kernel(s)"
         )
         return True
 
