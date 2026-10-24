@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from _torch.executor.kv_cache.test_kv_cache_v2_scheduler import (
+from _torch.pyexecutor.kv_cache.test_kv_cache_v2_scheduler import (
     make_ctx_request,
     make_disagg_request,
     make_filtered_request,
