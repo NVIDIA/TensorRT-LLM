@@ -785,20 +785,14 @@ class DecoderInputPreparer:
 
         position_ids: list[int] = []
         num_cached_tokens_per_seq: list[int] = []
-        num_accepted_draft_tokens: list[int] = []
         for request in scheduled_requests.generation_requests:
             past_seen_token_num = request.max_beam_num_tokens - 1
             position_ids.extend(range(past_seen_token_num, past_seen_token_num + tokens_per_step))
             num_cached_tokens_per_seq.append(
                 past_seen_token_num + tokens_per_step - request.py_num_compressed_tokens
             )
-            num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
-        host_values = torch.tensor(
-            position_ids + num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
-        )
-        host_position_ids = host_values[:num_tokens]
-        buffers.num_accepted_draft_tokens_cuda[:num_requests].copy_(
-            host_values[num_tokens:], non_blocking=True
+        host_position_ids = torch.tensor(
+            position_ids, dtype=torch.int, pin_memory=prefer_pinned()
         )
         buffers.position_ids_cuda[:num_tokens].copy_(host_position_ids, non_blocking=True)
         if self._config.use_mrope:
@@ -874,9 +868,6 @@ class DecoderInputPreparer:
         spec_metadata.request_ids = list(cache["request_ids"])
         spec_metadata.gather_ids = buffers.gather_ids_cuda[:num_tokens]
         spec_metadata.host_position_ids = host_position_ids
-        spec_metadata.num_accepted_draft_tokens = buffers.num_accepted_draft_tokens_cuda[
-            :num_requests
-        ]
         spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
         spec_metadata.prepare()
         spec_metadata.write_padding_onehot_draft_probs([], runtime_draft_len)
