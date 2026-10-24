@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
 
 if TYPE_CHECKING:
     import pytest
+    import torch
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -109,6 +110,10 @@ _FORCED_SUBMODULES = (f"{_BINDINGS}.BuildInfo",)
 # up; an empty namespace makes them report "unavailable", which is the truth
 # for a no-compile checkout.
 _TORCH_CLASS_NAMESPACES = ("trtllm",)
+
+# Libraries holding the C++ op schemas recreated from fake kernels; kept alive
+# for the session because torch drops a Library's definitions when it is freed.
+_FAKE_DEFINED_LIBS: dict[str, torch.library.Library] = {}
 
 
 class _StubMeta(ABCMeta):
@@ -321,10 +326,29 @@ def stub_torch_extensions() -> None:
             setattr(torch.classes, namespace, types.ModuleType(f"torch.classes.{namespace}"))
 
     # Product modules register fake kernels for C++ ops at import time; without
-    # the library the schemas are missing, so make those registrations no-ops.
+    # the library the schemas are missing. Define each missing op from its fake's
+    # signature so module-level code that looks the op up (e.g.
+    # torch.ops.trtllm.<op>.default) still finds it, as it would with the
+    # compiled library loaded. Fall back to a no-op if the schema cannot be
+    # inferred.
     register_fake = torch.library.register_fake
     if getattr(register_fake, "_trtllm_collection_stub", False):
         return
+
+    def define_from_fake(op: str, fn: Callable[..., object]) -> bool:
+        namespace, sep, name = op.partition("::")
+        if not sep or "." in name:
+            return False
+        try:
+            schema = torch.library.infer_schema(fn, op_name=name, mutates_args=())
+        except (TypeError, ValueError):
+            return False
+        lib = _FAKE_DEFINED_LIBS.get(namespace)
+        if lib is None:
+            lib = torch.library.Library(namespace, "FRAGMENT")
+            _FAKE_DEFINED_LIBS[namespace] = lib
+        lib.define(schema)
+        return True
 
     def tolerant_register_fake(
         op: str,
@@ -338,7 +362,9 @@ def stub_torch_extensions() -> None:
             except RuntimeError as exc:
                 if "does not exist" not in str(exc):
                     raise
+            if not define_from_fake(op, fn):
                 return fn
+            return cast(Callable[_P, _R], register_fake(op, fn, **kwargs))
 
         return apply(func) if func is not None else apply
 
