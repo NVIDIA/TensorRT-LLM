@@ -21,10 +21,10 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
-                        SpecWorkerBase)
 from .draft_loop_ops import MAX_REQUESTS as _ROW_SELECT_MAX_REQUESTS
 from .draft_loop_ops import draft_row_select
+from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
+                        SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -779,18 +779,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
         # The context rows' last tokens; a generation-only step has none.
-        last_tokens_idx = (torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) -
-                           1 if num_contexts > 0 else None)
+        last_tokens_idx = (
+            torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) -
+            1 if num_contexts > 0 else None)
         position_ids = inputs["position_ids"]
         # A captured generation-only MTP step selects each request's continuing
         # row (ids, hidden row, next positions) in one launch.
-        fused_rows = (self.is_mtp_eagle and spec_metadata.is_cuda_graph
-                      and num_contexts == 0
-                      and 0 < num_gens <= _ROW_SELECT_MAX_REQUESTS
-                      and self.guided_decoder is None
-                      and not (self.model_config is not None and self.
-                               model_config.mapping.enable_lm_head_tp_in_adp))
+        fused_rows = (
+            self.is_mtp_eagle and spec_metadata.is_cuda_graph
+            and num_contexts == 0 and 0 < num_gens <= _ROW_SELECT_MAX_REQUESTS
+            and self.guided_decoder is None
+            and not (self.model_config is not None
+                     and self.model_config.mapping.enable_lm_head_tp_in_adp))
         fused_hidden = fused_positions = None
         # Whether the row selection also moved the attention lengths to one row
         # per request (the first step's metadata update below).
@@ -868,12 +868,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     gather_ids_gen = (start_ids_gen +
                                       num_accepted_tokens[num_contexts:] - 1 +
                                       attn_metadata.num_ctx_tokens)
-                    gather_ids = (gather_ids_gen if num_contexts == 0 else
-                                  torch.concat([
-                                      last_tokens_idx[:num_contexts],
-                                      gather_ids_gen
-                                  ],
-                                               dim=0))
+                    gather_ids = (
+                        gather_ids_gen if num_contexts == 0 else torch.concat(
+                            [last_tokens_idx[:num_contexts], gather_ids_gen],
+                            dim=0))
                 else:
                     gather_ids = slice(0, batch_size)
 

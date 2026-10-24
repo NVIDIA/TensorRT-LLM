@@ -5029,9 +5029,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 or self._dummy_request_mask is None):
             return False
         replay_metadata = self.get_replay_state_update_metadata()
-        return (replay_metadata is not None
-                and replay_metadata.prev_num_accepted_tokens.dtype
-                == torch.int32
+        return (replay_metadata is not None and
+                replay_metadata.prev_num_accepted_tokens.dtype == torch.int32
                 and replay_metadata.cache_buf_idx.dtype == torch.int32
                 and self._dummy_request_mask.dtype == torch.bool)
 
@@ -5053,14 +5052,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.intermediate_conv_states,
             self.intermediate_state_indices[:num_gens],
             accepted,
-            state_indices[num_contexts:num_contexts +
-                          num_gens].to(torch.int32),
+            state_indices[num_contexts:num_contexts + num_gens].to(torch.int32),
             num_accepted_tokens=accepted,
             position_source_is_token_count=True,
             replay_pnat=replay_metadata.prev_num_accepted_tokens,
             replay_cache_buf_idx=replay_metadata.cache_buf_idx,
-            dummy_request_mask=self._dummy_request_mask[
-                num_contexts:num_contexts + num_gens],
+            dummy_request_mask=self.
+            _dummy_request_mask[num_contexts:num_contexts + num_gens],
             replay_step_width=replay_metadata.replay_step_width,
             replay_history_size=replay_metadata.replay_history_size)
 

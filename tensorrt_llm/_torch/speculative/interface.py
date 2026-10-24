@@ -935,15 +935,14 @@ class SpecMetadata:
             return
         # One pinned staging tensor holds all four lists; each buffer is
         # filled from its own slice.
-        uploads = ((self.request_seeds, request_seeds),
-                   (self.request_offsets, request_offsets),
-                   (self.seeds, flat_seeds), (self.offsets, flat_offsets))
-        staging = torch.tensor(request_seeds + request_offsets + flat_seeds +
-                               flat_offsets,
+        dsts = (self.request_seeds, self.request_offsets, self.seeds,
+                self.offsets)
+        lists = (request_seeds, request_offsets, flat_seeds, flat_offsets)
+        staging = torch.tensor(sum(lists, []),
                                dtype=torch.int64,
                                pin_memory=prefer_pinned())
         start = 0
-        for dst, values in uploads:
+        for dst, values in zip(dsts, lists):
             end = start + len(values)
             dst[:len(values)].copy_(staging[start:end], non_blocking=True)
             start = end

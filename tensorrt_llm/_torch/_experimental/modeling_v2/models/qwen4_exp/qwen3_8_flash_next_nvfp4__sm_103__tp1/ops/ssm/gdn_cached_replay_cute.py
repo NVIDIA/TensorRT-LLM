@@ -1734,16 +1734,16 @@ class _Replay:
                     if wrap:
                         dc = [_lds_f32(s_dec + (hl * 16 + 2 * c + jx) * 4) for jx in [0, 1, 8, 9]]
                         egs = _lds_f32(s_egs + hl * 4)
-                        ahi = []
-                        alo = []
+                        a_hi = []
+                        a_lo = []
                         for q4 in cutlass.range_constexpr(4):
                             dl = dc[0] if q4 < 2 else dc[2]
                             dhh = dc[1] if q4 < 2 else dc[3]
                             x0 = _bf2_lo(au[q4]) * dl
                             x1 = _bf2_hi(au[q4]) * dhh
                             hw = _bf2_pack(x0, x1)
-                            ahi.append(hw)
-                            alo.append(_bf2_pack(x0 - _bf2_lo(hw), x1 - _bf2_hi(hw)))
+                            a_hi.append(hw)
+                            a_lo.append(_bf2_pack(x0 - _bf2_lo(hw), x1 - _bf2_hi(hw)))
                         if const_expr(cur is None):
                             curc = self._smem_tile(s_st, s_mb, i, g, c, zi)
                         else:
@@ -1760,9 +1760,9 @@ class _Replay:
                             for s4 in cutlass.range_constexpr(4):
                                 bsrc = bb0 if s4 < 2 else bb1
                                 bf = (bsrc[2 * (s4 % 2)], bsrc[2 * (s4 % 2) + 1])
-                                dcm = _mma(ahi, bf, [zf, zf, zf, zf])
+                                dcm = _mma(a_hi, bf, [zf, zf, zf, zf])
                                 if const_expr(self.lo_split):
-                                    dcm = _mma(alo, bf, dcm)
+                                    dcm = _mma(a_lo, bf, dcm)
                                 wg = curc[8 * jj + s4]
                                 wh = curc[8 * jj + 4 + s4]
                                 ng.append(
@@ -2361,16 +2361,16 @@ class _Replay:
                                 _lds_f32(s_dec + (hl * 16 + 2 * c + jx) * 4) for jx in [0, 1, 8, 9]
                             ]
                             egs = _lds_f32(s_egs + hl * 4)
-                            ahi = []
-                            alo = []
+                            a_hi = []
+                            a_lo = []
                             for q4 in cutlass.range_constexpr(4):
                                 dl = dc[0] if q4 < 2 else dc[2]
                                 dhh = dc[1] if q4 < 2 else dc[3]
                                 x0 = _bf2_lo(au[q4]) * dl
                                 x1 = _bf2_hi(au[q4]) * dhh
                                 hw = _bf2_pack(x0, x1)
-                                ahi.append(hw)
-                                alo.append(_bf2_pack(x0 - _bf2_lo(hw), x1 - _bf2_hi(hw)))
+                                a_hi.append(hw)
+                                a_lo.append(_bf2_pack(x0 - _bf2_lo(hw), x1 - _bf2_hi(hw)))
                             taddr = self._tile_addr(h_ptr, slot64, h_ss, h, sp, warp, i, g, c)
                             kp_row = (
                                 s_kp + ((lane % 8) + 8 * ((lane // 8) % 2)) * PU + 16 * (lane // 16)
@@ -2383,9 +2383,9 @@ class _Replay:
                                 for s4 in cutlass.range_constexpr(4):
                                     bsrc = bb0 if s4 < 2 else bb1
                                     bf = (bsrc[2 * (s4 % 2)], bsrc[2 * (s4 % 2) + 1])
-                                    dcm = _mma(ahi, bf, [zf, zf, zf, zf])
+                                    dcm = _mma(a_hi, bf, [zf, zf, zf, zf])
                                     if const_expr(self.lo_split):
-                                        dcm = _mma(alo, bf, dcm)
+                                        dcm = _mma(a_lo, bf, dcm)
                                     wg = cur[8 * jj + s4]
                                     wh = cur[8 * jj + 4 + s4]
                                     ng.append(

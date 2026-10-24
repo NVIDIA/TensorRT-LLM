@@ -664,10 +664,11 @@ class GenerationExecutor(ABC):
 
         # A TP1 worker in its own process without MPI (a spawned Python
         # process), for containers that forbid MPI_Comm_spawn.
-        if (os.environ.get("TLLM_WORKER_USE_MP_PROCESS", "0") == "1" and not return_logits
-                and model_world_size == 1):
+        if (os.environ.get("TLLM_WORKER_USE_MP_PROCESS", "0") == "1"
+                and not return_logits and model_world_size == 1):
             ctx = multiprocessing.get_context("spawn")
-            mpi_session = ProcessPoolExecutorSession(n_workers=1, mp_context=ctx)
+            mpi_session = ProcessPoolExecutorSession(n_workers=1,
+                                                     mp_context=ctx)
             executor = GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
