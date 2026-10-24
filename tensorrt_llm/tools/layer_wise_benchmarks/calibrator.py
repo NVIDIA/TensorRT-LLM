@@ -19,6 +19,75 @@ class Mode(Enum):
     REPLAY = 4
 
 
+_LAYER_LIST_ATTRS = ("layers", "block", "blocks", "h")
+
+# Wrappers that hold the causal LM one level down: plain causal-LM wrappers use
+# `model`, Qwen3-VL-style wrappers `llm`, and HF-style `*ForConditionalGeneration`
+# classes `language_model`.
+_INNER_MODEL_ATTRS = ("model", "llm", "language_model")
+
+# Number of unwraps searched below the root, not the number of objects examined.
+_MAX_UNWRAP_DEPTH = 4
+
+
+class NoDecoderLayers(AttributeError):
+    """The model keeps its decoder layers under no attribute this tool knows."""
+
+
+def _layer_list(obj):
+    """Return the decoder layer list held directly by `obj`, or None.
+
+    A candidate must be non-empty, integer-indexable, and hold items with a
+    callable `forward`. `_wrap_layer_forward` assigns `forward` onto every item it
+    is given, so accepting an unrelated attribute that shares a name would measure
+    the wrong modules instead of failing.
+    """
+    for attr in _LAYER_LIST_ATTRS:
+        layers = getattr(obj, attr, None)
+        try:
+            first = layers[0]
+        except (TypeError, KeyError, IndexError):
+            # Absent, empty, or not an integer-indexed sequence (a mapping raises
+            # KeyError on [0]). Keep searching the remaining names.
+            continue
+        if callable(getattr(first, "forward", None)):
+            return layers
+    return None
+
+
+def _decoder_layers(model):
+    """Return the decoder layer list of `model`.
+
+    Searches `model` and up to `_MAX_UNWRAP_DEPTH` levels of wrappers reached
+    through `_INNER_MODEL_ATTRS`, e.g. `model.model.layers` for causal LMs and
+    `model.llm.model.layers` for Qwen3-VL-style wrappers. The attribute names are
+    an explicit allowlist rather than a module-tree search, for the reason given
+    in `_layer_list`.
+    """
+    visited = set()
+    chain = []
+    obj = model
+    for _ in range(_MAX_UNWRAP_DEPTH + 1):
+        layers = _layer_list(obj)
+        if layers is not None:
+            return layers
+        visited.add(id(obj))
+        chain.append(type(obj).__name__)
+        for attr in _INNER_MODEL_ATTRS:
+            inner = getattr(obj, attr, None)
+            if inner is not None and id(inner) not in visited:
+                obj = inner
+                break
+        else:
+            break
+    raise NoDecoderLayers(
+        f"{type(model).__name__} keeps its decoder layers under none of "
+        f"{', '.join(_LAYER_LIST_ATTRS)}, searched along {' -> '.join(chain)} "
+        f"(unwrapping through {', '.join(_INNER_MODEL_ATTRS)}, at most "
+        f"{_MAX_UNWRAP_DEPTH} levels)."
+    )
+
+
 class Calibrator:
     """Calibrator for layer-wise benchmarks with MoE expert routing data.
 
@@ -362,7 +431,7 @@ class Calibrator:
 
             return forward
 
-        for idx, layer in enumerate(model.model.layers):
+        for idx, layer in enumerate(_decoder_layers(model)):
             layer.forward = make_forward(idx, layer.forward)
 
     def maybe_collect_or_replay_slots(self, num_slots, token_selected_slots):
