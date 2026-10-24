@@ -12,19 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Route-ownership gate for trtllm-serve multi-frontend serving.
+"""Every OpenAIServer route must have a multi-frontend owner.
 
-With ``num_serve_frontends > 1`` a client cannot choose which frontend process
-answers, so every HTTP route of the LLM ``OpenAIServer`` must be classified:
-
-* **launcher-owned** -- backed by state that exists once per server (engine
-  stats queue, profiler, batch store). Attached frontends forward these to the
-  launcher; the list is ``tensorrt_llm.serve.multi_frontend.FORWARDED_ROUTES``.
-* **per-frontend safe** -- correct (or deliberately per-process) when served by
-  whichever frontend accepted the connection; listed below with the reason.
-
-A new route that is in neither set fails this test, forcing the author to
-decide instead of silently shipping a per-process copy of server-wide state.
+A route either is forwarded to the launcher (state that exists once per server,
+``FORWARDED_ROUTES``) or is safe to answer from whichever frontend accepted the
+connection (``PER_FRONTEND_SAFE`` below, with the reason). A new route in
+neither set fails here, so its author has to decide.
 """
 
 from types import SimpleNamespace
@@ -38,54 +31,32 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
 
-# (method, path template) -> why it is fine to answer from any frontend.
 PER_FRONTEND_SAFE = {
-    (
-        "GET",
-        "/health",
-    ): "liveness of the answering process; engine death propagates via the watchdog",
-    ("GET", "/health_generate"): "runs a real request through the shared executor",
+    ("GET", "/health"): "liveness of this process; engine death reaches it via the watchdog",
+    ("GET", "/health_generate"): "a real request through the shared executor",
     ("GET", "/version"): "constant",
     ("GET", "/v1/models"): "constant",
-    ("GET", "/server_info"): "static server/model configuration, identical in every frontend",
-    ("POST", "/v1/completions"): "request path: the whole point of multiple frontends",
+    ("GET", "/server_info"): "static configuration",
+    ("POST", "/v1/completions"): "request path",
     ("POST", "/v1/chat/completions"): "request path",
-    ("POST", "/v1/messages"): "request path (Anthropic adapter)",
-    ("POST", "/v1/messages/count_tokens"): "tokenizer-only, identical in every frontend",
-    (
-        "POST",
-        "/v1/responses",
-    ): "request path; the stateful store is disabled group-wide in multi-frontend mode",
-    (
-        "GET",
-        "/v1/responses/{response_id}",
-    ): "always 404 in multi-frontend mode (store disabled group-wide)",
-    (
-        "DELETE",
-        "/v1/responses/{response_id}",
-    ): "always 404 in multi-frontend mode (store disabled group-wide)",
-    ("POST", "/_internal/tokenize"): "tokenizer-only",
-    ("GET", "/energy_metrics"): "reads GPU energy counters; same devices from every process",
-    ("GET", "/v1/data_transceiver_state"): "fetched from the shared executor over RPC",
-    (
-        "GET",
-        "/steady_clock_offset",
-    ): "clock probe; every frontend reads the same host steady clock (the POST is forwarded)",
-    # RL control requires AsyncLLM, which is not the classic IPC executor path
-    # multi-frontend mode runs on, and runtime control (--enable_sleep_mode)
-    # requires num_serve_frontends=1; neither coexists with attached frontends.
-    (
-        "POST",
-        "/release_memory",
-    ): "RL / runtime control only; never coexists with attached frontends",
-    ("POST", "/resume_memory"): "RL / runtime control only; never coexists with attached frontends",
-    ("POST", "/update_weights"): "AsyncLLM-only; never registered together with attached frontends",
-    ("GET", "/memory_status"): "runtime control requires num_serve_frontends=1",
-    # FastAPI's generated schema and docs pages: static, identical everywhere.
-    ("GET", "/openapi.json"): "generated from the route table, identical in every frontend",
-    ("GET", "/docs"): "static page over /openapi.json",
+    ("POST", "/v1/messages"): "request path",
+    ("POST", "/v1/messages/count_tokens"): "tokenizer only",
+    ("POST", "/v1/responses"): "request path; the stateful store is off with several frontends",
+    ("GET", "/v1/responses/{response_id}"): "store is off with several frontends",
+    ("DELETE", "/v1/responses/{response_id}"): "store is off with several frontends",
+    ("POST", "/_internal/tokenize"): "tokenizer only",
+    ("GET", "/energy_metrics"): "the same GPUs from every process",
+    ("GET", "/v1/data_transceiver_state"): "read from the shared executor",
+    ("GET", "/steady_clock_offset"): "every frontend reads the same host clock",
+    # RL control needs AsyncLLM and runtime control needs one frontend.
+    ("POST", "/release_memory"): "never served by attached frontends",
+    ("POST", "/resume_memory"): "never served by attached frontends",
+    ("POST", "/update_weights"): "never served by attached frontends",
+    ("GET", "/memory_status"): "never served by attached frontends",
+    ("GET", "/openapi.json"): "generated, identical everywhere",
+    ("GET", "/docs"): "static page",
     ("GET", "/docs/oauth2-redirect"): "static page",
-    ("GET", "/redoc"): "static page over /openapi.json",
+    ("GET", "/redoc"): "static page",
 }
 
 
@@ -98,8 +69,7 @@ def _llm_server_routes() -> list[tuple[str, str]]:
         args=SimpleNamespace(return_perf_metrics=False),
     )
     server.use_harmony = False
-    # Mutually exclusive in OpenAIServer.__init__; enabling both here only
-    # enumerates every route either of them adds.
+    # Mutually exclusive in practice; both on to enumerate every route.
     server._enable_rl_control_endpoints = True
     server._enable_runtime_control_endpoints = True
     server.resource_governor = None
@@ -107,7 +77,7 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     return sorted(
         (method, route.path)
         for route in server.app.routes
-        if hasattr(route, "methods") and route.methods
+        if getattr(route, "methods", None)
         for method in route.methods
         if method != "HEAD"
     )
@@ -118,8 +88,7 @@ async def _stub():
 
 
 def _forwarding_app(routes=FORWARDED_ROUTES) -> FastAPI:
-    # Without FastAPI's generated /docs, /openapi.json, ... routes, which would
-    # otherwise "match" the same routes of the server under test.
+    # No generated docs routes: they would "match" the server's own.
     app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     for method, path in routes:
         app.add_api_route(path, _stub, methods=[method])
@@ -127,48 +96,26 @@ def _forwarding_app(routes=FORWARDED_ROUTES) -> FastAPI:
 
 
 def _is_forwarded(app: FastAPI, method: str, path_template: str) -> bool:
-    # Concretise the registered template so the forwarding templates
-    # (including the {rest:path} catch-all) can be matched against it.
-    concrete = path_template
-    for name in ("{batch_id}", "{response_id}"):
-        concrete = concrete.replace(name, "x")
+    concrete = path_template.replace("{batch_id}", "x").replace("{response_id}", "x")
     scope = {"type": "http", "method": method, "path": concrete, "path_params": {}}
     return any(route.matches(scope)[0] == Match.FULL for route in app.routes)
 
 
 def test_every_llm_route_is_classified() -> None:
-    fwd = _forwarding_app()
-    unclassified = []
-    double = []
-    for method, path in _llm_server_routes():
-        forwarded = _is_forwarded(fwd, method, path)
-        safe = (method, path) in PER_FRONTEND_SAFE
-        if forwarded and safe:
-            double.append((method, path))
-        elif not forwarded and not safe:
-            unclassified.append((method, path))
-    assert not double, f"routes both forwarded and per-frontend-safe: {double}"
+    forwarding = _forwarding_app()
+    routes = _llm_server_routes()
+    forwarded = {r for r in routes if _is_forwarded(forwarding, *r)}
+    assert not forwarded & PER_FRONTEND_SAFE.keys(), "both forwarded and per-frontend safe"
+    unclassified = [r for r in routes if r not in forwarded and r not in PER_FRONTEND_SAFE]
     assert not unclassified, (
-        "New OpenAIServer route(s) without a multi-frontend ownership decision: "
-        f"{unclassified}. Either add them to FORWARDED_ROUTES in "
-        "tensorrt_llm/serve/multi_frontend.py (state lives once per server, e.g. "
-        "an engine queue, the profiler or an in-memory store) or to "
-        "PER_FRONTEND_SAFE in this test with the reason they are correct when "
-        "served by whichever frontend accepted the connection."
+        f"Routes without a multi-frontend owner: {unclassified}. Add them to "
+        "FORWARDED_ROUTES (server-wide state) or to PER_FRONTEND_SAFE with the reason."
     )
 
 
-def test_every_forwarded_route_exists() -> None:
-    """A renamed route must not leave a dangling forwarding template."""
-    registered = _llm_server_routes()
+def test_no_stale_entries() -> None:
+    routes = _llm_server_routes()
     for method, template in FORWARDED_ROUTES:
         app = _forwarding_app([(method, template)])
-        assert any(_is_forwarded(app, m, path) for m, path in registered), (
-            f"FORWARDED_ROUTES entry {method} {template} matches no registered route"
-        )
-
-
-def test_allowlist_has_no_stale_entries() -> None:
-    registered = set(_llm_server_routes())
-    stale = [r for r in PER_FRONTEND_SAFE if r not in registered]
-    assert not stale, f"PER_FRONTEND_SAFE lists routes that no longer exist: {stale}"
+        assert any(_is_forwarded(app, *r) for r in routes), f"{method} {template} matches nothing"
+    assert not PER_FRONTEND_SAFE.keys() - set(routes), "PER_FRONTEND_SAFE lists removed routes"

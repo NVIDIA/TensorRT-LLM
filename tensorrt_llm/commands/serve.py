@@ -521,12 +521,10 @@ def _provision_kv_cache_pool(llm_args: dict,
 
 
 def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
-    """Bind the launcher's Unix socket inside the multi-frontend ipc dir.
+    """Bind the Unix socket attached frontends forward launcher-owned routes to.
 
-    uvicorn serves it next to the TCP socket, so attached frontends can
-    forward launcher-owned routes (/metrics, /kv_cache_events, profiling,
-    message batches) to the one process that owns the engine. The ipc dir
-    is private to the launcher's user and removed by the executor proxy.
+    It lives in the multi-frontend ipc dir, which is private to the user and
+    removed by the executor proxy.
     """
     ipc_dir = getattr(getattr(llm, "_executor", None),
                       "_multi_frontend_ipc_dir", None)
@@ -545,19 +543,10 @@ def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
 
 
 def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
-    """Give every frontend one PROMETHEUS_MULTIPROC_DIR before spawning.
+    """Give every frontend one PROMETHEUS_MULTIPROC_DIR before spawning them.
 
-    prometheus_client's multiprocess mode aggregates the .db files under
-    that directory. Left to OpenAIServer, each process would create its own
-    after the children already exist, and every /prometheus/metrics scrape
-    would report a single frontend's share of the request counters.
-
-    The directory lives inside the multi-frontend ipc dir, which the
-    executor proxy removes at shutdown. It is deliberately not created via
-    set_prometheus_multiproc_dir(): that helper keeps only its most recent
-    TemporaryDirectory alive, so its second call (OpenAIServer.__init__)
-    would garbage-collect, and thereby delete, a shared directory created
-    by the first while every process still writes into it.
+    Not via set_prometheus_multiproc_dir(): it keeps only its latest
+    TemporaryDirectory alive, so OpenAIServer's later call would delete this one.
     """
     args = getattr(llm, "args", None)
     if args is None or os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
@@ -601,9 +590,8 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
-    # An attached frontend forwards launcher-owned routes to the launcher's
-    # Unix socket, whose path the launcher hands down when spawning it (see
-    # serve/multi_frontend.py). The launcher is this process's parent.
+    # An attached frontend gets the launcher's socket from its spawn env; the
+    # launcher is its parent.
     multi_frontend_serving = None
     if multi_frontend.is_attached_frontend:
         attached_launcher_uds = os.environ.pop(LAUNCHER_UDS_ENV, None)

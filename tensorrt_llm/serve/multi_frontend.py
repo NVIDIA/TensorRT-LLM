@@ -14,18 +14,11 @@
 # limitations under the License.
 """Helpers for trtllm-serve multi-frontend serving (``num_serve_frontends > 1``).
 
-Several frontend processes share one executor and one ``SO_REUSEPORT`` port,
-and a client cannot choose which of them answers. Anything that needs exactly
-one owner per server therefore lives in the launcher (frontend 0): draining
-the engine's iteration statistics and KV-cache events, runtime profiling, the
-in-memory Anthropic Message Batches store, the disaggregated server's clock
-offset, and the server's registration with a metadata server or disagg
-cluster. The launcher's uvicorn also listens on a Unix domain socket in the
-multi-frontend ipc directory; attached frontends forward those routes to it
-(:class:`LauncherForwarder`), follow the clock offset it publishes there
-(:class:`SharedClockOffset`), and watch it (:class:`AttachedFrontendWatchdog`)
-so that a dead launcher or engine does not leave them answering ``/health``
-200 with nothing behind them.
+The frontends share one executor and one ``SO_REUSEPORT`` port, so a client
+cannot pick the process that answers. State that exists once per server lives
+in the launcher (frontend 0), which also serves a Unix socket in the
+multi-frontend ipc dir: attached frontends forward the routes backed by that
+state to it, follow the clock offset it publishes, and watch it for death.
 """
 
 import asyncio
@@ -43,15 +36,11 @@ from fastapi.responses import JSONResponse, Response
 from tensorrt_llm.logger import logger
 
 LAUNCHER_UDS_NAME = "launcher.sock"
-# Carries the launcher's Unix socket path to the attached frontends it spawns.
 LAUNCHER_UDS_ENV = "TLLM_SERVE_LAUNCHER_UDS"
-# The clock offset the launcher publishes in the multi-frontend ipc dir.
 CLOCK_OFFSET_NAME = "clock_offset"
 
-# Routes an attached frontend hands to the launcher, as FastAPI route
-# templates. They are registered before the regular routes, and FastAPI
-# matches in registration order, so they shadow the local handlers. The
-# catch-all covers /v1/messages/batches/{batch_id}[/cancel|/results].
+# Launcher-owned routes. Attached frontends register them ahead of the local
+# handlers, which they shadow since FastAPI matches in registration order.
 FORWARDED_ROUTES = (
     ("GET", "/metrics"),
     ("POST", "/kv_cache_events"),
@@ -65,11 +54,9 @@ FORWARDED_ROUTES = (
     ("DELETE", "/v1/messages/batches/{rest:path}"),
 )
 
-# Request headers not replayed to the launcher: hop-by-hop headers (RFC 9110,
-# section 7.6.1) and the framing/encoding headers aiohttp manages itself for
-# the replayed request (the body it hands back is already decoded). Everything
-# else arrives as the client sent it: x-trtllm-msgpack selects the body codec,
-# and auth headers feed the --middleware the launcher runs again.
+# Hop-by-hop and framing headers, which aiohttp sets for the replayed request.
+# The rest is forwarded: x-trtllm-msgpack selects the body codec, and auth
+# headers feed the --middleware the launcher runs again.
 _NOT_FORWARDED_REQUEST_HEADERS = frozenset(
     (
         "accept-encoding",
@@ -97,8 +84,7 @@ class MultiFrontendServing:
 
     launcher_uds: str
     is_launcher: bool
-    # The launcher's pid as seen by an attached frontend (its parent).
-    launcher_pid: Optional[int] = None
+    launcher_pid: Optional[int] = None  # attached frontends: their parent
 
     @property
     def is_attached(self) -> bool:
@@ -114,10 +100,9 @@ class LauncherForwarder:
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        # Created lazily so it binds to the serving event loop.
+        # Lazy, to bind to the serving loop. These routes are low-rate, so no
+        # keep-alive connections to race against a launcher shutting down.
         if self._session is None or self._session.closed:
-            # force_close: no idle keep-alive connections to race against a
-            # launcher that is shutting down; these routes are low-rate.
             self._session = aiohttp.ClientSession(
                 connector=aiohttp.UnixConnector(path=self._uds_path, force_close=True),
                 timeout=self._timeout,
@@ -137,8 +122,7 @@ class LauncherForwarder:
         body = await request.body()
         try:
             session = await self._get_session()
-            # The host is required by the URL syntax and ignored by the
-            # Unix connector.
+            # The Unix connector ignores the host.
             async with session.request(
                 request.method, f"http://launcher{target}", data=body, headers=headers
             ) as resp:
@@ -179,13 +163,10 @@ class LauncherForwarder:
 
 
 class SharedClockOffset:
-    """The disaggregated server's clock offset, shared by all frontends.
+    """The disaggregated server's clock offset, published by the launcher.
 
-    The disaggregated server measures this server's steady-clock offset and
-    POSTs it once, so it reaches a single frontend, which forwards it to the
-    launcher. Every frontend stamps its own requests' perf metrics with the
-    offset, though, so the launcher publishes it in the multi-frontend ipc dir
-    and the attached frontends follow it (:func:`follow_clock_offset`).
+    The disaggregated server POSTs it once, but every frontend stamps its own
+    requests' perf metrics with it.
     """
 
     def __init__(self, ipc_dir: str):
@@ -220,12 +201,7 @@ class SharedClockOffset:
 async def follow_clock_offset(
     shared: SharedClockOffset, apply: Callable[[float], None], interval_s: float = 0.25
 ) -> None:
-    """Attached-frontend loop: apply every offset the launcher publishes.
-
-    The disaggregated server calibrates a server when its router adds it, so
-    only requests routed within ``interval_s`` of that can still be stamped
-    with the previous offset; in exchange the request path never reads the file.
-    """
+    """Attached-frontend loop: apply every offset the launcher publishes."""
     while True:
         offset = shared.poll()
         if offset is not None:
@@ -236,12 +212,9 @@ async def follow_clock_offset(
 class AttachedFrontendWatchdog:
     """Detect a lost launcher or engine from an attached frontend.
 
-    An attached frontend owns no worker processes, so the only signals that
-    the engine is gone are its parent (the launcher) disappearing, or the
-    launcher's own ``/health`` failing, which happens once the launcher's
-    executor recorded a fatal engine error. Either way ``mark_dead`` is
-    called exactly once; the caller records the fatal error on its executor
-    (failing in-flight requests fast) and starts server shutdown.
+    An attached frontend owns no workers: its only signals are the launcher
+    process exiting and the launcher's ``/health`` failing. ``mark_dead`` is
+    called once.
     """
 
     def __init__(
@@ -264,11 +237,8 @@ class AttachedFrontendWatchdog:
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         failures = 0
-        # The launcher builds its own server, and starts listening, only after
-        # every attached frontend reported ready, so /health failures count
-        # only once it has answered. A launcher that dies before that is
-        # caught by the parent check, and one that fails its startup
-        # terminates its attached frontends itself.
+        # The launcher starts listening only after its attached frontends are
+        # ready, so failures count once it has answered.
         launcher_answered = False
         next_health = loop.time() + self._health_interval
         while True:

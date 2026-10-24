@@ -648,10 +648,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
         self.tool_parser = tool_parser
-        # One server, one registration: attached frontends serve the
-        # launcher's port, so only the launcher advertises it to a metadata
-        # server or disagg cluster. Registering under each process's own
-        # identity listed one server once per frontend.
+        # Attached frontends serve the launcher's port: only it registers.
         self._registers_server = (multi_frontend_serving is None
                                   or multi_frontend_serving.is_launcher)
         self.metadata_server = (create_metadata_server(metadata_server_cfg)
@@ -739,26 +736,20 @@ class OpenAIServer(_VideoRoutesMixin):
         ) if server_role is not None else "server"
         self._perf_metrics_writer = PerfMetricsJsonlWriter(
             perf_metrics_output_dir, server_kind)
-        # Multi-frontend serving (num_serve_frontends > 1): the launcher is
-        # the sole consumer of the engine's iteration stats / KV events and
-        # the only owner of profiling and the batch store; attached
-        # frontends forward those routes to it over its Unix socket and
-        # watch it for engine or launcher death (see serve/multi_frontend.py).
+        # Multi-frontend serving: see serve/multi_frontend.py.
         self._multi_frontend = multi_frontend_serving
         self._launcher_forwarder: Optional[LauncherForwarder] = None
         self._launcher_watchdog_task: Optional[asyncio.Task] = None
         if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
-        # POST /steady_clock_offset is launcher-owned; the launcher publishes
-        # the offset next to its socket and attached frontends follow it.
         self._shared_clock_offset: Optional[SharedClockOffset] = (
             SharedClockOffset(
                 os.path.dirname(multi_frontend_serving.launcher_uds))
             if multi_frontend_serving is not None else None)
         self._clock_offset_task: Optional[asyncio.Task] = None
         # Requests finishing on attached frontends never wake the launcher's
-        # collector, so the launcher also polls on a fixed cadence.
+        # collector, so it also polls.
         self._iteration_stats_poll_interval: Optional[float] = (
             1.0 if multi_frontend_serving is not None
             and multi_frontend_serving.is_launcher else None)
@@ -809,8 +800,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 # Start background iteration stats collector if metrics are enabled
                 # The PyTorch backend args include `enable_iter_perf_stats`.
-                # An attached frontend never drains the engine queue: the
-                # launcher owns it and /metrics is forwarded there.
+                # Attached frontends leave the engine queue to the launcher.
                 if self._launcher_forwarder is not None:
                     self._launcher_watchdog_task = asyncio.create_task(
                         AttachedFrontendWatchdog(
@@ -1057,9 +1047,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request_inference_time_buckets=(
                     pmc.request_inference_time_buckets if pmc else None),
             )
-            # With a shared PROMETHEUS_MULTIPROC_DIR every process would
-            # export its own per-pid config-info series; the launcher's
-            # suffices (attached frontends share its engine and config).
+            # One config-info series per server, not per frontend process.
             if self._launcher_forwarder is None:
                 self._log_config_info_metrics()
 
@@ -1765,11 +1753,7 @@ class OpenAIServer(_VideoRoutesMixin):
         })
 
     def _register_launcher_forwarding_routes(self) -> None:
-        """On an attached frontend, hand launcher-owned routes to the launcher.
-
-        Must run before register_routes(): FastAPI matches in registration
-        order, so these shadow the local handlers of the same routes.
-        """
+        """Attached frontends: forward launcher-owned routes (before register_routes())."""
         if self._launcher_forwarder is None:
             return
         for method, path in FORWARDED_ROUTES:
@@ -1779,11 +1763,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                    include_in_schema=False)
 
     def _register_server(self) -> None:
-        """Advertise this server to a metadata server and/or disagg cluster.
-
-        Attached frontends skip this (see ``_registers_server``); the disagg
-        cluster worker created here registers once uvicorn serves.
-        """
+        """Register with the metadata server and/or disagg cluster (launcher only)."""
         if not self._registers_server:
             return
         if self.metadata_server is not None:
@@ -1821,11 +1801,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     f"local and disagg server: {offset} second")
 
     def _on_launcher_lost(self, error: BaseException) -> None:
-        """Watchdog callback of an attached frontend: fail fast, then shut down.
+        """Watchdog callback: fail requests with EngineDeadError, then shut down.
 
-        Mirrors the fatal-error branch of ``health``: record the error on the
-        executor so in-flight and new requests raise EngineDeadError instead
-        of hanging, then raise SIGINT once for uvicorn's graceful shutdown.
+        Mirrors the fatal-error branch of ``health``.
         """
         executor = getattr(self.generator, '_executor', None)
         if executor is None:
@@ -2010,9 +1988,7 @@ class OpenAIServer(_VideoRoutesMixin):
         logger.info(
             f"The steady clock offset between local and disagg server: {offset} second"
         )
-        # Multi-frontend launcher (attached frontends forward this route
-        # here): every frontend stamps its own requests' perf metrics, so
-        # share the offset with them.
+        # Multi-frontend launcher: every frontend stamps perf metrics with it.
         shared = getattr(self, "_shared_clock_offset", None)
         if shared is not None:
             try:
@@ -2068,8 +2044,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.metrics_collector.log_request_metrics_dict(
                     res.metrics_dict)
             # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
-            # Wake up the stats collector to drain iteration stats (an
-            # attached frontend has no collector: the launcher drains).
+            # Wake up the stats collector to drain iteration stats
             if self._iteration_stats_collector_task is not None and getattr(
                     self.generator.args, "enable_iter_perf_stats", True):
                 self._iteration_stats_wakeup_event.set()
@@ -2123,10 +2098,7 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info("Iteration stats collector loop started")
             while True:
                 # Wait for signal that requests have completed and stats may
-                # be available. A multi-frontend launcher also wakes on a
-                # fixed cadence: requests finishing on attached frontends
-                # never set this event, yet their iterations land in the
-                # engine queue this loop alone drains.
+                # be available (a multi-frontend launcher also polls).
                 woken_by_timer = False
                 try:
                     await asyncio.wait_for(
@@ -2142,13 +2114,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Drain all available iteration stats and log each one to Prometheus.
                 try:
                     if woken_by_timer:
-                        # Idle poll: the stats RPC would otherwise wait out
-                        # its timeout inside a synchronous .remote() call and
-                        # stall this event loop, so fetch once without
-                        # waiting, off the loop. The metrics thread is idle
-                        # while this loop owns the queue (/metrics then reads
-                        # the buffer), and keeps the read off the default
-                        # executor that request handling uses.
+                        # Idle poll: a non-blocking read on the metrics
+                        # thread, idle while this loop owns the queue.
                         for llm_stat in await asyncio.get_running_loop(
                         ).run_in_executor(self._metrics_stats_executor,
                                           self.generator.get_stats, 0):
