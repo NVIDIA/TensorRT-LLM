@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Iterable, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
@@ -270,9 +270,10 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_fp4_mla_hp_pool",
             # The lifecycle manager owns the disaggregation declarations and
             # composes them with its own roles through the policy's
-            # DISAGG_ROLE_MAPPER_KINDS, DISAGG_IGNORED_ROLES, and
-            # _fp4_mla_disagg_global_layer_id.
+            # DISAGG_ROLE_MAPPER_KINDS, DISAGG_IGNORED_ROLES,
+            # _fp4_mla_disagg_global_layer_id, and _fp4_mla_disagg_role_layouts.
             "_fp4_mla_disagg_global_layer_id",
+            "_fp4_mla_disagg_role_layouts",
             "rebuild_disagg_imported_cache",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
@@ -1005,6 +1006,27 @@ class Fp4MlaV2CacheLayoutPolicy:
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         return {Role.ALL: MapperKind.NHD, **self.DISAGG_ROLE_MAPPER_KINDS}
+
+    def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        return {**super().get_disagg_role_layouts(), **self._fp4_mla_disagg_role_layouts()}
+
+    def _fp4_mla_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        """Declare the HP role as a ring of BF16 latent tokens.
+
+        A token at global position ``p`` sits in ring slot ``p % ring_size``,
+        and the ring size depends on the worker's speculative rewind, so a
+        context and a generation worker usually size it differently.
+        """
+        head_dims = {
+            int(self.head_dim_per_layer[local_layer])
+            for local_layer in self._fp4_mla_compact_to_local
+        }
+        if len(head_dims) != 1:
+            raise ValueError(
+                f"FP4 MLA HP ring needs one head dimension across layers, got {sorted(head_dims)}."
+            )
+        slot_bytes = head_dims.pop() * torch.empty((), dtype=torch.bfloat16).element_size()
+        return {Role.MLA_HP_TAIL: RoleLayout(ring_slot_bytes=slot_bytes)}
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         return self.DISAGG_IGNORED_ROLES

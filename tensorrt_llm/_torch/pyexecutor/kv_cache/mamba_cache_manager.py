@@ -3662,13 +3662,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return result
 
     def get_disagg_role_layouts(self) -> Dict[DataRole, RoleLayout]:
-        """Per-layer geometry for resharding conv and SSM state."""
+        """Per-layer geometry for resharding conv and SSM state.
+
+        With the FP4 MLA cache layout, the policy's HP ring geometry joins
+        them.
+        """
+        layouts = {}
+        if self._attention_cache_layout_policy is not None:
+            layouts.update(self._fp4_mla_disagg_role_layouts())
         if self.local_num_mamba_layers == 0:
-            return {}
+            return layouts
         d_conv_m1 = int(self.conv_state_shape[1])
         conv_elem_size = self.conv_state_dtype.itemsize
         _, head_dim, d_state = self.ssm_state_shape
-        return {
+        layouts.update({
             MambaRole.CONV_STATE:
             RoleLayout(section_bytes=tuple(
                 int(dim) * d_conv_m1 * conv_elem_size
@@ -3676,7 +3683,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             MambaRole.SSM_STATE:
             RoleLayout(bytes_per_head=int(head_dim) * int(d_state) *
                        self.ssm_state_dtype.itemsize),
-        }
+        })
+        return layouts
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         """Keep the KDA replay buffers out of disaggregated transfers.
