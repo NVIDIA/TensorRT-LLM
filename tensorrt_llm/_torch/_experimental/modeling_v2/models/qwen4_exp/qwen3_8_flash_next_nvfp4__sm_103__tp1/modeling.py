@@ -696,16 +696,15 @@ def _dense_fp8_enabled() -> bool:
 
 
 #: Row ranges `(lo, hi)` in which a projection with a packed FP8 decode copy runs `fp8_gemv`
-#: (FP8 weights, bf16 activations, one PDL launch), per projection kind. The input projections
-#: from one row (1.6-1.8x the bf16 GEMV through 16 rows, in the step as in isolation); the
-#: output and shared-expert projections from two: at one row the bf16 `bf16_gemv_pdl` hides
-#: more of itself behind its PDL neighbours (STP con1 capture: 1.7 us of exclusive time a call
-#: against 2.4 for fp8_gemv), from two rows the bf16 entry is the slower low-M GEMM (micro:
-#: out/o 5.8 vs 4.3 us, gate|up 4.4 vs 2.1, down 3.2 vs 1.5 at 4 rows). The upper ends are each
+#: (FP8 weights, bf16 activations, one PDL launch), per projection kind, every kind from one row:
+#: the input projections are 1.6-1.8x the bf16 GEMV through 16 rows; at one row the output and
+#: shared-expert projections on fp8_gemv serve STP concurrency 1 1.5% faster than on
+#: `bf16_gemv_pdl` (two same-node pairs), from two rows the bf16 entry is the slower low-M GEMM
+#: (micro: out/o 5.8 vs 4.3 us, gate|up 4.4 vs 2.1, down 3.2 vs 1.5 at 4 rows). The upper ends are each
 #: kind's crossover (GB300 micro, us, fp8_gemv against the next entry): in/attention-in 8.7 vs
 #: ~9 `mid_rows_mm` at 16 rows, 10.9 vs 9.1 at 17; out/o 6.4 vs 8.4 bf16 at 16 rows, 9.3 vs 8.8
 #: at 20; gate|up 2.6 vs 4.0 at 16, 4.6 vs 4.1 at 20; down 1.7 vs 2.9 at 8, 2.3 vs 2.0 at 12.
-_FP8_GEMV_ROWS = {"in": (1, 16), "out": (2, 16), "sh_gu": (2, 16), "sh_dn": (2, 8)}  # dispatch
+_FP8_GEMV_ROWS = {"in": (1, 16), "out": (1, 16), "sh_gu": (1, 16), "sh_dn": (1, 8)}  # dispatch
 
 #: Rows up to which a verify step's conv runs in the in_proj GEMV's epilogue
 #: (`fp8_gemv_conv1d_verify`, certified at 2..16 rows); more rows take the Triton conv.
