@@ -2054,6 +2054,7 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
@@ -2085,6 +2086,7 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
@@ -2313,6 +2315,7 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr.layer_specs = None
         mgr._generation_kv_capacity_headroom = 1
         mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
@@ -3903,6 +3906,7 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     """A V2 hybrid manager stub for _build_cache_config: one KDA layer with the replay caches and one attention
     layer."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.kv_cache_type = CacheTypeCpp.SELF
