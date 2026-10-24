@@ -11,7 +11,7 @@ MSA-only helpers live in :mod:`.kernels.msa_utils`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -30,6 +30,43 @@ if TYPE_CHECKING:
 # of their computed score. Init outranks local.
 _INIT_SCORE = 1e30
 _LOCAL_SCORE = 1e29
+
+
+def get_sparse_layer_ids(text_config: Any) -> Tuple[List[int], List[int]]:
+    """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model.
+
+    The checkpoint's ``sparse_attention_config.sparse_attention_freq`` is the
+    attention schedule; it is independent of the dense-MLP/MoE schedule.
+    Shared by the model, which builds sparse attention on these layers, and
+    the KV-cache manager, which allocates their index-K cache.
+    """
+    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+    n_layers = int(text_config.num_hidden_layers)
+    if sparse_cfg is None:
+        return list(range(n_layers)), []
+    if not sparse_cfg.get("use_sparse_attention", True):
+        return list(range(n_layers)), []
+    freq = sparse_cfg.get("sparse_attention_freq")
+    if freq is None:
+        return list(range(n_layers)), []
+    if len(freq) != n_layers:
+        raise ValueError(
+            f"sparse_attention_freq length {len(freq)} does not match num_hidden_layers {n_layers}"
+        )
+    dense = [i for i, f in enumerate(freq) if int(f) == 0]
+    sparse = [i for i, f in enumerate(freq) if int(f) != 0]
+    return dense, sparse
+
+
+def get_sparse_disable_index_value_layer_ids(text_config: Any) -> List[int]:
+    """Return layer ids where the sparse index-value branch is disabled."""
+    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+    if sparse_cfg is None:
+        return []
+    flags = sparse_cfg.get("sparse_disable_index_value")
+    if flags is None:
+        return []
+    return [i for i, f in enumerate(flags) if int(f) != 0]
 
 
 def index_head_range(

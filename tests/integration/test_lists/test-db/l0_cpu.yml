@@ -109,6 +109,17 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
+  # MiniMax-M3 compressed-tensors NVFP4 MoE packaging: config expansion,
+  # index-projection quantization and the checkpoint attention schedule.
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fold_gemma_boundary_weights_accepts_partial_lazy_load
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_projection_quantization_follows_checkpoint_entries
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_expands_to_mixed_precision
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_honors_ignored_layers
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_unsupported_expert_recipes
+  - unittest/_torch/models/test_minimax_m3.py::test_uniform_mxfp8_and_bf16_configs_are_unchanged
+  - unittest/_torch/models/test_minimax_m3.py::test_modelopt_mixed_precision_map_is_normalized_as_before
+  - unittest/_torch/models/test_minimax_m3.py::test_index_projection_quant_config_follows_declared_entries
+  - unittest/_torch/models/test_minimax_m3.py::test_kv_cache_schedule_follows_the_checkpoint_attention_schedule
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
