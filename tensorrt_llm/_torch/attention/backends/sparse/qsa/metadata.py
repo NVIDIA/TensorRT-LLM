@@ -11,7 +11,11 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 
 from .cache_manager import QSAMambaHybridCacheManagerV2
 from .constants import QSA_KEY_ROLE_INDEX
-from .kernels import triton_qsa_unscale_block_table
+from .kernels import (
+    QSA_GENERATION_MAPPING_MAX_SEQS,
+    triton_qsa_generation_token_mapping,
+    triton_qsa_unscale_block_table,
+)
 from .params import QSASparseMetadataParams
 
 
@@ -250,6 +254,18 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
                 logical_positions=self.qsa_logical_positions[:num_tokens],
                 sequence_lengths=self.qsa_sequence_lengths[:num_tokens],
                 visible_blocks=self.qsa_visible_blocks[:num_tokens],
+                compress_ratio=self.sparse_metadata_params.compress_ratio,
+            )
+            return
+        if self.num_contexts == 0 and num_seqs <= QSA_GENERATION_MAPPING_MAX_SEQS:
+            triton_qsa_generation_token_mapping(
+                kv_lens=self.kv_lens_cuda_runtime[:num_seqs],
+                seq_lens=seq_lens,
+                request_indices=self.qsa_req_idx_per_token,
+                logical_positions=self.qsa_logical_positions,
+                sequence_lengths=self.qsa_sequence_lengths,
+                visible_blocks=self.qsa_visible_blocks,
+                num_rows=num_tokens,
                 compress_ratio=self.sparse_metadata_params.compress_ratio,
             )
             return

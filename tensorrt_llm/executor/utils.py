@@ -209,8 +209,14 @@ class ProcessPoolExecutorSession(MpiSession):
         ]
         return [future.result() for future in futures]
 
-    def shutdown(self):
-        self.mpi_pool.shutdown(wait=True)
+    def shutdown(self, wait=True):
+        self.mpi_pool.shutdown(wait=wait)
+
+    def abort(self):
+        # Hard-stop the worker processes (the MPI sessions call MPI_Abort here).
+        for process in list(getattr(self.mpi_pool, "_processes", {}).values()):
+            process.kill()
+        self.mpi_pool.shutdown(wait=False, cancel_futures=True)
 
 
 class ErrorResponse(NamedTuple):

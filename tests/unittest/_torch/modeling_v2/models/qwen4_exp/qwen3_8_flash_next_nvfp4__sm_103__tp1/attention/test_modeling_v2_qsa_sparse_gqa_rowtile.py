@@ -187,7 +187,12 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     groups = math.ceil(rows / 10)
     assert launches[0][1] == (rows,) and launches[1][1] == (groups,)
     assert launches[2][1] == (min(rows, 256), spec["kv_heads"])
-    assert launches[3][1] == (groups, spec["kv_heads"])
+    # The row-tile pass is persistent: one CTA per SM, never more than (group, KV head) items.
+    items = groups * spec["kv_heads"]
+    assert launches[3][1] == (_module._rowtile_ctas(items, args["q"].device),)
+    assert launches[3][1][0] == min(
+        items, torch.cuda.get_device_properties(0).multi_processor_count
+    )
     assert out.shape == (rows, spec["q_heads"], spec["head_dim"])
     assert out.dtype == args["q"].dtype and out.is_contiguous()
     assert not bool(out.isnan().any())
@@ -202,6 +207,23 @@ def _with(segments, **overrides):
     return {**CKPT, "segments": tuple(segments), **overrides}
 
 
+@pytest.mark.parametrize(
+    "segments",
+    [
+        # Fewer items (2 groups x 2 KV heads) than SMs: a 4-CTA grid, mostly one item a CTA.
+        [(5000, 17)],
+        # A lone group (rows of two requests) between row-tile groups of each request.
+        [(3000, 25), (7000, 25)],
+    ],
+    ids=["fewer items than SMs", "a lone group between row-tile groups"],
+)
+def test_small_launches_match_the_reference(segments) -> None:
+    """The persistent pass's edges: CTAs left without a second item, and an item the pass
+    skips (a lone group) between items it serves."""
+    args = _build(_with(segments, slots=8), seed=7700 + len(segments))
+    _compare(op(**args), op.reference(**args))
+
+
 def test_calls_are_bitwise_deterministic() -> None:
     args = _build(_with([(0, 2000), (500, 300), (7000, 1)], slots=8), seed=8800)
     assert torch.equal(op(**args), op(**args))
@@ -213,3 +235,53 @@ def test_rejects_a_call_without_the_prefill_pair() -> None:
     args.update(query_positions=None, compress_ratio=None)
     with pytest.raises(ValueError, match=re.escape("the row-tile kernel needs the prefill pair")):
         op(**args)
+
+
+def test_plan_kernels_agree() -> None:
+    """The CuTe plan (int32 request indices) and the Triton plan (int64) give the same group
+    plan, slot lists, packed words (below each row-tile group's tile count) and lone rows, with
+    unmapped pages inside the tables and groups whose rows span requests."""
+    spec = _with([(0, 300), (2500, 45), (9000, 64), (700, 3)], slots=8)
+    args = _build(spec, seed=9900)
+    table = args["block_table"].clone()
+    for request in (0, 2):
+        slot = int(args["request_indices"][sum(n for _, n in spec["segments"][:request])])
+        table[slot, 1::3] = -1
+    rows, tpb = args["q"].shape[0], spec["tokens_per_block"]
+    width = table.shape[1]
+    num_words = math.ceil(width * tpb / 64)
+    rows_per_tile = 128 // (spec["q_heads"] // spec["kv_heads"])
+    groups = math.ceil(rows / rows_per_tile)
+    bits, row_info = _module._row_bits(
+        args["selected_tokens"], args["query_positions"], spec["compress_ratio"], tpb, width,
+        num_words,
+    )  # fmt: skip
+
+    def plan(request_indices, alloc):
+        slots = torch.full((groups, num_words * 64), -7, dtype=torch.int32, device=DEV)
+        packed = alloc((rows, num_words), dtype=torch.int64, device=DEV)
+        group_plan = torch.full((groups, 2), -7, dtype=torch.int32, device=DEV)
+        lone = torch.full((rows,), -7, dtype=torch.int32, device=DEV)
+        count = torch.zeros((1,), dtype=torch.int32, device=DEV)
+        _module._rowtile_plan(
+            (groups,), request_indices, row_info, bits, table, slots, packed, group_plan, lone,
+            count, rows, rows_per_tile=rows_per_tile, tokens_per_block=tpb,
+            num_cache_pages=args["k_cache"].shape[0],
+        )  # fmt: skip
+        return slots, packed, group_plan, lone[: int(count)].sort().values
+
+    assert _module._cute_plan_supported(
+        args["request_indices"].to(torch.int32), tpb, rows_per_tile, num_words
+    )
+    assert not _module._cute_plan_supported(
+        args["request_indices"].to(torch.int64), tpb, rows_per_tile, num_words
+    )
+    c_slots, c_packed, c_plan, c_lone = plan(args["request_indices"].to(torch.int32), torch.empty)
+    t_slots, t_packed, t_plan, t_lone = plan(args["request_indices"].to(torch.int64), torch.zeros)
+    assert torch.equal(c_plan, t_plan) and torch.equal(c_lone, t_lone)
+    assert int((c_plan[:, 0] >= 0).sum()) > 0 and c_lone.numel() > 0
+    for g, (tiles, listed) in enumerate(c_plan.tolist()):
+        assert torch.equal(c_slots[g, :listed], t_slots[g, :listed]), g
+        if tiles >= 0:
+            members = slice(g * rows_per_tile, min(rows, (g + 1) * rows_per_tile))
+            assert torch.equal(c_packed[members, :tiles], t_packed[members, :tiles]), g

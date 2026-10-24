@@ -57,13 +57,22 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     x, z, weight = args[:3]
     assert z.stride() == (_IN_PROJ_WIDTH, cell.spec["width"], 1) and not z.is_contiguous()
     before = [x.clone(), z.clone(), weight.clone()]
+    parts = None
+    if cell.spec.get("amax"):
+        plain = op(*args)
+        parts = torch.zeros(1024, dtype=torch.float32, device="cuda")
 
-    out = op(*args)
+    out = op(*args, amax_parts=parts)
 
     assert out.shape == x.shape and out.is_contiguous() and out.dtype == x.dtype
     for t, b in zip((x, z, weight), before):
         assert torch.equal(t, b), "inputs are read-only"
     torch.testing.assert_close(out, op.reference(*args))
+    if parts is not None:
+        # The target's copy keeps the shared kernel's arithmetic; the folded maximum is
+        # exactly the stored output's.
+        assert torch.equal(out, plain)
+        assert parts.max().item() == out.abs().max().float().item()
 
 
 def test_guard_refuses_a_weight_of_the_wrong_length() -> None:

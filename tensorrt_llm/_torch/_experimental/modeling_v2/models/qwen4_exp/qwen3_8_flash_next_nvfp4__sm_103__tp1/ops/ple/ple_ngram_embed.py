@@ -328,6 +328,13 @@ class PleNgramEmbed(OpWrapper):
             table="ckpt",
             eos_density=0.05,
         ),
+        _cell(
+            "MTP3 verify: 64 sequences x 4 rows, 461 slots",
+            (4,) * 64,
+            pool_slots=ENGINE_SLOTS,
+            table="host",
+            eos_density=0.05,
+        ),
         # Context-shaped (prefill / mixed) steps: the packed-row form.
         _cell(
             "mixed step: 2 contexts + 64 decode rows",

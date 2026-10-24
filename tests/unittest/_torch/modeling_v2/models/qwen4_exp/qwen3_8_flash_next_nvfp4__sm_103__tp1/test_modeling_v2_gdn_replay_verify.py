@@ -105,6 +105,8 @@ class _Mode:
                 history=HIST,
                 width=t,
                 all_layer_commit=True,
+                # The Triton replay and the manager's all-layer commit, as an fp32 pool runs.
+                cute=False,
             )
             self.meta = ReplayStateUpdateMetadata(self.pnat, self.buf, t, HIST)
             self.mm = SimpleNamespace(

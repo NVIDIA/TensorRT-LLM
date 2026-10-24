@@ -322,7 +322,7 @@ class TestMamba2Metadata:
         assert actual[0, REPLAY_WORK_PNAT] == 11
         assert actual[0, REPLAY_WORK_CACHE_BUF_IDX] == 1
 
-    @pytest.mark.parametrize("num_decodes", [16, 17, 40, 255, 256])
+    @pytest.mark.parametrize("num_decodes", [1, 2, 3, 8, 16, 17, 40, 255, 256])
     def test_replay_work_items_triton_matches_torch(self, num_decodes):
         """The two builders must agree everywhere the dispatch may pick either.
 
@@ -413,6 +413,50 @@ class TestMamba2Metadata:
         metadata._prepare_replay_work_items(manager, num_decodes, 0)
 
         assert bool(launches) is expect_fused
+
+    @pytest.mark.parametrize(
+        ("num_decodes", "expect_fused"),
+        [
+            pytest.param(1, True, id="single"),
+            pytest.param(8, True, id="small"),
+            pytest.param(256, True, id="fused-max"),
+            pytest.param(257, False, id="above-fused-max"),
+        ],
+    )
+    def test_prepare_replay_work_items_without_all_layer_commit_dispatch(
+        self, monkeypatch, num_decodes, expect_fused
+    ):
+        """Without the all-layer commit every batch up to the fused maximum builds in one launch,
+        with the same work items as the ATen path."""
+        num_slots = num_decodes + 7
+        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
+        manager.use_gdn_cached_replay_all_layer_commit = False
+        metadata = Mamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        state_indices = torch.randperm(num_slots, device="cuda")[:num_decodes].to(torch.int32)
+        metadata.state_indices.copy_(state_indices)
+
+        launches = []
+        original_kernel = mamba2_metadata._prepare_gdn_replay_work_items_kernel
+
+        class _CountingKernel:
+            def __getitem__(self, grid):
+                launches.append(grid)
+                return original_kernel[grid]
+
+        monkeypatch.setattr(
+            mamba2_metadata, "_prepare_gdn_replay_work_items_kernel", _CountingKernel()
+        )
+
+        metadata._prepare_replay_work_items(manager, num_decodes, 0)
+
+        assert bool(launches) is expect_fused
+        expected_items, expected_n_writes = _torch_reference_work_items(
+            state_indices, prev_num_accepted_tokens, cache_buf_idx
+        )
+        torch.testing.assert_close(metadata.replay_work_items[:num_decodes], expected_items)
+        torch.testing.assert_close(metadata.replay_n_writes, expected_n_writes)
 
     def test_prepare_gdn_replay_work_items_cuda_graph_replay(self):
         num_decodes = 40

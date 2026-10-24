@@ -280,6 +280,11 @@ l0_b200:
   - unittest/_torch/speculative/test_chain_speculative_sampling_op.py
   - unittest/_torch/speculative/test_dynamic_tree_rejection_op.py
   - unittest/_torch/speculative/test_dynamic_tree_sampling_dispatch.py
+  # Captured MTP decode-step bookkeeping kernels (Triton): the fused strict
+  # acceptance, the draft loop's row selection and the greedy argmax.
+  - unittest/_torch/speculative/test_fused_strict_accept.py
+  - unittest/_torch/speculative/test_draft_loop_ops.py
+  - unittest/_torch/speculative/test_greedy_argmax.py
   # One-model speculative decoding step-copy kernels and the engine's decode
   # step that runs them (SM 100; they skip on other GPUs).
   - unittest/_torch/kernels/test_spec_step_copies.py

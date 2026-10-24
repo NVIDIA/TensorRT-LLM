@@ -9,6 +9,7 @@ from typing import Optional
 
 import torch
 import triton
+import triton.language as tl
 
 # Registration is lazy: the op is defined beside the mamba/GDN mixer, and
 # `import tensorrt_llm._torch.custom_ops` alone does not make
@@ -24,6 +25,11 @@ _CKPT = dict(heads=48, width=128, dtype=torch.bfloat16, eps=1e-6, gate_activatio
 #: programs.
 _PREFILL_MIN_ROWS = 32768  # capacity: fixed: a dispatch threshold, not a buffer size
 _PREFILL_ROWS = 8
+#: The amax copy's program: 64 rows on 8 warps. At 16384 tokens on GB300 108 vs 122 us
+#: at 8 rows on 4 warps (bitwise-identical output and maximum; 16 rows on 4 warps 118,
+#: 64 rows on 4 or 16 warps 145 / 126, 128 rows on 8 or 16 warps 371 / 180).
+_AMAX_ROWS = 64
+_AMAX_WARPS = 8
 
 
 def _prefill_multirow(x: torch.Tensor, z: torch.Tensor, gate_activation: str) -> bool:
@@ -42,10 +48,64 @@ def _prefill_multirow(x: torch.Tensor, z: torch.Tensor, gate_activation: str) ->
     )
 
 
-def _prefill_launch(x, z, weight, eps, gate_activation):
-    """The multi-row kernel at `_PREFILL_ROWS` rows a program (no PDL: the grid covers every SM)."""
+@triton.jit
+def _rms_norm_gated_amax_kernel(
+    X,
+    Y,
+    W,
+    Z,
+    PARTS,
+    stride_x_row,
+    stride_y_row,
+    stride_z_tok,
+    M,
+    eps,
+    NUM_PARTS,
+    N: tl.constexpr,
+    ROWS: tl.constexpr,
+    HEADS_PER_TOK: tl.constexpr,
+    GATE_SIGMOID: tl.constexpr,
+):
+    """`_rms_norm_gated_fwd_multirow_kernel`'s arithmetic, plus the maximum of the stored
+    `|y|` folded into `PARTS[program % NUM_PARTS]`."""
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    row_mask = rows < M
+    cols = tl.arange(0, N)
+    mask2d = row_mask[:, None]
+    x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
+    x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=1) / N
+    rstd = 1.0 / tl.sqrt(var + eps)
+    w = tl.load(W + cols).to(tl.float32)
+    y = x * rstd[:, None] * w[None, :]
+    tok = rows // HEADS_PER_TOK
+    head = rows % HEADS_PER_TOK
+    z_off = tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N + cols[None, :]
+    z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
+    gate = tl.sigmoid(z)
+    if not GATE_SIGMOID:
+        gate *= z
+    y *= gate
+    yq = y.to(Y.dtype.element_ty)
+    y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
+    tl.store(Y + y_off, yq, mask=mask2d)
+    peak = tl.max(tl.max(tl.where(mask2d, tl.abs(yq.to(tl.float32)), 0.0), axis=1), axis=0)
+    tl.atomic_max(PARTS + tl.program_id(0) % NUM_PARTS, peak)
+
+
+def _prefill_launch(x, z, weight, eps, gate_activation, amax_parts=None):
+    """The multi-row kernel at `_PREFILL_ROWS` rows a program (no PDL: the grid covers every
+    SM); with `amax_parts` the target's copy that also folds the output's maximum, at
+    `_AMAX_ROWS` rows a program."""
     rows, n = x.shape
     out = torch.empty_like(x)
+    if amax_parts is not None:
+        _rms_norm_gated_amax_kernel[(triton.cdiv(rows, _AMAX_ROWS),)](
+            x, out, weight, z, amax_parts, x.stride(0), out.stride(0), z.stride(0), rows, eps,
+            amax_parts.shape[0], N=n, ROWS=_AMAX_ROWS, HEADS_PER_TOK=z.shape[1],
+            GATE_SIGMOID=gate_activation == "sigmoid", num_warps=_AMAX_WARPS,
+        )  # fmt: skip
+        return out
     _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(triton.cdiv(rows, _PREFILL_ROWS),)](
         x, out, weight, z, None, None, x.stride(0), out.stride(0), z.stride(0), rows, eps,
         N=n, ROWS=_PREFILL_ROWS, HEADS_PER_TOK=z.shape[1], GATE_SIGMOID=gate_activation == "sigmoid",
@@ -71,8 +131,12 @@ class RmsNormGatedTokenMajor(OpWrapper):
     Call site: `z` is the `[T, 6144]` column view of the GDN layer's one
     `[T, 16480]` input-projection output, reshaped `[T, 48, 128]`.
 
-    Fusion boundary: norm, weight, gate and the optional quantize. The caller
-    owns both projections producing `x` and `z`, and every reshape.
+    With `amax_parts` (a zeroed fp32 buffer, `fp8_per_tensor_mm.amax_partials`) the
+    maximum of the stored `|out|` is also folded into it (atomic maxima, one slot per
+    program modulo its length), for the per-tensor FP8 projection that consumes `out`.
+
+    Fusion boundary: norm, weight, gate and the optional quantize (or output maximum).
+    The caller owns both projections producing `x` and `z`, and every reshape.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -90,11 +154,16 @@ class RmsNormGatedTokenMajor(OpWrapper):
             why="683 tokens: the first launch at 8 rows a program",
             spec=dict(tokens=683, z="in_proj", **_CKPT),
         ),
+        Cell(
+            why="prefill 16384 tokens folding the output maximum for the FP8 out projection",
+            spec=dict(tokens=16384, z="in_proj", amax=True, **_CKPT),
+        ),
     )
 
     note = """
     Metadata consumed: none. Two Triton kernels: a multi-row kernel (4 rows per
-    program; 8 from 32768 rows, without fp8 output) when `x.stride(-1) == 1`,
+    program; 8 from 32768 rows, without fp8 output; its amax copy 64 rows on 8
+    warps) when `x.stride(-1) == 1`,
     `z.stride(2) == 1`, `z.stride(1) == N` and N is a power of two <= 256 --
     the checkpoint's N = 128 -- else the generic single-row kernel on a packed
     copy of `z`. PDL on the 4-row path only when the grid is smaller than the
@@ -136,12 +205,16 @@ class RmsNormGatedTokenMajor(OpWrapper):
         eps: float,
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
+        amax_parts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if fp8_scale is None and z.dim() == 3 and _prefill_multirow(x, z, gate_activation):
-            return _prefill_launch(x, z, weight, eps, gate_activation)
-        return torch.ops.trtllm.rms_norm_gated_token_major(
+            return _prefill_launch(x, z, weight, eps, gate_activation, amax_parts)
+        out = torch.ops.trtllm.rms_norm_gated_token_major(
             x, z, weight, eps, fp8_scale, gate_activation
         )
+        if amax_parts is not None:
+            amax_parts[:1].copy_(torch.reshape(torch.abs(out).amax().float(), [1]))
+        return out
 
     def reference(
         self,
@@ -151,6 +224,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
         eps: float,
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
+        amax_parts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """fp32 throughout; row `t * heads + h` pairs with `z[t, h]`.
 
@@ -177,7 +251,11 @@ class RmsNormGatedTokenMajor(OpWrapper):
         eps: float,
         fp8_scale: Optional[torch.Tensor] = None,
         gate_activation: str = "silu",
+        amax_parts: Optional[torch.Tensor] = None,
     ) -> None:
+        assert amax_parts is None or (
+            fp8_scale is None and amax_parts.dtype == torch.float32 and amax_parts.dim() == 1
+        ), "amax_parts: a 1-D fp32 buffer, bf16 output only"
         assert weight.shape == (x.shape[-1],), (
             f"weight must be 1-D of length x.shape[-1]={x.shape[-1]}; got "
             f"{tuple(weight.shape)} -- the multi-row kernel reads weight[0:N] "

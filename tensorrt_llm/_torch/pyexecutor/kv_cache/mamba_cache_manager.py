@@ -4960,11 +4960,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
+        if state_indices is None:
+            state_indices = self.get_state_indices()
+        if self._can_fold_replay_update(attn_metadata, num_gens,
+                                        accepted_leaf_positions):
+            self._promote_conv_and_advance_replay(attn_metadata,
+                                                  num_accepted_tokens,
+                                                  state_indices, num_contexts,
+                                                  num_gens)
+            return
         num_accepted_draft_tokens = (
             num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
                 torch.int32)
-        if state_indices is None:
-            state_indices = self.get_state_indices()
         state_indices_d = state_indices[num_contexts:num_contexts +
                                         num_gens].to(torch.int32)
         if self.use_kda_replay_update:
@@ -5006,6 +5013,54 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._promote_state(self.all_conv_states, self._stacked_conv_states,
                             self.intermediate_conv_states, src_state_indices,
                             accepted_positions, state_indices_d)
+
+    def _can_fold_replay_update(self, attn_metadata, num_gens: int,
+                                accepted_leaf_positions) -> bool:
+        """Whether `update_mamba_states` runs as one promotion launch that
+        also advances the replay bookkeeping: a linear-draft replay step of a
+        CUDA-graph batch over the stacked conv view, with the int32 / bool
+        bookkeeping buffers the promotion kernel updates in place (eager steps
+        keep the composed ops)."""
+        if (num_gens <= 0 or accepted_leaf_positions is not None
+                or not getattr(attn_metadata, "is_cuda_graph", False)
+                or self.use_kda_replay_update
+                or not self._use_replay_state_update
+                or self._stacked_conv_states is None
+                or self._dummy_request_mask is None):
+            return False
+        replay_metadata = self.get_replay_state_update_metadata()
+        return (replay_metadata is not None and
+                replay_metadata.prev_num_accepted_tokens.dtype == torch.int32
+                and replay_metadata.cache_buf_idx.dtype == torch.int32
+                and self._dummy_request_mask.dtype == torch.bool)
+
+    def _promote_conv_and_advance_replay(self, attn_metadata,
+                                         num_accepted_tokens: torch.Tensor,
+                                         state_indices: torch.Tensor,
+                                         num_contexts: int,
+                                         num_gens: int) -> None:
+        """The replay path of `update_mamba_states` in one launch: the
+        accepted conv window of every layer promoted from the accepted-token
+        count (the kernel subtracts one), and the replay checkpoint counters
+        and active history buffer advanced by layer 0's first tile, as
+        `_advance_replay_state` does (dummy rows unchanged)."""
+        self._commit_gdn_cached_replay_history_layers(attn_metadata, num_gens)
+        accepted = num_accepted_tokens[num_contexts:num_contexts + num_gens]
+        replay_metadata = self.get_replay_state_update_metadata()
+        _promote_mamba_state_triton(
+            self._stacked_conv_states,
+            self.intermediate_conv_states,
+            self.intermediate_state_indices[:num_gens],
+            accepted,
+            state_indices[num_contexts:num_contexts + num_gens].to(torch.int32),
+            num_accepted_tokens=accepted,
+            position_source_is_token_count=True,
+            replay_pnat=replay_metadata.prev_num_accepted_tokens,
+            replay_cache_buf_idx=replay_metadata.cache_buf_idx,
+            dummy_request_mask=self.
+            _dummy_request_mask[num_contexts:num_contexts + num_gens],
+            replay_step_width=replay_metadata.replay_step_width,
+            replay_history_size=replay_metadata.replay_history_size)
 
     @staticmethod
     def _promote_state(per_layer: List[torch.Tensor],

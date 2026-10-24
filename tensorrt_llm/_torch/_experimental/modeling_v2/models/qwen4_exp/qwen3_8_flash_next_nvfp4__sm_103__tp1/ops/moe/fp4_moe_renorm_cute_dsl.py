@@ -13,15 +13,83 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops as _cdo
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.utils import ActivationType
 
 from .fp4_block_scale_moe_renorm_routed import CERTIFIED_PAIRS, _ckpt
 from .fp4_block_scale_moe_renorm_routed import fp4_block_scale_moe_renorm_routed as _routed
-from .renorm_moe_routing_op import renorm_moe_routing_op
 
 #: Token tile of the grouped GEMMs (the kernels' M tile).
 TILE_TOKENS = 128
+#: The GEMM tactics, pinned: `((mma M, mma N), cluster (M, N), raster along M)`. FC1's is what
+#: the engine's autotune warmup picks at every prefill bucket; FC2's likewise, on the finalize
+#: kernel run with a K-tile of 128 (`_FC2_MMA_INST_TILE_K`).
+FC1_TACTIC = ((128, 256), (1, 1), False)
+FC2_TACTIC = ((128, 256), (1, 2), False)
+#: MMA instructions per FC2 A/B pipeline stage (K 128): five stages beside the C staging
+#: buffer instead of two at the kernel's default K 256, so FC2's short K (640) pipelines.
+_FC2_MMA_INST_TILE_K = 2
+#: Launches of at least this many rows run FC2 with L2 cache hints (operands EVICT_FIRST,
+#: scatter-add EVICT_LAST): a gain at ~16K rows, a small loss at 8K (GB300 micro-bench).
+L2_HINT_MIN_ROWS = 12288  # capacity: fixed: dispatch threshold
 _FP4 = torch.float4_e2m1fn_x2
+_SWIGLU_LIMIT = _cdo._canonicalize_swiglu_limit_scalar(_cdo.SWIGLU_LIMIT_SCALAR_DISABLED)
+_FinalizeKernel = _cdo.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
+
+
+class _Fc2Kernel(_FinalizeKernel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args, mma_inst_tile_k=_FC2_MMA_INST_TILE_K, row_owned_epilogue=True, **kwargs
+        )
+
+
+class _Fc2HintKernel(_FinalizeKernel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            mma_inst_tile_k=_FC2_MMA_INST_TILE_K,
+            row_owned_epilogue=True,
+            l2_hints=True,
+            **kwargs,
+        )
+
+
+class _Fc2Runner(_cdo.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner):
+    kernel_class = _Fc2Kernel
+    kernel_cache = dict()
+    tuning_config_cache = dict()
+
+
+class _Fc2HintRunner(_cdo.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner):
+    kernel_class = _Fc2HintKernel
+    kernel_cache = dict()
+    tuning_config_cache = dict()
+
+
+_RUNNERS: dict = {}
+
+
+def _runners(num_experts: int, top_k: int) -> tuple:
+    """`(fc1, fc2, fc2 with L2 hints)` for a geometry, built once (they hold compiled kernels)."""
+    key = (num_experts, top_k)
+    if key not in _RUNNERS:
+        _RUNNERS[key] = (
+            _cdo.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+                num_experts,
+                top_k,
+                num_experts,
+                0,
+                TILE_TOKENS,
+                16,
+                activation_type=ActivationType.Swiglu,
+                swiglu_limit_scalar=_SWIGLU_LIMIT,
+            ),
+            _Fc2Runner(num_experts, top_k, num_experts, 0, TILE_TOKENS, torch.bfloat16, 16),
+            _Fc2HintRunner(num_experts, top_k, num_experts, 0, TILE_TOKENS, torch.bfloat16, 16),
+        )
+    return _RUNNERS[key]
 
 
 class Fp4MoeRenormCuteDsl(OpWrapper):
@@ -77,12 +145,13 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
     expert (folded into `output1_scale_scalar`); a checkpoint whose experts
     disagree on `down_proj.input_scale` cannot use this entry as is.
 
-    Kernels (all TRT-LLM's): `trtllm::moe_sort` (tile metadata),
+    Kernels (all TRT-LLM's): `trtllm::moe_topk_sort` (routing + tile metadata),
     `trtllm::moe_output_memset_inplace` (zeroes the rows the scatter-add
-    touches), `trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell`,
-    `trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell`; the two
-    GEMMs pick their tactics through the AutoTuner. Not CUDA-graph certified
-    (prefill steps run eagerly).
+    touches; on `memset_stream` beside FC1 when given), the gathered FC1 runner
+    and the finalize-fused FC2 runner, both with pinned tactics (no AutoTuner
+    lookup); FC2's kernel runs with a K-tile of 128, a row-owned epilogue and,
+    from `L2_HINT_MIN_ROWS` rows, L2 cache hints. Not CUDA-graph certified
+    (prefill steps run eagerly or under the breakable prefill graph).
 
     Hard limits
       T            certified 4096..16384 (the target calls it from
@@ -104,67 +173,79 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
         fc2_input_scale: torch.Tensor,
         num_experts: int,
         top_k: int,
+        memset_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
         tokens = hidden_states.shape[0]
         hidden = hidden_states.shape[1] * 2
-        ids, weights = renorm_moe_routing_op(routing_logits, top_k, torch.bfloat16)
+        fc1, fc2, fc2_hint = _runners(num_experts, top_k)
+        if tokens >= L2_HINT_MIN_ROWS:
+            fc2 = fc2_hint
+        # Renormalize routing and the tile sort in one launch: the same (expert, weight) pairs
+        # (weights rounded to bf16 once) and slot order as `renorm_moe_routing_op` + `moe_sort`.
+        t2e, t2lim, e2p, p2e, _, live, weights = torch.ops.trtllm.moe_topk_sort(
+            routing_logits, None, num_experts, top_k, None, None, 0, num_experts, None,
+            TILE_TOKENS, 1,
+        )  # fmt: skip
         scales = weights.float()
-        t2e, t2lim, e2p, p2e, _, live = torch.ops.trtllm.moe_sort(
-            token_selected_experts=ids,
-            token_final_scales=scales,
-            num_experts=num_experts,
-            top_k=top_k,
-            local_expert_offset=0,
-            local_num_experts=num_experts,
-            tile_tokens_dim=TILE_TOKENS,
-        )
         out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device)
-        torch.ops.trtllm.moe_output_memset_inplace(
-            input=out,
-            tile_idx_to_mn_limit=t2lim,
-            expanded_idx_to_permuted_idx=e2p,
-            permuted_idx_to_expanded_idx=p2e,
-            num_non_exiting_tiles=live,
-            tile_tokens_dim=TILE_TOKENS,
-            top_k=top_k,
-            ep_size=1,
-            enable_alltoall=False,
+
+        def memset() -> None:
+            torch.ops.trtllm.moe_output_memset_inplace(
+                input=out,
+                tile_idx_to_mn_limit=t2lim,
+                expanded_idx_to_permuted_idx=e2p,
+                permuted_idx_to_expanded_idx=p2e,
+                num_non_exiting_tiles=live,
+                tile_tokens_dim=TILE_TOKENS,
+                top_k=top_k,
+                ep_size=1,
+                enable_alltoall=False,
+            )
+
+        # The memset of the rows FC2 scatter-adds into runs beside FC1 on `memset_stream` (a
+        # stream nothing else is queued on: the join before FC2 waits for all of it). `out` is
+        # a main-stream allocation the side stream is done with before main's next use of it
+        # (the join), so its block needs no `record_stream` -- which would make the caching
+        # allocator poll an event on every later allocation (~2000 cudaEventQuery a mixed step).
+        main = torch.cuda.current_stream()
+        if memset_stream is not None:
+            memset_stream.wait_stream(main)
+            with torch.cuda.stream(memset_stream):
+                memset()
+        h, h_sf = fc1.forward(
+            [
+                hidden_states.view(_FP4),
+                fc1_w.view(_FP4),
+                hidden_states_scale.view(torch.uint8).view(tokens, hidden // 16),
+                fc1_s.view(torch.uint8),
+                fc1_alpha,
+                t2e,
+                t2lim,
+                p2e,
+                live,
+                fc2_input_scale,
+            ],
+            tactic=FC1_TACTIC,
         )
-        h, h_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
-            input=hidden_states.view(_FP4),
-            weight=fc1_w.view(_FP4),
-            input_scale=hidden_states_scale.view(torch.uint8).view(tokens, hidden // 16),
-            weight_scale=fc1_s.view(torch.uint8),
-            alpha=fc1_alpha,
-            tile_idx_to_group_idx=t2e,
-            tile_idx_to_mn_limit=t2lim,
-            permuted_idx_to_expanded_idx=p2e,
-            num_non_exiting_tiles=live,
-            global_sf=fc2_input_scale,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_experts,
-            local_expert_offset=0,
-            tile_size=TILE_TOKENS,
-        )
-        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
-            input=h.view(_FP4),
-            weight=fc2_w.view(_FP4),
-            input_scale=h_sf.view(torch.uint8),
-            weight_scale=fc2_s.view(torch.uint8),
-            alpha=fc2_alpha,
-            output=out,
-            tile_idx_to_group_idx=t2e,
-            tile_idx_to_mn_limit=t2lim,
-            permuted_idx_to_expanded_idx=p2e,
-            num_non_exiting_tiles=live,
-            token_final_scales=scales,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_experts,
-            local_expert_offset=0,
-            tile_size=TILE_TOKENS,
-            output_dtype=torch.bfloat16,
+        if memset_stream is not None:
+            main.wait_stream(memset_stream)
+        else:
+            memset()
+        fc2.forward(
+            [
+                h.view(_FP4),
+                fc2_w.view(_FP4),
+                h_sf.view(torch.uint8),
+                fc2_s.view(torch.uint8),
+                fc2_alpha,
+                out,
+                t2e,
+                t2lim,
+                p2e,
+                live,
+                scales,
+            ],
+            tactic=FC2_TACTIC,
         )
         return out
 
@@ -198,6 +279,7 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
         fc2_input_scale: torch.Tensor,
         num_experts: int,
         top_k: int,
+        memset_stream: torch.cuda.Stream | None = None,
     ) -> None:
         for name, tensor in (
             ("routing_logits", routing_logits),

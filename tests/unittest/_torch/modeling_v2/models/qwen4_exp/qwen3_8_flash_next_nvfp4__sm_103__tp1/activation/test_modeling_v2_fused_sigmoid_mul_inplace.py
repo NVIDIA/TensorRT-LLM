@@ -54,12 +54,21 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     out, gate_buffer, gate = _build(cell.spec, seed=_seed(cell.why))
     gate_before = gate_buffer.clone()
     expected = op.reference(out, gate)
+    parts = None
+    if cell.spec.get("amax"):
+        registered = op(out.clone(), gate)
+        parts = torch.zeros(1024, dtype=torch.float32, device="cuda")
 
-    result = op(out, gate)
+    result = op(out, gate, parts)
 
     assert result.data_ptr() == out.data_ptr() and result.shape == out.shape
     torch.testing.assert_close(result, expected)
     assert torch.equal(gate_buffer, gate_before)
+    if parts is not None:
+        # The target's copy is the registered kernel's arithmetic, and the folded maximum
+        # is exactly the stored output's.
+        assert torch.equal(result, registered)
+        assert parts.max().item() == result.abs().max().float().item()
 
 
 def test_metadata_misuse_raises() -> None:

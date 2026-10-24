@@ -44,6 +44,11 @@ def _build(spec, seed):
         scores[:, ::7] = -0.0  # negative zero ties with zero
     if spec.get("narrow"):
         scores = 1.0 + 0.05 * torch.rand(rows, W, generator=g, device=DEV)
+    if spec.get("lognormal"):
+        scores = torch.exp(1.74 + 0.2 * torch.randn(rows, W, generator=g, device=DEV))
+        # bf16-like resolution, so equal scores tie; a zero in every other row.
+        scores = scores.to(torch.bfloat16).float()
+        scores[::2, 5] = 0.0
     ends = ((pos + 1) // CR).to(torch.int32)
     for r in range(rows):  # garbage past the visible blocks
         n = int(ends[r])

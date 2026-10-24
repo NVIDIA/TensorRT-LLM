@@ -21,6 +21,8 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
+from .draft_loop_ops import MAX_REQUESTS as _ROW_SELECT_MAX_REQUESTS
+from .draft_loop_ops import draft_row_select
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
                         SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
@@ -644,8 +646,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = self._prepare_next_new_tokens(
-            accepted_tokens, next_draft_tokens,
-            spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
+            accepted_tokens,
+            next_draft_tokens,
+            spec_metadata.batch_indices_cuda,
+            batch_size,
+            num_accepted_tokens,
+            fused=spec_metadata.is_cuda_graph and num_contexts == 0)
 
         attn_metadata.use_spec_decoding = True
 
@@ -772,9 +778,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        # The context rows' last tokens; a generation-only step has none.
+        last_tokens_idx = (
+            torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) -
+            1 if num_contexts > 0 else None)
         position_ids = inputs["position_ids"]
+        # A captured generation-only MTP step selects each request's continuing
+        # row (ids, hidden row, next positions) in one launch.
+        fused_rows = (
+            self.is_mtp_eagle and spec_metadata.is_cuda_graph
+            and num_contexts == 0 and 0 < num_gens <= _ROW_SELECT_MAX_REQUESTS
+            and self.guided_decoder is None
+            and not (self.model_config is not None
+                     and self.model_config.mapping.enable_lm_head_tp_in_adp))
+        fused_hidden = fused_positions = None
+        # Whether the row selection also moved the attention lengths to one row
+        # per request (the first step's metadata update below).
+        fused_lengths = False
 
         # Sparse backends that can reuse one indexer selection across the draft
         # loop expose this setter; each indexer still decides whether its own
@@ -824,15 +844,34 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # selection is the prefix slice [0, batch_size); each
                 # ``[gather_ids]`` site below takes a slice as readily as an
                 # index tensor.
-                if i == 0:
+                if (i == 0 and fused_rows and hidden_states.dim() == 2
+                        and hidden_states.stride(1) == 1
+                        and inputs["position_ids"].stride(-1) == 1):
+                    # The draft step above was the last reader of the step's
+                    # lengths, so the row selection also rewrites them.
+                    (gather_ids, fused_hidden,
+                     fused_positions) = draft_row_select(
+                         spec_metadata.batch_indices_cuda[:num_gens],
+                         num_accepted_tokens[num_contexts:],
+                         hidden_states,
+                         inputs["position_ids"],
+                         runtime_draft_len + 1,
+                         attn_metadata.num_ctx_tokens,
+                         kv_lens=getattr(attn_metadata, 'kv_lens_cuda', None),
+                         seq_lens=attn_metadata._seq_lens_cuda,
+                         draft_len=runtime_draft_len)
+                    fused_lengths = True
+                elif i == 0:
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *
                         (runtime_draft_len + 1)).long()
                     gather_ids_gen = (start_ids_gen +
                                       num_accepted_tokens[num_contexts:] - 1 +
                                       attn_metadata.num_ctx_tokens)
-                    gather_ids = torch.concat(
-                        [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
+                    gather_ids = (
+                        gather_ids_gen if num_contexts == 0 else torch.concat(
+                            [last_tokens_idx[:num_contexts], gather_ids_gen],
+                            dim=0))
                 else:
                     gather_ids = slice(0, batch_size)
 
@@ -876,7 +915,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 if self.is_mtp_eagle:
                     # One row per request: the LM-head input on this step and
                     # the draft input on the next.
-                    request_hidden_states = hidden_states[gather_ids]
+                    request_hidden_states = (fused_hidden if i == 0
+                                             and fused_hidden is not None else
+                                             hidden_states[gather_ids])
                     if use_lm_head_tp_in_adp:
                         token_count = request_hidden_states.view(
                             -1, request_hidden_states.shape[-1]).shape[0]
@@ -974,8 +1015,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         hidden_states = request_hidden_states
                     else:
                         hidden_states = hidden_states_to_save[gather_ids]
-                    position_ids = (_select_mtp_position_ids(
-                        inputs["position_ids"], gather_ids) + 1)
+                    if i == 0 and fused_positions is not None:
+                        position_ids = fused_positions
+                    else:
+                        position_ids = (_select_mtp_position_ids(
+                            inputs["position_ids"], gather_ids) + 1)
                     inputs = {
                         "input_ids": new_draft_token,
                         "position_ids": position_ids,
@@ -987,7 +1031,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # Update attn_metadata for the next iteration.
                 if i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
-                    attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+                    if not fused_lengths:
+                        attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
@@ -997,7 +1042,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                          num_contexts].fill_(1)
                     if has_kv_cache:
                         attn_metadata.num_contexts = 0
-                    if hasattr(attn_metadata, 'kv_lens_cuda'):
+                    if hasattr(attn_metadata,
+                               'kv_lens_cuda') and not fused_lengths:
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                             runtime_draft_len -
                             num_accepted_tokens[num_contexts:])
@@ -1241,7 +1287,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             num_contexts:, :spec_metadata.runtime_draft_len + 1].flatten()
 
         # get draft inputs
-        input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
+        input_ids = (input_ids_gen if input_ids_ctx.numel() == 0 else
+                     torch.concat([input_ids_ctx, input_ids_gen], dim=0))
 
         return {
             "input_ids": input_ids,
