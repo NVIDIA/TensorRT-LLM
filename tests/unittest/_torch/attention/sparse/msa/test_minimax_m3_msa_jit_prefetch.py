@@ -55,9 +55,10 @@ def _keys(calls):
 
 
 class _Engine:
-    """Engine-sized buffers; a generation step is a row slice of them."""
+    """Engine-sized buffers; a generation step is a row slice of them.
+    ``blocks`` is the block table's width, blocks per sequence."""
 
-    def __init__(self):
+    def __init__(self, blocks=MAX_BLOCKS):
         dev = torch.device("cuda")
         rows = (MAX_REQUESTS + 3) * SPAN
         heads = KV_HEADS * GROUP
@@ -69,7 +70,7 @@ class _Engine:
         pages = (MAX_REQUESTS + 3) * MAX_BLOCKS
         self.k = torch.zeros(pages, KV_HEADS, PAGE, HEAD_DIM, dtype=torch.bfloat16, device=dev)
         self.v = torch.zeros_like(self.k)
-        self.block_table = torch.zeros(MAX_REQUESTS + 3, MAX_BLOCKS, dtype=torch.int32, device=dev)
+        self.block_table = torch.zeros(MAX_REQUESTS + 3, blocks, dtype=torch.int32, device=dev)
         self.seq_lens = torch.full((MAX_REQUESTS + 3,), 300, dtype=torch.int32, device=dev)
 
     def decode(self, nctx, ngen):
@@ -87,8 +88,7 @@ class _Engine:
         )
 
 
-def test_planned_keys_cover_other_batches_without_allocating():
-    eng = _Engine()
+def _record(eng):
     jpm._RECORDS.clear()
     jpm.start_recording()
     try:
@@ -96,6 +96,11 @@ def test_planned_keys_cover_other_batches_without_allocating():
         torch.cuda.synchronize()
     finally:
         jpm.stop_recording()
+
+
+def test_planned_keys_cover_other_batches_without_allocating():
+    eng = _Engine()
+    _record(eng)
     assert jpm.recorded_launch_classes() == 1
     provider = jpm.MiniMaxM3MsaDecodeProvider(max_num_requests=MAX_REQUESTS)
 
@@ -119,3 +124,24 @@ def test_planned_keys_cover_other_batches_without_allocating():
         assert real, "no launches"
         missing = real - planned
         assert not missing, f"nctx={nctx} ngen={ngen}: unplanned {sorted(missing)}"
+
+
+@pytest.mark.parametrize("blocks", [(16, 17), (17, 16)], ids=["to_unaligned", "to_aligned"])
+def test_a_block_table_of_another_width_reuses_the_kernels(blocks):
+    """The final executor's block table is wider than the KV-cache estimation
+    executor's (a larger max_seq_len), so its row stride differs, divisible by
+    16 or not. The decode launches of either width reach the same kernels: the
+    final executor's warmup compiles none of them again."""
+    estimation, final = blocks
+    _record(_Engine(blocks=estimation))
+    planned = _keys(jpm.MiniMaxM3MsaDecodeProvider(max_num_requests=MAX_REQUESTS).plan_all())
+    eng = _Engine(blocks=final)
+    # Generation-only steps, as warmup's: every row starts aligned, so only
+    # the table's width differs from the recorded launch.
+    for ngen in (2, 5):
+        with jp.shadow_launches() as rec:
+            eng.decode(0, ngen)
+        real = _keys(rec)
+        assert real, "no launches"
+        missing = real - planned
+        assert not missing, f"width {final} after {estimation}: unplanned {sorted(missing)}"

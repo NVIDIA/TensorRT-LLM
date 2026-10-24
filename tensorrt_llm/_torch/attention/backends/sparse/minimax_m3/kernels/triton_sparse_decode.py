@@ -32,6 +32,8 @@ Differences from upstream:
 * The merge kernel zeroes rows whose chunks are all empty instead of letting
   them produce NaN, since CUDA-graph padding rows flow on into the rest of the
   network here.
+* The producers do not specialize on the block table's row stride (see
+  ``_PRODUCER_DO_NOT_SPECIALIZE``).
 """
 
 from __future__ import annotations
@@ -117,13 +119,21 @@ def _dequant_nvfp4_rows(
     return values * scales
 
 
+# Producer arguments Triton does not specialize on. stride_bt_b, the block
+# table's row stride, follows max_seq_len, which differs between the KV-cache
+# estimation executor and the final one; the table is only read by a scalar
+# load, so a divisibility specialization would compile each kernel once more
+# for the final executor, into the same binary.
+_PRODUCER_DO_NOT_SPECIALIZE = ["decode_query_len", "stride_bt_b"]
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(16, triton.next_power_of_2(args["gqa_group_size"])),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     }
 )
-@triton.jit(do_not_specialize=["decode_query_len"])
+@triton.jit(do_not_specialize=_PRODUCER_DO_NOT_SPECIALIZE)
 def _gqa_sparse_decode_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
     k_ptr,  # paged K: [num_pages, num_kv_heads, page_size, head_dim (or /2 packed)]
@@ -397,7 +407,7 @@ def _gqa_sparse_decode_kernel(
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     }
 )
-@triton.jit(do_not_specialize=["decode_query_len"])
+@triton.jit(do_not_specialize=_PRODUCER_DO_NOT_SPECIALIZE)
 def _gqa_sparse_decode_pair_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
     k_ptr,  # paged K: [num_pages, num_kv_heads, page_size, head_dim (or /2 packed)]
