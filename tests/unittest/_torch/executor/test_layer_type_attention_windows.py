@@ -282,3 +282,46 @@ def test_draft_manager_skips_derivation(monkeypatch):
     _run_create_kv_cache_manager(monkeypatch, manager_cls, kv_cache_config, is_draft=True)
 
     assert captured["kv_cache_config"].max_attention_window is None
+
+
+class _Windows:
+    """A manager's read-window inputs: one layer group per kept window over ``pp_layers``."""
+
+    def __init__(self, kept, declared, pp_layers=(2, 3), cache_layers=None):
+        self._kept = kept
+        internal = list(range(len(pp_layers)))
+        grouping = [internal] if len(kept) == 1 else [[layer] for layer in internal]
+        self.impl = SimpleNamespace(layer_grouping=grouping)
+        self.pp_layers = list(pp_layers)
+        self._model_attention_windows = declared
+        layers = len(pp_layers) if cache_layers is None else cache_layers
+        self.kv_cache_manager_py_config = SimpleNamespace(layers=[None] * layers)
+
+    def _life_cycle_by_layer_group(self):
+        return [SimpleNamespace(window_size=window) for window in self._kept]
+
+
+# Internal layers 0 and 1 are model layers 2 and 3, whose declarations decide.
+DECLARED = {0: 16, 1: 16, 2: 64, 3: 128}
+READ_WINDOWS = {
+    "second_stage": (_Windows([200, 300], DECLARED), [64, 128]),
+    "widest_of_the_group": (_Windows([300], {2: 64, 3: 96}), [96]),
+    "more_cache_layers_than_model_layers": (
+        _Windows([200, 300], DECLARED, cache_layers=4),
+        [200, 300],
+    ),
+    "nothing_declared": (_Windows([200, 300], {}), [200, 300]),
+    "full_attention": (_Windows([None, 300], DECLARED), [None, 128]),
+    "a_layer_declaring_none": (_Windows([300], {2: 64, 3: None}), [300]),
+    "a_configured_window_below_the_model_s": (_Windows([256], {2: 4096}, pp_layers=[2]), [256]),
+    "widest_of_the_group_past_the_kept_window": (_Windows([256], {2: 64, 3: 4096}), [256]),
+    "non_positive_declarations": (_Windows([200, 300], {2: 0, 3: -1}), [200, 300]),
+}
+
+
+@pytest.mark.parametrize("case", list(READ_WINDOWS))
+def test_a_layer_group_reads_the_windows_its_model_layers_declare(case):
+    """A group reads the widest positive window its model layers declare, at most its kept one."""
+    windows, expected = READ_WINDOWS[case]
+    read = [KVCacheManagerV2._attention_read_window(windows, lg) for lg in range(len(expected))]
+    assert read == expected
