@@ -2344,6 +2344,16 @@ class DecodingBaseConfig(StrictBaseModel):
         "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
+    draft_temperature_only: bool = Field(
+        default=False,
+        status="prototype",
+        description="If true, rejection-sampled draft tokens are drawn from the "
+        "temperature-scaled draft distribution without the request's top-k / "
+        "top-p / min-p filters, and that distribution is what verification "
+        "divides by (vLLM's 'probabilistic' drafting). Outputs stay lossless "
+        "either way; the setting changes the acceptance rate. Requires "
+        "use_rejection_sampling=True.")
+
     allow_advanced_sampling: bool = Field(
         default=False,
         status="deprecated",
@@ -6965,6 +6975,18 @@ class TorchLlmArgs(BaseLlmArgs):
             return False
         return True
 
+    def _validate_rejection_sampling_options(self) -> None:
+        """Reject rejection-sampling options that would have no effect.
+
+        ``draft_temperature_only`` only changes the rejection path, so setting
+        it while that path is off is a configuration mistake.
+        """
+        spec_cfg = self.speculative_config
+        if (getattr(spec_cfg, "draft_temperature_only", False)
+                and not spec_cfg.use_rejection_sampling):
+            raise ValueError("draft_temperature_only=True requires "
+                             "use_rejection_sampling=True.")
+
     def _validate_dflash_ctx_budget(self,
                                     memory_budget_bytes: Optional[int] = None
                                     ) -> None:
@@ -7217,6 +7239,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
                 # DraftTarget one-model) share the SpecMetadata slot-indexed
                 # dispatch.
+
+            self._validate_rejection_sampling_options()
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"

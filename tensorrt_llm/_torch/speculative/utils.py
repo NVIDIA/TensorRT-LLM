@@ -359,6 +359,9 @@ def get_spec_metadata(spec_config,
         # dispatcher routes to a backend that takes no min_p argument -- so the filter is
         # dropped with nothing raised. One assignment here keeps them in step.
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
+        metadata.draft_temperature_only = getattr(spec_config,
+                                                  "draft_temperature_only",
+                                                  False)
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
     return metadata

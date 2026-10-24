@@ -1656,6 +1656,11 @@
       "path": "speculative_config.decoding_type"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.draft_temperature_only"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.dynamic_tree_max_topK"
