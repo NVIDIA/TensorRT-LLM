@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import threading
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, List, Optional, Tuple
@@ -591,8 +591,11 @@ def test_model_engine_warmup_uses_load_balancer_public_api():
     engine_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/model_engine.py",
         "PyTorchModelEngine",
-        {"is_warmup", "moe_load_balancer_iter_info"},
-        {"set_moe_comm_warmup": lambda value: events.append(("comm", value))},
+        {"_set_warmup_effects", "warmup_scope"},
+        {
+            "contextmanager": contextmanager,
+            "set_moe_comm_warmup": lambda value: events.append(("comm", value)),
+        },
     )
     manager = SimpleNamespace(
         enable_statistic=True,
@@ -601,12 +604,17 @@ def test_model_engine_warmup_uses_load_balancer_public_api():
     )
     engine = engine_cls()
     engine.moe_load_balancer = manager
+    engine._warmup_depth = 0
 
-    engine.is_warmup = True
+    with engine.warmup_scope():
+        assert events == [
+            ("comm", True),
+            ("iter", {"enable_statistic": False, "enable_update_weights": False}),
+        ]
 
-    assert events == [
-        ("comm", True),
-        ("iter", {"enable_statistic": False, "enable_update_weights": False}),
+    assert events[2:] == [
+        ("comm", False),
+        ("iter", {"enable_statistic": True, "enable_update_weights": True}),
     ]
 
 
@@ -842,7 +850,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
                 raise RuntimeError("sampler stop failed")
 
     class Engine:
-        def _release_cuda_graphs(self, **_):
+        def release_executor_resources(self, *, release_model_owned_graphs):
             events.append("release_graphs")
 
     class DwdpManager:
