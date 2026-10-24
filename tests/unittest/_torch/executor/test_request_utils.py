@@ -790,7 +790,12 @@ def test_merge_requests_default(mock_convert):
 
     requests = [RequestQueueItem(1, Mock()), RequestQueueItem(2, Mock())]
     result = merge_requests(
-        requests, cp_config={}, cp_rank=0, cp_size=1, exclude_last_generation_logits=False
+        requests,
+        cp_config={},
+        cp_rank=0,
+        cp_size=1,
+        exclude_last_generation_logits=False,
+        is_disagg=False,
     )
 
     assert len(result) == 2
@@ -828,6 +833,7 @@ def test_merge_requests_with_helix_cp_config():
             cp_rank=rank,
             cp_size=4,
             exclude_last_generation_logits=False,
+            is_disagg=True,
         )
 
         # Verify the result.
@@ -850,6 +856,37 @@ def test_merge_requests_with_helix_cp_config():
             assert llm_request.get_tokens(0) == [5, 6, 13]
         else:
             assert llm_request.get_tokens(0) == [7, 8]
+
+
+def test_merge_requests_agg_helix_keeps_full_prompt():
+    """Aggregated helix keeps the full prompt on every CP rank, so every rank
+    sees identical request lengths."""
+    input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    executor_request = trtllm.Request(
+        input_token_ids=input_tokens,
+        max_tokens=5,
+        streaming=False,
+        sampling_config=trtllm.SamplingConfig(),
+        output_config=trtllm.OutputConfig(),
+    )
+    request_item = RequestQueueItem(id=1, request=executor_request)
+    cp_config = {"cp_type": CpType.HELIX, "tokens_per_block": 2}
+
+    for rank in range(4):
+        result = merge_requests(
+            [request_item],
+            cp_config=cp_config,
+            cp_rank=rank,
+            cp_size=4,
+            exclude_last_generation_logits=False,
+            is_disagg=False,
+        )
+
+        assert len(result) == 1
+        llm_request = result[0]
+        assert llm_request.get_tokens(0) == input_tokens
+        assert llm_request.prompt_len == len(input_tokens)
+        assert llm_request.total_input_len_cp == len(input_tokens)
 
 
 def test_get_from_waiting_queue():

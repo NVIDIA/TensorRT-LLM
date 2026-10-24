@@ -6893,7 +6893,8 @@ class PyExecutor:
                               cp_rank=self.dist.cp_rank,
                               cp_size=self.dist.cp_size,
                               exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+                              _should_exclude_last_generation_logits(),
+                              is_disagg=self.kv_cache_transceiver is not None)
 
     def _handle_special_queue_items(
             self,
