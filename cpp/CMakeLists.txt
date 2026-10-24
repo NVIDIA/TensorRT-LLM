@@ -60,6 +60,11 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(ENABLE_NANOBIND_PROFILING
+       "Emit PyTorch profiler regions around TensorRT-LLM nanobind calls" OFF)
+option(ENABLE_NCCL_PROFILING
+       "Emit PyTorch profiler regions around direct TensorRT-LLM NCCL calls"
+       OFF)
 option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
 option(CUBLAS_DYNAMIC_LINKING
        "Link against the dynamic cublas/cublasLt libraries" ON)

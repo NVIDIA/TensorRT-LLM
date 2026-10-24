@@ -56,6 +56,7 @@ l0_cpu:
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
+  - unittest/test_profiler.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory
