@@ -358,6 +358,14 @@ class DecoderInputPreparer:
         # buffer is never the source of an async H2D). Invalidated (set to
         # None) by every full prepare_inputs pass.
         self._steady_gen_cache: dict[str, Any] | None = None
+        # Steady-state speculative verify prepare cache (one-model linear
+        # drafting under the overlap scheduler). Holds what a full pass derived
+        # from a verify-only batch that stays invariant while the same requests
+        # keep the same slots: the request and prompt lists, the metadata
+        # objects of the replayed graph, and the device index buffers the full
+        # pass wrote (previous slots, previous position indices, gather ids).
+        # Invalidated (set to None) by every full prepare_inputs pass.
+        self._steady_spec_cache: dict[str, Any] | None = None
         # Log cached prefixes in model-input sequence order when enabled.
         self.log_cached_kv_tokens_per_req = (
             os.getenv("TLLM_LOG_CACHED_KV_TOKENS_PER_REQ", "0") == "1"
@@ -690,6 +698,279 @@ class DecoderInputPreparer:
             self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
         )
 
+    def _can_use_steady_spec_fast_prepare(
+        self,
+        scheduled_requests: ScheduledRequests,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata | None,
+        resource_manager: ResourceManager | None,
+        new_tensors_device: SampleStateTensors | None,
+        runtime_tokens_per_gen_step: int,
+        is_dummy: bool,
+    ) -> bool:
+        """Check whether the cached steady-state verify prepare applies.
+
+        The cache is only recorded by a full pass whose batch was verify-only:
+        every request a non-dummy generation request with a previous overlap
+        tensor and an unchanged slot (see ``_record_steady_spec_cache``). This
+        confirms the per-step conditions: the same graph metadata, the same
+        verify width, and the same requests in the same order, still in the
+        slots the cached device index buffers hold.
+        """
+        cache = self._steady_spec_cache
+        if cache is None or is_dummy:
+            return False
+        if (
+            spec_metadata is not cache["spec_metadata"]
+            or attn_metadata is not cache["attn_metadata"]
+            or runtime_tokens_per_gen_step != cache["tokens_per_gen_step"]
+            or not isinstance(new_tensors_device, SampleStateTensorsSpec)
+            or new_tensors_device.next_draft_tokens is None
+            or new_tensors_device.new_tokens_lens is None
+            or scheduled_requests.num_context_requests > 0
+            or scheduled_requests.attention_dp_phase is RemoteTailPhase.DECODE
+        ):
+            return False
+        if (
+            resource_manager is not None
+            and resource_manager.get_resource_manager(ResourceManagerType.PEFT_CACHE_MANAGER)
+            is not None
+        ):
+            return False
+        generation_requests = scheduled_requests.generation_requests
+        if len(generation_requests) != cache["num_requests"]:
+            return False
+        for request, request_id, slot in zip(
+            generation_requests, cache["request_ids"], cache["slots"]
+        ):
+            if (
+                request.py_request_id != request_id
+                or request.py_batch_idx != slot
+                or request.py_seq_slot != slot
+                or getattr(request, "py_needs_onehot_draft_probs", False)
+            ):
+                return False
+        return True
+
+    @nvtx_range("_apply_steady_spec_fast_prepare")
+    def _apply_steady_spec_fast_prepare(
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
+        new_tensors_device: SampleStateTensorsSpec,
+        resource_manager: ResourceManager | None,
+        runtime_draft_len: int,
+    ) -> PreparedInputs:
+        """Prepare inputs for an unchanged verify-only speculative batch.
+
+        Produces what a full pass produces for this batch. Each request takes
+        ``tokens_per_gen_step`` rows: the target's input tokens and the draft
+        tokens are gathered on the device from the previous step's sampler
+        buffers, the accepted-count corrections the captured preprocessing
+        applies are gathered from its ``new_tokens_lens``, and the host-derived
+        values (positions and cached-token counts from the host token count,
+        which lags the device by the step still in flight, exactly as in the
+        full pass) take one pinned upload. The previous-slot, previous-position
+        index and gather-id buffers keep the values the recording pass wrote:
+        the slots and the verify width are unchanged.
+        """
+        cache = self._steady_spec_cache
+        buffers = self._buffers
+        num_requests = cache["num_requests"]
+        tokens_per_step = cache["tokens_per_gen_step"]
+        draft_width = tokens_per_step - 1
+        num_tokens = num_requests * tokens_per_step
+
+        position_ids: list[int] = []
+        num_cached_tokens_per_seq: list[int] = []
+        num_accepted_draft_tokens: list[int] = []
+        for request in scheduled_requests.generation_requests:
+            past_seen_token_num = request.max_beam_num_tokens - 1
+            position_ids.extend(range(past_seen_token_num, past_seen_token_num + tokens_per_step))
+            num_cached_tokens_per_seq.append(
+                past_seen_token_num + tokens_per_step - request.py_num_compressed_tokens
+            )
+            num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
+        host_values = torch.tensor(
+            position_ids + num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+        )
+        host_position_ids = host_values[:num_tokens]
+        buffers.num_accepted_draft_tokens_cuda[:num_requests].copy_(
+            host_values[num_tokens:], non_blocking=True
+        )
+        buffers.position_ids_cuda[:num_tokens].copy_(host_position_ids, non_blocking=True)
+        if self._config.use_mrope:
+            buffers.mrope_position_ids_cuda[:, :, :num_tokens].copy_(
+                buffers.position_ids_cuda[:num_tokens].view(1, 1, -1).expand(3, 1, -1),
+                non_blocking=True,
+            )
+
+        # Input and draft tokens of the requests' previous slots; the
+        # accepted-count corrections the captured preprocessing adds to the
+        # positions and KV lengths. Rows past these stay zero from the
+        # recording pass.
+        previous_slots = buffers.previous_batch_indices_cuda[:num_requests]
+        torch.index_select(
+            new_tensors_device.new_tokens.transpose(0, 1)[:, :tokens_per_step],
+            0,
+            previous_slots,
+            out=buffers.input_ids_cuda[:num_tokens].view(num_requests, tokens_per_step, -1),
+        )
+        torch.index_select(
+            new_tensors_device.next_draft_tokens[:, :draft_width],
+            0,
+            previous_slots,
+            out=buffers.draft_tokens_cuda[: num_requests * draft_width].view(
+                num_requests, draft_width
+            ),
+        )
+        new_tokens_lens_device = new_tensors_device.new_tokens_lens
+        torch.index_select(
+            new_tokens_lens_device,
+            0,
+            buffers.previous_pos_indices_cuda[:num_tokens],
+            out=buffers.previous_pos_id_offsets_cuda[:num_tokens],
+        )
+        previous_kv_lens_offsets = buffers.previous_kv_lens_offsets_cuda[:num_requests]
+        torch.index_select(new_tokens_lens_device, 0, previous_slots, out=previous_kv_lens_offsets)
+        previous_kv_lens_offsets.sub_(tokens_per_step)
+
+        attn_metadata.beam_width = 1
+        attn_metadata.request_ids = list(cache["request_ids"])
+        attn_metadata.prompt_lens = list(cache["prompt_lens"])
+        attn_metadata.num_contexts = 0
+        attn_metadata.csa2_remote_tail_mode = None
+        attn_metadata.csa2_remote_tail_starts = []
+        attn_metadata.num_chunked_ctx_requests = 0
+        attn_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            num_extra_kv_tokens=cache["num_extra_kv_tokens"],
+            use_full_generation_page_table=cache["use_full_generation_page_table"],
+        )
+        attn_metadata.kv_cache_manager = kv_cache_manager
+        if hasattr(self.model.model_config.pretrained_config, "chunk_size"):
+            attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
+        prepare_context_replay = getattr(attn_metadata, "prepare_context_replay", None)
+        if prepare_context_replay is not None:
+            prepare_context_replay(
+                [],
+                allow_final_window=(
+                    self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
+                ),
+            )
+        attn_metadata.prepare()
+
+        spec_metadata.num_tokens = num_tokens
+        spec_metadata.num_generations = scheduled_requests.num_generation_requests
+        spec_metadata.seq_lens = [tokens_per_step] * num_requests
+        attn_metadata.padded_num_tokens = None
+        virtual_num_tokens = self.pad_tokens(attn_metadata, num_tokens, 0)
+
+        inputs = self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
+        spec_metadata.draft_tokens = buffers.draft_tokens_cuda[: num_requests * draft_width]
+        spec_metadata.request_ids = list(cache["request_ids"])
+        spec_metadata.gather_ids = buffers.gather_ids_cuda[:num_tokens]
+        spec_metadata.host_position_ids = host_position_ids
+        spec_metadata.num_accepted_draft_tokens = buffers.num_accepted_draft_tokens_cuda[
+            :num_requests
+        ]
+        spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
+        spec_metadata.prepare()
+        spec_metadata.write_padding_onehot_draft_probs([], runtime_draft_len)
+        inputs["spec_metadata"] = spec_metadata
+
+        self.iter_states["num_ctx_requests"] = 0
+        self.iter_states["num_ctx_tokens"] = 0
+        self.iter_states["num_generation_tokens"] = num_requests * tokens_per_step
+        self.iter_states["cached_kv_tokens"] = sum(num_cached_tokens_per_seq)
+        if self.log_cached_kv_tokens_per_req:
+            self.record_cached_kv_tokens_per_req(num_cached_tokens_per_seq)
+
+        return PreparedInputs(inputs, buffers.gather_ids_cuda[:num_tokens])
+
+    def _record_steady_spec_cache(
+        self,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata | None,
+        spec_config: DecodingBaseConfig | None,
+        next_draft_tokens_device: torch.Tensor | None,
+        lora_params: dict[str, Any] | None,
+        promoted_context_request_ids: frozenset[int],
+        runtime_tokens_per_gen_step: int,
+    ) -> None:
+        """Record the steady-state verify cache after a full pass that qualifies.
+
+        The pass must have handled only non-dummy verify requests that all
+        carried a previous overlap tensor from the slot they still hold
+        (``previous_batch_len`` equal to the request count and no host input
+        or draft tokens), on a replayed graph's metadata, with nothing the
+        cached prepare does not reproduce (MRoPE deltas, multimodal or extra
+        model inputs, LoRA, padding, one-hot draft-prob rows, helix,
+        attention DP, guided decoding).
+        """
+        extend_requests = host.lists.extend_requests
+        if not (
+            spec_metadata is not None
+            and spec_config is not None
+            and spec_config.is_linear_tree
+            and not spec_config.spec_dec_mode.extend_ctx(self._config.attention_backend)
+            and next_draft_tokens_device is not None
+            and runtime_tokens_per_gen_step > 1
+            and not promoted_context_request_ids
+            and not self._config.disable_overlap_scheduler
+            and self.guided_decoder is None
+            and not self._config.enable_attention_dp
+            and not self.use_beam_search
+            and self._config.max_beam_width == 1
+            and self._steady_gen_cache_supported
+            and self._lora.cuda_graph_manager is None
+            and not lora_params
+            and not host.has_cp_helix
+            and host.num_ctx_requests == 0
+            and scheduled_requests.num_context_requests == 0
+            and scheduled_requests.attention_dp_phase is not RemoteTailPhase.DECODE
+            and not host.remote_tail_modes
+            and not host.lists.generation_requests
+            and not host.lists.extend_dummy_requests
+            and extend_requests
+            and host.previous_batch_len == len(extend_requests)
+            and host.num_tokens == 0
+            and not host.lists.draft_tokens
+            and not host.lists.padding_gen_slots
+            and host.extra_inputs is _NO_EXTRA_INPUTS
+            and not host.lists.mrope_position_ids
+            and not host.lists.mrope_delta_write_seq_slots
+            and not host.lists.mrope_delta_read_seq_slots
+            and not host.lists.multimodal_params_list
+            and attn_metadata.is_cuda_graph
+            and attn_metadata.padded_num_tokens is None
+            and get_position_id_offset(self.model) == 0
+            and not getattr(kv_cache_manager, "kv_compression_manages_history", False)
+        ):
+            return
+        slots = [request.py_seq_slot for request in extend_requests]
+        if host.lists.previous_batch_indices != slots:
+            return
+        self._steady_spec_cache = {
+            "num_requests": len(extend_requests),
+            "request_ids": list(host.lists.request_ids),
+            "prompt_lens": list(host.lists.prompt_lengths),
+            "slots": slots,
+            "tokens_per_gen_step": runtime_tokens_per_gen_step,
+            "attn_metadata": attn_metadata,
+            "spec_metadata": spec_metadata,
+            "num_extra_kv_tokens": attn_metadata.kv_cache_params.num_extra_kv_tokens,
+            "use_full_generation_page_table": (
+                attn_metadata.kv_cache_params.use_full_generation_page_table
+            ),
+        }
+
     def _build_multimodal_data_for_llm(
         self,
         request: LlmRequest,
@@ -793,9 +1074,37 @@ class DecoderInputPreparer:
                 kv_cache_manager,
                 runtime_draft_len,
             )
-        # Any full pass invalidates the steady-state cache; it is re-recorded
-        # at the end of this pass when the batch qualifies.
+        if (
+            self._steady_spec_cache is not None
+            and not promoted_context_request_ids
+            and self._can_use_steady_spec_fast_prepare(
+                scheduled_requests,
+                attn_metadata,
+                spec_metadata,
+                resource_manager,
+                new_tensors_device,
+                self.get_runtime_tokens_per_gen_step(runtime_draft_len),
+                is_dummy,
+            )
+        ):
+            return self._finish_prepared(
+                self._apply_steady_spec_fast_prepare(
+                    scheduled_requests,
+                    kv_cache_manager,
+                    attn_metadata,
+                    spec_metadata,
+                    new_tensors_device,
+                    resource_manager,
+                    runtime_draft_len,
+                ),
+                scheduled_requests,
+                kv_cache_manager,
+                runtime_draft_len,
+            )
+        # Any full pass invalidates the steady-state caches; they are
+        # re-recorded at the end of this pass when the batch qualifies.
         self._steady_gen_cache = None
+        self._steady_spec_cache = None
 
         host = HostInputs(
             use_mrope=self._config.use_mrope,
@@ -898,6 +1207,18 @@ class DecoderInputPreparer:
         if not is_dummy:
             self._record_steady_gen_cache(
                 host, kv_cache_manager, attn_metadata, spec_metadata, new_tokens_device, lora_params
+            )
+            self._record_steady_spec_cache(
+                host,
+                scheduled_requests,
+                kv_cache_manager,
+                attn_metadata,
+                spec_metadata,
+                spec_config,
+                next_draft_tokens_device,
+                lora_params,
+                promoted_context_request_ids,
+                runtime_tokens_per_gen_step,
             )
 
         gather_ids_device = (

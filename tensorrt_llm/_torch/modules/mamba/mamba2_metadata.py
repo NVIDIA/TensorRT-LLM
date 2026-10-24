@@ -79,11 +79,14 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
                                     replay_step_width, replay_history_size):
     """Single-launch build of the write-first replay partition.
 
-    Interchangeable with :func:`_build_replay_work_items_torch`; the caller
-    picks between them. Kept to one CTA because the write-first offsets come
-    from an in-block ``tl.cumsum``.
+    Interchangeable with :func:`_build_replay_work_items_torch` for up to
+    ``_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE`` decodes; the caller picks
+    between them. Kept to one CTA because the write-first offsets come from an
+    in-block ``tl.cumsum``. The block always spans the largest batch, so a
+    single specialization serves every batch size.
     """
     num_decodes = state_indices.shape[0]
+    assert num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE
     _prepare_gdn_replay_work_items_kernel[(1, )](
         state_indices,
         prev_num_accepted_tokens,
@@ -98,7 +101,7 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
         cache_slot_field=REPLAY_WORK_CACHE_SLOT,
         pnat_field=REPLAY_WORK_PNAT,
         cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
-        BLOCK_SIZE=triton.next_power_of_2(num_decodes),
+        BLOCK_SIZE=_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE,
         num_warps=4,
     )
 
@@ -436,8 +439,9 @@ class Mamba2Metadata:
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
 
-        if (use_gdn_all_layer_commit
-                and num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE):
+        if (num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE
+                and prev_num_accepted_tokens.is_contiguous()
+                and cache_buf_idx.is_contiguous()):
             build_work_items = _build_replay_work_items_triton
         else:
             build_work_items = _build_replay_work_items_torch
