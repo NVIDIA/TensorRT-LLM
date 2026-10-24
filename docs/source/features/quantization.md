@@ -36,6 +36,13 @@ llm.generate("Hello, my name is")
 
 ```{note}
 TensorRT LLM allows you to enable the FP8 KV cache manually, even for checkpoints that do not have it enabled by default.
+
+For encoder-decoder models in the PyTorch backend, KV-cache quantization
+applies to decoder self-attention only. The cross-attention pool is sized and
+allocated in the model dtype because cross-attention does not quantize K/V.
+This applies whether FP8 or NVFP4 is selected explicitly or inherited from the
+checkpoint with `dtype="auto"`; existing hardware-specific restrictions still
+apply to the self-attention cache.
 ```
 
 Here is an example of how to set the FP8 KV Cache option:

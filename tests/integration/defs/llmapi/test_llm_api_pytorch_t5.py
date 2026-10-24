@@ -20,6 +20,8 @@ import pytest
 from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -30,7 +32,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig,
 )
 
-from ..conftest import llm_models_root
+from ..conftest import llm_models_root, skip_pre_ada
 
 _SOURCE_TEXT = "translate English to German: The house is wonderful."
 _MIXED_ENCODER_SOURCE_TEXTS = [
@@ -738,6 +740,57 @@ def _run_t5_pytorch_generate_encoder_decoder(
             exact_match,
             expected_output_token_ids_by_output,
         )
+
+
+@skip_pre_ada
+def test_t5_pytorch_fp8_self_cache_with_model_dtype_cross_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    model_path = _get_t5_model_path("t5-small")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        dtype="bfloat16",
+        model_kwargs={"torch_dtype": "bfloat16"},
+        cuda_graph_config=None,
+        disable_overlap_scheduler=True,
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            dtype="fp8",
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            use_kv_cache_manager_v2=False,
+        ),
+        max_batch_size=1,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+    ) as llm:
+        resources = llm._executor.engine.resource_manager
+        self_cache = resources.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+        cross_cache = resources.get_resource_manager(ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        assert self_cache.dtype == DataType.FP8
+        assert cross_cache.dtype == DataType.BF16
+
+        previous_token_ids = None
+        for _ in range(3):
+            response = llm.generate(_SOURCE_TEXT, _sampling_params(1, 1), use_tqdm=False)
+            token_ids = _assert_t5_response(response, num_return_sequences=1)
+            _assert_expected_generation(
+                tokenizer, token_ids, exact_match=False, expected_token_ids_by_output=None
+            )
+            if previous_token_ids is not None:
+                assert token_ids == previous_token_ids
+            previous_token_ids = token_ids
 
 
 @pytest.mark.parametrize(
