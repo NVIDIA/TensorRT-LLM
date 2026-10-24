@@ -105,7 +105,7 @@ add_tllm_gtest(
 
 add_tllm_gtest(
   contextTransferCoordinatorTest SOURCES contextTransferCoordinatorTest.cpp
-  FULL_STACK LABELS "unit;full-stack")
+  FULL_STACK LABELS "unit;full-stack;host")
 
 add_tllm_gtest(
   evictionPolicyTest
@@ -360,7 +360,7 @@ add_tllm_gtest(
   "unit;full-stack;gpu")
 
 add_tllm_gtest(rnnCacheFormatterTest SOURCES rnnCacheFormatterTest.cpp
-               FULL_STACK LABELS "unit;full-stack")
+               FULL_STACK LABELS "unit;full-stack;host")
 
 add_tllm_gtest(
   agentTreeTest

@@ -76,7 +76,7 @@ add_tllm_gtest(
   "unit;executor;gpu"
   REQUIRES_GPU)
 add_tllm_gtest(serializeUtilsTest SOURCES serializeUtilsTest.cpp FULL_STACK
-               LABELS "unit;full-stack")
+               LABELS "unit;full-stack;host")
 add_tllm_gtest(
   loraConfigTest
   OWNER
@@ -99,7 +99,7 @@ add_tllm_gtest(
   LABELS
   "unit;executor;host")
 add_tllm_gtest(genUniqueAgentNameTest SOURCES genUniqueAgentNameTest.cpp
-               FULL_STACK LABELS "unit;full-stack")
+               FULL_STACK LABELS "unit;full-stack;host")
 target_link_libraries(genUniqueAgentNameTest PRIVATE ${Python3_LIBRARIES})
 add_tllm_gtest(
   ucxCommTest

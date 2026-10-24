@@ -182,7 +182,7 @@ add_tllm_gtest(
   "unit;runtime;gpu"
   REQUIRES_GPU)
 add_tllm_gtest(workerPoolTest SOURCES workerPoolTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
+               "unit;full-stack;host")
 add_tllm_gtest(
   worldConfigTest
   OWNER

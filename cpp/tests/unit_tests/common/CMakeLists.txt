@@ -14,7 +14,7 @@
 # the License.
 
 add_tllm_gtest(cudaProfilerUtilsTest SOURCES cudaProfilerUtilsTest.cpp
-               FULL_STACK LABELS "unit;full-stack")
+               FULL_STACK LABELS "unit;full-stack;host")
 add_tllm_gtest(
   cudaUtilsTest
   OWNER
@@ -26,8 +26,14 @@ add_tllm_gtest(
   LABELS
   "unit;common;gpu"
   REQUIRES_GPU)
-add_tllm_gtest(attentionWorkspaceTest SOURCES attentionWorkspaceTest.cpp
-               FULL_STACK LABELS "unit;full-stack")
+add_tllm_gtest(
+  attentionWorkspaceTest
+  SOURCES
+  attentionWorkspaceTest.cpp
+  FULL_STACK
+  REQUIRES_GPU
+  LABELS
+  "unit;full-stack;gpu")
 add_tllm_gtest(
   memoryUtilsTest
   OWNER
