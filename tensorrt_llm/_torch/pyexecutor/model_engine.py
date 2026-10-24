@@ -1122,7 +1122,9 @@ class PyTorchModelEngine(ModelEngine):
         engine limits alone before warmup's first forward, so they plan the
         warmup forwards' batches (``_plan_warmup_batch``), and queue the
         batches tune ahead will run at the end of warmup
-        (``JitPrefetcher.queue_early_batches``)."""
+        (``JitPrefetcher.queue_early_batches``). MiniMax-M3's MSA decode
+        provider is registered too: it plans each decode launch class as
+        warmup records it (``JitPrefetcher.plan_recorded``)."""
         try:
             from ..jit_prefetch import JitPrefetcher
             prefetcher = JitPrefetcher.get()
@@ -1130,6 +1132,20 @@ class PyTorchModelEngine(ModelEngine):
                 return
             self._register_tune_ahead_providers(prefetcher)
             prefetcher.queue_early_batches()
+            if self._uses_minimax_m3_sparse():
+                from ..attention.backends.sparse.minimax_m3 import \
+                    jit_prefetch_msa
+                prefetcher.register(
+                    "minimax_m3_msa",
+                    jit_prefetch_msa.MiniMaxM3MsaDecodeProvider(
+                        self.batch_size))
+                # The first warmup's, which keeps the classes it planned.
+                msa_provider = prefetcher.registered("minimax_m3_msa")
+                jit_prefetch_msa.set_on_new_record(
+                    lambda: prefetcher.plan_recorded(msa_provider))
+                if msa_provider:
+                    # Launches recorded before the first forward (prewarms).
+                    prefetcher.plan_recorded(msa_provider)
         except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
             logger.warning(
                 f"[JIT prefetch] Triton providers not started before warmup: "

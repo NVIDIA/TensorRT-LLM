@@ -333,3 +333,23 @@ def test_layer_module_helpers_are_joined_before_the_first_forward(monkeypatch):
     assert jp.wait_flashinfer_layer_builds() is None
     assert jp.wait_flashinfer_build() is not None
     assert jp._fi_builds == []
+
+
+@pytest.mark.cpu_only
+def test_recorded_launches_are_planned_on_a_thread_of_their_own(prefetcher):
+    """A launch class warmup records is planned off the launching thread, on
+    a thread the idle-helper retirement waits for."""
+    p = prefetcher
+    seen = []
+
+    class Recorded:
+        def plan_all(self):
+            seen.append(threading.current_thread().name)
+            return []
+
+    p.plan_recorded(Recorded())
+    threads = list(p._enum_threads)
+    assert [t.name for t in threads] == ["jit_prefetch_recorded"]
+    for t in threads:
+        t.join(10.0)
+    assert seen == ["jit_prefetch_recorded"]

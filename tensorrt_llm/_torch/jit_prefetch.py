@@ -1226,7 +1226,7 @@ class JitPrefetcher:
         self.stats_on = stats_enabled()
         self.stats = _Stats()
         self._providers: List[Callable[[Any], List[KernelCall]]] = []
-        self._provider_names: set = set()
+        self._provider_names: Dict[str, Any] = {}
         self._spec_prio: Dict[str, int] = {}
         # ids of the providers a background enumeration has covered.
         self._enumerated: set = set()
@@ -1778,7 +1778,7 @@ class JitPrefetcher:
         """
         if name in self._provider_names:
             return False
-        self._provider_names.add(name)
+        self._provider_names[name] = provider
         self._providers.append(provider)
         modules = list(getattr(provider, "kernel_modules", ()) or ())
         if modules and self.prefetch:
@@ -1786,6 +1786,10 @@ class JitPrefetcher:
             for proc in self._procs_by_kind.get("triton", []):
                 self._write_line(proc, line)
         return True
+
+    def registered(self, name: str) -> Optional[Any]:
+        """The provider registered under ``name``, or None."""
+        return self._provider_names.get(name)
 
     # -- executor thread -------------------------------------------------
     def bind_executor_thread(self) -> None:
@@ -2177,6 +2181,31 @@ class JitPrefetcher:
         if queued:
             self._event(f"warmup batch: {queued} variant(s) queued")
         return queued
+
+    def plan_recorded(self, provider) -> None:
+        """Queue, ahead of other work and on a thread of its own, the
+        variants of the launch classes ``provider`` recorded in warmup and has
+        not planned yet (``provider.plan_all``). Called as warmup records a
+        new class, so its later launches of that class, at other batch sizes
+        and in the CUDA graph captures, find their variants built or being
+        built instead of compiling them one after another."""
+        if not self.prefetch:
+            return
+
+        def plan() -> None:
+            try:
+                calls = provider.plan_all()
+            except Exception as e:  # noqa: BLE001 - its launches compile in place
+                logger.warning_once(
+                    f"[JIT prefetch] recorded launches not planned: {type(e).__name__}: {e}",
+                    key=f"jitp_recorded_{type(provider).__name__}",
+                )
+                return
+            queued = sum(self._plan_call(call, priority=_PRIO_URGENT) for call in calls)
+            if queued:
+                self._event(f"recorded launches: {queued} variant(s) queued")
+
+        self._start_enumeration(plan, "jit_prefetch_recorded")
 
     def queue_early_batches(self) -> int:
         """Queue, at batch priority and without waiting, the variants of the

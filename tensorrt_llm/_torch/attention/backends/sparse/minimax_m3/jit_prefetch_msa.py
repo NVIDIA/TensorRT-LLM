@@ -25,7 +25,9 @@ alignment of the strided query and top-k views it is given.
 The launcher is wrapped while warmup runs (``start_recording`` /
 ``stop_recording``), recording one call per launch class: every tensor argument
 described by its layout without its per-token or per-request dimension, and
-the scalars. The provider then replays each record on ``meta`` tensors under
+the scalars. As soon as a launch class is recorded (``set_on_new_record``),
+so that warmup's later launches of it find their variants built or being
+built, the provider replays the record on ``meta`` tensors under
 ``shadow_launches`` for every generation request count up to the engine's
 (times the decode span for the token count), with each row-sliced argument
 whose alignment a row offset can change aligned and not: the launcher's own
@@ -43,7 +45,7 @@ import inspect
 import itertools
 import threading
 from types import SimpleNamespace
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -60,6 +62,8 @@ _RECORDS: Dict[tuple, Tuple[Any, Dict[str, tuple]]] = {}
 _LOCK = threading.Lock()
 _PATCHES: List[Tuple[Any, str, Any]] = []
 _RECORDING = False
+# Called after each new launch class is recorded (set_on_new_record).
+_ON_NEW_RECORD: Optional[Callable[[], None]] = None
 
 
 def _aligned(t: torch.Tensor) -> bool:
@@ -108,7 +112,20 @@ def _record(launcher, sig: inspect.Signature, args, kwargs) -> None:
         specs[param] = _spec(param, value)
     key = tuple(sorted(specs.items(), key=lambda kv: kv[0]))
     with _LOCK:
+        new = key not in _RECORDS
         _RECORDS.setdefault(key, (launcher, specs))
+    hook = _ON_NEW_RECORD
+    if new and hook is not None:
+        hook()
+
+
+def set_on_new_record(hook: Optional[Callable[[], None]]) -> None:
+    """Call ``hook`` after each launch class recorded from here on, until
+    recording stops: JIT compile ahead plans the class's other batches then,
+    while warmup still runs, rather than after warmup. The hook runs on the
+    launching thread, before the launch, so it must not block."""
+    global _ON_NEW_RECORD
+    _ON_NEW_RECORD = hook
 
 
 def start_recording() -> None:
@@ -136,9 +153,10 @@ def start_recording() -> None:
 
 
 def stop_recording() -> None:
-    """Stop recording and restore the launcher."""
-    global _RECORDING
+    """Stop recording, drop the new-record hook, and restore the launcher."""
+    global _RECORDING, _ON_NEW_RECORD
     _RECORDING = False
+    _ON_NEW_RECORD = None
     while _PATCHES:
         owner, attr, orig = _PATCHES.pop()
         setattr(owner, attr, orig)

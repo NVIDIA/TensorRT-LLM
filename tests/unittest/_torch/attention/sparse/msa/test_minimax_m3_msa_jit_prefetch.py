@@ -145,3 +145,29 @@ def test_a_block_table_of_another_width_reuses_the_kernels(blocks):
         assert real, "no launches"
         missing = real - planned
         assert not missing, f"width {final} after {estimation}: unplanned {sorted(missing)}"
+
+
+def test_each_new_launch_class_calls_the_new_record_hook_once():
+    """Warmup plans a decode launch class as soon as it records it: the hook
+    runs once per new class, not again for a launch of a class recorded
+    before, and no longer once recording stops."""
+    jpm._RECORDS.clear()
+    calls = []
+    jpm.start_recording()
+    try:
+        jpm.set_on_new_record(lambda: calls.append(jpm.recorded_launch_classes()))
+        eng = _Engine()
+        eng.decode(0, 2)
+        eng.decode(0, 5)
+        assert calls == [1]
+        _Engine(blocks=MAX_BLOCKS + 1).decode(0, 2)
+        assert calls == [1, 2]
+        torch.cuda.synchronize()
+    finally:
+        jpm.stop_recording()
+    jpm.start_recording()
+    try:
+        _Engine(blocks=MAX_BLOCKS + 2).decode(0, 2)
+    finally:
+        jpm.stop_recording()
+    assert calls == [1, 2]
