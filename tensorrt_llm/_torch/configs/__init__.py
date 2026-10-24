@@ -81,6 +81,7 @@ def _register_custom_configs_with_transformers() -> None:
         "cosmos3_edge_projector": Cosmos3EdgeProjectorConfig,
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
+        "xing4_0": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
         # DeepSeek-V4.1 composite multimodal config ("deepseek_v41") plus its two
         # sub-configs. V4.1 is NOT config-compatible with V4 (the compress_ratios
