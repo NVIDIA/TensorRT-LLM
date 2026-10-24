@@ -281,6 +281,12 @@ public:
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
     {
+        bool const hasVariableWindowStarts = params.variableWindowTokenStartsPtr != nullptr;
+        bool const hasVariableWindowEnds = params.variableWindowTokenEndsPtr != nullptr;
+        if (hasVariableWindowStarts != hasVariableWindowEnds)
+        {
+            return std::make_pair(false, "VariableWindow requires both start and end bound arrays");
+        }
         // Some conditions to check if the kernel is supported.
         // This is meant to avoid occupying unnecessary hashId bits.
         if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
@@ -511,6 +517,13 @@ public:
         {
             return;
         }
+
+        bool const hasVariableWindowStarts = params.variableWindowTokenStartsPtr != nullptr;
+        bool const hasVariableWindowEnds = params.variableWindowTokenEndsPtr != nullptr;
+        TLLM_CHECK_WITH_INFO(hasVariableWindowStarts == hasVariableWindowEnds,
+            "VariableWindow requires both start and end bound arrays.");
+        TLLM_CHECK_WITH_INFO(isVariableWindowMask(params.mMaskType) == hasVariableWindowStarts,
+            "VariableWindow mask type and bound arrays must be provided together.");
 
         // Keep the additional fail-fast validation Rubin-only so other architectures retain their existing behavior.
         // The output and scale-buffer shape are already validated by the Python caller; the inverse-RoPE cache has no
