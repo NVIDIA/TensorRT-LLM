@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exports of a response that is dropped on its way to the client.
 
-A multimodal encoder's response carries its embeddings and MRoPE positions as exported
-handles, which only a consumer that opens them, or ``release_dict``, consumes. The
-exports here are CPU tensors: each lives in a ``/dev/shm`` file until its handles are
-consumed.
+A multimodal encoder's response carries its MRoPE positions by value. Its CPU
+embeddings live in ``/dev/shm`` until a consumer or ``release_dict`` opens them.
 """
 
 import base64
@@ -38,14 +36,9 @@ def _exporting_response() -> tuple[LlmResponse, set[Path]]:
     py_result = PyResult(prompt_len=1, max_new_tokens=1)
     py_result.append_mm_embeddings(torch.ones(2, 1024), [1, 1])
     py_result.set_mrope_position(torch.zeros(3, 1024), torch.zeros(1024))
-    handles = [
-        *py_result.mm_embedding_handles,
-        py_result.mrope_position_ids_handle,
-        py_result.mrope_position_deltas_handle,
-    ]
     files = {
         Path("/dev/shm") / base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
-        for handle in handles
+        for handle in py_result.mm_embedding_handles
     }
     response = LlmResponse(
         request_id=CLIENT_ID,
