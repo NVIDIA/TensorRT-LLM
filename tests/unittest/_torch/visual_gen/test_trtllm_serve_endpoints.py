@@ -2641,27 +2641,25 @@ class TestRouteEngineValidationError:
 
 
 class TestNonVisualGenValidationResponse:
-    """Validation failures on non-visual-gen roles use the shared
-    ``OpenAIServer`` response shape (HTTP 400 + ``{"error": ...}``)
-    that existing integration coverage and clients expect (e.g.
-    ``test_malformed_json_request``). Only the visual-gen role swaps
-    in the LLM envelope.
+    """Validation failures answer through ``OpenAIServer._request_validation_error``.
 
-    The assertion is checked at the handler-closure level: rebuild
-    the exact dispatch installed in :meth:`OpenAIServer.__init__`
-    against a minimal FastAPI app so the assertion stays narrow and
-    the test doesn't need to spin up a full LLM-role server."""
+    Every role but visual generation answers HTTP 400 with OpenAI's
+    ``{"error": {"message", "type", "param", "code"}}``; visual generation
+    keeps its own 422 envelope. The server's own handler is installed on a
+    minimal app, so the test needs no model."""
 
-    def _build_app_with_dispatch(self, role):
-        """Return a FastAPI app wired with the production handler
-        dispatch, where ``role`` controls the branch the handler takes
-        on a ``RequestValidationError``."""
+    def _client(self, role):
         from fastapi import FastAPI
         from fastapi.exceptions import RequestValidationError
-        from fastapi.responses import JSONResponse
         from pydantic import BaseModel
 
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        server = object.__new__(OpenAIServer)
+        server.server_role = role
+        server.metrics_collector = None
         app = FastAPI()
+        app.add_exception_handler(RequestValidationError, server._request_validation_error)
 
         class _Body(BaseModel):
             messages: list
@@ -2670,54 +2668,31 @@ class TestNonVisualGenValidationResponse:
         async def _route(body: _Body):
             return {"ok": True}
 
-        @app.exception_handler(RequestValidationError)
-        async def _handler(_, exc):
-            if role == "VISUAL_GEN":
-                return _llm_envelope_branch(exc)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+        return TestClient(app)
 
-        # Mirror :meth:`OpenAIServer._create_visual_gen_validation_error_response`
-        # inline so the test does not depend on instance state.
-        def _llm_envelope_branch(exc):
-            from http import HTTPStatus
+    def test_non_visual_gen_role_returns_the_openai_error_object(self):
+        from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
-            from tensorrt_llm.serve.openai_protocol import ErrorResponse
-
-            error = ErrorResponse(
-                message="Validation failed",
-                type="BadRequestError",
-                code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
-            )
-            return JSONResponse(
-                content=error.model_dump(),
-                status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
-            )
-
-        return app
-
-    def test_non_visual_gen_role_returns_shared_400_error_body(self):
-        """Non-visual-gen roles return HTTP 400 with the shared
-        ``{"error": str(exc)}`` body that ``test_malformed_json_request``
-        and existing clients depend on."""
-        client = TestClient(self._build_app_with_dispatch(role="CONTEXT"))
-        resp = client.post("/route", json={"not_messages": []})
+        resp = self._client(ServerRole.CONTEXT).post("/route", json={"not_messages": []})
         assert resp.status_code == 400
-        body = resp.json()
-        assert "error" in body
-        assert isinstance(body["error"], str)
-        # The visual-gen LLM envelope must not leak into non-VG paths.
-        assert "object" not in body
-        assert "type" not in body
-        assert "code" not in body
+        assert resp.json() == {
+            "error": {
+                "message": "Missing required parameter: 'messages'.",
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": None,
+            }
+        }
 
-    def test_visual_gen_role_uses_llm_envelope(self):
-        client = TestClient(self._build_app_with_dispatch(role="VISUAL_GEN"))
-        resp = client.post("/route", json={"not_messages": []})
+    def test_visual_gen_role_uses_its_422_envelope(self):
+        from tensorrt_llm.llmapi.disagg_utils import ServerRole
+
+        resp = self._client(ServerRole.VISUAL_GEN).post("/route", json={"not_messages": []})
         assert resp.status_code == 422
         body = resp.json()
         assert body["type"] == "BadRequestError"
         assert body["code"] == 422
-        assert "message" in body
+        assert "messages" in body["message"]
 
 
 # =========================================================================

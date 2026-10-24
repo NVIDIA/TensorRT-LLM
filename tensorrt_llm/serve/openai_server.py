@@ -104,8 +104,9 @@ from tensorrt_llm.serve.openai_protocol import (
     ResponseFormat, ResponsesRequest, ResponsesResponse,
     RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
     TokenizeResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    ensure_request_chat_template_allowed, summarize_validation_errors,
+    to_llm_conversation_params, to_llm_disaggregated_params,
+    validation_error_body)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -854,24 +855,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app = FastAPI(lifespan=lifespan)
         self.app.router.route_class = _MsgspecRoute
 
-        @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(request, exc):
-            if request.url.path.startswith("/v1/messages"):
-                # Anthropic clients expect a 400 with the Anthropic error
-                # envelope, not FastAPI's 422 shape.
-                if self.metrics_collector:
-                    self.metrics_collector.log_request_error(http_code=400)
-                return anthropic_error_response(str(exc),
-                                                "invalid_request_error", 400)
-            if self.server_role is ServerRole.VISUAL_GEN:
-                return self._create_visual_gen_validation_error_response(exc)
-            # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
-            # response shape that integration tests (e.g.
-            # ``test_malformed_json_request``) and existing clients
-            # expect.
-            if self.metrics_collector:
-                self.metrics_collector.log_request_error(http_code=400)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+        self.app.add_exception_handler(RequestValidationError,
+                                       self._request_validation_error)
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -1257,6 +1242,30 @@ class OpenAIServer(_VideoRoutesMixin):
             message=message,
             status_code=HTTPStatus.NOT_IMPLEMENTED,
         )
+
+    async def _request_validation_error(
+            self, request: Request, exc: RequestValidationError) -> Response:
+        """Answer a request whose body failed validation with a 400.
+
+        /v1/messages answers in the Anthropic envelope, visual generation in
+        its own, and every other route in OpenAI's ``{"error": {...}}``,
+        whose top-level ``error`` key existing clients look for. The message
+        comes from ``exc.errors()``, never ``str(exc)``: that quotes every
+        rejected value (an inline image is megabytes of base64) and names the
+        endpoint's source file and line.
+        """
+        if request.url.path.startswith("/v1/messages"):
+            if self.metrics_collector:
+                self.metrics_collector.log_request_error(http_code=400)
+            message, _ = summarize_validation_errors(exc.errors())
+            return anthropic_error_response(message, "invalid_request_error",
+                                            400)
+        if self.server_role is ServerRole.VISUAL_GEN:
+            return self._create_visual_gen_validation_error_response(exc)
+        if self.metrics_collector:
+            self.metrics_collector.log_request_error(http_code=400)
+        return JSONResponse(status_code=400,
+                            content=validation_error_body(exc.errors()))
 
     def _create_visual_gen_validation_error_response(
             self, exc: RequestValidationError) -> Response:

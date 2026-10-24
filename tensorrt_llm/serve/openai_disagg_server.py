@@ -62,7 +62,8 @@ from tensorrt_llm.serve.openai_disagg_service import (
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
     ConversationParams, ErrorResponse, UCompletionRequest, UCompletionResponse,
-    ensure_request_chat_template_allowed)
+    ensure_request_chat_template_allowed, summarize_validation_errors,
+    validation_error_body)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -296,35 +297,42 @@ class OpenAIDisaggServer:
                 writer=self._perf_metrics_writer)
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
-        # Log request-body validation failures so a client/server schema mismatch
-        # shows up server-side. Throttled (first, then every 1000th) to avoid
-        # flooding the event loop when every request fails identically.
         self._val_err_n = 0
-        @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(request: Request, exc):
-            self._perf_metrics_collector.validation_exceptions.inc()
-            # Anthropic clients parse the error envelope, so every /v1/messages
-            # route must fail in that shape rather than the generic one below.
-            if request.url.path.startswith("/v1/messages"):
-                return anthropic_error_response(str(exc),
-                                                "invalid_request_error", 400)
-            self._val_err_n += 1
-            if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
-                try:
-                    errs = exc.errors()
-                    # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
-                    brief = [{"loc": e.get("loc"), "type": e.get("type"),
-                              "msg": e.get("msg")} for e in errs][:8]
-                except Exception:  # noqa: BLE001
-                    brief = str(exc)[:500]
-                method = request.method.translate(_LOG_CONTROL_CHARACTERS)
-                path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
-                logger.warning(
-                    f"[validation] {method} {path} 400 "
-                    f"(n={self._val_err_n}): {brief}")
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+        self.app.add_exception_handler(RequestValidationError,
+                                       self._request_validation_error)
 
         self.register_routes()
+
+    async def _request_validation_error(
+            self, request: Request, exc: RequestValidationError) -> Response:
+        """Answer a request whose body failed validation with a 400.
+
+        /v1/messages answers in the Anthropic envelope, which Anthropic clients
+        parse, and every other route in OpenAI's ``{"error": {...}}``. The
+        message comes from ``exc.errors()``, never ``str(exc)``, which quotes
+        every rejected value and names the endpoint's source file and line.
+
+        Failures are also logged so a client/server schema mismatch shows up
+        server-side, throttled (first, then every 1000th) so a client whose
+        every request fails the same way cannot flood the event loop.
+        """
+        self._perf_metrics_collector.validation_exceptions.inc()
+        if request.url.path.startswith("/v1/messages"):
+            message, _ = summarize_validation_errors(exc.errors())
+            return anthropic_error_response(message, "invalid_request_error",
+                                            400)
+        self._val_err_n += 1
+        if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
+            # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
+            brief = [{"loc": e.get("loc"), "type": e.get("type"),
+                      "msg": e.get("msg")} for e in exc.errors()][:8]
+            method = request.method.translate(_LOG_CONTROL_CHARACTERS)
+            path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
+            logger.warning(
+                f"[validation] {method} {path} 400 "
+                f"(n={self._val_err_n}): {brief}")
+        return JSONResponse(status_code=400,
+                            content=validation_error_body(exc.errors()))
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
         async def disagg_id_generator():
