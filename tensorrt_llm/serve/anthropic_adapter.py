@@ -1062,8 +1062,20 @@ async def reframe_openai_stream(
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames."""
     reframer = AnthropicStreamReframer(model=model)
+    done = False
+    # The frames that close the message, held from [DONE] until the upstream
+    # has been read to its end.
+    closing_frames: List[str] = []
     try:
         async for line in _iter_openai_sse_lines(openai_sse):
+            if done:
+                # The upstream is read to its end before the message is closed:
+                # the chat stream records the request's metrics after its last
+                # frame, and a consumer that stops reading at message_stop would
+                # leave it suspended at [DONE], to be closed there (GeneratorExit)
+                # without doing that work. A relayed byte stream likewise ends
+                # cleanly at the worker's EOF.
+                continue
             line = line.strip()
             if not line.startswith("data:"):
                 continue
@@ -1071,15 +1083,19 @@ async def reframe_openai_stream(
             if not data:
                 continue
             if data == "[DONE]":
-                for frame in reframer.finish():
-                    yield frame
-                return
+                closing_frames = reframer.finish()
+                done = True
+                continue
             try:
                 chunk = ChatCompletionStreamResponse(**json.loads(data))
             except (json.JSONDecodeError, ValueError) as e:
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
+        if done:
+            for frame in closing_frames:
+                yield frame
+            return
         # Upstream ended without [DONE]. Both streaming producers emit it only
         # after the response is complete, so its absence means the stream was
         # cut short. Calling finish() here would close the message with
@@ -1097,5 +1113,11 @@ async def reframe_openai_stream(
             yield frame
     except Exception as e:  # noqa: BLE001 - stream must end with an event
         logger.error(f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}")
+        if done:
+            # The response was complete at [DONE], so a failure while reading
+            # the rest of the upstream is logged and the message still closes.
+            for frame in closing_frames:
+                yield frame
+            return
         for frame in reframer.error("Internal server error"):
             yield frame
