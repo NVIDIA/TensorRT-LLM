@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import errno
 import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -977,9 +978,9 @@ class TestDisaggIdRegenOnRetry:
 class TestSelectiveTransientTcpRetry:
     """Selective retry budget for transient TCP race symptoms.
 
-    ServerDisconnectedError and ConnectionResetError (which include
-    aiohttp.ClientConnectionResetError via MRO) get an extended retry budget
-    of up to 5 attempts; all other client errors keep the original
+    ServerDisconnectedError and connection resets, including aiohttp's
+    ClientOSError wrapper, get an extended budget of up to 5 retries;
+    all other client errors keep the original
     max_retries fail-fast behaviour.
     """
 
@@ -1072,30 +1073,40 @@ class TestSelectiveTransientTcpRetry:
         assert session.post.call_count == 5
 
     @pytest.mark.asyncio
-    async def test_connection_reset_gets_extra_retries(self):
-        """ConnectionResetError: same extra budget as ServerDisconnectedError."""
+    @pytest.mark.parametrize("error_type", [ConnectionResetError, aiohttp.ClientOSError])
+    async def test_connection_reset_gets_extra_retries(self, error_type):
+        """OS connection resets recover after more than the ordinary retry budget."""
         session = AsyncMock(spec=aiohttp.ClientSession)
         client = self._make_client(session, max_retries=1)
 
         session.post.side_effect = [
-            ConnectionResetError(),
-            ConnectionResetError(),
+            error_type(errno.ECONNRESET, "Connection reset by peer"),
+            error_type(errno.ECONNRESET, "Connection reset by peer"),
             self._mock_http_ok(self._ok_response()),
         ]
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            await client.send_request(self._make_request())
+            response = await client.send_request(self._make_request())
 
+        assert response.choices[0].text == "ok"
         # 1 original + 2 retries = 3 total attempts (within extra budget)
         assert session.post.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_other_client_error_keeps_fail_fast(self):
-        """Generic aiohttp.ClientError still respects max_retries (=1)."""
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ClientError("transient non-tcp"),
+            aiohttp.ClientOSError(errno.ECONNREFUSED, "Connection refused"),
+            aiohttp.ClientOSError(errno.EACCES, "Permission denied"),
+        ],
+    )
+    async def test_other_client_error_keeps_fail_fast(self, error):
+        """Errors other than a transient reset respect max_retries (=1)."""
         session = AsyncMock(spec=aiohttp.ClientSession)
         client = self._make_client(session, max_retries=1)
 
-        session.post.side_effect = aiohttp.ClientError("transient non-tcp")
+        session.post.side_effect = error
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(aiohttp.ClientError):
@@ -1121,28 +1132,42 @@ class TestSelectiveTransientTcpRetry:
         assert session.post.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_no_retry_env_disables_all_http_retries(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ServerDisconnectedError(),
+            aiohttp.ClientOSError(errno.ECONNRESET, "Connection reset by peer"),
+        ],
+    )
+    async def test_no_retry_env_disables_all_http_retries(self, monkeypatch, error):
         monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
         session = AsyncMock(spec=aiohttp.ClientSession)
         with patch("tensorrt_llm.serve.openai_client.logger.info") as log_info:
             client = self._make_client(session, max_retries=5)
         assert "TRTLLM_DISAGG_NO_RETRY=1" in log_info.call_args.args[0]
-        session.post.side_effect = aiohttp.ServerDisconnectedError()
-        with pytest.raises(aiohttp.ServerDisconnectedError):
+        session.post.side_effect = error
+        with pytest.raises(type(error)):
             await client.send_request(self._make_request())
         assert session.post.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_transient_tcp_capped_at_5_when_max_retries_smaller(self):
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ServerDisconnectedError(),
+            aiohttp.ClientOSError(errno.ECONNRESET, "Connection reset by peer"),
+        ],
+    )
+    async def test_transient_tcp_capped_at_5_when_max_retries_smaller(self, error):
         """If transient TCP keeps failing, give up after the extended budget."""
         session = AsyncMock(spec=aiohttp.ClientSession)
         client = self._make_client(session, max_retries=1)
 
         # Always raise — must give up after extended (1 + 5) = 6 attempts
-        session.post.side_effect = aiohttp.ServerDisconnectedError()
+        session.post.side_effect = error
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            with pytest.raises(aiohttp.ServerDisconnectedError):
+            with pytest.raises(type(error)):
                 await client.send_request(self._make_request())
 
         # 1 original + 5 retries
@@ -1180,7 +1205,7 @@ class TestRequestCleanup:
             if stream:
                 _ = [chunk async for chunk in response]
 
-        assert mock_session.post.call_count == 2
+        assert mock_session.post.call_count == 6
         mock_router.finish_request.assert_awaited_once_with(
             completion_request, mock_session, success=False, req_id=42
         )
@@ -1233,9 +1258,15 @@ class TestRequestCleanup:
     async def test_failure_after_first_chunk_finishes_once_without_retry(
         self, client, streaming_completion_request, mock_session, mock_router, error_type
     ):
+        error = (
+            error_type(errno.ECONNRESET, "Connection reset by peer")
+            if issubclass(error_type, OSError)
+            else error_type("stream failed")
+        )
+
         async def chunks():
             yield b'data: "first"\n\n'
-            raise error_type("stream failed")
+            raise error
 
         http_response = self._response(chunks)
         mock_session.post.return_value = http_response
@@ -1468,7 +1499,11 @@ class TestRemoteTailHandoffRetry:
         openai_client._bounded_replay_on_generation = bounded_replay
         openai_client._metrics_collector = MagicMock()
         openai_client._disagg_id_generator = AsyncMock(return_value=999)
-        mock_session.post.side_effect = error_type("connection failed")
+        mock_session.post.side_effect = (
+            error_type(errno.ECONNRESET, "Connection reset by peer")
+            if issubclass(error_type, OSError)
+            else error_type("connection failed")
+        )
         request = CompletionRequest(
             model="m",
             prompt="hi",
