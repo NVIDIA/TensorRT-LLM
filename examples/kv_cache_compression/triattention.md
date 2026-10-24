@@ -31,6 +31,43 @@ TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager o
 4. MHA, MLA, SSM/hybrid pools, and native sliding-eviction layouts such as Gemma 4 are not supported. The current SWA path covers models such as GPT-OSS whose V2 pools remain full length and whose attention kernel applies the window.
 5. Speculative decoding is supported for one-model MTP and EAGLE3 with `eviction_mode="union"`. Tensor parallelism beyond TP1, attention DP, and disaggregated serving have not yet been validated end to end.
 
+6. The Blackwell TopK selector supports `budget` values up to 16384. Larger values are rejected when the compression manager is constructed, before calibration loading or GPU workspace initialization.
+
+## Workspace lifetime
+
+TriAttention allocates its resident eviction buffers when it binds the KV cache
+manager, before profiling finishes sizing the final KV pool. This storage is
+included in the measured non-KV peak; it must not be reserved a second time.
+Initialization also launches the single-request local scoring, selection, and
+compaction kernels. Zero source lengths and move counts keep this warmup from
+reading or modifying KV data; it finishes before requests are admitted.
+
+| Storage | Lifetime and bound |
+| --- | --- |
+| Calibration and phase outputs | Resident; phase outputs have one row per request slot. Only active positions are evaluated, without a sequence-length-sized phase table. |
+| Raw scores | Resident fallback for one request, all scored layers and heads. The token axis covers the bounded decode selection window plus one 128-token alignment tile, not the prompt. |
+| Selection scores, statistics, top-k outputs, move indices | Resident at configured batch capacity, reused across rounds. These buffers retain the parallel fast path without rebuilding its metadata. |
+| Target/draft page-table snapshots | Resident at configured batch and sequence capacity, including protected tails. Pinned host staging is reused only after its H2D copy completes. |
+| Optional batch raw scores | Allocated before a multi-request round when device headroom permits; released after submission back to the CUDA allocator. The resident fallback stays allocated throughout. |
+
+If the optional allocation cannot fit, requests are scored, selected, and
+compacted individually using the resident storage. The single-request selector
+uses caller-owned outputs and the REREAD top-k implementation. Allocation failure
+before scoring also takes this fallback; errors after KV writes begin are not
+retried. Compression completion orders subsequent KV use, and each chunk stages
+its own metadata before reusing the scratch.
+
+Memory checks and optional allocations add CPU overhead on multi-request eviction
+steps. They do not run on decode steps where no request is due for eviction.
+Insufficient headroom trades eviction latency for bounded workspace usage.
+Auxiliary buffers still scale with the configured batch size; initialization can
+fail if the configuration's resident storage itself does not fit.
+
+The allocation-free fallback contract applies to TP1. Union mode at TP greater
+than one uses fixed single-request cohorts to keep collective ordering identical
+across ranks, but its existing all-gather still allocates an output. TP remains
+outside the end-to-end validated support matrix above.
+
 ## Calibration
 
 The calibration file is produced once per model with the official tool, then reused for every inference run with that model.
