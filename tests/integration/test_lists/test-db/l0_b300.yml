@@ -161,8 +161,6 @@ l0_b300:
   - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_weight_table.py
   - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/test_modeling_v2_no_stale_claims.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_pool_contract.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_weight_table.py
   - unittest/_torch/modeling_v2/test_modeling_v2_target_contract.py
   - unittest/_torch/modeling_v2/test_modeling_v2_weight_table.py
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
