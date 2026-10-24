@@ -375,12 +375,15 @@ class FlashInferAttention(AttentionBackend):
                 is_sf_swizzled_layout=True,
                 backend="cute-dsl",
             )
-            encoded = encoded.view(torch.float4_e2m1fn_x2)
             encoded = encoded.view(batch, heads, padded_sequence, dimension // 2)[:, :, :sequence]
             factors = factors.view(torch.float8_e4m3fn)
         else:
             raise ValueError(f"Unsupported static-global Q/K mode: {mode!r}.")
-        return encoded.transpose(1, 2).contiguous(), factors
+        encoded = encoded.transpose(1, 2).contiguous()
+        if mode == "nvfp4":
+            # Copy packed bytes before viewing Float4, whose deterministic fill is unsupported.
+            encoded = encoded.view(torch.float4_e2m1fn_x2)
+        return encoded, factors
 
     @staticmethod
     def _quantize_fp8_per_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -12,24 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""End-to-end smoke and BF16 golden-media tests for LTX-2.3.
+"""LTX-2.3 video and audio quality tests against upstream golden media.
 
-Only BF16 is compared against video LPIPS and audio log-STFT goldens.
-Generation and retake FP8/NVFP4 run smoke tests without golden comparisons. Override paths with
+BF16 on one/two GPUs, FP8, and NVFP4 share the same golden comparisons and
+strict deterministic execution. Override paths with
 LTX23_MODEL_PATH (generation checkpoint), LTX23_RETAKE_CHECKPOINT,
 LTX23_TEXT_ENCODER_PATH, and LTX23_GOLDEN_DIR.
 """
 
 import os
-import subprocess
-import sys
 
 import librosa
 import numpy as np
 import pytest
 import soundfile as sf
 import torch
-from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
     REPO_ROOT,
     _assert_lpips_below_threshold,
@@ -44,16 +41,6 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _run_reusable_video_lpips_eval,
     _save_lpips_video_mp4,
     _visual_gen_output_path,
-)
-
-LTX23_MODEL_PATH = os.environ.get(
-    "LTX23_MODEL_PATH", _lpips_model_path("LTX-2.3", "ltx-2.3-22b-dev.safetensors")
-)
-if os.path.isdir(LTX23_MODEL_PATH):
-    LTX23_MODEL_PATH = os.path.join(LTX23_MODEL_PATH, "ltx-2.3-22b-dev.safetensors")
-LTX23_TEXT_ENCODER_PATH = os.environ.get(
-    "LTX23_TEXT_ENCODER_PATH",
-    _lpips_model_path("gemma-3-12b-it-qat-q4_0-unquantized"),
 )
 
 LTX23_GOLDEN_DIR = os.environ.get("LTX23_GOLDEN_DIR")
@@ -71,7 +58,18 @@ LTX23_LPIPS_GUIDANCE_SCALE = 5.0
 LTX23_LPIPS_FRAME_RATE = 24.0
 LTX23_LPIPS_SEED = 42
 
-LTX23_LPIPS_THRESHOLD = 0.05
+LTX23_ACCURACY_CASES = (
+    pytest.param("bf16-1gpu", id="bf16"),
+    pytest.param("bf16-2gpu", id="bf16-2gpu"),
+    pytest.param("fp8-1gpu", id="fp8"),
+    pytest.param("fp4-1gpu", id="nvfp4"),
+)
+LTX23_LPIPS_THRESHOLDS = {
+    "bf16-1gpu": 0.05,
+    "bf16-2gpu": 0.05,
+    "fp8-1gpu": 0.20,
+    "fp4-1gpu": 0.40,
+}
 LTX23_AUDIO_LOG_STFT_THRESHOLD = 0.10
 
 LTX23_RETAKE_EXPECTED_FRAMES = 121
@@ -83,8 +81,34 @@ LTX23_RETAKE_AUDIO_SAMPLES = 240480
 LTX23_RETAKE_CHECKPOINT_ENV = "LTX23_RETAKE_CHECKPOINT"
 LTX23_RETAKE_LPIPS_FRAME_START = 48
 LTX23_RETAKE_LPIPS_FRAME_STOP = 120
-LTX23_RETAKE_LPIPS_THRESHOLD = 0.05
+LTX23_RETAKE_LPIPS_THRESHOLDS = {
+    "bf16-1gpu": 0.05,
+    "bf16-2gpu": 0.05,
+    "fp8-1gpu": 0.15,
+    "fp4-1gpu": 0.15,
+}
 LTX23_RETAKE_PROMPT = "the duck flaps hard and flies right out of the frame"
+
+
+def _ltx23_required_gpus(config_name: str) -> int:
+    required = 2 if config_name.endswith("2gpu") else 1
+    if torch.cuda.device_count() < required:
+        pytest.skip(f"LTX-2.3 {config_name} requires {required} GPUs")
+    return required
+
+
+def _ltx23_model_paths() -> tuple[str, str]:
+    # Resolve model-store paths after the distributed harness selects the installed wheel.
+    model_path = os.environ.get(
+        "LTX23_MODEL_PATH", _lpips_model_path("LTX-2.3", "ltx-2.3-22b-dev.safetensors")
+    )
+    if os.path.isdir(model_path):
+        model_path = os.path.join(model_path, "ltx-2.3-22b-dev.safetensors")
+    text_encoder_path = os.environ.get(
+        "LTX23_TEXT_ENCODER_PATH",
+        _lpips_model_path("gemma-3-12b-it-qat-q4_0-unquantized"),
+    )
+    return model_path, text_encoder_path
 
 
 def _ltx23_golden_media_path(tmp_path, media_name: str, label: str) -> str:
@@ -166,27 +190,29 @@ def _save_ltx23_retake_audio(
     _save_wav(audio.samples[..., : reference.frames], audio_path, audio.sample_rate)
 
 
-def _generate_ltx23_av(video_out_path, audio_out_path):
-    """Render the unquantized BF16 golden-test candidate into an MP4 plus a WAV."""
+def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, config_name):
+    """Render a configured golden-test candidate; only rank zero writes media."""
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import CompilationConfig, CudaGraphConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-    _require_exists(LTX23_MODEL_PATH, "LTX-2.3 dev checkpoint")
-    _require_exists(
-        LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True
-    )
+    model_path, text_encoder_path = _ltx23_model_paths()
+    _require_exists(model_path, "LTX-2.3 dev checkpoint")
+    _require_exists(text_encoder_path, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True)
 
     with _lpips_deterministic_algorithms():
-        args = VisualGenArgs(
-            model=LTX23_MODEL_PATH,
-            pipeline_config={"text_encoder_path": LTX23_TEXT_ENCODER_PATH},
-            cuda_graph_config=CudaGraphConfig(enable=True),
-            compilation_config=CompilationConfig(
-                resolutions=[(LTX23_LPIPS_HEIGHT, LTX23_LPIPS_WIDTH)],
-                num_frames=[LTX23_LPIPS_NUM_FRAMES],
-            ),
+        config_path = os.path.join(
+            REPO_ROOT, "examples", "visual_gen", "configs", f"ltx23-t2v-{config_name}.yaml"
         )
-        pipeline = PipelineLoader(args).load()
+        args = VisualGenArgs.from_yaml(config_path)
+        assert args.parallel_config.n_workers == world_size
+        args.model = model_path
+        args.pipeline_config = {
+            **args.pipeline_config,
+            "text_encoder_path": text_encoder_path,
+        }
+        args.compilation_config.resolutions = [(LTX23_LPIPS_HEIGHT, LTX23_LPIPS_WIDTH)]
+        args.compilation_config.num_frames = [LTX23_LPIPS_NUM_FRAMES]
+        pipeline = PipelineLoader(args, device=f"cuda:{rank}").load()
         try:
             with torch.no_grad():
                 out = pipeline.forward(
@@ -200,147 +226,136 @@ def _generate_ltx23_av(video_out_path, audio_out_path):
                     num_inference_steps=LTX23_LPIPS_NUM_INFERENCE_STEPS,
                     guidance_scale=LTX23_LPIPS_GUIDANCE_SCALE,
                 )
-            video = out.video.detach().cpu()
-            audio = out.audio.detach().cpu() if out.audio is not None else None
-            audio_rate = out.audio_sample_rate
+            if rank == 0:
+                video = out.video.detach().cpu()
+                audio = out.audio.detach().cpu() if out.audio is not None else None
+                audio_rate = out.audio_sample_rate
         finally:
             del pipeline
             _cleanup_cuda()
 
-    _save_lpips_video_mp4(video, video_out_path, frame_rate=LTX23_LPIPS_FRAME_RATE)
-    assert audio is not None, "LTX-2.3 render returned no audio"
-    _save_wav(audio, audio_out_path, audio_rate)
+    if rank == 0:
+        assert video.shape == (
+            1,
+            LTX23_LPIPS_NUM_FRAMES,
+            LTX23_LPIPS_HEIGHT,
+            LTX23_LPIPS_WIDTH,
+            3,
+        )
+        _save_lpips_video_mp4(video, video_out_path, frame_rate=LTX23_LPIPS_FRAME_RATE)
+        assert audio is not None, "LTX-2.3 render returned no audio"
+        assert torch.isfinite(audio).all(), "LTX-2.3 render returned non-finite audio"
+        assert audio_rate == 48000
+        _save_wav(audio, audio_out_path, audio_rate)
 
 
-@pytest.fixture(scope="session")
-def ltx23_av_candidate(tmp_path_factory):
-    """Render BF16 once per session; return the candidate (video, audio) paths."""
-    out_dir = str(tmp_path_factory.mktemp("ltx23_av"))
-    video_path = os.path.join(out_dir, "ltx23_candidate_video.mp4")
-    audio_path = os.path.join(out_dir, "ltx23_candidate_audio.wav")
-    _generate_ltx23_av(video_path, audio_path)
-    return video_path, audio_path
+@pytest.fixture(scope="session", params=LTX23_ACCURACY_CASES)
+def ltx23_av_candidate(request, llm_venv, _visual_gen_deps):
+    """Render each precision/parallel configuration once per session."""
+    from defs.examples.visual_gen.test_visual_gen_multi_gpu import run_test_in_distributed
+
+    config_name = request.param
+    num_gpus = _ltx23_required_gpus(config_name)
+    video_path = _visual_gen_output_path(llm_venv, f"ltx23_av_{config_name}")
+    audio_path = os.path.join(os.path.dirname(video_path), "ltx23_candidate_audio.wav")
+    with _lpips_deterministic_algorithms():
+        run_test_in_distributed(
+            num_gpus,
+            _generate_ltx23_av,
+            video_out_path=video_path,
+            audio_out_path=audio_path,
+            config_name=config_name,
+        )
+    return config_name, video_path, audio_path
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx23_lpips_against_golden(tmp_path, ltx23_av_candidate):
-    """Check BF16 video LPIPS and audio log-STFT against the frozen goldens."""
+def test_ltx23_lpips_against_golden(request, tmp_path, ltx23_av_candidate):
+    """Check every generation configuration against the upstream video/audio goldens."""
     video_golden_path = _ltx23_golden_media_path(
         tmp_path, "ltx23_generation_lpips_golden_video.mp4", "LTX-2.3 LPIPS golden video"
     )
     audio_golden_path = _ltx23_golden_media_path(
         tmp_path, "ltx23_generation_lpips_golden_audio.wav", "LTX-2.3 golden audio"
     )
-    video_path, audio_path = ltx23_av_candidate
+    config_name, video_path, audio_path = ltx23_av_candidate
+    threshold = LTX23_LPIPS_THRESHOLDS[config_name]
     score = _run_lpips_eval(
-        tmp_path, "ltx23", "video", LTX23_LPIPS_PROMPT, video_golden_path, video_path
+        tmp_path,
+        f"ltx23-{config_name}",
+        "video",
+        LTX23_LPIPS_PROMPT,
+        video_golden_path,
+        video_path,
     )
     distance = _audio_log_stft_distance(audio_path, audio_golden_path)
-    _assert_lpips_below_threshold(score, LTX23_LPIPS_THRESHOLD)
+    _preserve_lpips_candidate_on_failure(
+        request, score, threshold, video_path, f"ltx23_{config_name}_generated.mp4"
+    )
+    _assert_lpips_below_threshold(score, threshold)
     assert distance < LTX23_AUDIO_LOG_STFT_THRESHOLD, (
         f"LTX-2.3 audio log-STFT too high: {distance:.6f} "
         f"(expected < {LTX23_AUDIO_LOG_STFT_THRESHOLD:.6f})"
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize(
-    "config_name",
-    ["ltx23-t2v-fp8-1gpu.yaml", "ltx23-t2v-fp4-1gpu.yaml", "ltx23-t2v-bf16-2gpu.yaml"],
-    ids=["fp8", "nvfp4", "bf16-2gpu"],
-)
-def test_ltx23_example(tmp_path, config_name):
-    """Run the configured generation example and verify its video and audio."""
-    if config_name.endswith("2gpu.yaml") and torch.cuda.device_count() < 2:
-        pytest.skip("Two GPUs are required for this parallel example")
-    _require_exists(LTX23_MODEL_PATH, "LTX-2.3 dev checkpoint")
-    _require_exists(
-        LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True
-    )
-
-    examples_root = os.path.join(REPO_ROOT, "examples", "visual_gen")
-    output_path = os.path.join(str(tmp_path), "ltx23_output.mp4")
-    result = subprocess.run(
-        [
-            sys.executable,
-            os.path.join(examples_root, "models", "ltx23.py"),
-            "--model",
-            LTX23_MODEL_PATH,
-            "--visual_gen_args",
-            os.path.join(examples_root, "configs", config_name),
-            "--text_encoder_path",
-            LTX23_TEXT_ENCODER_PATH,
-            "--output_path",
-            output_path,
-        ],
-        check=False,
-        timeout=1800,
-    )
-    assert result.returncode == 0, "LTX-2.3 example script exited non-zero"
-    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
-    assert os.path.getsize(output_path) > 0, f"Example produced an empty output at {output_path}"
-    import av
-
-    with av.open(output_path) as container:
-        video = container.streams.video[0]
-        assert video.width == LTX23_LPIPS_WIDTH
-        assert video.height == LTX23_LPIPS_HEIGHT
-        assert float(video.average_rate) == pytest.approx(LTX23_LPIPS_FRAME_RATE)
-        assert sum(1 for _ in container.decode(video=0)) == LTX23_LPIPS_NUM_FRAMES
-        assert len(container.streams.audio) == 1
-        assert container.streams.audio[0].rate == 48000
-
-
 def _generate_ltx23_retake_video(
-    llm_root,
-    llm_venv,
-    tmp_path,
+    rank,
+    world_size,
+    *,
+    source_path,
     output_path,
     config_filename="ltx23-retake-bf16-1gpu.yaml",
-    *,
-    regenerate_audio: bool = True,
 ):
-    """Run the native retake example without runtime LoRA and return its output."""
-    source = _golden_media_path(
-        tmp_path,
-        "ltx23_retake_input.mp4",
-        "LTX-2.3 official Duck retake input",
-    )
-    _require_exists(
-        LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True
-    )
+    """Run native retake under the same distributed harness as generation."""
+    from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.media.encoding import save_video
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+    from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams, prepare_reference_slots
+
+    model_path, text_encoder_path = _ltx23_model_paths()
+    _require_exists(text_encoder_path, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True)
     checkpoint = os.environ.get(LTX23_RETAKE_CHECKPOINT_ENV) or os.path.join(
-        os.path.dirname(LTX23_MODEL_PATH), "ltx-2.3-22b-distilled-1.1.safetensors"
+        os.path.dirname(model_path), "ltx-2.3-22b-distilled-1.1.safetensors"
     )
     _require_exists(checkpoint, "LTX-2.3 retake checkpoint")
-    example = os.path.join(llm_root, "examples", "visual_gen", "models", "ltx23_retake.py")
-    config = os.path.join(llm_root, "examples", "visual_gen", "configs", config_filename)
-    venv_check_call(
-        llm_venv,
-        [
-            example,
-            "--model",
-            checkpoint,
-            "--visual_gen_args",
-            str(config),
-            "--source",
-            str(source),
-            "--start",
-            "2.0",
-            "--end",
-            "5.0",
-            "--prompt",
-            LTX23_RETAKE_PROMPT,
-            "--regenerate_audio" if regenerate_audio else "--no-regenerate_audio",
-            "--text_encoder_path",
-            LTX23_TEXT_ENCODER_PATH,
-            "--output_path",
-            str(output_path),
-        ],
-    )
-    assert os.path.isfile(output_path), f"retake pipeline did not produce {output_path}"
-    assert os.path.getsize(output_path) > 0, f"retake pipeline produced an empty {output_path}"
-    return output_path
+    with _lpips_deterministic_algorithms():
+        config = os.path.join(REPO_ROOT, "examples", "visual_gen", "configs", config_filename)
+        args = VisualGenArgs.from_yaml(config)
+        assert args.parallel_config.n_workers == world_size
+        args.model = checkpoint
+        args.pipeline_config = {**args.pipeline_config, "text_encoder_path": text_encoder_path}
+        pipeline = PipelineLoader(args, device=f"cuda:{rank}").load()
+        try:
+            params = VisualGenParams(
+                **pipeline.default_generation_params,
+                video_reference=[MediaRef(content=str(source_path), format="path")],
+                extra_params={
+                    "retake_start_time": 2.0,
+                    "retake_end_time": 5.0,
+                    "retake_regenerate_video": True,
+                    "retake_regenerate_audio": True,
+                },
+            )
+            prepare_reference_slots(params)
+            output = pipeline.run_inference(
+                DiffusionRequest(request_id=0, prompt=[LTX23_RETAKE_PROMPT], params=params)
+            )
+            if rank == 0:
+                video = output.video.detach().cpu()
+                audio = output.audio.detach().cpu()
+                frame_rate = output.frame_rate
+                audio_rate = output.audio_sample_rate
+        finally:
+            del pipeline
+            _cleanup_cuda()
+    if rank == 0:
+        save_video(
+            video, output_path, audio=audio, frame_rate=frame_rate, audio_sample_rate=audio_rate
+        )
+        assert os.path.isfile(output_path), f"retake pipeline did not produce {output_path}"
+        assert os.path.getsize(output_path) > 0, f"retake pipeline produced an empty {output_path}"
 
 
 @pytest.fixture(scope="session")
@@ -358,13 +373,28 @@ def _ltx23_retake_deps(_visual_gen_deps, llm_venv):
     )
 
 
-@pytest.fixture(scope="session")
-def ltx23_retake_bf16_video_path(_ltx23_retake_deps, llm_root, llm_venv, tmp_path_factory):
-    output_path = _visual_gen_output_path(llm_venv, "ltx23_retake_duck_joint_bf16")
-    if os.path.isfile(output_path):
-        return output_path
-    work_dir = tmp_path_factory.mktemp("ltx23_retake")
-    return _generate_ltx23_retake_video(llm_root, llm_venv, work_dir, output_path)
+@pytest.fixture(scope="session", params=LTX23_ACCURACY_CASES)
+def ltx23_retake_candidate(request, _ltx23_retake_deps, llm_venv, tmp_path_factory):
+    from defs.examples.visual_gen.test_visual_gen_multi_gpu import run_test_in_distributed
+
+    config_name = request.param
+    num_gpus = _ltx23_required_gpus(config_name)
+    work_dir = tmp_path_factory.mktemp(f"ltx23_retake_{config_name}")
+    source_path = _ltx23_golden_media_path(
+        work_dir,
+        "ltx23_retake_input.mp4",
+        "LTX-2.3 official Duck retake input",
+    )
+    output_path = _visual_gen_output_path(llm_venv, f"ltx23_retake_{config_name}")
+    with _lpips_deterministic_algorithms():
+        run_test_in_distributed(
+            num_gpus,
+            _generate_ltx23_retake_video,
+            source_path=source_path,
+            output_path=output_path,
+            config_filename=f"ltx23-retake-{config_name}.yaml",
+        )
+    return config_name, output_path
 
 
 def _assert_ltx23_retake_output(video_path):
@@ -394,46 +424,25 @@ def _assert_ltx23_retake_output(video_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize(
-    "case_id, config_filename",
-    [
-        ("fp8", "ltx23-retake-fp8-1gpu.yaml"),
-        ("nvfp4", "ltx23-retake-fp4-1gpu.yaml"),
-        ("bf16-2gpu", "ltx23-retake-bf16-2gpu.yaml"),
-    ],
-    ids=["fp8", "nvfp4", "bf16-2gpu"],
-)
-def test_ltx23_retake_example(
-    tmp_path, _ltx23_retake_deps, llm_root, llm_venv, case_id, config_filename
-):
-    """Run the configured retake example and validate media without a golden comparison."""
-    if config_filename.endswith("2gpu.yaml") and torch.cuda.device_count() < 2:
-        pytest.skip("Two GPUs are required for this parallel example")
-    output_path = _visual_gen_output_path(llm_venv, f"ltx23_retake_{case_id}")
-    _generate_ltx23_retake_video(
-        llm_root, llm_venv, tmp_path, output_path, config_filename=config_filename
-    )
-    _assert_ltx23_retake_output(output_path)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_ltx23_retake_lpips_against_golden(
     request,
     tmp_path,
-    ltx23_retake_bf16_video_path,
+    ltx23_retake_candidate,
     _visual_gen_lpips_scorer,
 ):
-    """Compare BF16 retake video LPIPS and audio log-STFT against the upstream goldens."""
-    _assert_ltx23_retake_output(ltx23_retake_bf16_video_path)
-    golden_path = _golden_media_path(
+    """Compare every retake configuration against the upstream video/audio goldens."""
+    config_name, video_path = ltx23_retake_candidate
+    threshold = LTX23_RETAKE_LPIPS_THRESHOLDS[config_name]
+    _assert_ltx23_retake_output(video_path)
+    golden_path = _ltx23_golden_media_path(
         tmp_path,
         "ltx23_retake_lpips_golden_video.mp4",
         "LTX-2.3 retake LPIPS golden video",
     )
     score = _run_reusable_video_lpips_eval(
-        "ltx23_retake",
+        f"ltx23_retake-{config_name}",
         golden_path,
-        ltx23_retake_bf16_video_path,
+        video_path,
         _visual_gen_lpips_scorer,
         frame_start=LTX23_RETAKE_LPIPS_FRAME_START,
         frame_stop=LTX23_RETAKE_LPIPS_FRAME_STOP,
@@ -442,16 +451,16 @@ def test_ltx23_retake_lpips_against_golden(
         tmp_path, "ltx23_retake_lpips_golden_audio.wav", "LTX-2.3 retake golden audio"
     )
     audio_path = tmp_path / "ltx23_retake_candidate_audio.wav"
-    _save_ltx23_retake_audio(ltx23_retake_bf16_video_path, audio_golden_path, audio_path)
+    _save_ltx23_retake_audio(video_path, audio_golden_path, audio_path)
     distance = _audio_log_stft_distance(audio_path, audio_golden_path)
     _preserve_lpips_candidate_on_failure(
         request,
         score,
-        LTX23_RETAKE_LPIPS_THRESHOLD,
-        ltx23_retake_bf16_video_path,
-        "ltx23_retake_generated.mp4",
+        threshold,
+        video_path,
+        f"ltx23_retake_{config_name}_generated.mp4",
     )
-    _assert_lpips_below_threshold(score, LTX23_RETAKE_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, threshold)
     assert distance < LTX23_AUDIO_LOG_STFT_THRESHOLD, (
         f"LTX-2.3 retake audio log-STFT too high: {distance:.6f} "
         f"(expected < {LTX23_AUDIO_LOG_STFT_THRESHOLD:.6f})"
