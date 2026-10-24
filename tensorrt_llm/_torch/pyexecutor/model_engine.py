@@ -953,6 +953,17 @@ class PyTorchModelEngine(ModelEngine):
         with self.warmup_scope():
             self._warmup_impl(resource_manager)
 
+    def _configure_allreduce_tuning(self) -> None:
+        """Configure the profiling buckets before compilation and capture."""
+        from ..custom_ops.torch_custom_ops import AllReduceRunner
+
+        if not self.llm_args.enable_autotuner:
+            return
+        ceiling = self.max_num_tokens
+        if self._is_encoder_decoder_model():
+            ceiling = max(ceiling, self.encoder_max_num_tokens)
+        AllReduceRunner.configure_tuning_buckets(ceiling)
+
     def _warmup_impl(self,
                      resource_manager: Optional[ResourceManager] = None
                      ) -> None:
@@ -960,6 +971,8 @@ class PyTorchModelEngine(ModelEngine):
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        self._configure_allreduce_tuning()
+
         if isinstance(self._runner, PackedModelRunner):
             self._runner.warmup()
             return

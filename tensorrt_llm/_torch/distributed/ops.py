@@ -63,19 +63,6 @@ _thread_local = threading.local()
 # tracing the stateful AutoTuner singleton.
 _ALLREDUCE_AUTOTUNER_TUNING_MODE = False
 
-# Disabled only after the Python/C++ native-tactic contract cannot be honored.
-_ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = True
-
-
-def disable_native_allreduce_autotuner(reason: str) -> None:
-    """Use the Python AllReduce autotuner after a native compatibility failure."""
-    global _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED
-    if _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
-        _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = False
-        logger.warning(
-            "Disabling native AllReduce autotuner (%s); falling back to the Python autotuner.",
-            reason)
-
 
 def set_allreduce_autotuner_tuning_mode(is_tuning_mode: bool) -> None:
     """Set the Dynamo-safe AllReduce autotuner mode mirror."""
@@ -1354,9 +1341,8 @@ class AllReduce(nn.Module):
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
-            # Use native lookup after tuning unless its Python/C++ contract
-            # failed; then retain the existing Python cache and selection path.
-            if _ALLREDUCE_AUTOTUNER_TUNING_MODE or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
+            # Profile in Python during warmup; use native lookup during inference.
+            if _ALLREDUCE_AUTOTUNER_TUNING_MODE:
                 output = torch.ops.trtllm.tunable_allreduce(
                     input=input,
                     residual=all_reduce_params.residual,
