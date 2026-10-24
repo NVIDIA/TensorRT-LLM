@@ -672,7 +672,12 @@ class CompletionRequest(OpenAIBaseModel):
         ge=0,
         description="Top-k sampling; must be >= 0 (0 disables top-k).")
     top_p_min: float = 0.0
-    min_p: float = 0.0
+    min_p: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Minimum token probability scaled by the top token's "
+        "probability; must be in [0, 1] (0 disables min-p).")
     repetition_penalty: float = 1.0
     # Unset by default so the engine picks its own beam-search defaults, as it
     # does for requests coming through the Python API. Sending concrete values
@@ -1139,7 +1144,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ge=0,
         description="Top-k sampling; must be >= 0 (0 disables top-k).")
     top_p_min: float = 0.0
-    min_p: float = 0.0
+    min_p: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Minimum token probability scaled by the top token's "
+        "probability; must be in [0, 1] (0 disables min-p).")
     repetition_penalty: float = 1.0
     # Unset by default so the engine picks its own beam-search defaults, as it
     # does for requests coming through the Python API. Sending concrete values
@@ -1639,12 +1649,17 @@ class ResponsesRequest(OpenAIBaseModel):
                           "priority"] = "auto"
     store: Optional[bool] = True
     stream: Optional[bool] = False
-    temperature: Optional[float] = Field(default=None, ge=0.0)
+    temperature: Optional[float] = Field(
+        default=None, ge=0.0, description="Sampling temperature; must be >= 0.")
     text: Optional[ResponseTextConfig] = None
     tool_choice: ToolChoice = "auto"
     tools: list[Tool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
-    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    top_p: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Nucleus sampling probability; must be in [0, 1].")
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
     user: Optional[str] = None
 

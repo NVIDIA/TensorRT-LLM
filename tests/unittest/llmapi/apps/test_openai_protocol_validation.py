@@ -14,9 +14,11 @@
 # limitations under the License.
 """Boundary validation for trtllm-serve request models (issue #6329).
 
-Invalid sampling parameters must be rejected at the API boundary with a
-pydantic ValidationError (surfaced to clients as HTTP 422) instead of crashing
-the server downstream.
+Invalid sampling parameters are rejected at the pydantic boundary with a
+field-specific ValidationError (surfaced to clients as HTTP 400 by the
+server's RequestValidationError handler). SamplingParams._validate already
+rejects these values later with a 400; the benefit here is the earlier,
+field-named error and schema-visible bounds, not a crash fix.
 """
 
 import pytest
@@ -34,7 +36,12 @@ def _completion(**kw):
 
 
 def _chat(**kw):
-    return ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], **kw)
+    return ChatCompletionRequest(model="m",
+                                 messages=[{
+                                     "role": "user",
+                                     "content": "hi"
+                                 }],
+                                 **kw)
 
 
 def _responses(**kw):
@@ -65,6 +72,13 @@ def test_negative_temperature_rejected(build):
 def test_out_of_range_top_p_rejected(build, bad_top_p):
     with pytest.raises(ValidationError):
         build(top_p=bad_top_p)
+
+
+@pytest.mark.parametrize("build", BUILDERS_WITH_TOP_K)
+@pytest.mark.parametrize("bad_min_p", [-0.1, 1.1])
+def test_out_of_range_min_p_rejected(build, bad_min_p):
+    with pytest.raises(ValidationError):
+        build(min_p=bad_min_p)
 
 
 @pytest.mark.parametrize("build", BUILDERS_WITH_TOP_K)
