@@ -38,7 +38,6 @@ Example:
         fmha.forward(q, k, v, metadata, forward_args)
 """
 
-import contextlib
 import math
 import os
 from functools import lru_cache
@@ -283,21 +282,19 @@ def _decode_launch_groups(
 
 
 # Full-attention decode KV splits. The trtllm-gen generation kernel splits each sequence's KV over
-# smCount / (batch x kvHeads) CTAs, one CTA per SM, which suits a batch of equal lengths. At long
-# context the lengths in a batch differ widely, and the launch lasts as long as the CTA streaming
-# the longest sequence (~40 GB/s per CTA on GB300). Reporting k x the SM count to the launch gives
-# every sequence ~k x more KV splits, run in k waves. More splits shorten the longest sequence's
-# CTAs, but every CTA pays a fixed cost, so the best k grows with the batch and with the KV heads
-# per rank. Timed on GB300 for k = 1-8 at Muse Spark Open shapes (FP8 KV, head dim 64, 8 query
-# heads per KV head, 8 query tokens per sequence) with 1M-context agentic lengths, 1-64 sequences
-# and 1, 2, 4 or 16 KV heads per rank, under a CUDA graph captured at max_seq_len 1M: the best k
-# is ~batch at 16 KV heads, ~batch / 2 at 4, ~batch / 3 at 2 and ~batch / 4 at 1, i.e. about
-# 36 x sqrt(kvHeads) CTAs per sequence, rounded up to whole waves.
+# smCount / (batch x kvHeads) CTAs, one per SM, which suits a batch of equal lengths; at long
+# context the launch lasts as long as the CTA streaming the longest sequence. Reporting k x the SM
+# count gives every sequence ~k x more splits in k waves. Each CTA has a fixed cost, so k follows
+# the batch and the KV heads per rank: ~36 x sqrt(kvHeads) CTAs per sequence in whole waves
+# (fitted on GB300 for Muse Spark Open decode at 1M context, head dim 64).
 _DECODE_SM_SCALE_MAX = 8
 _DECODE_CTAS_PER_SEQ = 36  # per sqrt(KV heads on the rank)
 # The partial O (16-bit) and softmax stats of up to smCount' CTAs, at most 128 query rows each,
 # are carved from the FMHA workspace: smCount' x 128 x (2 x headDimV + 8) bytes.
 _DECODE_PARTIAL_ROWS_PER_CTA = 128
+# The module whose ``get_device_sm_count`` a split launch swaps; captured before any caller can
+# replace ``flashinfer`` for a call.
+_FLASHINFER_DECODE = flashinfer.decode if IS_FLASHINFER_AVAILABLE else None
 
 
 @lru_cache(maxsize=1)
@@ -311,7 +308,7 @@ def _decode_sm_scale_override() -> Optional[int]:
     if value in ("", "auto"):
         return None
     try:
-        return max(1, int(value))
+        return int(value)
     except ValueError:
         raise ValueError(
             f"TRTLLM_GEN_DECODE_SM_SCALE must be 'auto' or an integer, got {value!r}"
@@ -333,33 +330,30 @@ def _decode_sm_scale(
     """
     if window_left >= 0:
         return 1
-    cap = min(
-        _DECODE_SM_SCALE_MAX,
-        workspace_bytes // (sm_count * _DECODE_PARTIAL_ROWS_PER_CTA * (2 * head_dim_v + 8)),
-    )
-    forced = _decode_sm_scale_override()
-    if forced is not None:
-        return max(1, min(cap, forced))
-    ctas = _DECODE_CTAS_PER_SEQ * batch_size * math.sqrt(max(1, num_kv_heads))
-    return max(1, min(cap, math.ceil(ctas / sm_count)))
+    k = _decode_sm_scale_override()
+    if k is None:
+        k = math.ceil(_DECODE_CTAS_PER_SEQ * batch_size * math.sqrt(num_kv_heads) / sm_count)
+    cap = workspace_bytes // (sm_count * _DECODE_PARTIAL_ROWS_PER_CTA * (2 * head_dim_v + 8))
+    return max(1, min(_DECODE_SM_SCALE_MAX, cap, k))
 
 
-@contextlib.contextmanager
-def _reported_sm_count(scale: int):
-    """Make ``flashinfer.decode`` report ``scale`` x the SM count to the trtllm-gen launcher.
+def _trtllm_gen_decode(sm_scale: int, **kwargs) -> None:
+    """flashinfer's trtllm-gen decode FMHA with ``sm_scale`` x the SM count reported to it.
 
-    flashinfer reads the count through its module-level ``get_device_sm_count`` and takes no
-    override; without that name the launch keeps the real count.
+    flashinfer's decode takes no SM count: it reads ``get_device_sm_count`` from its module, which
+    is swapped for the call. When another caller has replaced ``flashinfer`` for this call (the
+    modeling_v2 decode stand-ins), that caller's SM count stands.
     """
-    real = getattr(flashinfer.decode, "get_device_sm_count", None)
-    if scale <= 1 or real is None:
-        yield
+    decode = flashinfer.decode
+    if sm_scale <= 1 or decode is not _FLASHINFER_DECODE:
+        decode.trtllm_batch_decode_with_kv_cache(**kwargs)
         return
-    flashinfer.decode.get_device_sm_count = lambda device: scale * real(device)
+    real = decode.get_device_sm_count
+    decode.get_device_sm_count = lambda device: sm_scale * real(device)
     try:
-        yield
+        decode.trtllm_batch_decode_with_kv_cache(**kwargs)
     finally:
-        flashinfer.decode.get_device_sm_count = real
+        decode.get_device_sm_count = real
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
@@ -1317,13 +1311,15 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
 
+        workspace_bytes = fmha_workspace.numel() * fmha_workspace.element_size()
+
         def sm_scale(num_seqs: int) -> int:
             return _decode_sm_scale(
                 num_seqs,
                 attn.num_kv_heads,
                 attn.head_dim,
                 self._multi_processor_count,
-                fmha_workspace.numel() * fmha_workspace.element_size(),
+                workspace_bytes,
                 window_left,
             )
 
@@ -1331,27 +1327,27 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             batch_beam, q_len_per_req, q_processed.size(0), params.output.size(0), window_left
         )
         if groups is None:
-            with _reported_sm_count(sm_scale(batch_beam)):
-                flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                    query=q_processed,
-                    block_tables=block_tables,
-                    seq_lens=params.sequence_lengths,
-                    out=params.output,
-                    **decode_kwargs,
-                )
+            _trtllm_gen_decode(
+                sm_scale(batch_beam),
+                query=q_processed,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                out=params.output,
+                **decode_kwargs,
+            )
             return
         # Sequences [first, last) of each group own token rows
         # [first * q_len_per_req, last * q_len_per_req) of the query and the output.
         for first, last in groups:
             rows = slice(first * q_len_per_req, last * q_len_per_req)
-            with _reported_sm_count(sm_scale(last - first)):
-                flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                    query=q_processed[rows],
-                    block_tables=block_tables[first:last],
-                    seq_lens=params.sequence_lengths[first:last],
-                    out=params.output[rows],
-                    **decode_kwargs,
-                )
+            _trtllm_gen_decode(
+                sm_scale(last - first),
+                query=q_processed[rows],
+                block_tables=block_tables[first:last],
+                seq_lens=params.sequence_lengths[first:last],
+                out=params.output[rows],
+                **decode_kwargs,
+            )
 
     def run_mla_generation(
         self,

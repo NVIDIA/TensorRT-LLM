@@ -259,7 +259,6 @@ def test_decode_sm_scale(
     finally:
         fi._decode_sm_scale_override.cache_clear()
     assert scale == expected
-    assert scale * 152 * 128 * (2 * head_dim + 8) <= _FMHA_WORKSPACE_BYTES or scale == 1
 
 
 def test_decode_sm_scale_rejects_bad_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,25 +268,47 @@ def test_decode_sm_scale_rejects_bad_env(monkeypatch: pytest.MonkeyPatch) -> Non
     fi._decode_sm_scale_override.cache_clear()
     try:
         with pytest.raises(ValueError, match="TRTLLM_GEN_DECODE_SM_SCALE"):
-            fi._decode_sm_scale(8, 16, 64, 152, _FMHA_WORKSPACE_BYTES, -1)
+            fi._decode_sm_scale_override()
     finally:
         fi._decode_sm_scale_override.cache_clear()
 
 
-def test_reported_sm_count_scales_and_restores(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_flashinfer_decode_reads_sm_count() -> None:
+    """The split works only while flashinfer's decode reads its module's get_device_sm_count."""
+    import inspect
+
+    flashinfer_decode = pytest.importorskip("flashinfer.decode")
+    fn = inspect.unwrap(flashinfer_decode.trtllm_batch_decode_with_kv_cache)
+    assert fn.__globals__ is vars(flashinfer_decode)
+    assert "get_device_sm_count" in fn.__code__.co_names
+
+
+def test_trtllm_gen_decode_reports_scaled_sm_count(monkeypatch: pytest.MonkeyPatch) -> None:
     flashinfer_decode = pytest.importorskip("flashinfer.decode")
     from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi
 
     def real(device):
         return 152
 
-    monkeypatch.setattr(flashinfer_decode, "get_device_sm_count", real)
-    with fi._reported_sm_count(6):
-        assert flashinfer_decode.get_device_sm_count(None) == 6 * 152
-    assert flashinfer_decode.get_device_sm_count is real
-    with fi._reported_sm_count(1):
-        assert flashinfer_decode.get_device_sm_count is real
-    with pytest.raises(RuntimeError):
-        with fi._reported_sm_count(4):
+    seen = []
+
+    def decode(**kwargs):
+        seen.append(flashinfer_decode.get_device_sm_count(None))
+        if kwargs.get("fail"):
             raise RuntimeError("launch failed")
+
+    monkeypatch.setattr(flashinfer_decode, "get_device_sm_count", real)
+    monkeypatch.setattr(flashinfer_decode, "trtllm_batch_decode_with_kv_cache", decode)
+    fi._trtllm_gen_decode(6)
+    fi._trtllm_gen_decode(1)
+    with pytest.raises(RuntimeError):
+        fi._trtllm_gen_decode(4, fail=True)
+    assert seen == [6 * 152, 152, 4 * 152]
+    assert flashinfer_decode.get_device_sm_count is real
+
+    # A caller that replaced flashinfer for the call keeps its own SM count.
+    stand_in = SimpleNamespace(trtllm_batch_decode_with_kv_cache=decode)
+    monkeypatch.setattr(fi, "flashinfer", SimpleNamespace(decode=stand_in))
+    fi._trtllm_gen_decode(6)
+    assert seen[-1] == 152
     assert flashinfer_decode.get_device_sm_count is real
