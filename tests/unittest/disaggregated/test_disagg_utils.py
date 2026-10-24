@@ -12,8 +12,9 @@ import yaml
 from tensorrt_llm.llmapi.disagg_utils import (
     MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig,
     disagg_process_id_space, extract_ctx_gen_cfgs, extract_router_config,
-    extract_disagg_cfg, get_global_disagg_request_id, get_local_request_id,
-    get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
+    extract_disagg_cfg, extract_disagg_cluster_config,
+    get_global_disagg_request_id, get_local_request_id, get_server_configs_dict,
+    parse_disagg_config_file, worker_local_process_id)
 # isort: on
 
 pytestmark = pytest.mark.cpu_only
@@ -503,3 +504,14 @@ def test_subagent_affinity_inert_when_header_unset(caplog):
         )
     assert "sub-agent" not in caplog.text.lower()
     assert "subagent_affinity_scope" not in caplog.text
+
+
+@pytest.mark.parametrize("cli_uri,expected", [
+    (None, "http://test_host:9000"),
+    ("http://cli_host:2379", "http://cli_host:2379"),
+])
+def test_extract_disagg_cluster_config_uri_argument(cli_uri, expected):
+    cluster_dict = get_yaml_config_with_disagg_cluster()["disagg_cluster"]
+    config = extract_disagg_cluster_config(cluster_dict, cli_uri)
+    assert config.cluster_uri == expected
+    assert config.cluster_name == "test_cluster"
