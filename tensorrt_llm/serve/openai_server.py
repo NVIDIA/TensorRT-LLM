@@ -2145,9 +2145,13 @@ class OpenAIServer(_VideoRoutesMixin):
                         # Idle poll: the stats RPC would otherwise wait out
                         # its timeout inside a synchronous .remote() call and
                         # stall this event loop, so fetch once without
-                        # waiting, off the loop.
-                        for llm_stat in await asyncio.to_thread(
-                                self.generator.get_stats, 0):
+                        # waiting, off the loop. The metrics thread is idle
+                        # while this loop owns the queue (/metrics then reads
+                        # the buffer), and keeps the read off the default
+                        # executor that request handling uses.
+                        for llm_stat in await asyncio.get_running_loop(
+                        ).run_in_executor(self._metrics_stats_executor,
+                                          self.generator.get_stats, 0):
                             self._record_iteration_stat(llm_stat)
                     else:
                         async for llm_stat in self.generator.get_stats_async(
