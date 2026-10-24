@@ -750,6 +750,13 @@ def _create_py_executor(
                 "tp_size=1 (disaggregated context worker) or "
                 "enable_attention_dp=True (aggregated serving), but got "
                 f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
+        # The host issues the expert prefetch as the MoE layers run, and the
+        # last layers of a pass already prefetch the next pass; a replayed
+        # CUDA graph would bind buffer slots the host schedule does not track.
+        if llm_args.cuda_graph_config is not None:
+            raise ValueError(
+                "DWDP does not support CUDA graphs; set cuda_graph_config=None."
+            )
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
