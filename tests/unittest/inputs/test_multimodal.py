@@ -381,6 +381,24 @@ def test_find_mm_token_lengths_accepts_stacked_numpy_video_frames():
     ) == {"video": [2]}
 
 
+@pytest.mark.parametrize("is_sampled", [False, True])
+def test_find_mm_token_lengths_forwards_sampling_provenance(is_sampled):
+    """Fallback token counting receives the same provenance as preprocessing."""
+
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(self, *, video, video_metadata, video_is_sampled):
+            assert video_is_sampled is is_sampled
+            assert video_metadata["frames_indices"] == [0, 2]
+            return 2
+
+    video = VideoData(
+        frames=np.zeros((2, 4, 6, 3), dtype=np.uint8),
+        metadata={"frames_indices": [0, 2]},
+        is_sampled=is_sampled,
+    )
+    assert find_mm_token_lengths({"video": [video]}, FakeVideoProcessor()) == {"video": [2]}
+
+
 def test_find_mm_token_lengths_rejects_undecoded_video_string():
     class FakeVideoProcessor:
         def get_num_tokens_per_video(self, *, video, **kwargs):

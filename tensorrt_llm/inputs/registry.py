@@ -623,6 +623,7 @@ class BaseMultimodalInputProcessor(ABC):
         video: List[Union[Image.Image, torch.Tensor]],
         video_metadata: Optional[dict] = None,
         video_audio: Optional[Any] = None,
+        video_is_sampled: Optional[bool] = None,
         **kwargs,
     ):
         """
@@ -638,7 +639,7 @@ class BaseMultimodalInputProcessor(ABC):
         Example: for a video item, return the prompt-side token count for that
         one video unit, not the number of video frames.
 
-        `video_metadata` and `video_audio` are consumed here (not forwarded
+        `video_metadata`, `video_audio` and `video_is_sampled` are consumed here (not forwarded
         into `get_num_multimodal_tokens`) so subclasses that don't need them
         are unaffected.
 

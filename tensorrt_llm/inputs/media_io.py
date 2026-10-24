@@ -849,6 +849,7 @@ def _load_video_by_cv2(
         metadata=metadata,
         audio=audio,
         raw_bytes_hash=raw_bytes_hash,
+        is_sampled=num_frames_to_sample < frame_count,
     )
 
 

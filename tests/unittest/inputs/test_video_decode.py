@@ -9,6 +9,7 @@ import asyncio
 import base64
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -27,6 +28,59 @@ from tensorrt_llm.inputs.multimodal_data import VideoData  # noqa: E402
 from tensorrt_llm.inputs.utils import async_load_video, load_base64_video, load_video  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("num_frames,expected_sampled", [(0, False), (32, True), (1000, False)])
+def test_real_codec_with_injected_interior_retrieve_failure(
+    tmp_path, monkeypatch, num_frames, expected_sampled
+) -> None:
+    """Run the real loader/codec and fail one retrieve at the decoder boundary."""
+    path = str(tmp_path / "interior.mp4")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30, (32, 32))
+    assert writer.isOpened()
+    for i in range(700):
+        writer.write(np.full((32, 32, 3), i % 256, dtype=np.uint8))
+    writer.release()
+    capture = cv2.VideoCapture(path)
+
+    class FaultyCapture:
+        index = -1
+
+        def isOpened(self):
+            return capture.isOpened()
+
+        def get(self, prop):
+            return capture.get(prop)
+
+        def grab(self):
+            self.index += 1
+            return capture.grab()
+
+        def retrieve(self, buffer):
+            if self.index == 350:
+                return False, buffer
+            return capture.retrieve(buffer)
+
+        def release(self):
+            capture.release()
+
+    backend = SimpleNamespace(
+        VideoCapture=lambda _: FaultyCapture(),
+        CAP_PROP_FRAME_COUNT=cv2.CAP_PROP_FRAME_COUNT,
+        CAP_PROP_FPS=cv2.CAP_PROP_FPS,
+        COLOR_BGR2RGB=cv2.COLOR_BGR2RGB,
+        cvtColor=cv2.cvtColor,
+    )
+    monkeypatch.setattr(media_io, "_get_cv2", lambda: backend)
+    video = _load_video_by_cv2(path, num_frames=num_frames, fps=0, format="np")
+    assert video.is_sampled is expected_sampled
+    expected = np.linspace(0, 699, 32 if expected_sampled else 700, dtype=int).tolist()
+    expected = [i for i in expected if i != 350]
+    assert video.metadata["frames_indices"] == expected
+    assert len(video.frames) == len(expected)
+    assert video.metadata["total_num_frames"] == 700
+    assert video.metadata["fps"] == 30
+    assert video.metadata["duration"] == 700 / 30
 
 
 @pytest.fixture(scope="module")
