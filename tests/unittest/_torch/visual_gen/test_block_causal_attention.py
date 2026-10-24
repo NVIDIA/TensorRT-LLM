@@ -263,16 +263,25 @@ def record_fmha_libraries(attn, served):
     manager.select = recording_select
 
 
+@pytest.fixture(params=[(4, 2, 64), (32, 8, 128)], ids=["d64_gqa2", "d128_gqa4"])
+def head_shape(request, monkeypatch):
+    """Query heads, K/V heads and head_dim for the helpers above: the small default, and
+    the Cosmos3 shape (head_dim 128, 4:1 grouping), which selects different kernels."""
+    for name, value in zip(("NUM_HEADS", "NUM_KV_HEADS", "HEAD_DIM"), request.param):
+        monkeypatch.setitem(globals(), name, value)
+    return request.param
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("num_causal_blocks", [1, 4, 8])
 @pytest.mark.parametrize("tokens_per_page", [32, 64], ids=["tpb32", "tpb64"])
 def test_every_layer_and_library_over_a_multi_layer_cache(
-    backend, dtype, num_causal_blocks, tokens_per_page
+    backend, dtype, num_causal_blocks, tokens_per_page, head_shape
 ):
     """A 3-layer cache with different K/V in every layer, attended on every layer
-    through a rotating table, with 1, 4 and 8 causal blocks in BF16 and FP16. Each
-    layer must read its own pages. For TRTLLM the cases also cross the FMHA library
+    through a rotating table, with 1, 4 and 8 causal blocks in BF16 and FP16, at two
+    head shapes. Each layer must read its own pages. For TRTLLM the cases also cross the FMHA library
     boundary on SM100/SM103, and the library that served each one is checked. For
     cuDNN every layer shares one graph."""
     torch.manual_seed(11)
