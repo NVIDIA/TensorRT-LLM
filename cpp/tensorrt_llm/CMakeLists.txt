@@ -259,8 +259,7 @@ set_target_properties(
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES
-                                          "^(aarch64|x86_64)$")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Keep host code, unwind tables, and the GOT within PC-relative addressing
   # range by placing large CUDA payloads after host data.
   set(CUDA_FATBIN_LINKER_SCRIPT
