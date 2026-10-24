@@ -25,18 +25,21 @@ import threading
 import time
 from collections.abc import Callable, Generator, Sequence
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
-from tensorrt_llm._torch.disaggregation.blob.keys import encode_key
+from tensorrt_llm._torch.disaggregation.blob.keys import encode_key, key_stem
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverRejected,
     Hint,
+    OnChange,
     OpHandle,
     ProbeStatus,
     RegionHandle,
     RegionLayout,
     RegistrationError,
+    RowBatch,
     RowIO,
     RowResult,
     RowStatus,
@@ -122,8 +125,14 @@ class Endpoint:
     def key(self, label: str) -> str:
         return key_of(label, self.prefix)
 
-    def rows(self) -> list[RowIO]:
-        return [RowIO(self.key(label), (self.span(i),)) for i, label in enumerate(self.labels)]
+    def rows(self) -> RowBatch:
+        """Every label's row, one whole slot each, laid out as the blob backend hands rows over:
+        keys built only when read, and addresses as a column of the caller's array."""
+        names = np.frombuffer(b"".join(name_of(label) for label in self.labels), dtype=np.uint8)
+        slots = self.memory.address + self.slot * np.arange(len(self.labels), dtype=np.int64)
+        region = Span(self.memory.address, self.memory.nbytes)
+        object_keys = names.reshape(len(self.labels), NAME_BYTES)
+        return RowBatch.of_slots(key_stem(self.prefix), object_keys, slots, self.slot, region)
 
     def span_at(self, offset: int, nbytes: int) -> Span:
         """Any range of the region, slot boundaries or not."""
@@ -193,14 +202,20 @@ class Harness:
             endpoint.register()
         return endpoint
 
-    def put(self, rows: Sequence[RowIO]) -> OpHandle:
-        op = self.driver.put(rows)
+    def put(self, rows: Sequence[RowIO], on_change: OnChange | None = None) -> OpHandle:
+        op = self.driver.put(_batch(rows), on_change=on_change)
         self.ops.append(op)
         return op
 
-    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> OpHandle:
-        # Without a hint the call keeps its old shape, as the backend's does.
-        op = self.driver.get(rows) if hint is None else self.driver.get(rows, hint)
+    def get(
+        self, rows: Sequence[RowIO], hint: Hint = None, on_change: OnChange | None = None
+    ) -> OpHandle:
+        # Without a hint the driver is called without one, as the backend calls it.
+        batch = _batch(rows)
+        if hint is None:
+            op = self.driver.get(batch, on_change=on_change)
+        else:
+            op = self.driver.get(batch, hint, on_change=on_change)
         self.ops.append(op)
         return op
 
@@ -350,7 +365,10 @@ class DriverConformance:
 
     timeout = 5.0
     registers_on_demand = True  # endpoints register fresh memory; a pool driver sets False
-    handles_before_completion = False  # put/get return their handle before the store answers
+    # True when put/get return their handle before the store answers, as the driver protocol
+    # asks. A driver that answers inside put/get, as the in-memory driver's automatic mode does,
+    # sets False to skip the checks that hold a put or a get inside the store.
+    handles_before_completion = True
 
     def make_driver(self) -> StoreDriver:
         raise NotImplementedError
@@ -389,6 +407,11 @@ class DriverConformance:
         runs."""
         return None
 
+    def make_blocked_put(self) -> tuple[StoreDriver, str, threading.Event | None, Unblock] | None:
+        """A driver whose store stalls every put of the returned key until the callable runs,
+        with an event set once a put is stalled, or ``None`` for no such signal."""
+        return None
+
     def make_held_key(self) -> tuple[StoreDriver, str, Unblock] | None:
         """A driver whose store holds the returned key as another writer's unfinished object
         until the callable runs."""
@@ -399,7 +422,20 @@ class DriverConformance:
         return None
 
     def make_crash_after_record(self) -> StoreDriver | None:
-        """A driver whose store raises something that is not a store error from inside a put."""
+        """A driver whose store raises something that is not a store error from inside every put
+        and every get."""
+        return None
+
+    def make_driver_starting_nothing(self) -> StoreDriver | None:
+        """A driver that starts no operation it takes: every row stays unstarted until a cancel or
+        a drain ends it."""
+        return None
+
+    def make_results_before_access_end(
+        self,
+    ) -> tuple[StoreDriver, Callable[[OpHandle], None], Callable[[OpHandle], None]] | None:
+        """A driver whose operations wait for the check: the first callable concludes every row of
+        an operation and leaves its access open, the second ends its access."""
         return None
 
     def make_failing_presence(self) -> tuple[StoreDriver, str] | None:
@@ -628,6 +664,20 @@ class DriverConformance:
             (result,) = h.settle(h.get(reader.rows()))
             h.assert_absent(result, reader, 0)
 
+    def test_every_span_of_a_row_is_checked_against_the_registrations(self) -> None:
+        with self.harness() as h:
+            h.needs(put=True, get=True, multi_span=True)
+            inside = h.endpoint(["A"], fill=0x2D)
+            inside.fill_row(0, b"aaaaaaaa")
+            stray = HostBuffer(SLOT, fill=0x2D)  # the second span of the row, in no registration
+            row = RowIO(h.key("M"), (inside.span(0), stray.span()))
+            with pytest.raises(DriverRejected):
+                h.put([row])
+            with pytest.raises(DriverRejected):
+                h.get([row])
+            assert stray.read() == b"-" * SLOT and stray.canaries_intact()
+            assert inside.read_row(0) == b"aaaaaaaa"
+
     def test_a_device_region_is_rejected_unless_device_memory_is_declared(self) -> None:
         with self.harness() as h:
             h.needs(registers=True)
@@ -639,22 +689,6 @@ class DriverConformance:
                 h.driver.register(memory.address, SLOT, device)
             handle = h.driver.register(memory.address, SLOT, RegionLayout(SLOT, 1, "kv"))
             h.driver.unregister(handle)
-
-    def test_a_key_appears_at_most_once_per_operation(self) -> None:
-        with self.harness() as h:
-            h.needs(put=True, get=True, rows=2)
-            writer = h.endpoint(["A", "A"])
-            writer.fill_row(0, b"aaaaaaaa")
-            writer.fill_row(1, b"bbbbbbbb")
-            with pytest.raises(DriverRejected):
-                h.put(writer.rows())
-            reader = h.endpoint(["A", "A"], fill=0x2D)
-            with pytest.raises(DriverRejected):
-                h.get(reader.rows())
-            single = h.endpoint(["A"], fill=0x2D)
-            (result,) = h.settle(h.get(single.rows()))
-            h.assert_absent(result, single, 0)
-            assert reader.read_row(0) == reader.read_row(1) == b"-" * SLOT
 
     def test_rows_beyond_the_declared_limit_are_rejected(self) -> None:
         with self.harness() as h:
@@ -703,6 +737,50 @@ class DriverConformance:
             assert not h.driver.access_unprovable(op)
             assert h.driver.poll(op) == results
 
+    def test_on_change_is_called_after_each_operation_settles(self) -> None:
+        """A caller that looks at an operation only when its ``on_change`` is called sees it
+        settle: some call comes after the last change shows."""
+        with self.harness() as h:
+            h.needs(put=True, get=True, rows=2)
+            h.publish({"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+            writer = h.endpoint(["C"])
+            writer.fill_row(0, b"cccccccc")
+            reader = h.endpoint(["A", "B"], fill=0x2D)
+            for start, rows in ((h.put, writer.rows()), (h.get, reader.rows())):
+                seen: list[tuple[tuple[RowResult, ...], bool]] = []
+
+                def look(op: OpHandle, seen: list = seen) -> None:
+                    seen.append((tuple(h.driver.poll(op)), h.driver.access_ended(op)))
+
+                op = start(rows, on_change=look)
+                settled = (tuple(h.settle(op)), True)
+                h.settle_access(op)
+                wait_until(lambda: settled in seen, "on_change after the last change", h.timeout)
+
+    def test_on_change_is_called_once_every_row_concluded_while_access_stays_open(self) -> None:
+        """A caller lands an outcome from the rows before their access ends, so the rows' settling
+        is told on its own."""
+        staged = self.make_results_before_access_end()
+        if staged is None:
+            pytest.skip("this driver cannot conclude rows while access stays open")
+        driver, conclude, end_access = staged
+        with self.harness(driver) as h:
+            h.needs(get=True)
+            reader = h.endpoint(["R"], fill=0x2D)
+            told: list[tuple[bool, bool]] = []
+            op = h.get(
+                reader.rows(),
+                on_change=lambda op: told.append(
+                    (concluded(driver.poll(op)), driver.access_ended(op))
+                ),
+            )
+            conclude(op)
+            concluded_open = (True, False)
+            wait_until(
+                lambda: concluded_open in told, "on_change once every row concluded", h.timeout
+            )
+            end_access(op)
+
     def test_an_unprovable_get_makes_drain_return_at_once_and_keeps_its_region(self) -> None:
         staged = self.make_unprovable_get()
         if staged is None:
@@ -711,12 +789,14 @@ class DriverConformance:
         with self.harness(driver) as h:
             h.needs(get=True)
             reader = h.endpoint(["U"], fill=0x2D)
-            op = h.get(reader.rows())
+            told_unprovable: list[bool] = []
+            op = h.get(
+                reader.rows(),
+                on_change=lambda op: told_unprovable.append(driver.access_unprovable(op)),
+            )
             lose_the_evidence(op)
             h.settle(op)
-            wait_until(
-                lambda: driver.access_unprovable(op), "the end to be declared unprovable", h.timeout
-            )
+            wait_until(lambda: True in told_unprovable, "on_change once unprovable", h.timeout)
             assert not driver.access_ended(op)
             started = time.monotonic()
             assert driver.drain(h.timeout) is False
@@ -726,6 +806,31 @@ class DriverConformance:
             if self.registers_on_demand:
                 with pytest.raises(DriverRejected):
                     reader.unregister()
+
+    def test_a_cancel_that_ends_an_operation_calls_its_on_change(self) -> None:
+        self._end_an_unstarted_get("cancel", lambda driver, op: driver.cancel(op))
+
+    def test_a_drain_that_ends_an_operation_calls_its_on_change(self) -> None:
+        self._end_an_unstarted_get("drain", lambda driver, op: driver.drain(0.0))
+
+    def _end_an_unstarted_get(
+        self, how: str, end: Callable[[StoreDriver, OpHandle], object]
+    ) -> None:
+        driver = self.make_driver_starting_nothing()
+        if driver is None:
+            pytest.skip("this driver cannot hold an operation unstarted")
+        with self.harness(driver) as h:
+            h.needs(get=True, cancel=how == "cancel")
+            reader = h.endpoint(["Q"], fill=0x2D)
+            told: list[tuple[list[RowStatus], bool]] = []
+            op = h.get(
+                reader.rows(),
+                on_change=lambda op: told.append((statuses(driver, op), driver.access_ended(op))),
+            )
+            end(driver, op)
+            assert statuses(driver, op) == [RowStatus.CANCELLED]
+            ended = ([RowStatus.CANCELLED], True)
+            wait_until(lambda: ended in told, f"on_change once the {how} ended the get", h.timeout)
 
     def test_cancel_after_conclusion_changes_nothing(self) -> None:
         with self.harness() as h:
@@ -737,6 +842,41 @@ class DriverConformance:
             h.driver.cancel(op)
             assert h.driver.poll(op) == results
             assert reader.read_row(0) == b"aaaaaaaa"
+
+    def test_a_put_returns_its_handle_before_the_store_answers(self) -> None:
+        """put runs on the caller's thread, the executor loop's: it hands the handle back while
+        the store still holds the row, and never waits for the store."""
+        if not self.handles_before_completion:
+            pytest.skip("this driver answers inside put and get")
+        staged = self.make_blocked_put()
+        if staged is None:
+            pytest.skip("this driver cannot stage a put blocked in the store")
+        driver, blocked_key, blocked, unblock = staged
+        with self.harness(driver) as h:
+            h.needs(put=True)
+            source = h.endpoint(["P"])
+            source.fill_row(0, b"pppppppp")
+            handed_back = threading.Event()
+            seen: dict[str, OpHandle] = {}
+
+            def put() -> None:
+                seen["op"] = h.put([RowIO(blocked_key, (source.span(0),))])
+                handed_back.set()
+
+            putter = threading.Thread(target=put, daemon=True)
+            putter.start()
+            try:
+                assert handed_back.wait(h.timeout), "put waited for the store to answer"
+                if blocked is not None:
+                    assert blocked.wait(h.timeout), "the put never reached the store"
+                op = seen["op"]
+                assert statuses(h.driver, op) == [RowStatus.PENDING]  # still inside the store
+                assert h.driver.access_ended(op) is False
+            finally:
+                unblock()
+                putter.join(h.timeout)
+            (result,) = h.settle(seen["op"])
+            assert result.status is RowStatus.READY
 
     def test_cancel_of_a_get_inside_the_store_neither_waits_nor_lies(self) -> None:
         """Cancel is best effort, so only what it must not do is checked: wait for the store,
@@ -813,15 +953,20 @@ class DriverConformance:
         if driver is None:
             pytest.skip("this driver cannot stage a store that raises mid-operation")
         with self.harness(driver) as h:
-            h.needs(put=True)
+            h.needs(put=True, get=True)
             writer = h.endpoint(["A"])
             writer.fill_row(0, b"aaaaaaaa")
-            try:
-                op = h.put(writer.rows())
-            except Exception as error:  # noqa: BLE001 - the check is that nothing escapes
-                pytest.fail(f"put raised after the operation was recorded: {error!r}")
-            (result,) = h.settle(op)
-            assert result.status is RowStatus.FAULT, result
+            reader = h.endpoint(["A"], fill=0x2D)
+            for direction, start, rows in (
+                ("put", h.put, writer.rows()),
+                ("get", h.get, reader.rows()),
+            ):
+                try:
+                    op = start(rows)
+                except Exception as error:  # noqa: BLE001 - the check is that nothing escapes
+                    pytest.fail(f"{direction} raised after the operation was recorded: {error!r}")
+                (result,) = h.settle(op)
+                assert result.status is RowStatus.FAULT, (direction, result)
 
     def test_a_key_held_by_an_unfinished_write_is_not_ready_for_get_put_and_probe(self) -> None:
         staged = self.make_held_key()
@@ -921,6 +1066,8 @@ class DriverConformance:
                         else:
                             seen["unregister"] = "accepted"
                     seen["drain"] = h.driver.drain(0.05)
+                    if handle_back.is_set():
+                        seen["slow_ended_after_drain"] = h.driver.access_ended(seen["slow_op"])
                 except BaseException as error:  # noqa: BLE001 - reported from the main thread
                     failures.append(error)
 
@@ -951,6 +1098,7 @@ class DriverConformance:
                     assert seen.get("slow_checked"), "the stalled get was never asked about"
                 if seen.get("slow_checked"):
                     assert seen["slow_ended"] is False and seen["slow_unprovable"] is False
+                    assert seen["slow_ended_after_drain"] is False, "drain forced an access end"
                     slow_results = seen["slow_poll"]
                     assert isinstance(slow_results, tuple)
                     assert all(r.status is not RowStatus.READY for r in slow_results)
@@ -1030,7 +1178,10 @@ class DriverConformance:
             assert endpoint.handle is not None
             assert h.driver.drain(self.timeout) is True
             h.driver.unregister(endpoint.handle)
-            h.driver.unregister(endpoint.handle)
+            try:
+                h.driver.unregister(endpoint.handle)
+            except Exception as error:  # noqa: BLE001 - the check is that nothing escapes
+                pytest.fail(f"a second unregister raised {error!r}")
             endpoint.released = True  # the harness must not give pool memory back twice
 
     def test_unregister_frees_the_range_for_a_new_registration(self) -> None:
@@ -1078,3 +1229,8 @@ class DriverConformance:
             h.done = True  # closed by the check itself
             with pytest.raises(DriverRejected):
                 h.put(writer.rows())
+
+
+def _batch(rows: Sequence[RowIO]) -> RowBatch:
+    """``rows`` as the batch a driver takes; a check that builds its rows by hand lists them."""
+    return rows if isinstance(rows, RowBatch) else RowBatch.of(rows)

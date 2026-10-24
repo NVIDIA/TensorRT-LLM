@@ -12,9 +12,11 @@ other. Nothing here belongs to the public backend contract in ``base/``, from wh
 from __future__ import annotations
 
 import enum
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, overload, runtime_checkable
+
+import numpy as np
 
 from ..base.memory import MemoryKind
 
@@ -22,8 +24,8 @@ Hint = Any
 """The caller's hint for where a get or probe should look, handed to the driver unchanged. A hint
 is an immutable snapshot: the driver may keep a reference to it for as long as it needs and never
 modifies it. The backend passes a hint only to a driver that declares ``hints``; for any other
-driver it rejects the submission that carries one, before dispatch, so such a driver keeps its
-hint-free calls as they were."""
+driver it rejects the submission that carries one, before dispatch, so such a driver is never
+called with a hint."""
 
 
 class DriverRejected(Exception):
@@ -31,8 +33,8 @@ class DriverRejected(Exception):
 
     The only exception that certifies nothing escaped: the caller may forget the call. It is not a
     :class:`StoreError`, so code that handles store trouble never swallows a rejection. Any other
-    raise from ``register``, ``put`` or ``get`` may have escaped, and the caller keeps the memory
-    protected until the driver proves otherwise, at the latest through a ``drain`` returning True.
+    raise from ``register``, ``put`` or ``get`` may have escaped, so the caller keeps the memory
+    protected; the blob backend, which cannot tell what escaped, holds it for good.
     """
 
 
@@ -202,12 +204,162 @@ class RowIO:
         return sum(span.nbytes for span in self.spans)
 
 
+class RowBatch(Sequence[RowIO]):
+    """The rows of one ``put`` or ``get``, laid out alike and held as columns.
+
+    Row ``i`` is stored under ``keys()[i]``; its payload is its spans
+    ``(addresses[i, j], span_bytes[j])`` back to back, in order. ``addresses`` is
+    ``int64 [rows, spans_per_row]``, read only. Every row has the same span sizes, so every row
+    holds ``row_bytes``. Span ``j`` of every row lies in ``extents[j]``, and each extent lies in one
+    region its maker registered with the driver, so a driver can check a batch's memory once per
+    extent instead of once per row.
+
+    A batch keeps arrays and builds nothing per row until a driver asks, so handing one over costs
+    the same for any number of rows. A driver whose store calls take lists builds them on the
+    thread that makes those calls (``keys()``, ``addresses[:, 0].tolist()``); a driver that works
+    row by row reads the batch as a ``Sequence[RowIO]``, one ``RowIO`` per row read. Slicing a
+    batch gives the batch of those rows, again without building anything per row.
+
+    Its maker guarantees what a driver would otherwise check row by row: at least one row, no key
+    twice, spans of positive size inside their extent that do not overlap within a row, and each
+    extent inside one registered region. :meth:`of` checks all but the last, which only the driver
+    can; :meth:`of_slots`, for a maker that checked its rows already, checks nothing.
+    """
+
+    def __init__(
+        self,
+        keys: Sequence[str],
+        addresses: np.ndarray,
+        span_bytes: tuple[int, ...],
+        extents: tuple[Span, ...],
+    ) -> None:
+        self._keys = keys
+        self.addresses = addresses
+        self.span_bytes = span_bytes
+        self.extents = extents
+
+    @classmethod
+    def of_slots(
+        cls,
+        key_stem: str,
+        object_keys: np.ndarray,
+        addresses: np.ndarray,
+        slot_bytes: int,
+        extent: Span,
+    ) -> RowBatch:
+        """Rows that are each one whole slot: row ``i`` is keyed ``key_stem`` followed by
+        ``object_keys[i]`` in hex, and its payload is the ``slot_bytes`` at ``addresses[i]``.
+        Checks nothing and copies nothing.
+
+        Args:
+            key_stem: How every key starts (``keys.key_stem``).
+            object_keys: ``uint8 [rows, width > 0]``, no row twice.
+            addresses: ``int64 [rows]``, each the start of a slot inside ``extent``.
+            slot_bytes: Every row's size.
+            extent: The registered region holding every slot, or a span inside it.
+        """
+        column = addresses[:, None]  # a view of the caller's array, which stays writable
+        column.flags.writeable = False
+        return cls(_HexKeys(key_stem, object_keys), column, (slot_bytes,), (extent,))
+
+    @classmethod
+    def of(cls, rows: Sequence[RowIO]) -> RowBatch:
+        """The batch of ``rows``, built row by row and checked. Span ``j``'s extent is the
+        smallest span holding every row's span ``j``.
+
+        Raises:
+            ValueError: No rows, a key twice, or rows not laid out alike.
+        """
+        rows = list(rows)
+        if not rows:
+            raise ValueError("a batch needs at least one row")
+        keys = tuple(row.key for row in rows)
+        if len(set(keys)) != len(keys):
+            raise ValueError("a key appears twice in one batch")
+        span_bytes = tuple(span.nbytes for span in rows[0].spans)
+        if any(tuple(span.nbytes for span in row.spans) != span_bytes for row in rows):
+            raise ValueError("the rows of a batch have the same span sizes, in the same order")
+        addresses = np.array([[s.address for s in row.spans] for row in rows], dtype=np.int64)
+        addresses.flags.writeable = False
+        extents = tuple(
+            Span(int(column.min()), int(column.max()) + nbytes - int(column.min()))
+            for column, nbytes in zip(addresses.T, span_bytes)
+        )
+        return cls(keys, addresses, span_bytes, extents)
+
+    @property
+    def spans_per_row(self) -> int:
+        return len(self.span_bytes)
+
+    @property
+    def row_bytes(self) -> int:
+        """Every row's size: its spans' bytes added up."""
+        return sum(self.span_bytes)
+
+    def keys(self) -> list[str]:
+        """Every row's store key, in order."""
+        return list(self._keys)
+
+    def __len__(self) -> int:
+        return len(self.addresses)
+
+    @overload
+    def __getitem__(self, index: int) -> RowIO: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> RowBatch: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            if step != 1:
+                raise ValueError("a RowBatch slice is contiguous")
+            rows = slice(start, stop)
+            return RowBatch(self._keys[rows], self.addresses[rows], self.span_bytes, self.extents)
+        spans = zip(self.addresses[index].tolist(), self.span_bytes)
+        return RowIO(self._keys[index], tuple(Span(address, nbytes) for address, nbytes in spans))
+
+
+@dataclass(frozen=True)
+class _HexKeys(Sequence[str]):
+    """Store keys as ``stem`` followed by each row of ``object_keys`` in hex, built only when
+    read; iterating builds every key with one hex conversion."""
+
+    stem: str
+    object_keys: np.ndarray  # uint8 [rows, width]
+
+    def __len__(self) -> int:
+        return len(self.object_keys)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return _HexKeys(self.stem, self.object_keys[index])
+        return self.stem + self.object_keys[index].tobytes().hex()
+
+    def __iter__(self) -> Iterator[str]:
+        stem, width = self.stem, 2 * self.object_keys.shape[1]
+        hexed = self.object_keys.tobytes().hex()
+        return iter([stem + hexed[i : i + width] for i in range(0, len(hexed), width)])
+
+
 class RegionHandle(Protocol):
     """Opaque handle of one registration; only the driver that issued it reads it."""
 
 
 class OpHandle(Protocol):
     """Opaque handle of one put or get; only the driver that issued it reads it."""
+
+
+OnChange = Callable[[OpHandle], None]
+"""What a caller of ``put`` or ``get`` hands the driver to hear of the operation.
+
+The driver calls it with the operation's handle once every row concluded, once its access ended
+and once its access turned unprovable, each time after the change shows through ``poll``,
+``access_ended`` and ``access_unprovable`` (one call may tell of several). The driver may also
+call it at other times, such as after some rows concluded, from any thread, outside its locks,
+possibly before the ``put`` or ``get`` that issued the operation returned. The callback may call
+the driver's non-blocking queries and ``cancel``; it returns promptly and never raises. A caller
+that passes None polls instead."""
 
 
 class ProbeStatus(enum.Enum):
@@ -230,12 +382,15 @@ class DriverCapabilities:
     Args:
         get: ``get`` is implemented.
         put: ``put`` is implemented.
-        cancel: ``cancel`` does something; without it the backend only suppresses unstarted work.
-        probe: ``probe`` answers; without it the backend fetches blindly.
+        cancel: ``cancel`` does something. Without it the backend never calls ``cancel`` and
+            declares no cancel of its own: the calls of a stopped submission run to their end.
+        probe: ``probe`` answers. The blob backend never probes, so it fetches without asking
+            first either way.
         max_rows_per_op: Rows one ``put``/``get`` accepts, or ``None`` for no limit.
         hints: ``get`` and ``probe`` read a caller's hint; without it the backend rejects a
             submission carrying a hint before dispatch and the driver is called without one.
-        absent_is_miss: A get of a key the store does not hold always concludes MISS. Without
+        absent_is_miss: A get of a key the store does not hold concludes MISS, unless an earlier
+            read of that row in the same operation already wrote its memory (a reread). Without
             it the store may not tell absence from failure, and such a get may conclude FAULT.
         device_memory: The driver registers regions whose ``memory_kind`` is DEVICE; without it
             every region handed to it is host memory and it rejects a DEVICE one.
@@ -265,10 +420,16 @@ class StoreDriver(Protocol):
     """What the backend asks of a store.
 
     Threads: ``register``, ``unregister``, ``drain`` and ``close`` are called one at a time.
-    ``put``, ``get``, ``cancel`` and ``probe`` may run concurrently with each other and with those,
-    from the backend's own threads; a blocked ``put``/``get`` must not delay another. ``poll``,
-    ``access_ended`` and ``access_unprovable`` may be called from any thread. Locks inside a driver
-    guard its state only and are never held while waiting on the store.
+    ``put`` and ``get`` are called on the executor loop's thread, so they only record the
+    operation and queue its work: they never wait on the store or start a thread, take only locks
+    that no thread holds while waiting on the store (letting go of the GIL only while such a lock
+    is contended), and do no Python work per row; one list built at C speed, such as a pending
+    result per row, is the most. A driver whose store calls block runs them on threads of its own,
+    and it alone decides how they are batched and in what order gets and puts run.
+    ``put``, ``get``, ``cancel`` and ``probe`` may run concurrently with each other and with the
+    calls above. ``poll``, ``access_ended`` and ``access_unprovable`` may be called from any
+    thread. Locks inside a driver guard its state only and are never held while waiting on the
+    store.
 
     Side effects: :class:`DriverRejected` is the only raise that certifies nothing escaped, and
     ``put``/``get`` raise it only before recording the operation. Once recorded, the call returns
@@ -321,22 +482,26 @@ class StoreDriver(Protocol):
         """
         ...
 
-    def put(self, rows: Sequence[RowIO]) -> OpHandle:
-        """Publish ``rows``; may return before any byte moved.
+    def put(self, rows: RowBatch, *, on_change: OnChange | None = None) -> OpHandle:
+        """Publish ``rows``; returns without waiting on the store, usually before any byte moved.
+        ``on_change`` is called as ``OnChange`` says.
 
         The caller guarantees that the rows' spans hold the payload and stay unchanged until
-        ``access_ended`` is true, and hands a row of more than one span only to a driver that
-        declares ``multi_span``; a driver may treat an unexpected one as a programming error.
+        ``access_ended`` is true, and hands rows of more than one span only to a driver that
+        declares ``multi_span``; a driver may treat unexpected ones as a programming error.
 
         Raises:
-            DriverRejected: ``put`` is not declared, the driver is draining or closed, a key
-                appears twice in ``rows``, ``rows`` exceed ``max_rows_per_op``, or a span lies
-                outside a live registration; nothing escaped.
+            DriverRejected: ``put`` is not declared, the driver is draining or closed, ``rows``
+                exceed ``max_rows_per_op``, or an extent lies outside every live registration;
+                nothing escaped.
         """
         ...
 
-    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> OpHandle:
-        """Fetch ``rows``, from where ``hint`` says when given; may return before any byte moved.
+    def get(
+        self, rows: RowBatch, hint: Hint = None, *, on_change: OnChange | None = None
+    ) -> OpHandle:
+        """Fetch ``rows``, from where ``hint`` says when given; returns without waiting on the
+        store, usually before any byte moved. ``on_change`` is called as ``OnChange`` says.
 
         The caller guarantees that no two spans of one call overlap, within a row or across rows,
         so a driver may write the rows concurrently without checking, and that nothing but this
@@ -395,7 +560,10 @@ class StoreDriver(Protocol):
         access and for the driver's own background work, such as outstanding probes, to finish.
 
         One-way: after the first call the driver rejects new ``put``/``get`` for good, whatever
-        the result. Returns False at once when an operation that cannot prove its end remains.
+        the result. Before it returns, every row the driver has not started working on (no
+        transfer or store call taken up) concludes CANCELLED, and an operation left with nothing
+        running ends its access. Returns False at once when an operation that cannot
+        prove its end remains.
         True when nothing can still touch memory and nothing is left running; False means keep
         everything registered and try again. Never forces an end.
         """

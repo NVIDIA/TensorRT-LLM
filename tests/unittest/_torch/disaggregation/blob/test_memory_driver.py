@@ -59,7 +59,11 @@ from tensorrt_llm._torch.disaggregation.testing.memory_store import (
 )
 from tensorrt_llm._torch.disaggregation.testing.object_trailer import encode_trailer
 
-pytestmark = pytest.mark.cpu_only
+# An exception that escapes a thread fails the test.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 PREFIX = "m"  # the prefix the controlled-mode endpoints below use
 KEY_A, KEY_B, KEY_C = (key_of(label, PREFIX) for label in "ABC")
@@ -99,9 +103,13 @@ class TimeoutStore(MemoryStore):
 
 
 class CrashingStore(MemoryStore):
-    """Raises something that is not a ``StoreError`` from inside a commit, as a binding bug would."""
+    """Raises something that is not a ``StoreError`` from inside every commit and read, as a
+    binding bug would."""
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
+        raise RuntimeError("binding returned garbage")
+
+    def get(self, key: str) -> StoredObject | None:
         raise RuntimeError("binding returned garbage")
 
 
@@ -160,6 +168,10 @@ class TestMemoryDriverConformance(DriverConformance):
     driver_cls: type[MemoryDriver] = MemoryDriver
     capabilities = DEFAULT_CAPABILITIES
     background = False  # True: put/get return once recorded and a thread executes them
+    # Automatic mode runs each operation inside put/get, which the protocol forbids; the checks
+    # that hold a put or a get inside the store skip it, and TestAsyncMemoryDriverConformance runs
+    # them.
+    handles_before_completion = False
 
     def _driver(self, store: MemoryStore | None = None) -> MemoryDriver:
         # An empty store is falsy (it has a length), so test for None explicitly.
@@ -182,6 +194,11 @@ class TestMemoryDriverConformance(DriverConformance):
         store.gate.clear()
         return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
 
+    def make_blocked_put(self) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
+        store = GatedStore(held={STAGED_KEY})
+        store.gate.clear()
+        return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
+
     def make_held_key(self) -> tuple[StoreDriver, str, Unblock]:
         store = MemoryStore()
         store.begin_write(STAGED_KEY)
@@ -192,6 +209,15 @@ class TestMemoryDriverConformance(DriverConformance):
 
     def make_crash_after_record(self) -> StoreDriver:
         return self._driver(CrashingStore())
+
+    def make_driver_starting_nothing(self) -> StoreDriver:
+        return self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
+
+    def make_results_before_access_end(
+        self,
+    ) -> tuple[StoreDriver, Callable[[OpHandle], None], Callable[[OpHandle], None]]:
+        driver = self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
+        return driver, driver.complete, driver.end_access
 
     def make_failing_presence(self) -> tuple[StoreDriver, str]:
         store = MemoryStore()
@@ -217,8 +243,8 @@ class _HintFreeSignatures(MemoryDriver):
     """A driver written before hints existed: ``get`` and ``probe`` take no hint. With
     ``hints`` undeclared the backend never passes one, so it stays a valid driver."""
 
-    def get(self, rows: Sequence[RowIO]) -> MemoryOp:  # type: ignore[override]
-        return super().get(rows)
+    def get(self, rows: Sequence[RowIO], *, on_change=None) -> MemoryOp:  # type: ignore[override]
+        return super().get(rows, on_change=on_change)
 
     def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:  # type: ignore[override]
         return super().probe(keys, budget_s)
@@ -241,6 +267,8 @@ SHARED_STORE = MemoryStore()
 class TestSharedStoreConformance(DriverConformance):
     """Fresh clients of one persistent store: every check finds the previous checks' objects."""
 
+    handles_before_completion = False  # the in-memory driver's automatic mode
+
     def make_driver(self) -> StoreDriver:
         return MemoryDriver(SHARED_STORE)
 
@@ -249,6 +277,7 @@ class TestPoolDriverConformance(DriverConformance):
     """A driver that registered its memory once, when built; endpoints are carved out of it."""
 
     registers_on_demand = False
+    handles_before_completion = False  # the in-memory driver's automatic mode
     POOL_BYTES = 1 << 16
 
     def pool_driver(self) -> MemoryDriver:
@@ -1112,6 +1141,12 @@ def test_each_async_conformance_check_passes_the_driver_and_fails_the_one_breaki
     _run_check(_conformance(MemoryDriver, capabilities, asynchronous), check)
     with pytest.raises(CHECK_FAILED):
         _run_check(_conformance(broken, capabilities, asynchronous), check)
+    # A broken driver may claim an access ended while its own thread still runs it.
+    wait_until(
+        lambda: not any(t.name == "memory-driver-op" for t in threading.enumerate()),
+        "the broken driver's threads to finish",
+        TIMEOUT,
+    )
 
 
 @pytest.mark.parametrize("rule", sorted(BROKEN_MEMORY))
@@ -1132,12 +1167,30 @@ def test_a_skip_on_the_broken_side_is_not_an_expected_failure() -> None:
             _run_check(suite, "test_probe_reports_hit_and_miss")
 
 
-def test_each_broken_driver_breaks_one_rule_and_names_an_existing_check() -> None:
+def test_every_check_has_a_broken_driver_and_each_driver_one_pairing() -> None:
     pairings = [*BROKEN_CONFORMANCE.values(), *BROKEN_ASYNC_CONFORMANCE.values()]
     conformance = [cls for cls, _, _ in pairings]
     memory = [cls for cls, _ in BROKEN_MEMORY.values()]
     assert len(set(conformance + memory)) == len(conformance) + len(memory)
     checks = {check for _, _, check in pairings}
-    assert checks <= {name for name in dir(DriverConformance) if name.startswith("test_")}
+    # A check no broken driver fails is one nothing proves can fail.
+    assert checks == {name for name in dir(DriverConformance) if name.startswith("test_")}
     checks = {check for _, check in BROKEN_MEMORY.values()}
     assert checks <= {name for name in dir(TestMemoryDriver) if name.startswith("test_")}
+
+
+class TestMemoryDriverOnChange:
+    @pytest.mark.parametrize("stop", ["cancel", "drain"])
+    def test_a_cancel_or_drain_shows_before_on_change_is_called(self, stop: str) -> None:
+        driver = MemoryDriver(MemoryStore(), controlled=True)
+        reader = endpoint(driver, ["A"])
+        seen: list[tuple[list[RowStatus], bool]] = []
+        op = driver.get(
+            reader.rows(),
+            on_change=lambda op: seen.append((statuses(driver, op), driver.access_ended(op))),
+        )
+        if stop == "cancel":
+            driver.cancel(op)
+        else:
+            assert driver.drain(TIMEOUT) is True
+        assert seen == [([RowStatus.CANCELLED], True)]
