@@ -1,0 +1,481 @@
+# trtllm-modeling-v2 task specification.
+#
+# Copy this file, fill it in, and run:
+#
+#   trtllm-modeling-v2 --task task.yaml --workspace workspace/trtllm-modeling-v2 --dry-run
+#
+# Or derive one from the checkpoint: `trtllm-modeling-v2 --checkpoint <dir> --site site.yaml
+# --workspace W --goal "..."` compiles the request into this schema (W/task.resolved.yaml) and runs
+# it (INTAKE.md, the fast path).
+#
+# Every block is CLOSED: a key this schema does not know is an error naming the nearest real key,
+# never a silent default. Commented-out fields are optional; the default is stated beside each.
+# docs/user-guide.md says which keys decide the outcome.
+
+# ---------------------------------------------------------------- identity
+# A target's identity is (checkpoint, GPU arch, parallel config): the run's slug, its branch name
+# and the target's path.
+
+checkpoint_path: /path/to/Qwen3-30B-A3B
+
+# REQUIRED and never inferred: catalog receipts are per architecture. sm_100 = B200, sm_103 = GB300.
+arch: sm_103
+
+# tp<N> | tep<N> | dep<N> | unified. The number is the world size, and how many devices preflight
+# claims; `unified` takes its world size from the member set.
+parallel: tp1
+
+# The configurations a `unified` target is gated at; legal only with `parallel: unified`. Each
+# member pays boot + accuracy per unit (accuracy is roughly an hour), and preflight prints the
+# count. On a `local` run every member must have the same world size; under `session_spool` each
+# gate job asks the scheduler for its own member's devices ([tp1, tep2, tep4]).
+# Default, at the unified world size W (4 unless a member says otherwise): [tpW, tepW, depW].
+#
+# members: [tp4, tep4, dep4]
+#
+# Per unit, layered over `default`, the same shape as `runtime:`:
+# members:
+#   default: [tp4, tep4, dep4]
+#   multimodal: [tep4]
+
+# Feature increments, built after core: mtp, eagle3, dflash, dspark, multimodal, host_offload,
+# disagg, kv_quant, decoder_replay, encoder_replay. The speculators get the acceptance gate;
+# host_offload, disagg, kv_quant and the replay features a witness (`accuracy.witness`, required at
+# spec time for disagg, kv_quant and the replay features). `dspark` is not a spelling of `mtp`: a
+# checkpoint whose `mtp.*` stages are a DSpark block drafter (its config carries `dspark_*` keys)
+# asks for `dspark`, and the two are refused together.
+features: []
+
+# Configurations a built unit must also serve, each gated on its own: a KV-cache or SSM-state
+# dtype, a speculation depth. A variant builds nothing; its checks (`<variant>:<gate>@<member>`)
+# run on its unit's target under the unit's settings plus the overlay, and the planner claims them
+# with a `feature` task whose `ref` is the variant. A variant with no `acceptance` gate also boots
+# at every member of its unit, where its boot attests the setting on every rank.
+#
+# variants:
+#   kv_fp8:
+#     unit: core                    # default core
+#     members: [tep4]               # default: the unit's members
+#     gates: [boot, accuracy]       # the default; `acceptance` needs a speculator unit
+#     runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # boot gate, appended
+#     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
+#     env: {}                       # added to the gate command's environment
+#     accuracy: {discriminators: {kv_cache_quant_algo: FP8}}  # where its anchor differs
+#     note: KV cache stored as FP8
+
+# What the contract proves of the request, feature by member (`coverage.yaml`). A requested cell
+# no check covers stops the run at preflight unless accepted here: `<feature>@<member>`,
+# `<feature>@*` for a whole row, `<unit>+<unit>` for a pair no check reaches together.
+# coverage:
+#   accept: [mtp7@tp4, disagg+multimodal@*]
+
+# How much the contract owes: `bringup` (each unit at its cheapest member; no variant, no delivery
+# check), `standard` (default: this file as written), `certified` (also the witnesses, the envelope
+# boot and the serve gate, and each unit's benchmark at every member). A switch set here keeps its
+# value.
+# profile: standard
+
+# What the run may spend: wall-clock hours, and device-hours held (the devices its sessions hold
+# times the hours since it started). Past either it starts nothing more and closes with the cells
+# it proved. Default: no bound.
+# budget: {wall_hours: 48, gpu_hours: 1500}
+
+trtllm_repo_path: /path/to/TensorRT-LLM
+
+# Overrides of the derived identity. The family comes from `architectures[0]`; the checkpoint
+# segment is guessed from the directory name. Both are Python package names.
+# target:
+#   family: qwen3_5
+#   checkpoint_segment: qwen3_5_27b_nvfp4
+#
+# A kernel task on a shared catalog entry lands a local variant in the target's ops/, and a promote
+# task merges the variants into the catalog; delivery refuses a target that still holds one. An
+# entry named here stays local, and delivery accepts it. Default: none.
+#   keep_local: [norm/flashinfer_rmsnorm]
+
+# `full` (default) | `text_only`: a multimodal checkpoint built and gated as a language model.
+# scope: text_only
+
+# Free text passed verbatim to every role: code style, reference implementations, infrastructure.
+# It never relaxes a gate, the embargo or the scope.
+# notes: |
+#   Reuse the NVFP4 MoE kernels in tensorrt_llm/_torch/modules/fused_moe.
+
+# Paths no role may read. Each must exist. Repo-relative (under `trtllm_repo_path`: the engine's
+# own implementation of this checkpoint); ABSOLUTE outside the repo (a sibling engine's checkout;
+# a directory embargoes its tree); or `package:<path>` inside this workflow package (its worked
+# example of the model, `package:examples/<model>.md`). Running an embargoed implementation as an
+# accuracy oracle is allowed; only reading it is not. A prompt rule, not a tool hook.
+# source_embargo:
+#   - tensorrt_llm/_torch/models/modeling_qwen3_5.py
+#   - /path/to/vllm
+#   - package:examples/<model>.md
+
+# ----------------------------------------------------------------- runtime
+# What every gate command runs with. Its limits (max_batch_size, max_num_tokens, max_seq_len and
+# the CUDA-graph capture batches) are the serving envelope: what the target claims to serve, which
+# kernels are certified against and capacity constants are derived from.
+#
+# runtime:
+#   cuda_graph: false          # default false
+#   chunked_prefill: false     # default false
+#   overlap_scheduler: true    # default true  (--disable_overlap_scheduler)
+#   kv_cache_reuse: true       # default true  (--disable_kv_cache_reuse)
+#   min_free_memory_gib: 2.0          # a gate leaving less device memory free warns LOW MARGIN
+#   min_free_memory_fraction: 0.02    # ... or less than this fraction of the device, if larger
+#   # Anything else the gate command needs, verbatim. Set --max_seq_len: without it the engine
+#   # sizes its cache for `max_position_embeddings` and dies with `Impossible to fit in any
+#   # sequence in kvCache`.
+#   extra_flags:
+#     - --max_seq_len=8192
+#     - --max_batch_size=8
+#     - --kv_cache_fraction=0.6
+#
+# Per unit, layered over `default`:
+#
+#   runtime:
+#     default:
+#       kv_cache_reuse: true
+#       extra_flags: [--max_seq_len=8192]
+#     multimodal:
+#       kv_cache_reuse: false
+#
+# The quickstart the boot gate drives takes no options file, so this block is its only channel. A
+# setting both launchers take (the KV fraction, KV and SSM cache dtypes, tokens per block,
+# max_num_tokens, trust_remote_code) is stated once, here or in `llm_api_options`, and reaches
+# every launcher; two values for one setting are refused at preflight. A checkpoint that ships its
+# own code (`auto_map`) is trusted by every launcher.
+
+# ------------------------------------------------------------- environment
+# How GPU work is launched, resolved once into the command prefix every role's prompt carries.
+
+environment:
+  # `local`: this host, the devices preflight claims. `session_spool`: long-lived compute sessions
+  # whose spool scheduler runs every job (docs/user-guide.md, section 6).
+  kind: local
+
+  # The interpreter every Python command runs under: the editable TensorRT-LLM install to measure.
+  python: /path/to/TensorRT-LLM/.venv-3.12/bin/python
+
+  env:
+    # Mandatory: under `auto` a configuration that misses the target's routing silently runs the
+    # built-in implementation, and its numbers read as the target's.
+    TRTLLM_MODELING_V2: require
+    # Outside /tmp, and at most 61 characters (the LLM API binds a unix socket under it).
+    TMPDIR: /path/to/scratch/tmp
+    CLAUDE_CODE_TMPDIR: /path/to/scratch/tmp
+
+  # A checkpoint the STOCK modeling path supports, booted by the substrate gate when the run's own
+  # checkpoint is an architecture the stock path does not know (and only then). `MPI_ERR_SPAWN` and
+  # the NVRTC PATH fault are still proven; a kvCache sizing fault then surfaces at the first boot
+  # gate. Prefer this over `--skip-substrate-gate`, which gives up all three.
+  # substrate_checkpoint: /path/to/Qwen3-30B-A3B
+
+  # --- session allocations (session_spool) -------------------------------
+  # Submission parameters every session inherits unless it sets its own;
+  # `trtllm-modeling-v2 session submission` renders the call from them.
+  # partition: batch
+  # account: your-account
+  # container_image: /path/to/image.sqsh    # a local squashfs mounts in seconds; a registry
+  #                                         # reference is imported per allocation (5-35 min)
+  # mounts:
+  #   - /lustre:/lustre
+  # time_limit: "04:00:00"
+  # gpus_per_node: 4
+  # container_name: trtllm-modeling-v2      # pyxis skips the import when this name exists
+  #
+  # The gate spool: work is a file, `<spool>/pending/<name>.sh` in, `<spool>/done/<name>.rc` out.
+  # spool: /path/to/scratch/spool
+  #
+  # The sessions the run stands on, each an allocation whose main process is the spool scheduler.
+  # Render each entry script with `trtllm-modeling-v2 session render --task task.yaml --name a`.
+  # With a `time_limit`, a session asks for a successor `handover_lead` before its end and stops
+  # admitting jobs that could not finish. `nodes: 2` makes a multi-node session
+  # (infra/scripts/mn/README.md).
+  # sessions:
+  #   - name: a
+  #     spool: /path/to/scratch/spool          # the gate spool above
+  #     role: gates                            # gates | work | any
+  #     gpus_per_node: 4
+  #     time_limit: "24:00:00"
+  #     handover_lead: "01:00:00"
+  #     scheduler: {default_wall: 2h}
+  #   - name: b
+  #     spool: /path/to/scratch/spool-b
+  #     role: work                             # catalog tests, microbenchmarks
+  #
+  # How long the orchestrator waits for a gate's session to heart-beat again before the run closes
+  # `session-lost:<unit>`. Seconds, 90m, 2h or HH:MM:SS. Default 1h.
+  # session_wait: 1h
+
+# ---------------------------------------------------------------- accuracy
+# The release criterion: measured >= reference - k x SE (see `floor`). The anchor comes from
+# TensorRT-LLM's own accuracy references and is never invented; preflight resolves every unit's row
+# before any agent turn.
+
+accuracy:
+  benchmark: gsm8k
+  reference_yaml: tests/integration/defs/accuracy/references/gsm8k.yaml
+
+  # `statistical` (default): reference - k x SE, the SE binomial over the benchmark's sample count
+  # (0.73 points for GSM8K's 1319 questions at 92 %, so k = 2 puts the floor 1.5 points down).
+  # `rule: tolerance` keeps the fixed `tolerance` below. When every member of a unit (at least
+  # `shift_min_members`) scores more than 1 SE under the reference, the run records a FINDING, and
+  # delivery refuses it until `acknowledge` names the unit with the reason.
+  # floor:
+  #   rule: statistical
+  #   k: 2.0
+  #   shift_min_members: 2
+  #   acknowledge:
+  #     dspark: "every member -0.9..-1.1: drafter changes rounding, see 06-gates/..."
+
+  # In benchmark points; read only under `floor.rule: tolerance`.
+  tolerance: 5.0
+
+  # The benchmark's sample count, for the SE, when the gate cannot read it from the eval's output
+  # or `--num_samples`. A scalar, or a mapping from unit to a count.
+  # samples: {default: 1319, multimodal: 900}
+
+  # `sampled` (default): with the logit gate owed, each unit's benchmark runs at its narrowest
+  # member, its widest, and every member the logit gate does not run whole (attention DP; a
+  # speculator unit whose boot compares no greedy tokens); without the logit gate, at every member.
+  # `every`: at every member regardless. contract.yaml's `notes` say where.
+  # benchmark_members: sampled
+
+  # `pending` where no written anchor exists yet (scalar, or per unit; default `recorded`): the
+  # unit's benchmark is then no check, the logit gate must be on as its oracle, and delivery stays
+  # incomplete until the row is recorded. Anchors are in percent; one of 1 or less is refused.
+  # anchor: {multimodal: pending}
+
+  # The reference_yaml row's model; default: the checkpoint path's last two components.
+  # model_key: openai/gpt-oss-120b
+
+  # The row's tags, matched EXACTLY (`quant_algo`, `kv_cache_quant_algo`, `spec_dec_algo`).
+  # Omitted, it asks for the untagged row: for a quantized checkpoint the bf16 number. Per unit,
+  # since `core` and `mtp` are different rows.
+  # discriminators:
+  #   core: {quant_algo: MIXED_PRECISION}
+  #   mtp:  {quant_algo: MIXED_PRECISION, spec_dec_algo: MTP}
+
+  # The WITNESSES, for the features boot and accuracy cannot see; owed when `enabled: true` or
+  # under `profile: certified`. A witness compares one observable across two legs that differ in
+  # one variable. Any block may set `timeout` (seconds per leg; default 1800). A token-comparing
+  # witness (host_offload, kv_quant, disagg) declares `prompts` or `prompts_file`, `max_tokens` and
+  # `min_generated_tokens` (default 32), else uses the acceptance or boot prompts; both legs print
+  # token ids under TRTLLM_WITNESS_FULL_OUTPUT=1, and `max_batch_size` runs both legs at it (1 for
+  # an exact comparison).
+  #
+  # witness:
+  #   enabled: true
+  #   host_offload:
+  #     contrast_env: {MYMODEL_HOST_OFFLOAD: "0"}   # the leg WITHOUT the offload
+  #     expected_mib: 48800          # predicted from the checkpoint's shapes, never from the run
+  #     # The target prints `__DEVICE_MEMORY_MIB__ <MiB>` once per rank, after its weights load
+  #     # and before the KV cache pool is allocated.
+  #   disagg:
+  #     # Leg B is a launcher of the run's own, REQUIRED with its `contrast_env`: one process on a
+  #     # whole node that starts a context and a generation engine of the member's width (twice
+  #     # its devices) and hands the state between them, given leg A's workload as
+  #     # MV2FLOW_WITNESS_* variables. A word naming a file beside this spec is resolved against its
+  #     # directory. Its contract is in docs/design.md, section 5.2.
+  #     contrast_command: scripts/my_leg_b.py
+  #     contrast_env: {MYMODEL_DISAGG: "1"}      # leg B's environment alone
+  #     cache_transceiver_config: {backend: NIXL}   # optional: leg B's MV2FLOW_WITNESS_TRANSCEIVER
+  #     prompt_tokens: [131, 2050, 2051, 4097]   # extra prose prompts, BOTH legs
+  #     timeout: 2700
+  #     max_batch_size: 1
+  #     # The environment of BOTH legs: a path leg B's engines refuse under disaggregation (here,
+  #     # both bounded replays) is pinned off in leg A too, so the legs differ only in the hop.
+  #     legs_env:
+  #       MYMODEL_ENCODER_REPLAY: "0"
+  #       MYMODEL_DECODER_REPLAY: "0"
+  #   # The target prints `MODELING_V2_WITNESS kv_bytes_per_token=<int>` once per rank under
+  #   # TRTLLM_MODELING_V2_WITNESS=1, held to the figure declared here; `exact: true` (default)
+  #   # also demands token identity with bf16 storage, `exact: false` names a lossy attention path.
+  #   kv_quant:
+  #     contrast_env: {MYMODEL_KV_STORAGE: bf16}   # the leg WITH bf16 storage
+  #     expected_bytes_per_token: 656              # one rank's persistent bytes per token
+  #     exact: true
+  #     bytes_tolerance: 0.02            # default
+  #     max_batch_size: 1
+  #   # The bounded-replay features: the target prints `MODELING_V2_WITNESS forwarded_tokens=<int>
+  #   # decoder_tokens=<int> ...` per context request, judged against the window and workload
+  #   # declared here. Each size must exceed the window and stay under 16384.
+  #   decoder_replay:
+  #     contrast_env: {MYMODEL_DECODER_REPLAY: "0"}  # replay OFF
+  #     window: 128            # the checkpoint's sliding window
+  #     prompt_tokens: 4096
+  #   encoder_replay:
+  #     contrast_env: {MYMODEL_ENCODER_REPLAY: "0"}  # replay OFF
+  #     window: 128
+  #     prefix_tokens: 4096
+  #     reuse_alignment: 2     # e.g. a KV compression ratio the boundary may not split
+
+  # The ACCEPTANCE gate, in every unit whose target keeps speculation on. It measures accepted
+  # tokens per iteration per prompt against the same checkpoint under built-in modeling (`=off`;
+  # fails under a 0.95 ratio when a paired test finds the drop significant), against the previous
+  # tree's verdict (a paired test with a minimum effect), and against 1.0. A new architecture has
+  # no `=off` path: declare `measured_reference` (the floor is 0.95 x it) or `min_absolute` with its
+  # `floor_source`. The workload defaults to the first 32 questions of the accuracy dataset
+  # (`dataset`, read from the local cache; nothing is downloaded). Each key also works per unit.
+  #
+  # acceptance:
+  #   # dataset: /data/gsm8k         # or a cached id; dataset_config, split, text_field pick the
+  #   #                              # dataset's config, split and question field
+  #   num_prompts: 32
+  #   prompt_template: "{text} Solve it step by step, then give the answer."
+  #   # prompts: [...]              # or declare the prompts outright
+  #   # prompts_file: prompts.json  # a YAML/JSON list, or boot.yaml's shape
+  #   max_tokens: 256
+  #   min_draft_iterations: 32      # fewer fails as "workload too short"
+  #   min_prompts: 32               # fewer fails as "workload too small"
+  #   regression: {test: t, alpha: 0.05, min_effect: 0.1}
+  #   mtp:
+  #     min_absolute: 1.5
+  #     floor_source: "03-plan/acceptance-spike.md: reference 2.31, wrong controls <= 1.4"
+  #   dspark:
+  #     measured_reference: 3.32    # floor 3.15
+
+  # The BOOT gate's workload (else the workspace boot.yaml). Keywords are matched against the
+  # generated text only. A unit that implements `multimodal` and declares no image prompt sends
+  # tests/integration/test_input_files/merlion.png (a git-lfs file). With a logit reference, the
+  # boot also holds its first greedy tokens to the reference's; `greedy` sets how many prompts and
+  # tokens, `enabled: false` compares none, and a variant compares none unless its entry says so.
+  #
+  # boot:
+  #   prompts:
+  #     - "The capital of France is"
+  #     - prompt: "Natalia sold 48 clips in April and half as many in May. How many in all?"
+  #       keywords: ["72"]
+  #   max_tokens: 32
+  #   greedy: {enabled: true, prompts: 4, tokens: 24}
+  #   multimodal:
+  #     prompts:
+  #       - prompt: "<|User|><image>What vegetable is this? One word.<|Assistant|>"
+  #         images: [examples/images/carrots.jpeg]   # beside this file, or in the tree
+  #         render: raw                              # pre-rendered; or `loader`
+  #         keywords_any: [carrot]
+
+  # The ENVELOPE BOOT, once per member at delivery: the target at the runtime block's limits
+  # (max_batch_size in flight, prompts at max_seq_len, every capture batch replayed), with probes
+  # that must keep their first `agree_tokens` tokens from a batch-1 run. Needs `--max_seq_len`.
+  # envelope:
+  #   enabled: true
+  #   max_tokens: 16
+  #   agree_tokens: 4
+  #   long_prompts: 2
+  #   probes: ["The capital of France is", "Two plus two equals"]
+  #   timeout: 3600
+
+  # The SERVE gate: `trtllm-serve` starts each unit's target with the accuracy gate's options
+  # file, at the unit's widest member, and answers a /v1/completions request (and an image chat
+  # request for a unit whose boot sends one). On by default wherever the spec bounds the server's
+  # sequence length (`max_seq_len` below, or in the run-wide options file).
+  # serve:
+  #   enabled: true
+  #   prompt: "The capital of France is"
+  #   max_tokens: 32
+  #   timeout: 1800              # seconds for /health
+
+  # The LOGIT gate, on wherever a reference is named (or `logits.reference.json.gz` sits beside
+  # this file): every position's log-prob of the HF reference's top-1 token, held to the
+  # reference's own bf16-vs-fp32 spread times `threshold_factor`. Make the reference once, on the
+  # HF implementation (docs/user-guide.md, section 2):
+  #   python onboard/logit_reference.py --model <checkpoint> --out logits.reference.json.gz
+  # logits:
+  #   reference: logits.reference.json.gz
+  #   prompts: [capital, clips, long, image0]   # default: every one the unit takes
+  #   threshold_factor: 3.0
+  #   timeout: 1800
+
+  # `trtllm-eval`'s own flags. Without `max_seq_len` the eval inherits the checkpoint's
+  # `max_position_embeddings` and dies in kvCache allocation.
+  # max_seq_len: 8192
+  # max_batch_size: 32
+
+  # MMLU only: trtllm-eval fetches that dataset from a URL that 404s and dies inside
+  # tarfile.open, which reads as a corrupt archive. Point it at a local copy.
+  # dataset_path: /path/to/datasets/mmlu
+
+  # The LLM-API YAML the accuracy gate runs under: a path, or a mapping from unit to a path. A
+  # speculator unit's must carry its `speculative_config`, or its gates re-measure the base path;
+  # it is also where the boot and acceptance gates read the draft depth (`max_draft_len`, or
+  # `block_size` for DSpark, which must equal the drafter's trained block size). A relative path
+  # is resolved against THIS FILE'S directory.
+  # llm_api_options:
+  #   core: scripts/core_llm_api.yaml
+  #   mtp: scripts/mtp_llm_api.yaml
+  #   dspark: scripts/dspark_llm_api.yaml  # decoding_type: DSpark, max_draft_len: 5
+
+  # The benchmark subcommand's own options: the PROTOCOL. A mismatch with the anchor's reads as a
+  # large regression (measured: 63.50 against a 95.53 anchor scored with a chat template).
+  # benchmark_args:
+  #   - --apply_chat_template
+
+# ------------------------------------------------------- agent backends
+# Without this block, an in-process run starts every role (planner, surveyor, kernel_writer,
+# assembler, tuner) on the agent that started it, at maximum effort: Codex, on the model it is
+# set to, when a Codex session started the run; else Claude Code at its default model. An
+# external driver runs each turn on its own agent. `defaults` applies to every role and
+# `roles.<name>` overrides it per field; under `--agent-transport external` a routed role's agent
+# reaches the driver as `agent` in the turn's request file.
+# agents:
+#   roles:
+#     planner:
+#       backend: codex           # with no model: the one your Codex is set to
+#       reasoning_effort: max
+#   # External MCP servers (STDIO or streamable HTTP), under defaults or a role:
+#   #   extra_mcp_servers:
+#   #     knowledge-base: {type: http, url: https://example.test/mcp}
+
+# ----------------------------------------------------------- commit policy
+# What the agents' commit helper (`<workspace>/bin/commit.sh`) accepts, and what delivery checks on
+# the branch. Every commit is authored and signed off as the repository's configured user (or
+# MV2FLOW_GIT_NAME / MV2FLOW_GIT_EMAIL); the helper always refuses directories, globs, absolute
+# paths, untracked symlinks, sandbox placeholders and the run's own workspace.
+# commit_policy:
+#   allowed_paths: [tensorrt_llm/, tests/, cpp/, examples/]   # the default
+#   allow_co_authors: false    # the default
+#   base_ref: origin/main      # delivery audits merge-base(HEAD, base_ref)..HEAD; default
+#                              # origin/main, else upstream/main, else main
+
+# ------------------------------------------------------------- performance
+# The tune campaign (docs/design.md, section 10). With `enabled: true` the planned run holds a
+# `tune` task that starts once the core is correct; on a target onboarded elsewhere,
+# `trtllm-modeling-v2 tune --task task.yaml --workspace W`. Perf is never a release gate, and every
+# kept change passes the accuracy gate.
+# perf:
+#   enabled: true
+#   identity_configs: [<LLM-API yaml>]   # optional: derived from the workload when absent
+#   workload: {isl: 8192, osl: 1024, concurrency: [1, 128]}
+#   configs:                       # instead of `workload`: several named perf configs, all measured
+#     - name: chat                 #   per candidate; a candidate must lose on none of them
+#       workload: {isl: 1024, osl: 256, concurrency: [1, 16]}
+#       constraint: {tpot_ms_max: 30}          # breaking it is a loss (also ttft_ms_max)
+#     - name: batch
+#       workload: {isl: 8192, osl: 1024, concurrency: [128]}
+#       llm_api_options: {enable_chunked_prefill: true}   # over the derived serving config
+#   goal: {ratio_to_reference: 1.1}  # stop dispatching once every headline is 1.1x the reference;
+#                                  # or/and pct_of_sol: 0.7, 70% of each headline's SOL ceiling
+#   sol: {enabled: true, gpu: gb200}  # the SOL turn (default on); `gpu` is the part it prices
+#   reference: stock               # the same checkpoint and configs under modeling_v2: "off"
+#   spools: [<whole-node session spools for e2e measurements>]
+#   dev_spools: [<sessions for 1-GPU tuner jobs and the keep gate>]
+#   env_script: <sourced by every perf job: interpreter, PYTHONNOUSERSITE, CUDA_VISIBLE_DEVICES>
+#   noise_repeats: 2               # baseline repeats; the noise floor is the same-host spread
+#   campaign:
+#     min_gain: 0.01               # keep threshold = max(min_gain, noise_factor x spread)
+#     noise_factor: 3.0
+#     ttft_tolerance: 0.1          # a first token this much slower at concurrency 1 is a loss
+#     max_parallel_tuners: 4
+#     max_iterations: 12
+#     split_variants: true         # a LOSS split by member asks for one member-gated variant
+#     max_consecutive_misses: 3
+#     max_roadmaps: 2              # a spent roadmap with budget left is refreshed on the best tree
+#     max_hours: 24                # the campaign's wall budget; omit it for none
+#     idle_settle_s: 120           # a measurement starts on a node idle this long
+#     smoke: true                  # one short serve per world size before the baseline
+#     smoke_wall: 45m
+#     accuracy: {unit: core, members: [tp1, dep4]}   # the keep gate's unit and members; or {gate: off}
+#   source_embargo: [<this checkpoint's in-tree modeling, its modules and kernels>]
+#   sister_engines: [<other engines' checkouts: strategies may inform, code may not be copied>]

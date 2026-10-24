@@ -212,6 +212,21 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 
 - Use `TLLM_LOG_LEVEL_BY_MODULE` to enable per-module log filtering (e.g., `"debug:_torch,runtime;info:serve"`); see [Module-Level Logging](docs/source/developer-guide/overview.md#module-level-logging) for details.
 
+**Environment failures that read as model failures.** Each of these presents as a broken
+model or a broken build, and none of them is. Check them before debugging modeling code:
+
+| symptom | cause | fix |
+|---|---|---|
+| `MPI_ERR_SPAWN: could not spawn` | the container runtime forbids `MPI_Comm_spawn`, which the default LLM API path uses to start workers (normal under pyxis/enroot) | start one task per rank under `trtllm-llmapi-launch` so the ranks exist before the engine; `TLLM_WORKER_USE_SINGLE_PROCESS=1` only at world size 1 |
+| `Impossible to fit in any sequence in kvCache` | the engine inherited the checkpoint's `max_position_embeddings` (262144 is common) and sized the cache for it | pass `--max_seq_len` / `--max_batch_size` / `--kv_cache_fraction` explicitly |
+| `NVRTC ... could not open source file "cuda.h"` | usually the venv's `bin` missing from `PATH`; separately, the generation FMHA kernel takes the NVRTC path unless the KV dtype is `E2m1` (grep `options.mDtypeKv != tg::Dtype::E2m1`) | check `PATH` first; `--kv_cache_dtype fp8` takes the non-NVRTC branch |
+| the engine hangs at startup and never returns | a wrong launch substrate hangs rather than raises — typically an MPI connect-back on an interface that does not carry it | probe with a deadline rather than waiting |
+| the import resolves to a different checkout | `/root/.local` is shared across container runs on some clusters | `PYTHONNOUSERSITE=1` at runtime — but **not** during the native build, which needs the user site for `cutlass_library` |
+
+A longer list, with the wrong diagnoses recorded alongside the right ones, is in
+[`agent-flow/agent_flow/workflows/trtllm_modeling_v2/TROUBLESHOOTING.md`](agent-flow/agent_flow/workflows/trtllm_modeling_v2/TROUBLESHOOTING.md).
+It is keyed on verbatim error text, so search it for the string you saw.
+
 ## Key Documentation
 
 | Topic | Path |

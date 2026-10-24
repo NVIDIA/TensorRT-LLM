@@ -6,11 +6,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable, Iterator
 
 import claude_agent_sdk
 from claude_agent_sdk import (
@@ -304,6 +305,7 @@ class ClaudeCodeClient(BackendClient):
                         is_error=bool(sdk_message.is_error),
                         errors=list(sdk_message.errors or []),
                         permission_denials=list(sdk_message.permission_denials or []),
+                        session_id=sdk_message.session_id,
                     )
         except Exception:
             if not got_result:
@@ -370,13 +372,114 @@ def _claude_sdk_version() -> str:
         return ""
 
 
-def _find_claude_cli() -> str | None:
-    """Locate the ``claude`` CLI binary the SDK would actually launch.
+#: A ``claude`` binary every layer launches instead of the SDK's own choice.
+CLI_PATH_ENV = "AGENT_FLOW_CLAUDE_CLI"
 
-    Mirrors the SDK's lookup order — bundled binary first, then ``PATH``.
-    Returns ``None`` when nothing is found so the caller can simply omit
-    the CLI version from the rendered string.
+
+def _version_of(cli_path: str) -> tuple[int, ...]:
+    """``claude --version`` of ``cli_path`` as a comparable tuple; empty when unreadable."""
+    try:
+        out = subprocess.run(
+            [cli_path, "--version"], capture_output=True, text=True, timeout=_CLI_VERSION_TIMEOUT_S
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    token = out.stdout.strip().split()[0] if out.returncode == 0 and out.stdout.strip() else ""
+    try:
+        return tuple(int(part) for part in token.split("."))
+    except ValueError:
+        return ()
+
+
+def _cli_override() -> str | None:
+    """The ``claude`` binary layers launch, when it is not the SDK's bundled one.
+
+    ``$AGENT_FLOW_CLAUDE_CLI`` names one outright. Otherwise the ``claude``
+    on ``PATH`` is used when it is newer than the bundled binary: an
+    organization can require a minimum CLI version, and the bundled one
+    only moves when the SDK is upgraded, so it is refused while the
+    user's own CLI runs. ``None`` keeps the SDK's choice.
     """
+    named = os.environ.get(CLI_PATH_ENV, "").strip()
+    if named:
+        return named
+    global _CLI_OVERRIDE_CACHE
+    if _CLI_OVERRIDE_CACHE is None:
+        bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+        on_path = shutil.which("claude")
+        choice = ""
+        if on_path and bundled.is_file():
+            path_version = _version_of(on_path)
+            if path_version and path_version > _version_of(str(bundled)):
+                choice = on_path
+        _CLI_OVERRIDE_CACHE = choice
+    return _CLI_OVERRIDE_CACHE or None
+
+
+_CLI_OVERRIDE_CACHE: str | None = None
+
+
+def launched_cli() -> tuple[str, str]:
+    """The ``claude`` binary a layer launches here, and its version; ``""`` for what is unknown."""
+    return _find_claude_cli() or "", _claude_cli_version()
+
+
+#: Given each line a CLI started in this context writes to stderr; see :func:`cli_stderr_to`.
+_CLI_STDERR_LISTENER: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "claude_cli_stderr_listener", default=None
+)
+
+
+@contextmanager
+def cli_stderr_to(listener: Callable[[str], None]) -> Iterator[None]:
+    """Hand ``listener`` every stderr line of a CLI started inside the block, too.
+
+    The lines still reach this process's stderr, and a listener set by an
+    enclosing block still gets them. A layer called in the block's thread
+    starts its CLI in the block's context, so the lines of one turn reach the
+    listener of that turn and of no other running beside it. A listener that
+    raises does not stop the CLI's stderr from being read.
+    """
+    outer = _CLI_STDERR_LISTENER.get()
+
+    def both(line: str) -> None:
+        if outer is not None:
+            _tell(outer, line)
+        _tell(listener, line)
+
+    token = _CLI_STDERR_LISTENER.set(both)
+    try:
+        yield
+    finally:
+        _CLI_STDERR_LISTENER.reset(token)
+
+
+def _tell(listener: Callable[[str], None], line: str) -> None:
+    try:
+        listener(line)
+    except Exception:  # noqa: BLE001 - an observer cannot fail the CLI it reads
+        pass
+
+
+def _forward_stderr(line: str) -> None:
+    """Print a CLI stderr line, so a start-up failure is diagnosable, and pass it to the listener."""
+    print(f"[claude-cli stderr] {line}", file=sys.stderr, flush=True)
+    listener = _CLI_STDERR_LISTENER.get()
+    if listener is not None:
+        _tell(listener, line)
+
+
+def _find_claude_cli() -> str | None:
+    """Locate the ``claude`` CLI binary the SDK will actually launch.
+
+    The override (:func:`_cli_override`) first, then the SDK's own lookup
+    order — bundled binary first, then ``PATH``. Returns ``None`` when
+    nothing is found so the caller can simply omit the CLI version from
+    the rendered string.
+    """
+    override = _cli_override()
+    if override:
+        return override
     bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
     if bundled.is_file():
         return str(bundled)
@@ -541,6 +644,7 @@ class ClaudeCodeBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ) -> AsyncIterator[BackendClient]:
         # External MCP server configs (e.g. ``{"knowledge-base": {"type":
         # "http", "url": ...}}``) are layered alongside the in-process
@@ -576,6 +680,7 @@ class ClaudeCodeBackend(Backend):
             cwd=work_dir,
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
+            cli_path=_cli_override(),
             hooks=hooks,
             disallowed_tools=[
                 *(disallowed_tools or []),
@@ -583,7 +688,11 @@ class ClaudeCodeBackend(Backend):
             ],
             # Forward the CLI's stderr so startup failures are diagnosable
             # instead of vanishing with the subprocess.
-            stderr=lambda line: print(f"[claude-cli stderr] {line}", file=sys.stderr, flush=True),
+            stderr=_forward_stderr,
+            # A fork may run in another cwd than the session it copies: the
+            # CLI finds that session by id and writes the fork under its own cwd.
+            resume=fork_from,
+            fork_session=fork_from is not None,
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:
