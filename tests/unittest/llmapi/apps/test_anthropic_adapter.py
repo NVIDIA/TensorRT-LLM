@@ -986,6 +986,41 @@ def test_stream_whitespace_before_text_stays_with_the_text():
     assert starts == ["thinking", "text"]
 
 
+def test_stream_whitespace_inside_an_open_text_block_stays_with_the_text():
+    """Whitespace inside a text block that holds text is delivered unchanged."""
+    events = run_reframer(
+        [
+            chunk({"content": "hello"}),
+            chunk({"content": " "}),
+            chunk({"content": "world"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    texts = [
+        p["delta"]["text"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(texts) == "hello world"
+
+
+def test_stream_trailing_whitespace_opens_no_text_block():
+    """Whitespace-only text at the end of the stream opens no text block."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "plan"}),
+            chunk({"content": "\n\n"}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking"]
+    assert not [
+        p for n, p in events if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+
+
 def test_whitespace_only_content_is_not_a_text_block():
     message = ChatMessage(
         role="assistant",
