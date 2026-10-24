@@ -7863,6 +7863,23 @@ class KVCacheManagerV2(BaseResourceManager):
             should_commit = is_all_reusable or is_branch_point or req.context_remaining_length == 0
 
             if should_resize:
+                checkpoint = (
+                    self._context_end_checkpoint(req, kv_cache)
+                    if should_block_reuse and req.context_remaining_length == 0
+                    else None
+                )
+                if checkpoint is not None:
+                    # Commit the window that ends at the checkpoint while this
+                    # chunk still holds it, as if a chunk had ended there.
+                    self._resize_context_history(req, kv_cache, checkpoint)
+                    kv_cache.commit(
+                        self._augment_tokens_for_block_reuse(
+                            self._reuse_token_source(req),
+                            req,
+                            start=kv_cache.num_committed_tokens,
+                            end=checkpoint,
+                        )
+                    )
                 self._resize_context_history(req, kv_cache, req.context_current_position)
             if should_commit:
                 self.try_commit_blocks(req)
@@ -7873,6 +7890,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.
                 kv_cache.enable_swa_scratch_reuse = False
+
+    def _context_end_checkpoint(self, req: LlmRequest, kv_cache) -> Optional[int]:
+        """Prompt position before the end whose window a finishing context also commits.
+
+        Only used when the policy commits a context once, at its end. ``None``
+        commits no extra window.
+        """
+        return None
 
     def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
         """Advance a context cache's history marker, or raise."""

@@ -390,6 +390,35 @@ def test_decoder_replay_selects_cache_lifecycles(monkeypatch, fallback, partial_
         manager.shutdown()
 
 
+@pytest.mark.parametrize(
+    "policy, encoder_replay, committed, history, expected",
+    [
+        # (2000 - 128 - 512) // 128 * 128: one Decoder window plus the rewrite
+        # tolerance before the prompt end.
+        ("per_conversation", False, 0, 0, 1280),
+        ("per_request", False, 0, 1280, 1280),
+        # Reuse already reaches the point, or the chunk no longer holds its window.
+        ("per_conversation", False, 1280, 1280, None),
+        ("per_conversation", False, 0, 1408, None),
+        # Encoder replay recomputes the Encoder history; reuse is not shortened.
+        ("per_conversation", True, 0, 0, None),
+        # Every chunk commits under all_reusable.
+        ("all_reusable", False, 0, 0, None),
+    ],
+)
+def test_context_end_checkpoint(policy, encoder_replay, committed, history, expected):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
+
+    manager = CSA2CacheManager.__new__(CSA2CacheManager)
+    manager._decoder_replay_window = 128
+    manager._encoder_replay_enabled = encoder_replay
+    manager.block_reuse_policy = BlockReusePolicy(policy)
+    manager.tokens_per_block = 128
+    request = SimpleNamespace(prompt_len=2000)
+    cache = SimpleNamespace(num_committed_tokens=committed, history_length=history)
+    assert manager._context_end_checkpoint(request, cache) == expected
+
+
 def _request(request_id, tokens):
     return LlmRequest(
         request_id=request_id,
