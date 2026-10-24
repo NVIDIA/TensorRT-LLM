@@ -1508,13 +1508,13 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-void preallocateNCCLWindowBuffer(
-    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t const buffersPerSize)
+bool preallocateNCCLWindowBufferBytes(torch::Tensor const& input, torch::List<int64_t> const& group,
+    int64_t const buffersPerSize, int64_t const sizeBytes)
 {
 #if ENABLE_MULTI_DEVICE
-    if (buffersPerSize <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
+    if (buffersPerSize <= 0 || sizeBytes <= 0 || group.size() == 0 || input.numel() == 0)
     {
-        return;
+        return false;
     }
 
     std::set<int> groupSet;
@@ -1527,27 +1527,16 @@ void preallocateNCCLWindowBuffer(
     if (!commPtr || *commPtr == nullptr)
     {
         TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffers] NCCL comm is null; skipping preallocation");
-        return;
+        return false;
     }
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
     auto& allocator = NCCLWindowAllocator::getInstance();
     ncclComm_t const comm = *commPtr;
 
-    int64_t const numTokens = input.size(0);
-    int64_t const elementsPerToken = input.numel() / numTokens;
-    if (elementsPerToken <= 0)
-    {
-        return;
-    }
-    size_t const bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
-        * static_cast<size_t>(input.element_size());
-    if (bufferSize == 0)
-    {
-        return;
-    }
-    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) for tokens=%ld (%zu bytes) comm %p",
-        buffersPerSize, numTokens, bufferSize, static_cast<void*>(comm));
+    size_t const bufferSize = static_cast<size_t>(sizeBytes);
+    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) of %zu bytes on comm %p", buffersPerSize,
+        bufferSize, static_cast<void*>(comm));
     std::vector<void*> allocatedPtrs;
     allocatedPtrs.reserve(buffersPerSize);
     try
@@ -1571,10 +1560,20 @@ void preallocateNCCLWindowBuffer(
     {
         allocator.releaseBuffer(comm, ptr);
     }
+    return allocatedPtrs.size() == static_cast<size_t>(buffersPerSize);
 #else
+    (void) input;
+    (void) sizeBytes;
     (void) group;
     (void) buffersPerSize;
+    return false;
 #endif
+}
+
+void preallocateNCCLWindowBuffer(
+    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t const buffersPerSize)
+{
+    preallocateNCCLWindowBufferBytes(input, group, buffersPerSize, input.nbytes());
 }
 
 bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& group)
@@ -2598,6 +2597,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
+    m.def("preallocate_nccl_window_buffer.bytes(Tensor input, int[] group, int count, int size_bytes) -> bool");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
     // Scope boundaries modify host-side allocator ownership but do not mutate their tensors.
     // Python registers them as ordered effects so AOT preserves their runtime order.
@@ -2645,6 +2645,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
+    m.impl("preallocate_nccl_window_buffer.bytes", &tensorrt_llm::torch_ext::preallocateNCCLWindowBufferBytes);
     m.impl("begin_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::beginNCCLWindowTensorScope);
     m.impl("end_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::endNCCLWindowTensorScope);
     m.impl("begin_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::beginTrackedNCCLWindowTensorScope);
@@ -2702,6 +2703,8 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
             return std::vector<at::Tensor>{};
         });
     m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
+    m.impl("preallocate_nccl_window_buffer.bytes",
+        [](at::Tensor const&, torch::List<int64_t> const&, int64_t, int64_t) { return false; });
     m.impl("is_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&) { return false; });
     m.impl("begin_nccl_window_tensor_scope", [](torch::List<torch::Tensor> const&) { return; });
     m.impl("begin_nccl_window_tensor_scope.tracked", [](torch::List<torch::Tensor> const&) { return int64_t{0}; });

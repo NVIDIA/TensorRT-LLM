@@ -2682,46 +2682,36 @@ class AllReduceRunner(TunableRunner):
             return
         if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
             return
+        preallocate = getattr(torch.ops.trtllm.preallocate_nccl_window_buffer,
+                              "bytes", None)
+        if preallocate is None:
+            return
         if input_tensor.numel() == 0 or input_tensor.size(0) == 0:
             return
-        if hasattr(torch.cuda, "is_current_stream_capturing"):
-            try:
-                if torch.cuda.is_current_stream_capturing():
-                    return
-            except (RuntimeError, AssertionError):
-                # If capture status can't be queried, avoid prealloc to be safe.
-                return
-
-        # If max_num_tokens and hidden_size are provided, pre-allocate at 2x
-        # the model-configured size to give the NCCL window allocator extra
-        # headroom beyond the nominal max shape.  dtype comes from the model
-        # spec; fall back to the actual input tensor's properties when any
-        # value is missing.
-        # The dummy tensor is created here, after the stream-capture guard,
-        # so it is never allocated inside a CUDA graph context.
+        # Size the windows from model metadata without allocating a dummy tensor.
+        # The existing input tensor supplies the custom op's CUDA dispatch key.
         if max_num_tokens is not None and hidden_size is not None:
-            prealloc_input = torch.empty(
-                [2 * max_num_tokens, hidden_size],
-                dtype=dtype if dtype is not None else input_tensor.dtype,
-                device=input_tensor.device)
+            prealloc_dtype = dtype if dtype is not None else input_tensor.dtype
+            element_size = prealloc_dtype.itemsize
+            buffer_size = 2 * max_num_tokens * hidden_size * element_size
         else:
-            prealloc_input = input_tensor
-
-        num_tokens = int(prealloc_input.size(0))
-        if num_tokens <= 0:
+            buffer_size = input_tensor.numel() * input_tensor.element_size()
+        if buffer_size <= 0:
             return
-        group_key = tuple(group)
-        cache_key = (group_key, num_tokens)
+        is_capturing = (input_tensor.is_cuda
+                        and torch.cuda.is_current_stream_capturing())
+        cache_key = (tuple(group), input_tensor.device, buffer_size)
         with cls._prealloc_lock:
-            if cache_key in cls._prealloc_done:
+            if not is_capturing and cache_key in cls._prealloc_done:
                 return
-            cls._prealloc_done.add(cache_key)
-
-        logger.debug(
-            "[tunable_allreduce] Pre-allocating NCCL window buffers: "
-            "tokens=%d group=%s", num_tokens, list(group))
-        torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
-                                                        2)
+            logger.debug(
+                "[tunable_allreduce] Pre-allocating NCCL window buffers: "
+                "bytes=%d group=%s", buffer_size, list(group))
+            prepared = preallocate(input_tensor, group, 2, buffer_size)
+            # Capture buffers belong to one graph pool and do not satisfy eager
+            # preparation or preparation for another graph pool.
+            if prepared and not is_capturing:
+                cls._prealloc_done.add(cache_key)
 
     def get_valid_tactics(
         self,
@@ -2847,6 +2837,16 @@ def _(
     count: int,
 ) -> None:
     return None
+
+
+@torch.library.register_fake("trtllm::preallocate_nccl_window_buffer.bytes")
+def _(
+    input: torch.Tensor,
+    group: List[int],
+    count: int,
+    size_bytes: int,
+) -> bool:
+    return False
 
 
 @torch.library.register_fake("trtllm::begin_nccl_window_tensor_scope")
