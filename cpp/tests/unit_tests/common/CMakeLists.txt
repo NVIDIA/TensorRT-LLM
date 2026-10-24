@@ -37,8 +37,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::common_cuda
   LABELS
-  "unit;common;gpu"
-  REQUIRES_GPU)
+  "unit;common;host")
 add_tllm_gtest(
   optionalRefTest
   OWNER
