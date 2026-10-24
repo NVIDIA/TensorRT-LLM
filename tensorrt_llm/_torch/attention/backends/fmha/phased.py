@@ -114,7 +114,14 @@ class PhasedFmha(Fmha):
             return int(view_bound(local_layer_idx))
 
         if isinstance(kv_cache_manager, KVCacheManagerV2):
-            return int(kv_cache_manager.impl.get_page_index_upper_bound(local_layer_idx, Role.KEY))
+            impl = kv_cache_manager.impl
+            upper_bound = impl.get_page_index_upper_bound(local_layer_idx, Role.KEY)
+            if kv_cache_manager._use_per_layer_page_tables:
+                # Per-layer tables include the layer offset and address the pool root.
+                converter = impl.get_page_index_converter(local_layer_idx, Role.KEY)
+                if converter.layer_offset is not None:
+                    upper_bound += converter.layer_offset * converter.expansion
+            return int(upper_bound)
         if not isinstance(kv_cache_manager, KVCacheManager):
             raise TypeError(f"Unsupported KV cache manager: {type(kv_cache_manager).__name__}.")
 

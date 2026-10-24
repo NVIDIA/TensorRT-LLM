@@ -179,7 +179,7 @@ def test_sparse_gpu_resident_history_uses_dense_attention_offsets(
         manager.copy_batch_block_offsets(destination, [7, 8], 1, 0, 2)
         if per_layer:
             manager._copy_batch_block_offsets_per_layer.assert_called_once_with(
-                destination, [7, 8], manager.index_mapper.get_copy_index.return_value, 0, 2
+                destination, [7, 8], manager.index_mapper.get_copy_index.return_value, 0, 2, None
             )
             dense_copy.assert_not_called()
         else:

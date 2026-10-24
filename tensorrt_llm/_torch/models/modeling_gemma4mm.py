@@ -914,7 +914,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return Gemma4ForCausalLM.get_model_defaults(llm_args)
+        defaults = Gemma4ForCausalLM.get_model_defaults(llm_args)
+        defaults.setdefault("kv_cache_config", {})["enable_swa_scratch_reuse"] = False
+        return defaults
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

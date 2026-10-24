@@ -57,6 +57,7 @@ from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, 
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper,
     copy_batch_block_offsets_to_device,
+    copy_per_layer_block_offsets_to_device,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.logger import logger
@@ -1306,6 +1307,25 @@ def _update_kv_cache_draft_token_location(
             cache_manager.tokens_per_block,
             None,
         )
+
+
+@maybe_compile(options={"max-autotune": True})
+def _copy_per_layer_block_offsets_compiled(
+    block_offsets: torch.Tensor,
+    copy_idx: torch.Tensor,
+    pool_ids: torch.Tensor,
+    scales: torch.Tensor,
+    layer_offsets: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Write pool-root page indices for a batch without scratch slots."""
+    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
+    converted = torch.where(
+        base == BAD_PAGE_INDEX,
+        BAD_PAGE_INDEX,
+        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
+    )
+    output.copy_(converted.permute(0, 2, 1, 3))
 
 
 @maybe_compile(options={"max-autotune": True})
@@ -3081,6 +3101,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         staging_capacity = index_mapper_capacity * self.max_copy_beam_width
         device = torch.device("cuda", torch.cuda.current_device())
+        self._per_layer_host_tables_pinned = self.host_kv_cache_block_offsets.is_pinned()
         self._device_kv_cache_block_offsets_input = torch.empty_like(
             self.host_kv_cache_block_offsets,
             device=device,
@@ -3102,6 +3123,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._device_attention_op_pool_ids = pool_ids.to(device=device)
         self._device_attention_op_scales = scales.to(device=device)
         self._device_attention_op_layer_offsets = layer_offsets.to(device=device)
+        self._device_attention_op_converters = torch.stack(
+            (pool_ids.to(dtype=torch.int32), scales, layer_offsets), dim=-1
+        ).to(device=device)
         self._device_attention_op_scratch_pages = scratch_pages.to(device=device)
         self._device_block_positions = torch.arange(
             self.max_blocks_per_seq,
@@ -3215,12 +3239,42 @@ class KVCacheManagerV2(BaseResourceManager):
         copy_idx: torch.Tensor,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int],
     ) -> None:
+        has_scratch = num_contexts > 0 and any(
+            self.kv_cache_map[request_id].has_scratch_slots
+            for request_id in request_ids[:num_contexts]
+        )
+        if not has_scratch and self._per_layer_host_tables_pinned:
+            # Both the table and IndexMapper's int32 row map are pinned host buffers.
+            # Gather only the batch's columns directly into the per-layer device table.
+            num_blocks = self.max_blocks_per_seq if max_blocks is None else max_blocks
+            if dst_tensor.shape[0] != self.num_attention_op_pools:
+                dst_tensor = dst_tensor[: self.num_attention_op_pools]
+            copy_per_layer_block_offsets_to_device(
+                self.host_kv_cache_block_offsets,
+                dst_tensor,
+                copy_idx,
+                self._device_attention_op_converters,
+                num_blocks,
+                self._stream.cuda_stream,
+            )
+            return
         device_copy_idx = self._copy_idx_to_device(copy_idx)
         self._device_kv_cache_block_offsets_input.copy_(
             self.host_kv_cache_block_offsets,
             non_blocking=True,
         )
+        if not has_scratch:
+            _copy_per_layer_block_offsets_compiled(
+                self._device_kv_cache_block_offsets_input[..., :max_blocks],
+                device_copy_idx[:num_seqs],
+                self._device_attention_op_pool_ids,
+                self._device_attention_op_scales,
+                self._device_attention_op_layer_offsets,
+                dst_tensor[: self.num_attention_op_pools, :num_seqs, :, :max_blocks],
+            )
+            return
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
             request_ids,
             num_contexts,
@@ -7552,8 +7606,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Offloaded sparse history requires Batch metadata and sparse fetch; "
                 "dense attention offsets cannot address host slots"
             )
-        # max_blocks is accepted for signature parity with KVCacheManager; the
-        # device-side copy op here already scales with allocated blocks only.
         assert beam_width <= self.max_copy_beam_width
 
         # Cross KV is request-scoped: generation beams share the encoder K/V
@@ -7568,7 +7620,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if self._use_per_layer_page_tables:
             self._copy_batch_block_offsets_per_layer(
-                dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
+                dst_tensor, request_ids, copy_idx, num_contexts, num_seqs, max_blocks
             )
             return
 

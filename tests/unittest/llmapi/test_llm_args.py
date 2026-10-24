@@ -793,6 +793,78 @@ def test_post_processor_hook_rejected_with_skip_tokenizer_init():
 class TestModelDefaults:
     """Test suite for model-specific default overrides functionality."""
 
+    @pytest.mark.parametrize(
+        "model,sm,backend,mtp,expected_backend,expected_scratch",
+        [
+            ("gemma3", 80, None, False, "TRTLLM", False),
+            ("gemma3", 86, None, False, "TRTLLM", False),
+            ("gemma3", 89, "trtllm", False, "trtllm", False),
+            ("gemma3", 90, None, False, "TRTLLM", True),
+            ("gemma3", 100, None, False, "TRTLLM", True),
+            ("gemma3", 100, "trtllm", False, "trtllm", True),
+            ("gemma3", 100, "FLASHINFER", False, "FLASHINFER", False),
+            ("gemma3", 100, "VANILLA", False, "VANILLA", False),
+            ("gemma4", 100, None, False, "TRTLLM", True),
+            ("gemma4", 90, None, False, "FLASHINFER", False),
+            ("gemma4", 100, "FLASHINFER", False, "FLASHINFER", False),
+            ("gemma4", 90, "TRTLLM", False, "TRTLLM", True),
+            ("gemma4", 100, "trtllm", False, "trtllm", True),
+            ("gemma4", 100, None, True, "FLASHINFER", False),
+            ("gemma4", 100, "TRTLLM", True, "TRTLLM", False),
+            ("gemma3_vlm", 100, None, False, "TRTLLM", False),
+            ("gemma4_vlm", 100, None, False, "TRTLLM", False),
+            ("gemma4_unified", 100, None, False, "TRTLLM", False),
+        ],
+    )
+    @pytest.mark.parametrize("kv_setting",
+                             ["omitted", "dict", "object", "opt_out"])
+    def test_gemma_scratch_defaults(self, monkeypatch: pytest.MonkeyPatch,
+                                    model: str, sm: int, backend: str | None,
+                                    mtp: bool, expected_backend: str,
+                                    expected_scratch: bool,
+                                    kv_setting: str) -> None:
+        from tensorrt_llm._torch.models.modeling_gemma3vl import Gemma3VLM
+        from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+        from tensorrt_llm._torch.models.modeling_gemma4_unified import \
+            Gemma4UnifiedForConditionalGeneration
+        from tensorrt_llm._torch.models.modeling_gemma4mm import \
+            Gemma4ForConditionalGeneration
+
+        model_cls = {
+            "gemma3": Gemma3ForCausalLM,
+            "gemma3_vlm": Gemma3VLM,
+            "gemma4": Gemma4ForCausalLM,
+            "gemma4_vlm": Gemma4ForConditionalGeneration,
+            "gemma4_unified": Gemma4UnifiedForConditionalGeneration,
+        }[model]
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.models.modeling_gemma3.get_sm_version",
+            lambda: sm)
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+            lambda: 100 <= sm < 110)
+        kwargs = {}
+        if backend is not None:
+            kwargs["attn_backend"] = backend
+        if mtp:
+            kwargs["speculative_config"] = MTPDecodingConfig(max_draft_len=1)
+        if kv_setting != "omitted":
+            kv_config = {"enable_block_reuse": False}
+            if kv_setting == "opt_out":
+                kv_config["enable_swa_scratch_reuse"] = False
+            kwargs["kv_cache_config"] = (KvCacheConfig(
+                **kv_config) if kv_setting == "object" else kv_config)
+        args = TorchLlmArgs(model="/tmp/dummy_model", **kwargs)
+        if hasattr(model_cls, "get_model_defaults"):
+            apply_model_defaults_to_llm_args(args,
+                                             model_cls.get_model_defaults(args))
+
+        assert args.attn_backend == expected_backend
+        assert args.kv_cache_config.enable_swa_scratch_reuse == (
+            expected_scratch and kv_setting != "opt_out")
+        if kv_setting != "omitted":
+            assert args.kv_cache_config.enable_block_reuse is False
+
     def test_compute_applied_llm_defaults_simple_field(self):
         model_defaults = {"enable_chunked_prefill": False}
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")

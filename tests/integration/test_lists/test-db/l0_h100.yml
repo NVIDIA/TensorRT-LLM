@@ -16,6 +16,7 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - unittest/_torch/modeling/test_gemma_swa_scratch.py
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere

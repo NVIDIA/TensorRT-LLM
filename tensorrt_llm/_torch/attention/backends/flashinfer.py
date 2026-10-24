@@ -40,6 +40,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ...metadata import KVCacheParams
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
@@ -1079,6 +1080,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._update_draft_kv_lengths()
 
     def __post_init__(self) -> None:
+        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
+                and self.kv_cache_manager.enable_swa_scratch_reuse):
+            raise ValueError(
+                "FlashInfer attention does not support SWA scratch reuse. "
+                "Set kv_cache_config.enable_swa_scratch_reuse=False or use "
+                "the TRTLLM attention backend.")
         super().__post_init__()
         self._post_init_with_buffers(self.cuda_graph_buffers)
 

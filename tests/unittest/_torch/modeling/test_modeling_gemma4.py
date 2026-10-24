@@ -26,6 +26,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
@@ -2661,6 +2662,41 @@ class TestGemma4HFComparison(unittest.TestCase):
         expected_weights *= per_expert_scale[expected_indices]
         torch.testing.assert_close(actual_indices, expected_indices.to(torch.int32))
         torch.testing.assert_close(actual_weights, expected_weights.float())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "source, window, scratch", [(0, 32, True), (2, 32, True), (0, None, True), (0, 32, False)]
+)
+def test_shared_kv_scratch_requires_last_writer(
+    monkeypatch: pytest.MonkeyPatch, source: int, window: int | None, scratch: bool
+) -> None:
+    from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_swa_scratch_reuse = scratch
+    manager.layer_offsets = {layer: layer for layer in range(5)}
+    manager.pp_layers = list(range(5))
+    manager.max_attention_window_vec = [window] * 5
+    manager.impl = SimpleNamespace(get_layer_group_id=lambda _: 0, layer_grouping=[[0, 2, 4]])
+    attn = object.__new__(Gemma4Attention)
+    torch.nn.Module.__init__(attn)
+    attn.is_kv_shared = True
+    attn._num_kv_writing_layers = 4
+    attn._validated_scratch_source = None
+    attn.attn = SimpleNamespace(layer_idx=source)
+    attn.attention_window_size = window
+    monkeypatch.setattr(
+        QKNormRoPEAttention, "forward", lambda *_, **kwargs: kwargs["hidden_states"]
+    )
+    hidden = torch.empty(0)
+    metadata = SimpleNamespace(kv_cache_manager=manager)
+    if scratch and window is not None and source != 2:
+        with pytest.raises(AssertionError, match="last KV-writing layer"):
+            attn.forward(None, hidden, metadata)
+    else:
+        assert attn.forward(None, hidden, metadata) is hidden
 
 
 class TestGemma4ModelDefaults(unittest.TestCase):
