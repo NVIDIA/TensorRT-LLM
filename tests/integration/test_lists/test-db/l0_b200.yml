@@ -104,17 +104,22 @@ l0_b200:
   - test_e2e.py::test_ptp_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp_eagle[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py TIMEOUT (90)
+  # Covers the GPU cases of tests/unittest/_torch/attention/ on B200, except the paths
+  # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
+  # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it
+  # here. multi_gpu/ cases need >= 2 GPUs, so they skip here and run on multi-GPU stages:
+  # l0_gb300_multi_gpus (post_merge) and l0_dgx_b300, which runs test_helix_zero_kv.py in
+  # its pre_merge block and the rest in post_merge. Collecting them still runs their helix
+  # files' import-time rebinding of mpi4py's serializer, which applies to the whole pytest
+  # process.
+  # - kernels/parallel_hw_agnostic/ is ignored: its cases do not depend on the GPU
+  #   architecture, so its GPU cases run on H100 (l0_h100) and its cpu_only ones on CPU
+  #   (l0_cpu). GB300 (l0_gb300_multi_gpus, post_merge) also runs the GPU cases; it is
+  #   the only Blackwell stage that does.
+  # - The other files ignored here have their own entries below.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
   - unittest/_torch/executor/kv_cache/test_mixed_precision_kv_cache.py
-  # Keep cold-JIT MSA coverage out of the 60-minute attention aggregate.
+  # Keep cold-JIT MSA coverage out of the 90-minute attention aggregate.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
   - unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
@@ -125,14 +130,6 @@ l0_b200:
   - unittest/_torch/kv_cache_compression
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
-  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py TIMEOUT (60)
-  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py TIMEOUT (60)
-  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_indices_transform.py TIMEOUT (60)
-  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_o_proj.py TIMEOUT (30)
-  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py TIMEOUT (90)
-  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_module.py TIMEOUT (90)
-  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
-  - unittest/_torch/attention/sparse/test_sparse_mla_forward.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
