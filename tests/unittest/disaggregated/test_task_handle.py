@@ -645,6 +645,8 @@ def test_a_send_session_reads_a_parked_cancel_as_the_peers_too():
     outcome = TaskHandle(session, task, TOKENS).poll()
     assert isinstance(outcome, Cancelled)
     assert outcome.by_peer is True
+    assert session.close() is True
+    assert sender._sessions == {}
 
 
 # ---------------------------------------------------------------------------
