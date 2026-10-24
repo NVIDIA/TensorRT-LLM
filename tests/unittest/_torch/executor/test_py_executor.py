@@ -830,15 +830,24 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
 
 def test_free_request_resources_releases_target_and_draft_model_state() -> None:
     target, draft = Mock(), Mock()
+    events = []
+    sampler = Mock()
+    sampler.release_request.side_effect = lambda request: events.append(request.py_seq_slot)
     executor = types.SimpleNamespace(
+        sampler=sampler,
         model_engine=types.SimpleNamespace(model=target),
         draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=Mock(),
         _prefetched_request_ids={41},
         disagg=Mock(),
     )
-    request = types.SimpleNamespace(py_request_id=41)
+    request = types.SimpleNamespace(py_request_id=41, py_seq_slot=3)
+    executor.resource_manager.free_resources.side_effect = lambda req: setattr(
+        req, "py_seq_slot", None
+    )
     PyExecutor._free_request_resources(executor, request)
+    sampler.release_request.assert_called_once_with(request)
+    assert events == [3]
     target.release_request_state.assert_called_once_with(41)
     draft.release_request_state.assert_called_once_with(41)
     assert not executor._prefetched_request_ids
