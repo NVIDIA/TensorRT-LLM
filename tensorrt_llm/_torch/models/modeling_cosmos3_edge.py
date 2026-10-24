@@ -330,7 +330,7 @@ class Cosmos3EdgeSiglip(nn.Module, MultimodalEncoderMixin):
             attention_metadata_capacity = {
                 "attention": max(1, max_num_tokens // self.spatial_merge_unit)
             }
-        self.attn_metadata = self.metadata_cls(
+        self.attn_metadata = self.metadata_cls(  # type: ignore[call-arg]
             max_num_requests=attention_metadata_capacity["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
@@ -682,7 +682,7 @@ def _cacheable_stats(value):
     return value
 
 
-class Cosmos3EdgeImagesKwargs(Siglip2ImageProcessor.valid_kwargs, total=False):
+class Cosmos3EdgeImagesKwargs(Siglip2ImageProcessor.valid_kwargs, total=False):  # type: ignore[call-arg]
     max_pixels: int | None
     min_pixels: int | None
     per_image_kwargs: list[dict] | None

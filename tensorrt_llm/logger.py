@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+import traceback
 from collections.abc import Mapping
 from typing import Dict, Optional
 
@@ -295,7 +296,7 @@ class Logger(metaclass=Singleton):
         except (TypeError, ValueError, KeyError):
             return None
 
-    def log(self, severity, *msg):
+    def log(self, severity, *msg, exc_info=False):
         module = _get_caller_module()
         if not self.is_severity_enabled(severity, module):
             return
@@ -313,6 +314,8 @@ class Logger(metaclass=Singleton):
             parts.append(formatted)
         else:
             parts.extend(map(str, msg))
+        if exc_info:
+            parts.append("\n" + traceback.format_exc().rstrip())
         self._func_wrapper(severity)(" ".join(parts))
 
     def log_once(self, severity, *msg, key):
@@ -330,26 +333,26 @@ class Logger(metaclass=Singleton):
     fatal = critical
     fatal_once = critical_once
 
-    def error(self, *msg):
-        self.log(self.ERROR, *msg)
+    def error(self, *msg, exc_info=False):
+        self.log(self.ERROR, *msg, exc_info=exc_info)
 
     def error_once(self, *msg, key):
         self.log_once(self.ERROR, *msg, key=key)
 
-    def warning(self, *msg):
-        self.log(self.WARNING, *msg)
+    def warning(self, *msg, exc_info=False):
+        self.log(self.WARNING, *msg, exc_info=exc_info)
 
     def warning_once(self, *msg, key):
         self.log_once(self.WARNING, *msg, key=key)
 
-    def info(self, *msg):
-        self.log(self.INFO, *msg)
+    def info(self, *msg, exc_info=False):
+        self.log(self.INFO, *msg, exc_info=exc_info)
 
     def info_once(self, *msg, key):
         self.log_once(self.INFO, *msg, key=key)
 
-    def debug(self, *msg):
-        self.log(self.VERBOSE, *msg)
+    def debug(self, *msg, exc_info=False):
+        self.log(self.VERBOSE, *msg, exc_info=exc_info)
 
     def debug_once(self, *msg, key):
         self.log_once(self.VERBOSE, *msg, key=key)

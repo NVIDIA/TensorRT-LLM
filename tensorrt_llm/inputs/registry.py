@@ -1176,11 +1176,12 @@ def create_input_processor(
             # "module ... has no attribute ...". The lock lets the first rank
             # fill the cache and the rest load concurrently once it is complete.
             with hf_remote_code_lock():
-                return input_processor_cls(model_path_or_dir,
-                                           config,
-                                           tokenizer,
-                                           trust_remote_code=trust_remote_code,
-                                           **kwargs)
+                return input_processor_cls(
+                    model_path_or_dir,  # type: ignore[call-arg]
+                    config,
+                    tokenizer,
+                    trust_remote_code=trust_remote_code,
+                    **kwargs)
 
     return DefaultInputProcessor(
         None,

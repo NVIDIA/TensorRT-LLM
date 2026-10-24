@@ -1184,8 +1184,9 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                      weight_mapper: BaseWeightMapper,
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
-        new_weights = weight_mapper.preprocess_weights(
-            weights, allow_partial_loading=allow_partial_loading)
+        new_weights = weight_mapper.preprocess_weights(  # type: ignore[call-arg]
+            weights,
+            allow_partial_loading=allow_partial_loading)
         # `new_weights` aliases the source tensors for every key
         # `preprocess_weights` did not rewrite -- the routed experts, i.e. most
         # of a MoE checkpoint. Holding `weights` too would pin them, so

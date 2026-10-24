@@ -13,7 +13,8 @@ class MCPCallTask(Task):
     retry: Optional[int] = field(default=1)
     delay: Optional[float] = field(default=10)
 
-    worker_tag: Union[str, "Controller.WorkerTag"] = None
+    worker_tag: Union[
+        str, "Controller.WorkerTag"] = None  # type: ignore[name-defined]
 
     #result field
     result_str: Optional[str] = None
@@ -33,7 +34,8 @@ class MCPCallTask(Task):
 
 @dataclass
 class MCPListTask(Task):
-    worker_tag: Union[str, "Controller.WorkerTag"] = None
+    worker_tag: Union[
+        str, "Controller.WorkerTag"] = None  # type: ignore[name-defined]
 
     #result field
     result_str: Optional[str] = None

@@ -732,7 +732,7 @@ class GenerationExecutor(ABC):
         # clear already-finished requests
         for f in futures:
             if f._done:
-                wait_set.pop(f)
+                wait_set.discard(f)
                 yield f
 
         # wait remaining active requests

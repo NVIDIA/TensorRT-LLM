@@ -55,8 +55,10 @@ class ConfidenceInfo:
                                  num_bottom - 1)[:num_bottom])
             self.min_window_conf = np.min(self.avg_conf_group_list)
 
-    def update_confidence_info(self, token_dict: Mapping[int, 'Logprob'],
-                               token_id: int):
+    def update_confidence_info(
+            self,
+            token_dict: Mapping[int, 'Logprob'],  # type: ignore[name-defined]
+            token_id: int):
         mean_logprob = np.mean(
             [logprob_obj.logprob for logprob_obj in token_dict.values()])
         new_conf = round(-mean_logprob, 3)

@@ -39,8 +39,8 @@ class ScaffoldingResult:
     def set_output_streaming(self, output: Union[ScaffoldingOutput, Any]):
         self.aqueue.put_nowait(output)
 
-    def set_task_collections(self, task_collections: Mapping[str,
-                                                             "TaskCollection"]):
+    def set_task_collections(self, task_collections: Mapping[
+        str, "TaskCollection"]):  # type: ignore[name-defined]
         self.task_collections = task_collections
 
     async def _aresult_step(self):

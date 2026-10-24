@@ -39,6 +39,9 @@ from ..request import GenerationRequest
 from ..result import GenerationResult
 from ..rpc_worker_mixin import RpcWorkerMixin
 
+# The logger is imported lazily in the workers because Ray cannot pickle it.
+logger: Any
+
 __all__ = [
     "RayGPUWorker",
     "RayWorkerWrapper",
@@ -112,8 +115,9 @@ class RayWorkerWrapper:
             f"[Rank {self.rank}] Finished PG init. Global GPU ID: {self.gpu}, local GPU ID: {self.local_gpu}"
         )
 
-        self.worker = self.worker_cls(device_id=self.local_gpu,
-                                      **self.worker_kwargs)
+        self.worker = self.worker_cls(
+            device_id=self.local_gpu,  # type: ignore[call-arg]
+            **self.worker_kwargs)
         self._has_setup_distributed_env_and_worker = True
 
     @property

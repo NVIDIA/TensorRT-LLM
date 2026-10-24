@@ -1,4 +1,6 @@
-def suggest_spec_config(max_batch_size: int) -> "DecodingBaseConfig":
+def suggest_spec_config(
+        max_batch_size: int
+) -> "DecodingBaseConfig":  # type: ignore[name-defined]
     """
     Suggests a reasonable draft model free speculation scheme.
     Used when the user specifies spec_mode == AUTO.

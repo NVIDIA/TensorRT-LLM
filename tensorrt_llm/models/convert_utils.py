@@ -538,7 +538,7 @@ def get_tllm_linear_weight(weight,
             results[prefix + postfix] = weight
             torch_weight_scales = weight_scale.to(torch.float32)
         else:
-            processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
+            processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(  # type: ignore[name-defined]
                 weight, clamp_value)
             results[prefix + postfix] = processed_torch_weights
             torch_weight_scales = torch_weight_scales.to(torch.float32)

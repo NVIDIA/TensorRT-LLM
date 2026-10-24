@@ -309,7 +309,7 @@ class QSAIndexer(nn.Module):
         )
         coordinates = _position_coordinates(position_ids, num_tokens)
 
-        index_cache = metadata.kv_cache_manager.get_index_k_buffer(layer_idx)
+        index_cache = metadata.kv_cache_manager.get_index_k_buffer(layer_idx)  # type: ignore[call-arg]
         position_cache = metadata.kv_cache_manager.get_qsa_position_buffer()
         if index_cache is None or position_cache is None:
             raise RuntimeError("QSA sparse side-cache buffers are unavailable")
@@ -380,7 +380,7 @@ class QSAIndexer(nn.Module):
         req_idx = metadata.qsa_req_idx_per_token[:num_tokens]
         logical = metadata.qsa_logical_positions[:num_tokens]
         pages, within = _logical_to_pages(metadata, req_idx, logical)
-        index_cache = metadata.kv_cache_manager.get_index_k_buffer(layer_idx)
+        index_cache = metadata.kv_cache_manager.get_index_k_buffer(layer_idx)  # type: ignore[call-arg]
         position_cache = metadata.kv_cache_manager.get_qsa_position_buffer()
         if index_cache is None or position_cache is None:
             raise RuntimeError("QSA sparse side-cache buffers are unavailable")

@@ -158,12 +158,11 @@ class SaveHiddenStatesSpecMetadata(SpecMetadata):
             self.layers_to_capture = _get_eagle3_default_capture_layers(
                 self.num_model_layers) + (-1, )
         else:
-            self.layers_to_capture = sorted(list(self.layers_to_capture))
+            layers = sorted(self.layers_to_capture)
             # Handle -1 (last layer) - move to end of list
-            if self.layers_to_capture and self.layers_to_capture[0] == -1:
-                self.layers_to_capture = self.layers_to_capture[1:] + [
-                    self.layers_to_capture.pop(0)
-                ]
+            if layers and layers[0] == -1:
+                layers = layers[1:] + layers[:1]
+            self.layers_to_capture = layers
         self.num_capture_layers = len(self.layers_to_capture)
 
     def is_layer_capture(self, layer_id: int):

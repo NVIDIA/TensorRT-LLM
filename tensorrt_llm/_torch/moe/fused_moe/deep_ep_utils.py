@@ -242,9 +242,9 @@ class BufferPool:
     """
 
     def __init__(self):
-        self.buffers: Map[Mapping,
-                          weakref.ReferenceType[VariableLengthBuffer]] = {}
-        self.low_latency_buffers: Map[
+        self.buffers: dict[Mapping,
+                           weakref.ReferenceType[VariableLengthBuffer]] = {}
+        self.low_latency_buffers: dict[
             Mapping,
             weakref.ReferenceType[VariableLengthLowLatencyBuffer]] = {}
 

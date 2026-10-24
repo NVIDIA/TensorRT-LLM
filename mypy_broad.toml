@@ -1,0 +1,20 @@
+# mypy configuration for the broad, code-filtered check over tensorrt_llm/.
+# Run through scripts/run_mypy_broad.sh, which reports only the error codes
+# listed in that script. The strict check of the sampler files stays in
+# pyproject.toml [tool.mypy].
+[tool.mypy]
+follow_imports = "silent"
+explicit_package_bases = true
+namespace_packages = true
+show_error_codes = true
+check_untyped_defs = true
+mypy_path = "."
+files = ["tensorrt_llm"]
+exclude = [
+    '^tensorrt_llm/bindings/',
+    '^tensorrt_llm/_torch/kernels/',
+    '^tensorrt_llm/_torch/cute_dsl_kernels/',
+    '^tensorrt_llm/_torch/attention/backends/prims_ts/',
+    '^tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/',
+    '^triton_kernels/',
+]

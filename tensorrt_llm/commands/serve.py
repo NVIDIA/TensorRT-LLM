@@ -218,7 +218,7 @@ def is_non_default_or_required(param_name, value, explicit_cli_keys):
     if callable(default):
         default = default()
     elif field_info.default_factory is not None:
-        default = field_info.default_factory()
+        default = field_info.default_factory()  # type: ignore[call-arg]
 
     return value != default
 
