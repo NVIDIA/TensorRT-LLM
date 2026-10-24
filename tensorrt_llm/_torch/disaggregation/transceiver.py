@@ -51,6 +51,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
     TransferWorker,
     TransferWorkerConfig,
+    TxSession,
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -92,6 +93,7 @@ def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
             "other executors in the same job. Retaining KV "
             f"and transport roots until process teardown. request_id={event.request_id}, "
             f"direction={event.direction}, reason={event.reason}, "
+            "deadline_owner=retirement_grace progress_at_observation=unproven_quiescence, "
             f"deadline={event.deadline}, expired_at={event.expired_at}"
         )
     except Exception:  # noqa: BLE001 - diagnostics cannot alter containment
@@ -1229,6 +1231,37 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if session is not None:
                 self._recv_sessions[rid] = session
 
+    @staticmethod
+    def _describe_timeout_session(session: TxSessionBase | RxSessionBase | None) -> str:
+        """Read optional native progress without changing timeout handling.
+
+        Args:
+            session: Existing local transfer session, if still retained.
+
+        Returns:
+            Local progress or an explicit unavailable reason.
+        """
+        if isinstance(session, (TxSession, RxSession)):
+            try:
+                return session._timeout_progress_description()
+            except Exception:  # noqa: BLE001 - Reporting must not change timeout handling.
+                return "progress_at_observation=unavailable(snapshot_failed)"
+        reason = "session_not_found" if session is None else "alternate_session"
+        return f"progress_at_observation=unavailable({reason})"
+
+    def _describe_transfer_timeout(self, req: LlmRequest) -> str:
+        """Describe local progress for an executor-owned timeout observation.
+
+        Args:
+            req: Request whose existing executor clock expired.
+
+        Returns:
+            Best-effort native progress; no deadline or backend is polled.
+        """
+        rid = get_unique_rid(req)
+        sessions = self._send_sessions if req.is_context_only_request else self._recv_sessions
+        return self._describe_timeout_session(sessions.get(rid))
+
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ) -> CtxTransferStatus:
@@ -1277,7 +1310,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 logger.warning(
                     f"TxSession rid={session.disagg_request_id} exceeded "
                     f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}ms; "
-                    "keeping it in progress"
+                    "keeping it in progress; deadline_owner=native_sender_overall_wait "
+                    f"{self._describe_timeout_session(session)}"
                 )
             else:
                 logger.warning(f"TxSession rid={session.disagg_request_id} failed")
