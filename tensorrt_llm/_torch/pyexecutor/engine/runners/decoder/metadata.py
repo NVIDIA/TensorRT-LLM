@@ -25,7 +25,10 @@ from ...metadata import build_attention_metadata
 from .config import DecoderRunnerConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionMetadata,
+        AttentionRuntimeFeatures,
+    )
     from tensorrt_llm._torch.distributed import Distributed
     from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -49,11 +52,13 @@ class DecoderMetadata:
         mapping: Mapping,
         model: torch.nn.Module,
         buffers: DecoderInputBuffers,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         self._config = config
         self.mapping = mapping
         self.model = model
         self._buffers = buffers
+        self._attention_runtime_features = attention_runtime_features
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:
         # 1) The attention metadata depends on the KV cache manager.
@@ -84,7 +89,7 @@ class DecoderMetadata:
             max_num_tokens=self._config.max_num_tokens,
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
-            attention_runtime_features=self._config.attention_runtime_features,
+            attention_runtime_features=self._attention_runtime_features,
             mapping=self.mapping,
             cache_indirection=self._buffers.cache_indirection
             if self._config.attention_backend.Metadata is TrtllmAttentionMetadata

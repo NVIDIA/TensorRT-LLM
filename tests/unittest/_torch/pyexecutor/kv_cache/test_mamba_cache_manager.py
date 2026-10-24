@@ -69,6 +69,7 @@ from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     CacheTransceiverConfig,
@@ -410,8 +411,8 @@ def test_kimi_explicit_v2_manager_kda_draft_records_follow_the_model(
     backbone = SimpleNamespace(kda_draft_records=True) if backbone_asks else SimpleNamespace()
     model_engine = SimpleNamespace(
         model=SimpleNamespace(model=backbone),
-        _max_cuda_graph_batch_size=4,
-        is_multimodal=True,
+        max_cuda_graph_batch_size=4,
+        input_processor=MagicMock(spec=BaseMultimodalInputProcessor),
     )
 
     _, kwargs = _capture_kimi_v2_manager_ctor(

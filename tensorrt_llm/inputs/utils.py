@@ -993,6 +993,7 @@ async def async_build_multimodal_prompt(
     inputs = prompt_inputs(rendered)
     if mm_data:
         inputs["multi_modal_data"] = mm_data
+        inputs["chat_template_applied"] = True
         item_order = mm_data_tracker.item_order()
         if item_order:
             inputs["mm_item_order"] = item_order
@@ -1176,6 +1177,7 @@ def default_multimodal_input_loader(
         input = {"prompt": prompt}
 
         if mm_placeholder_counts:
+            input["chat_template_applied"] = True
             if mm_embeddings is not None:
                 _, input[
                     "multi_modal_embeddings"] = mm_data_tracker.retrieve_all_sync(
