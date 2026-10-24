@@ -633,6 +633,74 @@ def test_gdn_attaches_only_static_fp8_scale():
     assert layer.norm.fp8_scale is None
 
 
+@pytest.mark.parametrize("ring_mode", [False, True], ids=["triton", "flashinfer_ring"])
+def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
+    from tensorrt_llm._torch.modules.mamba import gdn_mixer
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        ReplayStateUpdateMetadata,
+    )
+
+    layer = gdn_mixer.Qwen3NextGatedDeltaNet.__new__(gdn_mixer.Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.A_log = torch.zeros(4)
+    layer.dt_bias = torch.zeros(4)
+    calls = {}
+    monkeypatch.setattr(
+        gdn_mixer,
+        "flashinfer_cached_replay_update",
+        lambda **kwargs: calls.setdefault("flashinfer", kwargs),
+    )
+    monkeypatch.setattr(
+        gdn_mixer,
+        "fused_recurrent_gated_delta_rule_cached_replay_update",
+        lambda **kwargs: calls.setdefault("triton", kwargs),
+    )
+
+    prev_num_accepted_tokens = torch.tensor([0, 3, 9, 13, 5, 7], dtype=torch.int32)
+    cache_buf_idx = torch.zeros(6, dtype=torch.int32)
+    layer_cache = SimpleNamespace(
+        prev_num_accepted_tokens=prev_num_accepted_tokens,
+        cache_buf_idx=cache_buf_idx,
+        cache_base=torch.tensor([0, 1, 2, 30, 4, 5], dtype=torch.int32) if ring_mode else None,
+        k_ring="k_ring",
+        u_ring="u_ring",
+        g_ring="g_ring",
+        old_x="old_x",
+        old_B="old_B",
+        old_dt="old_dt",
+        old_dA_cumsum="old_dA_cumsum",
+    )
+
+    layer._replay_verify_recurrent(
+        "q",
+        "k",
+        "v",
+        "a",
+        "b",
+        "pool",
+        state_indices_d=torch.tensor([3, 1, 5, 0], dtype=torch.int32),
+        num_decodes=3,
+        draft_token_num=4,
+        replay_metadata=ReplayStateUpdateMetadata(prev_num_accepted_tokens, cache_buf_idx, 4, 16),
+        layer_cache=layer_cache,
+        replay_work_items=None,
+        replay_n_writes=None,
+    )
+
+    if ring_mode:
+        assert set(calls) == {"flashinfer"}
+        kwargs = calls["flashinfer"]
+        assert kwargs["state_indices"].tolist() == [3, 1, 5]
+        assert kwargs["hist_len"].tolist() == [13, 3, 7]  # gathered per row
+        assert kwargs["cache_base"].tolist() == [30, 1, 5]
+        assert kwargs["k_ring"] == "k_ring" and kwargs["history_size"] == 16
+    else:
+        assert set(calls) == {"triton"}
+        kwargs = calls["triton"]
+        assert kwargs["state_indices"].tolist() == [3, 1, 5]
+        assert kwargs["old_u"] == "old_x"
+
+
 def test_verify_intermediate_state_indices_reuses_buffers():
     """The verify path's row-index vector is built once, not per GDN layer.
 
