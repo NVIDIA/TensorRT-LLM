@@ -312,11 +312,11 @@ nonzero task status still takes precedence.
 ### Remote MPI batch ordering
 
 The remote MPI server dispatches the next batch only after every future in the
-previous batch has completed. The task wrapper retains its entry barrier to
-place one task on each rank, but has no trailing barrier: an individual rank can
-finish or report an error while its peers are still running. Cross-batch ordering
-is enforced by the server; directly invoking the wrapper does not provide a
-collective completion barrier.
+previous batch has completed. Each batch runs exactly once on every rank, but
+the task wrapper has no trailing barrier: an individual rank can finish or report
+an error while its peers are still running. Cross-batch ordering is enforced by
+the server; directly invoking the wrapper does not provide a collective
+completion barrier.
 
 ### Disaggregated MPI leader failures
 
