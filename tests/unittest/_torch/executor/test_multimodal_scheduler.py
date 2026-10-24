@@ -1155,6 +1155,7 @@ def _make_v2_multimodal_scheduler(
     kv_allocated = {}
     manager = Mock(spec=KVCacheManagerV2)
     manager.context_replay_tokens.return_value = None
+    manager.plan_context_waits.return_value = {}
     manager.tokens_per_block = 10
     manager.enable_block_reuse = False
     manager.enable_joint_kv_cache_reuse = False

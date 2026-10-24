@@ -940,19 +940,19 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache_index[r] = block
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                self.mamba_cache.cache_buf_idx[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                self.mamba_cache.cache_buf_idx[block].zero_()
             elif (isinstance(self.mamba_cache, self.SpeculativeState)
                   and self._use_kda_replay_update):
                 # Fresh request: no drafts pending in the replay caches.
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
             if self._mamba_ssm_rand_seed is not None:
                 # Deterministic per-slot rotation on fresh assignment.
                 # `block` is pulled from mamba_cache_free_blocks, which
                 # excludes _padding_slot by construction (see __init__),
                 # so padding sentinels never reach this branch.
                 self._seed_request_counter += 1
-                self._mamba_ssm_rand_seed[block] = (
+                self._mamba_ssm_rand_seed[block].fill_(
                     _compute_deterministic_mamba_seed(
                         self._seed_request_counter, block,
                         self._seed_rank_offset))
@@ -986,9 +986,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         if not blocks:
             return
         conv = self.mamba_cache.conv  # [L, slots, 3D, W - 1]
-        idx = torch.tensor(sorted(set(blocks)),
-                           dtype=torch.long,
-                           device=conv.device)
+        idx = _host_slots_to_device(sorted(set(blocks)), conv.device)
         d = conv.shape[2] // 3
         committed = conv.shape[3]
         cs = conv.index_select(1, idx)
@@ -1009,7 +1007,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                     self.mamba_cache.kda_v_cache,
                     self.mamba_cache.kda_beta_cache):
             buf.index_fill_(1, idx, 0)
-        self.mamba_cache.prev_num_accepted_tokens[idx] = 0
+        self.mamba_cache.prev_num_accepted_tokens.index_fill_(0, idx, 0)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         requests = (scheduled_batch.context_requests +
@@ -1047,11 +1045,11 @@ class PythonMambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_index[r]
                 if (isinstance(self.mamba_cache, self.SpeculativeState)
                         and self._use_replay_state_update):
-                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                    self.mamba_cache.cache_buf_idx[block] = 0
+                    self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                    self.mamba_cache.cache_buf_idx[block].zero_()
                 elif (isinstance(self.mamba_cache, self.SpeculativeState)
                       and self._use_kda_replay_update):
-                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                    self.mamba_cache.prev_num_accepted_tokens[block].zero_()
                 continue
             if self._is_padding_sentinel(r):
                 block = self._padding_slot
@@ -1065,11 +1063,11 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache_index[r] = block
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                self.mamba_cache.cache_buf_idx[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                self.mamba_cache.cache_buf_idx[block].zero_()
             elif (isinstance(self.mamba_cache, self.SpeculativeState)
                   and self._use_kda_replay_update):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
@@ -3146,6 +3144,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _ple_ngram_context_shape: list[int] = []
     # Set per instance on a disaggregated context server of a KDA model.
     kda_context_only = False
+    # ``[num_layers, *replay buffer]`` view per KDA replay buffer when the
+    # per-layer views are affine (see _stack_state_views); set per instance.
+    _stacked_kda_replay_layers: Optional[Dict[str, torch.Tensor]] = None
+    # Request id -> snapshot points requested by requests waiting for its
+    # prefix (KVCacheManagerV2.plan_context_waits). Set per instance.
+    _requested_snapshot_points: Optional[Dict[int, set[int]]] = None
 
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
         # The incoming recurrent state overwrites the whole local slot and summarizes the
@@ -3274,6 +3278,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # overwrites the per-request list on every scheduler pass, so the point
         # has to be re-merged from here rather than stored only on the request.
         self._branch_snapshot_points: Dict[int, int] = {}
+        self._requested_snapshot_points = {}
         self._snapshot_pruned_tokens_total = 0
         self._page_pruned_tokens_total = 0
         self._branch_snapshots_taken_total = 0
@@ -3735,6 +3740,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"{cache_size}")
                 layer[name] = view
             self._kda_replay_layers.append(layer)
+        # The drafts' records are never seeded (see _seed_kda_replay_slots).
+        stacked = {
+            name:
+            self._stack_state_views(
+                [layer[name] for layer in self._kda_replay_layers])
+            for name in layout if name != _KDA_DRAFT_RECORDS_ROLE
+        }
+        self._stacked_kda_replay_layers = (None if any(
+            view is None for view in stacked.values()) else stacked)
         # All SSM layers share a slot lifecycle, so the accepted-draft count is
         # stored once, on the first local KDA layer.
         self.prev_num_accepted_tokens = self._get_state_buffer(
@@ -3912,11 +3926,38 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
-        if (not self.enable_block_reuse or not self.kv_cache_config.
-                block_reuse_config.enable_branch_snapshot):
+        if (self.enable_block_reuse and
+                self.kv_cache_config.block_reuse_config.enable_branch_snapshot):
+            for request in requests:
+                self._apply_branch_snapshot_point(request)
+        if self._requested_snapshot_points:
+            for request in requests:
+                self._apply_requested_snapshot_points(request)
+
+    def _request_snapshot_point(self, owner: LlmRequest, point: int) -> bool:
+        """Snapshot ``owner`` at ``point`` for a request waiting for that prefix.
+
+        Returns False when ``owner`` cannot take it anymore (already past it, or
+        the point is not inside its prompt).
+        """
+        point = point // self.tokens_per_block * self.tokens_per_block
+        if not owner.context_current_position < point < owner.prompt_len:
+            return False
+        points = self._requested_snapshot_points.setdefault(
+            owner.py_request_id, set())
+        if point not in points:
+            points.add(point)
+            self._apply_requested_snapshot_points(owner)
+        return True
+
+    def _apply_requested_snapshot_points(self, request: LlmRequest) -> None:
+        requested = self._requested_snapshot_points.get(request.py_request_id)
+        if not requested:
             return
-        for request in requests:
-            self._apply_branch_snapshot_point(request)
+        start = request.context_current_position
+        points = set(request.expect_snapshot_points)
+        points.update(point for point in requested if point > start)
+        request.expect_snapshot_points = sorted(points)
 
     def _apply_branch_snapshot_point(
         self,
@@ -4640,7 +4681,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     num_accepted,
                     state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
                 )
-            self.prev_num_accepted_tokens[slot] = 0
+            self.prev_num_accepted_tokens[slot].zero_()
 
     def add_dummy_requests(
         self,
@@ -4679,6 +4720,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
+        if self._requested_snapshot_points is not None:
+            self._requested_snapshot_points.pop(request.py_request_id, None)
         self._kda_replay_suspended.discard(request.py_request_id)
         self._kda_replay_acceptance_pending.discard(request.py_request_id)
         self._kda_replay_unseeded.discard(request.py_request_id)
@@ -4831,6 +4874,22 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             section_offsets.append(section_offsets[-1] + section_dim)
 
         self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
+        stacked_replay = self._stacked_kda_replay_layers
+        if stacked_replay is not None and self._stacked_conv_states is not None:
+            # All layers at once: one launch per replay buffer and section.
+            # The stacked views leave out the drafts' records, which need no
+            # reset (see the per-layer loop below).
+            for replay_buffer in stacked_replay.values():
+                replay_buffer.index_fill_(1, state_indices, 0)
+            selected_conv = self._stacked_conv_states.index_select(
+                1, state_indices)
+            for section_idx, name in enumerate(_KDA_REPLAY_CONV_ROLES):
+                replay_buffer = stacked_replay[name]
+                section = selected_conv[:, :, section_offsets[section_idx]:
+                                        section_offsets[section_idx + 1], :]
+                replay_buffer[..., :committed_window].index_copy_(
+                    1, state_indices, section.to(replay_buffer.dtype))
+            return
         for replay_layer, conv_state in zip(self._kda_replay_layers,
                                             self.all_conv_states):
             for name, replay_buffer in replay_layer.items():
@@ -5121,6 +5180,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.all_conv_states = []
         self._stacked_ssm_states = None
         self._stacked_conv_states = None
+        self._stacked_kda_replay_layers = None
         self._ple_ngram_contexts = {}
         self._ple_conv_states = {}
         self.intermediate_ssm_states = None
@@ -5136,6 +5196,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.old_dt = None
         self.old_dA_cumsum = None
         self._branch_snapshot_points.clear()
+        if self._requested_snapshot_points is not None:
+            self._requested_snapshot_points.clear()
         self._kda_replay_layers = []
         self._kda_replay_suspended.clear()
         self._kda_replay_acceptance_pending.clear()

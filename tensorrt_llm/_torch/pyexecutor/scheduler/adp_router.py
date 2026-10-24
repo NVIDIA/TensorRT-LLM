@@ -25,7 +25,8 @@ Protocol:
     3. ADPRouter.route_requests() distributes new requests
 
 Includes:
-    - DefaultADPRouter: load-balanced min-heap routing
+    - DefaultADPRouter: load-balanced min-heap routing; generation-only
+      (disaggregated decode) requests are admitted and placed by KV length
     - KVCacheAwareADPRouter: cache-aware routing that factors in
       prefix match length from the KV cache radix tree
 """
@@ -33,15 +34,18 @@ Includes:
 from __future__ import annotations
 
 import heapq
+import itertools
 import math
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
+from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequestState
+from ..request_utils import get_from_waiting_queue
 from .rank_state import RankIterStatsPayload, RankState
 
 if TYPE_CHECKING:
@@ -49,8 +53,15 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
     from ..executor_request_queue import RequestQueueItem
+    from .waiting_queue import WaitingQueue
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
+
+# KV-balanced admission considers this many requests from the head of the
+# waiting queue.
+KV_BALANCE_WINDOW = 32
+# A request passed over in this many admission rounds is admitted next.
+KV_BALANCE_MAX_SKIPPED_ROUNDS = 64
 
 
 def _num_input_tokens(request) -> int:
@@ -62,6 +73,83 @@ def _num_input_tokens(request) -> int:
     if isinstance(num_input_tokens, int):
         return num_input_tokens
     return len(getattr(request, "input_token_ids", []))
+
+
+def _is_kv_balanced_request(req_item) -> bool:
+    """True for a generation-only request without child requests or a strict
+    ``attention_dp_rank``: its whole prompt KV lands on the chosen rank at
+    admission, and no placement constraint competes with KV balance."""
+    request = req_item.request
+    if request is None or req_item.child_req_ids:
+        return False
+    if request.request_type != RequestType.REQUEST_TYPE_GENERATION_ONLY:
+        return False
+    scheduling_params = getattr(request, "py_scheduling_params", None)
+    return scheduling_params is None or scheduling_params.attention_dp_rank is None
+
+
+def plan_kv_balanced_admission(
+    candidate_tokens: List[int],
+    candidate_forced: List[bool],
+    rank_tokens: List[int],
+    rank_num_requests: List[int],
+    max_requests_per_rank: int,
+    max_new_requests: int,
+) -> List[Tuple[int, int]]:
+    """Plan which candidates to admit and on which rank.
+
+    Ranks step in lockstep under attention DP, so the step time follows the
+    rank holding the most KV. The target is the mean per-rank load once every
+    admitted slot holds an average-sized candidate. Each admission goes to the
+    least-loaded rank below its fair share of requests and takes the
+    candidate that brings that rank closest to the target; forced candidates
+    are taken first, in queue order. The fair share, ``ceil((requests + 1) /
+    ranks)`` before each admission, keeps per-rank request counts as even as
+    count-balanced routing does: a rank whose requests are short cannot take
+    every slot and leave the long requests to the few ranks with slots left.
+
+    Args:
+        candidate_tokens: KV tokens of each candidate, in queue order.
+        candidate_forced: Whether the candidate must be admitted first.
+        rank_tokens: Current KV tokens per rank.
+        rank_num_requests: Current requests per rank.
+        max_requests_per_rank: Request slots per rank.
+        max_new_requests: Upper bound on the number of admissions.
+
+    Returns:
+        ``(candidate_index, rank)`` pairs in admission order.
+    """
+    loads = list(rank_tokens)
+    counts = list(rank_num_requests)
+    num_ranks = len(counts)
+    remaining = list(range(len(candidate_tokens)))
+    free_slots = sum(max(0, max_requests_per_rank - count) for count in counts)
+    budget = min(max_new_requests, free_slots, len(remaining))
+    plan: List[Tuple[int, int]] = []
+    if budget <= 0:
+        return plan
+
+    avg_candidate_tokens = sum(candidate_tokens) / len(candidate_tokens)
+    target = (sum(loads) + avg_candidate_tokens * budget) / num_ranks
+
+    for _ in range(budget):
+        fair_share = min(-(-(sum(counts) + 1) // num_ranks), max_requests_per_rank)
+        # The rank with the fewest requests is always below the fair share.
+        rank = min(
+            (r for r in range(num_ranks) if counts[r] < fair_share),
+            key=lambda r: (loads[r], r),
+        )
+        forced = [idx for idx in remaining if candidate_forced[idx]]
+        if forced:
+            idx = forced[0]
+        else:
+            wanted_tokens = target - loads[rank]
+            idx = min(remaining, key=lambda i: (abs(candidate_tokens[i] - wanted_tokens), i))
+        plan.append((idx, rank))
+        remaining.remove(idx)
+        loads[rank] += candidate_tokens[idx]
+        counts[rank] += 1
+    return plan
 
 
 def is_retiring_request(request) -> bool:
@@ -215,6 +303,37 @@ class ADPRouter(ABC):
         responses = self.dist.tp_allgather(local_state.serialize(include_kv_cache_load))
         return [RankState.deserialize(data=resp) for resp in responses]
 
+    def pop_requests(
+        self,
+        waiting_queue: WaitingQueue,
+        all_rank_states: list[RankState],
+        max_new_requests: int,
+        max_num_active_requests: int,
+        kv_balance: bool = True,
+    ) -> list[RequestQueueItem]:
+        """Pop the requests to admit this iteration, to be passed to
+        ``route_requests``. Every rank sees the same waiting queue and rank
+        states, so every rank pops the same requests.
+
+        The default admits in FIFO order; a request with a strict
+        ``attention_dp_rank`` whose rank is full stays queued.
+
+        Args:
+            waiting_queue: Queue to pop from.
+            all_rank_states: State of all ranks (from allgather).
+            max_new_requests: Maximum number of requests to admit.
+            max_num_active_requests: Maximum active requests per rank.
+            kv_balance: Whether a router may admit by KV load. False admits in
+                FIFO order.
+        """
+        return get_from_waiting_queue(
+            waiting_queue,
+            max_new_requests,
+            enable_attention_dp=True,
+            max_num_active_requests=max_num_active_requests,
+            all_ranks_num_active_requests=[s.num_active_requests for s in all_rank_states],
+        )
+
     @staticmethod
     def _assign_explicit_dp_ranks(
         requests: List["RequestQueueItem"],
@@ -304,7 +423,30 @@ class DefaultADPRouter(ADPRouter):
            keyed on (num_active_tokens, num_active_requests), so ranks with
            fewer tokens get more requests. Requests are sorted by token count
            (descending) for better load balancing.
+
+    KV-balanced admission: generation-only requests (disaggregated decode)
+    bring their whole prompt KV at admission. While the first
+    ``KV_BALANCE_WINDOW`` queued requests are all such requests (without
+    child requests or a strict ``attention_dp_rank``, see
+    ``_is_kv_balanced_request``), ``pop_requests`` plans admission and
+    placement together (``plan_kv_balanced_admission``): each slot, on a rank
+    below its fair share of requests, takes the request from that window that
+    brings its rank closest to the mean load. A request passed over for
+    ``KV_BALANCE_MAX_SKIPPED_ROUNDS`` admission rounds is admitted next.
+    ``route_requests`` places the popped requests where that plan put them.
+    The executor turns it off (``kv_balance=False``) during warmup and the
+    disaggregated-benchmark fill phase, where every request must fit at once
+    and none leaves.
     """
+
+    def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = False):
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        # Request id -> admission rounds in which KV-balanced admission passed
+        # it over; covers the requests in the current head window only.
+        self._kv_balance_skipped_rounds: Dict[int, int] = {}
+        # Request id -> rank of the requests the last KV-balanced admission
+        # popped, until route_requests places them.
+        self._kv_balanced_placement: Dict[int, int] = {}
 
     def create_rank_state(
         self,
@@ -321,6 +463,46 @@ class DefaultADPRouter(ADPRouter):
             num_active_tokens=num_active_tokens,
         )
 
+    def pop_requests(
+        self,
+        waiting_queue: WaitingQueue,
+        all_rank_states: list[RankState],
+        max_new_requests: int,
+        max_num_active_requests: int,
+        kv_balance: bool = True,
+    ) -> list[RequestQueueItem]:
+        self._kv_balanced_placement = {}
+        window = list(itertools.islice(waiting_queue, KV_BALANCE_WINDOW)) if kv_balance else []
+        if not window or not all(_is_kv_balanced_request(item) for item in window):
+            return super().pop_requests(
+                waiting_queue, all_rank_states, max_new_requests, max_num_active_requests
+            )
+
+        skipped_rounds = self._kv_balance_skipped_rounds
+        plan = plan_kv_balanced_admission(
+            candidate_tokens=[_num_input_tokens(item.request) for item in window],
+            candidate_forced=[
+                skipped_rounds.get(item.id, 0) >= KV_BALANCE_MAX_SKIPPED_ROUNDS for item in window
+            ],
+            rank_tokens=[s.num_active_tokens for s in all_rank_states],
+            rank_num_requests=[s.num_active_requests for s in all_rank_states],
+            max_requests_per_rank=max_num_active_requests,
+            max_new_requests=max_new_requests,
+        )
+        chosen = [window[idx] for idx in sorted(idx for idx, _ in plan)]
+        self._kv_balanced_placement = {window[idx].id: rank for idx, rank in plan}
+        chosen_ids = set(self._kv_balanced_placement)
+        if chosen_ids:
+            waiting_queue.remove_by_ids(chosen_ids)
+        # Only a round that admitted something passes the others over.
+        skipped = 1 if chosen else 0
+        self._kv_balance_skipped_rounds = {
+            item.id: skipped_rounds.get(item.id, 0) + skipped
+            for item in window
+            if item.id not in chosen_ids
+        }
+        return chosen
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
@@ -333,6 +515,18 @@ class DefaultADPRouter(ADPRouter):
         }
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
+
+        placement, self._kv_balanced_placement = self._kv_balanced_placement, {}
+        if new_requests and all(item.id in placement for item in new_requests):
+            # Popped by KV-balanced admission: place them as it planned.
+            for item in new_requests:
+                rank = placement[item.id]
+                all_ranks_new_requests[rank].append(item)
+                all_ranks_num_active_requests[rank] += 1
+            expected_num_active_requests = self._expected_num_active_requests(
+                all_ranks_num_active_requests, 0, tp_size, hard_cap=max_num_active_requests
+            )
+            return all_ranks_new_requests, expected_num_active_requests
 
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import math
 import os
 import sys
@@ -1285,6 +1286,97 @@ def _swa_branch_snapshot_point(
     return point
 
 
+# A new context request waits for a request that is still prefilling a prefix
+# it shares (see KVCacheManagerV2.plan_context_waits). Prefixes are compared in
+# units of this many cache blocks.
+_INFLIGHT_PREFIX_UNIT_BLOCKS = 8
+# Wait only when it can make at least this many more blocks reusable.
+_INFLIGHT_PREFIX_MIN_GAIN_BLOCKS = 64
+# Scheduler passes a request may wait in total.
+_INFLIGHT_PREFIX_MAX_WAIT_PASSES = 128
+
+
+class _InflightPrefixIndex:
+    """Prefix fingerprints of the context requests that are still prefilling.
+
+    A fingerprint is a chained digest per full unit of prompt tokens, seeded
+    with the request's reuse scope, so equal fingerprints at depth ``k`` mean
+    equal first ``k`` units in the same scope. Digests are deterministic, so
+    every rank takes the same decisions.
+    """
+
+    def __init__(self, unit_tokens: int) -> None:
+        self.unit_tokens = unit_tokens
+        self._fingerprints: Dict[int, List[bytes]] = {}
+        self._prefilling: Dict[int, LlmRequest] = {}
+        self._owners: Dict[bytes, set] = defaultdict(set)
+        # Scheduler passes each request has waited.
+        self.wait_passes: Dict[int, int] = {}
+
+    def fingerprints(self, req: LlmRequest, tokens: Sequence[int], scope: bytes) -> List[bytes]:
+        request_id = req.py_request_id
+        cached = self._fingerprints.get(request_id)
+        if cached is not None:
+            return cached
+        unit = self.unit_tokens
+        # The last prompt token is recomputed, so it never counts as reusable.
+        num_units = max(len(tokens) - 1, 0) // unit
+        array = np.asarray(tokens[: num_units * unit], dtype=np.int32)
+        digest = hashlib.blake2b(scope, digest_size=16).digest()
+        result = []
+        for start in range(0, num_units * unit, unit):
+            digest = hashlib.blake2b(
+                digest + array[start : start + unit].tobytes(), digest_size=16
+            ).digest()
+            result.append(digest)
+        self._fingerprints[request_id] = result
+        return result
+
+    def add(self, req: LlmRequest) -> None:
+        request_id = req.py_request_id
+        if request_id in self._prefilling:
+            return
+        self._prefilling[request_id] = req
+        for digest in self._fingerprints.get(request_id, ()):
+            self._owners[digest].add(request_id)
+
+    def remove(self, request_id: int) -> None:
+        self.wait_passes.pop(request_id, None)
+        if self._prefilling.pop(request_id, None) is not None:
+            for digest in self._fingerprints.get(request_id, ()):
+                owners = self._owners.get(digest)
+                if owners is not None:
+                    owners.discard(request_id)
+                    if not owners:
+                        del self._owners[digest]
+        self._fingerprints.pop(request_id, None)
+
+    def deepest_owner(
+        self, fingerprints: List[bytes], request_id: int
+    ) -> Tuple[Optional[LlmRequest], int]:
+        """Request still prefilling that shares the most units with ``fingerprints``.
+
+        Returns ``(request, shared units)``, or ``(None, 0)``. Requests whose
+        context ended stay indexed until they are freed but are skipped.
+        """
+        for depth in range(len(fingerprints), 0, -1):
+            for owner_id in sorted(self._owners.get(fingerprints[depth - 1], ())):
+                owner = self._prefilling.get(owner_id)
+                if (
+                    owner_id != request_id
+                    and owner is not None
+                    and owner.context_remaining_length > 0
+                ):
+                    return owner, depth
+        return None, 0
+
+    def clear(self) -> None:
+        self._fingerprints.clear()
+        self._prefilling.clear()
+        self._owners.clear()
+        self.wait_passes.clear()
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
@@ -1325,6 +1417,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # the class for instances built without running __init__.
     _commit_branch_snapshots = False
     _record_branch_snapshots = False
+    # Prefilling requests by prompt prefix, with block reuse; on the class so it
+    # exists without running __init__.
+    _inflight_prefix: Optional[_InflightPrefixIndex] = None
 
     def __init__(
         self,
@@ -1962,6 +2057,11 @@ class KVCacheManagerV2(BaseResourceManager):
             and not self.is_draft
             and not self.enable_joint_kv_cache_reuse
             and not self._has_cp_helix
+        )
+        self._inflight_prefix = (
+            _InflightPrefixIndex(_INFLIGHT_PREFIX_UNIT_BLOCKS * self.tokens_per_block)
+            if self.enable_block_reuse and self._can_publish_block_reuse
+            else None
         )
 
         # With pipeline parallelism, multiple microbatches can be in-flight
@@ -4151,6 +4251,108 @@ class KVCacheManagerV2(BaseResourceManager):
             f"(divergence={divergence}, reused={reused}, prompt_len={req.prompt_len})"
         )
 
+    def _request_snapshot_point(self, owner: LlmRequest, point: int) -> bool:
+        """Whether waiting for ``owner`` can make its first ``point`` tokens reusable.
+
+        Attention-only caches commit what a request computed, at the latest
+        when its context ends, so waiting always helps. Where only the SWA
+        window at a context chunk end reaches the radix tree (SWA branch
+        snapshots, see :meth:`_record_branch_snapshot_point`), ``owner`` also
+        ends a chunk at the block-aligned ``point``, if it has not passed it.
+        Recurrent-state managers must snapshot ``owner`` at ``point`` while it
+        prefills.
+        """
+        if not self._record_branch_snapshots:
+            return True
+        point = point // self.tokens_per_block * self.tokens_per_block
+        if not owner.context_current_position < point < owner.prompt_len:
+            return False
+        if point not in owner.expect_snapshot_points:
+            owner.expect_snapshot_points = sorted({*owner.expect_snapshot_points, point})
+        return True
+
+    def _waits_for_inflight_prefix(self, req: LlmRequest) -> bool:
+        # Fingerprints cover raw token ids, so multimodal prompts (whose
+        # placeholder tokens do not identify the content) are left out.
+        return (
+            self._inflight_prefix is not None
+            and not req.is_dummy_request
+            and not req.is_disagg_generation_init_state
+            and req.multimodal_hashes is None
+        )
+
+    def _inflight_prefix_fingerprints(self, req: LlmRequest) -> List[bytes]:
+        scope = repr((req.lora_task_id, req.cache_salt)).encode()
+        return self._inflight_prefix.fingerprints(req, self._reuse_token_source(req), scope)
+
+    def plan_context_waits(self, requests: Sequence[LlmRequest]) -> Dict[int, Optional[int]]:
+        """Context requests to keep queued this scheduler pass.
+
+        Agent fan-outs send sibling requests that share a long prefix at about
+        the same time; admitted together, each of them computes that prefix.
+        ``requests`` are the pass's pending context requests in scheduling
+        order. A request without a cache claim waits while a request ahead of
+        it shares a prefix at least ``_INFLIGHT_PREFIX_MIN_GAIN_BLOCKS`` blocks
+        deeper than the reuse tree offers: one that is prefilling (holds a
+        claim), or one that is new in this pass and does not wait itself. The
+        prefix owner is asked to make the shared depth reusable
+        (``_request_snapshot_point``). A request waits at most
+        ``_INFLIGHT_PREFIX_MAX_WAIT_PASSES`` passes in total.
+
+        Returns the waiting request ids, each mapped to the id of the new
+        request of this pass it waits for, or None when it waits for a request
+        that is prefilling. A request that waits for a new request only waits
+        if the scheduler admits that request earlier in the same pass.
+        """
+        waiting: Dict[int, Optional[int]] = {}
+        if self._inflight_prefix is None:
+            return waiting
+        # First-chunk requests of this pass that will claim a cache, by the
+        # fingerprint of each of their prefix units.
+        pass_owners: Dict[bytes, LlmRequest] = {}
+        for req in requests:
+            if (
+                not req.is_first_context_chunk
+                or req.py_request_id in self.kv_cache_map
+                or not self._waits_for_inflight_prefix(req)
+            ):
+                continue
+            fingerprints = self._inflight_prefix_fingerprints(req)
+            owner = self._prefix_owner_to_wait_for(req, fingerprints, pass_owners)
+            if owner is not None:
+                waiting[req.py_request_id] = (
+                    None if owner.py_request_id in self.kv_cache_map else owner.py_request_id
+                )
+                continue
+            for digest in fingerprints:
+                pass_owners.setdefault(digest, req)
+        return waiting
+
+    def _prefix_owner_to_wait_for(
+        self, req: LlmRequest, fingerprints: List[bytes], pass_owners: Dict[bytes, LlmRequest]
+    ) -> Optional[LlmRequest]:
+        index = self._inflight_prefix
+        request_id = req.py_request_id
+        waited = index.wait_passes.get(request_id, 0)
+        if waited >= _INFLIGHT_PREFIX_MAX_WAIT_PASSES:
+            return None
+        owner, units = index.deepest_owner(fingerprints, request_id)
+        for depth in range(len(fingerprints), units, -1):
+            pass_owner = pass_owners.get(fingerprints[depth - 1])
+            if pass_owner is not None:
+                owner, units = pass_owner, depth
+                break
+        if owner is None:
+            return None
+        shared = units * index.unit_tokens
+        reusable = self.probe_context_reuse(req) or 0
+        if shared - reusable < _INFLIGHT_PREFIX_MIN_GAIN_BLOCKS * self.tokens_per_block:
+            return None
+        if not self._request_snapshot_point(owner, shared):
+            return None
+        index.wait_passes[request_id] = waited + 1
+        return owner
+
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
 
@@ -4246,6 +4448,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.stop_committing()
             else:
                 self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
+                if num_lookup_tokens is not None and self._waits_for_inflight_prefix(req):
+                    self._inflight_prefix_fingerprints(req)
+                    self._inflight_prefix.add(req)
 
             # The core stages the cached-token level attribution when it takes the reuse match and
             # commits it with the rest of this sequence's stats. Only the cases the core cannot see
@@ -6220,6 +6425,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.reset_request_state(request)
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
+        if self._inflight_prefix is not None:
+            self._inflight_prefix.remove(request.py_request_id)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         self._inflight_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
@@ -6514,6 +6721,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # its plan, which mutates manager state.
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
+        if self._inflight_prefix is not None:
+            self._inflight_prefix.clear()
         self.impl.shutdown()
         if self._sharing is not None:
             # After the runtime's shutdown, which raises while any cache is open, in the map or not;

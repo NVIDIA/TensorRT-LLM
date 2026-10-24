@@ -6739,7 +6739,7 @@ class PyExecutor:
         self,
         waiting_queue: WaitingQueue,
         total_num_active_requests: int,
-        all_ranks_num_active_requests: Optional[List[int]] = None
+        all_rank_states: Optional[List[RankState]] = None
     ) -> List[RequestQueueItem]:
         """Pop requests from waiting_queue based on available capacity."""
         admission_capacity = self._get_request_admission_capacity()
@@ -6756,15 +6756,25 @@ class PyExecutor:
                                            admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
+        if self.enable_attention_dp:
+            # Warmup and the benchmark fill phase admit in FIFO order: in the
+            # fill phase every request must fit at once and none leaves, so
+            # placement by KV load could strand the last requests.
+            kv_balance = not (self.is_warmup or
+                              (self.is_benchmark_disagg
+                               and self._benchmark_fill_phase_active))
+            return self.adp_router.pop_requests(waiting_queue,
+                                                all_rank_states,
+                                                max_new_requests,
+                                                self.max_num_active_requests,
+                                                kv_balance=kv_balance)
         new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
-            enable_attention_dp=self.enable_attention_dp,
-            max_num_active_requests=self.max_num_active_requests,
-            all_ranks_num_active_requests=all_ranks_num_active_requests)
-        if (not new_requests or
-                not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
-                or self.enable_attention_dp):
+            enable_attention_dp=False,
+            max_num_active_requests=self.max_num_active_requests)
+        if (not new_requests or not getattr(
+                self, "_mm_encoder_item_scheduling_enabled", False)):
             return new_requests
         return self._apply_mm_encoder_admission(waiting_queue, new_requests)
 
@@ -6780,7 +6790,7 @@ class PyExecutor:
 
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
-            # because _pop_from_waiting_queue needs all_ranks_num_active_requests
+            # because _pop_from_waiting_queue needs the rank states
             # from the allgather result. Moving it to step 5 would require an
             # extra allgather. When introducing new router implementations
             # (e.g. KV-cache-aware) that need new_requests to gather additional
@@ -6829,10 +6839,8 @@ class PyExecutor:
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
                         gpu_forward_time_ms=record.gpu_forward_time_ms)
-            all_ranks_num_active_requests = [
-                s.num_active_requests for s in all_rank_states
-            ]
-            total_num_active_requests = sum(all_ranks_num_active_requests)
+            total_num_active_requests = sum(s.num_active_requests
+                                            for s in all_rank_states)
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
@@ -6844,16 +6852,15 @@ class PyExecutor:
                 # should_enable_overlap_headroom). They still count as live.
                 total_num_active_requests -= count_retiring_requests(
                     active_requests)
-            all_ranks_num_active_requests = None
             all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
 
         # 3. Pop requests from waiting queue
-        new_requests = self._pop_from_waiting_queue(
-            waiting_queue, total_num_active_requests,
-            all_ranks_num_active_requests)
+        new_requests = self._pop_from_waiting_queue(waiting_queue,
+                                                    total_num_active_requests,
+                                                    all_rank_states)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -7851,7 +7858,8 @@ class PyExecutor:
         """Pad an idle attention-DP rank with a role-matched dummy request."""
         if getattr(self, "_enable_remote_tail_adp", False):
             return
-        if not self.enable_attention_dp:
+        # A single-rank attention-DP group has no peer to keep in step.
+        if not self.enable_attention_dp or self.dist.tp_size <= 1:
             return
 
         expected_num_active_requests = self.expected_num_active_requests
@@ -8019,6 +8027,10 @@ class PyExecutor:
                 scheduled_batch.attention_dp_phase
                 in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE) and 0
                 in self.model_engine.cuda_graph_runner.padding_dummy_requests)
+            return
+        # With a single attention-DP rank `_can_queue` vetoes only this rank's
+        # own empty batch, so there is no peer to unblock.
+        if self.dist.tp_size <= 1:
             return
         if not self.active_requests or self.expected_num_active_requests <= 0:
             return

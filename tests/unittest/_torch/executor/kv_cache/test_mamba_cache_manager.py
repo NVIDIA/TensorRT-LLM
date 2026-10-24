@@ -1302,6 +1302,126 @@ def test_replay_inactive_without_spec_config():
     assert mgr.get_replay_state_update_metadata() is None
 
 
+@contextlib.contextmanager
+def _no_host_sync():
+    """Fail on any host-device synchronization inside the block."""
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+
+@skip_no_cuda
+def test_python_mamba_slot_assignment_without_sync():
+    """Requests and dummies joining the v1 manager reset their slots' replay state and
+    seeds without synchronizing the stream (the previous decode step is still queued)."""
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+    mgr = PythonMambaCacheManager(
+        d_state=8,
+        d_conv=4,
+        num_heads=4,
+        n_groups=1,
+        head_dim=8,
+        num_layers=2,
+        max_batch_size=_get_mamba_hybrid_pool_size(4, mapping),
+        spec_state_size=4,
+        mapping=mapping,
+        dtype=torch.float16,
+        ssm_cache_dtype=torch.float16,
+        speculative_num_draft_tokens=2,
+        use_replay_state_update=True,
+        mamba_ssm_stochastic_rounding=True,
+    )
+    assert mgr.use_replay_state_update
+    cache = mgr.mamba_cache
+    cache.prev_num_accepted_tokens.fill_(5)
+    cache.cache_buf_idx.fill_(1)
+    seeds = mgr.get_mamba_ssm_rand_seed()
+    seeds_before = seeds.clone()
+
+    with _no_host_sync():
+        mgr._prepare_mamba_cache_blocks([100, 101])
+        # 100 is known: its slot is reset in place; 200 takes a new slot.
+        mgr.add_dummy_requests([100, 200])
+
+    slots = [mgr.mamba_cache_index[r] for r in (100, 101, 200)]
+    for slot in slots:
+        assert int(cache.prev_num_accepted_tokens[slot]) == 0
+        assert int(cache.cache_buf_idx[slot]) == 0
+    # Fresh assignments rotate their seeds; the dummy never reaches the seed rotation.
+    for slot in slots[:2]:
+        assert int(seeds[slot]) != int(seeds_before[slot])
+
+
+@skip_no_cuda
+def test_python_mamba_kda_replay_seed_without_sync():
+    """The v1 manager's disagg replay seed stages its slots and seeds the replay caches
+    without synchronizing the stream."""
+    num_layers, num_slots, dim, committed, num_spec = 2, 4, 6, 3, 2
+
+    class _SpecState:
+        pass
+
+    cache = _SpecState()
+    cache.conv = torch.randn(num_layers, num_slots, 3 * dim, committed, device="cuda")
+    for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v"):
+        setattr(
+            cache,
+            name,
+            torch.full((num_layers, num_slots, dim, committed + num_spec), 7.0, device="cuda"),
+        )
+    for name in ("kda_k_cache", "kda_g_cache", "kda_v_cache"):
+        setattr(cache, name, torch.full((num_layers, num_slots, num_spec, dim), 7.0, device="cuda"))
+    cache.kda_beta_cache = torch.full((num_layers, num_slots, num_spec, 3), 7.0, device="cuda")
+    cache.prev_num_accepted_tokens = torch.full((num_slots,), 5, dtype=torch.int32, device="cuda")
+    mgr = object.__new__(PythonMambaCacheManager)
+    mgr._use_kda_replay_update = True
+    mgr.SpeculativeState = _SpecState
+    mgr.mamba_cache = cache
+    mgr.mamba_cache_index = {101: 1, 202: 3}
+
+    with _no_host_sync():
+        mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+
+    assert cache.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
+    for slot in (1, 3):
+        assert torch.equal(cache.kda_conv_q[:, slot, :, :committed], cache.conv[:, slot, :dim])
+        assert not cache.kda_conv_q[:, slot, :, committed:].any()
+        assert not cache.kda_k_cache[:, slot].any()
+    assert (cache.kda_conv_q[:, 0] == 7.0).all()
+
+
+@skip_no_cuda
+def test_v2_kda_replay_commit_clears_draft_count_without_sync():
+    """Committing a suspended request's pending drafts clears its draft count without
+    synchronizing the stream."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import is_kda_mtp_verify_available
+
+    if not is_kda_mtp_verify_available():
+        pytest.skip("needs the fused KDA verify kernel (sm_100 / sm_103 with the CuTe DSL)")
+    mgr = _v2_kda_replay_manager_with_large_slots()
+    request = None
+    try:
+        (request,) = mgr.add_dummy_requests(
+            [1], token_nums=[8], is_gen=True, max_num_draft_tokens=2
+        )
+        slot = mgr._request_id_to_state_index[1]
+        # The first commit compiles its kernel.
+        mgr.prev_num_accepted_tokens[slot] = 1
+        mgr._commit_kda_pending_drafts(slot)
+        mgr.prev_num_accepted_tokens[slot] = 2
+        with _no_host_sync():
+            mgr._commit_kda_pending_drafts(slot)
+        assert int(mgr.prev_num_accepted_tokens[slot]) == 0
+    finally:
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
+
+
 @skip_no_cuda
 def test_padding_slot_not_held_by_parked_real():
     """Padding must not resolve to a slot owned by a parked real
@@ -5914,3 +6034,65 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
 
     # Reset 5, 1 and 3; seeding resets 4 and 2; 0, 6 and 7 untouched.
     assert mgr.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 7, 8]
+
+
+def _kda_replay_seed_manager(stacked: bool):
+    """Two KDA layers whose state and replay buffers are per-layer views of
+    one allocation each, like the KVCM pool views."""
+    generator = torch.Generator().manual_seed(0)
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = True
+    mgr._kda_replay_unseeded = set()
+    mgr.local_num_mamba_layers = 2
+    mgr.conv_state_shape = [6, 4]
+    mgr.conv_section_dims = [2, 2, 2]
+    mgr._request_id_to_state_index = {101: 1, 202: 3}
+    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32, device="cuda")
+    conv = torch.randn(2, 4, 6, 4, generator=generator).to("cuda", torch.bfloat16)
+    mgr.all_conv_states = [conv[layer] for layer in range(2)]
+    replay = {
+        name: torch.randn(2, 4, 6, 2, generator=generator)
+        .to("cuda", torch.bfloat16)
+        .transpose(-1, -2)
+        for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v")
+    }
+    for name, dtype in (
+        ("kda_k_cache", torch.bfloat16),
+        ("kda_g_cache", torch.float32),
+        ("kda_v_cache", torch.bfloat16),
+    ):
+        replay[name] = torch.randn(2, 4, 2, 2, generator=generator).to("cuda", dtype)
+    replay["kda_beta_cache"] = torch.randn(2, 4, 2, 4, generator=generator).to(
+        "cuda", torch.bfloat16
+    )[..., :2]
+    mgr._kda_replay_layers = [
+        {name: buffer[layer] for name, buffer in replay.items()} for layer in range(2)
+    ]
+    if stacked:
+        mgr._stacked_conv_states = MambaHybridCacheManagerV2._stack_state_views(mgr.all_conv_states)
+        mgr._stacked_kda_replay_layers = {
+            name: MambaHybridCacheManagerV2._stack_state_views(
+                [layer[name] for layer in mgr._kda_replay_layers]
+            )
+            for name in replay
+        }
+        assert all(view is not None for view in mgr._stacked_kda_replay_layers.values())
+    return mgr, replay
+
+
+@skip_no_cuda
+def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
+    per_layer, per_layer_replay = _kda_replay_seed_manager(stacked=False)
+    stacked, stacked_replay = _kda_replay_seed_manager(stacked=True)
+
+    per_layer.seed_kda_replay_caches_for_disagg_gen([101, 202])
+    stacked.seed_kda_replay_caches_for_disagg_gen([101, 202])
+
+    for name, buffer in per_layer_replay.items():
+        assert torch.equal(stacked_replay[name], buffer), name
+    assert torch.equal(stacked.prev_num_accepted_tokens, per_layer.prev_num_accepted_tokens)
+    # The seeded slots hold the committed windows, the others are untouched.
+    assert torch.equal(
+        stacked_replay["kda_conv_k"][1, 3, :, :4], stacked.all_conv_states[1][3, 2:4, :]
+    )
+    assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
