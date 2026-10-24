@@ -255,6 +255,7 @@ l0_cpu:
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
+  - unittest/llmapi/test_startup_checks.py
   - unittest/llmapi/test_tokenizer_aliases.py
   - unittest/llmapi/test_tokenizer_decode.py
   - unittest/llmapi/test_trtllm_serve_config_schemas.py

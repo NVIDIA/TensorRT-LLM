@@ -29,6 +29,10 @@ import zmq
 import zmq.asyncio
 
 from tensorrt_llm._startup import _StartupTimer
+from tensorrt_llm._startup_errors import (StartupErrorInfo,
+                                          is_worker_startup_error,
+                                          log_startup_error,
+                                          wrap_worker_startup_error)
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
@@ -836,6 +840,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         abort itself raises, so the engine-dead bookkeeping (and the original
         initialization error) cannot be lost to a teardown failure.
         """
+        # The abort can end this process (MPI_Abort) before the error reaches
+        # the LLM boundary, so the classified hint is logged first.
+        error.__cause__ = cause
+        log_startup_error(error, "LLM initialization failed")
         root_cause = cause if cause is not None else error
         try:
             self._abort_owned_session(root_cause)
@@ -936,9 +944,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
                 logger.error(
                     f"Executor worker initialization error: {error_trace}")
+                # The worker classified the error before pickling dropped its
+                # cause chain; carry that onto the error raised here.
+                info = status[2] if len(status) > 2 and isinstance(
+                    status[2], StartupErrorInfo) else None
                 self._fail_initialization(
-                    RuntimeError("Executor worker returned error"),
-                    ready_signal)
+                    wrap_worker_startup_error("Executor worker returned error",
+                                              info), ready_signal)
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
@@ -980,13 +992,17 @@ class GenerationExecutorProxy(GenerationExecutor):
 
             death = self._detect_worker_death_during_init()
             if death is not None:
+                # A non-leader rank that fails here has no status queue, so its
+                # peers stay blocked in the init collective still holding their
+                # share of the weights. Raising alone leaks them until job end
+                # and makes the next blocking shutdown() hang instead of
+                # reporting this failure.
+                if is_worker_startup_error(death):
+                    # The rank raised its classified error, which already names
+                    # the rank, stage and root cause.
+                    self._fail_initialization(death)
                 message = f"Executor worker died during initialization: {death}"
                 logger.error(message)
-                # A non-leader rank that fails here returns without notifying
-                # anyone, so its peers stay blocked in the init collective
-                # still holding their share of the weights. Raising alone
-                # leaks them until job end and makes the next blocking
-                # shutdown() hang instead of reporting this failure.
                 self._fail_initialization(RuntimeError(message), death)
             self._handle_background_error()
 

@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     CLIENT_CONFIG_NAME,
     CONFIG_PATH_ENV,
 )
+from tensorrt_llm.llmapi import llm as llm_module
 from tensorrt_llm.llmapi.llm import LLM, _TorchLLM
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
@@ -286,6 +287,8 @@ def test_the_llm_constructor_settles_them_before_it_spawns_its_ranks(monkeypatch
         )
 
     monkeypatch.setattr(_TorchLLM, "_build_model", record_instead_of_building)
+    # CPU runners have no GPU; the constructor checks for one first.
+    monkeypatch.setattr(llm_module, "check_visible_gpus", lambda *_a, **_k: None)
 
     llm = LLM(
         model="/tmp/dummy_model",

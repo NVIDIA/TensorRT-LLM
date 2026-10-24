@@ -23,6 +23,7 @@ import torch
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
 
+from .._startup_errors import tag_startup_error
 from .._utils import mpi_world_size
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -572,10 +573,15 @@ class GenerationExecutor(ABC):
             world_size = mpi_world_size()
 
         if world_size > 1 and world_size < model_world_size:
-            raise RuntimeError(
-                "Cannot instantiate an executor requiring "
-                f"{model_world_size} ranks, while currently running "
-                f"on {world_size} ranks.")
+            raise tag_startup_error(
+                RuntimeError(
+                    "Cannot instantiate an executor requiring "
+                    f"{model_world_size} ranks, while currently running "
+                    f"on {world_size} ranks."),
+                "config_input",
+                hint="Launch tensor_parallel_size x pipeline_parallel_size x "
+                "context_parallel_size MPI ranks (srun -n / mpirun -np), or "
+                "lower the parallel sizes.")
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )

@@ -181,6 +181,8 @@ class TestProcessLifecycleCounters:
         error = RuntimeError("expected model build failure")
         payloads = []
         with (
+            # CPU runners have no GPU; the constructor checks for one first.
+            patch("tensorrt_llm.llmapi.llm.check_visible_gpus"),
             patch.object(BaseLLM, "_build_model", side_effect=error) as build,
             patch.object(usage_lib, "_send_to_gxt", side_effect=payloads.append),
             patch.object(usage_lib, "_is_reporting_rank", return_value=True),
