@@ -385,13 +385,12 @@ def test_automatic_buckets_cover_every_batch_with_bounded_layout_shapes() -> Non
 @pytest.mark.cpu_only
 def test_automatic_buckets_include_intermediate_token_capacities() -> None:
     buckets = _BatchedFramesIOAdapter().capture_buckets(3, 4096)
-    assert [bucket.total_tokens for bucket in buckets if bucket.num_contexts == 1] == [
-        256,
-        512,
-        1024,
-        2048,
-        4096,
-    ]
+    totals = [bucket.total_tokens for bucket in buckets if bucket.num_contexts == 1]
+    assert totals[0] == 256 and totals[-1] == 4096
+    assert all(
+        upper <= ((lower * 5 + 1023) // 1024) * 256 for lower, upper in zip(totals, totals[1:])
+    )
+    assert {bucket.num_contexts for bucket in buckets} == {1, 2, 3}
     assert EncoderGraphKey(4096, 3) in buckets
     assert all(bucket.total_tokens <= 4096 for bucket in buckets)
     inputs = _BatchedFramesIOAdapter().allocate_inputs(
@@ -1004,3 +1003,22 @@ def test_dummy_padding_isolates_real_tokens(cuda_device, make_cuda_runner):
     )
     captured_meta = runner._captured[captured_key].metadata
     assert captured_meta.seq_lens_cuda.tolist() == padded_seq_lengths
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "lengths,capacity,expected",
+    [
+        ([4092], 8192, True),
+        ([4096], 5120, True),
+        ([4096], 5121, False),
+        ([8192], 16384, False),
+        ([2048, 2048], 5120, True),
+        ([2048, 2048], 5121, False),
+    ],
+)
+def test_packed_padding_guard_preserves_small_calls_and_multi_context(lengths, capacity, expected):
+    runner = _make_logic_runner()
+    runner._buckets = [EncoderGraphKey(capacity, len(lengths))]
+    bucket = runner._select_bucket(len(lengths), sum(lengths), lengths)
+    assert (bucket is not None) == expected
