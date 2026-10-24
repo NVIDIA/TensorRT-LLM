@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
     _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
     _fp4_mla_block_reuse_blocker,
-    _validate_fp4_mla_chunk_size,
+    _validate_fp4_mla_chunk_unit,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import (
@@ -506,27 +506,26 @@ def _dense_fp4_mla_model_config() -> SimpleNamespace:
 
 
 @pytest.mark.parametrize(
-    ("enable_chunked_prefill", "max_num_tokens"),
-    [(True, 4096), (False, 4097)],
+    "ctx_chunk_config",
+    [
+        None,
+        (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 128),
+        (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 256),
+        (ContextChunkingPolicy.FORCE_CHUNK, 128),
+    ],
+    ids=["disabled", "fcfs_128", "swa_256", "force_128"],
 )
-def test_dense_fp4_mla_accepts_aligned_or_disabled_chunking(
-    enable_chunked_prefill: bool,
-    max_num_tokens: int,
-) -> None:
-    _validate_fp4_mla_chunk_size(
-        _dense_fp4_mla_model_config(),
-        enable_chunked_prefill=enable_chunked_prefill,
-        max_num_tokens=max_num_tokens,
-    )
+def test_fp4_mla_accepts_tile_aligned_or_disabled_chunk_unit(ctx_chunk_config) -> None:
+    _validate_fp4_mla_chunk_unit(_dense_fp4_mla_model_config(), ctx_chunk_config)
 
 
-def test_dense_fp4_mla_rejects_unaligned_chunk_size() -> None:
-    # Only a request's final chunk may end inside an FP4 quantization tile.
+def test_fp4_mla_rejects_unaligned_chunk_unit() -> None:
+    # The schedulers round truncated non-final chunks to the chunk unit, so
+    # the unit must cover whole FP4 quantization tiles.
     with pytest.raises(ValueError, match="multiple of 16"):
-        _validate_fp4_mla_chunk_size(
+        _validate_fp4_mla_chunk_unit(
             _dense_fp4_mla_model_config(),
-            enable_chunked_prefill=True,
-            max_num_tokens=4097,
+            (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 72),
         )
 
 
