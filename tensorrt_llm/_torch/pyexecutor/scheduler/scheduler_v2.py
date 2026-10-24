@@ -261,6 +261,22 @@ class KVCacheV2Scheduler(RequestScheduler):
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
 
+        # Opt-in (default off): admit pending context requests in order of
+        # their estimated uncached tokens instead of arrival order. With FCFS
+        # admission a started long prompt takes the whole max_num_tokens budget
+        # every iteration until it finishes, and short prompts behind it wait
+        # for all of its chunks. A request that gets no tokens for
+        # TLLM_CTX_SHORTEST_FIRST_MAX_WAITS consecutive iterations moves to the
+        # front, so a long prompt cannot starve. See _order_ctx_shortest_first.
+        self._ctx_shortest_first = os.environ.get("TLLM_CTX_SHORTEST_FIRST", "0") == "1"
+        self._ctx_shortest_first_max_waits = int(
+            os.environ.get("TLLM_CTX_SHORTEST_FIRST_MAX_WAITS", "8")
+        )
+        # Per pending request id: estimated uncached tokens of a not-yet-started
+        # request (probed once), and consecutive iterations without tokens.
+        self._ctx_uncached_estimates: dict[int, int] = {}
+        self._ctx_waits: dict[int, int] = {}
+
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
@@ -557,6 +573,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # `_collect_contributed_blocks` returns the blocks already promised by
         # context requests running this iteration, or None when the skip cannot
         # fire at all and every probe below can be avoided.
+        if self._ctx_shortest_first and len(pending_ctx) > 1:
+            pending_ctx = self._order_ctx_shortest_first(pending_ctx)
         contributed_blocks = self._collect_contributed_blocks(
             requests_list, pending_ctx, inflight_request_ids
         )
@@ -650,6 +668,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # either inflight_request_ids or scheduled_ctx non-empty.
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
+
+        if self._ctx_shortest_first:
+            self._update_ctx_waits(pending_ctx, scheduled_ctx)
 
         made_progress = bool(
             scheduled_gen
@@ -950,6 +971,53 @@ class KVCacheV2Scheduler(RequestScheduler):
             return cross_action, 0, False
 
         return ScheduleAction.SCHEDULED, req_tokens, False
+
+    def _ctx_uncached_estimate(self, req: LlmRequest) -> int:
+        """Context tokens ``req`` still has to compute, for admission ordering.
+
+        A started request knows its remaining length exactly. For a request that
+        has not claimed its cache yet, ``context_remaining_length`` still counts
+        the reusable prefix, so subtract the probed reuse depth; the probe walks
+        the radix tree once per request and is then cached.
+        """
+        request_id = req.py_request_id
+        if not req.is_first_context_chunk or request_id in self.kv_cache_manager.kv_cache_map:
+            return req.context_remaining_length
+        estimate = self._ctx_uncached_estimates.get(request_id)
+        if estimate is None:
+            reuse = self.kv_cache_manager.probe_context_reuse(req) or 0
+            estimate = max(req.prompt_len - reuse, 0)
+        return estimate
+
+    def _order_ctx_shortest_first(self, requests: RequestList) -> RequestList:
+        """Starved requests first (oldest wait first), then fewest uncached tokens."""
+        estimates = {}
+        for req in requests:
+            if req.is_first_context_chunk and req.py_request_id not in (
+                self.kv_cache_manager.kv_cache_map
+            ):
+                estimates[req.py_request_id] = self._ctx_uncached_estimate(req)
+        self._ctx_uncached_estimates = estimates
+
+        def key(req: LlmRequest) -> tuple[int, int]:
+            waits = self._ctx_waits.get(req.py_request_id, 0)
+            if waits >= self._ctx_shortest_first_max_waits:
+                return (0, -waits)
+            return (1, self._ctx_uncached_estimate(req))
+
+        # Stable: ties keep arrival order.
+        return sorted(requests, key=key)
+
+    def _update_ctx_waits(self, pending_ctx: RequestList, scheduled_ctx: RequestList) -> None:
+        scheduled = {req.py_request_id for req in scheduled_ctx}
+        self._ctx_waits = {
+            req.py_request_id: (
+                0
+                if req.py_request_id in scheduled
+                else self._ctx_waits.get(req.py_request_id, 0) + 1
+            )
+            for req in pending_ctx
+        }
 
     def _has_context_chunk_budget(self, budget: BudgetTracker) -> bool:
         remaining = budget.remaining_tokens

@@ -919,6 +919,76 @@ class TestTokenBudget:
 # ===========================================================================
 
 
+class TestContextShortestFirst:
+    """TLLM_CTX_SHORTEST_FIRST: pending context admitted by estimated uncached tokens."""
+
+    @staticmethod
+    def started_long_request(request_id: int, mgr: Mock, remaining: int = 5000) -> Mock:
+        req = make_ctx_request(
+            request_id,
+            context_remaining_length=remaining,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        mgr.kv_cache_map[request_id] = Mock(is_active=True)
+        return req
+
+    def test_default_admits_in_arrival_order(self, monkeypatch):
+        monkeypatch.delenv("TLLM_CTX_SHORTEST_FIRST", raising=False)
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        long_req = self.started_long_request(0, mgr)
+        short_req = make_ctx_request(1, context_remaining_length=100)
+
+        out = sched.schedule_request([long_req, short_req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert long_req.context_chunk_size == 1024
+
+    def test_short_request_admitted_ahead_of_started_long_one(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_SHORTEST_FIRST", "1")
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        long_req = self.started_long_request(0, mgr)
+        short_req = make_ctx_request(1, context_remaining_length=100)
+
+        out = sched.schedule_request([long_req, short_req], set())
+
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert short_req.context_chunk_size == 100
+        # The long prompt keeps the rest of the budget, rounded down to the chunk unit.
+        assert long_req.context_chunk_size == 896
+
+    def test_reusable_prefix_is_not_counted(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_SHORTEST_FIRST", "1")
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_block_reuse=True)
+        mgr.probe_context_reuse.side_effect = lambda req: 3900 if req.py_request_id == 1 else 0
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        uncached = make_ctx_request(0, context_remaining_length=500)
+        mostly_cached = make_ctx_request(1, context_remaining_length=4000)
+
+        ordered = sched._order_ctx_shortest_first([uncached, mostly_cached])
+
+        assert ids(ordered) == [1, 0]
+
+    def test_starved_request_moves_to_front(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_SHORTEST_FIRST", "1")
+        monkeypatch.setenv("TLLM_CTX_SHORTEST_FIRST_MAX_WAITS", "2")
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        long_req = self.started_long_request(0, mgr)
+
+        admitted = []
+        for step in range(3):
+            # A fresh short prompt that fills the whole budget every iteration.
+            short_req = make_ctx_request(10 + step, context_remaining_length=1024)
+            out = sched.schedule_request([long_req, short_req], set())
+            admitted.append(ids(out.context_requests))
+
+        assert admitted == [[10], [11], [0]]
+        assert long_req.context_chunk_size == 1024
+
+
 class TestDraftTokenBudget:
     def test_ctx_fits_draft_exceeds_budget(self):
         """ctx(80) fits in budget=100, but 80+30=110 > 100.
