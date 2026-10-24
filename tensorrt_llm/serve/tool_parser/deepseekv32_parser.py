@@ -84,6 +84,8 @@ class DeepSeekV32Parser(BaseToolParser):
         # the invokes and precede the closing tag are the format's layout (the
         # checkpoint's encoder writes them), not content.
         self._in_calls_block = False
+        # Set while an increment re-reads what its last invoke left behind.
+        self._reading_rest = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -230,6 +232,7 @@ class DeepSeekV32Parser(BaseToolParser):
             self._tool_indices = self._get_tool_indices(tools)
 
         all_calls: list[ToolCallItem] = []
+        invokes_exhausted = False
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -246,6 +249,7 @@ class DeepSeekV32Parser(BaseToolParser):
                 )
 
                 if not invoke_match:
+                    invokes_exhausted = True
                     break
 
                 func_name = invoke_match.group(1).strip()
@@ -330,7 +334,23 @@ class DeepSeekV32Parser(BaseToolParser):
                     # Wait for more chunks until we see </｜DSML｜invoke>
                     break
 
-            # No more invoke blocks found
+            # The rest of this increment may close the block and carry text after
+            # it. Read it now: a later increment may never come, and nothing
+            # flushes this parser when the stream ends.
+            if (
+                invokes_exhausted
+                and self._in_calls_block
+                and not self._reading_rest
+                and self.eot_token in self._buffer
+                and not any(token in self._buffer for token in start_tokens)
+            ):
+                self._reading_rest = True
+                try:
+                    rest = self.parse_streaming_increment("", tools)
+                finally:
+                    self._reading_rest = False
+                normal_text += rest.normal_text
+                all_calls.extend(rest.calls)
             return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:

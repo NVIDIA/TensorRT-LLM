@@ -6290,14 +6290,20 @@ def test_dsml_newlines_between_calls_are_not_content(
 
 @pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
                          _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [5, 10_000])
 def test_dsml_text_after_the_block_is_still_content(
         sample_tools: list[ChatCompletionToolsParam],
         parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
-        parameter_tag: str) -> None:
-    """Only the layout inside the block is dropped; text after it is kept."""
+        parameter_tag: str, chunk_size: int) -> None:
+    """Only the layout inside the block is dropped; text after it is kept.
+
+    In one increment, the closing tag and the text after it follow the last
+    invoke; that text must come out of that increment, since nothing flushes
+    the parser when the stream ends.
+    """
     text = _dsml_block(calls_tag, invoke_tag, parameter_tag) + " Done."
 
-    content, calls = _stream(parser_cls(), text, 5, sample_tools)
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
 
     assert content == " Done."
     assert [call.name for call in calls
