@@ -6,10 +6,11 @@ built-in model zoo rather than inside it.
 Where `_torch/models/modeling_deepseekv3.py` is one class serving V3, V3-Lite,
 R1 and V3.2 across every GPU generation and parallel topology,
 `_torch/_experimental/modeling_v2/models/deepseek_v3/` is one flat forward per (checkpoint,
-GPU architecture, parallel topology) triple — assembled only from `catalog/`
-entries, sharing nothing with its siblings, and trusted through accuracy gates
-instead of shared abstractions. The one-to-one correspondence between
-`models/<x>/` here and `modeling_<x>.py` there is the point of the exercise.
+GPU architecture, parallel topology) triple — assembled from certified `OpWrapper`
+entries and trusted through accuracy gates. Model-family ops and kernels may be
+shared by that family's targets; target-only code remains inside its target.
+The one-to-one correspondence between `models/<x>/` here and `modeling_<x>.py`
+there is the point of the exercise.
 
 ## Using it
 
@@ -114,10 +115,14 @@ checkpoint of the same shape is ungated.
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
+  ops/<category>/   entries shared only by this family's targets
+  kernels/          CuTe DSL packages shared only by this family's targets
+  csrc/             model-owned compiled specializations and native op bridges
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
-catalog/<category>/ entries more than one target calls
+                      kernels/          target-only kernel implementations
+catalog/<category>/ entries shared across model families
 ```
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
@@ -126,6 +131,19 @@ torch, `is_valid` names the inputs it accepts and answers wrongly, and `CELLS`
 / `ARCHS` are the configurations and architectures it is proven at. The
 wrapper is stateless and `__call__` reads nothing off `self`, so a call site
 shows exactly what the kernel receives; `catalog/_op.py` states the rest.
+
+Kimi K3's `csrc/` is compiled into the existing native libraries through CMake
+OBJECT targets and `target_sources`; it has no runtime extension loader. Its
+one-shot MNNVL specialization and fused attention-residual decode kernels are
+family-owned. The generic attention-residual, persistent fallback and two-shot
+MNNVL kernels remain stock, as do the shared native schemas and workspace
+ownership. Rebuild the native libraries when these model-owned sources change.
+
+K3's all-reduce adapter keeps its one-shot ceiling and entry-release setting on
+the selected model's modules. Stock PDL releases after rank reduction; K3 can
+release immediately after its entry dependency wait. Neither release implies
+output readiness: a dependent must wait before reading producer outputs or
+reusing its workspace. Shared kernels and defaults are unchanged.
 
 Accuracy anchors are not kept here. They live where every other model's do,
 `tests/integration/defs/accuracy/references/`, read by the gates CI runs.
@@ -142,7 +160,8 @@ tests/unittest/_torch/modeling_v2/
   comm/_<entry>_op_matrix.py   the collectives' rank bodies: allgather, reducescatter
                                and allreduce at 2/4/8 ranks in one node, mnnvl_allreduce
                                at 8 ranks over two trays (srun only, see its docstring)
-  comm/_rank_job.py            starts one of those and asserts on its exit code
+  comm/_lockstep.py            the stateful matrices' launcher and shared reference
+  comm/_rank_job.py            starts one at a world size and asserts on its exit code
 ```
 
 That split is not a preference; it is where this repo's CI collects from, and
@@ -151,13 +170,51 @@ an in-package test is on no list. Each test is parametrized off its entry's
 and derives, so the certification is re-proved on every commit rather than
 recorded once.
 
+Kimi K3's shared TP4×EP4 / TP16×EP1 wrappers and CuTe packages live once under
+`models/kimi_k3_vl/{ops,kernels}/`. The TP16×EP1 M1/M2 MoE engines live under
+that target's `kernels/k3_moe_engines/`; target-only wrappers live under their
+target's `ops/`. Their existing tests retain their paths under the category
+and `tests/unittest/_torch/kernels/kimi_k3/` trees so CI selectors do not change.
+Claims discovery covers both family-owned and target-owned entries, and import
+isolation rejects sibling-target and unrelated-family dependencies.
+
+The Markov chain declares its Lamport buffers, rotation flags and optional
+KV-length rewind as mutable custom-op inputs. Its no-rewind call uses a
+separate cached length buffer, allocated before CUDA-graph capture.
+
+Model-owned native fake implementations register with the standard native-op
+initialization, without importing a target. KDA verify consumes the cache
+manager's bf16 convolution pools and independent per-slot strides directly;
+standalone fp32 convolution pools remain supported. Pool views are never
+copied or cast on the call path.
+
+MLA launch admission queries the launch stream's owning context resources,
+including converted green contexts, without querying stream execution during
+graph capture. Invalid resources still reject the launch. Wide MoE states use
+the canonical decode build for up to eight tokens, sharing their preallocated
+scratch through prefix views; larger steps retain the wide build.
+
+
 The collectives' rank bodies sit in the tests tree with everything else
 that only tests run. Both halves are started by file path -- the launcher must
 not import `tensorrt_llm`, because that calls `MPI_Init` and an
 MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
 by absolute import -- so neither needs a package to live in. Neither those
 file names nor their `check_*` bodies match pytest's collection patterns:
-each is one fixed 4-rank sequence that cannot run as independent cases.
+each is one fixed sequence over one job's ranks that cannot run as
+independent cases. CI runs them at 4 ranks on one node. A stateful entry's
+launcher also takes `--world-size N --launcher srun`, which runs the same
+body as one of N ranks started across nodes: that is how its multi-node
+receipt is recorded.
+
+Stateful matrices compare ordered per-tensor SHA-256 fingerprints of raw
+bytes together with shape and dtype across ranks. The large KDA-pool tests
+check free CUDA memory before allocating their full pools, including 1 GiB
+of headroom for weights, small reference pools and compilation.
+
+Routing and claims tests run on the CPU list; GPU lists exclude their
+`cpu_only` marker. KDA post-convolution cells exercise both channel-major and
+transposed token-major inputs accepted by the shared kernel.
 
 Identity is the directory name, and it carries all three segments:
 `gpt_oss_120b__sm_10x__default`. They were three nested directories once, which
@@ -285,7 +342,9 @@ Perf is measured, never gated.
 
 **Every entry the gpt-oss and deepseek default targets call is certified on
 sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp target
-and the entries it owns are certified on sm_103.
+and the entries it owns are certified on sm_103. Kimi K3's sm_100 operation
+receipts remain in its adjacent records; its generic-operation regressions
+exercise the relocated entries.
 
 The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
 their cells through `__call__` and `reference`. Where that runs depends on the
