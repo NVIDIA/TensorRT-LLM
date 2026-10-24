@@ -138,6 +138,64 @@ def _fp8_block_scales_uses_cute_dsl_sm107(module) -> bool:
             (module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm))
 
 
+@dataclass(frozen=True)
+class Fp8BlockScaleLowMGemmRange:
+    """Row counts for which an FP8 block-scale linear runs the low-M GEMM
+    (``trtllm::fp8_block_scale_low_m_gemm``) instead of its default GEMM.
+
+    The low-M GEMM reads the operands of ``fp8_swap_ab_gemm(...,
+    disable_ue8m0_cast=True)``: the UE8M0-resmoothed FP8 weight and its
+    DeepGEMM-packed scale. The range comes from the GEMM's selection for the
+    weight shape on the current device (``max_m_for`` / ``kernel_max_m_for`` in
+    ``kernels/blackwell/fp8_block_scale_low_m_gemm.py``) and is resolved once
+    per weight; the default never selects it.
+    """
+
+    #: Forward runs the GEMM on ``1 <= M <= max_m`` BF16 rows.
+    max_m: int = 0
+    #: Its low-M kernel (and the variants that match it bitwise: gated,
+    #: sigmoid, prequantized input) serves ``1 <= M <= kernel_max_m``.
+    kernel_max_m: int = 0
+
+    @classmethod
+    def for_weight(cls, out_features: int,
+                   in_features: int) -> "Fp8BlockScaleLowMGemmRange":
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return cls()
+        from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+        return cls(
+            fp8_block_scale_low_m_gemm.max_m_for(out_features, in_features),
+            fp8_block_scale_low_m_gemm.kernel_max_m_for(out_features,
+                                                        in_features))
+
+    def serves(self, input: torch.Tensor, *, kernel: bool = False) -> bool:
+        """Whether the GEMM (``kernel``: its low-M kernel) runs on the 2-D
+        ``input`` rows."""
+        limit = self.kernel_max_m if kernel else self.max_m
+        return (1 <= input.shape[0] <= limit and input.dtype == torch.bfloat16
+                and input.is_contiguous())
+
+
+def fp8_block_scale_ue8m0_gemm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        low_m: Fp8BlockScaleLowMGemmRange,
+        output_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """FP8 block-scale GEMM of 2-D BF16 ``input`` on SM100f DeepGEMM operands
+    (UE8M0-resmoothed weight, packed UE8M0 scale): the low-M GEMM where
+    ``low_m`` serves the rows and the output is BF16, ``fp8_swap_ab_gemm``
+    otherwise."""
+    if output_dtype is torch.bfloat16 and low_m.serves(input):
+        return torch.ops.trtllm.fp8_block_scale_low_m_gemm(
+            input, weight, weight_scale)
+    return torch.ops.trtllm.fp8_swap_ab_gemm(input,
+                                             weight,
+                                             weight_scale,
+                                             output_dtype=output_dtype,
+                                             disable_ue8m0_cast=True)
+
+
 def _uses_marlin_nvfp4_backend(module) -> bool:
     """Whether a regular NVFP4 linear explicitly selects Marlin."""
     allowed_backends = getattr(module, "nvfp4_allowed_backends", ())
@@ -1301,6 +1359,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                     requires_grad=False)
         else:
             module.register_parameter("bias", None)
+        # Set once the weight is in the DeepGEMM layout (transform_weights).
+        module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange()
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
@@ -1382,12 +1442,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                             act_input_fp8, module.weight, act_input_sf,
                             module.weight_scale)
             else:
-                output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    disable_ue8m0_cast=True,
-                )
+                output = fp8_block_scale_ue8m0_gemm(input, module.weight,
+                                                    module.weight_scale,
+                                                    module.fp8_low_m_gemm)
         elif sm_version == 120:
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
@@ -1576,6 +1633,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 module, "weight_scale",
                 nn.Parameter(transformed_scale, requires_grad=False),
                 module.rebuild_tensor_metadata)
+            # On SM107 the low-M GEMM's limits are cross-overs with the CuTe
+            # MXFP8 GEMM, not with fp8_swap_ab_gemm, which this layout runs.
+            if get_sm_version() != 107:
+                module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange.for_weight(
+                    *weight.shape)
 
 
 class NVFP4LinearMethod(LinearMethodBase):
