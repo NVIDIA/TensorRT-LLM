@@ -937,6 +937,106 @@ def test_stream_tool_call_arguments_concatenate():
     assert message_delta["delta"]["stop_reason"] == "tool_use"
 
 
+def _tool_call_chunk(index, call_id, name, arguments):
+    return chunk(
+        {
+            "tool_calls": [
+                {"index": index, "id": call_id, "function": {"name": name, "arguments": arguments}}
+            ]
+        }
+    )
+
+
+def test_stream_whitespace_between_blocks_opens_no_text_block():
+    """Whitespace-only text between blocks opens no text block of its own."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "check the weather"}),
+            chunk({"content": "\n\n"}),
+            _tool_call_chunk(0, "call_1", "get_weather", '{"city": "sf"}'),
+            chunk({"content": "\n"}),
+            _tool_call_chunk(1, "call_2", "get_weather", '{"city": "nyc"}'),
+            chunk({"content": "\n"}),
+            chunk({}, finish_reason="tool_calls"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking", "tool_use", "tool_use"]
+
+
+def test_stream_whitespace_before_text_stays_with_the_text():
+    """Whitespace that precedes text is that text's, delivered unchanged."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "plan"}),
+            chunk({"content": "\n\n"}),
+            chunk({"content": "Answer.\n"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    texts = [
+        p["delta"]["text"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(texts) == "\n\nAnswer.\n"
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking", "text"]
+
+
+def test_stream_whitespace_inside_an_open_text_block_stays_with_the_text():
+    """Whitespace inside a text block that holds text is delivered unchanged."""
+    events = run_reframer(
+        [
+            chunk({"content": "hello"}),
+            chunk({"content": " "}),
+            chunk({"content": "world"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    texts = [
+        p["delta"]["text"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(texts) == "hello world"
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["text"]
+
+
+def test_stream_trailing_whitespace_opens_no_text_block():
+    """Whitespace-only text at the end of the stream opens no text block."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "plan"}),
+            chunk({"content": "\n\n"}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking"]
+    assert not [
+        p for n, p in events if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+
+
+def test_whitespace_only_content_is_not_a_text_block():
+    message = ChatMessage(
+        role="assistant",
+        content="\n\n",
+        tool_calls=[
+            ToolCall(
+                id="call_1", function=FunctionCall(name="get_weather", arguments='{"city": "sf"}')
+            )
+        ],
+    )
+    resp = convert_chat_response(make_chat_response(message, finish_reason="tool_calls"))
+    assert [block.type for block in resp.content] == ["tool_use"]
+
+
 def test_stream_parallel_tool_calls_get_separate_blocks():
     events = run_reframer(
         [
