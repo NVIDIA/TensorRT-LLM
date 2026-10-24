@@ -313,10 +313,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # range by placing large CUDA payloads after host data.
   set(CUDA_FATBIN_LINKER_SCRIPT
       "${PROJECT_SOURCE_DIR}/cmake/templates/cuda_fatbin.ld")
-  target_link_options(${SHARED_TARGET} PRIVATE
-                      "LINKER:-T,${CUDA_FATBIN_LINKER_SCRIPT}")
-  set_property(TARGET ${SHARED_TARGET} APPEND
-               PROPERTY LINK_DEPENDS "${CUDA_FATBIN_LINKER_SCRIPT}")
+  foreach(target ${SHARED_TARGET} ${DECODER_SHARED_TARGET_0}
+                 ${DECODER_SHARED_TARGET_1})
+    target_link_options(${target} PRIVATE
+                        "LINKER:-T,${CUDA_FATBIN_LINKER_SCRIPT}")
+    set_property(TARGET ${target} APPEND
+                 PROPERTY LINK_DEPENDS "${CUDA_FATBIN_LINKER_SCRIPT}")
+  endforeach()
 endif()
 
 # Keep statically linked NVRTC symbols local so they cannot be interposed by a
