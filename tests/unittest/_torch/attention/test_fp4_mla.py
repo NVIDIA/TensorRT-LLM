@@ -839,6 +839,60 @@ def test_kimi_k3_rejects_removed_bf16_kv_layers_env(
     )
 
 
+@pytest.mark.parametrize(
+    "fp4_kv, sparse_config, expected_fp8_context",
+    [
+        (True, None, True),
+        (True, SimpleNamespace(algorithm="skip_softmax"), False),
+        (False, None, False),
+    ],
+    ids=["dense_nvfp4", "sparse_nvfp4", "bf16"],
+)
+def test_dense_fp4_mla_declares_fp8_context_workspace(
+    monkeypatch: pytest.MonkeyPatch, fp4_kv: bool, sparse_config, expected_fp8_context: bool
+) -> None:
+    # An all-NVFP4 model still attends cached-prefix chunks through the FP8
+    # context kernel, so it must declare that kernel's workspace.
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "")
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 100)
+    requested = {}
+
+    def workspace_bytes_per_token(**kwargs):
+        requested.update(kwargs)
+        return 7 if kwargs["fp8_context_mla"] else 0
+
+    monkeypatch.setattr(
+        trtllm_backend,
+        "thop",
+        SimpleNamespace(get_context_mla_workspace_bytes_per_token=workspace_bytes_per_token),
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            model_type="kimi_linear",
+            num_hidden_layers=8,
+            linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+            num_attention_heads=16,
+        ),
+        quant_config=SimpleNamespace(
+            quant_mode=SimpleNamespace(
+                has_fp4_kv_cache=lambda: fp4_kv, has_fp8_kv_cache=lambda: False
+            )
+        ),
+        sparse_attention_config=sparse_config,
+    )
+
+    rate = trtllm_backend.TrtllmAttention.runtime_workspace_bytes_per_token(
+        model_config, Mapping(world_size=1, tp_size=1, pp_size=1)
+    )
+
+    assert rate == (7 if expected_fp8_context else 0)
+    assert requested.get("fp8_context_mla", False) is expected_fp8_context
+
+
 def _pp_mapping(pp_size: int, rank: int = 0, pp_partition=None) -> Mapping:
     return Mapping(
         world_size=pp_size, tp_size=1, pp_size=pp_size, rank=rank, pp_partition=pp_partition
