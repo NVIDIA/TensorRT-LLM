@@ -216,3 +216,78 @@ def test_decode_launch_groups_requires_exact_rows(monkeypatch: pytest.MonkeyPatc
         assert fi._decode_launch_groups(16, 8, 16 * 8, 16 * 8 + 8, -1) is None
     finally:
         fi._decode_seqs_per_launch.cache_clear()
+
+
+_FMHA_WORKSPACE_BYTES = 32 << 20
+
+
+@pytest.mark.parametrize(
+    "env,batch,kv_heads,head_dim,window_left,expected",
+    [
+        # Automatic: ~36 x sqrt(kv_heads) CTAs per sequence in whole waves of 152 SMs.
+        (None, 1, 16, 64, -1, 1),
+        (None, 6, 16, 64, -1, 6),
+        (None, 32, 16, 64, -1, 8),
+        (None, 8, 2, 64, -1, 3),
+        (None, 10, 2, 64, -1, 4),
+        ("auto", 16, 1, 64, -1, 4),
+        # A sliding window keeps the kernel's own split.
+        (None, 8, 16, 64, 2047, 1),
+        ("8", 8, 16, 64, 2047, 1),
+        # Forced, and capped by what the workspace holds for the head dim.
+        ("1", 32, 16, 64, -1, 1),
+        ("4", 1, 16, 64, -1, 4),
+        ("16", 32, 16, 64, -1, 8),
+        (None, 32, 16, 128, -1, 6),
+        (None, 32, 16, 256, -1, 3),
+    ],
+)
+def test_decode_sm_scale(
+    monkeypatch: pytest.MonkeyPatch, env, batch, kv_heads, head_dim, window_left, expected
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi
+
+    if env is None:
+        monkeypatch.delenv("TRTLLM_GEN_DECODE_SM_SCALE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_GEN_DECODE_SM_SCALE", env)
+    fi._decode_sm_scale_override.cache_clear()
+    try:
+        scale = fi._decode_sm_scale(
+            batch, kv_heads, head_dim, 152, _FMHA_WORKSPACE_BYTES, window_left
+        )
+    finally:
+        fi._decode_sm_scale_override.cache_clear()
+    assert scale == expected
+    assert scale * 152 * 128 * (2 * head_dim + 8) <= _FMHA_WORKSPACE_BYTES or scale == 1
+
+
+def test_decode_sm_scale_rejects_bad_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi
+
+    monkeypatch.setenv("TRTLLM_GEN_DECODE_SM_SCALE", "eight")
+    fi._decode_sm_scale_override.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="TRTLLM_GEN_DECODE_SM_SCALE"):
+            fi._decode_sm_scale(8, 16, 64, 152, _FMHA_WORKSPACE_BYTES, -1)
+    finally:
+        fi._decode_sm_scale_override.cache_clear()
+
+
+def test_reported_sm_count_scales_and_restores(monkeypatch: pytest.MonkeyPatch) -> None:
+    flashinfer_decode = pytest.importorskip("flashinfer.decode")
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi
+
+    def real(device):
+        return 152
+
+    monkeypatch.setattr(flashinfer_decode, "get_device_sm_count", real)
+    with fi._reported_sm_count(6):
+        assert flashinfer_decode.get_device_sm_count(None) == 6 * 152
+    assert flashinfer_decode.get_device_sm_count is real
+    with fi._reported_sm_count(1):
+        assert flashinfer_decode.get_device_sm_count is real
+    with pytest.raises(RuntimeError):
+        with fi._reported_sm_count(4):
+            raise RuntimeError("launch failed")
+    assert flashinfer_decode.get_device_sm_count is real
