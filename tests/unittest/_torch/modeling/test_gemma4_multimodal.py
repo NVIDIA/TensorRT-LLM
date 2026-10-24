@@ -80,6 +80,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
+    MultimodalItemMetadata,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -207,7 +208,10 @@ def _make_keyed_image_param(
                 "image_position_ids": image_position_ids,
                 "image_seq_lens": [1] * item_count,
             },
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -229,7 +233,10 @@ def _make_keyed_video_param(item_hashes: list[list[int]]) -> MultimodalParams:
         ),
         multimodal_data={
             "video": {"pixel_values": torch.arange(item_count).reshape(item_count, 1, 1)},
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("video", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -254,7 +261,10 @@ def _make_keyed_audio_param(item_hashes: list[list[int]]) -> MultimodalParams:
                 "audio_features": torch.arange(item_count * 2).reshape(item_count, 1, 2),
                 "audio_features_mask": torch.ones(item_count, 1),
             },
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("audio", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -293,9 +303,8 @@ def _make_item_input_processor(
 
 def _with_item_metadata(multimodal_data: dict, processor: Gemma4InputProcessor) -> MultimodalParams:
     """Attach encoder item metadata the way the input-processor wrapper does."""
-    metadata = processor.get_mm_encoder_item_metadata([], multimodal_data)
+    metadata = processor.get_mm_item_metadata([], multimodal_data)
     multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
-    multimodal_data["multimodal_embedding_lengths"] = metadata.output_embedding_lengths
     return MultimodalParams(multimodal_data=multimodal_data)
 
 
@@ -948,13 +957,17 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         """Gemma4 audio features and their mask remain item-aligned."""
         audio_features = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2)
         audio_mask = torch.arange(12).reshape(3, 4)
+        shared_stats = torch.arange(3)
         param = MultimodalParams(
             multimodal_data={
                 "audio": {
                     "audio_features": audio_features,
                     "audio_features_mask": audio_mask,
+                    "shared_stats": shared_stats,
                 },
-                "multimodal_embedding_lengths": [1, 1, 1],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("audio", 0), ("audio", 1), ("audio", 2)], output_embedding_lengths=[1, 1, 1]
+                ),
             }
         )
 
@@ -963,6 +976,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         residual_audio = residual.multimodal_data["audio"]
         torch.testing.assert_close(residual_audio["audio_features"], audio_features[[2, 0]])
         torch.testing.assert_close(residual_audio["audio_features_mask"], audio_mask[[2, 0]])
+        assert residual_audio["shared_stats"] is shared_stats
 
     def test_build_multimodal_encoder_input_slices_whole_videos(self):
         """A video item is the run of flattened frames its `num_frames` entry declares."""
@@ -974,7 +988,10 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                     "image_seq_lens": [10, 11, 12, 13, 14, 15],
                     "num_frames": [2, 1, 3],
                 },
-                "multimodal_embedding_lengths": [1, 1, 1],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("video", 0), ("video", 1), ("video", 2)],
+                    output_embedding_lengths=[1, 1, 1],
+                ),
             }
         )
 
@@ -1062,7 +1079,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                     },
                     processor,
                 )
-                lengths = param.multimodal_data["multimodal_embedding_lengths"]
+                lengths = param.get_item_layout()[1]
                 expected = torch.split(model.encode_multimodal_inputs([param]), lengths)
                 selected = [len(lengths) - 1, 0]
 
@@ -1089,6 +1106,24 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         torch.testing.assert_close(embeddings[:2], torch.ones(2, model.embedding_dim))
         torch.testing.assert_close(embeddings[2:], torch.full((2, model.embedding_dim), 2.0))
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
+
+    @pytest.mark.cpu_only
+    def test_build_multimodal_encoder_input_uses_typed_audio_item_count(self):
+        features = torch.arange(24).reshape(3, 4, 2)
+        param = MultimodalParams(
+            multimodal_data={
+                "audio": {"audio_features": features},
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("audio", 0), ("audio", 1), ("audio", 2)], [8, 8, 8], [1, 1, 1]
+                ),
+            }
+        )
+
+        residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
+
+        torch.testing.assert_close(
+            residual.multimodal_data["audio"]["audio_features"], features[[2, 0]]
+        )
 
     def test_encoder_cache_partial_hit_with_unsupported_item_axis_becomes_full_miss(self):
         """Unexpected Gemma4 image and audio layouts bypass partial cache reuse."""
@@ -1296,7 +1331,7 @@ class TestGemma4EncoderItems(unittest.TestCase):
         position_ids = torch.zeros(2, 2520, 2, dtype=torch.long)
         position_ids[1, 1260:] = -1  # The second image fills half of its patch slots.
 
-        metadata = processor.get_mm_encoder_item_metadata(
+        metadata = processor.get_mm_item_metadata(
             [],
             {
                 "image": {
@@ -1306,27 +1341,37 @@ class TestGemma4EncoderItems(unittest.TestCase):
             },
         )
 
-        self.assertEqual(metadata.item_refs, [("image", 0), ("image", 1)])
-        self.assertEqual(metadata.encoder_token_lengths, [2520, 2520])
-        self.assertEqual(metadata.output_embedding_lengths, [280, 140])
+        self.assertEqual(list(metadata.item_refs), [("image", 0), ("image", 1)])
+        self.assertEqual(list(metadata.encoder_token_lengths), [2520, 2520])
+        self.assertEqual(list(metadata.output_embedding_lengths), [280, 140])
 
     def test_video_items_span_their_frames(self):
         processor = _make_item_input_processor()
+        data = {
+            "video": {
+                "pixel_values": torch.zeros(5, 630, 1),
+                "image_seq_lens": [630, 630, 315, 315, 315],
+                "num_frames": [2, 3],
+            }
+        }
+        metadata = processor.get_mm_item_metadata([], data)
 
-        metadata = processor.get_mm_encoder_item_metadata(
-            [],
-            {
-                "video": {
-                    "pixel_values": torch.zeros(5, 630, 1),
-                    "image_seq_lens": [630, 630, 315, 315, 315],
-                    "num_frames": [2, 3],
-                }
-            },
+        self.assertEqual(list(metadata.item_refs), [("video", 0), ("video", 1)])
+        self.assertEqual(list(metadata.encoder_token_lengths), [1260, 1890])
+        self.assertEqual(list(metadata.output_embedding_lengths), [140, 105])
+        self.assertEqual(metadata.input_partitions["video"]["image_seq_lens"].item_lengths, (2, 3))
+        self.assertEqual(
+            metadata.input_partitions["video"]["image_seq_lens"].select(
+                data["video"]["image_seq_lens"], [1, 0]
+            ),
+            [315, 315, 315, 630, 630],
         )
-
-        self.assertEqual(metadata.item_refs, [("video", 0), ("video", 1)])
-        self.assertEqual(metadata.encoder_token_lengths, [1260, 1890])
-        self.assertEqual(metadata.output_embedding_lengths, [140, 105])
+        reordered = processor.get_mm_item_metadata(
+            [], data, [{"modality": "video", "index": 1}, {"modality": "video", "index": 0}]
+        )
+        self.assertEqual(reordered.item_refs, (("video", 1), ("video", 0)))
+        self.assertEqual(reordered.encoder_token_lengths, (1890, 1260))
+        self.assertEqual(reordered.output_embedding_lengths, (105, 140))
 
     def test_audio_items_count_subsampled_frames(self):
         """Each clip yields ceil(valid mel frames / 4) rows, the count HF's processor inserts."""
@@ -1335,19 +1380,19 @@ class TestGemma4EncoderItems(unittest.TestCase):
         mask[0] = True
         mask[1, :5] = True
 
-        metadata = processor.get_mm_encoder_item_metadata(
+        metadata = processor.get_mm_item_metadata(
             [],
             {"audio": {"audio_features": torch.zeros(2, 10, 128), "audio_features_mask": mask}},
         )
 
-        self.assertEqual(metadata.item_refs, [("audio", 0), ("audio", 1)])
-        self.assertEqual(metadata.encoder_token_lengths, [3, 3])
-        self.assertEqual(metadata.output_embedding_lengths, [3, 2])
+        self.assertEqual(list(metadata.item_refs), [("audio", 0), ("audio", 1)])
+        self.assertEqual(list(metadata.encoder_token_lengths), [3, 3])
+        self.assertEqual(list(metadata.output_embedding_lengths), [3, 2])
 
     def test_mixed_modality_request_is_rejected(self):
         processor = _make_item_input_processor(audio_seq_length=750)
         with self.assertRaisesRegex(ValueError, "multiple multimodal input types"):
-            processor.get_mm_encoder_item_metadata(
+            processor.get_mm_item_metadata(
                 [],
                 {
                     "image": {"pixel_values": torch.zeros(1, 2520, 1)},
@@ -1382,8 +1427,8 @@ class TestGemma4EncoderItems(unittest.TestCase):
         )
         dummy = processor.get_dummy_mm_data(max_num_encoder_tokens=budget, mm_counts={"video": 1})
         self.assertEqual(dummy["video"]["num_frames"], [64])
-        metadata = processor.get_mm_encoder_item_metadata([], dummy)
-        self.assertEqual(metadata.encoder_token_lengths, [budget])
+        metadata = processor.get_mm_item_metadata([], dummy)
+        self.assertEqual(list(metadata.encoder_token_lengths), [budget])
 
     def test_encoder_iteration_bounds(self):
         processor = _make_item_input_processor()
@@ -1409,12 +1454,14 @@ class TestGemma4EncoderItems(unittest.TestCase):
                     max_num_encoder_tokens=budget, mm_counts={modality: num_items}
                 )
 
-                metadata = processor.get_mm_encoder_item_metadata([], dummy)
+                metadata = processor.get_mm_item_metadata([], dummy)
 
-                self.assertEqual(metadata.encoder_token_lengths, [item_tokens] * num_items)
+                self.assertEqual(list(metadata.encoder_token_lengths), [item_tokens] * num_items)
                 # Every patch slot or mel frame holds valid input.
                 rows_per_item = item_tokens if modality == "audio" else item_tokens // 9
-                self.assertEqual(metadata.output_embedding_lengths, [rows_per_item] * num_items)
+                self.assertEqual(
+                    list(metadata.output_embedding_lengths), [rows_per_item] * num_items
+                )
 
     def test_dummy_rejects_items_beyond_the_budget(self):
         processor = _make_item_input_processor()
@@ -1459,7 +1506,7 @@ class TestGemma4EncoderItems(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             unified.get_mm_max_tokens_per_item(max_num_encoder_tokens=8192)
         self.assertIsNone(
-            unified.get_mm_encoder_item_metadata([], {"image": {"pixel_values": torch.zeros(1)}})
+            unified.get_mm_item_metadata([], {"image": {"pixel_values": torch.zeros(1)}})
         )
 
 
@@ -1673,7 +1720,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
             SamplingParams(max_tokens=10),
         )
 
-        metadata = proc.get_mm_encoder_item_metadata(input_ids, mm_data["multimodal_data"])
+        metadata = proc.get_mm_item_metadata(input_ids, mm_data["multimodal_data"])
 
         self.assertEqual(
             metadata.output_embedding_lengths,
@@ -1875,7 +1922,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         self.assertEqual(video_data["pixel_values"].dim(), 3)
         self.assertEqual(video_data["pixel_values"].shape[0], len(frames))
         self.assertEqual(video_data["num_frames"], [len(frames)])
-        metadata = proc.get_mm_encoder_item_metadata(input_ids, mm_data["multimodal_data"])
+        metadata = proc.get_mm_item_metadata(input_ids, mm_data["multimodal_data"])
         self.assertEqual(metadata.output_embedding_lengths, [predicted_video_tokens])
 
         video_token_id = self._video_token_id()

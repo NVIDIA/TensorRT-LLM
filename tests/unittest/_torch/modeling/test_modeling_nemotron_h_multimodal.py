@@ -38,7 +38,12 @@ from tensorrt_llm.inputs import (
     default_multimodal_input_loader,
     prompt_inputs,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_args import (
@@ -85,16 +90,17 @@ def test_nemotron_nano_registers_native_multimodal_epd_components():
     assert NemotronHMultimodalModel.support_mm_disagg is True
 
 
-def _assert_nano_video_handoff(handoff):
+def _assert_nano_video_handoff(prompt_token_ids, params):
     """Shared assertions for the EPD video handoff: split runs stay grouped under one MM item."""
-    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
-    assert handoff.multimodal_lengths == [8]
-    assert handoff.multimodal_positions == [1]
-    assert handoff.multimodal_embedding_lengths == [4]
-    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
-    assert handoff.multimodal_run_positions == [1, 6]
-    assert handoff.multimodal_run_lengths == [4, 4]
-    assert handoff.special_token_offsets == [0, 3, 4, 7]
+    assert prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert params.multimodal_input.multimodal_lengths == [8]
+    assert params.multimodal_input.multimodal_positions == [1]
+    assert params.item_metadata.item_refs == (("video", 0),)
+    assert params.item_metadata.output_embedding_lengths == (4,)
+    assert params.multimodal_input.multimodal_item_run_cu_offsets == [0, 2]
+    assert params.multimodal_input.multimodal_run_positions == [1, 6]
+    assert params.multimodal_input.multimodal_run_lengths == [4, 4]
+    assert params.multimodal_data["special_token_offsets"] == [0, 3, 4, 7]
 
 
 @pytest.mark.parametrize(
@@ -137,19 +143,20 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
     )
 
     video = VideoData(frames=[object()], metadata={}, audio=None)
-    handoff = processor.build_disagg_prefill_multimodal_inputs(
+    prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
         {
             input_field: input_value,
             "multi_modal_data": {"video": [video]},
         },
         [{"tensor_size": (4, 16)}],
+        mm_hashes=[[1] * 8],
     )
 
     if asserts_encode_not_called:
         processor._tokenizer.encode.assert_not_called()
         processor.expand_prompt_token_ids_for_mm.assert_called_once()
         assert processor.expand_prompt_token_ids_for_mm.call_args.args[0] == [101, 98, 102]
-    _assert_nano_video_handoff(handoff)
+    _assert_nano_video_handoff(prompt_token_ids, params)
 
 
 @pytest.mark.parametrize(
@@ -973,7 +980,8 @@ class TestEncodeAudio:
             mask[i, :vl] = 1
         return {"input_audio_features": features, "feature_attention_mask": mask}
 
-    def test_batched_matches_per_input(self):
+    @pytest.mark.parametrize("precomputed_lengths", [False, True])
+    def test_batched_matches_per_input(self, precomputed_lengths):
         """Bucket output equals N singleton `_encode_audio` calls.
 
         Compares ``encode([a1, a2])`` against ``[encode([a1])[0], encode([a2])[0]]``
@@ -989,6 +997,12 @@ class TestEncodeAudio:
         # Two inputs with different time / clip counts.
         a1 = self._make_audio_data(num_clips=2, time_len=10, valid_lens=[10, 6])
         a2 = self._make_audio_data(num_clips=1, time_len=14, valid_lens=[12])
+        if precomputed_lengths:
+            a1["audio_output_lengths"] = torch.tensor([5, 3])
+            a2["audio_output_lengths"] = torch.tensor([6])
+            model.sound_encoder.encoder._get_subsampling_output_length = mock.Mock(
+                side_effect=AssertionError("Forward must reuse host output lengths")
+            )
 
         per_input_results = [
             NemotronHMultimodalModel._encode_audio(model, [a1])[0],
@@ -997,6 +1011,7 @@ class TestEncodeAudio:
         batched_results = NemotronHMultimodalModel._encode_audio(model, [a1, a2])
 
         assert len(batched_results) == 2
+        assert [counts for _, counts in batched_results] == [[5, 3], [6]]
         for (b_emb, b_counts), (s_emb, s_counts) in zip(batched_results, per_input_results):
             assert b_counts == s_counts
             assert torch.allclose(b_emb, s_emb, atol=1e-6, rtol=1e-6)
@@ -1045,7 +1060,9 @@ class TestChunkedPrefillCaching:
             multimodal_data={
                 "modality_type": modality,
                 modality: nested,
-                "multimodal_embedding_lengths": [num_tokens],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [(modality, 0)], output_embedding_lengths=[num_tokens]
+                ),
                 **extra,
             },
             multimodal_runtime=runtime,

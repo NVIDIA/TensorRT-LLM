@@ -93,6 +93,12 @@ HuggingFace Model → LLM API → PyTorch Executor
 - **Disaggregated serving**: separates prefill (context) and decode (generation) across GPUs
   - KV cache exchange via NIXL (default), UCX, or MPI
 
+### Multimodal request data
+
+Read the [multimodal developer guide](docs/source/developer-guide/multimodal.md) before changing multimodal paths.
+Reuse `MultimodalParams`; request Params own cache references.
+Encoder and LLM forward Params are execution views.
+
 ## Key Files
 
 | File | Role |

@@ -1088,7 +1088,6 @@ class DecoderInputPreparer:
             ),
             multimodal_data=self._build_multimodal_data_for_llm(request, py_multimodal_runtime),
             multimodal_runtime=py_multimodal_runtime,
-            mm_item_order=getattr(request, "py_mm_item_order", None),
             input_ids_start_offset=context_start_idx,
         )
         # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
