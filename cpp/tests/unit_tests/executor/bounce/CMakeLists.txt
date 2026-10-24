@@ -155,15 +155,29 @@ if(NIXL_ROOT)
     # One reactor test target: the bounce sources compiled in, plus the shared
     # include/link sets.
     function(add_bounce_reactor_test name src)
-      cmake_parse_arguments(ARG "INSTRUMENTED" "" "" ${ARGN})
-      add_tllm_gtest(${name} SOURCES ${src} FULL_STACK LABELS "unit;full-stack")
+      cmake_parse_arguments(ARG "INSTRUMENTED;REQUIRES_GPU" "" "" ${ARGN})
+      set(gpu_option "")
+      set(test_labels "unit;full-stack")
+      if(ARG_REQUIRES_GPU)
+        set(gpu_option REQUIRES_GPU)
+        list(APPEND test_labels gpu)
+      endif()
+      add_tllm_gtest(
+        ${name}
+        SOURCES
+        ${src}
+        FULL_STACK
+        ${gpu_option}
+        LABELS
+        "${test_labels}")
       if(ARG_INSTRUMENTED)
         target_sources(${name} PRIVATE ${BOUNCE_TSAN_SRCS})
       else()
         target_sources(${name} PRIVATE ${BOUNCE_REACTOR_SRCS})
         target_link_libraries(
-          ${name} PRIVATE tllm::executor_bounce_core tllm::executor_bounce_cuda
-                          tllm::executor_bounce_arena)
+          ${name}
+          PRIVATE tllm::executor_bounce_core tllm::executor_bounce_cuda
+                  tllm::executor_bounce_arena tllm::executor_bounce_control)
       endif()
       target_include_directories(${name} PRIVATE ${BOUNCE_TEST_INCS})
       target_link_libraries(${name} PRIVATE ${BOUNCE_TEST_LIBS})
@@ -171,11 +185,12 @@ if(NIXL_ROOT)
 
     # End-to-end transport over real RDMA (gather -> RDMA write -> scatter +
     # credit recycling), byte-exact.
-    add_bounce_reactor_test(bounceTransportTest bounceTransportTest.cpp)
+    add_bounce_reactor_test(bounceTransportTest bounceTransportTest.cpp
+                            REQUIRES_GPU)
 
     # Boundary, failure-path, and concurrency tests.
     add_bounce_reactor_test(bounceTransportFailureTest
-                            bounceTransportFailureTest.cpp)
+                            bounceTransportFailureTest.cpp REQUIRES_GPU)
 
     # Optional ThreadSanitizer variant of the reactor concurrency test. The
     # bounce sources + the test are instrumented; the shared libtensorrt_llm
@@ -185,8 +200,9 @@ if(NIXL_ROOT)
     option(BOUNCE_TSAN
            "Build a ThreadSanitizer variant of the bounce reactor test" OFF)
     if(BOUNCE_TSAN)
-      add_bounce_reactor_test(bounceTransportTsanTest
-                              bounceTransportFailureTest.cpp INSTRUMENTED)
+      add_bounce_reactor_test(
+        bounceTransportTsanTest bounceTransportFailureTest.cpp INSTRUMENTED
+        REQUIRES_GPU)
       target_compile_options(
         bounceTransportTsanTest
         PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=thread -g>
@@ -199,8 +215,14 @@ if(NIXL_ROOT)
     # wrapper; this test only uses the public agent API (the zmq include is
     # needed only because the shared bounceTestNixlNode.h helpers pull in
     # ZmqControlChannel.h at compile time).
-    add_tllm_gtest(bounceAgentE2ETest SOURCES bounceAgentE2ETest.cpp FULL_STACK
-                   LABELS "unit;full-stack")
+    add_tllm_gtest(
+      bounceAgentE2ETest
+      SOURCES
+      bounceAgentE2ETest.cpp
+      FULL_STACK
+      REQUIRES_GPU
+      LABELS
+      "unit;full-stack;gpu")
     target_include_directories(bounceAgentE2ETest PRIVATE ${BOUNCE_TEST_INCS})
     target_link_libraries(
       bounceAgentE2ETest PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl

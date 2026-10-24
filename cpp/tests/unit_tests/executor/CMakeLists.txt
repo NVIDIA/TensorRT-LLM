@@ -106,8 +106,9 @@ add_tllm_gtest(
   SOURCES
   ucxCommTest.cpp
   FULL_STACK
+  REQUIRES_GPU
   LABELS
-  "unit;full-stack"
+  "unit;full-stack;gpu"
   TIMEOUT
   60)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
@@ -125,10 +126,22 @@ if(EXISTS "/etc/redhat-release")
 endif()
 
 if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
-  add_tllm_gtest(agentCommTest SOURCES agentCommTest.cpp FULL_STACK LABELS
-                 "unit;full-stack")
-  add_tllm_gtest(transferAgentTest SOURCES transferAgentTest.cpp FULL_STACK
-                 LABELS "unit;full-stack")
+  add_tllm_gtest(
+    agentCommTest
+    SOURCES
+    agentCommTest.cpp
+    FULL_STACK
+    REQUIRES_GPU
+    LABELS
+    "unit;full-stack;gpu")
+  add_tllm_gtest(
+    transferAgentTest
+    SOURCES
+    transferAgentTest.cpp
+    FULL_STACK
+    REQUIRES_GPU
+    LABELS
+    "unit;full-stack;gpu")
 
   if(NIXL_ROOT)
     target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)

@@ -38,8 +38,13 @@ add_tllm_gtest(
 add_tllm_gtest(gdrcopyTest SOURCES gdrcopyTest.cpp FULL_STACK LABELS
                "unit;full-stack")
 add_tllm_gtest(
-  hostAccessibleDeviceAllocatorTest SOURCES
-  hostAccessibleDeviceAllocatorTest.cu FULL_STACK LABELS "unit;full-stack")
+  hostAccessibleDeviceAllocatorTest
+  SOURCES
+  hostAccessibleDeviceAllocatorTest.cu
+  FULL_STACK
+  REQUIRES_GPU
+  LABELS
+  "unit;full-stack;gpu")
 add_tllm_gtest(
   iBufferTest
   OWNER
