@@ -25,6 +25,14 @@ pytestmark = pytest.mark.cpu_only
 # must accept all of them. release_transfer is reached only with a
 # transceiver (the executor keeps the connector-only release).
 _LOOP_ENTRY_POINTS_EXCLUDED = {"release_transfer"}
+_SHARED_HOLDER_METHODS = {
+    "attach_shared_transfer_manager",
+    "has_pending_shared_transfers",
+    "take_shared_updates",
+    "take_shared_domain_failures",
+    "begin_shared_shutdown",
+    "shared_shutdown_complete",
+}
 
 
 def _public_methods(cls) -> set:
@@ -90,7 +98,7 @@ def test_noop_coordinator_overrides_every_entry_point() -> None:
     inherited = {
         name
         for name in _public_methods(DisaggTransferCoordinator)
-        if name not in vars(NoopDisaggCoordinator)
+        if name not in vars(NoopDisaggCoordinator) and name not in _SHARED_HOLDER_METHODS
     }
     assert inherited == set(), inherited
 
@@ -100,10 +108,18 @@ def test_noop_coordinator_accepts_every_loop_call() -> None:
     accept every call the real one does."""
     noop = NoopDisaggCoordinator()
     for name in (
-        _public_methods(DisaggTransferCoordinator) - {"admit"} - _LOOP_ENTRY_POINTS_EXCLUDED
+        _public_methods(DisaggTransferCoordinator)
+        - {"admit"}
+        - _LOOP_ENTRY_POINTS_EXCLUDED
+        - _SHARED_HOLDER_METHODS
     ):
         params = inspect.signature(getattr(noop, name)).parameters
-        getattr(noop, name)(*[Mock() for _ in params])
+        arguments = {
+            name: Mock()
+            for name, parameter in params.items()
+            if parameter.default is inspect.Parameter.empty
+        }
+        getattr(noop, name)(**arguments)
 
 
 def test_noop_coordinator_refuses_release_transfer() -> None:

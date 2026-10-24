@@ -79,6 +79,7 @@ def test_resume_restores_page_buffers_and_sparse_metadata_row(sparse: bool) -> N
     manager.index_mapper = Mock()
     manager.index_mapper.get_index.return_value = 3
     manager._set_page_index_bufs = Mock()
+    manager._early_freed_index_requests = set()
     manager.sparse_metadata_batch = Mock() if sparse else None
     cache = Mock()
 
@@ -88,6 +89,30 @@ def test_resume_restores_page_buffers_and_sparse_metadata_row(sparse: bool) -> N
     if sparse:
         manager.index_mapper.get_index.assert_called_once_with(7)
         manager.sparse_metadata_batch.add.assert_called_once_with(cache, 3)
+
+
+@pytest.mark.parametrize("parked", [False, True])
+def test_resume_binds_a_released_slot_s_parked_row_again(parked: bool) -> None:
+    """A resume of a request whose index slot was released early binds its parked row, if any."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager.index_mapper = Mock()
+    manager._set_page_index_bufs = Mock()
+    manager._early_freed_index_requests = {7}
+    manager.num_pools = 2
+    manager.sparse_metadata_batch = Mock()
+    manager._sharing = Mock()
+    manager._sharing._parked_row.return_value = ("row 0", "row 1") if parked else None
+    cache = Mock()
+
+    manager._restore_page_index_bufs(7, cache)
+
+    manager._set_page_index_bufs.assert_not_called()
+    manager.index_mapper.get_index.assert_not_called()
+    manager.sparse_metadata_batch.add.assert_not_called()
+    manager._sharing._parked_row.assert_called_once_with(7)
+    manager._sharing._on_resume.assert_called_once_with(7)
+    bound = [args for args, _ in cache.set_base_page_index_buf.call_args_list]
+    assert bound == ([(0, 0, "row 0"), (0, 1, "row 1")] if parked else [])
 
 
 @pytest.mark.parametrize("is_draft", [False, True])
@@ -614,6 +639,9 @@ def make_kv_cache_manager(
 ):
     mgr = Mock()
     mgr.kv_connector_manager = None
+    # No lender attached: no page locks, and the history a window would reach is left as it is.
+    mgr._holds_page_locks.return_value = False
+    mgr._lent_history.side_effect = lambda kv_cache, history: history
     mgr.tokens_per_block = tokens_per_block
     # A real policy, not an auto-created Mock attribute: the prefix-aware skip
     # is gated on ALL_REUSABLE (see _skip_pays_off_under_reuse_policy).
@@ -5006,6 +5034,91 @@ def test_pending_connector_load_does_not_self_evict_or_report_deadlock() -> None
     assert output.recompute_paused_requests == []
     manager.suspend_request.assert_not_called()
     manager.free_resources.assert_not_called()
+
+
+def test_a_request_holding_page_locks_is_neither_evicted_nor_paused_for_another() -> None:
+    """Out of pages, a generation request takes no victim among the requests holding page locks."""
+    attempts = []
+
+    def allocate(request):
+        attempts.append(request.py_request_id)
+        return len(attempts) > 1  # the first fails; a retry after a victim's release succeeds
+
+    manager = make_kv_cache_manager(can_evict=True, try_allocate_generation_fn=allocate)
+    manager._holds_page_locks.side_effect = lambda request_id: request_id == 99
+    scheduler = make_scheduler(manager, max_num_tokens=100)
+    locked = make_gen_request(99)
+    assert not scheduler._is_evictable(locked, set())
+    assert not scheduler._is_recompute_pause_candidate(locked, set())
+    out = scheduler.schedule_request([make_gen_request(0), locked], set())
+    suspended = [call.args[0].py_request_id for call in manager.suspend_request.call_args_list]
+    taken = ids(out.paused_requests) + ids(out.recompute_paused_requests) + suspended
+    assert 99 not in taken, f"the locked request taken: {taken}"
+    assert ids(out.paused_requests) == [0] and suspended == [0]
+
+
+def test_a_request_holding_page_locks_suspends_neither_itself_nor_its_cache() -> None:
+    """Out of pages with no victim, a request holding page locks stays unscheduled and running."""
+    manager = make_kv_cache_manager(can_evict=True, try_allocate_generation_fn=lambda r: False)
+    manager._holds_page_locks.side_effect = lambda request_id: request_id == 0
+    scheduler = make_scheduler(manager, max_num_tokens=100)
+    locked = make_gen_request(0)
+    out = scheduler.schedule_request([locked], set())
+    assert out.generation_requests == [] and ids(out.paused_requests) != [0]
+    scheduler._suspend_request(locked)
+    assert not manager.suspend_request.called
+
+
+def test_a_stall_while_a_lender_locks_pages_is_not_a_deadlock() -> None:
+    """Passes that reclaim nothing while a lender's locks hold pages are no stall."""
+    manager = make_kv_cache_manager(
+        resize_context_fn=lambda req, n: False, has_cache_tier_below_gpu=False
+    )
+    manager._holds_page_locks.side_effect = lambda request_id: request_id is None
+    scheduler = make_scheduler(manager, max_num_tokens=1000)
+    scheduler._DEADLOCK_STALL_ITERS = 3
+    requests = [make_ctx_request(0, 100, is_first_context_chunk=False)]
+    for _ in range(7):
+        scheduler.schedule_request(requests, set())
+
+
+def test_a_request_holding_page_locks_in_the_draft_pool_counts_as_locked() -> None:
+    manager = make_kv_cache_manager(can_evict=True)
+    draft = make_kv_cache_manager(can_evict=True)
+    draft.__class__ = KVCacheManagerV2
+    draft._holds_page_locks.side_effect = lambda request_id: request_id == 5
+    scheduler = make_scheduler(manager, draft_kv_cache_manager=draft)
+    assert scheduler._holds_page_locks(make_gen_request(5))
+    assert not scheduler._holds_page_locks(make_gen_request(6))
+    assert not scheduler._is_evictable(make_gen_request(5), set())
+
+
+@pytest.mark.parametrize("legacy_hook", ["missing", "non_callable", "callable"])
+def test_a_legacy_draft_manager_is_unlocked_regardless_of_page_lock_hook(legacy_hook: str) -> None:
+    manager = make_kv_cache_manager(can_evict=True)
+    draft = make_kv_cache_manager(can_evict=True)
+    if legacy_hook == "missing":
+        del draft._holds_page_locks
+    elif legacy_hook == "non_callable":
+        draft._holds_page_locks = False
+    scheduler = make_scheduler(manager, draft_kv_cache_manager=draft)
+    request = make_gen_request(5)
+
+    assert not scheduler._holds_page_locks(request)
+    manager._holds_page_locks.assert_called_once_with(5)
+    assert scheduler._is_evictable(request, set())
+    if legacy_hook == "callable":
+        draft._holds_page_locks.assert_not_called()
+
+
+def test_target_page_lock_short_circuits_draft_page_lock_query() -> None:
+    manager = make_kv_cache_manager(can_evict=True)
+    manager._holds_page_locks.return_value = True
+    draft = make_kv_cache_manager(can_evict=True)
+    scheduler = make_scheduler(manager, draft_kv_cache_manager=draft)
+
+    assert scheduler._holds_page_locks(make_gen_request(5))
+    draft._holds_page_locks.assert_not_called()
 
 
 def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:

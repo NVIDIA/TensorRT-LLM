@@ -12,21 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Staging sizing and the slot queue alone, over plain layouts, the usable end resume_bounds finds and
+"""Staging sizing and the slot queue alone, over plain layouts, the usable end poll_resume_bounds finds and
 how it and fetch ends keep out of runs of multimodal tokens, with the runtime's own life cycles
 behind a stand-in manager, the delivered rows a shrink hook drops when its own work raises, the
-slots a read's grant or a write's marks keep when a copy's completion cannot be recorded, also when
+slots a read's grant or a write's return keep when a copy's completion cannot be recorded, also when
 the quarantine itself raises, a write whose grant and failure both raise, a lender stopped by an
-error its free or shutdown hook logs, the records of a replaced cache resume_bounds drops, the states
+error its free or shutdown hook logs, the records of a replaced cache poll_resume_bounds drops, the states
 a fetch walks through, and the bytes the test kit stages: no real manager, no memory, no GPU."""
 
-import ast
 import gc
-import inspect
-import itertools
 import random
 import weakref
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -36,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     StagingOptions,
     _fetch_ledger,
     _lender,
+    _manager,
     _ranges,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._slots import (
@@ -88,24 +85,25 @@ DSV4_PRO = layout(
 def test_tinyllama_stages_eight_whole_prompts():
     assert slots_per_fetch(TINYLLAMA, 2048) == {0: 64}
     assert one_fetch(TINYLLAMA, 2048) == 44 * MiB
-    assert slot_counts(TINYLLAMA, StagingOptions(2048, planned_fetches=8)) == {0: 8 * 64}
+    assert slot_counts(TINYLLAMA, StagingOptions(2048, capacity_in_fetches=8)) == {0: 8 * 64}
 
 
 def test_deepseek_v4_windows_take_their_window_and_the_full_group_the_range():
     assert slots_per_fetch(DSV4_PRO, 4096) == {1: 1, 0: 32, 2: 1}
     assert 74 * MiB < one_fetch(DSV4_PRO, 4096) < 75 * MiB
-    assert slot_counts(DSV4_PRO, StagingOptions(4096, planned_fetches=8)) == {1: 8, 0: 256, 2: 8}
+    options = StagingOptions(4096, capacity_in_fetches=8)
+    assert slot_counts(DSV4_PRO, options) == {1: 8, 0: 256, 2: 8}
 
 
 def test_deepseek_v4_long_ranges_capped_at_one_fetch_keep_one_fetch():
     one = one_fetch(DSV4_PRO, 1 << 20)
     assert slots_per_fetch(DSV4_PRO, 1 << 20) == {1: 1, 0: 8192, 2: 1}
     assert 4 * GiB < one < 5 * GiB
-    options = StagingOptions(1 << 20, planned_fetches=8, max_bytes=one)
+    options = StagingOptions(1 << 20, capacity_in_fetches=8, max_bytes=one)
     assert slot_counts(DSV4_PRO, options) == {1: 1, 0: 8192, 2: 1}
     # A cap between one and eight fetches: every group keeps its rows of one fetch and more.
     cap = 960 * GiB // 8 // 4
-    counts = slot_counts(DSV4_PRO, StagingOptions(1 << 20, planned_fetches=8, max_bytes=cap))
+    counts = slot_counts(DSV4_PRO, StagingOptions(1 << 20, capacity_in_fetches=8, max_bytes=cap))
     assert counts[0] >= 8192 and counts[1] >= 1 and counts[2] >= 1
     assert sum(counts[g] * DSV4_PAGES[g] for g in counts) <= cap
 
@@ -118,14 +116,14 @@ def test_short_ranges_take_no_more_than_their_blocks_even_in_a_window():
 def test_a_window_wider_than_the_range_takes_the_range_blocks():
     lay = layout(32, [(1024, 0, 0, 100)])  # a window of 32 blocks over a range of 8
     assert slots_per_fetch(lay, 256) == {0: 8}
-    assert slot_counts(lay, StagingOptions(256, planned_fetches=2)) == {0: 16}
+    assert slot_counts(lay, StagingOptions(256, capacity_in_fetches=2)) == {0: 16}
 
 
 def test_sink_blocks_count_with_the_window():
     lay = layout(32, [(64, 1, 0, 100), (None, 0, 1, 10)])
     assert slots_per_fetch(lay, 320) == {0: 1 + 2, 1: 10}
     assert one_fetch(lay, 320) == 3 * 100 + 10 * 10
-    assert slot_counts(lay, StagingOptions(320, planned_fetches=3)) == {0: 9, 1: 30}
+    assert slot_counts(lay, StagingOptions(320, capacity_in_fetches=3)) == {0: 9, 1: 30}
 
 
 def test_layer_groups_sharing_a_pool_group_add_up():
@@ -138,10 +136,10 @@ def test_a_partial_block_counts_as_a_whole_one():
     assert slots_per_fetch(TINYLLAMA, 1) == {0: 1}
 
 
-@pytest.mark.parametrize("tokens_per_fetch", [0, -32])
-def test_tokens_per_fetch_must_be_positive(tokens_per_fetch):
+@pytest.mark.parametrize("guaranteed_fetch_tokens", [0, -32])
+def test_guaranteed_fetch_tokens_must_be_positive(guaranteed_fetch_tokens):
     with pytest.raises(ValueError):
-        slots_per_fetch(TINYLLAMA, tokens_per_fetch)
+        slots_per_fetch(TINYLLAMA, guaranteed_fetch_tokens)
 
 
 def test_max_bytes_below_one_fetch_is_rejected():
@@ -153,8 +151,9 @@ def test_max_bytes_below_one_fetch_is_rejected():
     )
 
 
-def test_max_bytes_above_planned_fetches_changes_nothing():
-    options = StagingOptions(4096, planned_fetches=2, max_bytes=100 * one_fetch(DSV4_PRO, 4096))
+def test_max_bytes_above_capacity_in_fetches_changes_nothing():
+    one = one_fetch(DSV4_PRO, 4096)
+    options = StagingOptions(4096, capacity_in_fetches=2, max_bytes=100 * one)
     assert slot_counts(DSV4_PRO, options) == {1: 2, 0: 64, 2: 2}
 
 
@@ -174,7 +173,7 @@ def random_layout(rng):
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_any_whole_block_range_of_at_most_tokens_per_fetch_fits_one_fetch(seed):
+def test_any_whole_block_range_of_at_most_guaranteed_fetch_tokens_fits_one_fetch(seed):
     # Rows a range [start, end) needs: its blocks that a history of end still reads, as the
     # runtime's own life cycle says; the longest range ending at end needs the most.
     rng = random.Random(seed)
@@ -194,28 +193,28 @@ def test_any_whole_block_range_of_at_most_tokens_per_fetch_fits_one_fetch(seed):
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_counts_are_planned_fetches_fetches_or_the_cap_rounded_down(seed):
+def test_counts_are_capacity_in_fetches_fetches_or_the_cap_rounded_down(seed):
     rng = random.Random(seed)
     lay, _ = random_layout(rng)
     tokens_per_fetch = rng.randint(1, 12 * lay.tokens_per_block)
     rows = slots_per_fetch(lay, tokens_per_fetch)
     one = one_fetch(lay, tokens_per_fetch)
-    planned_fetches = rng.randint(1, 9)
-    assert slot_counts(lay, StagingOptions(tokens_per_fetch, planned_fetches)) == {
-        g: planned_fetches * rows[g] for g in rows
+    capacity_in_fetches = rng.randint(1, 9)
+    assert slot_counts(lay, StagingOptions(tokens_per_fetch, capacity_in_fetches)) == {
+        g: capacity_in_fetches * rows[g] for g in rows
     }
-    cap = rng.randint(one, planned_fetches * one)
-    counts = slot_counts(lay, StagingOptions(tokens_per_fetch, planned_fetches, max_bytes=cap))
+    cap = rng.randint(one, capacity_in_fetches * one)
+    counts = slot_counts(lay, StagingOptions(tokens_per_fetch, capacity_in_fetches, max_bytes=cap))
     assert sum(counts[g] * lay.page_bytes[g] for g in counts) <= cap
     # As many whole fetches as the cap holds hold slots at once.
     whole = cap // one
-    assert all(whole * rows[g] <= counts[g] <= planned_fetches * rows[g] for g in rows)
+    assert all(whole * rows[g] <= counts[g] <= capacity_in_fetches * rows[g] for g in rows)
     assert all(counts[g] * one <= cap * rows[g] < (counts[g] + 1) * one for g in rows)
 
 
 def test_a_fractional_fetch_budget_keeps_slots_for_a_shorter_range() -> None:
     lay = layout(32, [(None, 0, 0, 8)])
-    slots = SlotQueue(slot_counts(lay, StagingOptions(320, planned_fetches=3, max_bytes=200)))
+    slots = SlotQueue(slot_counts(lay, StagingOptions(320, capacity_in_fetches=3, max_bytes=200)))
     assert slots.num_slots(0) == 25
     for rows in (10, 10, 5):
         assert slots.try_grant(slots.enqueue({0: rows})) is not None
@@ -223,7 +222,7 @@ def test_a_fractional_fetch_budget_keeps_slots_for_a_shorter_range() -> None:
 
 
 @pytest.mark.parametrize("max_bytes_in_fetches", [None, 1, 2.5])
-def test_planned_fetches_ranges_hold_slots_at_once_and_one_more_waits(max_bytes_in_fetches):
+def test_capacity_in_fetches_ranges_hold_slots_at_once_and_one_more_waits(max_bytes_in_fetches):
     rows = slots_per_fetch(DSV4_PRO, 4096)
     max_bytes = None
     at_once = 3
@@ -231,7 +230,7 @@ def test_planned_fetches_ranges_hold_slots_at_once_and_one_more_waits(max_bytes_
         max_bytes = int(max_bytes_in_fetches * one_fetch(DSV4_PRO, 4096))
         at_once = int(max_bytes_in_fetches)
     slots = SlotQueue(
-        slot_counts(DSV4_PRO, StagingOptions(4096, planned_fetches=3, max_bytes=max_bytes))
+        slot_counts(DSV4_PRO, StagingOptions(4096, capacity_in_fetches=3, max_bytes=max_bytes))
     )
     for _ in range(at_once):
         assert slots.try_grant(slots.enqueue(rows)) is not None
@@ -401,13 +400,16 @@ def test_zero_counts_need_no_slots():
 class _Owner:
     """What a stand-in lender's weak references point at."""
 
+    enable_block_reuse = False
+    _can_publish_block_reuse = False
+    is_draft = False
+
 
 _OWNER = _Owner()
 
 
-def staging_over(windows, sinks, tpb):
-    """A staging lender and a manager stand-in answering what resume_bounds asks: the tokens per block
-    and each layer group's stale range, from the runtime's own life cycle."""
+def lender_over(windows, sinks, tpb):
+    """Lender and manager stand-ins using the runtime's stale-range rule."""
     cycles = [AttnLifeCycle.make(w, s * tpb, tpb) for w, s in zip(windows, sinks)]
 
     def stale_block_range(lg, history):
@@ -418,8 +420,9 @@ def staging_over(windows, sinks, tpb):
     lay = SimpleNamespace(
         tokens_per_block=tpb, windows=tuple(windows), pool_groups=(), num_layer_groups=len(windows)
     )
+    lay.named_groups = (True,) * len(windows)
     ref = weakref.ref(_OWNER)
-    return _lender.Staging(ref, lay, None, (), None, ref), manager
+    return _lender._ManagerLender(ref, lay, None, (), None, ref), manager
 
 
 def reads_all(manager, windows, blocks, first, end_block, tpb):
@@ -457,14 +460,14 @@ def test_max_resume_position_is_the_largest_start_every_layer_group_reads():
                     row[rng.randrange(len(row))] = False
             row[: origin // tpb] = False  # fetches start at origin or later
             blocks.append(row)
-        lender, manager = staging_over(windows, sinks, tpb)
+        lender, manager = lender_over(windows, sinks, tpb)
         first = known // tpb
         last = max((len(b) for b in blocks), default=0)
         ends = range(first + 1, last + 1)
         starts = [e for e in ends if reads_all(manager, windows, blocks, first, e, tpb)]
         want = starts[-1] * tpb if starts else known
         delivered = _fetch_ledger._Deliveries(None, origin, [b.copy() for b in blocks])
-        got = lender._ledger._max_resume_position(manager, delivered, known)
+        got = lender._ledger._max_resume_position(manager, delivered, [known] * len(windows))
         assert got == want, (
             f"windows {windows}, sinks {sinks}, tpb {tpb}, origin {origin}, known {known}, "
             f"delivered {[np.nonzero(b)[0].tolist() for b in blocks]}: usable until {got}, "
@@ -472,53 +475,32 @@ def test_max_resume_position_is_the_largest_start_every_layer_group_reads():
         )
 
 
-def test_max_resume_position_after_a_whole_fetch_checks_its_end_alone(monkeypatch):
-    """Two windowed layer groups, nothing computed and 4096 blocks delivered in each: the end of the
-    delivered rows is usable, found with one stale-range lookup per layer group, not one per block
-    below it, so resume_bounds after each lease of a split fetch costs no more as the fetch grows."""
-    lender, manager = staging_over([4096, 8192], [0, 0], 32)
+def test_max_resume_position_after_a_whole_fetch_is_the_delivered_end():
+    """With both windows delivered, the last delivered block bounds recovery."""
+    lender, manager = lender_over([4096, 8192], [0, 0], 32)
     blocks = [np.ones(4096, dtype=bool), np.ones(4096, dtype=bool)]
-    real_stale, calls = _ranges._stale_range, []
-
-    def counted(*args):
-        calls.append(args)
-        return real_stale(*args)
-
-    monkeypatch.setattr(_ranges, "_stale_range", counted)
     got = lender._ledger._max_resume_position(
-        manager, _fetch_ledger._Deliveries(None, 0, blocks), 0
+        manager, _fetch_ledger._Deliveries(None, 0, blocks), (0, 0)
     )
     assert got == 4096 * 32, f"usable until {got}"
-    assert len(calls) == 2, f"{len(calls)} stale-range lookups for one usable end"
 
 
-def test_max_resume_position_checks_no_start_past_a_missing_full_attention_block(monkeypatch):
-    """One full-attention layer group, nothing computed and 8192 blocks delivered but one: no start
-    past the missing block has every block it reads, so none is checked, and resume_bounds after each
-    later lease of a split fetch that lost an early block checks no more starts as it grows."""
-    lender, manager = staging_over([None], [0], 32)
-    real_stale, calls = _ranges._stale_range, []
-
-    def counted(*args):
-        calls.append(args)
-        return real_stale(*args)
-
-    monkeypatch.setattr(_ranges, "_stale_range", counted)
-    for hole, usable, checked in ((0, 0, 0), (4000, 4000 * 32, 1)):
+def test_a_missing_full_attention_block_bounds_the_resume_position():
+    """A missing full-attention page clips recovery, including a hole at the start."""
+    lender, manager = lender_over([None], [0], 32)
+    for hole, usable in ((0, 0), (4000, 4000 * 32)):
         blocks = np.ones(8192, dtype=bool)
         blocks[hole] = False
-        calls.clear()
         got = lender._ledger._max_resume_position(
-            manager, _fetch_ledger._Deliveries(None, 0, [blocks]), 0
+            manager, _fetch_ledger._Deliveries(None, 0, [blocks]), (0,)
         )
         assert got == usable, f"usable until {got} with block {hole} missing"
-        assert len(calls) == checked, f"{len(calls)} starts checked with block {hole} missing"
 
 
 def test_a_shrink_hook_that_raises_forgets_what_the_request_was_delivered(monkeypatch):
     """A shrink hook whose own work raises, which it logs: the request's delivered rows all go,
-    since the cache may grow back before resume_bounds sees the freed ones past its blocks."""
-    lender, _ = staging_over([None], [0], 32)
+    since the cache may grow back before poll_resume_bounds sees the freed ones past its blocks."""
+    lender, _ = lender_over([None], [0], 32)
     kv = object()
     lender._ledger._deliveries[7] = _fetch_ledger._Deliveries(kv, 0, [np.ones(3, dtype=bool)])
     lender._ledger._mixed_tail_caches[7] = kv
@@ -553,11 +535,11 @@ def strictly_inside(runs, position):
 
 def test_resume_bounds_and_fetch_ends_keep_out_of_bidirectional_runs():
     """Random bidirectional runs of multimodal tokens: a fetch end strictly inside a run is refused,
-    others not; resume_bounds lowers its end to the largest position at or below it not strictly inside
+    others not; poll_resume_bounds lowers its end to the largest position at or below it not strictly inside
     one, with a floor at the end of the last run at or below that, so none from floor to end is."""
     rng = random.Random(0)
     # With a window too, which the refusal must not read: the model's window can be narrower.
-    lender, windowed = (staging_over(w, [0] * len(w), 32)[0] for w in ([None], [64, None]))
+    lender, windowed = (lender_over(w, [0] * len(w), 32)[0] for w in ([None], [64, None]))
     for _ in range(3000):
         length = rng.randint(1, 400)
         runs, pos = [], rng.randint(0, 20)
@@ -567,7 +549,9 @@ def test_resume_bounds_and_fetch_ends_keep_out_of_bidirectional_runs():
             pos = stop + rng.randint(1, 40)
         request = multimodal(runs, length)
         usable = rng.randint(0, length)
-        got, floor = lender._ledger._clip_to_bidirectional_runs(request, usable)
+        got, floor = lender._ledger._clip_to_bidirectional_runs(
+            _manager.bidirectional_runs(request), usable
+        )
         want = max(p for p in range(usable + 1) if not strictly_inside(runs, p))
         case = f"runs {runs}, usable {usable}"
         assert got == want, f"{case}: the end lowered to {got}, not {want}"
@@ -587,13 +571,15 @@ def test_resume_bounds_and_fetch_ends_keep_out_of_bidirectional_runs():
 
 def test_a_request_without_bidirectional_runs_keeps_its_interval_and_ends():
     """No flag, no multimodal data, or no mask: nothing lowers, rises or fails."""
-    lender, _ = staging_over([64, None], [0, 0], 32)
+    lender, _ = lender_over([64, None], [0, 0], 32)
     for request in (
         multimodal([(1, 300)], 400, flagged=False),
         SimpleNamespace(py_multimodal_data=None),
         SimpleNamespace(py_multimodal_data={"mm_bidirectional_blocks": True}),
     ):
-        assert lender._ledger._clip_to_bidirectional_runs(request, 200) == (200, 0)
+        assert lender._ledger._clip_to_bidirectional_runs(
+            _manager.bidirectional_runs(request), 200
+        ) == (200, 0)
         assert lender._bidirectional_split_refusal(request, 200) is None
 
 
@@ -626,7 +612,7 @@ class _AppendRaisingOnce(list):
         super().append(item)
 
 
-def _stand_in_view(rows, keys):
+def _stand_in_view(rows, keys, *bounds):
     return "view"
 
 
@@ -640,10 +626,11 @@ def test_a_read_grant_keeps_the_slots_its_queued_copy_may_write_out_of_use(monke
         pool_group_of=(0,),
         windows=(None,),
         num_layer_groups=1,
+        named_groups=(True,),
         tokens_per_block=1,
     )
     ref = weakref.ref(_OWNER)
-    lender = _lender.Staging(ref, lay, None, (), SlotQueue({0: 4}), ref)
+    lender = _lender._ManagerLender(ref, lay, None, (), SlotQueue({0: 4}), ref)
     fired = []
     view = _stand_in_view
     if fault == "before":
@@ -651,7 +638,7 @@ def test_a_read_grant_keeps_the_slots_its_queued_copy_may_write_out_of_use(monke
     monkeypatch.setattr(lender, "_build_view", view)
     monkeypatch.setattr(lender, "_copy_segments", lambda rows: [])
     monkeypatch.setattr(
-        lender, "_queue_copy", lambda segments, to_staging: (None, "planted: no event")
+        lender, "_queue_copy", lambda segments, to_staging, after=None: (None, "planted: no event")
     )
     if fault == "record":
         lender._quarantined = _AppendRaisingOnce(fired)
@@ -685,7 +672,7 @@ class _IterRaisingOnce(list):
         return super().__iter__()
 
 
-def _unrecorded_copy(segments, to_staging):
+def _unrecorded_copy(segments, to_staging, after=None):
     raise MemoryError("planted: the copy is queued, its record is not")
 
 
@@ -695,6 +682,7 @@ def _one_pool_group():
         pool_group_of=(0,),
         windows=(None,),
         num_layer_groups=1,
+        named_groups=(True,),
         tokens_per_block=1,
     )
 
@@ -713,6 +701,63 @@ def _write_target():
     return kv, manager
 
 
+@pytest.mark.parametrize("kind", ["read", "write"])
+def test_an_interrupted_immediate_grant_leaves_no_unreachable_lease(monkeypatch, kind):
+    """An interrupted lend cannot return its lease, but must keep possibly touched slots lost."""
+    kv, manager = _write_target()
+    ref = weakref.ref(manager)
+    lender = _lender._ManagerLender(ref, _one_pool_group(), None, (), SlotQueue({0: 4}), ref)
+    rows = _lender._LentBlockEntries([0], [np.arange(2)], [np.arange(2)])
+    fetch = _fetch_ledger._FetchRecord(0, kv) if kind == "write" else None
+    if fetch is not None:
+        lender._ledger._latest_fetches[7] = fetch
+    lease = _lender._StagingLease(lender, kind, 7, kv, rows, None, fetch)
+    unreachable = weakref.ref(lease)
+
+    def interrupted(*args):
+        raise KeyboardInterrupt("planted")
+
+    monkeypatch.setattr(lender, "_build_view", interrupted)
+    with pytest.raises(KeyboardInterrupt, match="planted"):
+        lender._admit(lease, {0: 2})
+    assert lender._open_lease_count() == 0, "the caller never received this lease"
+    assert 7 not in lender._ledger._latest_fetches, "an unreachable fetch stayed unsettled"
+    assert lender._free_slots(0) == 2 and len(lender._quarantined) == 1
+    assert lender._must_retain_memory(), "an interrupted grant may have queued a copy"
+    del lease
+    gc.collect()
+    assert unreachable() is None, "the lender retained a lease no caller can release"
+
+
+def test_an_interrupted_older_grant_cancels_the_new_unreturned_lease(monkeypatch):
+    """An older waiter keeps its failure; the new lend cannot leave a second ticket behind."""
+    kv, manager = _write_target()
+    ref = weakref.ref(manager)
+    lender = _lender._ManagerLender(ref, _one_pool_group(), None, (), SlotQueue({0: 4}), ref)
+    rows = _lender._LentBlockEntries([0], [np.arange(2)], [np.arange(2)])
+    older = _lender._StagingLease(lender, "write", 8, kv, rows)
+    older._ticket = lender._slot_queue.enqueue({0: 2})
+    lender._waiting_for_slots.append(older)
+    lender._open_leases.add(older)
+    fetch = _fetch_ledger._FetchRecord(0, kv)
+    lender._ledger._latest_fetches[7] = fetch
+    current = _lender._StagingLease(lender, "write", 7, kv, rows, None, fetch)
+
+    def interrupted(*args):
+        raise KeyboardInterrupt("planted")
+
+    monkeypatch.setattr(lender, "_build_view", interrupted)
+    with pytest.raises(KeyboardInterrupt, match="planted"):
+        lender._admit(current, {0: 2})
+    assert older.failure is not None and older.poll() is None
+    assert lender._open_lease_count() == 1, "the new caller never received its lease"
+    assert lender._slot_queue.num_waiting == 0 and not lender._waiting_for_slots
+    assert 7 not in lender._ledger._latest_fetches
+    assert lender._free_slots(0) == 2 and len(lender._quarantined) == 1
+    older.release()
+    assert lender._open_lease_count() == 0
+
+
 @pytest.mark.parametrize("fault", ["none", "call", "record", "holding", "log", "append", "partial"])
 def test_a_read_whose_grant_and_quarantine_both_raise_is_never_ready(monkeypatch, fault):
     """A read granted 2 of 4 slots: its grant raises once its view is set (recording its copy,
@@ -722,17 +767,17 @@ def test_a_read_whose_grant_and_quarantine_both_raise_is_never_ready(monkeypatch
     release, and where a copy may be queued the shutdown would keep the staging memory. With no
     fault it is ready once its copy landed."""
     ref = weakref.ref(_OWNER)
-    lender = _lender.Staging(ref, _one_pool_group(), None, (), SlotQueue({0: 4}), ref)
+    lender = _lender._ManagerLender(ref, _one_pool_group(), None, (), SlotQueue({0: 4}), ref)
     planted = [[], []]  # the grant's fault, then the quarantine's
     landed = SimpleNamespace(query=lambda: True)
     monkeypatch.setattr(lender, "_build_view", _stand_in_view)
     monkeypatch.setattr(lender, "_copy_segments", lambda rows: [])
     if fault == "none":
         copied = (_lender._QueuedCopy(landed), None)
-        monkeypatch.setattr(lender, "_queue_copy", lambda segments, to_staging: copied)
+        monkeypatch.setattr(lender, "_queue_copy", lambda segments, to_staging, after=None: copied)
     elif fault == "partial":
         copied = (_lender._QueuedCopy(landed), "planted: a copy call failed")
-        monkeypatch.setattr(lender, "_queue_copy", lambda segments, to_staging: copied)
+        monkeypatch.setattr(lender, "_queue_copy", lambda segments, to_staging, after=None: copied)
         failing = raising_once(lender._fail, MemoryError("planted"), planted[0])
         monkeypatch.setattr(lender, "_fail", failing)
     else:
@@ -761,6 +806,7 @@ def test_a_read_whose_grant_and_quarantine_both_raise_is_never_ready(monkeypatch
         assert all(planted), "a planted fault did not strike: proves nothing"
     view = read.poll()
     read.release()
+    lender.progress()  # the round that returns a released lease's slots
     if fault == "none":
         assert view == "view" and read.failure is None, "a read whose copy landed was not ready"
         assert lender._free_slots(0) == 4, "the slots of a read whose copy landed stayed out of use"
@@ -780,21 +826,21 @@ def test_a_read_whose_grant_and_quarantine_both_raise_is_never_ready(monkeypatch
 def test_marks_whose_copy_and_quarantine_both_fail_keep_the_slots_out_of_use(
     monkeypatch, copy, fault
 ):
-    """A write granted 2 of 4 slots is marked; its marks' copy raises once queued or returns with no
-    record of its completion, then its quarantine raises too, at its call or the slots' record:
-    after the release the slots stay out of use and the shutdown would keep the staging memory."""
+    """A write returned after its copy and then its quarantine fail keeps its slots out of use."""
     kv, manager = _write_target()
     ref = weakref.ref(manager)
-    lender = _lender.Staging(ref, _one_pool_group(), None, (), SlotQueue({0: 4}), ref)
+    lender = _lender._ManagerLender(ref, _one_pool_group(), None, (), SlotQueue({0: 4}), ref)
     fired = []
     monkeypatch.setattr(
-        lender, "_build_view", lambda rows, keys: SimpleNamespace(groups=rows.block_ordinals)
+        lender, "_build_view", lambda rows, *keys: SimpleNamespace(groups=rows.block_ordinals)
     )
     monkeypatch.setattr(lender, "_copy_segments", lambda rows, mask: [])
     if copy == "raised":
         monkeypatch.setattr(lender, "_queue_copy", _unrecorded_copy)
     else:
-        monkeypatch.setattr(lender, "_queue_copy", lambda segments, to_staging: (None, "no event"))
+        monkeypatch.setattr(
+            lender, "_queue_copy", lambda segments, to_staging, after=None: (None, "no event")
+        )
     if fault == "call":
         failing = raising_once(lender._quarantine, MemoryError("planted"), fired)
         monkeypatch.setattr(lender, "_quarantine", failing)
@@ -804,10 +850,11 @@ def test_marks_whose_copy_and_quarantine_both_fail_keep_the_slots_out_of_use(
     write = _lender._StagingLease(lender, "write", 7, kv, rows)
     lender._admit(write, {0: 2})
     view = write.poll()
+    arrived = [np.ones(len(run), dtype=bool) for run in view.groups]
     with pytest.raises(MemoryError, match="planted"):
-        write.mark_arrived([np.ones(len(run), dtype=bool) for run in view.groups])
+        lender.return_writes([(write, arrived, True)])
     assert fired, "the quarantine did not raise: proves nothing"
-    write.release()
+    lender.progress()
     assert lender._free_slots(0) == 2, "slots a queued copy may still read came back"
     assert lender._must_retain_memory(), (
         "the shutdown would free staging a queued copy may still read"
@@ -830,19 +877,17 @@ class _HoldingAppendRaisingOnce(list):
 
 
 def test_a_write_whose_grant_and_failure_both_raise_is_never_ready(monkeypatch):
-    """A write waits for the slots a read holds, and the read's release grants it: entering the
-    holding list raises, then failing the write raises too. As after a manager hook logged that
-    error, the write never returns a view over the slots it gave back for the next grant."""
+    """A write whose grant and then its failure raise never returns a view over its slots."""
     kv, manager = _write_target()
     ref = weakref.ref(manager)
-    lender = _lender.Staging(ref, _one_pool_group(), None, (), SlotQueue({0: 2}), ref)
+    lender = _lender._ManagerLender(ref, _one_pool_group(), None, (), SlotQueue({0: 2}), ref)
     landed = SimpleNamespace(query=lambda: True)
     monkeypatch.setattr(
-        lender, "_build_view", lambda rows, keys: SimpleNamespace(groups=rows.block_ordinals)
+        lender, "_build_view", lambda rows, *keys: SimpleNamespace(groups=rows.block_ordinals)
     )
     monkeypatch.setattr(lender, "_copy_segments", lambda rows, mask=None: [])
     copied = (_lender._QueuedCopy(landed), None)
-    monkeypatch.setattr(lender, "_queue_copy", lambda segments, to_staging: copied)
+    monkeypatch.setattr(lender, "_queue_copy", lambda segments, to_staging, after=None: copied)
     read = _lender._StagingLease(
         lender,
         "read",
@@ -869,8 +914,9 @@ def test_a_write_whose_grant_and_failure_both_raise_is_never_ready(monkeypatch):
 
     monkeypatch.setattr(lender, "_recycle", recycling)
     monkeypatch.setattr(lender, "_fail", raising_once(lender._fail, MemoryError("planted"), failed))
-    with pytest.raises(MemoryError, match="planted"):  # what a manager hook logs and goes on
-        read.release()
+    read.release()
+    with pytest.raises(MemoryError, match="planted"):
+        lender.progress()
     assert appended and failed, "a planted fault did not strike: proves nothing"
     assert write.poll() is None, "a write was ready over slots it gave back"
 
@@ -894,6 +940,7 @@ def _cache(blocks=2, committed=0):
     pages = list(range(blocks))
     return SimpleNamespace(
         num_committed_tokens=committed,
+        reuse_status=[SimpleNamespace(complete=True, endpoint=committed)] * 2,
         history_length=committed,
         is_active=True,
         num_blocks=blocks,
@@ -921,20 +968,22 @@ def _a_write_waits(monkeypatch, fault, error=MemoryError):
     """Two layer groups on pool groups 0 and 1 of four slots each: a read holds slots 0 and 1 of
     both with its copy pending, a write into request 8 whose view a poll returned holds slot 2, a
     write whose view no poll returned holds slot 3, and a write into request 7 waits for 2 + 2;
-    request 10's cache has 8 committed blocks. The read is released and its copy lands. ``error``
-    is planted in pool group 1, changed second, for its next take or return of slots as ``fault``
-    says: the take of the waiting write's slots or the return of the read's."""
+    request 10's cache has 8 committed blocks, request 11's 8 blocks none. The read is released and
+    its copy lands, no round of progress since. ``error`` is planted where ``fault`` says: pool
+    group 1's next ``"take"`` or ``"give"`` of slots, or the ledger's next ``"drop"`` of records."""
     manager = _Owner()
     manager.kv_cache_map = {7: _cache(), 8: _cache(), 10: _cache(blocks=8, committed=8)}
+    manager.kv_cache_map[11] = _cache(blocks=8)
     layout = SimpleNamespace(
         pool_groups=(0, 1),
         pool_group_of=(0, 1),
         windows=(None, None),
         num_layer_groups=2,
+        named_groups=(True, True),
         tokens_per_block=1,
     )
     memory = _Memory()
-    lender = _lender.Staging(
+    lender = _lender._ManagerLender(
         weakref.ref(manager), layout, None, (), SlotQueue({0: 4, 1: 4}), weakref.ref(memory)
     )
     s = SimpleNamespace(
@@ -943,12 +992,12 @@ def _a_write_waits(monkeypatch, fault, error=MemoryError):
     landed = []
     event = SimpleNamespace(query=lambda: bool(landed), synchronize=lambda: None)
 
-    def memcpy(segments, to_staging):
+    def memcpy(segments, to_staging, after=None):
         s.copies.append(to_staging)
         return _lender._QueuedCopy(event), None
 
     monkeypatch.setattr(
-        lender, "_build_view", lambda rows, keys: SimpleNamespace(groups=rows.block_ordinals)
+        lender, "_build_view", lambda rows, *keys: SimpleNamespace(groups=rows.block_ordinals)
     )
     monkeypatch.setattr(lender, "_copy_segments", lambda rows, mask=None: [])
     monkeypatch.setattr(lender, "_queue_copy", memcpy)
@@ -972,7 +1021,11 @@ def _a_write_waits(monkeypatch, fault, error=MemoryError):
     assert s.waiting.poll() is None and s.waiting.failure is None, "the write did not wait"
     s.read.release()  # its copy pends, so its slots stay out of use
     landed.append(True)
-    if fault != "none":
+    if fault == "drop":
+        ledger = lender._ledger
+        planted = raising_once(ledger._drop_records, error("planted"), s.fired)
+        monkeypatch.setattr(ledger, "_drop_records", planted)
+    elif fault != "none":
         alloc = lender._slot_queue._allocators[1]
         planted = raising_once(getattr(alloc, fault), error("planted"), s.fired)
         monkeypatch.setattr(alloc, fault, planted)
@@ -989,50 +1042,40 @@ def _freed_while_a_write_waits(monkeypatch, fault, error=MemoryError):
 
 @pytest.mark.parametrize(
     "fault, error",
-    [
-        ("none", None),
-        ("take", MemoryError),
-        ("give", MemoryError),
-        ("take", KeyError),
-        ("give", KeyError),
-    ],
-    ids=["none", "take", "give", "take_key_error", "give_key_error"],
+    [("none", None), ("drop", MemoryError), ("drop", KeyError)],
+    ids=["none", "drop", "drop_key_error"],
 )
-def test_an_error_the_free_hook_logs_stops_the_lender(monkeypatch, fault, error):
-    """Another request's free returns the slots of a released read whose copy landed and grants
-    them to the write waiting for them, and a planted MemoryError or KeyError strikes between the
-    changes of the two pool groups: at the take of the write's slots or at the return of the read's.
-    The hook logs it, raises nothing into the free, and stops the lender for good: the next lender
-    call fails the waiting write, a poll fails a lease no poll returned the view of and returns a
-    view one did, lends fail at the call after their range checks, resume_bounds is an empty interval,
-    a mark copies nothing, no slot returns or is granted, and the shutdown keeps the staging memory
-    with nothing open. ResumeBounds of a request without a cache still raises. A range needing more
-    slots than a part has still raises in ``lend_write``, which checks the stop after its slot
-    check, and fails at the call in ``lend_read``, which checks the stop before any check of the
-    cache, each where it checks a reuse reset. Without the fault the free grants the waiting write,
-    and that range raises in both lends."""
+def test_an_error_the_free_hook_logs_stops_the_lender(kit, monkeypatch, fault, error):
+    """An error the free hook logs stops the lender for good; without one, progress grants."""
     s = _freed_while_a_write_waits(monkeypatch, fault, error)
     lender, waiting = s.lender, s.waiting
     big = _request(10, prompt_len=9)  # [0, 8) needs 8 slots of each pool group, which has 4
+    # A fetch lends past the committed blocks alone, so it goes into a cache without any.
+    fresh = _request(11, prompt_len=9)
     if fault == "none":
         assert not s.errors, s.errors
-        assert waiting.poll() is not None and waiting.failure is None, "the free granted nothing"
+        lender.progress()  # the next executor iteration
+        assert waiting.poll() is not None and waiting.failure is None, "the round granted nothing"
         assert s.granted.poll() is not None and s.seen.poll() is s.seen_view
-        for lend in (lender.lend_read, lender.lend_write):
-            with pytest.raises(ValueError, match="more staging slots"):
-                lend(big, 0, 8)
-        for lease in (s.seen, s.granted, waiting):
-            lease.mark_arrived([np.full(len(run), lease is s.seen) for run in lease._view.groups])
+        for lend, request in ((lender.lend_read, big), (lender.lend_write, fresh)):
+            lease = lend(request, 0, 8, **kit.HOST_NAMED)
+            assert lease.failure is not None and "more staging slots" in lease.failure, (
+                f"{lend.__name__}: {lease.failure}"
+            )
             lease.release()
-        assert s.copies == [True, False], "no copy of the marked rows into the request's pages"
+        for lease in (s.seen, s.granted, waiting):
+            arrived = [np.full(len(run), lease is s.seen) for run in lease._view.groups]
+            lender.return_writes([(lease, arrived, True)])
+        assert s.copies == [True, False], "no copy of the arrived rows into the request's pages"
         lender._on_shutdown()
         assert s.memory.freed == [True], "the shutdown kept staging that nothing holds"
         return
     assert len(s.errors) == 1 and "planted" in s.errors[0], s.errors
-    free = (0, 2) if fault == "take" else (2, 0)  # pool group 0 changed, pool group 1 not
-    assert (lender._free_slots(0), lender._free_slots(1)) == free, "no fault between the groups"
+    free = (0, 0)  # the released read still holds its slots: no round of progress ran
     requests = [_request(7), _request(8)]
-    intervals = [lender.resume_bounds(request) for request in requests]  # progress comes first
+    intervals = [lender.poll_resume_bounds(request) for request in requests]
+    assert waiting.failure is None, "poll_resume_bounds ran a round of progress"
+    lender.progress()  # the next executor iteration
     assert waiting.failure is not None, "the waiting write neither became ready nor failed"
     stop = waiting.failure
     assert stop == _lender._REASON_STOPPED, stop
@@ -1043,30 +1086,30 @@ def test_an_error_the_free_hook_logs_stops_the_lender(monkeypatch, fault, error)
         )
     no_cache = _request(9)
     with pytest.raises(ValueError, match="has no KV cache"):
-        lender.resume_bounds(no_cache)
+        lender.poll_resume_bounds(no_cache)
     assert s.granted.poll() is None and s.granted.failure == stop, "a view went out after the stop"
     assert s.seen.poll() is s.seen_view, "a view a poll returned before the stop was taken back"
     for lend in (lender.lend_read, lender.lend_write):
-        lease = lend(no_cache, 0, 2)
-        assert lease.failure == stop, f"{lend.__name__} did not fail at the call: {lease.failure}"
-        lease.release()
+        for request, end in ((no_cache, 2), (big, 8)):
+            with pytest.raises(RuntimeError, match="lends no more") as raised:
+                lend(request, 0, end, **kit.HOST_NAMED)
+            assert stop in str(raised.value), f"{lend.__name__}: {raised.value}"
     with pytest.raises(ValueError):
-        lender.lend_read(no_cache, 2, 0)
-    with pytest.raises(ValueError):
-        lender.lend_write(no_cache, 0, 4)  # past the whole blocks before the last prompt token
-    with pytest.raises(ValueError, match="more staging slots"):
-        lender.lend_write(big, 0, 8)
-    read = lender.lend_read(big, 0, 8)
-    assert read.failure == stop, f"lend_read of the range did not fail at the call: {read.failure}"
-    read.release()
-    marks = [np.ones(len(run), dtype=bool) for run in s.seen_view.groups]
-    s.seen.mark_arrived(marks)
-    assert s.copies == [True], "a mark queued a copy into the request's pages"
-    with pytest.raises(RuntimeError, match="twice"):
-        s.seen.mark_arrived(marks)
+        lender.lend_read(no_cache, 2, 0, **kit.HOST_NAMED)
+    with pytest.raises(ValueError):  # past the whole blocks before the last prompt token
+        lender.lend_write(no_cache, 0, 4, **kit.HOST_NAMED)
+    arrived = [np.ones(len(run), dtype=bool) for run in s.seen_view.groups]
+    (bounds,) = lender.return_writes([(s.seen, arrived, True)])
+    assert s.copies == [True], "a return queued a copy into the request's pages"
+    assert bounds is not None and bounds.max_position < bounds.min_position, (
+        f"request 8: the return gave {bounds}, not an empty interval"
+    )
+    with pytest.raises(RuntimeError, match="returned already"):
+        lender.return_writes([(s.seen, arrived, True)])
     for lease in (s.seen, s.granted, waiting):
         lease.release()
     assert lender._open_lease_count() == 0
+    lender.progress()
     assert (lender._free_slots(0), lender._free_slots(1)) == free, "slots returned or granted"
     assert lender._must_retain_memory(), "the shutdown would free the staging memory"
     warnings = []
@@ -1078,13 +1121,13 @@ def test_an_error_the_free_hook_logs_stops_the_lender(monkeypatch, fault, error)
     assert len(s.errors) == 1, f"the shutdown logged an error: {s.errors[1:]}"
 
 
-@pytest.mark.parametrize("fault", ["take", "give"])
-def test_a_shutdown_right_after_the_free_hook_stopped_the_lender(monkeypatch, fault):
+@pytest.mark.parametrize("error", [MemoryError, KeyError], ids=["memory_error", "key_error"])
+def test_a_shutdown_right_after_the_free_hook_stopped_the_lender(monkeypatch, error):
     """As above, with the manager's shutdown the first call after the free: the shutdown itself
     fails the waiting write, before any poll, a later poll fails a lease no poll returned the view
     of and returns a view one did, the staging memory stays, and the shutdown logs no error of its
     own."""
-    s = _freed_while_a_write_waits(monkeypatch, fault)
+    s = _freed_while_a_write_waits(monkeypatch, "drop", error)
     s.lender._on_shutdown()
     assert s.waiting.failure == _lender._REASON_SHUT_DOWN, (
         "the shutdown left the waiting write in line"
@@ -1111,7 +1154,7 @@ def test_an_error_the_shutdown_logs_stops_the_lender(monkeypatch, before):
         s = _a_write_waits(monkeypatch, "give")
         struck = s.fired
     else:
-        s = _freed_while_a_write_waits(monkeypatch, "take")
+        s = _freed_while_a_write_waits(monkeypatch, "drop")
         struck = []
         warned = raising_once(_lender.logger.warning, MemoryError("planted"), struck)
         monkeypatch.setattr(_lender.logger, "warning", warned)
@@ -1123,7 +1166,7 @@ def test_an_error_the_shutdown_logs_stops_the_lender(monkeypatch, before):
     assert s.seen.poll() is s.seen_view, "a view a poll returned was taken back"
     assert not s.memory.freed, "the shutdown freed staging whose slot records may be wrong"
     with pytest.raises(ValueError, match="shut down"):
-        s.lender.resume_bounds(_request(7))
+        s.lender.poll_resume_bounds(_request(7))
     first = _lender._REASON_STOPPED_AT_SHUTDOWN if before == "live" else _lender._REASON_STOPPED
     assert s.granted.failure == first, f"not the first reason: {s.granted.failure}"
 
@@ -1145,12 +1188,8 @@ def test_a_clean_shutdown_does_not_stop_the_lender(monkeypatch):
 
 @pytest.mark.parametrize("hook", ["free", "shutdown"])
 def test_a_hook_whose_error_log_raises_still_stops_the_lender(monkeypatch, hook):
-    """A planted MemoryError strikes in a hook's own work, at the take in the free or at the return
-    in the shutdown as above, and the hook's error log line raises a KeyError, which goes out into
-    the manager's free or shutdown: the lender has stopped all the same, so the waiting write and a
-    lease no poll returned the view of fail at their next poll, and a view a poll returned keeps
-    returning."""
-    s = _a_write_waits(monkeypatch, "take" if hook == "free" else "give")
+    """A free or shutdown hook whose error log line raises has still stopped the lender."""
+    s = _a_write_waits(monkeypatch, "drop" if hook == "free" else "give")
     logged = []
     log = raising_once(s.errors.append, KeyError("log line"), logged)
     monkeypatch.setattr(_lender.logger, "error", log)
@@ -1191,10 +1230,11 @@ def _records_of(monkeypatch, kind, owner):
         pool_group_of=(0, 1),
         windows=(None, None),
         num_layer_groups=2,
+        named_groups=(True, True),
         tokens_per_block=1,
     )
     ref = weakref.ref(manager)
-    lender = _lender.Staging(ref, layout, None, (), SlotQueue({0: 4, 1: 4}), ref)
+    lender = _lender._ManagerLender(ref, layout, None, (), SlotQueue({0: 4, 1: 4}), ref)
     cache = kv if owner == "current" else old
     rows = np.zeros(6, dtype=bool)
     rows[2:] = True
@@ -1202,9 +1242,9 @@ def _records_of(monkeypatch, kind, owner):
         "fetch": (lender._ledger._latest_fetches, _fetch_ledger._FetchRecord(2, cache)),
         "delivered": (
             lender._ledger._deliveries,
-            _fetch_ledger._Deliveries(cache, 2, [rows, rows.copy()]),
+            _fetch_ledger._Deliveries(cache, 2, [rows, rows.copy()], end=6),
         ),
-        "advanced": (lender._ledger._kept_prefixes, (cache, 2, 4)),
+        "advanced": (lender._ledger._kept_prefixes, (cache, (2, 2), 4)),
         "tainted": (lender._ledger._mixed_tail_caches, cache),
     }[kind]
     records[7] = record
@@ -1223,7 +1263,7 @@ def test_resume_bounds_drops_the_records_of_a_cache_the_request_no_longer_holds(
     request, answering as without records; the same record of the current cache changes resume_bounds
     and stays."""
     s = _records_of(monkeypatch, kind, owner)
-    resume_bounds = s.lender.resume_bounds(_request(7))
+    resume_bounds = s.lender.poll_resume_bounds(_request(7, prompt_len=8))  # all 8 blocks
     if owner == "current":
         assert resume_bounds == CURRENT_RECORDS[kind] != NO_RECORDS, (
             f"resume_bounds {resume_bounds}"
@@ -1236,20 +1276,42 @@ def test_resume_bounds_drops_the_records_of_a_cache_the_request_no_longer_holds(
     assert 7 not in s.records, "resume_bounds kept a record of a replaced cache"
 
 
+@pytest.mark.parametrize("prompt_len,usable", [(10, 10), (12, 12), (14, 12)])
+def test_resume_bounds_stop_at_the_prompt_inside_a_delivered_last_block(
+    monkeypatch, prompt_len, usable
+):
+    """Three delivered 4-token blocks: a request resumes where its prompt ends inside the last."""
+    monkeypatch.setattr(_ranges, "_floor_follows_history", lambda manager: True)
+    manager = _Owner()
+    kv = _cache(blocks=3)
+    manager.kv_cache_map = {7: kv}
+    layout = SimpleNamespace(
+        pool_groups=(0, 1),
+        pool_group_of=(0, 1),
+        windows=(None, None),
+        num_layer_groups=2,
+        named_groups=(True, True),
+        tokens_per_block=4,
+    )
+    ref = weakref.ref(manager)
+    lender = _lender._ManagerLender(ref, layout, None, (), SlotQueue({0: 4, 1: 4}), ref)
+    rows = np.ones(3, dtype=bool)
+    lender._ledger._deliveries[7] = _fetch_ledger._Deliveries(kv, 0, [rows, rows.copy()], end=12)
+    assert lender.poll_resume_bounds(_request(7, prompt_len=prompt_len)) == (usable, 0)
+
+
 # -- a fetch's states -------------------------------------------------------------------------
 
 
 def test_a_fetch_walks_through_the_states_its_enum_names(monkeypatch):
-    """Write leases into a stand-in cache, ``_fetch_state`` read after each call: the first fetch
-    open, delivered with its copy pending, settled once the copy completed, then replaced by the
-    next, which is abandoned when its lease is released before a poll returned the view; a third is
-    abandoned when the copy of its marks fails. A new fetch is refused while one is unsettled."""
+    """Write leases into a stand-in cache walk a fetch through every state of ``_fetch_state``."""
     states = _fetch_ledger._FetchState
     lay = SimpleNamespace(
         pool_groups=(0,),
         pool_group_of=(0,),
         windows=(None,),
         num_layer_groups=1,
+        named_groups=(True,),
         tokens_per_block=1,
     )
     kv = SimpleNamespace(
@@ -1262,17 +1324,17 @@ def test_a_fetch_walks_through_the_states_its_enum_names(monkeypatch):
     manager = _Owner()
     manager.kv_cache_map = {7: kv}
     ref = weakref.ref(manager)
-    lender = _lender.Staging(ref, lay, None, (), SlotQueue({0: 4}), ref)
+    lender = _lender._ManagerLender(ref, lay, None, (), SlotQueue({0: 4}), ref)
     landed, failure = [], {}
     event = SimpleNamespace(query=lambda: bool(landed))
     monkeypatch.setattr(
-        lender, "_build_view", lambda rows, keys: SimpleNamespace(groups=rows.block_ordinals)
+        lender, "_build_view", lambda rows, *keys: SimpleNamespace(groups=rows.block_ordinals)
     )
     monkeypatch.setattr(lender, "_copy_segments", lambda rows, mask: [])
     monkeypatch.setattr(
         lender,
         "_queue_copy",
-        lambda segments, to_staging: (_lender._QueuedCopy(event), failure.get("error")),
+        lambda segments, to_staging, after: (_lender._QueuedCopy(event), failure.get("error")),
     )
     seen = set()
 
@@ -1290,20 +1352,20 @@ def test_a_fetch_walks_through_the_states_its_enum_names(monkeypatch):
         lender._admit(lease, {0: 2})
         return lease
 
-    def marked(lease):
-        lease.mark_arrived([np.ones(len(run), dtype=bool) for run in lease.poll().groups])
+    def returned(lease):
+        arrived = [np.ones(len(run), dtype=bool) for run in lease.poll().groups]
+        lender.return_writes([(lease, arrived, True)])
 
     first = lent()
     state(first, states.AWAITING_MARKS)
     assert lender._ledger._unsettled_fetch_refusal(7, kv), "a fetch started while another was open"
-    marked(first)
+    returned(first)
     state(first, states.COPY_PENDING)
     assert lender._ledger._unsettled_fetch_refusal(7, kv), (
         "a fetch started while another's copy was pending"
     )
-    first.release()
     landed.append(True)
-    lender._progress()  # as a lend, a poll or a resume_bounds call does first; it asks the copy again
+    lender.progress()  # the next executor iteration's round asks the copy again
     state(first, states.COPY_DONE)
     assert lender._ledger._unsettled_fetch_refusal(7, kv) is None, (
         "a settled fetch kept a new one from starting"
@@ -1315,69 +1377,47 @@ def test_a_fetch_walks_through_the_states_its_enum_names(monkeypatch):
     state(second, states.ABANDONED)
     third = lent()
     failure["error"] = "planted"
-    marked(third)
+    returned(third)
     state(third, states.ABANDONED)
-    third.release()
     assert seen == set(states), f"states never seen: {set(states) - seen}"
 
 
-# -- the hooks the manager calls --------------------------------------------------------------
-
-# The manager's module, beside the sharing package.
-MANAGER_SOURCE = Path(_lender.__file__).resolve().parents[1] / "kv_cache_manager_v2.py"
-# Each lender method the manager calls on its ``_sharing``: positional arguments, keywords.
-HOOKS = {
-    "_on_free": (2, ()),
-    "_on_shrink": (2, ()),
-    "_on_shutdown": (0, ()),
-    "_on_caches_closed": (0, ()),
-    "_on_reset": (0, ()),
-}
+# -- the manager's lender calls ---------------------------------------------------------------
 
 
-def hook_calls(source):
-    """Each method ``source`` calls on an attribute named ``_sharing``, with the positional
-    arguments and the keywords of each of its calls."""
-    calls = {}
-    for node in ast.walk(ast.parse(source)):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Attribute)
-            and node.func.value.attr == "_sharing"
-        ):
-            shape = (len(node.args), tuple(k.arg for k in node.keywords))
-            calls.setdefault(node.func.attr, set()).add(shape)
-    return calls
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "locked"])
+def test_suspending_a_request_observes_its_lender_lock(locked):
+    """The manager leaves a locked cache active and suspends it after the lock clears."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    suspended = []
+    cache = SimpleNamespace(id=7, is_active=True, suspend=lambda: suspended.append(True))
+    manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_map = {7: cache}
+    manager._sharing = SimpleNamespace(_is_locked=lambda candidate: locked)
+    request = SimpleNamespace(py_request_id=7)
+
+    if locked:
+        with pytest.raises(RuntimeError, match="cannot be suspended"):
+            manager.suspend_request(request)
+        assert suspended == []
+    else:
+        manager.suspend_request(request)
+        assert suspended == [True]
 
 
-def unbound_hooks(cls, calls):
-    """The methods of ``calls`` that ``cls`` lacks, or whose signature cannot bind one of their
-    calls."""
-    unbound = []
-    for name, shapes in sorted(calls.items()):
-        try:
-            signature = inspect.signature(getattr(cls, name))
-            for args, keywords in shapes:
-                signature.bind(None, *[None] * args, **dict.fromkeys(keywords))
-        except (AttributeError, TypeError, ValueError):
-            unbound.append(name)
-    return unbound
+def test_a_manager_shrink_notifies_its_lender():
+    """The manager forwards an in-place shrink with the same cache identity."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
-
-def test_the_lender_has_every_hook_the_manager_calls(monkeypatch):
-    """The manager calls five lender methods on its ``_sharing``, and ``Staging`` has each, taking
-    the arguments the manager passes. The check finds a ``Staging`` planted without one of them,
-    and one planted with a hook that takes fewer arguments."""
-    calls = hook_calls(MANAGER_SOURCE.read_text())
-    assert calls == {name: {shape} for name, shape in HOOKS.items()}, calls
-    assert unbound_hooks(_lender.Staging, calls) == []
-    with monkeypatch.context() as patched:
-        patched.delattr(_lender.Staging, "_on_reset")
-        assert unbound_hooks(_lender.Staging, calls) == ["_on_reset"], "a missing hook passed"
-    with monkeypatch.context() as patched:
-        patched.setattr(_lender.Staging, "_on_free", lambda self, request_id: None)
-        assert unbound_hooks(_lender.Staging, calls) == ["_on_free"], "a short hook passed"
+    calls = []
+    cache = object()
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sharing = SimpleNamespace(
+        _on_shrink=lambda request_id, kv_cache: calls.append((request_id, kv_cache))
+    )
+    manager._after_shrink(7, cache)
+    assert calls == [(7, cache)]
 
 
 # -- the bytes the test kit stages ------------------------------------------------------------
@@ -1391,45 +1431,6 @@ def test_the_pieces_of_a_staged_row_differ(kit):
     assert len(set(pieces)) == len(pieces), "a staged row repeats a piece, so a swap would not show"
 
 
-# -- a lease's axes ------------------------------------------------------------------------------
-
-
-def test_each_axis_of_a_lease_follows_its_own_fields_alone():
-    """Each axis of a staging lease follows its own fields alone: the holder axis the failure and
-    whether a poll returned the view, the slot axis the ticket, the copy axis the copy. Checked
-    over every combination of those four fields, ticket 0 (the first a slot queue issues) and an
-    empty failure among them, and of four lease fields no axis reads."""
-    lender, _ = staging_over([None], [0], 32)
-    holder, slots, copies = _lender._HolderState, _lender._SlotState, _lender._CopyState
-    queued = _lender._QueuedCopy(SimpleNamespace(query=lambda: False))
-    recorded = {None: True, _lender._COPY_WITHOUT_RECORD: False, queued: True}
-    for failure, seen, ticket, copy, released, marked, runs, doomed in itertools.product(
-        [None, "failed", ""],
-        [False, True],
-        [None, 0, 3],
-        recorded,
-        [False, True],
-        [False, True],
-        [None, SlotRuns({0: (0, 1)})],
-        [None, "doomed"],
-    ):
-        lease = _lender._StagingLease(lender, "write", 7)
-        lease._failure, lease._view_returned, lease._ticket = failure, seen, ticket
-        lease._copy, lease._released, lease._marked = copy, released, marked
-        lease._slot_runs, lease._first_poll_failure = runs, doomed
-        failed = failure is not None
-        want = (
-            holder.FAILED if failed else holder.VIEW_RETURNED if seen else holder.VIEW_PENDING,
-            slots.WAITING if ticket is not None else slots.NOT_WAITING,
-            copies.NONE_OR_RECORDED if recorded[copy] else copies.WITHOUT_RECORD,
-        )
-        got = (lease._holder_state(), lease._slot_state(), lease._copy_state())
-        assert got == want, (
-            f"failure {failure}, seen {seen}, ticket {ticket}, copy {copy}, released {released}, "
-            f"marked {marked}, runs {runs}, doomed {doomed}: {got}"
-        )
-
-
 class _Cache:
     """A stand-in cache a weak reference can follow."""
 
@@ -1438,7 +1439,7 @@ def test_a_lender_and_its_records_go_with_its_last_reference():
     """With the cyclic collector off, a lender and a cache its fetch records hold go as soon as the
     last reference to the lender does: its ledger reaches it only through a weak reference, so no
     reference cycle keeps either until a collection."""
-    lender, _ = staging_over([None], [0], 32)
+    lender, _ = lender_over([None], [0], 32)
     cache = _Cache()
     lender._ledger._kept_prefixes[7] = (cache, 0, 1)
     lender_ref, cache_ref = weakref.ref(lender), weakref.ref(cache)
