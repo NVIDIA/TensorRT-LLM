@@ -46,7 +46,7 @@ import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, NoReturn, Optional
 
 import click
 
@@ -80,6 +80,17 @@ COVERAGE_GIT_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
+
+# `build_info.txt` is read with the read helper, jenkins/scripts/fetch_build_artifact.sh, which
+# looks for it in the primary artifact location (LLM_ARTIFACTS_PRIMARY) first and in the other one
+# only when it is absent there, authenticating to artifactory.nvidia.com with the ARTIFACTORY_NETRC
+# file. Coverage archives and pins are read from `_URM` only.
+_FETCH_BUILD_ARTIFACT = Path(__file__).resolve().parents[5] / "fetch_build_artifact.sh"
+# Exit codes of the read helper that `_fetch_build_artifact` acts on, by the names the helper gives
+# them; tests/unittest/scripts/test_fetch_build_artifact.py checks that they match.
+_FETCH_ABSENT = 2
+_FETCH_REJECTED = 3
+_FETCH_TRANSFER_FAILED = 4
 # Cover missing or unsuccessful recent builds.
 _MAX_PROBE = 50
 # Per-request timeout in seconds, for the small JSON/metadata calls.
@@ -94,6 +105,18 @@ _RETRIES = 3
 _PatchApplyStatus = Literal["clean", "conflict", "unknown"]
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
 _PR_NUMBER_RE = re.compile(r"[1-9][0-9]*")
+
+
+class ArtifactError(Exception):
+    """An in-scope build artifact could not be read; the message is written for the job log."""
+
+
+class ArtifactAuthError(ArtifactError):
+    """The read helper exited with FETCH_REJECTED: the primary location rejected the request."""
+
+
+class ArtifactTransferError(ArtifactError):
+    """The read helper exited with FETCH_TRANSFER_FAILED: the transfer failed after its retries."""
 
 
 def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optional[bytes]]:
@@ -141,14 +164,55 @@ def tarball_urls(build: int, artifact_base: str = ARTIFACT_BASE) -> list[str]:
     return [tarball_url(build, name, artifact_base) for name in ARCH_TARBALL_NAMES]
 
 
-def build_info_url(build: int, artifact_base: str = ARTIFACT_BASE) -> str:
-    return f"{_URM}/{artifact_base}/{build}/{BUILD_INFO_NAME}"
+# Exceptions for the read helper's failure exit statuses, with what each status means.
+_HELPER_FAILURES = {
+    _FETCH_REJECTED: (ArtifactAuthError, "the location rejected the request"),
+    _FETCH_TRANSFER_FAILED: (ArtifactTransferError, "the transfer failed after retries"),
+}
+
+
+def _fetch_build_artifact(artifact_path: str) -> Optional[bytes]:
+    """Content of a build artifact read with the read helper, or None when neither location has it.
+
+    The helper's stdout is discarded, since this command's stdout carries JSON; its stderr, which
+    names the location that served the file or says why it could not, goes to the job log.
+
+    Raises:
+        ArtifactAuthError: The helper exited with FETCH_REJECTED.
+        ArtifactTransferError: The helper exited with FETCH_TRANSFER_FAILED.
+        ArtifactError: The helper could not be run, or exited with another status.
+    """
+    with tempfile.TemporaryDirectory(prefix="cbts-artifact-") as tmp:
+        dest = Path(tmp) / Path(artifact_path).name
+        try:
+            status = subprocess.run(
+                ["bash", str(_FETCH_BUILD_ARTIFACT), artifact_path, str(dest)],
+                stdout=subprocess.DEVNULL,
+                check=False,
+            ).returncode
+            content = dest.read_bytes() if status == 0 else None
+        except OSError as e:
+            raise ArtifactError(
+                f"{_FETCH_BUILD_ARTIFACT.name} could not read {artifact_path}: {e}"
+            ) from e
+    if status in (0, _FETCH_ABSENT):
+        return content
+    error, reason = _HELPER_FAILURES.get(status, (ArtifactError, None))
+    detail = f": {reason}" if reason else ""
+    raise error(
+        f"{_FETCH_BUILD_ARTIFACT.name} could not read {artifact_path}{detail} "
+        f"(exit status {status}); its message above says why."
+    )
 
 
 def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str]:
-    """Revision a build ran, from its `build_info.txt`, or None when unavailable."""
-    status, data = _get(build_info_url(build, artifact_base))
-    if status != 200 or not data:
+    """Revision a build ran, from its `build_info.txt`, or None when unavailable.
+
+    Raises:
+        ArtifactError: As `_fetch_build_artifact` raises it; `main` reports it and exits 1.
+    """
+    data = _fetch_build_artifact(f"{artifact_base}/{build}/{BUILD_INFO_NAME}")
+    if not data:
         return None
     for line in data.decode("utf-8", "replace").splitlines():
         key, _, value = line.partition("=")
@@ -770,7 +834,35 @@ def main(
         )
     if expected_commit is not None and build is None:
         raise click.UsageError("--expected-commit requires --build")
+    try:
+        _run_entry_point(
+            resolve_pin_file,
+            resolve_build,
+            build,
+            expected_commit,
+            prepare_dir,
+            pr_head,
+            pr_number,
+            paths_json,
+        )
+    except ArtifactError as e:
+        # Reported like the other failures: a message on stderr, no JSON, exit status 1.
+        for line in str(e).splitlines():
+            print(f"[artifact] {line}", file=sys.stderr)
+        sys.exit(1)
 
+
+def _run_entry_point(
+    resolve_pin_file: Optional[str],
+    resolve_build: bool,
+    build: Optional[int],
+    expected_commit: Optional[str],
+    prepare_dir: Optional[str],
+    pr_head: Optional[str],
+    pr_number: Optional[str],
+    paths_json: Optional[str],
+) -> NoReturn:
+    """Run the entry point `main` selected and exit with its status."""
     if prepare_dir:
         relevant_paths = _load_paths_json(paths_json)
         if relevant_paths is None:
