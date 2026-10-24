@@ -37,10 +37,6 @@ class FlashinferSiluAndMul(OpWrapper):
             why="the dense layers' wider intermediate, 2 x 18432",
             spec=dict(shape=(16, 36864), dtype=torch.bfloat16),
         ),
-        Cell(
-            why="deepseek default at attention TP8: the shared expert's gate+up, 2 x 2048/8",
-            spec=dict(shape=(16, 512), dtype=torch.bfloat16),
-        ),
     )
 
     note = """

@@ -13,6 +13,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_blo
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
@@ -1621,7 +1622,10 @@ def _window(args, ref, offset: int, num_local: int):
     return sub, sub_ref
 
 
-@pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
+CELLS = certified_cells(moe)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell):
     """Drive every configuration the entry claims, through the entry's own
     reference and its own gate.

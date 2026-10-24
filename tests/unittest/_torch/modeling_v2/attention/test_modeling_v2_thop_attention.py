@@ -221,6 +221,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import (  # noqa: E402,F401 — needs the path declared above
     ULP,
     assert_within_ulp,
@@ -7264,7 +7265,10 @@ def _cell_encoder(cell, arm) -> None:
     torch.cuda.empty_cache()
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+CELLS = certified_cells(op)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     """Drive every configuration the entry claims.
 

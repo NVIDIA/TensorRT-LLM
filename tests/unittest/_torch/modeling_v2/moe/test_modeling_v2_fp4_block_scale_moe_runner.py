@@ -13,6 +13,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_m
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — needs the path declared above
 
 assert torch.cuda.is_available(), "fp4_block_scale_moe_runner requires a CUDA device"
@@ -2328,7 +2329,10 @@ def _cell_layer(spec: dict):
     return _dsr1_at(key[2])
 
 
-@pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
+CELLS = certified_cells(moe)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
     """Drive every configuration the entry claims, through the entry's own
     reference and its own gate.

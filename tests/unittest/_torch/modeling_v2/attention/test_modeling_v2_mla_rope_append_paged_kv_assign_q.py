@@ -51,6 +51,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mla_rope_append_paged_kv_assign_q requires a CUDA device"
@@ -545,7 +546,10 @@ def _fp8_env(max_batch_size: int = 8, orig_quant: Optional[float] = None) -> _Ml
     )
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+CELLS = certified_cells(op)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     """Every configuration the entry claims, through the same driver the
     hand-written cases use.
