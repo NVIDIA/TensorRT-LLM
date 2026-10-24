@@ -21,8 +21,7 @@ if(${BUILD_PYT})
     eagerMoeWorkspaceTest.cpp
     FULL_STACK
     LABELS
-    "unit;full-stack;gpu"
-    REQUIRES_GPU)
+    "unit;full-stack;gpu")
   target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
                                            ${TORCH_LIBRARIES})
 endif()

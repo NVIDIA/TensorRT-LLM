@@ -24,16 +24,9 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_buffers
   LABELS
-  "unit;common;gpu"
-  REQUIRES_GPU)
-add_tllm_gtest(
-  attentionWorkspaceTest
-  SOURCES
-  attentionWorkspaceTest.cpp
-  FULL_STACK
-  REQUIRES_GPU
-  LABELS
-  "unit;full-stack;gpu")
+  "unit;common;gpu")
+add_tllm_gtest(attentionWorkspaceTest SOURCES attentionWorkspaceTest.cpp
+               FULL_STACK LABELS "unit;full-stack;gpu")
 add_tllm_gtest(
   memoryUtilsTest
   OWNER
@@ -115,8 +108,7 @@ add_tllm_gtest(
   tllm::common_cuda
   CUDA::cuda_driver
   LABELS
-  "unit;common;gpu"
-  REQUIRES_GPU)
+  "unit;common;gpu")
 add_tllm_gtest(
   loggerTest
   OWNER

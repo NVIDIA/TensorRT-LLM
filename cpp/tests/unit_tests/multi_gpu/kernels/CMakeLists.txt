@@ -14,30 +14,12 @@
 # the License.
 
 if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
-  add_tllm_gtest(
-    allReduceKernelTest
-    SOURCES
-    allReduce/allReduceKernelTest.cu
-    FULL_STACK
-    REQUIRES_GPU
-    LABELS
-    "unit;full-stack;gpu")
-  add_tllm_gtest(
-    allReduceFusionTest
-    SOURCES
-    allReduce/allReduceFusionTest.cu
-    FULL_STACK
-    REQUIRES_GPU
-    LABELS
-    "unit;full-stack;gpu")
-  add_tllm_gtest(
-    gemmAllReduceTest
-    SOURCES
-    allReduce/gemmAllReduceTest.cu
-    FULL_STACK
-    REQUIRES_GPU
-    LABELS
-    "unit;full-stack;gpu")
+  add_tllm_gtest(allReduceKernelTest SOURCES allReduce/allReduceKernelTest.cu
+                 FULL_STACK LABELS "unit;full-stack;gpu")
+  add_tllm_gtest(allReduceFusionTest SOURCES allReduce/allReduceFusionTest.cu
+                 FULL_STACK LABELS "unit;full-stack;gpu")
+  add_tllm_gtest(gemmAllReduceTest SOURCES allReduce/gemmAllReduceTest.cu
+                 FULL_STACK LABELS "unit;full-stack;gpu")
   if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
     target_link_libraries(gemmAllReduceTest PRIVATE ar_gemm_src)
     target_compile_definitions(gemmAllReduceTest

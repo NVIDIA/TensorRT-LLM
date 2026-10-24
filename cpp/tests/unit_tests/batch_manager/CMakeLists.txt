@@ -350,14 +350,8 @@ add_tllm_gtest(
   "unit;batch-manager;gpu"
   REQUIRES_GPU)
 
-add_tllm_gtest(
-  peftCacheManagerTest
-  SOURCES
-  peftCacheManagerTest.cpp
-  FULL_STACK
-  REQUIRES_GPU
-  LABELS
-  "unit;full-stack;gpu")
+add_tllm_gtest(peftCacheManagerTest SOURCES peftCacheManagerTest.cpp FULL_STACK
+               LABELS "unit;full-stack;gpu")
 
 add_tllm_gtest(rnnCacheFormatterTest SOURCES rnnCacheFormatterTest.cpp
                FULL_STACK LABELS "unit;full-stack;host")

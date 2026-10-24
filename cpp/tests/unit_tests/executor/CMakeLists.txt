@@ -73,8 +73,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::executor_values
   LABELS
-  "unit;executor;gpu"
-  REQUIRES_GPU)
+  "unit;executor;gpu")
 add_tllm_gtest(serializeUtilsTest SOURCES serializeUtilsTest.cpp FULL_STACK
                LABELS "unit;full-stack;host")
 add_tllm_gtest(
@@ -86,8 +85,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::executor_values
   LABELS
-  "unit;executor;gpu"
-  REQUIRES_GPU)
+  "unit;executor;gpu")
 add_tllm_gtest(
   coalesceTest
   OWNER
@@ -106,7 +104,6 @@ add_tllm_gtest(
   SOURCES
   ucxCommTest.cpp
   FULL_STACK
-  REQUIRES_GPU
   LABELS
   "unit;full-stack;gpu"
   TIMEOUT
@@ -126,22 +123,10 @@ if(EXISTS "/etc/redhat-release")
 endif()
 
 if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
-  add_tllm_gtest(
-    agentCommTest
-    SOURCES
-    agentCommTest.cpp
-    FULL_STACK
-    REQUIRES_GPU
-    LABELS
-    "unit;full-stack;gpu")
-  add_tllm_gtest(
-    transferAgentTest
-    SOURCES
-    transferAgentTest.cpp
-    FULL_STACK
-    REQUIRES_GPU
-    LABELS
-    "unit;full-stack;gpu")
+  add_tllm_gtest(agentCommTest SOURCES agentCommTest.cpp FULL_STACK LABELS
+                 "unit;full-stack;gpu")
+  add_tllm_gtest(transferAgentTest SOURCES transferAgentTest.cpp FULL_STACK
+                 LABELS "unit;full-stack;gpu")
 
   if(NIXL_ROOT)
     target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)

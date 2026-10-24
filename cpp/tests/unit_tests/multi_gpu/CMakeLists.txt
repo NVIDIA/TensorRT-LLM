@@ -15,14 +15,8 @@
 
 add_subdirectory(kernels)
 
-add_tllm_gtest(
-  cacheTransceiverTest
-  SOURCES
-  cacheTransceiverTest.cpp
-  FULL_STACK
-  REQUIRES_GPU
-  LABELS
-  "unit;full-stack;gpu")
+add_tllm_gtest(cacheTransceiverTest SOURCES cacheTransceiverTest.cpp FULL_STACK
+               LABELS "unit;full-stack;gpu")
 target_link_libraries(cacheTransceiverTest PRIVATE ${Python3_LIBRARIES})
 
 add_tllm_gtest(
@@ -35,8 +29,7 @@ add_tllm_gtest(
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   FULL_STACK
   LABELS
-  "unit;full-stack;batch-manager;gpu"
-  REQUIRES_GPU)
+  "unit;full-stack;batch-manager;gpu")
 target_include_directories(
   kvCacheManagerV2HostMemNumaTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
@@ -57,22 +50,10 @@ add_tllm_gtest(
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(mpiUtilsTest PRIVATE ${NCCL_LIB})
 endif()
-add_tllm_gtest(
-  userBufferTest
-  SOURCES
-  userBufferTest.cpp
-  FULL_STACK
-  REQUIRES_GPU
-  LABELS
-  "unit;full-stack;gpu")
-add_tllm_gtest(
-  ncclUtilsTest
-  SOURCES
-  ncclUtilsTest.cpp
-  FULL_STACK
-  REQUIRES_GPU
-  LABELS
-  "unit;full-stack;gpu")
+add_tllm_gtest(userBufferTest SOURCES userBufferTest.cpp FULL_STACK LABELS
+               "unit;full-stack;gpu")
+add_tllm_gtest(ncclUtilsTest SOURCES ncclUtilsTest.cpp FULL_STACK LABELS
+               "unit;full-stack;gpu")
 target_link_libraries(ncclUtilsTest PRIVATE ${Python3_LIBRARIES})
 if(BUILD_PYT)
   target_compile_definitions(cacheTransceiverTest PUBLIC BUILD_PYT)
