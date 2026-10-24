@@ -75,13 +75,13 @@ class _FakeSelf:
 def test_setup_helix_mappings_precondition_validation():
     setup = _get_setup_method()
 
-    # enable_attention_dp raises
+    # enable_attention_dp at tp_size > 1 raises: helix_a2a needs tp_size == 1
     mapping = _make_helix_mapping(tp_size=4, cp_size=2, enable_attention_dp=True)
     model_config = _make_model_config(mapping)
     cfg = _make_cfg(num_attention_heads=96, kda_num_heads=96)
     obj = _FakeSelf()
     with patch.object(type(mapping), "has_cp_helix", return_value=True):
-        with pytest.raises(ValueError, match="enable_attention_dp"):
+        with pytest.raises(NotImplementedError, match="requires tp_size=1"):
             setup(obj, model_config, cfg, None)
 
     # a non-DSpark spec_config raises: helix now supports DSpark, so the

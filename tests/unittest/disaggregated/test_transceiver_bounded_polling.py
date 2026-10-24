@@ -433,6 +433,47 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus_outcome.assert_called_once_with([], [], [], [], [])
 
 
+@pytest.mark.parametrize(
+    ("cp_size", "attention_dp", "expect_sync", "expect_group"),
+    [
+        (16, True, True, "cp"),  # helix + attention DP: CP ranks share requests
+        (1, True, False, "pp"),  # plain attention DP: ranks own their requests
+        (16, False, True, "world"),  # helix without attention DP
+    ],
+)
+def test_gen_consensus_group_follows_request_sharing(
+    cp_size: int, attention_dp: bool, expect_sync: bool, expect_group: str
+):
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._mapping = SimpleNamespace(
+        tp_size=1,
+        pp_size=1,
+        cp_size=cp_size,
+        world_size=cp_size,
+        enable_attention_dp=attention_dp,
+        has_cp_helix=lambda: cp_size > 1,
+    )
+    # Request 2 is ready on every rank of the group, request 1 only locally.
+    group_view = [[1, 2]] + [[2]] * (cp_size - 1)
+    transceiver._dist = SimpleNamespace(
+        cp_allgather=Mock(return_value=group_view),
+        pp_allgather=Mock(return_value=[[1, 2]]),
+        allgather=Mock(return_value=group_view),
+    )
+    transceiver._init_sync_policy()
+
+    assert transceiver._gen_need_sync is expect_sync
+    expected = [2] if expect_sync else [1, 2]
+    assert transceiver._gen_consensus([1, 2]) == expected
+    gathered = {
+        "cp": transceiver._dist.cp_allgather,
+        "pp": transceiver._dist.pp_allgather,
+        "world": transceiver._dist.allgather,
+    }
+    for group, allgather in gathered.items():
+        assert allgather.called is (expect_sync and group == expect_group)
+
+
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
     # The outcome and quiescence id lists are exchanged with ONE allgather.
     transceiver = object.__new__(KvCacheTransceiverV2)

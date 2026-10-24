@@ -1242,10 +1242,9 @@ class KvCacheCreator:
         token (the target stores only every cp_size-th page per rank).
         Intercepts are per-request rank-local bytes and stay unscaled.
         """
-        draft_mapping = self._mapping
+        draft_mapping = self._get_draft_mapping()
         helix_cp_scale = 1
         if self._mapping.has_cp_helix():
-            draft_mapping = self._mapping.repurpose_helix_cp_to_tp()
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
@@ -2157,6 +2156,22 @@ class KvCacheCreator:
             return False
         return True
 
+    def _get_draft_mapping(self) -> Mapping:
+        """Mapping the drafter's KV is sized and allocated with.
+
+        Under helix the drafter is dense, built against the repurposed mapping
+        (CP ranks become TP ranks), so its paged manager needs the CP-free
+        mapping: the round-robin ledger applies to the TARGET KV alone, and
+        KVCacheManagerV2 rejects is_draft x helix outright.
+
+        Heads are sharded like the drafter's attention: helix + attention DP
+        builds it head-TP (``mapping_for_full_rows``), unlike the executor mapping.
+        """
+        mapping = (self._draft_config.mapping
+                   if self._draft_config is not None else self._mapping)
+        return (mapping.repurpose_helix_cp_to_tp()
+                if mapping.has_cp_helix() else mapping)
+
     def _get_effective_draft_config(self) -> ModelConfig:
         """
         Return the ModelConfig to use for draft KV cache creation.
@@ -2348,14 +2363,7 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
-        # Under helix the standalone drafter is built against the repurposed
-        # mapping (CP ranks become TP ranks) and every rank keeps its full
-        # drafter KV, so its paged manager needs the CP-free mapping: the
-        # round-robin ledger applies to the TARGET KV alone, and
-        # KVCacheManagerV2 rejects is_draft x helix outright.
-        draft_mapping = self._mapping
-        if draft_mapping.has_cp_helix():
-            draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
+        draft_mapping = self._get_draft_mapping()
         draft_tokens_per_block = self._get_draft_tokens_per_block()
         if draft_tokens_per_block != self._tokens_per_block:
             # Logged because nothing fails when the two differ: only the draft
@@ -3319,6 +3327,18 @@ def _create_kv_cache_manager(
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
         _model_config = model_engine.model.model_config
+
+    # Helix + attention DP needs the model to slice and regather rows around
+    # helix attention; other models used to be rejected here by
+    # KVCacheManagerV2 and still are.
+    if (issubclass(kv_cache_manager_cls, KVCacheManagerV2)
+            and mapping.has_cp_helix() and mapping.enable_attention_dp
+            and not getattr(getattr(model_engine, "model", None),
+                            "supports_helix_attention_dp", False)):
+        raise ValueError(
+            "KVCacheManagerV2 does not support attention-DP with helix context "
+            "parallelism for this model: it does not slice the residual stream "
+            "around helix attention (supports_helix_attention_dp).")
 
     if dtype is None:
         dtype = model_engine.model.config.torch_dtype
