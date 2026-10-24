@@ -76,16 +76,25 @@ FP4_MLA_TOKENS_PER_BLOCK = 128
 FP4_MLA_QUANTIZATION_TILE_SIZE = 16
 
 
-def _validate_fp4_mla_chunk_size(model_config, *, enable_chunked_prefill: bool,
-                                 max_num_tokens: int) -> None:
-    """Require tile-aligned non-final chunks for dense FP4 MLA cache writes."""
-    if (enable_chunked_prefill and uses_fp4_mla_attention(model_config)
-            and max_num_tokens % FP4_MLA_QUANTIZATION_TILE_SIZE != 0):
+def _validate_fp4_mla_chunk_unit(
+        model_config, ctx_chunk_config: Optional[Tuple[StrEnum, int]]) -> None:
+    """Require a tile-aligned chunk unit for FP4 MLA chunked prefill.
+
+    The schedulers round every non-final context chunk that the token budget
+    or the context length truncates down to a multiple of the chunk unit, and
+    the hybrid FP4 MLA manager aligns snapshot points (which end forced
+    chunks) to cache blocks. A tile-aligned unit therefore keeps every
+    non-final chunk on a whole FP4 quantization tile; only the final chunk of
+    a request may end inside a tile, which the HP pool holds.
+    """
+    if ctx_chunk_config is None or not uses_fp4_mla_attention(model_config):
+        return
+    chunk_unit_size = ctx_chunk_config[1]
+    if chunk_unit_size % FP4_MLA_QUANTIZATION_TILE_SIZE != 0:
         raise ValueError(
-            "Dense NVFP4 MLA chunked prefill requires max_num_tokens to be "
+            "NVFP4 MLA chunked prefill requires a context chunk unit that is "
             f"a multiple of {FP4_MLA_QUANTIZATION_TILE_SIZE}, got "
-            f"{max_num_tokens}. Only the final chunk of a request may end "
-            "inside an FP4 quantization tile, which the HP pool holds.")
+            f"{chunk_unit_size}.")
 
 
 def _fp4_mla_block_reuse_blocker(pretrained_config, *,
@@ -961,11 +970,6 @@ def _create_py_executor(
                                f"{fp4_mla_reuse_blocker}.")
                 kv_cache_config.enable_block_reuse = False
                 model_engine.attn_runtime_features.cache_reuse = False
-        _validate_fp4_mla_chunk_size(
-            model_engine.model.model_config,
-            enable_chunked_prefill=enable_chunked_context,
-            max_num_tokens=max_num_tokens,
-        )
 
     if (kv_cache_config.enable_block_reuse
             and model_engine.model.model_config.is_encoder_decoder
@@ -1014,6 +1018,9 @@ def _create_py_executor(
         # Snapshot boundaries come from expect_snapshot_points.  The unit is
         # only used to align chunks shortened by the scheduling budget.
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
+    if is_mla(config):
+        _validate_fp4_mla_chunk_unit(model_engine.model.model_config,
+                                     ctx_chunk_config)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
