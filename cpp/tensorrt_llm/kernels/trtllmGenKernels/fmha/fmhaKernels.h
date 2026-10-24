@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -912,6 +913,44 @@ private:
             info);
     }
 
+    // The trtllm-gen generator queries `nvcc --version` at GenCfg::nvccPath, which defaults to
+    // /usr/local/cuda/bin/nvcc. Point it at the toolkit the environment selects -- CUDA_HOME, then CUDA_PATH, then the
+    // first nvcc on PATH -- as the DeepGEMM JIT does. Empty when none is found: the default is kept.
+    static std::string const& getNvccPath()
+    {
+        static std::string const nvccPath = []() -> std::string
+        {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            for (char const* var : {"CUDA_HOME", "CUDA_PATH"})
+            {
+                char const* root = std::getenv(var);
+                if (root != nullptr && root[0] != '\0')
+                {
+                    fs::path const candidate = fs::path(root) / "bin" / "nvcc";
+                    if (fs::is_regular_file(candidate, ec))
+                    {
+                        return candidate.string();
+                    }
+                }
+            }
+            if (char const* pathEnv = std::getenv("PATH"))
+            {
+                std::istringstream dirs(pathEnv);
+                std::string dir;
+                while (std::getline(dirs, dir, ':'))
+                {
+                    if (!dir.empty() && fs::is_regular_file(fs::path(dir) / "nvcc", ec))
+                    {
+                        return (fs::path(dir) / "nvcc").string();
+                    }
+                }
+            }
+            return {};
+        }();
+        return nvccPath;
+    }
+
     std::string const& getExecPath() const
     {
         static std::string execPathStr;
@@ -1366,6 +1405,21 @@ private:
         if (options.mTileScheduler == TileScheduler::Persistent)
         {
             sstream << "\"skipsFirstProdAcquiresLastConsReleases\": false,\n";
+        }
+
+        // Without it the generator runs /usr/local/cuda/bin/nvcc and fails where the toolkit lives elsewhere (#20515).
+        if (auto const& nvccPath = getNvccPath(); !nvccPath.empty())
+        {
+            sstream << "\"nvccPath\": \"";
+            for (char const c : nvccPath)
+            {
+                if (c == '"' || c == '\\')
+                {
+                    sstream << '\\';
+                }
+                sstream << c;
+            }
+            sstream << "\",\n";
         }
 
         sstream << "\"usesNvRtc\": "
