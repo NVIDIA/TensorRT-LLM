@@ -150,6 +150,40 @@ def test_fp4_mla_request_validation_still_requires_nvfp4_kv() -> None:
 
 
 @pytest.mark.parametrize(
+    "attention_input_type, context_only_cache, supported",
+    [
+        (AttentionInputType.context_only, True, True),
+        (AttentionInputType.generation_only, True, False),
+        (AttentionInputType.context_only, False, False),
+    ],
+    ids=["context_only_cache", "generation", "context_with_full_cache"],
+)
+def test_fp4_mla_missing_v_scale_pool_only_for_context_only_cache(
+    attention_input_type: AttentionInputType, context_only_cache: bool, supported: bool
+) -> None:
+    # Only a disaggregated context worker omits the V-scale pool.
+    metadata = _fp4_mla_validation_metadata(
+        kv_cache_manager=SimpleNamespace(
+            dtype=_DataType.NVFP4,
+            kv_factor=1,
+            fp4_mla_context_only_cache=context_only_cache,
+        ),
+        fp4_mla_state=Fp4MlaState(hp_pool=object(), v_scale_pool=None),
+    )
+    forward_args = AttentionForwardArgs(attention_input_type=attention_input_type)
+    fmha = SimpleNamespace(attn=SimpleNamespace(sparse_params=None))
+    is_context = attention_input_type == AttentionInputType.context_only
+    k = torch.empty(1, 4) if is_context else None
+    v = torch.empty(1, 4) if is_context else None
+
+    if supported:
+        assert Fp4MlaFmha._is_supported(fmha, torch.empty(1, 4), k, v, metadata, forward_args)
+    else:
+        with pytest.raises(RuntimeError, match="requires the V-scale pool"):
+            Fp4MlaFmha._is_supported(fmha, torch.empty(1, 4), k, v, metadata, forward_args)
+
+
+@pytest.mark.parametrize(
     "softmax_stats, expected_exception",
     [
         (None, RuntimeError),
