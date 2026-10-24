@@ -377,6 +377,13 @@ class RequestBroadcaster:
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
+        self.tp_handles = None
+        from ..distributed.communicator import MPIDist
+
+        if isinstance(dist, MPIDist) and not dist.has_pp and dist.tp_size == dist.world_size > 1:
+            from .tp_bcast_handles import TpBroadcastHandles
+
+            self.tp_handles = TpBroadcastHandles(dist)
 
     def broadcast(
         self, new_requests: List, prefer_cpu: bool = False
@@ -528,6 +535,8 @@ class RequestBroadcaster:
             return payloads
 
         if not self.dist.has_pp:
+            if self.tp_handles is not None:
+                return self.tp_handles.broadcast(new_requests, py_request_objects)
             return self.dist.broadcast(payloads, root=0)
 
         # Broadcast within first PP stage before send/recv chain to other PP stages.
