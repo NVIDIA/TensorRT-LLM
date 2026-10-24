@@ -616,6 +616,14 @@ fp8_gemm_loader = None
 # None to compile it here as usual.
 nvfp4_gemm_loader = None
 
+# Set by the JIT prefetcher (jit_prefetch_cute_dsl.install_moe_gemm_loader):
+# (gemm, kernel_cache key, max_active_clusters) -> the NVFP4 grouped GEMM of
+# the CuTe DSL MoE a CPU-only helper exported, or None to compile it here as
+# usual. ``gemm`` is "fc1" (Sm100BlockScaledContiguousGatherGroupedGemm-
+# ActFusionRunner) or "fc2" (Sm100BlockScaledContiguousGroupedGemmFinalize-
+# FusionRunner).
+moe_gemm_loader = None
+
 
 def get_dense_gemm_approximate_cta_nums(
         M: int, N: int, tile_mn: Tuple[int, int],
@@ -3528,14 +3536,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     expert_capacity,
                 ]
 
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    *compile_args,
-                    tile_size=self.tile_size,
-                    scaling_vector_size=self.scaling_vector_size,
-                    max_active_clusters=max_active_clusters,
-                    stream=stream,
-                )
+                # Every extent is a runtime scalar and every operand a
+                # pointer, so the key and the cluster occupancy select the
+                # kernel: a CPU-only JIT prefetch helper may have exported it.
+                loader = moe_gemm_loader
+                compiled_gemm = (loader("fc2", cache_key, max_active_clusters)
+                                 if loader is not None else None)
+                if compiled_gemm is None:
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        *compile_args,
+                        tile_size=self.tile_size,
+                        scaling_vector_size=self.scaling_vector_size,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                    )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
@@ -4460,15 +4475,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     expert_capacity,
                 ]
 
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    *compile_args,
-                    tile_size=self.tile_size,
-                    scaling_vector_size=self.scaling_vector_size,
-                    max_active_clusters=max_active_clusters,
-                    stream=stream,
-                    activation_type=self.activation_type,
-                )
+                # As in the finalize runner: the key and the cluster occupancy
+                # select the kernel, which a JIT prefetch helper may export.
+                loader = moe_gemm_loader
+                compiled_gemm = (loader("fc1", cache_key, max_active_clusters)
+                                 if loader is not None else None)
+                if compiled_gemm is None:
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        *compile_args,
+                        tile_size=self.tile_size,
+                        scaling_vector_size=self.scaling_vector_size,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        activation_type=self.activation_type,
+                    )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]

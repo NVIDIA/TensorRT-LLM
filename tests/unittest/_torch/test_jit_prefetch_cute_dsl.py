@@ -843,3 +843,156 @@ def test_lowm_provider_lists_the_race_variants(monkeypatch):
     assert set(p.specs) == want and len(p.specs) == len(want)
     monkeypatch.setattr(lm, "LOW_M_GEMM_ACTIVE", False)
     assert not jcd.LowMDirectGemmProvider(model, max_num_tokens=14)
+
+
+def _moe_routing(num_tokens, num_experts, top_k, tile, g):
+    logits = torch.randn(num_tokens, num_experts, generator=g, device="cuda")
+    scales, experts = logits.topk(top_k, dim=-1)
+    scales = scales.softmax(dim=-1).float()
+    sort = torch.ops.trtllm.moe_sort(
+        token_selected_experts=experts.to(torch.int32), token_final_scales=scales,
+        num_experts=num_experts, top_k=top_k, local_expert_offset=0,
+        local_num_experts=num_experts, tile_tokens_dim=tile,
+    )  # fmt: skip
+    return scales, sort
+
+
+def _fp4(rows, cols, g, swizzled=True):
+    x = torch.randn(rows, cols, generator=g, device="cuda").to(torch.bfloat16)
+    x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
+        x, (448 * 6) / x.abs().max().float(), 16, False, swizzled
+    )
+    return x_fp4.view(torch.float4_e2m1fn_x2), x_sf.view(torch.uint8)
+
+
+def test_moe_gemm_exports_are_what_the_runners_run(tmp_path):
+    """Every FC1 (gather + GEMM + SwiGLU) and FC2 (GEMM + finalize) kernel the
+    CuTe DSL MoE's runners compile for a layer, at both routing tile sizes and
+    every tactic, is one MoeGemmProvider plans; compiled by the helper (no
+    visible GPU) and loaded through the runners' loader, each gives bitwise
+    the runner's own output, and the runners compile nothing."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+    from tensorrt_llm._torch.utils import ActivationType, unswizzle_sf
+
+    E, H, inter, tokens, limit = 8, 512, 256, 96, 7.0
+    fc1_cls = ops.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner
+    fc2_cls = ops.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner
+    layer = (E, 2, E, 0, (E, 2 * inter, H // 2), (E, H, inter // 2),
+             int(ActivationType.Swiglu), limit, (None, None), True)  # fmt: skip
+    planned = jcd.MoeGemmProvider.kernel_keys(layer)
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w13, w13_sf = _fp4(E * 2 * inter, H, g)
+    w2, w2_sf = _fp4(E * H, inter, g)
+    w13, w2 = w13.view(E, 2 * inter, H // 2), w2.view(E, H, inter // 2)
+    w13_sf, w2_sf = w13_sf.view(E, 2 * inter, H // 16), w2_sf.view(E, H, inter // 16)
+    alpha = torch.rand(E, generator=g, device="cuda") * 1e-3
+    x, x_sf = _fp4(tokens, H, g, swizzled=False)
+    x_sf = x_sf.view(tokens, H // 16)
+
+    cases = []
+    for tile in (128, 256):
+        # FC1 writes each permuted row once; FC2 adds each token's top-k rows
+        # into its output, so one row per token keeps its sum reproducible.
+        _, s1 = _moe_routing(tokens, E, 2, tile, g)
+        fc1 = fc1_cls(E, 2, E, 0, tile, 16, activation_type=ActivationType.Swiglu,
+                      swiglu_limit_scalar=limit)  # fmt: skip
+        fc1_in = [x, w13, x_sf, w13_sf, alpha, s1[0], s1[1], s1[3], s1[5],
+                  torch.ones(1, device="cuda")]  # fmt: skip
+        m = s1[3].size(0)
+        limits = s1[1].tolist()
+        rows = torch.tensor(
+            [i < limits[i // tile] for i in range(min(m, s1[5].item() * tile))]
+            + [False] * (m - min(m, s1[5].item() * tile)), device="cuda",
+        )  # fmt: skip
+        scales2, s2 = _moe_routing(tokens, E, 1, tile, g)
+        m2 = s2[3].size(0)
+        a2, a2_sf = _fp4(m2, inter, g)
+        out = torch.zeros(tokens, H, dtype=torch.bfloat16, device="cuda")
+        fc2 = fc2_cls(E, 1, E, 0, tile, torch.bfloat16, 16)
+        fc2_in = [a2, w2, a2_sf, w2_sf, alpha, out, s2[0], s2[1], s2[3], s2[5], scales2]
+        cases.append((tile, fc1, fc1_in, rows, m, fc2, fc2_in, out))
+
+    def run():
+        res = {}
+        for tile, fc1, fc1_in, rows, m, fc2, fc2_in, out in cases:
+            for t in fc1.get_valid_tactics(fc1_in, None):
+                c, c_sf = fc1(fc1_in, tactic=t)
+                sf = unswizzle_sf(c_sf, m, inter)
+                res[("fc1", tile, t)] = (c.view(torch.uint8)[rows].clone(), sf[rows].clone())
+            for t in fc2.get_valid_tactics(fc2_in, None):
+                out.zero_()
+                fc2(fc2_in, tactic=t)
+                res[("fc2", tile, t)] = (out.view(torch.int16).clone(),)
+        torch.cuda.synchronize()
+        return res
+
+    saved = (dict(fc1_cls.kernel_cache), dict(fc2_cls.kernel_cache))
+    try:
+        fc1_cls.kernel_cache.clear()
+        fc2_cls.kernel_cache.clear()
+        ops.moe_gemm_loader = None
+        ref = run()
+        compiled = [("fc1", k) for k in fc1_cls.kernel_cache]
+        compiled += [("fc2", k) for k in fc2_cls.kernel_cache]
+        # The provider plans exactly the kernels the runners compile.
+        assert set(compiled) == set(planned), set(compiled) ^ set(planned)
+        specs = jcd.MoeGemmProvider.layer_specs([layer])
+        assert len(specs) == len(planned)
+        replies = _helper_build(str(tmp_path / "aot"), specs)
+        assert all(r["ok"] and r["built"] for r in replies), [r for r in replies if not r["ok"]][:3]
+        fc1_cls.kernel_cache.clear()
+        fc2_cls.kernel_cache.clear()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, str(tmp_path / "aot"))
+            loads.append((fn is not None, spec))
+            return fn
+
+        assert jcd.install_moe_gemm_loader(loader)
+        got = run()
+    finally:
+        ops.moe_gemm_loader = None
+        for cls, cache in zip((fc1_cls, fc2_cls), saved):
+            cls.kernel_cache.clear()
+            cls.kernel_cache.update(cache)
+    missing = [spec for ok, spec in loads if not ok]
+    assert len(loads) == len(planned) and not missing, f"kernels not prefetched: {missing}"
+    assert got.keys() == ref.keys()
+    for key, value in ref.items():
+        assert all(torch.equal(a, b) for a, b in zip(got[key], value)), key
+
+
+def test_moe_gemm_provider_plans_a_constructed_layer():
+    """Right after construction (meta weights) a CuTe DSL NVFP4 MoE layer's
+    routed top-k, local experts, weight shapes and SwiGLU clamp are what the
+    provider plans with, for both routing tile sizes; a layer without fused
+    finalize plans no FC2 kernel."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.routing import RenormalizeMoeRoutingMethod
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    def layer(**config):
+        with MetaInitMode():
+            moe = CuteDslFusedMoE(
+                routing_method=RenormalizeMoeRoutingMethod(top_k=6), num_experts=16,
+                hidden_size=1024, intermediate_size=512, dtype=torch.bfloat16,
+                model_config=ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+                                         **config),
+            )  # fmt: skip
+        model = torch.nn.Module()
+        model.moe = moe
+        return model
+
+    provider = jcd.MoeGemmProvider(layer())
+    assert len(provider.layers) == 1 and provider.specs
+    specs = [json.loads(s) for s in provider.specs]
+    fc1 = [s for s in specs if s["kernel"] == "cute_dsl_moe_fc1_gather_act"]
+    assert {s["tile_size"] for s in specs} == {128, 256}
+    assert {(s["top_k"], s["num_local_experts"]) for s in fc1} == {(6, 16)}
+    assert any(s["kernel"] == "cute_dsl_moe_fc2_finalize" for s in specs)
+    no_finalize = jcd.MoeGemmProvider(layer(moe_disable_finalize_fusion=True))
+    assert {json.loads(s)["kernel"] for s in no_finalize.specs} == {"cute_dsl_moe_fc1_gather_act"}

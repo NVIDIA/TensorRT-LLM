@@ -540,8 +540,9 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
       without DeepGEMM, and the batched GEMM of DeepSeek-V4's grouped FP8
       O-LoRA projection), the NVFP4 dense GEMM tactics the NVFP4 GEMM's
       autotuner races (``Nvfp4GemmProvider``, M buckets up to the engine's
-      ``max_num_tokens``), the KDA prefill kernel (``KdaPrefillProvider``) and
-      FlashInfer's CuTe DSL RMSNorm variants (``FlashInferNormProvider``);
+      ``max_num_tokens``), the CuTe DSL MoE's NVFP4 grouped GEMM tactics
+      (``MoeGemmProvider``), the KDA prefill kernel (``KdaPrefillProvider``)
+      and FlashInfer's CuTe DSL RMSNorm variants (``FlashInferNormProvider``);
       the CuTe DSL helpers start here, so their start-up overlaps the weight
       load;
     * MiniMax-M3's MSA ``fmha_sm100`` kernels (:class:`FmhaSm100Builds`),
@@ -600,16 +601,17 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
             from . import jit_prefetch_cute_dsl as jcd
 
             # They follow from the layers' geometry and are compiled in
-            # warmup's first forwards: the FP8 and NVFP4 GEMM tactics by the
-            # autotuner, the KDA prefill kernel by the first prefill, the
-            # FlashInfer norms by the first forward.
+            # warmup's first forwards: the FP8, NVFP4 and MoE grouped GEMM
+            # tactics by the autotuner, the KDA prefill kernel by the first
+            # prefill, the FlashInfer norms by the first forward.
             gemm_provider = jcd.Fp8GemmProvider(model)
             nvfp4_provider = jcd.Nvfp4GemmProvider(
                 model, getattr(llm_args, "max_num_tokens", None) or 0
             )
             kda_provider = jcd.KdaPrefillProvider(model)
             norm_provider = jcd.FlashInferNormProvider(model)
-            if gemm_provider or nvfp4_provider or kda_provider or norm_provider:
+            moe_provider = jcd.MoeGemmProvider(model)
+            if gemm_provider or nvfp4_provider or kda_provider or norm_provider or moe_provider:
                 prefetcher = JitPrefetcher.init(rank)
                 if prefetcher is not None:
                     # Queued in the order warmup needs them: the norms in the
@@ -622,6 +624,8 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
                         started = prefetcher.enable_cute_dsl(kda_provider) or started
                     if nvfp4_provider:
                         started = prefetcher.enable_nvfp4_gemm(nvfp4_provider) or started
+                    if moe_provider:
+                        started = prefetcher.enable_moe_gemm(moe_provider) or started
     except Exception as e:  # noqa: BLE001 - the kernels then compile in place
         logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
     if llm_args is not None and FmhaSm100Builds.get() is None:
@@ -1266,6 +1270,7 @@ class JitPrefetcher:
         self._cd_dir = None
         self._fp8_gemm = False  # the FP8 blockwise GEMM loader is installed
         self._nvfp4_gemm = False  # the NVFP4 dense GEMM loader is installed
+        self._moe_gemm = False  # the CuTe DSL MoE grouped GEMM loader is installed
         self._lowm = False  # the low-M direct GEMM loader is installed
         self._fi_norm = False  # the FlashInfer norm loader is installed
 
@@ -2073,6 +2078,34 @@ class JitPrefetcher:
         self._event(
             f"CuTe DSL NVFP4 GEMM prefetch: {len(nvfp4_provider.shapes)} GEMM shape(s), "
             f"{len(nvfp4_provider.specs)} tactic(s)"
+        )
+        return True
+
+    def enable_moe_gemm(self, moe_provider) -> bool:
+        """Compile the NVFP4 grouped GEMM tactics the CuTe DSL MoE layers'
+        autotuners benchmark (FC1 gather + activation, FC2 finalize, every
+        routing tile size) in the CuTe DSL helpers, and have the runners load
+        them.
+
+        Called right after the model is constructed (``start_model_builds``):
+        the autotuner's first pass compiles every tactic it benchmarks, and
+        the helpers compile them while the weights load. A tactic whose
+        export is missing when a runner needs it compiles in place; one a
+        helper is compiling is waited for (``_cute_dsl_load``).
+        """
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if self._moe_gemm or not moe_provider or not self._start_cute_dsl_helpers():
+            return False
+        if not jcd.install_moe_gemm_loader(self._cute_dsl_load):
+            return False
+        self._moe_gemm = True
+        self._grow_cute_dsl_helpers(len(moe_provider.specs))
+        for spec in moe_provider.enumerate_specs():
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(
+            f"CuTe DSL MoE grouped GEMM prefetch: {len(moe_provider.layers)} layer "
+            f"configuration(s), {len(moe_provider.specs)} tactic(s)"
         )
         return True
 

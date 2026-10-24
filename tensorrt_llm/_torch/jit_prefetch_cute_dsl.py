@@ -54,6 +54,10 @@ Covered kernels, each a builder in ``_BUILDERS`` / ``_PRECOMPILED``:
 * FlashInfer's low-M BF16 direct GEMM (``LowMDirectGemmProvider``), which
   ``modules.low_m_gemm``'s AutoTuner race benchmarks: specialized on M, N, K
   and the tactic, so one variant per (M bucket, Linear shape, tactic).
+* the NVFP4 grouped GEMMs of the CuTe DSL MoE backend (``MoeGemmProvider``):
+  FC1's gather + GEMM + activation and FC2's GEMM + finalize, for every tile
+  size and tactic their autotuners benchmark. Extents are runtime scalars and
+  operands pointers, so the layer's constants and the tactic select each.
 
 A spec is canonical JSON naming the kernel and its compile-time arguments;
 its SHA-1 is the file name, so helper and executor agree without sharing
@@ -666,6 +670,142 @@ def _build_nvfp4_gemm(s: Dict[str, Any]):
     return gemm.wrapper, (args, {}), "--opt-level 2 --enable-tvm-ffi"
 
 
+# The NVFP4 grouped GEMMs of the CuTe DSL MoE backend: FC1's gather + GEMM +
+# activation (``Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner``)
+# and FC2's GEMM + finalize (``Sm100BlockScaledContiguousGroupedGemm-
+# FinalizeFusionRunner``), keyed like the runners' kernel caches plus the
+# cluster occupancy each compiles with.
+_MOE_FC1 = "cute_dsl_moe_fc1_gather_act"
+_MOE_FC2 = "cute_dsl_moe_fc2_finalize"
+
+
+def _float_or_none(v) -> Optional[float]:
+    return None if v is None else float(v)
+
+
+def moe_gemm_spec(gemm: str, cache_key: tuple, max_active_clusters: int) -> Optional[str]:
+    """Spec for one MoE grouped GEMM from its runner's kernel-cache key;
+    ``gemm`` is "fc1" or "fc2" (as ``moe_gemm_loader`` is called)."""
+    if gemm == "fc1":
+        (sf_vec_size, tile_size, top_k, tiler, cluster, raster, activation, swiglu_limit,
+         use_expert_counts, num_local_experts, situ_beta, situ_linear_beta) = cache_key  # fmt: skip
+        s = {
+            "kernel": _MOE_FC1,
+            "top_k": int(top_k),
+            "activation": int(activation),
+            "swiglu_limit": float(swiglu_limit),
+            "situ_beta": _float_or_none(situ_beta),
+            "situ_linear_beta": _float_or_none(situ_linear_beta),
+        }
+    elif gemm == "fc2":
+        (sf_vec_size, tile_size, tiler, cluster, raster, use_expert_counts,
+         num_local_experts) = cache_key  # fmt: skip
+        s = {"kernel": _MOE_FC2}
+    else:
+        return None
+    s.update(
+        sf_vec_size=int(sf_vec_size),
+        tile_size=int(tile_size),
+        mma_tiler=[int(x) for x in tiler],
+        cluster=[int(x) for x in cluster],
+        raster_along_m=bool(raster),
+        use_expert_counts=bool(use_expert_counts),
+        num_local_experts=int(num_local_experts),
+        max_active_clusters=int(max_active_clusters),
+    )
+    return json.dumps(s, sort_keys=True)
+
+
+def _moe_ptrs(kinds):
+    """Fake gmem pointers of the given (element, alignment) kinds, as the MoE
+    runners make them (no alignment: the element's natural one). The compile
+    reads only the type and the alignment, so any suitably aligned address
+    does."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from .kernels.blackwell.utils import make_ptr
+
+    out = []
+    for element, align in kinds:
+        kw = {} if align is None else {"assumed_align": align}
+        out.append(make_ptr(getattr(cutlass, element), 1 << 20, cute.AddressSpace.gmem, **kw))
+    return out
+
+
+def _build_moe_fc1(s: Dict[str, Any]):
+    """Return (wrapper, fake args, options) for one FC1 gather + GEMM +
+    activation tactic, with the argument kinds the runner's ``forward`` passes:
+    FP4 A/B/C 32-byte aligned, the FP8 scale factors 16-byte aligned, alpha,
+    the routing metadata and the global scale at their natural alignment, and
+    every extent a runtime scalar."""
+    import cutlass.cute as cute
+
+    from .moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        BlockScaledContiguousGatherGroupedGemmKernel,
+    )
+    from .utils import ActivationType
+
+    activation = ActivationType(s["activation"])
+    gemm = BlockScaledContiguousGatherGroupedGemmKernel(
+        sf_vec_size=s["sf_vec_size"],
+        mma_tiler_mn=tuple(s["mma_tiler"]),
+        cluster_shape_mn=tuple(s["cluster"]),
+        vectorized_f32=True,
+        topk=s["top_k"],
+        raster_along_m=s["raster_along_m"],
+        activation_type=activation,
+        swiglu_limit=s["swiglu_limit"],
+        use_expert_counts=s["use_expert_counts"],
+        num_local_experts=s["num_local_experts"],
+        situ_beta=s["situ_beta"],
+        situ_linear_beta=s["situ_linear_beta"],
+    )
+    f4, f8 = ("Float4E2M1FN", 32), ("Float8E4M3FN", 16)
+    ptrs = _moe_ptrs([f4, f4, f8, f8, f4, f8, ("Float32", None)] + [("Int32", None)] * 4
+                     + [("Float32", None)])  # fmt: skip
+    args = ptrs + [1, 1, 1, 1, 1, 0]  # orig_m m n k l expert_capacity
+    kwargs = {
+        "tile_size": s["tile_size"],
+        "scaling_vector_size": s["sf_vec_size"],
+        "max_active_clusters": s["max_active_clusters"],
+        "stream": cute.runtime.make_fake_stream(),
+        "activation_type": activation,
+    }
+    return gemm.wrapper, (args, kwargs), ""
+
+
+def _build_moe_fc2(s: Dict[str, Any]):
+    """Return (wrapper, fake args, options) for one FC2 GEMM + finalize
+    tactic, with the argument kinds the runner's ``forward`` passes (as for
+    FC1; the output is BF16, 16-byte aligned)."""
+    import cutlass.cute as cute
+
+    from .moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+    )
+
+    gemm = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+        sf_vec_size=s["sf_vec_size"],
+        mma_tiler_mn=tuple(s["mma_tiler"]),
+        cluster_shape_mn=tuple(s["cluster"]),
+        raster_along_m=s["raster_along_m"],
+        use_expert_counts=s["use_expert_counts"],
+        num_local_experts=s["num_local_experts"],
+    )
+    f4, f8 = ("Float4E2M1FN", 32), ("Float8E4M3FN", 16)
+    ptrs = _moe_ptrs([f4, f4, f8, f8, ("BFloat16", 16), ("Float32", None)]
+                     + [("Int32", None)] * 4 + [("Float32", None)])  # fmt: skip
+    args = ptrs + [1, 1, 1, 1, 1, 1, 0]  # m n k l num_tokens top_k expert_capacity
+    kwargs = {
+        "tile_size": s["tile_size"],
+        "scaling_vector_size": s["sf_vec_size"],
+        "max_active_clusters": s["max_active_clusters"],
+        "stream": cute.runtime.make_fake_stream(),
+    }
+    return gemm.wrapper, (args, kwargs), ""
+
+
 # FlashInfer's low-M BF16 direct (SIMT) GEMM, which ``modules.low_m_gemm``'s
 # AutoTuner race benchmarks once per tactic and runtime shape
 # (``TRTLLM_LOW_M_GEMM_BACKEND``). Its compiled form is specialized on M, N
@@ -727,6 +867,8 @@ _BUILDERS = {
     _CSA2_PUBLISH: _build_csa2_publish,
     _FP8_GEMM: _build_fp8_gemm,
     _NVFP4_GEMM: _build_nvfp4_gemm,
+    _MOE_FC1: _build_moe_fc1,
+    _MOE_FC2: _build_moe_fc2,
 }
 # Builders that return an already compiled kernel instead of (fn, args, options).
 _PRECOMPILED = {_TOPK: _build_topk, _LOWM_DIRECT: _build_lowm_direct}
@@ -1149,6 +1291,198 @@ def install_nvfp4_gemm_loader(loader: Callable[[str], Optional[Callable]]) -> bo
         return loader(nvfp4_gemm_spec(*key))
 
     ops.nvfp4_gemm_loader = _loader
+    return True
+
+
+class MoeGemmProvider:
+    """Every NVFP4 grouped GEMM tactic the CuTe DSL MoE layers' autotuners
+    benchmark.
+
+    ``CuteDslFusedMoE``'s NVFP4 forward races the routing tile sizes (128 and
+    256 rows on SM100/SM103), and each tile's forward tunes FC1
+    (``trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell``) and,
+    with fused finalize, FC2 (``..._grouped_gemm_finalize_inplace_blackwell``)
+    over every tactic their runners list, compiling each at its first
+    benchmark on the executor thread (0.5-1 s each, a dozen per layer
+    configuration). A kernel depends only on the tile, the tactic and the
+    layer's constants, read off the layer as ``run_moe_nvfp4_impl`` passes
+    them: the routed top-k, the local expert count and the activation with
+    its clamp or SiTU caps. The runners' own ``get_valid_tactics`` is asked on
+    ``meta`` tensors of the layer's weight shapes, which exist (on ``meta``)
+    right after construction.
+
+    Not planned, so compiled in place as before: layers on the
+    locality-domain kernels, and DeepEP's count-native metadata (top-k 1 over
+    per-expert counts), whose use is decided at the first forward.
+    """
+
+    def __init__(self, model):
+        from .._utils import get_sm_version
+
+        self.layers: List[tuple] = []
+        self.specs: List[str] = []
+        if get_sm_version() not in (100, 103):
+            return
+        try:
+            from .moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+        except ImportError:
+            return
+        layers = set()
+        for mod in model.modules():
+            if not isinstance(mod, CuteDslFusedMoE) or not getattr(mod, "has_nvfp4", False):
+                continue
+            if getattr(mod, "_locality_domain_runtime", None) is not None:
+                continue
+            layer = self.layer_constants(mod)
+            if layer is not None:
+                layers.add(layer)
+        self.layers = sorted(layers, key=repr)
+        if self.layers:
+            self.specs = self.layer_specs(self.layers)
+
+    def __bool__(self):
+        return bool(self.specs)
+
+    @staticmethod
+    def layer_constants(mod) -> Optional[tuple]:
+        """(num_slots, top_k, local experts, slot start, FC1 / FC2 weight
+        shapes, activation, SwiGLU clamp, SiTU caps, fused finalize) of one
+        ``CuteDslFusedMoE``, as its NVFP4 forward passes them to the ops; None
+        if the layer has no 3-D weights or a clamp the ops reject."""
+        import math
+
+        import torch
+
+        from .utils import ActivationType
+
+        w13, w2 = getattr(mod, "w3_w1_weight", None), getattr(mod, "w2_weight", None)
+        if not all(isinstance(w, torch.Tensor) and w.dim() == 3 for w in (w13, w2)):
+            return None
+
+        def scalar(v):
+            if isinstance(v, torch.Tensor):
+                if v.numel() != 1 or v.is_meta:
+                    raise ValueError("not a uniform scalar")
+                v = v.item()
+            return float(v)
+
+        activation = ActivationType(mod.activation_type)
+        limit, situ = float("inf"), (None, None)
+        try:
+            if activation == ActivationType.Swiglu and mod.act_clamp is not None:
+                limit = scalar(mod.act_clamp)
+                if math.isnan(limit):
+                    return None
+                limit = float("inf") if limit < 0 else limit
+            elif activation == ActivationType.SiTu:
+                situ = (scalar(mod.act_alpha), scalar(mod.act_beta))
+        except (TypeError, ValueError):
+            return None
+        return (
+            int(mod.num_slots),
+            int(mod.routing_method.experts_per_token),
+            int(mod.expert_size_per_partition),
+            int(mod.slot_start),
+            tuple(int(x) for x in w13.shape),
+            tuple(int(x) for x in w2.shape),
+            int(activation),
+            limit,
+            situ,
+            bool(mod.use_fused_finalize),
+        )
+
+    @staticmethod
+    def kernel_keys(layer: tuple) -> List[Tuple[str, tuple]]:
+        """The ("fc1" | "fc2", runner kernel-cache key) of every kernel one
+        layer configuration's autotuners benchmark."""
+        import torch
+
+        from .custom_ops import cute_dsl_custom_ops as ops
+        from .moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoENvfp4Runner
+        from .utils import ActivationType
+
+        (num_experts, top_k, local_experts, slot_start, w13, w2, activation, limit, situ,
+         fused_finalize) = layer  # fmt: skip
+        meta = torch.device("meta")
+        keys = []
+        for tile in CuteDslFusedMoENvfp4Runner._tile_sizes():
+            fc1 = ops.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+                num_experts, top_k, local_experts, slot_start, tile, 16,
+                activation_type=ActivationType(activation), swiglu_limit_scalar=limit,
+                situ_beta=situ[0], situ_linear_beta=situ[1],
+            )  # fmt: skip
+            fc2 = None
+            if fused_finalize:
+                fc2 = ops.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                    num_experts, top_k, local_experts, slot_start, tile, torch.bfloat16, 16
+                )
+            # The tuned permuted row counts are multiples of the tile; a
+            # tactic's validity depends on them only through the tile count
+            # its cluster needs.
+            for rows in (tile, 8 * tile, 64 * tile):
+                idx = torch.empty(rows, dtype=torch.int32, device=meta)
+                a = torch.empty(rows, w13[2], dtype=torch.uint8, device=meta)
+                b = torch.empty(*w13, dtype=torch.uint8, device=meta)
+                for tiler, cluster, raster in fc1.get_valid_tactics(
+                    [a, b, None, None, None, None, None, idx], None
+                ):
+                    keys.append(("fc1", (
+                        fc1.scaling_vector_size, tile, fc1.top_k, tuple(tiler), tuple(cluster),
+                        raster, fc1.activation_type, fc1.swiglu_limit_scalar,
+                        fc1.use_expert_counts, fc1.num_local_experts, fc1.situ_beta,
+                        fc1.situ_linear_beta,
+                    )))  # fmt: skip
+                if fc2 is None:
+                    continue
+                a = torch.empty(rows, w2[2], dtype=torch.uint8, device=meta)
+                b = torch.empty(*w2, dtype=torch.uint8, device=meta)
+                for tiler, cluster, raster in fc2.get_valid_tactics([a, b], None):
+                    keys.append(("fc2", (
+                        fc2.scaling_vector_size, tile, tuple(tiler), tuple(cluster), raster,
+                        fc2.use_expert_counts, fc2.num_local_experts,
+                    )))  # fmt: skip
+        return list(dict.fromkeys(keys))
+
+    @classmethod
+    def layer_specs(cls, layers) -> List[str]:
+        """The specs of every kernel of ``layers`` (``layer_constants``
+        tuples), with this device's cluster occupancy."""
+        import cutlass
+
+        # The cluster occupancy, computed as the runners compute it.
+        hw = cutlass.utils.HardwareInfo()
+        occupancy: Dict[int, int] = {}
+        specs = []
+        for layer in layers:
+            for gemm, key in cls.kernel_keys(layer):
+                cluster = key[4] if gemm == "fc1" else key[3]
+                size = cluster[0] * cluster[1]
+                if size not in occupancy:
+                    occupancy[size] = hw.get_max_active_clusters(size)
+                specs.append(moe_gemm_spec(gemm, key, occupancy[size]))
+        return list(dict.fromkeys(specs))
+
+    def enumerate_specs(self) -> List[str]:
+        return list(self.specs)
+
+
+def install_moe_gemm_loader(loader: Callable[[str], Optional[Callable]]) -> bool:
+    """Route the compiles of the CuTe DSL MoE's FC1 and FC2 grouped GEMM
+    runners through ``loader(spec)``; returns False if CuTe DSL is
+    unavailable."""
+    try:
+        from .custom_ops import cute_dsl_custom_ops as ops
+    except ImportError:
+        return False
+
+    def _loader(gemm, cache_key, max_active_clusters):
+        try:
+            spec = moe_gemm_spec(gemm, cache_key, max_active_clusters)
+        except (TypeError, ValueError):
+            return None
+        return None if spec is None else loader(spec)
+
+    ops.moe_gemm_loader = _loader
     return True
 
 
