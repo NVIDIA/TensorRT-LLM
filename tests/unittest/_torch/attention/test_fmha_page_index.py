@@ -24,7 +24,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 
-def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("per_layer", [False, True])
+@pytest.mark.parametrize("expansion", [1, 2])
+def test_flashinfer_uses_v2_page_index_upper_bound(per_layer: bool, expansion: int) -> None:
     calls: list[tuple[int, object]] = []
     bounds = iter((97, 101))
 
@@ -33,7 +36,11 @@ def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
         return next(bounds)
 
     manager = object.__new__(KVCacheManagerV2)
-    manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
+    manager._use_per_layer_page_tables = per_layer
+    manager.impl = SimpleNamespace(
+        get_page_index_upper_bound=get_page_index_upper_bound,
+        get_page_index_converter=lambda *_: SimpleNamespace(layer_offset=4, expansion=expansion),
+    )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
     fmha._v1_total_num_blocks_cache = None
@@ -44,8 +51,9 @@ def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
         host_kv_cache_pool_mapping=None,
     )
 
-    assert fmha._get_total_num_blocks(metadata) == 97
-    assert fmha._get_total_num_blocks(metadata) == 101
+    offset = 4 * expansion if per_layer else 0
+    assert fmha._get_total_num_blocks(metadata) == 97 + offset
+    assert fmha._get_total_num_blocks(metadata) == 101 + offset
     assert calls == [(7, Role.KEY), (7, Role.KEY)]
 
 

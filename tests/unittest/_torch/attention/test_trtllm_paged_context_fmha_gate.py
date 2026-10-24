@@ -34,6 +34,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
@@ -43,6 +44,30 @@ from tensorrt_llm.bindings.internal import thop
 _ABSENT = object()
 
 _FALLBACK_SM_VERSION_TARGET = "tensorrt_llm._torch.attention.backends.fmha.fallback.get_sm_version"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [80, 86, 89, 90, 100])
+@pytest.mark.parametrize("scratch", [False, True])
+def test_swa_scratch_architecture_gate(sm_version, scratch):
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_swa_scratch_reuse = scratch
+    with (
+        mock.patch(
+            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
+            return_value=sm_version,
+        ),
+        mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers") as allocate,
+    ):
+        if scratch and sm_version < 90:
+            with pytest.raises(ValueError, match="requires SM90 or newer for SWA scratch reuse"):
+                TrtllmAttentionMetadata(
+                    max_num_requests=1, max_num_tokens=32, kv_cache_manager=manager
+                )
+            allocate.assert_not_called()
+        else:
+            TrtllmAttentionMetadata(max_num_requests=1, max_num_tokens=32, kv_cache_manager=manager)
+            allocate.assert_called_once()
 
 
 def _make_metadata(head_dim, features, kv_dtype=_ABSENT, tokens_per_block=32):
