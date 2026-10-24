@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+from contextlib import aclosing
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
@@ -745,6 +746,7 @@ class TestHttpErrorBodyPreservation:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         "status,body",
         [
@@ -752,19 +754,28 @@ class TestHttpErrorBodyPreservation:
             (500, "internal failure detail"),
         ],
     )
-    async def test_error_body_in_exception(self, status, body):
+    async def test_error_body_in_exception(self, status, body, stream):
         session = AsyncMock(spec=aiohttp.ClientSession)
-        session.post.return_value = self._mock_http_error(status, body)
+        http_response = self._mock_http_error(status, body)
+        session.post.return_value = http_response
         client = self._make_client(session)
         req = CompletionRequest(
             model="m",
             prompt="hi",
-            stream=False,
+            stream=stream,
             disaggregated_params=DisaggregatedParams(request_type="context_only", ctx_request_id=1),
         )
         with pytest.raises(aiohttp.ClientResponseError) as exc_info:
-            await client.send_request(req)
-        assert body[:20] in str(exc_info.value.message)
+            response = await client.send_request(req)
+            if stream:
+                async with aclosing(response):
+                    async for _ in response:
+                        pytest.fail("An HTTP rejection must not yield streaming output")
+        assert exc_info.value.status == status
+        assert exc_info.value.message == f"{http_response.reason}: {body}"
+        assert exc_info.value.headers == http_response.headers
+        session.post.assert_called_once()
+        client._router.finish_request.assert_awaited_once_with(req, session, success=False)
 
 
 class TestDisaggIdRegenOnRetry:
