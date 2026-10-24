@@ -534,6 +534,28 @@ class MicroBatchScheduler(ABC):
         raise NotImplementedError
 
 
+def _check_forced_chunk_context_limit(
+    is_forced_chunk: bool, chunk_unit_size: int, max_context_length: Optional[int]
+) -> None:
+    """Reject a context-length limit below one FORCE_CHUNK unit.
+
+    The micro-batch schedulers reject such a limit on every context request
+    (see ``_chunk_forced`` and ``microBatchScheduler.cpp``), so the
+    configuration is rejected when the scheduler is created instead.
+    """
+    if not is_forced_chunk or max_context_length is None:
+        return
+    if max_context_length < chunk_unit_size:
+        raise ValueError(
+            f"max_num_tokens ({max_context_length}) must be at least the "
+            f"FORCE_CHUNK context chunk unit ({chunk_unit_size}, which is "
+            "kv_cache_config.tokens_per_block for hybrid linear-attention "
+            "models with KV cache block reuse). Increase max_num_tokens, "
+            "decrease tokens_per_block, disable kv_cache_config.enable_block_reuse, "
+            "or set kv_cache_config.use_kv_cache_manager_v2=True."
+        )
+
+
 class BindMicroBatchScheduler(MicroBatchScheduler):
     def __init__(
         self,
@@ -551,6 +573,9 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
 
         ctx_chunk_config_cpp = None
         if ctx_chunk_config is not None:
+            _check_forced_chunk_context_limit(
+                "FORCE_CHUNK" in str(ctx_chunk_config[0]), ctx_chunk_config[1], max_num_tokens
+            )
             ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
@@ -1339,6 +1364,12 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         self.max_num_tokens = max_num_tokens
         self.ctx_chunk_config = ctx_chunk_config
         self.max_context_length = max_num_tokens
+        if ctx_chunk_config is not None:
+            _check_forced_chunk_context_limit(
+                ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK,
+                ctx_chunk_config.chunk_unit_size,
+                self.max_context_length,
+            )
         # Match C++ MicroBatchScheduler defaults (see algorithms.cpp line 68-70)
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
