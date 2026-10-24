@@ -13,10 +13,32 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(cudaProfilerUtilsTest cudaProfilerUtilsTest.cpp)
-add_gtest(cudaUtilsTest cudaUtilsTest.cpp)
-add_gtest(attentionWorkspaceTest attentionWorkspaceTest.cpp)
-add_gtest(memoryUtilsTest memoryUtilsTest.cu)
+add_tllm_gtest(cudaProfilerUtilsTest SOURCES cudaProfilerUtilsTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
+add_tllm_gtest(
+  cudaUtilsTest
+  OWNER
+  common
+  SOURCES
+  cudaUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;common;gpu"
+  REQUIRES_GPU)
+add_tllm_gtest(attentionWorkspaceTest SOURCES attentionWorkspaceTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
+add_tllm_gtest(
+  memoryUtilsTest
+  OWNER
+  common
+  SOURCES
+  memoryUtilsTest.cu
+  LINK_LIBRARIES
+  tllm::common_cuda
+  LABELS
+  "unit;common;gpu"
+  REQUIRES_GPU)
 add_tllm_gtest(
   optionalRefTest
   OWNER
@@ -78,7 +100,18 @@ add_tllm_gtest(
   tllm::common_logging
   LABELS
   "unit;common;host")
-add_gtest(cudaDriverWrapperTest cudaDriverWrapperTest.cpp)
+add_tllm_gtest(
+  cudaDriverWrapperTest
+  OWNER
+  common
+  SOURCES
+  cudaDriverWrapperTest.cpp
+  LINK_LIBRARIES
+  tllm::common_cuda
+  CUDA::cuda_driver
+  LABELS
+  "unit;common;gpu"
+  REQUIRES_GPU)
 add_tllm_gtest(
   loggerTest
   OWNER
