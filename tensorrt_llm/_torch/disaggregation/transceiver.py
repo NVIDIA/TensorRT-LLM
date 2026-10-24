@@ -763,7 +763,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_retirable = []
         for rid in to_process:
             session = self._recv_sessions[rid]
-            if not self._ownership_blocks_retirement(session):
+            if not self._retirement_blocked(session):
                 locally_retirable.append(rid)
         new_cancelled, new_failed, new_completed, globally_retirable, verified = (
             self._consensus_outcome(
@@ -864,6 +864,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     if isinstance(session, RxSession):
                         session.notify_cancel()
                     continue
+                if self._retirement_blocked(session):
+                    continue
                 failed.append(rid)
         return completed, failed
 
@@ -925,6 +927,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return False
         resources_drained = getattr(session, "resources_drained", None)
         return resources_drained is None or not resources_drained()
+
+    @classmethod
+    def _retirement_blocked(cls, session: object) -> bool:
+        """Whether a terminal session must stay open for an accessor that may still be active.
+
+        Besides ownership-held resources, this covers a failed receive whose
+        other writers have not all reported yet (see
+        ``RxSession.failed_receive_awaits_writers``).
+        """
+        if cls._ownership_blocks_retirement(session):
+            return True
+        return isinstance(session, RxSession) and session.failed_receive_awaits_writers()
 
     def _close_session_or_raise(self, session: object, rid: int, outcome: str) -> None:
         """Close one terminal session or fail-stop instead of diverging locally."""
@@ -998,6 +1012,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether a transfer session still owns this request's resources."""
         rid = get_unique_rid(req)
         return rid in self._send_sessions or rid in self._recv_sessions
+
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        # Waiting until every peer rank's REQUEST_DATA has arrived (receiver_ready),
+        # even while the ranks that already asked are being written. A retired,
+        # cancelled or failed send is not waiting and must time out normally.
+        session = self._send_sessions.get(get_unique_rid(req))
+        if session is None or session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            return False
+        return not session.receiver_ready
+
+    def context_transfer_peer_ready_time(self, req: LlmRequest) -> Optional[float]:
+        session = self._send_sessions.get(get_unique_rid(req))
+        return None if session is None else getattr(session, "peer_ready_time", None)
 
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether req's send session was torn down before its last slice."""
@@ -1340,7 +1367,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
-                if self._ownership_blocks_retirement(session):
+                # A cancel after a failure must not free pages a writer is still writing.
+                if self._retirement_blocked(session):
                     continue
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
@@ -1356,10 +1384,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 # RxSession.wait_complete() already withholds FAILED while an
-                # ownership-enabled accessor remains active. Keep the caller
-                # boundary fail-closed as well so alternate/test session
+                # accessor may remain active. Keep the caller boundary
+                # fail-closed as well so alternate/test session
                 # implementations cannot authorize request retirement early.
-                if self._ownership_blocks_retirement(session):
+                if self._retirement_blocked(session):
                     continue
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
