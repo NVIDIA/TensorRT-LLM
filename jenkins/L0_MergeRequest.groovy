@@ -2487,7 +2487,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 string(name: 'postMergeBuildNumber', value: ''),
                                 string(name: 'scanMode', value: isNightlyRelease ? 'release' : 'pre_merge'),
                                 string(name: 'runSourceCodeScanning', value: 'true'),
-                                string(name: 'runContainerScanning', value: 'false'),
+                                string(name: 'runContainerOssScanning', value: 'false'),
+                                string(name: 'runContainerMalwareScanning', value: 'false'),
                                 string(name: 'runSonarQube', value: 'false'),
                             ]
                             def handle = build(
@@ -3028,7 +3029,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 name: 'scanMode',
                                 value: runMode == "nightly_release" ? 'release' : 'pre_merge'),
                             string(name: 'runSourceCodeScanning', value: 'false'),
-                            string(name: 'runContainerScanning', value: 'true'),
+                            string(name: 'runContainerOssScanning', value: 'true'),
+                            string(name: 'runContainerMalwareScanning', value: 'false'),
                             string(name: 'runSonarQube', value: 'false'),
                         ]
                         def logger = new Logger(pipeline)
