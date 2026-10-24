@@ -5117,12 +5117,12 @@ class TestPregrownContextCapacity:
         mgr.kv_cache_map[0].capacity = 900
         assert sched._pregrown_context_tokens(req) == 0
 
-    def test_zero_without_scratch_reuse_or_active_cache(self):
+    def test_zero_without_scratch_reuse_or_cache(self):
         sched, mgr = self._make(scratch=False)
         assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 0
         sched, mgr = self._make()
         req = self._req(mgr, 0, 5_000, 1_000, grown=768)
-        mgr.kv_cache_map[0].is_active = False
+        mgr.kv_cache_map.pop(0)
         assert sched._pregrown_context_tokens(req) == 0
         # A manager that does not define the flag reads as off.
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -5142,14 +5142,18 @@ class TestPregrownContextCapacity:
 
         sched, mgr = self._make()
         req = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
-        # A bidirectional MM block across the pre-grown end would snap the chunk up to 640.
+        # The pre-grown end was MM-aligned when first sized: a block ends there.
         mask = torch.zeros(1_024 + 10_000, dtype=torch.int64)
-        mask[1_024 + 448 : 1_024 + 600] = 1
+        mask[1_024 + 448 : 1_024 + 512] = 1
         req.py_multimodal_data = {
             "multimodal_embed_mask_cumsum": mask.cumsum(0, dtype=torch.int64),
             "mm_bidirectional_blocks": True,
         }
-        out = sched.schedule_request([req], set())
+        with patch.object(
+            sched, "_align_chunk_to_mm_block", wraps=sched._align_chunk_to_mm_block
+        ) as align:
+            out = sched.schedule_request([req], set())
+        align.assert_not_called()
         assert ids(out.context_requests) == [0]
         assert req.context_chunk_size == 512
         mgr.resize_context.assert_called_once_with(req, 512)
@@ -5171,6 +5175,16 @@ class TestPregrownContextCapacity:
         assert ids(out.context_requests) == [0, 1]
         assert pregrown.context_chunk_size == 512
         assert newcomer.context_chunk_size == 256
+
+    def test_suspended_pregrown_request_runs_first(self):
+        sched, mgr = self._make()
+        newcomer = self._req(mgr, 1, 1_024)
+        pregrown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        mgr.kv_cache_map[0].is_active = False  # suspended: capacity is kept
+        out = sched.schedule_request([newcomer, pregrown], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert pregrown.context_chunk_size == 512
+        assert newcomer.context_chunk_size == 512
 
     def test_order_unchanged_without_scratch_reuse(self):
         sched, mgr = self._make(scratch=False)

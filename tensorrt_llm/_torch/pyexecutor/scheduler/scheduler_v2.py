@@ -275,11 +275,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         Under SWA scratch reuse, blocks of the grown chunk outside its end's
         window get no page; a shorter chunk would leave pages missing inside the
         next chunk's window (an invalid page index), so it must replay exactly.
+        A suspended cache keeps its capacity, so it counts too.
         """
         if not self._swa_scratch_reuse:
             return 0
         kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
-        if kv_cache is None or not kv_cache.is_active:
+        if kv_cache is None:
             return 0
         grown = (
             kv_cache.capacity
