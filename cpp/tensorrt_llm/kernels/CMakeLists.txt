@@ -78,6 +78,10 @@ list(FILTER SRC_CU EXCLUDE REGEX "fusedSampling/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
 
+# Scope tcgen05 attention sources to their supported architectures.
+list(FILTER SRC_CU EXCLUDE REGEX
+     "minimaxM3/(fusedDecodeAttn|attnMega|attnC1)\\.cu$")
+
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
 endif()
@@ -111,10 +115,27 @@ if(MARLIN_SRC)
   set_cuda_architectures(marlin_src 89 90 120f)
 endif()
 
+# Preserve the FlashInfer-matched compilation for sampling only. Do not enable
+# fast math globally: attention exactness depends on its flags.
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/minimaxM31/toppRenormDetSm103.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/minimaxM31/toppRenormDetV3Sm103.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/minimaxM31/softmaxMcSm103.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
+
+# Preserve the historical architecture-scoped attention object library.
+add_library(
+  minimax_m3_attn_src OBJECT minimaxM3/fusedDecodeAttn.cu minimaxM3/attnMega.cu
+                             minimaxM3/attnC1.cu)
+set_property(TARGET minimax_m3_attn_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET minimax_m3_attn_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_cuda_architectures(minimax_m3_attn_src 100 103)
+
 add_library(
   kernels_src STATIC
   ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
-  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
+  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>
+  $<TARGET_OBJECTS:minimax_m3_attn_src>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(

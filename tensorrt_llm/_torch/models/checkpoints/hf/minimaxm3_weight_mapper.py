@@ -60,6 +60,11 @@ def _read_global_scale(name: str, value) -> Tensor:
     return scale
 
 
+def reciprocal_global_scale(name: str, value: Tensor) -> Tensor:
+    """Validate a packed expert scale and return its FP32 modelopt divisor."""
+    return nvfp4_weight_scale_2(_read_global_scale(name, value))
+
+
 def translate_packed_nvfp4_experts(weights: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
     """Rename packed NVFP4 routed-expert tensors to the NVFP4 MoE contract.
 

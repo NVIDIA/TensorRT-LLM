@@ -129,10 +129,6 @@ struct RowParams
     bool needMinP;
 };
 
-//! Philox subsequences from here up hold per-row streams. A shared seed/offset makes the row
-//! index the subsequence, which never reaches them.
-constexpr uint64_t kPerRowSubsequenceBase = 1ull << 63;
-
 //! Seeds one row's Philox stream (see FusedSamplingParams::perRowRng).
 __device__ inline void initRowRng(FusedSamplingParams const& p, int row, curandStatePhilox4_32_10_t* state)
 {

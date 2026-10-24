@@ -114,6 +114,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
+from .runtime_hooks import runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -379,6 +380,13 @@ class PendingEncoderStep:
 
 
 class PyExecutor:
+    # True while the overlap loop runs with the execution stream current
+    # (_overlap_loop_stream_scope).
+    _loop_on_execution_stream = False
+    # Whether the model opted into running the overlap loop on the execution
+    # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
+    _execution_stream_loop_armed = False
+
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
     # If the number of micro batches is too small, the executor will spend too much time in synchronization.
@@ -490,6 +498,8 @@ class PyExecutor:
         # related modules
         self.resource_manager = resource_manager
         self.model_engine = model_engine
+        self._execution_stream_loop_armed = runtime_hooks_of(
+            model_engine.model).loop_on_execution_stream
         self._enable_adp_dummy_fixes = getattr(model_engine,
                                                "_enable_adp_dummy_fixes", False)
         self._enable_scheduler_aware_adp_dummy = getattr(
@@ -5602,11 +5612,42 @@ class PyExecutor:
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
+    @contextmanager
+    def _overlap_loop_stream_scope(self):
+        """Run the overlap loop with the execution stream current, when the model opted in.
+
+        _forward_step makes the execution stream wait for the current stream
+        before every forward and the current stream wait for the execution
+        stream after it. On the thread's default stream, which in steady decode
+        carries only these waits and timing events, step N+1's inputs wait for
+        decode graph N through two cross-stream event hops. With the execution
+        stream current the loop's stream work is queued in the same order on one
+        stream and _forward_step skips both waits.
+
+        Not taken with a two-model drafter, a guided decoder, a KV connector,
+        an encoder-decoder model or multimodal encoder item scheduling, whose
+        side streams synchronize with the current stream.
+        """
+        if not (self._execution_stream_loop_armed and self.drafter is None and
+                self.draft_model_engine is None and self.guided_decoder is None
+                and self.kv_connector_manager is None
+                and not self.is_encoder_decoder
+                and not self._mm_encoder_item_scheduling_enabled):
+            yield
+            return
+        with torch.cuda.stream(self.execution_stream):
+            self._loop_on_execution_stream = True
+            try:
+                yield
+            finally:
+                self._loop_on_execution_stream = False
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step, self.hang_detector:
+        with self._profiler() as profile_step, self.hang_detector, \
+                self._overlap_loop_stream_scope():
             iter_start_time = time.time()
             iter_stats = None
             target_inputs = None
@@ -8311,8 +8352,10 @@ class PyExecutor:
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
-            # with KVCacheTransferManager's onboard/offload operations.
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
+            # with KVCacheTransferManager's onboard/offload operations. With the
+            # loop on the execution stream both waits are program order.
+            if not self._loop_on_execution_stream:
+                self.execution_stream.wait_stream(torch.cuda.current_stream())
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
@@ -8326,7 +8369,8 @@ class PyExecutor:
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if not self._loop_on_execution_stream:
+                torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:
@@ -8455,9 +8499,11 @@ class PyExecutor:
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
 
+                # A forward that sampled greedy tokens in place of the logits
+                # returns no logits; no request of such a batch asks for them.
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
-                               batch_outputs["logits"], beam_width,
+                               batch_outputs.get("logits"), beam_width,
                                num_context_logits_prefix_sum,
                                self.sampler.is_generation_model())
 
