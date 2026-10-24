@@ -192,8 +192,10 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
-continues to build all C++ tests; component aggregate targets build migrated tests.
+for integration tests and `REQUIRES_GPU` for tests that need a GPU. `REQUIRES_GPU`
+adds the `gpu` label without serializing GPU tests; CI controls concurrency through
+`parallel_run_ctest`. `google-tests` continues to build all C++ tests; component
+aggregate targets build migrated tests.
 
 ### Advisory semantic review
 
