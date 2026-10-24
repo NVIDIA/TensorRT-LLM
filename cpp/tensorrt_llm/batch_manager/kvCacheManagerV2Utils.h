@@ -104,4 +104,7 @@ void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
     ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
 
+void copyPerLayerBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
+    ITensor const& converters, SizeType32 maxBlocks, CUstream stream) noexcept;
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
