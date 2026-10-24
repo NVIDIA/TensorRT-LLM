@@ -62,6 +62,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -2026,6 +2027,8 @@ MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
     case AllReduceFusionOp::NONE: return MnnvlFusionPattern::kAllReduce;
     case AllReduceFusionOp::RMS_NORM: return MnnvlFusionPattern::kARRMSNorm;
     case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE: return MnnvlFusionPattern::kARRMSNormFP8BlockScale;
+    case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4:
+        return MnnvlFusionPattern::kARRMSNormFP8BlockScaleR128c4;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return MnnvlFusionPattern::kARResidualRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return MnnvlFusionPattern::kARResidualRMSNormFP8Quant;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormFP4Quant;
@@ -2099,8 +2102,9 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         // kARRMSNorm has no residual operand (kHasResidual/kHasResidualOut
         // are both false), so residual_in is optional for it alone.
-        bool const needsResidual
-            = fusionOp != AllReduceFusionOp::RMS_NORM && fusionOp != AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE;
+        bool const needsResidual = fusionOp != AllReduceFusionOp::RMS_NORM
+            && fusionOp != AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE
+            && fusionOp != AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4;
         TORCH_CHECK(gamma.has_value() && epsilon.has_value(),
             "[mnnvlFusionAllReduce] gamma and epsilon must be provided for RMSNorm fusion");
         TORCH_CHECK(!needsResidual || residual_in.has_value(),
@@ -2176,6 +2180,22 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         quantOut = at::detail::empty_cuda({tPadded, hiddenDim}, torch::kFloat8_e4m3fn, input.device(), std::nullopt);
         sfBuf = at::detail::empty_cuda({numPackedSfK, scaleLeadingDim}, torch::kInt32, input.device(), std::nullopt);
     }
+    // FP8 1x128 block-scale quant with R128c4 scales: shapes replicate fp8_quantize_1x128_cutedsl_ue8m0 (value
+    // [T, hidden]; flat uint8 scales for T padded to 128 rows and ceil(hidden / 32) padded to 4 columns), so the
+    // Rubin CuTe DSL MXFP8 GEMM consumes the outputs as it consumes the standalone quantizer's.
+    if (fusionOp == AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4)
+    {
+        TORCH_CHECK(hiddenDim % 128 == 0, "[mnnvlFusionAllReduce] FP8 block-scale quant needs hidden % 128 == 0, got ",
+            hiddenDim);
+        // The bit-exact reference (fp8_quantize_1x128_cutedsl_ue8m0) and the consumer take BF16 only.
+        TORCH_CHECK(input.scalar_type() == torch::kBFloat16,
+            "[mnnvlFusionAllReduce] RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4 needs BF16 input");
+        int64_t const tPadded128 = (numTokens + 127) / 128 * 128;
+        int64_t const sfCols = (hiddenDim / 32 + 3) / 4 * 4;
+        scaleLeadingDim = tPadded128;
+        quantOut = at::detail::empty_cuda({numTokens, hiddenDim}, torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+        sfBuf = at::detail::empty_cuda({tPadded128 * sfCols}, torch::kUInt8, input.device(), std::nullopt);
+    }
 
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
     allreduce_params.nRanks = mcast_mem->getWorldSize();
@@ -2213,7 +2233,8 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         allreduce_params.scaleOut = scaleOut.defined() ? scaleOut.mutable_data_ptr() : nullptr;
         allreduce_params.scaleFactor = scale.value().data_ptr<float>();
     }
-    else if (fusionOp == AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE)
+    else if (fusionOp == AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE
+        || fusionOp == AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4)
     {
         allreduce_params.quantOut = quantOut.mutable_data_ptr();
         allreduce_params.scaleOut = sfBuf.mutable_data_ptr();
@@ -2225,7 +2246,17 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 
     // Threshold to switch between one-shot and two-shot allreduce kernel.
     // Empirical value from the MNNVL sweep, matching FlashInfer's byte threshold.
-    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
+    // TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES overrides it (read once); it must match the Python side
+    // (tensorrt_llm/_torch/distributed/ops.py), which sizes the Lamport workspace with the same rule.
+    static size_t const kOneShotSizeThreshold = []()
+    {
+        size_t threshold = 64 * 1024 * 8 * 2;
+        if (char const* env = std::getenv("TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES"))
+        {
+            threshold = static_cast<size_t>(std::stoull(env));
+        }
+        return threshold;
+    }();
 
     if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
     {
@@ -2247,6 +2278,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
             at::from_blob(
                 sfBuf.mutable_data_ptr(), {numTokens, numPackedSfK}, {1, scaleLeadingDim},
                 [keep = sfBuf](void*) mutable {}, sfBuf.options())};
+    case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4: return {quantOut, sfBuf};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {normOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quantOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {normOut, quantOut, residualOut};

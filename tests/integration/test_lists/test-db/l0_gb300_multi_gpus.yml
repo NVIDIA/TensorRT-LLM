@@ -43,6 +43,13 @@ l0_gb300_multi_gpus:
   # parity vs CPU golden + FLA sequential, and runtime-level fused-vs-
   # sequential two-round replay parity.
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
+  # The FP8-output verify op compiles per layout class (split_v, compact), not per
+  # batch size (the MXFP8 scale buffer's extent is not part of the compile key).
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_compile_classes.py
+  # Verify PDL (TRTLLM_K3_KDA_VERIFY_PDL, SM107 only): bitwise parity of the PDL launch with
+  # the plain launch, the hazard rig that fails on a verify without its griddepcontrol.wait,
+  # the per-call decision and its fallbacks. The device tests skip off SM107.
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_pdl.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   # Plain-decode conv-state tiers: the decode kernel's in-place pool roll
   # must match the staged Triton pass and the ATen sequence exactly.
@@ -50,6 +57,7 @@ l0_gb300_multi_gpus:
   - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (30)
   # Kimi K3 op parity tests (random weights, no checkpoint; SM100/SM103).
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_prepad_mixer_ab.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   # KDA prefill scratch must stay bounded: _get_buffers is keyed on the
   # unquantized per-iteration context token count, so a cache entry that

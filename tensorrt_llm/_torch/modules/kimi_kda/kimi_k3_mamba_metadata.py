@@ -7,6 +7,8 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
+from ._kda_flashinfer_schedule import KDAFlashInferSchedule, flashinfer_prefill_requested
+
 KDA_PREFILL_CHUNK_SIZE = 64
 
 
@@ -53,6 +55,13 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.kda_chunk_indices: torch.Tensor | None = None
         self.kda_varlen_is_aligned: bool | None = None
         self.kda_single_sequence_length: int | None = None
+        # Opt-in FlashInfer prefill (TLLM_KDA_FLASHINFER_PREFILL=1) adds its own per-step
+        # schedule; None (the default) leaves this metadata exactly as it was.
+        self._kda_fi_schedule = (
+            KDAFlashInferSchedule(max_batch_size) if flashinfer_prefill_requested() else None
+        )
+        if self._kda_fi_schedule is not None:
+            self._kda_fi_schedule.prepare(self, [])
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         super().prepare(attn_metadata)
@@ -62,6 +71,8 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.state_indices_long = self._state_indices_long[:batch_size]
 
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()
+        if self._kda_fi_schedule is not None:
+            self._kda_fi_schedule.prepare(self, context_lengths)
         self.kda_varlen_is_aligned = (
             all(length % KDA_PREFILL_CHUNK_SIZE == 0 for length in context_lengths)
             if context_lengths

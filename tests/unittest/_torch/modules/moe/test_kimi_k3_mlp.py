@@ -287,6 +287,10 @@ def test_kimi_k3_shared_expert_parallel_construction(
     )
 
     shared = runtime.shared_experts
+    # The SiTU activation of the shared expert launches without PDL only beside an attention-DP dispatch (DEP16): the
+    # TP recipes (no attention DP, no MoE all-to-all) keep the PDL launch.
+    assert isinstance(shared.activation, SituAndMul)
+    assert shared.activation.overlaps_moe_dispatch is attention_dp
     assert runtime._defer_shared_allreduce is (
         not attention_dp
         and tp_size > 1
@@ -310,6 +314,45 @@ def test_kimi_k3_shared_expert_parallel_construction(
     )
     assert shared.gate_up_proj.weight.shape == (2 * local_intermediate, config.hidden_size)
     assert shared.down_proj.weight.shape == (config.hidden_size, local_intermediate)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "value,attention_dp,expected",
+    [
+        (None, True, True),
+        (None, False, True),
+        ("", True, True),
+        ("1", True, True),
+        ("0", True, False),
+        ("0", False, False),
+        ("legacy", True, False),
+        ("legacy", False, True),
+        (" Legacy ", True, False),
+        ("true", True, True),
+        ("off", False, False),
+    ],
+)
+def test_kimi_k3_router_gemm_dtype_env(monkeypatch, value, attention_dp, expected):
+    """KIMI_K3_ROUTER_BF16: unset or 1 = bf16, 0 = upcast, legacy = upcast under attention DP
+    only; the other spellings of get_env_flag work too."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+
+    if value is None:
+        monkeypatch.delenv("KIMI_K3_ROUTER_BF16", raising=False)
+    else:
+        monkeypatch.setenv("KIMI_K3_ROUTER_BF16", value)
+    assert modeling_kimi_linear._k3_router_gemm_bf16(attention_dp) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("value", ["2", "bf16", "legacy-ish"])
+def test_kimi_k3_router_gemm_dtype_env_rejects_unknown_values(monkeypatch, value):
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+
+    monkeypatch.setenv("KIMI_K3_ROUTER_BF16", value)
+    with pytest.raises(ValueError, match="KIMI_K3_ROUTER_BF16"):
+        modeling_kimi_linear._k3_router_gemm_bf16(True)
 
 
 @pytest.mark.cpu_only
@@ -417,6 +460,9 @@ def test_kimi_k3_shared_allreduce_ordering(
     runtime.moe_shared_event = _Event("shared_done", parallel)
     midpoint_event = _Event("midpoint", overlap) if defer else None
     runtime.moe_routed_event = midpoint_event
+    runtime.latent_down_stream = None
+    runtime.moe_latent_fork_event = None
+    runtime.moe_latent_ready_event = None
 
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
     monkeypatch.setattr(torch.cuda, "Event", lambda: pytest.fail("Events must be initialized once"))
@@ -446,6 +492,22 @@ def test_kimi_k3_shared_allreduce_ordering(
         elif defer:
             assert calls.index(("routed_moe", "main")) < allreduce
         torch.testing.assert_close(output, torch.full((2, 4), 10.0))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("overlap", [True, False], ids=["overlap", "no_overlap"])
+@pytest.mark.parametrize("moe_backend", ["CUTEDSL", "CUTEDSL_FC12", "TRTLLM", "MEGAMOE_CUTEDSL"])
+def test_kimi_k3_latent_down_stream(monkeypatch, overlap, moe_backend):
+    """TRTLLM_K3_LATENT_OVERLAP=0 keeps the CuteDSL latent down-projection on the main stream."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_LATENT_OVERLAP", overlap)
+    aux_stream_dict = _make_aux_stream_dict()
+    stream = modeling_kimi_linear._k3_latent_down_stream(aux_stream_dict, moe_backend)
+    if overlap and moe_backend in ("CUTEDSL", "CUTEDSL_FC12"):
+        assert stream is aux_stream_dict[AuxStreamType.MoeOutputMemset]
+    else:
+        assert stream is None
 
 
 def _make_kimi_k3_moe_weights(config):

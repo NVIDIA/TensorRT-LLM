@@ -37,7 +37,7 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
             if constexpr (std::is_same_v<T, SsmLayerConfig>)
                 return SsmLifeCycle{};
             else
-                return AttnLifeCycle::make(cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock);
+                return AttnLifeCycle::make(cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, cfg.cacheDomain);
         },
         layer);
 }

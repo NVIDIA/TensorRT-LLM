@@ -23,7 +23,9 @@ import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 str_dtype_to_binding, torch_dtype_to_binding,
+                                 torch_dtype_to_str)
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -59,7 +61,11 @@ from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache_manager_v2 import (DECODE_ONLY_DRAFT_KV_ENV, KVCacheManagerV2,
+                                  compute_decode_only_draft_kv_slack,
+                                  decode_only_draft_kv_requested,
+                                  decode_only_draft_kv_tokens_per_request,
+                                  legacy_kv_estimation_enabled)
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
@@ -70,6 +76,7 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+from .request_utils import disagg_gen_admission_factor
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
@@ -606,6 +613,9 @@ class KvCacheCreator:
     # Paired-reuse protocol flag. ``build_managers`` resolves it once and hands
     # it to both constructors; the managers must not re-derive it.
     _joint_kv_cache_reuse = False
+    # Decode-only draft pool (TLLM_DSPARK_DECODE_ONLY_DRAFT_KV), resolved and
+    # handed to the draft manager the same way.
+    _decode_only_draft_kv = False
 
     def __init__(
         self,
@@ -660,6 +670,7 @@ class KvCacheCreator:
                                                   KVCacheManagerV2)
         self._draft_config = draft_config
         self._skip_est = skip_est
+        self._validate_standalone_draft_cache()
         # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
@@ -831,24 +842,48 @@ class KvCacheCreator:
         model_config = self._model_engine.model.model_config
         use_separate_draft_kv_cache = (
             self._should_create_separate_draft_kv_cache())
-        # DRAFT cost unit convention under helix: compute per GLOBAL token with
-        # the same repurposed mapping runtime construction uses (the drafter is
-        # dense, not helix-sharded), then multiply by cp_size to express it per
-        # rank-LOCAL target token so the split's slopes share a unit (the
-        # target stores only every cp_size-th page per rank). Intercepts are
-        # per-request rank-local bytes and stay unscaled.
-        draft_mapping = self._mapping
-        helix_cp_scale = 1
-        if self._mapping.has_cp_helix():
-            draft_mapping = self._mapping.repurpose_helix_cp_to_tp()
-            helix_cp_scale = self._mapping.cp_size
+        draft_kwargs = {}
+        if self._uses_unified_standalone_draft_cache():
+            draft_kwargs = self._get_unified_draft_cache_kwargs()
         total = self._per_manager_cache_cost(
             self._kv_cache_manager_cls,
             model_config,
             kv_cache_config,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            **draft_kwargs)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
+        draft_cost = self._get_draft_cache_cost(
+            kv_cache_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
+        if draft_cost is not None:
+            total += draft_cost
+        return total
+
+    def _get_draft_cache_cost(
+        self,
+        kv_cache_config: KvCacheConfig,
+        *,
+        use_separate_draft_kv_cache: bool,
+    ) -> Optional[CacheCost]:
+        """Return the draft manager's standalone cache cost, if it has one.
+
+        Under helix CP the drafter is dense rather than helix-sharded, so it is
+        costed with the same repurposed mapping runtime construction uses, then
+        the slope is multiplied by cp_size to express it per rank-LOCAL target
+        token (the target stores only every cp_size-th page per rank).
+        Intercepts are per-request rank-local bytes and stay unscaled.
+        """
+        draft_mapping = self._get_draft_mapping()
+        helix_cp_scale = 1
+        if self._mapping.has_cp_helix():
+            helix_cp_scale = self._mapping.cp_size
+
+        def scaled(cost: CacheCost) -> CacheCost:
+            return CacheCost(slope=cost.slope * helix_cp_scale,
+                             intercept=cost.intercept)
+
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
@@ -858,8 +893,7 @@ class KvCacheCreator:
                 draft_model_config,
                 kv_cache_config,
                 mapping=draft_mapping)
-            total += CacheCost(slope=draft_cost.slope * helix_cp_scale,
-                               intercept=draft_cost.intercept)
+            return scaled(draft_cost)
         elif use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -888,8 +922,7 @@ class KvCacheCreator:
                     draft_kv_cache_config,
                     mapping=draft_mapping,
                     tokens_per_block=draft_tokens_per_block)
-                total += CacheCost(slope=draft_cost.slope * helix_cp_scale,
-                                   intercept=draft_cost.intercept)
+                return scaled(draft_cost)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 draft_cost = self._per_manager_cache_cost(
@@ -900,9 +933,8 @@ class KvCacheCreator:
                     tokens_per_block=draft_tokens_per_block,
                     num_layers=self._get_num_draft_layers(),
                     is_draft=True)
-                total += CacheCost(slope=draft_cost.slope * helix_cp_scale,
-                                   intercept=draft_cost.intercept)
-        return total
+                return scaled(draft_cost)
+        return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
@@ -1086,6 +1118,8 @@ class KvCacheCreator:
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
+            if self._uses_unified_standalone_draft_cache():
+                num_extra_tokens_per_seq += self._get_draft_scratch_tokens()
 
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
@@ -1104,15 +1138,21 @@ class KvCacheCreator:
             num_cache_blocks = (num_cache_blocks + self._mapping.tp_size -
                                 1) // self._mapping.tp_size
 
-        # Max cuda graph warmup required tokens
-        max_cuda_graph_bs = min(self._model_engine.batch_size,
-                                self._model_engine._max_cuda_graph_batch_size)
-        # Round up the max seq len to the block size
-        max_seq_len_blocks = ceil_div(self._model_engine.max_seq_len + 1,
-                                      self._tokens_per_block)
-        cuda_graph_warmup_block = max_seq_len_blocks + max_cuda_graph_bs - 1
-        num_cache_blocks = max(cuda_graph_warmup_block, num_cache_blocks)
-
+        # A disabled graph runner never performs max-sequence decode warmup.
+        # Bound the temporary cache by the real eager dummy workload in that
+        # case, so a larger final KV fraction does not inflate profiling pools.
+        # TRTLLM_K3_LEGACY_KV_ESTIMATION=1 keeps the floor regardless (A/B).
+        if (self._model_engine.cuda_graph_config is not None
+                or legacy_kv_estimation_enabled()):
+            # Max cuda graph warmup required tokens
+            max_cuda_graph_bs = min(
+                self._model_engine.batch_size,
+                self._model_engine._max_cuda_graph_batch_size)
+            # Round up the max seq len to the block size
+            max_seq_len_blocks = ceil_div(self._model_engine.max_seq_len + 1,
+                                          self._tokens_per_block)
+            cuda_graph_warmup_block = max_seq_len_blocks + max_cuda_graph_bs - 1
+            num_cache_blocks = max(cuda_graph_warmup_block, num_cache_blocks)
         # This is the minimal blocks required to run with max bs
         # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
         num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
@@ -1130,6 +1170,8 @@ class KvCacheCreator:
                 self._model_engine.max_seq_len,
                 self._kv_cache_config.max_attention_window,
             )
+            if self._uses_unified_standalone_draft_cache():
+                num_pool_groups += 1
         num_cache_blocks *= num_pool_groups
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
@@ -1533,12 +1575,14 @@ class KvCacheCreator:
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine, kv_cache_config)
 
-        # When using separate draft KV cache in one-model speculative decoding,
-        # use layer_mask to include only target layers. The draft layers should
-        # only be in the separate draft KV cache manager.
-        # We still pass spec_config so that num_extra_kv_tokens is calculated.
+        # The target and draft layers have independent storage properties.
+        # spec_config also determines the target's extra-token capacity.
         spec_dec_layer_mask = None
-        if self._should_create_separate_draft_kv_cache():
+        draft_cache_kwargs = (self._get_unified_draft_cache_kwargs()
+                              if self._uses_unified_standalone_draft_cache()
+                              else {})
+        if (self._should_create_separate_draft_kv_cache()
+                or draft_cache_kwargs):
             num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
@@ -1564,6 +1608,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            **draft_cache_kwargs,
         )
 
         if not self._skip_est:
@@ -1591,6 +1636,118 @@ class KvCacheCreator:
 
         return kv_cache_manager
 
+    def _is_standalone_dspark(self) -> bool:
+        spec_config = self._speculative_config
+        return (spec_config is not None
+                and spec_config.spec_dec_mode.is_dspark()
+                and not spec_config.draft_is_embedded_in_target
+                and not spec_config._use_shared_kv_cache)
+
+    def _is_embedded_dspark(self) -> bool:
+        spec_config = self._speculative_config
+        return (spec_config is not None
+                and spec_config.spec_dec_mode.is_dspark()
+                and spec_config.draft_is_embedded_in_target)
+
+    @staticmethod
+    def _unified_draft_cache_disabled_by_env() -> bool:
+        # A/B switch: keep the pre-unified (legacy) drafter state, i.e. no draft
+        # history is transferred from the context to the generation worker.
+        return os.environ.get("TLLM_DSPARK_DISABLE_UNIFIED_DRAFT_CACHE",
+                              "0") == "1"
+
+    def _uses_unified_standalone_draft_cache(self) -> bool:
+        if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
+                or not self._is_kv_cache_manager_v2
+                or self._unified_draft_cache_disabled_by_env()):
+            return False
+        # Drafters the unified cache cannot hold (MLA) keep legacy state in
+        # both aggregate and disaggregated serving instead of failing startup.
+        return self._unified_draft_cache_unsupported_reason() is None
+
+    def _validate_standalone_draft_cache(self) -> None:
+        """Validate manager-owned DSpark history for disaggregated serving."""
+        if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
+                or not self._is_disagg
+                or self._unified_draft_cache_disabled_by_env()):
+            return
+        if not self._is_kv_cache_manager_v2:
+            raise ValueError("DSpark disaggregation requires "
+                             "kv_cache_config.use_kv_cache_manager_v2=True "
+                             "on both workers.")
+        reason = self._unified_draft_cache_unsupported_reason()
+        if reason is not None:
+            logger.warning(
+                f"{reason} Falling back to legacy drafter state: the "
+                "generation worker drafts without the prompt history, which "
+                "lowers acceptance (NVIDIA/TensorRT-LLM#20010 transfers it).")
+
+    def _unified_draft_cache_unsupported_reason(self) -> Optional[str]:
+        """Shared admission requirements for unified aggregate and disagg KV."""
+        if (self._is_standalone_dspark()
+                and is_mla(self._draft_config.pretrained_config)):
+            return "Unified DSpark KV cache does not yet support MLA drafters."
+        return None
+
+    def _get_draft_mapping(self) -> Mapping:
+        """Use the drafter's dense TP mapping when target attention uses Helix."""
+        return (self._mapping.repurpose_helix_cp_to_tp()
+                if self._mapping.has_cp_helix() else self._mapping)
+
+    def _get_draft_scratch_tokens(self) -> int:
+        return 0 if self._is_embedded_dspark(
+        ) else self._speculative_config.max_draft_len + 1
+
+    def _get_unified_draft_cache_kwargs(self) -> dict:
+        """Pass draft storage properties separately from its history requirements."""
+        draft = self._model_engine.model.draft_model
+        if self._is_embedded_dspark():
+            return dict(
+                draft_num_layers=draft.num_stages,
+                draft_num_kv_heads=1,
+                draft_head_dim=int(draft._attn_params["head_dim"]),
+                draft_dtype=torch_dtype_to_binding(torch.bfloat16),
+                draft_kv_factor=1,
+                draft_scratch_tokens=0,
+                draft_attention_backend="DSv4",
+                draft_window_size=int(draft._attn_params["window_size"]),
+            )
+        config = self._draft_config.pretrained_config
+        num_heads = config.num_attention_heads
+        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
+        head_dim = getattr(config, "head_dim", None)
+        if head_dim is None:
+            head_dim = config.hidden_size // num_heads
+        draft_mapping = self._get_draft_mapping()
+        attention_tp_size = (1 if draft_mapping.enable_attention_dp else
+                             draft_mapping.tp_size)
+        attention_backend = self._speculative_config.attention_backend
+        if attention_backend == "AUTO":
+            attention_backend = draft.dflash_attention_backend
+        draft_model_config = getattr(draft, "config", None)
+        dtype = draft.fc.weight.dtype if hasattr(draft,
+                                                 "fc") else torch.bfloat16
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "Standalone draft KV supports FP16 and BF16 storage")
+        if attention_backend == "TRTLLM":
+            # The TRTLLM drafter attention reads FP8 pages with FP8 queries;
+            # the drafter's history is stored at half the BF16 footprint.
+            dtype = torch.float8_e4m3fn
+        return dict(
+            draft_num_layers=config.num_hidden_layers,
+            draft_num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
+            attention_tp_size,
+            draft_head_dim=head_dim,
+            draft_dtype=torch_dtype_to_binding(dtype),
+            draft_total_num_kv_heads=num_kv_heads,
+            draft_scratch_tokens=self._get_draft_scratch_tokens(),
+            draft_attention_backend=attention_backend,
+            draft_max_position_embeddings=(getattr(
+                draft_model_config, "max_position_embeddings", None)
+                                           if draft_model_config else None),
+        )
+
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
         Check if we need a separate draft KV cache manager for one-model mode.
@@ -1602,6 +1759,8 @@ class KvCacheCreator:
         """
         if self._speculative_config is None:
             # No drafter at all, so there is nothing to give a manager to.
+            return False
+        if self._uses_unified_standalone_draft_cache():
             return False
         is_external_drafter = (
             self._speculative_config.spec_dec_mode.is_external_drafter())
@@ -1769,9 +1928,7 @@ class KvCacheCreator:
         # the repurposed, CP-free mapping — helix round-robin ledger semantics
         # apply only to the TARGET KV (and KVCacheManagerV2 rejects
         # is_draft x helix outright).
-        draft_mapping = self._mapping
-        if draft_mapping.has_cp_helix():
-            draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
+        draft_mapping = self._get_draft_mapping()
         draft_tokens_per_block = self._get_draft_tokens_per_block()
         if draft_tokens_per_block != self._tokens_per_block:
             # Logged because nothing fails when the two differ: only the draft
@@ -1806,6 +1963,7 @@ class KvCacheCreator:
             is_disagg=self._is_disagg,
             enable_ugpu=self._llm_args.enable_ugpu,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            decode_only_draft_kv=self._decode_only_draft_kv,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -1942,6 +2100,23 @@ class KvCacheCreator:
             return target_kv_cache_config, draft_kv_cache_config
         target_budget, draft_budget = shares
 
+        # The proportional split assumes the draft pool holds as many tokens as
+        # the target pool. A disaggregated generation worker never runs the
+        # prompt forward, so an external drafter there only stores the tokens
+        # generated on this worker; TLLM_DRAFT_KV_GPU_BUDGET_GIB caps the
+        # draft's GPU share and hands the rest to the target pool.
+        draft_cap_gib = os.environ.get("TLLM_DRAFT_KV_GPU_BUDGET_GIB")
+        if draft_cap_gib and budget_attr == "max_gpu_total_bytes":
+            draft_cap = draft_kv.intercept + int(float(draft_cap_gib) * GB)
+            if draft_cap < draft_budget:
+                logger.info(
+                    f"Capping the draft KV cache GPU budget at "
+                    f"{draft_cap / GB:.2f} GiB (TLLM_DRAFT_KV_GPU_BUDGET_GIB="
+                    f"{draft_cap_gib}); the proportional share was "
+                    f"{draft_budget / GB:.2f} GiB.")
+                draft_budget = draft_cap
+                target_budget = total_budget - draft_budget
+
         logger.info(
             f"Splitting KV cache {budget_attr}: total={total_budget / GB:.2f} GiB, "
             f"target={target_budget / GB:.2f} GiB ({target_kv}), "
@@ -1955,6 +2130,108 @@ class KvCacheCreator:
             split_draft_kv_cache_config = draft_kv_cache_config.model_copy()
         setattr(split_draft_kv_cache_config, budget_attr, draft_budget)
         return split_target_kv_cache_config, split_draft_kv_cache_config
+
+    def _resolve_decode_only_draft_kv(
+            self, has_separate_one_model_draft: bool) -> bool:
+        """Whether ``TLLM_DSPARK_DECODE_ONLY_DRAFT_KV=1`` applies to this worker.
+
+        It applies to the separate, unpaired KVCacheManagerV2 draft pool of a
+        DSpark/DFlash drafter on a disaggregated worker that is not a context
+        server: there the drafter never runs a transferred prompt, whose KV is
+        the target's alone (see KVCacheManagerV2.register_decode_only_history).
+        Set it only for generation workers that prefill nothing locally: a
+        local prompt (e.g. conditional disaggregation) keeps its full draft
+        reservation, which this small pool cannot hold, and context admission
+        does not check the draft pool.
+
+        Args:
+            has_separate_one_model_draft: Whether a separate one-model draft KV
+                cache manager is built.
+
+        Returns:
+            True when the decode-only draft pool is enabled for this worker.
+        """
+        if not decode_only_draft_kv_requested():
+            return False
+        spec_config = self._speculative_config
+        mode = spec_config.spec_dec_mode if spec_config is not None else None
+        reasons = []
+        if not self._is_kv_cache_manager_v2:
+            reasons.append("KVCacheManagerV2 is not in use")
+        if not has_separate_one_model_draft:
+            reasons.append("there is no separate one-model draft KV cache")
+        if self._joint_kv_cache_reuse:
+            reasons.append("the draft pool is paired for joint block reuse")
+        if mode is None or not (mode.is_dflash() or mode.is_dspark()):
+            reasons.append("the drafter is not DSpark/DFlash")
+        if not self._is_disagg:
+            reasons.append("the worker is not disaggregated")
+        elif os.environ.get("TRTLLM_DISAGG_ROLE", "") == "context":
+            reasons.append("this is a context worker")
+        if reasons:
+            logger.warning(f"{DECODE_ONLY_DRAFT_KV_ENV}=1 is ignored: "
+                           f"{'; '.join(reasons)}.")
+            return False
+        return True
+
+    def _size_decode_only_draft_budget(
+        self,
+        target_kv_cache_config: KvCacheConfig,
+        draft_kv_cache_config: KvCacheConfig,
+        max_seq_len: int,
+    ) -> tuple[KvCacheConfig, KvCacheConfig]:
+        """Move the GPU budget a decode-only draft pool does not need to the target.
+
+        The proportional split sizes the draft pool to hold as many tokens as
+        the target pool. A decode-only one holds only tokens generated on this
+        worker, so it gets ``max_batch_size + 2`` requests of
+        TLLM_DSPARK_DECODE_ONLY_DRAFT_KV_TOKENS generated tokens plus slack and
+        growth, and at least one request at max_seq_len; the scheduler
+        backpressures on it past that. Each config also gets its own max_tokens:
+        the shared one was derived from the combined per-token cost, and the
+        V2 quota is the smaller of the byte budget and the max_tokens cost, so
+        it would keep the target at its old token count. An explicit user
+        max_tokens is kept.
+        """
+        cache_costs = self._get_target_and_draft_cache_costs(
+            target_kv_cache_config)
+        if cache_costs is None:
+            return target_kv_cache_config, draft_kv_cache_config
+        target_kv, draft_kv = cache_costs
+        target_budget = target_kv_cache_config.max_gpu_total_bytes
+        draft_budget = draft_kv_cache_config.max_gpu_total_bytes
+
+        tokens_per_block = self._get_draft_tokens_per_block()
+        slack = compute_decode_only_draft_kv_slack(self._speculative_config,
+                                                   tokens_per_block)
+        # Two scheduler growth rounds of 1 + 2 * max_draft_len before an
+        # update trims them, plus page rounding.
+        growth = (2 *
+                  (1 + 2 * self._speculative_config.max_total_draft_tokens) +
+                  tokens_per_block)
+        per_request = (decode_only_draft_kv_tokens_per_request() + slack +
+                       growth)
+        pool_tokens = max((self._max_batch_size + 2) * per_request,
+                          max_seq_len + slack + growth)
+        need = draft_kv.bytes_for_tokens(pool_tokens)
+        if need < draft_budget:
+            target_budget += draft_budget - need
+            draft_budget = need
+
+        sized_target = target_kv_cache_config.model_copy()
+        sized_draft = draft_kv_cache_config.model_copy()
+        sized_target.max_gpu_total_bytes = target_budget
+        sized_draft.max_gpu_total_bytes = draft_budget
+        if self._max_kv_tokens_in is None:
+            sized_target.max_tokens = target_kv.tokens_for_budget(target_budget)
+            sized_draft.max_tokens = draft_kv.tokens_for_budget(draft_budget)
+        logger.info(
+            f"{DECODE_ONLY_DRAFT_KV_ENV}=1: the draft KV pool holds tokens "
+            f"generated on this worker ({per_request} per request); "
+            f"target={target_budget / GB:.2f} GiB (max_tokens="
+            f"{sized_target.max_tokens}), draft={draft_budget / GB:.2f} GiB "
+            f"(max_tokens={sized_draft.max_tokens})")
+        return sized_target, sized_draft
 
     def _is_encoder_decoder(self) -> bool:
         return self._model_engine.model.model_config.is_encoder_decoder
@@ -2221,27 +2498,42 @@ class KvCacheCreator:
         self._joint_kv_cache_reuse = (has_separate_one_model_draft and
                                       self_kv_cache_config.enable_block_reuse
                                       and self._joint_reuse_supported())
+        self._decode_only_draft_kv = self._resolve_decode_only_draft_kv(
+            has_separate_one_model_draft)
 
-        # Split combined KV cache budgets before creating managers. Skip during
-        # estimation — estimation uses max_tokens-based logic and must not
-        # mutate the config.
+        # Split combined byte budgets before creating managers. V2 profiling
+        # also uses max_gpu_total_bytes, so its one-model target and draft must
+        # share that budget. The splitter clones configs without mutating the
+        # creator's profiling configuration.
         has_draft = (
             self._draft_model_engine is not None  # two-model
             or has_separate_one_model_draft)  # one-model
         draft_kv_cache_config = None
-        if not estimating_kv_cache and has_draft:
+        if has_draft:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
             # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
-            if self._needs_gpu_kv_cache_budget_split(original_max_seq_len,
-                                                     self_kv_cache_config):
+            # TRTLLM_K3_LEGACY_KV_ESTIMATION=1: profile each pool with the
+            # whole budget, as before the V2 profiling split (A/B).
+            split_gpu_budget = (not estimating_kv_cache
+                                or (self._is_kv_cache_manager_v2
+                                    and has_separate_one_model_draft
+                                    and not legacy_kv_estimation_enabled()))
+            if (split_gpu_budget and self._needs_gpu_kv_cache_budget_split(
+                    original_max_seq_len, self_kv_cache_config)):
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
                         "max_gpu_total_bytes", self_kv_cache_config,
                         draft_kv_cache_config))
+                if self._decode_only_draft_kv and not estimating_kv_cache:
+                    # The estimation build keeps its profiling max_tokens.
+                    self_kv_cache_config, draft_kv_cache_config = (
+                        self._size_decode_only_draft_budget(
+                            self_kv_cache_config, draft_kv_cache_config,
+                            original_max_seq_len))
             # KVCacheManagerV2 does not support two-model draft budget splitting.
             v2_two_model = (self._is_kv_cache_manager_v2
                             and self._draft_model_engine is not None)
-            if not v2_two_model:
+            if not estimating_kv_cache and not v2_two_model:
                 # Each manager sizes its host pool from host_cache_size directly.
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
@@ -2415,11 +2707,25 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
-        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
+        draft_num_layers: int = 0,
+        draft_num_kv_heads: int = 0,
+        draft_head_dim: int = 0,
+        draft_dtype: DataType = DataType.BF16,
+        draft_kv_factor: int = 2,
+        draft_total_num_kv_heads: Optional[int] = None,
+        draft_scratch_tokens: int = 0,
+        draft_window_size: Optional[int] = None,
+        draft_attention_backend: Optional[str] = None,
+        draft_max_position_embeddings: Optional[int] = None,
+        joint_kv_cache_reuse: bool = False,
+        decode_only_draft_kv: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
+    if draft_num_layers and not issubclass(kv_cache_manager_cls,
+                                           KVCacheManagerV2):
+        raise ValueError("Unified draft cache layers require KVCacheManagerV2.")
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
             and kv_cache_config.pool_ratio is None
@@ -2548,6 +2854,24 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_ugpu"] = enable_ugpu
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        if decode_only_draft_kv:
+            manager_extra_kwargs["decode_only_draft_kv"] = True
+        manager_extra_kwargs.update(
+            draft_num_layers=draft_num_layers,
+            draft_num_kv_heads=draft_num_kv_heads,
+            draft_head_dim=draft_head_dim,
+            draft_dtype=draft_dtype,
+            draft_kv_factor=draft_kv_factor,
+            draft_total_num_kv_heads=draft_total_num_kv_heads,
+            draft_scratch_tokens=draft_scratch_tokens,
+            draft_window_size=draft_window_size,
+            draft_attention_backend=draft_attention_backend,
+            draft_max_position_embeddings=draft_max_position_embeddings,
+        )
+        # Config-only draft managers have no engine here; preserve the
+        # existing conservative floor when the graph setting is unknown.
+        manager_extra_kwargs["cuda_graph_warmup_enabled"] = (
+            model_engine is None or model_engine.cuda_graph_config is not None)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -3060,10 +3384,17 @@ def should_enable_disagg_adp_overlap_headroom(
         mapping: Mapping,
         cache_transceiver_config: Optional[CacheTransceiverConfig],
         disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to non-PP disaggregated attention-DP."""
+    """Gate extra sequence slots to non-PP disaggregated overlap scheduling.
+
+    Attention-DP always takes them. Without attention-DP they are needed only
+    when the generation admission factor is above 1: a request whose
+    transfer completed can then be seated in the iteration where a finished
+    request still holds its slot.
+    """
     is_disagg = (cache_transceiver_config is not None
                  and cache_transceiver_config.backend is not None)
-    return (mapping.enable_attention_dp and is_disagg and not mapping.has_pp()
+    return ((mapping.enable_attention_dp or disagg_gen_admission_factor() > 1.0)
+            and is_disagg and not mapping.has_pp()
             and not disable_overlap_scheduler)
 
 

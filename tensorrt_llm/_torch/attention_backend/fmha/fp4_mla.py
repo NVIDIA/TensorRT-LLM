@@ -37,7 +37,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.logger import logger
 
 from .fallback import FallbackFmha
 from .phased import FmhaParams, PhasedFmha
@@ -46,6 +48,91 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
+    )
+
+
+def k3_fp8_split_k_context_supported(attn: "TrtllmAttention") -> bool:
+    """Whether the Rubin K3 split-K context kernel can serve ``attn``.
+
+    The kernel consumes FP8 Q/K-nope/K-pe/V scratch tensors, so it applies to both
+    NVFP4 and FP8 latent caches.
+    """
+    sm_version = get_sm_version()
+    if sm_version != 107:
+        reason = f"requires SM107, got SM{sm_version}"
+    elif attn.num_heads <= 0 or attn.num_heads != attn.num_kv_heads:
+        reason = (
+            "requires matching positive Q/KV head counts per rank, "
+            f"got {attn.num_heads}/{attn.num_kv_heads}"
+        )
+    elif attn.qk_nope_head_dim != 128 or attn.qk_rope_head_dim != 64 or attn.v_head_dim != 128:
+        reason = (
+            "requires head dimensions (K-nope, K-pe, V)=(128, 64, 128), "
+            f"got {(attn.qk_nope_head_dim, attn.qk_rope_head_dim, attn.v_head_dim)}"
+        )
+    else:
+        from tensorrt_llm._torch.custom_ops.cute_dsl_k3_context_custom_ops import (
+            IS_K3_CONTEXT_FMHA_AVAILABLE,
+            K3_CONTEXT_FMHA_IMPORT_ERROR,
+        )
+
+        if IS_K3_CONTEXT_FMHA_AVAILABLE:
+            return True
+        reason = "CuTe DSL kernel lacks split-K epilogue merge support"
+        if K3_CONTEXT_FMHA_IMPORT_ERROR is not None:
+            reason = f"CuTe DSL kernel import failed: {K3_CONTEXT_FMHA_IMPORT_ERROR!r}"
+            # SM107 with K3 shapes: the kernel is wanted here (FP8-KV split-K is on by
+            # default), so say it loudly; the image was most likely built with the public
+            # CuTe DSL.
+            logger.warning_once(
+                f"Rubin K3 FP8 split-K context FMHA disabled: {reason}; "
+                "using FP8 context fallback.",
+                key=("k3_fp8_split_k_context_import_failed", reason),
+            )
+    logger.debug_once(
+        f"Rubin K3 FP8 split-K context FMHA disabled: {reason}; using FP8 context fallback.",
+        key=("k3_fp8_split_k_context_unavailable", reason),
+    )
+    return False
+
+
+def run_k3_fp8_split_k_context_partition(
+    attn: "TrtllmAttention",
+    q: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    v: torch.Tensor,
+    output: torch.Tensor,
+    softmax_stats: torch.Tensor,
+    merge_op: torch.Tensor,
+    cu_q_seqlens: torch.Tensor,
+    cu_kv_seqlens: torch.Tensor,
+    *,
+    max_q_len: int,
+    max_kv_len: int,
+    is_causal: bool,
+) -> None:
+    """Run one K3 FP8 partition and merge it directly into ``output``."""
+    if not k3_fp8_split_k_context_supported(attn):
+        raise RuntimeError("Rubin K3 FP8 split-K context FMHA is unavailable.")
+    sm_scale = 1.0 / (
+        attn.q_scaling * ((attn.qk_nope_head_dim or 0) + (attn.qk_rope_head_dim or 0)) ** 0.5
+    )
+    num_heads = attn.num_heads
+    torch.ops.trtllm.cute_dsl_k3_context_fmha_rubin(
+        q.view(q.shape[0], num_heads, 192),
+        k_nope.view(k_nope.shape[0], num_heads, 128),
+        k_pe.view(k_pe.shape[0], 1, 64),
+        v.view(v.shape[0], num_heads, 128),
+        output.view(q.shape[0], num_heads, 128),
+        cu_q_seqlens,
+        cu_kv_seqlens,
+        softmax_stats,
+        merge_op,
+        max_q_len,
+        max_kv_len,
+        sm_scale,
+        is_causal,
     )
 
 
@@ -349,6 +436,43 @@ class Fp4MlaFmha(PhasedFmha):
             latent_cache=None,
         )
         return fp8_attention.forward(q, k, v, fp8_metadata, fp8_forward_args)
+
+    def supports_k3_fp8_split_k_context(self) -> bool:
+        """Whether the Rubin K3 split-K context kernel is available."""
+        return k3_fp8_split_k_context_supported(self.attn)
+
+    def forward_k3_fp8_split_k_context_partition(
+        self,
+        q: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+        output: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        merge_op: torch.Tensor,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        *,
+        max_q_len: int,
+        max_kv_len: int,
+        is_causal: bool,
+    ) -> None:
+        """Run one K3 FP8 partition and merge it directly into ``output``."""
+        run_k3_fp8_split_k_context_partition(
+            self.attn,
+            q,
+            k_nope,
+            k_pe,
+            v,
+            output,
+            softmax_stats,
+            merge_op,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            is_causal=is_causal,
+        )
 
     def run_mla_generation(self, params: FmhaParams) -> None:
         attn = params.attn

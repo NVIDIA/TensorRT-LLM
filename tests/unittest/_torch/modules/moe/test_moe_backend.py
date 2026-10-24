@@ -43,7 +43,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
@@ -77,7 +77,10 @@ from tensorrt_llm._torch.modules.fused_moe.interface import (
 )
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
-from tensorrt_llm._torch.modules.fused_moe.moe_scheduler import FusedCommMoEScheduler
+from tensorrt_llm._torch.modules.fused_moe.moe_scheduler import (
+    ExternalCommMoEScheduler,
+    FusedCommMoEScheduler,
+)
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -148,6 +151,30 @@ def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
 
     with pytest.raises(ValueError, match="got 2 counts for EP size 4"):
         scheduler._strip_adp_padding(x, router_logits, None, [6, 5])
+
+
+def test_external_comm_scheduler_plans_caller_output_buffer():
+    """Without external communication a caller buffer of the output's shape and dtype becomes
+    the plan's output buffer; anything else leaves the backend to allocate its own."""
+    moe = SimpleNamespace(comm=None, enable_alltoall=False, hidden_size=8)
+    scheduler = ExternalCommMoEScheduler(moe)
+    storage = torch.empty(6 * 8 + 6 * 16, dtype=torch.bfloat16)
+    buffer = storage[: 6 * 8].view(6, 8)
+
+    def plan(output, num_tokens=6, dtype=torch.bfloat16):
+        return scheduler._build_comm_plan(
+            [num_tokens], dtype, num_tokens=num_tokens, moe_output=output
+        )
+
+    assert plan(buffer).moe_output is buffer
+    assert not plan(buffer).payload_in_workspace
+    assert plan(None).moe_output is None
+    assert plan(buffer, num_tokens=5).moe_output is None
+    assert plan(buffer, dtype=torch.float16).moe_output is None
+    assert plan(storage[: 6 * 16].view(6, 16)[:, :8]).moe_output is None  # not contiguous
+    # External combine: the backend output is not the layer output.
+    moe.comm = SimpleNamespace(supports_post_quant_dispatch=lambda: True)
+    assert plan(buffer).moe_output is None
 
 
 def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
@@ -1309,6 +1336,7 @@ def run_backend_moe(
     dtype: torch.dtype,
     router_logits: torch.Tensor = None,
     trtllm_use_router_logits: bool = True,
+    moe_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Run MoE computation with backend-specific parameters.
@@ -1324,6 +1352,8 @@ def run_backend_moe(
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
             If False, uses token_selected_experts and token_final_scales.
             Note: When both are provided, TRTLLM only uses (topk_ids and topk_weights).
+        moe_output: Output buffer handed to the backend in the comm plan (external-comm
+            backends only), as ``ExternalCommMoEScheduler`` does for a caller's buffer.
     """
     # Common args for all backends (default: token_final_scales=float32)
     args = dict(
@@ -1368,11 +1398,78 @@ def run_backend_moe(
         args["comm_plan"] = MoECommPlan(
             input_sf_swizzled=True,
             enable_alltoall=False,
-            moe_output=None,
+            moe_output=moe_output,
             payload_in_workspace=False,
         )
 
     return backend.run_moe(MoERunContext(**args), workspace=workspace)
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103, 107),
+    reason="CuteDSL NVFP4 MoE runs on SM100/SM103/SM107",
+)
+def test_cutedsl_nvfp4_run_moe_writes_caller_output_buffer():
+    """The CuteDSL NVFP4 finalize writes into a plan output buffer that is a slice of a larger,
+    NaN-filled allocation (memset + scatter-add stay inside the slice)."""
+    seq_len, num_experts, top_k, hidden_size, intermediate_size = 7, 8, 2, 512, 512
+    dtype = torch.bfloat16
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, MoeBackendType.CUTEDSL
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        backend = create_test_backend(
+            backend_type=MoeBackendType.CUTEDSL,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+        )
+        backend.load_weights([quantize_util.create_weights(**quant_kwargs)])
+        backend.post_load_weights()
+        backend.cuda()
+
+        def run(moe_output=None):
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            return run_backend_moe(
+                backend,
+                MoeBackendType.CUTEDSL,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+                moe_output=moe_output,
+            )
+
+        guard = 64
+        storage = torch.full((guard + seq_len * hidden_size + guard,), float("nan"), dtype=dtype)
+        buffer = storage[guard : guard + seq_len * hidden_size].view(seq_len, hidden_size)
+        with torch.inference_mode():
+            expected = run()
+            output = run(buffer)
+        assert output.data_ptr() == buffer.data_ptr()
+        torch.testing.assert_close(output, expected)
+        assert storage[:guard].isnan().all() and storage[-guard:].isnan().all()
 
 
 # ============================================================================
@@ -1491,8 +1588,8 @@ def should_skip_ugpu_runtime(enable_ugpu: bool) -> Optional[str]:
     sm_version = get_sm_version()
     if sm_version != 107:
         return f"Rubin (SM 107) required, got SM {sm_version}"
-    if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
-        return "internal CuteDSL Rubin kernels are not available"
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return "the CuTe DSL Rubin kernels are not available"
     is_ugpu_enabled.cache_clear()
     if not is_ugpu_enabled():
         return "uGPU is not enabled/supported on this system"

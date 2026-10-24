@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 
+from ...._utils import get_env_flag
 from ....functional import PositionEmbeddingType
 from ....logger import logger
 from ....mapping import Mapping
@@ -27,8 +28,36 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
 from ..mla import MLA
+from ..multi_stream_utils import maybe_execute_in_parallel
 
 _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
+
+# TRTLLM_K3_MLA_GATE_FP8=1: when o_proj takes a prequantized FP8 1x128 input (the K3 FP8
+# weight-read projection on Rubin), the output gate emits that operand directly
+# (output_gate_fp8.gate_mul_fp8_r128c4: sigmoid, multiply and quantization in one kernel, the
+# same bytes as quantizing attn_out * sigmoid(gate)), and o_proj skips its quantize kernel.
+_K3_MLA_GATE_FP8 = bool(get_env_flag("TRTLLM_K3_MLA_GATE_FP8", False))
+# TRTLLM_K3_MLA_GATE_OVERLAP=1: under CUDA graphs, g_proj (which only reads hidden_states) runs on
+# a side stream while the attention runs instead of after it. Same kernels and inputs.
+_K3_MLA_GATE_OVERLAP = bool(get_env_flag("TRTLLM_K3_MLA_GATE_OVERLAP", False))
+# TRTLLM_K3_MLA_FUSE_GATE_A=1: g_proj runs inside one [g_proj; fused q_a/kv_a] GEMM before the
+# attention (built by the model after weight load: modeling_kimi_linear._fuse_mla_gate_and_a_proj,
+# which reads the same variable). It and TRTLLM_K3_MLA_GATE_OVERLAP take g_proj off the critical
+# path in two incompatible ways, so setting both is an error (_check_gate_flags).
+# TRTLLM_K3_MLA_GATE_FP8 only changes how the gate is applied and composes with either.
+_K3_MLA_FUSE_GATE_A_ENV = "TRTLLM_K3_MLA_FUSE_GATE_A"
+
+
+def _check_gate_flags() -> None:
+    """Reject ``TRTLLM_K3_MLA_FUSE_GATE_A=1`` together with ``TRTLLM_K3_MLA_GATE_OVERLAP=1``."""
+    if _K3_MLA_GATE_OVERLAP and get_env_flag(_K3_MLA_FUSE_GATE_A_ENV, False):
+        raise ValueError(
+            "TRTLLM_K3_MLA_FUSE_GATE_A=1 and TRTLLM_K3_MLA_GATE_OVERLAP=1 are alternatives: the "
+            "first fuses g_proj into the q_a/kv_a GEMM before the attention, the second runs it "
+            "on a side stream during the attention. Set at most one of them; "
+            "TRTLLM_K3_MLA_GATE_FP8=1 works with either."
+        )
+
 
 # Deliberate divergence from upstream, which defaults this to "cute-dsl".
 #
@@ -36,8 +65,8 @@ _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 # decode path cannot initialize at all. flashinfer 0.6.15 unpacks the MLA
 # scheduler params one MLIR value per field
 # (flashinfer/cute_dsl/attention/monolithic/mla_helpers.py), while the installed
-# nvidia-cutlass-dsl-internal 0.3.0+20260529 serializes FastDivmodDivisor as two
-# SSA values (cutlass issue #3243). Every rank dies during executor init with
+# nvidia-cutlass-dsl serializes FastDivmodDivisor as two SSA values (cutlass
+# issue #3243). Every rank dies during executor init with
 #
 #     ValueError: FastDivmodDivisor expects exactly 2 MLIR values
 #                 (encoded divisor + scalar divisor SSA), got 1.
@@ -47,8 +76,8 @@ _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 # This is a package-pairing problem, not an architecture limit: nothing on that
 # path inspects the SM version. So this is a default flip rather than a hard
 # block -- set TLLM_K3_MLA_GEN_BACKEND=cute-dsl to opt back in wherever the
-# FlashInfer and CuTe-DSL builds do agree (for example the K3 FlashInfer fork
-# used on GB300). Restore the upstream default once the shipped pair is aligned.
+# FlashInfer and CuTe-DSL builds do agree. Restore the upstream default once the
+# shipped pair is aligned.
 _KIMI_K3_MLA_GEN_BACKEND_DEFAULT = "trtllm-gen"
 
 
@@ -222,6 +251,8 @@ class KimiK3MLAAttention(MLA):
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
+        # Before any allocation: a conflicting gate configuration fails at model build.
+        _check_gate_flags()
         quant_config = model_config.get_quant_config()
         has_fp8_kv_cache = bool(
             quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
@@ -274,6 +305,15 @@ class KimiK3MLAAttention(MLA):
         self.register_to_config = False
 
         self.use_output_gate = use_output_gate
+        # g_proj's side stream (TRTLLM_K3_MLA_GATE_OVERLAP): the MoE latent-down stream, idle
+        # during attention and forked from the main stream again by the MoE after this join.
+        self._gate_stream = (
+            aux_stream_dict.get(AuxStreamType.MoeOutputMemset)
+            if use_output_gate and _K3_MLA_GATE_OVERLAP
+            else None
+        )
+        self._gate_fork_event = torch.cuda.Event()
+        self._gate_join_event = torch.cuda.Event()
 
         if use_output_gate:
             # The gate must match o_proj's input sharding (under helix the
@@ -322,15 +362,48 @@ class KimiK3MLAAttention(MLA):
             self.mqa.mla_backend_policy = _kimi_k3_mla_decode_backend_policy
         self.rotary_emb = None
         self.apply_rotary_emb = False
+        # NoPE: with an FP8 KV cache, build the FP8 decode query in one kernel
+        # instead of a BF16 absorption BMM plus its FP8 re-read in the RoPE
+        # kernel (opt-in: TRTLLM_K3_MLA_FP8_Q_ABSORB=1).
+        self.fp8_nope_q_absorb = os.environ.get("TRTLLM_K3_MLA_FP8_Q_ABSORB", "0") == "1"
+        # [g_proj; kv_a_proj_with_mqa] stacked into one projection of the layer input
+        # (one activation quant + one GEMM instead of two each). Built after weight load
+        # by the model when TRTLLM_K3_MLA_FUSE_GATE_A=1; the two projections then hold row
+        # views of its weight.
+        self.g_fused_a_proj = None
+
+    def _o_proj_takes_prequantized(self, attn_out: torch.Tensor, gate: torch.Tensor) -> bool:
+        """Whether ``o_proj.forward_prequantized`` can take the fused gate's FP8 output."""
+        return (
+            bool(getattr(self.o_proj, "supports_prequantized_input", False))
+            and callable(getattr(self.o_proj, "forward_prequantized", None))
+            and attn_out.dim() == 2
+            and gate.shape == attn_out.shape
+            and attn_out.dtype == torch.bfloat16
+            and gate.dtype == torch.bfloat16
+            and attn_out.shape[0] > 0
+            and attn_out.shape[1] % 128 == 0
+            and attn_out.stride(1) == 1
+            and gate.stride(1) == 1
+        )
 
     def _apply_output_gate_and_o_proj(
         self,
         hidden_states: torch.Tensor,
         attn_out: torch.Tensor,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.use_output_gate:
-            attn_out = attn_out * self.g_proj(hidden_states).sigmoid()
-        return self.o_proj(attn_out)
+        """``o_proj(attn_out * sigmoid(g_proj(hidden_states)))``; ``gate``: g_proj's output if
+        already computed."""
+        if not self.use_output_gate:
+            return self.o_proj(attn_out)
+        if gate is None:
+            gate = self.g_proj(hidden_states)
+        if _K3_MLA_GATE_FP8 and self._o_proj_takes_prequantized(attn_out, gate):
+            from .output_gate_fp8 import gate_mul_fp8_r128c4
+
+            return self.o_proj.forward_prequantized(*gate_mul_fp8_r128c4(attn_out, gate))
+        return self.o_proj(attn_out * gate.sigmoid())
 
     def forward(
         self,
@@ -342,10 +415,37 @@ class KimiK3MLAAttention(MLA):
         # and it routes through the sparse hooks when they are installed. The
         # dense path this module uses is element 0.
         attn_outputs = self._create_outputs(hidden_states, attn_metadata)
-        super().forward_impl(
-            None,
-            hidden_states,
-            attn_metadata,
-            attn_output=attn_outputs,
+        if self.g_fused_a_proj is not None:
+            # TRTLLM_K3_MLA_FUSE_GATE_A: the gate comes out of the fused GEMM, on the full
+            # (CUDA-graph padded) input as g_proj ran before: the gate rows match attn_outputs;
+            # MLA slices fused_a_output to the real tokens. _gate_stream is None here
+            # (_check_gate_flags).
+            gate_width = self.g_proj.out_features
+            gate, fused_a_output = self.g_fused_a_proj(hidden_states).split(
+                [gate_width, self.g_fused_a_proj.out_features - gate_width], -1
+            )
+            super().forward_impl(
+                None,
+                hidden_states,
+                attn_metadata,
+                attn_output=attn_outputs,
+                fused_a_output=fused_a_output,
+            )
+            return self._apply_output_gate_and_o_proj(hidden_states, attn_outputs[0], gate)
+        forward_impl = super().forward_impl
+
+        def attention() -> torch.Tensor:
+            forward_impl(None, hidden_states, attn_metadata, attn_output=attn_outputs)
+            return attn_outputs[0]
+
+        if self._gate_stream is None:
+            return self._apply_output_gate_and_o_proj(hidden_states, attention())
+        attn_out, gate = maybe_execute_in_parallel(
+            attention,
+            lambda: self.g_proj(hidden_states),
+            self._gate_fork_event,
+            self._gate_join_event,
+            self._gate_stream,
+            disable_on_compile=True,
         )
-        return self._apply_output_gate_and_o_proj(hidden_states, attn_outputs[0])
+        return self._apply_output_gate_and_o_proj(hidden_states, attn_out, gate)

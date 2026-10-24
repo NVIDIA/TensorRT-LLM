@@ -21,8 +21,8 @@ from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
-from tensorrt_llm._torch.cute_dsl_utils import (
-    IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
+from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from tensorrt_llm._torch.modules.linear import (Linear, WeightMode,
                                                 WeightsLoadingConfig)
 from tensorrt_llm._torch.modules.swiglu import swiglu
@@ -185,8 +185,8 @@ def test_fp4_linear_cute_dsl(dtype, mnk):
 
 
 def _skip_if_no_ugpu():
-    if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
-        pytest.skip("Rubin CuTe DSL internal package is not available")
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("the CuTe DSL Rubin helpers are not available")
     is_ugpu_enabled.cache_clear()
     if not is_ugpu_enabled():
         pytest.skip("uGPU localization is not enabled/supported on this system")
@@ -497,8 +497,8 @@ def test_fp4_fused_gate_up_linear_ugpu_correctness():
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-@pytest.mark.skipif(not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-                    reason="Rubin CuTe DSL internal package is not available")
+@pytest.mark.skipif(not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                    reason="the CuTe DSL Rubin helpers are not available")
 @pytest.mark.parametrize(
     "mnk,tactic",
     [
@@ -587,8 +587,8 @@ def test_fp4_linear_cute_dsl_mixed_cluster_ugpu_strided_output(mnk, tactic):
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-    reason="Rubin CuTe DSL internal package is not available",
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="the CuTe DSL Rubin helpers are not available",
 )
 @pytest.mark.parametrize(
     "m,mma_tiler,mma_inst_shape",
@@ -667,8 +667,8 @@ def test_cute_dsl_nvfp4_rubin_mixed_clusters_n192_fallback(
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-@pytest.mark.skipif(not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-                    reason="Rubin CuTe DSL internal package is not available")
+@pytest.mark.skipif(not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                    reason="the CuTe DSL Rubin helpers are not available")
 def test_fp4_linear_cute_dsl_mixed_cluster_fallback_sfb_layout():
     from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import FP4GemmRunner
@@ -855,8 +855,8 @@ def test_fp4_linear_ugpu_weight_lifecycle_and_global_bias(
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-@pytest.mark.skipif(not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-                    reason="Rubin CuTe DSL internal package is not available")
+@pytest.mark.skipif(not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                    reason="the CuTe DSL Rubin helpers are not available")
 @pytest.mark.parametrize("swap_ab", [False, True])
 def test_cute_dsl_nvfp4_inplace_rubin_mixed_clusters_ugpu_correctness(swap_ab):
     _skip_if_no_ugpu()

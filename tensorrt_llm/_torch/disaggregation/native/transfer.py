@@ -154,8 +154,21 @@ class RecvReqInfo:
     slice_id: Optional[int] = None
     need_aux: bool = False
     bounce_dst_base: Optional[int] = None
+    # Set when the receiver bounces only these of its layer groups: the senders gather those
+    # fragments into their share of the region (bounce_writer_bytes each) and write the rest in
+    # place. Sent only when set, so peers that predate them still parse the request.
+    bounce_layer_groups: Optional[List[int]] = None
+    bounce_writer_bytes: Optional[int] = None
 
     def to_bytes(self) -> bytes:
+        partial_bounce = (
+            {}
+            if self.bounce_layer_groups is None
+            else {
+                "bounce_layer_groups": [int(g) for g in self.bounce_layer_groups],
+                "bounce_writer_bytes": self.bounce_writer_bytes,
+            }
+        )
         return msgpack.packb(
             {
                 "sender_req_id": self.sender_req_id,
@@ -171,6 +184,7 @@ class RecvReqInfo:
                 "slice_id": self.slice_id,
                 "need_aux": self.need_aux,
                 "bounce_dst_base": self.bounce_dst_base,
+                **partial_bounce,
             }
         )
 
@@ -211,6 +225,10 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    # Partial bounce: the leading bounce_num_frags fragments are gathered into this writer's
+    # bounce_writer_bytes share of the region; the rest are written in place. None: all of them.
+    bounce_num_frags: Optional[int] = None
+    bounce_writer_bytes: Optional[int] = None
     # Set by Sender._enqueue while the work item owns the Tx session's
     # queued-or-active lifetime reservation. Worker completion releases it.
     owner_session: Optional["TxSession"] = None
@@ -586,8 +604,16 @@ class Sender(SenderBase):
         Called opportunistically from the listener thread when a new REQUEST_DATA
         arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
         entries that are never consumed; this sweep prevents unbounded growth.
+
+        A context-first receiver sends REQUEST_DATA only to the ranks that hold
+        its request's KV cache, after the context phase produced it. When no
+        TxSession has claimed such an entry within the TTL, none ever will (the
+        session already ended, or the receiver names a request this rank never
+        had), so the receiver is told that the transfer failed instead of
+        waiting for data that will not arrive.
         """
         now = time.monotonic()
+        orphaned_infos: list[RecvReqInfo] = []
         with self._sessions_lock, self._peer_requests_lock:
             stale_req_rids = [
                 rid
@@ -601,8 +627,12 @@ class Sender(SenderBase):
             ]
             for rid in stale_req_rids:
                 if rid not in self._sessions and rid in self._peer_requests:
-                    self._peer_requests.pop(rid, None)
+                    req_info_map = self._peer_requests.pop(rid, None)
                     self._peer_requests_timestamps.pop(rid, None)
+                    if req_info_map:
+                        orphaned_infos.extend(
+                            info for info in req_info_map.values() if not info.need_aux
+                        )
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
             for rid in stale_cancel_rids:
                 if rid in self._sessions:
@@ -613,6 +643,36 @@ class Sender(SenderBase):
                     key for key in self._cancel_failed_result_keys if key[0] != rid
                 }
                 logger.debug(f"Swept stale pre-cancel tombstone for rid={rid}")
+        for info in orphaned_infos:
+            self._fail_orphaned_receiver(info)
+
+    def _fail_orphaned_receiver(self, info: RecvReqInfo) -> None:
+        """Send FAILED for a context-first REQUEST_DATA that no TxSession claimed.
+
+        This resolves the receiver's peer reservation, so its RxSession reports
+        the request as failed. The sweep runs on the executor and listener
+        threads, so the message goes through the thread-safe outbox.
+        """
+        logger.warning(
+            f"KV transfer request rid={info.unique_rid} from receiver "
+            f"{info.instance_name} rank {info.instance_rank} has no TxSession on this "
+            f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
+        )
+        try:
+            peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
+            message = _make_kv_result_msg(
+                self._instance_rank,
+                info.unique_rid,
+                info.slice_id if info.slice_id is not None else 0,
+                True,  # is_last_slice
+                AgentResult.FAILED,
+            )
+            if not self._reliable_message_outbox.submit(peer_ri.self_endpoint, message):
+                logger.error(f"Failed to queue FAILED result for orphaned rid={info.unique_rid}")
+        except (KeyError, ValueError) as exc:
+            # KeyError: the receiver rank never registered with this sender;
+            # ValueError: it registered without an endpoint.
+            logger.error(f"Failed to notify receiver of orphaned rid={info.unique_rid}: {exc}")
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -1187,13 +1247,11 @@ class Sender(SenderBase):
         # Aggregate fragment pointers from all matching pool pairs.
         # Each pool pair produces one or more region pairs (rp), each containing
         # a numpy array of src/dst pointers and a uniform bytes_per_region.
-        src_frag_parts: list[np.ndarray] = []
-        dst_frag_parts: list[np.ndarray] = []
-        # Instead of calling np.full() per region pair to build a size array and
-        # then np.concatenate() all of them, we record (count, bytes_per_region)
-        # tuples and construct the final sizes array with a single np.repeat().
-        # For 48k+ items this avoids many small allocations in the hot loop.
-        size_specs: list[tuple[int, int]] = []
+        # Fragments of layer groups the receiver bounces on their own go first:
+        # the bounce gathers exactly that leading run and writes the rest in place.
+        bounce_groups = set(req_info.bounce_layer_groups or ())
+        bounced_parts: list[tuple[np.ndarray, np.ndarray, int]] = []
+        frag_parts: list[tuple[np.ndarray, np.ndarray, int]] = []
         dst_device_id = peer_ri.device_id
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
@@ -1215,7 +1273,11 @@ class Sender(SenderBase):
             token_range = task._slice.token_range
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
-            if peer_ri.cp_size > 1 and self._registrar.self_rank_info.cp_size == 1:
+            if (
+                peer_ri.cp_size > 1
+                and self._registrar.self_rank_info.cp_size == 1
+                and not getattr(lg_info, "cp_as_tp", False)
+            ):
                 # Helix: the receiver owns global blocks [cp_rank::cp_size]
                 # (same protocol as partition_context_for_helix); block reuse
                 # is rejected under helix. Windowed lists are a suffix of the
@@ -1303,24 +1365,14 @@ class Sender(SenderBase):
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
             region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+            parts = bounced_parts if peer_lg in bounce_groups else frag_parts
             for rp in region_pairs:
-                src_frag_parts.append(rp.src.memory.ptrs)
-                dst_frag_parts.append(rp.dst.memory.ptrs)
-                size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+                parts.append(
+                    (rp.src.memory.ptrs, rp.dst.memory.ptrs, rp.src.memory.bytes_per_region)
+                )
 
-        if src_frag_parts:
-            src_frags = np.concatenate(src_frag_parts)
-            dst_frags = np.concatenate(dst_frag_parts)
-            # Build the kv_sizes array in one shot: np.repeat expands each
-            # bytes_per_region value by its count, e.g.:
-            #   values=[4096, 8192], counts=[100, 200]
-            #   → [4096]*100 ++ [8192]*200
-            counts, values = zip(*size_specs)
-            kv_sizes = np.repeat(np.array(values, dtype=np.int64), counts)
-        else:
-            src_frags = np.array([], dtype=np.int64)
-            dst_frags = np.array([], dtype=np.int64)
-            kv_sizes = np.array([], dtype=np.int64)
+        src_frags, dst_frags, kv_sizes = Sender._concat_frag_parts(bounced_parts + frag_parts)
+        num_bounced_frags = sum(int(src.size) for src, _, _ in bounced_parts)
 
         # handle mamba fragments
         m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
@@ -1354,7 +1406,30 @@ class Sender(SenderBase):
             slice_id=task.slice_id,
             is_last_slice=task._slice.is_last_slice,
             bounce_dst_base=req_info.bounce_dst_base,
+            bounce_num_frags=num_bounced_frags if bounce_groups else None,
+            bounce_writer_bytes=req_info.bounce_writer_bytes,
         )
+
+    @staticmethod
+    def _concat_frag_parts(
+        parts: list[tuple[np.ndarray, np.ndarray, int]],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Concatenate (src_ptrs, dst_ptrs, bytes_per_region) parts into flat arrays, in order."""
+        if not parts:
+            empty = np.array([], dtype=np.int64)
+            return empty, empty.copy(), empty.copy()
+        src_frags = np.concatenate([src for src, _, _ in parts])
+        dst_frags = np.concatenate([dst for _, dst, _ in parts])
+        # Instead of calling np.full() per region pair to build a size array and
+        # then np.concatenate() all of them, build the sizes array in one shot:
+        # np.repeat expands each bytes_per_region value by its count, e.g.:
+        #   values=[4096, 8192], counts=[100, 200]
+        #   → [4096]*100 ++ [8192]*200
+        # For 48k+ items this avoids many small allocations in the hot loop.
+        counts = [int(src.size) for src, _, _ in parts]
+        values = [nbytes for _, _, nbytes in parts]
+        kv_sizes = np.repeat(np.array(values, dtype=np.int64), counts)
+        return src_frags, dst_frags, kv_sizes
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -1570,6 +1645,8 @@ class Sender(SenderBase):
             else:
                 self._save_peer_req_info(info)
                 tasks = list(session.kv_tasks)
+                if session.aux_task is not None:
+                    tasks.append(session.aux_task)
                 already_known = False
                 aux_task_exists = False
         if terminal:
@@ -1587,14 +1664,21 @@ class Sender(SenderBase):
             try:
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(info.instance_rank)
-                trans_meta = self._build_kv_write_meta(task, info)
+                trans_meta = (
+                    self._build_kv_write_meta(task, info)
+                    if isinstance(task, KVSendTask)
+                    else self._build_aux_write_meta(task, info)
+                )
                 if task._perf_timer is not None:
                     task._perf_timer.record_push_start(trans_meta.peer_rank)
                 self._enqueue(trans_meta)
             except Exception as exc:
                 task.fail(exc)
                 session.set_exception(str(exc))
-                self._send_failed_result_to_receiver(info, slice_id=task.slice_id)
+                is_aux = isinstance(task, AuxSendTask)
+                self._send_failed_result_to_receiver(
+                    info, slice_id=-1 if is_aux else task.slice_id, aux=is_aux
+                )
                 raise
 
     def _cancel_failed_result_key(
@@ -1816,7 +1900,9 @@ class TxSession(TxSessionBase):
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or (
+            aux_buffer is not None and aux_buffer.has_draft_history
+        )
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
         self._aux_buffer = aux_buffer
@@ -2304,8 +2390,11 @@ class Receiver(ReceiverBase):
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV (should_send_kv) yet still
-            count in expected_transfers, so the live writers overflow their slots;
+          * neither side duplicates heads (duplicate_head_factor == peer_duplicate_head_factor == 1)
+            -- the senders' should_send_kv uses peer_duplicate_head_factor, so when it is > 1 some
+            ranks don't send KV yet still count in expected_transfers, and a live writer overflows
+            its slot (e.g. MLA from a TP context server to an attention-DP generation server: one
+            of the TP ranks writes every page);
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
@@ -2313,7 +2402,7 @@ class Receiver(ReceiverBase):
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
         Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
         the mismatched case, so this only needs the count to split evenly."""
-        if overlap.duplicate_head_factor != 1:
+        if overlap.duplicate_head_factor != 1 or overlap.peer_duplicate_head_factor != 1:
             return False
         if overlap.overlap_pp_size > 1:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
@@ -2325,6 +2414,19 @@ class Receiver(ReceiverBase):
         # a masked PP stage may advertise no replicated view even though another
         # stage owns one that is visible in the receiver's page table.
         if len(overlap.ranks) > 1:
+            if peer_ri.page_table is not None:
+                for layer_group in peer_ri.page_table.layer_groups:
+                    if not getattr(layer_group, "cp_as_tp", False):
+                        continue
+                    draft_tp, _ = MambaPolicy._mamba_tp(peer_ri)
+                    if (
+                        layer_group.total_kv_head_num is None
+                        or layer_group.kv_head_num_per_rank * draft_tp
+                        > layer_group.total_kv_head_num
+                    ):
+                        # Draft head replicas may elect fewer writers than the
+                        # target's heads, so their payload shares are unequal.
+                        return False
             for page_table in (peer_ri.page_table, receiver_page_table):
                 if page_table is None:
                     continue
@@ -2333,6 +2435,35 @@ class Receiver(ReceiverBase):
                         if pool_view.mapper_kind == MapperKind.REPLICATED:
                             return False
         return True
+
+    @staticmethod
+    def _drafter_bounce_groups(
+        overlap: PeerOverlap,
+        pool_mapping: dict,
+        receiver_page_table: Optional[KVCachePageTable],
+        sender_page_table: Optional[KVCachePageTable],
+        block_ids_per_layer_groups: list,
+    ) -> List[int]:
+        """Receiver drafter (cp_as_tp) layer groups with blocks to receive whose fan-in senders hold
+        equal, disjoint slices of the KV heads, so each writes the same bytes and a bounce can split
+        the region evenly. Empty if any such group splits otherwise, or under PP fan-in."""
+        num_writers = len(overlap.ranks)
+        if num_writers <= 1 or overlap.overlap_pp_size > 1:
+            return []
+        if receiver_page_table is None or sender_page_table is None:
+            return []
+        groups = set()
+        for (self_lg, _), (peer_lg, _) in pool_mapping.items():
+            layer_group = receiver_page_table.layer_groups[self_lg]
+            if not getattr(layer_group, "cp_as_tp", False):
+                continue
+            if int(block_ids_per_layer_groups[self_lg].size) == 0:
+                continue
+            sender_heads = sender_page_table.layer_groups[peer_lg].kv_head_num_per_rank
+            if sender_heads * num_writers != layer_group.kv_head_num_per_rank:
+                return []
+            groups.add(self_lg)
+        return sorted(groups)
 
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
@@ -2424,9 +2555,33 @@ class Receiver(ReceiverBase):
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=receiver_req.mamba_state_index,
                 )
-        bounced = allow_bounce and self._bounce.reserve(
-            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
+        # Senders that each hold a slice of a drafter's KV heads write one small fragment per
+        # (page, layer, K/V) of its history. Under such a fan-in, bounce the drafter layer groups
+        # on their own: every sender writes an equal share, and the target KV and recurrent state
+        # go in place in the same write. It takes precedence over the full bounce, whose equal
+        # split those differently sized groups and the recurrent state rule out.
+        drafter_groups = (
+            self._drafter_bounce_groups(
+                topo_overlap,
+                self._registrar.get_pool_mapping(peer_infos),
+                self._registrar.self_extractor.page_table,
+                peer_infos.page_table,
+                receiver_req.block_ids_per_layer_groups,
+            )
+            if self._bounce.enabled
+            and sender_dp_rank is not None
+            and not cp_involved
+            and task.expected_transfers > 1
+            else []
         )
+        if drafter_groups:
+            bounced = self._bounce.reserve(
+                receiver_req, task.expected_transfers, layer_groups=drafter_groups
+            )
+        else:
+            bounced = allow_bounce and self._bounce.reserve(
+                receiver_req, task.expected_transfers, extra_bytes=extra_bytes
+            )
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -2672,7 +2827,9 @@ class RxSession(RxSessionBase):
             SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
         )
         self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or (
+            aux_buffer is not None and aux_buffer.has_draft_history
+        )
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
         self._aux_buffer = aux_buffer
@@ -3008,6 +3165,8 @@ class RxSession(RxSessionBase):
         """Read token data from the aux buffer slot into the given request."""
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
         assert self.aux_slot is not None, "No aux_slot set for this session"
+        if self._aux_buffer.has_draft_history:
+            self.unpack_draft_history(request)
         first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens) = (
             self._aux_buffer.get_slot_data(self.aux_slot)
         )
@@ -3022,6 +3181,12 @@ class RxSession(RxSessionBase):
                     "cached_tokens": cached_tokens,
                 },
             }
+
+    def unpack_draft_history(self, request: LlmRequest) -> None:
+        """Read standalone history without changing context-first token fields."""
+        if self._aux_buffer is None or self.aux_slot is None:
+            raise ValueError("Standalone draft transfer requires an auxiliary buffer slot")
+        request.py_draft_transfer_history = self._aux_buffer.get_slot_draft_history(self.aux_slot)
 
     def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?"""
@@ -3210,7 +3375,10 @@ def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAge
 def _make_aux_buffer(
     kvm: KVCacheManager, max_slots: int, max_draft_len: Optional[int] = None
 ) -> Optional[AuxBuffer]:
+    draft_history = bool(getattr(kvm, "draft_layer_ids", ()))
     if max_slots <= 0:
+        if draft_history:
+            raise ValueError("Standalone draft transfer requires auxiliary buffer slots")
         return None
     if max_draft_len is None:
         max_draft_len = max(0, int(getattr(kvm, "max_draft_len", 0)))
@@ -3219,6 +3387,7 @@ def _make_aux_buffer(
         beam_width=max(1, int(getattr(kvm, "max_beam_width", 1))),
         max_draft_len=max_draft_len,
         device="cpu",
+        draft_history=draft_history,
     )
 
 

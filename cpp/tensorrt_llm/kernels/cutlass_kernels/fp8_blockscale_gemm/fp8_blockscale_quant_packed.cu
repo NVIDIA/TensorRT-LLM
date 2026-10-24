@@ -24,6 +24,7 @@
 
 #include "fp8_blockscale_quant_packed.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 
@@ -396,7 +397,176 @@ __global__ void silu_and_mul_fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3
 #endif
 }
 
+// RMSNorm (no residual) followed by the 1x128 FP8 quantization above, written
+// straight into the CuTe/CUTLASS 128x4 swizzled scale layout
+// (launch_fp8_quantize_1x128_cutedsl_bf16_e4m3). One CTA owns one row; warp w
+// covers columns [512 w, 512 w + 512) and each lane 16 contiguous elements, so
+// lane groups of 8 are exactly the 1x128 quantization blocks of the plain
+// quantizer. The normalized row is rounded to BF16 before quantization to
+// reproduce the unfused "FlashInfer RMSNorm -> fp8_quantize_1x128_cutedsl"
+// sequence: y = bf16((x * rstd) * w) with rstd = rsqrt(sum(x^2) / k + eps).
+// rstd can differ from FlashInfer's in the last bit: the FP32 sum-of-squares
+// order differs, and FlashInfer's JIT build uses fast-math division and rsqrt.
+// The weight is read before the PDL wait (cudaGridDependencySynchronize), so it
+// must not be written by the kernels this launch may overlap (true for model
+// weights). Rows in [m, gridDim.x) only write zero scales, like the plain
+// quantizer.
+template <int MaxWarpsPerBlock>
+__global__ void rmsnorm_fp8_quantize_1x128_cutedsl_kernel_impl(__nv_fp8_e4m3* __restrict__ fp8_output,
+    uint8_t* __restrict__ swizzled_scale_output, __nv_bfloat16 const* __restrict__ input,
+    int64_t const input_row_stride, __nv_bfloat16 const* __restrict__ weight, float const eps, int const m, int const k)
+{
+    constexpr int kElemsPerLane = 16;
+    int const row = static_cast<int>(blockIdx.x);
+    int const warpId = static_cast<int>(threadIdx.x) >> 5;
+    int const laneId = static_cast<int>(threadIdx.x) & 31;
+    int const numWarps = static_cast<int>(blockDim.x) >> 5;
+    int const kBase = warpId * 512 + laneId * kElemsPerLane;
+    // k % 128 == 0 (checked by the op), so a lane group of 8 is entirely in or out of range.
+    bool const kInRange = kBase < k;
+    bool const rowInRange = row < m;
+
+    __shared__ float warpSumSq[MaxWarpsPerBlock];
+
+    union Bf16Pack
+    {
+        uint4 pack[2];
+        __nv_bfloat16 values[kElemsPerLane];
+    };
+
+    // The norm weight is not produced by the preceding kernel, so it may be read
+    // before the PDL wait. Nothing is written before the wait.
+    Bf16Pack w;
+    w.pack[0] = make_uint4(0U, 0U, 0U, 0U);
+    w.pack[1] = make_uint4(0U, 0U, 0U, 0U);
+    if (kInRange)
+    {
+        auto const* wPtr = reinterpret_cast<uint4 const*>(weight + kBase);
+        w.pack[0] = __ldg(wPtr);
+        w.pack[1] = __ldg(wPtr + 1);
+    }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
+    Bf16Pack x;
+    x.pack[0] = make_uint4(0U, 0U, 0U, 0U);
+    x.pack[1] = make_uint4(0U, 0U, 0U, 0U);
+    if (rowInRange && kInRange)
+    {
+        auto const* xPtr = reinterpret_cast<uint4 const*>(input + static_cast<int64_t>(row) * input_row_stride + kBase);
+        x.pack[0] = xPtr[0];
+        x.pack[1] = xPtr[1];
+    }
+
+    // ---- 1. Row sum of squares: lane -> warp (butterfly) -> CTA (fixed warp order). ----
+    float sumSq = 0.0F;
+#pragma unroll
+    for (int i = 0; i < kElemsPerLane; ++i)
+    {
+        float const v = static_cast<float>(x.values[i]);
+        sumSq += v * v;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        sumSq += __shfl_xor_sync(0xFFFFFFFFU, sumSq, offset);
+    }
+    if (laneId == 0)
+    {
+        warpSumSq[warpId] = sumSq;
+    }
+    __syncthreads();
+    float rowSumSq = 0.0F;
+    for (int i = 0; i < numWarps; ++i)
+    {
+        rowSumSq += warpSumSq[i];
+    }
+    float const rstd = rsqrtf(rowSumSq / static_cast<float>(k) + eps);
+
+    // ---- 2. Normalize, round to BF16, per-1x128-block amax (8-lane groups). ----
+    Bf16Pack y;
+    __nv_bfloat16 maxElem = __nv_bfloat16(0.0F);
+#pragma unroll
+    for (int i = 0; i < kElemsPerLane; ++i)
+    {
+        float const normalized = static_cast<float>(x.values[i]) * rstd;
+        y.values[i] = __float2bfloat16_rn(normalized * static_cast<float>(w.values[i]));
+        maxElem = __hmax(maxElem, __habs(y.values[i]));
+    }
+    float amax = static_cast<float>(maxElem);
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 4, 8));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 2, 8));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 1, 8));
+    amax = fmaxf(amax, 1e-10F);
+
+    // ---- 3. UE8M0 scale and FP8 values, identical arithmetic to the plain quantizer. ----
+    float const dequantScaleRaw = amax * reciprocal_approximate_ftz_local(448.0F);
+    __nv_fp8_e8m0 ue8m0Scale;
+    ue8m0Scale.__x = __nv_cvt_float_to_e8m0(dequantScaleRaw, __NV_SATFINITE, cudaRoundPosInf);
+    constexpr uint32_t kFp32ExponentBias = 127U;
+    float const quantScale = ue8m0Scale.__x == 0
+        ? 1.0F
+        : exp2f(static_cast<float>(kFp32ExponentBias) - static_cast<float>(ue8m0Scale.__x));
+
+    if (rowInRange && kInRange)
+    {
+        union Fp8Pack
+        {
+            float4 pack;
+            __nv_fp8_e4m3 values[kElemsPerLane];
+        };
+
+        Fp8Pack out;
+#pragma unroll
+        for (int i = 0; i < kElemsPerLane; ++i)
+        {
+            out.values[i] = __nv_fp8_e4m3(static_cast<float>(y.values[i]) * quantScale);
+        }
+        *reinterpret_cast<float4*>(fp8_output + static_cast<int64_t>(row) * k + kBase) = out.pack;
+    }
+
+    // ---- 4. Scale: one byte per 1x128 block, replicated over its four 32-wide MX groups. ----
+    if (laneId % 8 == 0 && kInRange)
+    {
+        int const sf128Idx = warpId * 4 + laneId / 8;
+        int const numKTiles = (k / 32 + 3) / 4;
+        int64_t const dstOffset = static_cast<int64_t>(row / 128) * numKTiles * 512
+            + static_cast<int64_t>(sf128Idx) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4;
+        uint32_t const replicated = rowInRange ? static_cast<uint32_t>(ue8m0Scale.__x) * 0x01010101U : 0U;
+        *reinterpret_cast<uint32_t*>(swizzled_scale_output + dstOffset) = replicated;
+    }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 } // namespace
+
+void launch_rmsnorm_fp8_quantize_1x128_cutedsl_bf16_e4m3(__nv_fp8_e4m3* fp8_output, uint8_t* swizzled_scale_output,
+    __nv_bfloat16 const* input, int64_t input_row_stride, __nv_bfloat16 const* weight, float eps, int m, int k,
+    int padded_m, cudaStream_t stream)
+{
+    if (m <= 0 || k <= 0)
+    {
+        return;
+    }
+
+    constexpr int kMaxWarpsPerBlock = kRmsNormFp8QuantMaxK / 512;
+    int const numWarps = (k + 511) / 512;
+    TLLM_CHECK_WITH_INFO(k % 128 == 0 && numWarps <= kMaxWarpsPerBlock,
+        "rmsnorm_fp8_quantize_1x128_cutedsl needs k %% 128 == 0 and k <= %d, got %d", kRmsNormFp8QuantMaxK, k);
+    TLLM_CHECK_WITH_INFO(padded_m >= m && padded_m % 128 == 0, "padded_m must be a multiple of 128 and >= m");
+
+    dim3 const grid(static_cast<unsigned int>(padded_m), 1, 1);
+    dim3 const block(static_cast<unsigned int>(numWarps * 32), 1, 1);
+
+    tensorrt_llm::common::launchWithPdlWhenEnabled("rmsnorm_fp8_quantize_1x128_cutedsl_kernel_impl",
+        rmsnorm_fp8_quantize_1x128_cutedsl_kernel_impl<kMaxWarpsPerBlock>, grid, block, 0, stream, fp8_output,
+        swizzled_scale_output, input, input_row_stride, weight, eps, m, k);
+}
 
 void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32_t* packed_scale_output,
     __nv_bfloat16 const* input, int m, int k, int scale_leading_dim_uint32, cudaStream_t stream)

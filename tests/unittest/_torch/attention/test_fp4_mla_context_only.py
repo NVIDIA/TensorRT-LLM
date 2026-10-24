@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.attention_backend.fp4_mla import Fp4MlaVLayout
 from tensorrt_llm._torch.attention_backend.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
@@ -16,11 +17,21 @@ from tensorrt_llm.mapping import Mapping
 
 @pytest.mark.parametrize("role", ["context", "generation", ""])
 @pytest.mark.parametrize("is_disagg", [False, True])
+@pytest.mark.parametrize("v_layout", list(Fp4MlaVLayout), ids=lambda layout: layout.value)
 @pytest.mark.parametrize("legacy_flag", [None, "0", "1"])
-def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, legacy_flag):
+def test_layout_and_estimate_follow_worker_role(
+    monkeypatch, role, is_disagg, v_layout, legacy_flag
+):
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
-    monkeypatch.delenv("TRTLLM_FP4_MLA_ATTENTION_BACKEND", raising=False)
-    monkeypatch.delenv("TLLM_KIMI_K3_BF16_KV_LAYERS", raising=False)
+    monkeypatch.setenv("TRTLLM_FP4_MLA_ATTENTION_BACKEND", "cutedsl")
+    monkeypatch.setenv(
+        "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE", str(int(v_layout is Fp4MlaVLayout.FUSED_V))
+    )
+    monkeypatch.setenv(
+        "TRTLLM_FP4_MLA_PACKED_SINGLE_COPY",
+        str(int(v_layout is Fp4MlaVLayout.PACKED_SINGLE_COPY)),
+    )
+    monkeypatch.delenv("TLLM_KIMI_K3_FP8_KV_LAYERS", raising=False)
     if legacy_flag is None:
         monkeypatch.delenv("TRTLLM_FP4_MLA_CONTEXT_ONLY_CACHE", raising=False)
     else:
@@ -38,8 +49,10 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, le
         is_disagg=is_disagg,
     )
     context_only = is_disagg and role == "context"
+    has_v_sidecar = v_layout is Fp4MlaVLayout.DUAL_COPY and not context_only
     assert manager.fp4_mla_context_only_cache == context_only
-    assert manager.mla_v_head_dim is None
+    assert manager.fp4_mla_v_layout is v_layout
+    assert manager.mla_v_head_dim == (512 if has_v_sidecar else None)
     slope, intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
         SimpleNamespace(pretrained_config=config),
         Mapping(world_size=1, tp_size=1, rank=0),
@@ -48,7 +61,7 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, le
         max_batch_size=2,
         is_disagg=is_disagg,
     )
-    assert slope == (360 if context_only else 392)
+    assert slope == (648 if has_v_sidecar else 360 if context_only else 392)
     assert intercept == 2 * 16 * 576 * 2
 
 

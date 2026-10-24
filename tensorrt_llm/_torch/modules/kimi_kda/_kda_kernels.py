@@ -23,6 +23,7 @@ the delta-rule inner loop plus its state update.
 from __future__ import annotations
 
 import importlib
+import os
 from types import ModuleType
 from typing import Optional, Tuple
 
@@ -69,26 +70,38 @@ def is_kda_optimized_supported() -> bool:
     return get_kda_sm_version() in (100, 103, 107)
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "num_out_tokens", "beta_row_stride"])
 def _fused_kda_post_conv_kernel(
     packed_ptr,
     q_out_ptr,
     k_out_ptr,
     v_out_ptr,
+    beta_ptr,
+    beta_out_ptr,
     num_tokens,
+    num_out_tokens,
+    beta_row_stride,
     l2_norm_eps,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
-    """Normalize and transpose channel-major packed Q/K/V in one launch."""
+    """Normalize and transpose channel-major packed Q/K/V in one launch.
+
+    Rows in ``[num_tokens, num_out_tokens)`` are written as exact zeros, so
+    the outputs are already zero-padded for the KDA prefill op. When
+    ``HAS_BETA``, beta is cast to fp32 and zero-padded the same way.
+    """
     token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     head_idx = tl.program_id(1)
     dim_offsets = tl.arange(0, BLOCK_DIM)
     token_mask = token_offsets < num_tokens
+    out_token_mask = token_offsets < num_out_tokens
     dim_mask = dim_offsets < HEAD_DIM
     mask = token_mask[:, None] & dim_mask[None, :]
+    out_mask = out_token_mask[:, None] & dim_mask[None, :]
 
     feature_offsets = head_idx * HEAD_DIM + dim_offsets
     projection_size = NUM_HEADS * HEAD_DIM
@@ -101,9 +114,10 @@ def _fused_kda_post_conv_kernel(
         token_offsets[:, None].to(tl.int64) * projection_size + feature_offsets[None, :]
     )
 
+    # Masked-off rows load 0 and normalize to exactly +0 (0 / sqrt(eps)).
     q = tl.load(packed_ptr + source_offsets, mask=mask, other=0.0).to(tl.float32)
     q /= tl.sqrt(tl.sum(q * q, axis=1) + l2_norm_eps)[:, None]
-    tl.store(q_out_ptr + output_offsets, q, mask=mask)
+    tl.store(q_out_ptr + output_offsets, q, mask=out_mask)
 
     k = tl.load(
         packed_ptr + section_stride + source_offsets,
@@ -111,14 +125,21 @@ def _fused_kda_post_conv_kernel(
         other=0.0,
     ).to(tl.float32)
     k /= tl.sqrt(tl.sum(k * k, axis=1) + l2_norm_eps)[:, None]
-    tl.store(k_out_ptr + output_offsets, k, mask=mask)
+    tl.store(k_out_ptr + output_offsets, k, mask=out_mask)
 
     v = tl.load(
         packed_ptr + 2 * section_stride + source_offsets,
         mask=mask,
         other=0.0,
     )
-    tl.store(v_out_ptr + output_offsets, v, mask=mask)
+    tl.store(v_out_ptr + output_offsets, v, mask=out_mask)
+
+    if HAS_BETA:
+        token_i64 = token_offsets.to(tl.int64)
+        beta = tl.load(
+            beta_ptr + token_i64 * beta_row_stride + head_idx, mask=token_mask, other=0.0
+        ).to(tl.float32)
+        tl.store(beta_out_ptr + token_i64 * NUM_HEADS + head_idx, beta, mask=out_token_mask)
 
 
 def fused_kda_post_conv(
@@ -126,12 +147,20 @@ def fused_kda_post_conv(
     num_heads: int,
     head_dim: int,
     l2_norm_eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    padded_tokens: Optional[int] = None,
+    beta: Optional[torch.Tensor] = None,
+):
     """Convert packed channel-major convolution output to KDA Q/K/V.
 
     ``packed`` has shape ``[3 * num_heads * head_dim, tokens]``. The
-    returned tensors are contiguous ``[1, tokens, num_heads, head_dim]``;
-    Q and K are L2-normalized along the head dimension.
+    returned tensors are contiguous ``[1, out_tokens, num_heads, head_dim]``;
+    Q and K are L2-normalized along the head dimension. ``out_tokens`` is
+    ``padded_tokens`` when given (rows past ``tokens`` are exact zeros),
+    else ``tokens``.
+
+    If ``beta`` (``[..., tokens, num_heads]`` with unit head stride) is
+    given, a fourth output holds it cast to fp32 and zero-padded to
+    ``[1, out_tokens, num_heads]``.
     """
     projection_size = num_heads * head_dim
     if packed.ndim != 2 or packed.shape[0] != 3 * projection_size:
@@ -143,31 +172,56 @@ def fused_kda_post_conv(
         raise ValueError("Packed KDA post-conv requires a contiguous tensor")
 
     num_tokens = packed.shape[1]
-    output_shape = (1, num_tokens, num_heads, head_dim)
+    out_tokens = num_tokens if padded_tokens is None else padded_tokens
+    if out_tokens < num_tokens:
+        raise ValueError(f"padded_tokens={out_tokens} is smaller than tokens={num_tokens}")
+    output_shape = (1, out_tokens, num_heads, head_dim)
     q_out = torch.empty(output_shape, dtype=packed.dtype, device=packed.device)
     k_out = torch.empty_like(q_out)
     v_out = torch.empty_like(q_out)
-    if num_tokens == 0:
-        return q_out, k_out, v_out
+    beta_out = None
+    beta_2d = None
+    if beta is not None:
+        if beta.ndim == 2 and beta.shape == (num_tokens, num_heads):
+            beta_2d = beta
+        elif beta.ndim == 3 and beta.shape == (1, num_tokens, num_heads):
+            beta_2d = beta[0]
+        if beta_2d is None or beta_2d.stride(-1) != 1 or beta_2d.device != packed.device:
+            raise ValueError(
+                f"beta must be [tokens={num_tokens}, heads={num_heads}] or "
+                f"[1, tokens={num_tokens}, heads={num_heads}] on {packed.device} "
+                f"with unit head stride, got shape {tuple(beta.shape)}, "
+                f"stride {beta.stride()}, device {beta.device}"
+            )
+        beta_out = torch.empty(
+            (1, out_tokens, num_heads), dtype=torch.float32, device=packed.device
+        )
+    if out_tokens == 0:
+        return (q_out, k_out, v_out) if beta is None else (q_out, k_out, v_out, beta_out)
 
     block_tokens = 16
     block_dim = triton.next_power_of_2(head_dim)
-    grid = (triton.cdiv(num_tokens, block_tokens), num_heads)
+    grid = (triton.cdiv(out_tokens, block_tokens), num_heads)
     _fused_kda_post_conv_kernel[grid](
         packed,
         q_out,
         k_out,
         v_out,
+        beta_2d if beta_2d is not None else q_out,
+        beta_out if beta_out is not None else q_out,
         num_tokens,
+        out_tokens,
+        beta_2d.stride(0) if beta_2d is not None else 0,
         l2_norm_eps,
         num_heads,
         head_dim,
         block_tokens,
         block_dim,
+        beta is not None,
         num_warps=8,
         num_stages=3,
     )
-    return q_out, k_out, v_out
+    return (q_out, k_out, v_out) if beta is None else (q_out, k_out, v_out, beta_out)
 
 
 @triton.jit
@@ -346,6 +400,283 @@ def is_kda_mtp_verify_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Generated MTP verify kernel (trtllm::kimi_k3_kda_mtp_verify_kf).
+# ---------------------------------------------------------------------------
+
+# Default off. Startup snapshot per dispatch instance, strict 0/1 parsing.
+_KF_VERIFY_ENV = "TRTLLM_K3_KDA_VERIFY_KF"
+# (heads per rank, num_spec) the kernel takes: attention-DP ranks (96 heads) with 3 or 5 drafts. TP8 ranks (12 heads)
+# stay on the CuTe DSL kernels, whose PDL variant (TRTLLM_K3_KDA_VERIFY_PDL) is at least as fast there.
+_KF_VERIFY_ROUTES = frozenset({(96, 3), (96, 5)})
+# The Kimi K3 constants the kernel bakes in.
+_KF_LOWER_BOUND = -5.0
+_KF_SCALE = 128**-0.5
+_KF_ONORM_EPS = 1e-5
+_KF_BF16_INPUTS = (
+    "x_q",
+    "x_k",
+    "x_v",
+    "g",
+    "beta",
+    "onorm_g",
+    "cs_q",
+    "cs_k",
+    "cs_v",
+    "recurrent_state",
+    "k_cache",
+    "v_cache",
+    "beta_cache",
+)
+# The constants the kernel reads as float32. The mixer casts its parameters to BF16 (A_log and dt_bias among them), so
+# it passes FP32 copies of those two (see mtp_verify).
+_KF_FP32_INPUTS = ("w_q", "w_k", "w_v", "A_log", "dt_bias", "onorm_weight")
+# Tensors read through tensor maps or bulk copies: (name, stride dims that must be whole 16-byte units). beta and the
+# beta cache are read through tensor maps with boxes of 8 heads, so their rows must be padded to a multiple of 8 heads
+# (the [f_a | b] projection and the cache manager do; a separate [T, 12] beta output at TP8 is not eligible).
+_KF_ROW_ALIGNED = (
+    ("x_q", (1,)),
+    ("x_k", (1,)),
+    ("x_v", (1,)),
+    ("g", (1,)),
+    ("beta", (1,)),
+    ("onorm_g", (1,)),
+    ("cs_q", (0, 2)),
+    ("cs_k", (0, 2)),
+    ("cs_v", (0, 2)),
+    ("k_cache", (0, 1)),
+    ("g_cache", (0, 1)),
+    ("v_cache", (0, 1)),
+    ("beta_cache", (0, 1)),
+    ("recurrent_state", (0,)),
+    ("w_q", ()),
+    ("w_k", ()),
+    ("w_v", ()),
+)
+_kf_logged: set = set()
+
+
+def _parse_switch(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def _log_kf_once(key: str, message: str) -> None:
+    """Log once per process and key: which routes ran and why other calls stayed on the CuTe DSL kernels."""
+    if key in _kf_logged:
+        return
+    _kf_logged.add(key)
+    try:
+        from tensorrt_llm.logger import logger
+    except ImportError:  # pragma: no cover - source-loader stub path
+        return
+    logger.info(message)
+
+
+def _kf_layout_ok(kwargs: dict, num_heads: int, num_spec: int) -> bool:
+    """The layouts that ``kimi_k3_kda_mtp_verify_kf`` checks (the production op accepts more of them)."""
+    dim = num_heads * 128
+    x_q, indices = kwargs["x_q"], kwargs["ssm_state_indices"]
+    if x_q.dim() != 4 or indices.dim() != 1 or kwargs["A_log"].dim() != 1:
+        return False
+    rows = x_q.shape[1]
+    if rows != indices.shape[0] * (num_spec + 1):
+        return False
+    if indices.dtype == torch.int32 and not indices.is_contiguous():
+        return False
+    for name in ("x_q", "x_k", "x_v", "g", "onorm_g"):  # [1, T, H, 128], contiguous head blocks
+        t = kwargs[name]
+        if t.shape != (1, rows, num_heads, 128) or t.stride(3) != 1 or t.stride(2) != 128:
+            return False
+    beta = kwargs["beta"]
+    if beta.shape != (1, rows, num_heads) or beta.stride(2) != 1:
+        return False
+    for name, shape in (
+        ("w_q", (dim, 4)),
+        ("w_k", (dim, 4)),
+        ("w_v", (dim, 4)),
+        ("A_log", (num_heads,)),
+        ("dt_bias", (dim,)),
+        ("onorm_weight", (128,)),
+    ):
+        t = kwargs[name]
+        if t.dtype != torch.float32 or t.shape != shape or not t.is_contiguous():
+            return False
+    state = kwargs["recurrent_state"]
+    if state.dim() != 4 or state.shape[1:] != (num_heads, 128, 128):
+        return False
+    if state.stride()[1:] != (128 * 128, 128, 1):
+        return False
+    pool = state.shape[0]
+    # Accepted counts may have any slot stride (KV cache manager v2 keeps a count block per slot).
+    accepted = kwargs["num_accepted_tokens"]
+    if accepted.dim() != 1 or accepted.shape[0] < pool:
+        return False
+    for name in ("cs_q", "cs_k", "cs_v"):  # [>= pool, H * 128, >= 3 + num_spec], dim-contiguous
+        t = kwargs[name]
+        if t.dim() != 3 or t.shape[0] < pool or t.shape[1] != dim or t.shape[2] < 3 + num_spec:
+            return False
+        if t.stride(1) != 1:
+            return False
+    for name, width in (
+        ("k_cache", dim),
+        ("g_cache", dim),
+        ("v_cache", dim),
+        ("beta_cache", num_heads),
+    ):
+        t = kwargs[name]
+        if (
+            t.dim() != 3
+            or t.shape[0] < pool
+            or t.shape[1:] != (num_spec, width)
+            or t.stride(2) != 1
+        ):
+            return False
+    return True
+
+
+def _kf_verify_ineligibility(kwargs: dict, mxfp8_output: bool) -> Optional[str]:
+    """Why the generated verify kernel cannot take a ``mtp_verify`` call, or None.
+
+    Mirrors the checks of ``kimi_k3_kda_mtp_verify_kf`` (which raises on a violation), so
+    enabling the switch never turns a call that the CuTe DSL kernels take into an error:
+    such a call stays on the CuTe DSL kernels, and each distinct reason is logged once.
+    """
+    if not mxfp8_output:
+        return "BF16 output"
+    if not kwargs.get("packed_token_layout", False) or not kwargs.get("fuse_output_norm", False):
+        return "not the packed fused-norm layout"
+    if kwargs.get("cu_seqlens") is not None:
+        return "cu_seqlens"
+    if kwargs.get("onorm_g") is None or kwargs.get("onorm_weight") is None:
+        return "no output-norm inputs"
+    num_heads = kwargs["A_log"].shape[0]
+    if (num_heads, kwargs["num_spec"]) not in _KF_VERIFY_ROUTES:
+        return f"{num_heads} heads with num_spec {kwargs['num_spec']}"
+    scale = kwargs.get("scale")
+    if (
+        kwargs.get("lower_bound") != _KF_LOWER_BOUND
+        or (scale is not None and scale != _KF_SCALE)
+        or kwargs.get("onorm_eps", 1e-5) != _KF_ONORM_EPS
+    ):
+        return "constants"
+    if any(kwargs[name].dtype != torch.bfloat16 for name in _KF_BF16_INPUTS):
+        return "dtype"
+    if kwargs["g_cache"].dtype != torch.float32:
+        return "dtype"
+    for name in _KF_FP32_INPUTS:
+        if kwargs[name].dtype != torch.float32:
+            return f"{name} is {kwargs[name].dtype}, not torch.float32"
+    if not _kf_layout_ok(kwargs, num_heads, kwargs["num_spec"]):
+        return "layout"
+    for name, dims in _KF_ROW_ALIGNED:
+        tensor = kwargs[name]
+        units = 16 // tensor.element_size()
+        if tensor.data_ptr() % 16 != 0 or any(
+            tensor.stride(d) <= 0 or tensor.stride(d) % units != 0 for d in dims
+        ):
+            return f"{name} alignment"
+    return None
+
+
+def _with_fp32_gate_constants(
+    kwargs: dict, A_log_f32: Optional[torch.Tensor], dt_bias_f32: Optional[torch.Tensor]
+) -> dict:
+    """The verify arguments with FP32 copies of ``A_log`` / ``dt_bias``, which the KF kernel reads as float32.
+
+    The copies hold the same values as the parameters (BF16 -> FP32 is exact). Without them, or with other shapes,
+    the arguments stay as they are and the eligibility check names a parameter that is not float32.
+    """
+    if A_log_f32 is None or dt_bias_f32 is None:
+        return kwargs
+    if A_log_f32.shape != kwargs["A_log"].shape or dt_bias_f32.shape != kwargs["dt_bias"].shape:
+        return kwargs
+    return {**kwargs, "A_log": A_log_f32, "dt_bias": dt_bias_f32}
+
+
+def _kf_mtp_verify(
+    *,
+    enable_pdl: bool,
+    x_q: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    w_q: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    cs_q: torch.Tensor,
+    cs_k: torch.Tensor,
+    cs_v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    beta_cache: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    num_spec: int,
+    num_accepted_tokens: torch.Tensor,
+    onorm_g: torch.Tensor,
+    onorm_weight: torch.Tensor,
+    lower_bound: float = _KF_LOWER_BOUND,
+    scale: Optional[float] = None,
+    onorm_eps: float = _KF_ONORM_EPS,
+    **unused,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``trtllm::kda_mtp_decode_fp8`` (packed layout, fused output norm) through the KF kernel."""
+    num_tokens = x_q.shape[1]
+    num_heads = A_log.shape[0]
+    head_dim = x_v.shape[-1]
+    if scale is None:
+        scale = x_q.shape[-1] ** -0.5
+    out = torch.empty(
+        (num_tokens, num_heads * head_dim), dtype=torch.float8_e4m3fn, device=x_q.device
+    )
+    out_scale = torch.empty(
+        ((num_tokens + 127) // 128 * 128 * num_heads * 4,), dtype=torch.uint8, device=x_q.device
+    )
+    # The kernel waits for its programmatic-launch predecessor before reading anything, so the int32
+    # conversions (a kernel each, when needed) do not restrict PDL.
+    torch.ops.trtllm.kimi_k3_kda_mtp_verify_kf(
+        x_q,
+        x_k,
+        x_v,
+        g,
+        beta,
+        onorm_g,
+        w_q,
+        w_k,
+        w_v,
+        A_log,
+        dt_bias,
+        onorm_weight,
+        ssm_state_indices.to(torch.int32),
+        num_accepted_tokens.to(torch.int32),
+        cs_q,
+        cs_k,
+        cs_v,
+        recurrent_state,
+        k_cache,
+        g_cache,
+        v_cache,
+        beta_cache,
+        out,
+        out_scale,
+        num_spec,
+        lower_bound,
+        scale,
+        onorm_eps,
+        enable_pdl,
+    )
+    return out, out_scale
+
+
+# ---------------------------------------------------------------------------
 # Dispatch API used by the KimiKDALinearAttention module.
 # ---------------------------------------------------------------------------
 
@@ -391,6 +722,17 @@ class KDAKernelDispatch:
         self.verify_kernel_path = "fla"
         if use_optimized_verify and optimized_supported and is_intree_mtp_available():
             self.verify_kernel_path = "optimized"
+        # Generated verify kernel for the eligible optimized verify calls
+        # (see _kf_verify_ineligibility), default off.
+        kf_switch = _parse_switch(_KF_VERIFY_ENV)  # an invalid value raises on every path
+        self._kf_verify = False
+        if kf_switch and self.verify_kernel_path == "optimized":
+            if not hasattr(torch.ops.trtllm, "kimi_k3_kda_mtp_verify_kf"):
+                raise RuntimeError(
+                    f"{_KF_VERIFY_ENV}=1 needs trtllm::kimi_k3_kda_mtp_verify_kf; "
+                    "rebuild the TensorRT-LLM C++ extension"
+                )
+            self._kf_verify = True
         # One line per process so runs record which paths actually executed
         # (the fallback is otherwise silent).
         if not KDAKernelDispatch._selection_logged:
@@ -403,11 +745,17 @@ class KDAKernelDispatch:
                 logger.info(
                     f"KDA kernel dispatch: prefill={self.prefill_kernel_path} "
                     f"decode={self.decode_kernel_path} "
-                    f"verify={self.verify_kernel_path}"
+                    f"verify={self.verify_kernel_path} "
+                    f"verify_kf={self._kf_verify}"
                 )
 
     def mtp_verify(
-        self, *, mxfp8_output: bool = False, **kwargs
+        self,
+        *,
+        mxfp8_output: bool = False,
+        A_log_f32: Optional[torch.Tensor] = None,
+        dt_bias_f32: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the fused KDA multi-token verify kernel.
 
@@ -416,11 +764,32 @@ class KDAKernelDispatch:
         argument and state-management contract). Only defined on the
         optimized path; the FLA fallback is the module's sequential
         per-step loop with intermediate-buffer promotion.
+
+        ``A_log_f32`` / ``dt_bias_f32``: FP32 copies of ``A_log`` / ``dt_bias``
+        (the mixer casts those parameters to BF16), read only by the Kernel
+        Factory verify kernel; the CuTe DSL kernels read ``A_log`` / ``dt_bias``.
         """
         if self.verify_kernel_path != "optimized":
             raise RuntimeError(
                 "mtp_verify called on non-optimized path; use the module's "
                 "sequential FLA verify fallback instead."
+            )
+        if self._kf_verify:
+            kf_kwargs = _with_fp32_gate_constants(kwargs, A_log_f32, dt_bias_f32)
+            reason = _kf_verify_ineligibility(kf_kwargs, mxfp8_output)
+            if reason is None:
+                route = (kf_kwargs["A_log"].shape[0], kf_kwargs["num_spec"])
+                _log_kf_once(
+                    f"route {route}",
+                    f"{_KF_VERIFY_ENV}: generated verify kernel for {route[0]} heads, "
+                    f"num_spec {route[1]}",
+                )
+                # PDL as for the CuTe DSL verify kernels (TRTLLM_K3_KDA_VERIFY_PDL with TRTLLM_ENABLE_PDL).
+                enable_pdl = _load_mtp_module()._verify_pdl_enabled()
+                return _kf_mtp_verify(enable_pdl=enable_pdl, **kf_kwargs)
+            _log_kf_once(
+                reason,
+                f"{_KF_VERIFY_ENV}: CuTe DSL verify kernels for an ineligible call ({reason})",
             )
         _load_mtp_module()  # registers both BF16 and FP8 MTP ops
         if mxfp8_output:
@@ -535,7 +904,28 @@ class KDAKernelDispatch:
             import torch.nn.functional as F
 
             real_T = q.shape[1]
-            if cu_seqlens is not None:
+            if (
+                cu_seqlens is not None
+                and single_sequence_length is not None
+                and q.shape[1] != single_sequence_length
+            ):
+                # Caller already produced chunk-padded inputs (zero tails);
+                # only the output needs trimming back to the real length.
+                real_T = single_sequence_length
+                padded_T = q.shape[1]
+                if (
+                    cu_seqlens.shape[0] != 2
+                    or padded_T % chunk_size != 0
+                    or not 0 < padded_T - real_T < chunk_size
+                    or any(t.shape[1] != padded_T for t in (k, v, beta))
+                    or g.shape[1] not in (real_T, padded_T)
+                ):
+                    raise ValueError(
+                        "Pre-padded KDA prefill inputs must be one sequence padded to the "
+                        f"next {chunk_size}-token boundary (real_T={real_T}, "
+                        f"q/k/v/g/beta lengths={[t.shape[1] for t in (q, k, v, g, beta)]})."
+                    )
+            elif cu_seqlens is not None:
                 # The op's varlen single-seq path (Phase 2.1) expects the
                 # caller to zero-pad the packed tensors to a chunk multiple
                 # (FLA convention) while cu_seqlens keeps the real length;

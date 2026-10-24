@@ -12,7 +12,7 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
@@ -243,7 +243,7 @@ class GatedMLP(nn.Module):
                 and self.down_proj.has_fp8_block_scales):
             return False
         if get_sm_version() == 107:
-            return (IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+            return (IS_CUTLASS_DSL_RUBIN_AVAILABLE
                     and (self.down_proj.use_cute_dsl_blockscaling_mm
                          or self.down_proj.disable_deep_gemm))
         return (is_sm_100f() and not self.down_proj.use_cute_dsl_blockscaling_mm

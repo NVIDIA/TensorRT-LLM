@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -7,6 +10,8 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
     AuxBufferMeta,
     AuxSlot,
+    _decode_draft_history,
+    _encode_draft_history,
     build_aux_transfer_layout,
 )
 
@@ -185,3 +190,23 @@ def test_aux_transfer_layout_ctx_no_spec_gen_sa():
     np.testing.assert_array_equal(layout.dst_item_sizes, gen.meta.item_sizes[expected_keep])
     np.testing.assert_array_equal(layout.src_base_ptrs, ctx.meta.ptrs[expected_keep])
     np.testing.assert_array_equal(layout.dst_base_ptrs, gen.meta.ptrs[expected_keep])
+
+
+@pytest.mark.parametrize("dtype", ["torch.bfloat16", "torch.float8_e4m3fn"])
+def test_draft_history_record_round_trips_the_storage_dtype(dtype):
+    """Prefill and generation servers compare the decoded layout, dtype included."""
+    history = {
+        "valid_length": 89,
+        "position": 89,
+        "layout": {
+            "num_layers": 5,
+            "num_kv_heads": 16,
+            "head_dim": 64,
+            "dtype": dtype,
+            "attention_backend": "VANILLA",
+            "kv_factor": 2,
+            "window_size": None,
+        },
+    }
+
+    assert _decode_draft_history(_encode_draft_history(history)) == history

@@ -1747,13 +1747,22 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            # get logits. A worker that selects tokens vocab-parallel takes
+            # this rank's vocab shard of the logits instead of gathered ones.
+            get_vocab_head = getattr(self.spec_worker,
+                                     "target_vocab_parallel_head", None)
+            vocab_head = (get_vocab_head(self.lm_head)
+                          if get_vocab_head is not None else None)
+            if vocab_head is not None:
+                logits = vocab_head.shard_logits(
+                    hidden_states[spec_metadata.gather_ids])
+            else:
+                logits = self.logits_processor.forward(
+                    hidden_states[spec_metadata.gather_ids],
+                    self.lm_head,
+                    attn_metadata,
+                    True,
+                )
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs

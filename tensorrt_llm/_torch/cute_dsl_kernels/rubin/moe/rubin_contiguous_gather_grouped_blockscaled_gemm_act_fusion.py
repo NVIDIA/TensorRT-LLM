@@ -28,7 +28,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 import torch
-from cutlass._mlir.dialects import math, nvvm
+from cutlass._mlir.dialects import llvm, math, nvvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.cute.runtime import from_dlpack
@@ -44,12 +44,14 @@ from ....utils import ActivationType, is_gated_activation
 try:
     from .custom_pipeline import PipelineCpAsyncUmma
     from .inline_ptx import sm100_tcgen05_st_32x32b_x4, sm100_tma_gather4_load
-    from .utils import TRTLLM_ENABLE_PDL
+    from .utils import TRTLLM_ENABLE_PDL, read_smid
 except ImportError:
     from custom_pipeline import PipelineCpAsyncUmma
     from inline_ptx import sm100_tcgen05_st_32x32b_x4, sm100_tma_gather4_load
-    from utils import TRTLLM_ENABLE_PDL
+    from utils import TRTLLM_ENABLE_PDL, read_smid
 
+# L2 cache hint of a TMA load: evict first (CUTLASS ``CacheHintSm90::EVICT_FIRST``).
+_TMA_EVICT_FIRST = 0x12F0000000000000
 
 # ============================================================================
 # Inline utility functions
@@ -70,6 +72,24 @@ def fmin(
             cutlass.Float32(a).ir_value(loc=loc, ip=ip),
             cutlass.Float32(b).ir_value(loc=loc, ip=ip),
             nan=nan,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def tanh_approx_f32(a: Union[float, cutlass.Float32], *, loc=None, ip=None) -> cutlass.Float32:
+    """Hardware tanh: one MUFU op, max relative error about 2**-11 (PTX ``tanh.approx.f32``)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            cutlass.Float32.mlir_type,
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            "tanh.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
             ip=ip,
         )
@@ -203,8 +223,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         activation_type: ActivationType = ActivationType.Swiglu,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        die_local: bool = False,
+        situ_fast: bool = False,
+        weight_evict_first: bool = False,
     ):
         self.a_path = a_path
+        # L2 evict-first hint on the TMA loads of the expert weights (B) and their block scales (SFB): each is
+        # read once per call and the stream is far larger than L2, so it should not displace the activations.
+        self.weight_evict_first = weight_evict_first
         # uGPU half-GEMM: two partitions write their N-half into a shared
         # full-width C/SFC buffer at a column offset (see wrapper/__call__).
         self.ugpu_half_gemm = ugpu_half_gemm
@@ -228,9 +254,30 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             )
         self.situ_beta = None if situ_beta is None else float(situ_beta)
         self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
+        # SiTU with the hardware tanh instead of ex2 + rcp per sigmoid; not bitwise equal.
+        self.situ_fast = bool(situ_fast)
+        if self.situ_fast and self.activation_type != ActivationType.SiTu:
+            raise ValueError("situ_fast requires ActivationType.SiTu")
+        if self.situ_fast and not vectorized_f32:
+            raise ValueError("situ_fast is implemented for the vectorized (f32x2) epilogue only")
         self.is_gated = is_gated_activation(self.activation_type)
         if ugpu_half_gemm and not self.is_gated:
             raise ValueError("Rubin uGPU half-GEMM currently supports SwiGLU only")
+        # Die-local experts (TRTLLM_K3_DIE_LOCAL_EXPERTS): B/SFB arrive as stacked N-halves
+        # [2L, N/2, K] whose half h is homed on die h. The scheduler warp hands each CTA the
+        # tiles of its own die's half first (one atomic queue per die) and then steals, so
+        # B is read die-locally except for the stolen tail. C stays full width.
+        self.die_local = die_local
+        if die_local and (
+            ugpu_half_gemm
+            or tuple(cluster_shape_mn) != (1, 1)
+            or mma_inst_shape[0] != 128
+            or mma_tiler[1] not in (128, 256)
+        ):
+            raise ValueError(
+                "die_local needs a 1-CTA tactic (mma_inst_m 128, mma_n 128/256, "
+                "cluster (1, 1)) without uGPU half-GEMM"
+            )
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
         self.mma_tiler = mma_tiler
@@ -738,6 +785,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         c_sf_n_tile_offset: cutlass.Int64 = cutlass.Int64(0),
+        die_tab: Optional[cute.Tensor] = None,
+        die_ws: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -1186,6 +1235,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             self.tile_sched_params,
             epilogue_op,
             c_sf_n_tile_offset,
+            die_tab,
+            die_ws,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1277,6 +1328,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         c_sf_n_tile_offset: cutlass.Int64 = cutlass.Int64(0),
+        die_tab: Optional[cute.Tensor] = None,
+        die_ws: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1639,6 +1692,18 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         else:
             tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
+        # Die-local experts: the scheduler warp looks up its CTA's die (%smid -> die_tab)
+        # this early so the load overlaps the prologue (die_tab is static, so it needs
+        # no dependency wait).
+        die_own = cutlass.Int32(0)
+        if cutlass.const_expr(self.die_local):
+            if warp_idx == self.sched_warp_id:
+                die_smid = read_smid()
+                if die_smid < cute.size(die_tab):
+                    die_own = die_tab[die_smid]
+                if die_own != 1:
+                    die_own = cutlass.Int32(0)
+
         #
         # Cluster wait before tensor memory alloc
         #
@@ -1665,7 +1730,88 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
 
             num_non_exiting_tiles_value = num_non_exiting_tiles[0]
 
-            if cutlass.const_expr(self.raster_along_m):
+            if cutlass.const_expr(self.die_local):
+                # Die-local tile order. Tiles of N-half d (N tiles [d * half, (d + 1) * half) of
+                # every valid M tile, N fastest) form queue d with ticket counter die_ws[d]; a CTA
+                # drains its own die's queue, then steals from the other one. Every output tile is
+                # computed by exactly one CTA with the same math as the static schedule.
+                die_n_tiles_half = cutlass.Int32(
+                    cute.size(tile_sched_params.problem_layout_ncluster_mnl, mode=[1]) // 2
+                )
+                die_tiles_per_half = num_non_exiting_tiles_value * die_n_tiles_half
+                die_grid = cute.arch.grid_dim()
+                die_ctas = die_grid[0] * die_grid[1] * die_grid[2]
+                if die_tiles_per_half * 2 <= die_ctas:
+                    # At most one tile per CTA: take tile blockIdx directly. The queue atomics
+                    # would only add latency here; die_ws is not touched and stays zeroed.
+                    die_bid = cute.arch.block_idx()
+                    die_t = die_bid[0] + die_grid[0] * (die_bid[1] + die_grid[1] * die_bid[2])
+                    if die_t < die_tiles_per_half * 2:
+                        die_m = die_t // (2 * die_n_tiles_half)
+                        die_n = die_t - die_m * (2 * die_n_tiles_half)
+                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        expert_idx = tile_idx_to_expert_idx[die_m]
+                        mn_limit = tile_idx_to_mn_limit[die_m]
+                        with cute.arch.elect_one():
+                            sInfo[(0, tile_info_producer_state.index)] = die_m
+                            sInfo[(1, tile_info_producer_state.index)] = die_n
+                            sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                            sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(1)
+                            sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.sched_sync_barrier.arrive_and_wait()
+                        tile_info_pipeline.producer_commit(tile_info_producer_state)
+                        tile_info_producer_state.advance()
+                else:
+                    die_lane = cute.arch.lane_idx()
+                    die_queue = die_own
+                    die_continue = cutlass.Boolean(1)
+                    while die_continue:
+                        die_ticket = cutlass.Int32(0)
+                        if die_lane == 0:
+                            die_ticket = cute.arch.atomic_add(
+                                die_ws.iterator + die_queue,
+                                cutlass.Int32(1),
+                                sem="relaxed",
+                                scope="gpu",
+                            )
+                        die_ticket = cute.arch.shuffle_sync(die_ticket, 0)
+                        if die_ticket < die_tiles_per_half:
+                            die_m = die_ticket // die_n_tiles_half
+                            die_n = die_queue * die_n_tiles_half + (
+                                die_ticket - die_m * die_n_tiles_half
+                            )
+                            tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                            expert_idx = tile_idx_to_expert_idx[die_m]
+                            mn_limit = tile_idx_to_mn_limit[die_m]
+                            with cute.arch.elect_one():
+                                sInfo[(0, tile_info_producer_state.index)] = die_m
+                                sInfo[(1, tile_info_producer_state.index)] = die_n
+                                sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                                sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(1)
+                                sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            self.sched_sync_barrier.arrive_and_wait()
+                            tile_info_pipeline.producer_commit(tile_info_producer_state)
+                            tile_info_producer_state.advance()
+                        elif die_queue == die_own:
+                            die_queue = 1 - die_own
+                        else:
+                            die_continue = cutlass.Boolean(0)
+                    # The last scheduler warp to finish resets the queues for the next launch
+                    # (every CTA has taken its final ticket before it counts itself done).
+                    if die_lane == 0:
+                        die_done = cute.arch.atomic_add(
+                            die_ws.iterator + 2,
+                            cutlass.Int32(1),
+                            sem="acq_rel",
+                            scope="gpu",
+                        )
+                        if die_done == die_ctas - 1:
+                            die_ws[0] = cutlass.Int32(0)
+                            die_ws[1] = cutlass.Int32(0)
+                            die_ws[2] = cutlass.Int32(0)
+            elif cutlass.const_expr(self.raster_along_m):
                 while work_tile.is_valid_tile:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
@@ -2324,6 +2470,11 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 _b_pipe = b_pipeline
             else:
                 _b_pipe = ab_pipeline
+            b_cache_kw = (
+                {"cache_policy": cutlass.Int64(_TMA_EVICT_FIRST)}
+                if cutlass.const_expr(self.weight_evict_first)
+                else {}
+            )
             #
             # Persistent tile scheduling loop
             #
@@ -2360,19 +2511,29 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                     tile_info[1],
                     tile_info[2],
                 )
+                b_coord_n = mma_tile_coord_mnl[1]
+                b_coord_l = mma_tile_coord_mnl[2]
+                if cutlass.const_expr(self.die_local):
+                    # Stacked halves: N tile n of expert e lives in batch e + h * L of the
+                    # [2L, N/2, K] tensor at N tile n - h * (N tiles per half).
+                    b_n_tiles_half = cutlass.Int32(cute.size(tBgB, mode=[1]))
+                    b_num_experts = cutlass.Int32(cute.size(tBgB, mode=[3]) // 2)
+                    if b_coord_n >= b_n_tiles_half:
+                        b_coord_n = b_coord_n - b_n_tiles_half
+                        b_coord_l = b_coord_l + b_num_experts
                 #
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), loopK)
-                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                tBgB_slice = tBgB[(None, b_coord_n, None, b_coord_l)]
 
                 # Apply SFB slicing hack when cta_tile_shape_n=64
-                slice_n = mma_tile_coord_mnl[1]
+                slice_n = b_coord_n
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
-                    slice_n = mma_tile_coord_mnl[1] // 2
+                    slice_n = b_coord_n // 2
 
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
+                tBgSFB_slice = tBgSFB[(None, slice_n, None, b_coord_l)]
 
                 # Peek (try_wait) B buffer empty for k_tile = prefetch_k_tile_cnt
                 b_producer_state.reset_count()
@@ -2410,6 +2571,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                         tBsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
+                        **b_cache_kw,
                     )
 
                     # TMA load SFB
@@ -2419,6 +2581,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                         tBsSFB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfb_full_mcast_mask,
+                        **b_cache_kw,
                     )
 
                     # Peek (try_wait) B buffer empty for k_tile + 1
@@ -3053,7 +3216,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                             )
                         elif cutlass.const_expr(self.activation_type == ActivationType.SiTu):
                             acc_vec_gate = tTR_rAcc_gate.load()
-                            self._apply_situ_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
+                            if cutlass.const_expr(self.situ_fast):
+                                self._apply_situ_epilogue_fast(
+                                    acc_vec_up, acc_vec_gate, alpha_val, tCompute
+                                )
+                            else:
+                                self._apply_situ_epilogue(
+                                    acc_vec_up, acc_vec_gate, alpha_val, tCompute
+                                )
                         elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
                             self._apply_relu2_epilogue(acc_vec_up, alpha_val, tCompute)
 
@@ -3395,6 +3565,53 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 tanh_g = two_beta * sigmoid_f32(g * inv_2beta, fastmath=True) - beta_f32
                 tanh_u = two_lbeta * sigmoid_f32(u * inv_2lbeta, fastmath=True) - lbeta_f32
                 tCompute[i] = (tanh_g * sigmoid_f32(g, fastmath=True)) * tanh_u
+
+    @cute.jit
+    def _apply_situ_epilogue_fast(
+        self,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+    ):
+        """SiTU with the hardware tanh instead of ``ex2`` + ``rcp`` per sigmoid.
+
+        With ``g = alpha * gate``, ``u = alpha * up`` and ``sigmoid(g) = 0.5 * (1 + tanh(g / 2))``::
+
+            beta * tanh(g/beta) * sigmoid(g) * linear_beta * tanh(u/linear_beta)
+              = (0.5 * beta * linear_beta) * tanh(g/beta) * (1 + tanh(g/2)) * tanh(u/linear_beta)
+
+        ``alpha`` is folded into the three tanh arguments. ``tanh.approx.f32`` has a maximum relative
+        error of about 2**-11, saturates to +-1 and propagates NaN. The two plain tanh factors carry
+        about 2**-11 relative error. The gate factor ``1 + tanh(g / 2)`` (= 2 * sigmoid(g)) carries about
+        2**-11 ABSOLUTE error, because the sum cancels for negative gates: its relative error is about
+        1% at g = -4, 10% at g = -6, up to O(1) at g <= -8 (where the exact factor is below 7e-4), and it
+        reaches 0 once the tanh rounds to -1. Those outputs are far below the NVFP4 resolution of a block
+        that holds any ordinary element, but the result is not bitwise equal to ``_apply_situ_epilogue``.
+        """
+        alpha = cutlass.Float32(alpha_val)
+        c_gate_beta = alpha * cutlass.Float32(1.0 / self.situ_beta)
+        c_gate_half = alpha * cutlass.Float32(0.5)
+        c_up_beta = alpha * cutlass.Float32(1.0 / self.situ_linear_beta)
+        k_out = cutlass.Float32(0.5 * self.situ_beta * self.situ_linear_beta)
+        one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
+        for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+            gate_pair = (acc_vec_gate[i], acc_vec_gate[i + 1])
+            xg = cute.arch.mul_packed_f32x2(gate_pair, (c_gate_beta, c_gate_beta))
+            xh = cute.arch.mul_packed_f32x2(gate_pair, (c_gate_half, c_gate_half))
+            xu = cute.arch.mul_packed_f32x2(
+                (acc_vec_up[i], acc_vec_up[i + 1]), (c_up_beta, c_up_beta)
+            )
+            t_gate = (tanh_approx_f32(xg[0]), tanh_approx_f32(xg[1]))
+            t_half = (tanh_approx_f32(xh[0]), tanh_approx_f32(xh[1]))
+            t_up = (tanh_approx_f32(xu[0]), tanh_approx_f32(xu[1]))
+            gate_term = cute.arch.mul_packed_f32x2(
+                t_gate, cute.arch.add_packed_f32x2(t_half, one_pair)
+            )
+            up_term = cute.arch.mul_packed_f32x2(t_up, (k_out, k_out))
+            out_pair = cute.arch.mul_packed_f32x2(gate_term, up_term)
+            tCompute[i] = out_pair[0]
+            tCompute[i + 1] = out_pair[1]
 
     @cute.jit
     def _apply_relu2_epilogue(
@@ -4177,6 +4394,109 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             stream=stream,
             epilogue_op=epilogue_op,
             c_sf_n_tile_offset=c_sf_n_tile_offset,
+        )
+
+    @cute.jit
+    def wrapper_die_local(
+        self,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        c_sf_ptr: cute.Pointer,
+        alpha_ptr: cute.Pointer,
+        tile_idx_to_group_idx_ptr: cute.Pointer,
+        tile_idx_to_mn_limit_ptr: cute.Pointer,
+        token_id_mapping_ptr: cute.Pointer,
+        num_non_exiting_tiles_ptr: cute.Pointer,
+        global_sf_ptr: cute.Pointer,
+        die_tab_ptr: cute.Pointer,
+        die_ws_ptr: cute.Pointer,
+        orig_m: cutlass.Int64,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
+        die_ntab: cutlass.Int32,
+        tile_size: cutlass.Constexpr,
+        scaling_vector_size: cutlass.Constexpr,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        epilogue_op: cutlass.Constexpr = lambda x: x,
+    ):
+        """wrapper() for die-local experts: b / b_sf hold the stacked N-halves
+        [2l, n/2, k] (half h homed on die h); n and l are the full problem's. die_tab
+        maps %smid to a die (0/1, anything else = 0); die_ws is a zeroed int32[4]
+        workspace of queue counters that the kernel leaves zeroed again."""
+        assert self.die_local
+        scale_k = k // scaling_vector_size
+        interm_size = n // 2 if self.is_gated else n
+        num_tiles = m // tile_size
+        b_n = n // 2
+        b_l = l * 2
+        a = cute.make_tensor(
+            a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
+        )
+        b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((b_n, k, b_l), order=(1, 0, 2)))
+        a_sf = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_ordered_layout((orig_m, scale_k, 1), order=(1, 0, 2)),
+        )
+        b_sf = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, b_n // 128, 4, scale_k // 4, b_l), order=(2, 1, 4, 0, 3, 5)
+            ),
+        )
+        c = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_layout(
+                (m, interm_size, 1),
+                stride=(interm_size, 1, m * interm_size),
+            ),
+        )
+        c_sf = cute.make_tensor(
+            c_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
+                order=(2, 1, 4, 0, 3, 5),
+            ),
+        )
+        alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        tile_idx_to_group_idx = cute.make_tensor(
+            tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
+        )
+        tile_idx_to_mn_limit = cute.make_tensor(
+            tile_idx_to_mn_limit_ptr, layout=cute.make_layout((num_tiles,))
+        )
+        token_id_mapping = cute.make_tensor(token_id_mapping_ptr, layout=cute.make_layout((m,)))
+        num_non_exiting_tiles = cute.make_tensor(
+            num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
+        )
+        global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
+        die_tab = cute.make_tensor(die_tab_ptr, layout=cute.make_layout((die_ntab,)))
+        die_ws = cute.make_tensor(die_ws_ptr, layout=cute.make_layout((4,)))
+
+        return self(
+            a,
+            b,
+            c,
+            a_sf,
+            b_sf,
+            c_sf,
+            None,
+            global_sf,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            token_id_mapping,
+            num_non_exiting_tiles,
+            alpha,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+            epilogue_op=epilogue_op,
+            die_tab=die_tab,
+            die_ws=die_ws,
         )
 
 

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
 import itertools
 import json
@@ -42,6 +45,9 @@ def main():
     parser.add_argument("--max-batch-size", type=int)
     parser.add_argument("--tokens-per-block", type=int)
     parser.add_argument("--max-seq-len", type=int)
+    parser.add_argument(
+        "--use-kv-cache-manager-v2", action=argparse.BooleanOptionalAction, default=True
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--enable-attention-dp", action="store_true", dest="enable_attention_dp")
     group.add_argument("--no-enable-attention-dp", action="store_false", dest="enable_attention_dp")
@@ -50,7 +56,16 @@ def main():
     parser.add_argument(
         "--mamba-ssm-cache-dtype", type=str, choices=["auto", "float16", "bfloat16", "float32"]
     )
+    parser.add_argument("--kv-pool-headroom", type=int)
+    parser.add_argument("--enable-swa-scratch-reuse", action="store_true")
     # Model init args
+    parser.add_argument(
+        "--vision-config",
+        type=str,
+        choices=["none", "checkpoint"],
+        help="Which vision tower to build from a composite multimodal checkpoint. Default"
+        ' "none": drop it and profile the text decoder layers, which is all this tool runs.',
+    )
     parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
     parser.add_argument("--max-num-tokens", type=int)
     parser.add_argument("--moe-backend", type=str)
@@ -58,6 +73,13 @@ def main():
     # whose Literal is the authoritative list. A second list here can only drift.
     parser.add_argument("--moe-backend-for-prefill", type=str)
     parser.add_argument("--moe-max-num-tokens", type=int)
+    parser.add_argument(
+        "--spec-max-draft-len",
+        type=int,
+        help="Draft tokens per generation step. Required by models whose multi-token verify"
+        " path needs cache-manager-allocated speculative buffers (Kimi K3 KDA). Must equal"
+        " seq_len_q - 1.",
+    )
     parser.add_argument("--num-mtp-layers", type=int)
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -110,6 +132,11 @@ def main():
     group.add_argument(
         "--no-replay-verify-metadata", action="store_false", dest="replay_verify_metadata"
     )
+    # Without this the "default on" below is dead code. In a mutually exclusive group
+    # argparse seeds the dest from the FIRST action's default -- store_true's False --
+    # so replay_verify_metadata is always a real bool and never None, and passing
+    # neither flag silently disabled verification instead of enabling it.
+    parser.set_defaults(replay_verify_metadata=None)
     # Schedule
     parser.add_argument("--warmup-times", type=int, default=20)
     parser.add_argument("--run-times", type=int, default=100)
@@ -132,7 +159,8 @@ def main():
                 setattr(args, k, v)
         else:
             config_key = k
-            if v is None and config_key in config:
+            # A flag left at its argparse default yields to the YAML value.
+            if config_key in config and (v is None or v == parser.get_default(k)):
                 v = config[config_key]
                 setattr(args, k, v)
         if config_key in config:
@@ -150,6 +178,8 @@ def main():
         args.kv_cache_dtype = "auto"
     if args.mamba_ssm_cache_dtype is None:
         args.mamba_ssm_cache_dtype = "auto"
+    if args.vision_config is None:
+        args.vision_config = "none"
     if args.load_format is None:
         args.load_format = "DUMMY"
     if args.max_num_tokens is None:
@@ -170,7 +200,28 @@ def main():
         parser.error("Both --replay-start-iter and --replay-stop-iter must be provided or none")
     if args.replay_verify_metadata is None:
         args.replay_verify_metadata = True
+    if args.spec_max_draft_len is not None:
+        if args.run_type != "GEN":
+            parser.error("--spec-max-draft-len only applies to --run-type GEN")
+        if args.spec_max_draft_len < 1:
+            parser.error("--spec-max-draft-len must be >= 1")
+        if args.num_mtp_layers:
+            parser.error("--spec-max-draft-len and --num-mtp-layers are mutually exclusive")
+        if args.seq_len_q_list != [args.spec_max_draft_len + 1]:
+            parser.error(
+                f"--spec-max-draft-len {args.spec_max_draft_len} implies a single seq_len_q"
+                f" {args.spec_max_draft_len + 1}, got {args.seq_len_q_list}"
+            )
     print(args)
+
+    # Speculative decoding shape only: the harness has no sampler, so no drafts are
+    # ever accepted. This exists so the cache manager allocates the multi-token
+    # verify buffers (Kimi K3 KDA replay caches) that seq_len_q > 1 needs.
+    spec_config = None
+    if args.spec_max_draft_len is not None:
+        from tensorrt_llm.llmapi.llm_args import SADecodingConfig
+
+        spec_config = SADecodingConfig(max_draft_len=args.spec_max_draft_len)
 
     # MPI args
     rank = mpi_rank()
@@ -191,6 +242,11 @@ def main():
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         layer_indices=args.layer_indices,
         num_mtp_layers=args.num_mtp_layers,
+        kv_pool_headroom=args.kv_pool_headroom,
+        enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
+        spec_config=spec_config,
+        vision_config=args.vision_config,
+        use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
     )
     attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
     logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
@@ -219,6 +275,8 @@ def main():
         num_mtp_layers=args.num_mtp_layers,
         use_cute_dsl_bf16_gemm=args.use_cute_dsl_bf16_gemm,
         use_cute_dsl_bf16_bmm=args.use_cute_dsl_bf16_bmm,
+        spec_config=spec_config,
+        vision_config=args.vision_config,
     )
     logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
@@ -235,9 +293,59 @@ def main():
             replay_start_iter, replay_stop_iter = calibrator.get_replay_iteration_range()
         else:
             replay_start_iter, replay_stop_iter = args.replay_start_iter, args.replay_stop_iter
+            # An inverted window is empty, so the membership check below reports nothing
+            # missing and lets it through -- and the replay index at the bottom of this
+            # file then divides by (stop - start + 1), which is zero or negative.
+            if replay_start_iter > replay_stop_iter:
+                parser.error(
+                    f"--replay-start-iter {replay_start_iter} is past --replay-stop-iter "
+                    f"{replay_stop_iter}; the window is inclusive on both ends."
+                )
+            # Check the window before pre_step() indexes into it: a missing iteration
+            # otherwise surfaces as a KeyError thousands of lines into an interleaved
+            # multi-rank log. Membership, not bounds -- a calibration with a hole
+            # satisfies a first/last comparison and still dies at that KeyError.
+            missing_count, missing = calibrator.get_missing_replay_iterations(
+                replay_start_iter, replay_stop_iter
+            )
+            if missing_count:
+                shown = ", ".join(str(i) for i in missing)
+                if missing_count > len(missing):
+                    shown += f", ... ({missing_count:d} in total)"
+                parser.error(
+                    f"--replay-start-iter/--replay-stop-iter ask for iterations "
+                    f"[{replay_start_iter}, {replay_stop_iter}], but "
+                    f"{args.replay_file_path} does not hold {shown}. Pick a window it "
+                    f"does hold, or drop both flags to take the recorded range, which "
+                    f"has to be contiguous."
+                )
         logger.info(
             f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
         )
+        # The replay has to put the same number of tokens through MoE that the calibration
+        # recorded, or it profiles different routing and still reports a number. Scoped to
+        # the window being replayed: iterations outside it may hold another shape, and
+        # those are none of this run's business.
+        try:
+            recorded_tokens = calibrator.get_replay_token_count(replay_start_iter, replay_stop_iter)
+        except ValueError as e:
+            # Report it the way the rest of this block does rather than as a traceback:
+            # the message names the shapes and the iterations that carry them, which is
+            # what the caller has to act on.
+            parser.error(f"{args.replay_file_path}: {e}")
+        mismatched = [
+            (b, s)
+            for b in args.batch_size_list
+            for s in args.seq_len_q_list
+            if b * s != recorded_tokens
+        ]
+        if mismatched:
+            parser.error(
+                f"{args.replay_file_path} recorded {recorded_tokens} tokens per "
+                f"iteration, but --batch-size/--seq-len-q ask for "
+                f"{', '.join(f'{b}x{s}={b * s}' for b, s in mismatched)}. "
+                f"seq_len_q > 1 is MTP and also needs --spec-max-draft-len seq_len_q-1."
+            )
     else:
         calibrator.init("NONE", None, None)
         replay_start_iter, replay_stop_iter = 1, 1  # To avoid None in mathematics
@@ -292,6 +400,7 @@ def main():
                 num_mtp_layers=args.num_mtp_layers,
                 use_cute_dsl_bf16_gemm=args.use_cute_dsl_bf16_gemm,
                 use_cute_dsl_bf16_bmm=args.use_cute_dsl_bf16_bmm,
+                vision_config=args.vision_config,
             )
         logger.info("Layer-wise benchmarks: Create runner for prefill  ... Done")
 

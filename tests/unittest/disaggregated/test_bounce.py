@@ -42,6 +42,12 @@ try:
 except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
     _HAVE_TRANSPORT = False
 
+# Peer routing (RankInfo, PeerRegistrar) is pure Python + numpy, always importable on CPU.
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+
 # page.py is pure numpy dataclasses, always importable on CPU.
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
@@ -226,17 +232,22 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
 def test_fanin_bounce_safe_gate() -> None:
     """Restrict multi-writer equal-split bounce to uniform TP-by-head.
 
-    Uneven PP splits and duplicate_head_factor>1 (MLA / duplicate TP heads ->
-    some ranks don't send KV yet count in expected_transfers) must fall back to
-    the per-fragment path.
+    Uneven PP splits and head duplication on either side (MLA / duplicate TP
+    heads -> some ranks don't send KV yet count in expected_transfers) must fall
+    back to the per-fragment path.
     """
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
-        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
+    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,), peer_dup: int = 1) -> SimpleNamespace:
+        return SimpleNamespace(
+            duplicate_head_factor=dup,
+            peer_duplicate_head_factor=peer_dup,
+            overlap_pp_size=pp,
+            ranks=list(ranks),
+        )
 
     def ri(lpp: list[int], page_table: SimpleNamespace | None = None) -> SimpleNamespace:
         return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
@@ -249,6 +260,11 @@ def test_fanin_bounce_safe_gate() -> None:
     assert safe(ov(1, 1), ri([24]), None) is True
     assert safe(ov(1, 0), ri([24]), None) is True
     assert safe(ov(2, 1), ri([24]), None) is False  # duplicate heads / MLA -> some don't send
+    # sender-side duplication: MLA from TP8 context ranks to an attention-DP rank sees 8 writers,
+    # but should_send_kv elects one of them to write every page
+    assert safe(ov(1, 1, ranks=tuple(range(8)), peer_dup=8), ri([24]), None) is False
+    # GQA TP-by-head fan-in (every writer sends its own heads) -> allowed
+    assert safe(ov(1, 1, ranks=tuple(range(8))), ri([24]), None) is True
     # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
     assert safe(ov(1, 4), ri([20, 20, 20, 20]), None) is True
     # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
@@ -257,6 +273,7 @@ def test_fanin_bounce_safe_gate() -> None:
     assert safe(ov(1, 4), ri([20]), None) is False
     # duplicate heads blocks even an otherwise-even PP split
     assert safe(ov(2, 4), ri([20, 20, 20, 20]), None) is False
+    assert safe(ov(1, 4, peer_dup=2), ri([20, 20, 20, 20]), None) is False
     # replicated views (one elected sender per destination) make multi-writer
     # contributions unequal -> fall back; single-writer overlap stays safe,
     # and sharded-only view schemes are unaffected. Both page tables must be
@@ -280,6 +297,148 @@ def test_fanin_bounce_safe_gate() -> None:
         )
         is True
     )
+
+
+# TP8 context ranks -> one attention-DP (TP8, DP8) generation rank:
+# name -> (is_mla, total KV heads, context ranks that write KV, fan-in bounce allowed)
+_TP8_TO_ADP_CASES = {
+    "mla": (True, 1, 1, False),
+    "gqa_tp_by_head": (False, 8, 8, True),
+    "gqa_duplicated_heads": (False, 4, 4, False),
+}
+_ADP_BLOCK_BYTES = 1024
+
+
+def _tp8_to_adp_rank_infos(is_mla: bool, total_kv_heads: int, gen_dp_rank: int):
+    """RankInfos of the eight context ranks and of one generation rank, plus their page table."""
+    page_table = KVCachePageTable(
+        tokens_per_block=32,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=0,
+                local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+                pool_views=[
+                    PoolView(pool_idx=0, buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE))
+                ],
+            )
+        ],
+        pool_groups=[
+            PhysicalPoolGroup(
+                pools=[
+                    PhysicalPool(base_address=0x200000, slot_bytes=_ADP_BLOCK_BYTES, num_slots=16)
+                ]
+            )
+        ],
+    )
+
+    def rank_info(name: str, rank: int, dp_size: int, kv_heads_per_rank: int) -> RankInfo:
+        return RankInfo(
+            instance_name=name,
+            instance_rank=rank,
+            tp_size=8,
+            tp_rank=rank,
+            pp_size=1,
+            pp_rank=0,
+            dp_size=dp_size,
+            dp_rank=rank if dp_size > 1 else 0,
+            layer_num_per_pp=[1],
+            sender_endpoints=[f"ctx{r}" for r in range(8)],
+            self_endpoint="",
+            transfer_engine_info=b"",
+            attention=AttentionInfo(
+                kv_heads_per_rank=kv_heads_per_rank,
+                tokens_per_block=32,
+                dims_per_head=16,
+                element_bytes=2,
+                enable_attention_dp=dp_size > 1,
+                is_mla=is_mla,
+            ),
+            page_table=page_table,
+        )
+
+    ctx_infos = [rank_info("ctx", r, 1, max(1, total_kv_heads // 8)) for r in range(8)]
+    return ctx_infos, rank_info("gen", gen_dp_rank, 8, total_kv_heads), page_table
+
+
+def _kv_writers(ctx_infos: list, gen_ri, page_table: KVCachePageTable) -> list[int]:
+    """Context ranks whose should_send_kv elects them to write KV to ``gen_ri``."""
+    writers = []
+    for ctx_ri in ctx_infos:
+        registrar = PeerRegistrar(ctx_ri, KVRegionExtractorV1(page_table))
+        overlap = registrar.get_peer_overlap(gen_ri, gen_ri.dp_rank)
+        if registrar.should_send_kv(overlap, gen_ri):
+            writers.append(ctx_ri.tp_rank)
+    return writers
+
+
+@pytest.mark.parametrize("case", list(_TP8_TO_ADP_CASES))
+def test_fanin_bounce_safe_requires_every_writer_to_send_kv(case) -> None:
+    """The gate must refuse a fan-in whose writers do not all send KV.
+
+    In all three cases the receiver sees eight writers and duplicate_head_factor == 1; only
+    the sender-side factor shows how many of them should_send_kv lets write.
+    """
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    is_mla, total_kv_heads, num_writers, allowed = _TP8_TO_ADP_CASES[case]
+    ctx_infos, gen_ri, page_table = _tp8_to_adp_rank_infos(is_mla, total_kv_heads, gen_dp_rank=3)
+    overlap = PeerRegistrar(gen_ri, KVRegionExtractorV1(page_table)).get_peer_overlap(
+        ctx_infos[0], 0
+    )
+    assert overlap.ranks == list(range(8))
+    assert overlap.duplicate_head_factor == 1
+    assert len(_kv_writers(ctx_infos, gen_ri, page_table)) == num_writers
+    assert tfr.Receiver._fanin_bounce_safe(overlap, ctx_infos[0], page_table) is allowed
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+@pytest.mark.parametrize(
+    "case,gen_dp_rank", [("mla", 0), ("mla", 3), ("mla", 7), ("gqa_tp_by_head", 3)]
+)
+def test_dispatch_task_keeps_fanin_writers_in_their_slots(monkeypatch, case, gen_dp_rank) -> None:
+    """Receiver.dispatch_task must not give a writer a bounce slot that its payload overruns.
+
+    For MLA, one of the eight context ranks writes every page. Writing them at its 1/8 share's
+    base would run past the region (into another request's slot) unless it is writer 0, so the
+    receiver must keep these writers on the per-fragment path. GQA split by head still bounces.
+    """
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    is_mla, total_kv_heads, _, allowed = _TP8_TO_ADP_CASES[case]
+    ctx_infos, gen_ri, page_table = _tp8_to_adp_rank_infos(is_mla, total_kv_heads, gen_dp_rank)
+    transport = _make_transport(monkeypatch, block_bytes_per_group=[_ADP_BLOCK_BYTES])
+    req = _recv_req([16])
+    req.mamba_state_index = None
+    req.to_bytes = lambda: req.bounce_dst_base  # what each sender is told to write to
+    sent = {}  # sender endpoint -> its bounce_dst_base
+
+    receiver = object.__new__(tfr.Receiver)
+    receiver._registrar = PeerRegistrar(gen_ri, KVRegionExtractorV1(page_table))
+    receiver._bounce = transport
+    receiver._build_recv_req_info = lambda task: req
+    receiver._get_sender_info = lambda params: ctx_infos[0]
+    receiver._get_session = lambda rid: SimpleNamespace(begin_peer_transfer=lambda *args: True)
+    receiver._request_sender_data = lambda endpoint, payload: sent.__setitem__(endpoint, payload)
+    task = SimpleNamespace(
+        _params=SimpleNamespace(ctx_dp_rank=0),
+        _unique_rid=req.unique_rid,
+        slice_id=req.slice_id,
+        expected_transfers=None,
+        _perf_timer=None,
+    )
+    receiver.dispatch_task(task)
+
+    assert task.expected_transfers == len(sent) == 8
+    writers = _kv_writers(ctx_infos, gen_ri, page_table)
+    payload = 16 * _ADP_BLOCK_BYTES // len(writers)
+    for rank in writers:
+        base = sent[f"ctx{rank}"]
+        if base is not None:
+            (region_bytes,) = transport._recv_alloc.reserved_sizes
+            region_end = transport._recv_alloc.base + region_bytes
+            assert base + payload <= region_end, (
+                f"context rank {rank} writes {payload}B at offset "
+                f"{base - transport._recv_alloc.base} of a {region_bytes}B region"
+            )
+    assert all((base is not None) is allowed for base in sent.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -676,6 +835,182 @@ _K3_SSM_SLOT_BYTES = 6_291_456  # [H, hd, hd] fp32 per layer (95.5% of the state
 _K3_KDA_PAYLOAD_BYTES = (
     449_372_160  # 69 x (conv + delta) per request per rank, from the geometry above
 )
+
+
+# --------------------------------------------------------------------------- #
+# Partial bounce: only the drafter (cp_as_tp) layer groups are coalesced
+# --------------------------------------------------------------------------- #
+# K3-like receiver groups: target MLA pages, drafter pages (16 heads), KDA (not paged).
+_MLA_BLOCK = 884736
+_DRAFT_BLOCK = 655360
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+class TestPartialBounce:
+    def test_reserve_covers_only_the_bounced_groups(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[_MLA_BLOCK, _DRAFT_BLOCK, None])
+        req = _recv_req([10, 10, 0])
+        assert t.reserve(req, num_writers=8, layer_groups=[1]) is True
+        total = 10 * _DRAFT_BLOCK
+        assert t._recv_alloc.reserved_sizes == [total]
+        assert req.bounce_layer_groups == [1]
+        assert req.bounce_writer_bytes == total // 8
+        key = (req.unique_rid, req.slice_id)
+        assert t.writer_base(key, 3) == 0x100000 + 3 * (total // 8)
+
+    def test_reserve_rejects_recurrent_payload(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[_MLA_BLOCK, _DRAFT_BLOCK])
+        with pytest.raises(ValueError):
+            t.reserve(_recv_req([10, 10]), num_writers=8, extra_bytes=100, layer_groups=[1])
+
+    def test_reserve_gates_on_bytes_not_blocks(self, monkeypatch):
+        t = _make_transport(
+            monkeypatch, block_bytes_per_group=[_MLA_BLOCK, _DRAFT_BLOCK], min_blocks=1000
+        )
+        assert t.reserve(_recv_req([2, 2]), num_writers=8, layer_groups=[1]) is True
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=[_MLA_BLOCK, _DRAFT_BLOCK],
+            min_bytes=3 * _DRAFT_BLOCK,
+        )
+        req = _recv_req([10, 2])
+        assert t.reserve(req, num_writers=8, layer_groups=[1]) is False
+        assert req.bounce_dst_base is None
+
+    def test_reserve_without_bounced_blocks_falls_back(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[_MLA_BLOCK, _DRAFT_BLOCK])
+        req = _recv_req([10, 0])
+        assert t.reserve(req, num_writers=8, layer_groups=[1]) is False
+        assert req.bounce_dst_base is None
+
+    @staticmethod
+    def _write_meta(num_bounced, writer_bytes=None):
+        # Three 8 KB drafter fragments, then two in-place MLA pages.
+        return SimpleNamespace(
+            src_ptrs=np.array([0x1000, 0x9000, 0x20000, 0x80000, 0x90000], dtype=np.int64),
+            dst_ptrs=np.array([0xA000, 0xB000, 0xC000, 0xD0000, 0xE0000], dtype=np.int64),
+            sizes=np.array([8192, 8192, 8192, 65536, 65536], dtype=np.int64),
+            bounce_dst_base=0x500000,
+            dst_device_id=1,
+            peer_name="gen0",
+            bounce_num_frags=num_bounced,
+            bounce_writer_bytes=writer_bytes,
+        )
+
+    def _patch_request(self, monkeypatch, t):
+        gathered = []
+        monkeypatch.setattr(
+            t,
+            "_gather_blocking",
+            lambda src_addr, wm, total: gathered.append((src_addr, btr.bounced_frags(wm), total)),
+        )
+        # Descriptor lists as plain (ptrs, sizes, device) tuples instead of NIXL objects.
+        monkeypatch.setattr(
+            btr,
+            "MemoryDescs",
+            SimpleNamespace(
+                from_arrays_uniform_device=lambda mem_type, ptrs, sizes, device: (
+                    ptrs.copy(),
+                    sizes.copy(),
+                    device,
+                )
+            ),
+        )
+        monkeypatch.setattr(btr, "TransferRequest", lambda op, src, dst, name, msg: (src, dst))
+        return gathered
+
+    def test_build_request_gathers_only_the_leading_fragments(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[_DRAFT_BLOCK])
+        gathered = self._patch_request(monkeypatch, t)
+        wm = self._write_meta(num_bounced=3, writer_bytes=3 * 8192)
+        (src, dst), slot_id = t.build_request(wm)
+        assert t._send_alloc.reserved_sizes == [3 * 8192]
+        ((src_addr, (g_src, g_dst, g_sizes), total),) = gathered
+        assert np.array_equal(g_src, wm.src_ptrs[:3]) and total == 3 * 8192
+        # One coalesced descriptor, then the in-place fragments unchanged.
+        assert np.array_equal(src[0], np.r_[src_addr, wm.src_ptrs[3:]])
+        assert np.array_equal(dst[0], np.r_[wm.bounce_dst_base, wm.dst_ptrs[3:]])
+        assert np.array_equal(src[1], np.r_[3 * 8192, wm.sizes[3:]])
+        assert (src[2], dst[2]) == (0, 1)
+        # The tail lists only the gathered fragments, for the receiver's scatter.
+        dst_ptrs, sizes, base = btr.decode_result_tail([b"m", b"p"] + btr.encode_result_tail(wm))
+        assert np.array_equal(dst_ptrs, wm.dst_ptrs[:3]) and np.array_equal(sizes, wm.sizes[:3])
+        assert base == wm.bounce_dst_base
+
+    def test_build_request_falls_back_past_the_writer_share(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[_DRAFT_BLOCK])
+        gathered = self._patch_request(monkeypatch, t)
+        assert t.build_request(self._write_meta(num_bounced=3, writer_bytes=2 * 8192)) is None
+        assert t.build_request(self._write_meta(num_bounced=0)) is None
+        assert gathered == [] and t._send_alloc.reserved_sizes == []
+
+    def test_full_bounce_keeps_every_fragment(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[_DRAFT_BLOCK])
+        gathered = self._patch_request(monkeypatch, t)
+        wm = self._write_meta(num_bounced=None)
+        (src, _), _ = t.build_request(wm)
+        assert gathered[0][2] == int(wm.sizes.sum()) and src[0].size == 1
+
+
+def test_drafter_bounce_groups_need_an_even_head_split() -> None:
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    select = tfr.Receiver._drafter_bounce_groups
+
+    def table(draft_heads):
+        return SimpleNamespace(
+            layer_groups=[
+                SimpleNamespace(cp_as_tp=False, kv_head_num_per_rank=1),
+                SimpleNamespace(cp_as_tp=True, kv_head_num_per_rank=draft_heads),
+            ]
+        )
+
+    # Receiver group -> sender group, one entry per pool view (K and V for the drafter).
+    mapping = {(0, 0): (0, 0), (1, 0): (1, 0), (1, 1): (1, 1)}
+    blocks = [np.arange(10), np.arange(10)]
+
+    def ov(writers, pp=1):
+        return SimpleNamespace(ranks=list(range(writers)), overlap_pp_size=pp)
+
+    # TP8 prefill ranks hold 2 of the 16 drafter heads the attention-DP receiver holds.
+    assert select(ov(8), mapping, table(16), table(2), blocks) == [1]
+    # Duplicated heads: some senders would write nothing, so the split is not even.
+    assert select(ov(8), mapping, table(16), table(4), blocks) == []
+    assert select(ov(8), mapping, table(16), table(2), [np.arange(10), np.arange(0)]) == []
+    assert select(ov(1), mapping, table(16), table(16), blocks) == []
+    assert select(ov(8, pp=2), mapping, table(16), table(2), blocks) == []
+    assert select(ov(8), mapping, table(16), None, blocks) == []
+
+
+def test_recv_req_info_partial_bounce_wire_format() -> None:
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    import msgpack
+
+    info = tfr.RecvReqInfo(
+        sender_req_id=1,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[np.arange(3, dtype=np.int64)],
+        unique_rid=7,
+    )
+    # Unset: the keys stay off the wire, so peers that predate them still parse the request.
+    assert "bounce_layer_groups" not in msgpack.unpackb(info.to_bytes(), raw=False)
+    info.bounce_layer_groups = [1, 2]
+    info.bounce_writer_bytes = 81920
+    back = tfr.RecvReqInfo.from_bytes(info.to_bytes())
+    assert back.bounce_layer_groups == [1, 2] and back.bounce_writer_bytes == 81920
+
+
+def test_concat_frag_parts_keeps_part_order() -> None:
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    parts = [
+        (np.array([1, 2]), np.array([11, 12]), 8),
+        (np.array([3]), np.array([13]), 64),
+    ]
+    src, dst, sizes = tfr.Sender._concat_frag_parts(parts)
+    assert src.tolist() == [1, 2, 3] and dst.tolist() == [11, 12, 13]
+    assert sizes.tolist() == [8, 8, 64]
+    src, dst, sizes = tfr.Sender._concat_frag_parts([])
+    assert src.size == dst.size == sizes.size == 0
 
 
 def _k3_page_table() -> KVCachePageTable:

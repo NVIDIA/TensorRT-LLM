@@ -1487,6 +1487,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         {
             TLLM_LOG_WARNING("Attention workspace size is not enough, increase the size from %ld bytes to %ld bytes",
                 workspace_.value().numel(), workspace_size);
+            // This is scratch space: no contents need to survive between attention calls.
+            // resize_ preserves the old storage while allocating and copying the new one,
+            // which can require both workspaces to fit at once. Drop the old storage first.
+            workspace_.value().set_(torch::empty({0}, workspace_.value().options()));
             workspace_.value().resize_({workspace_size});
         }
         workspace = workspace_.value();

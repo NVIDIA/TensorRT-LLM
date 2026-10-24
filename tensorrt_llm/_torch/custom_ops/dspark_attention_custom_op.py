@@ -1,28 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Torch custom op for fused DSpark rolling-window attention.
-
-The op runs the specialized tcgen05 MMA kernel
-(:class:`DSparkAttention`) on the production DSpark
-geometry: 128 heads, head_dim 512, draft block 5 or 6, and a 128-row rolling
-window. Other shapes fall back to the pure-PyTorch reference path in
-``models/dspark/attention.py``.
-"""
+"""Paged DSpark attention and Rubin FP8 projection operators."""
 
 import functools
+from collections.abc import Callable
 from typing import List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 import torch
-import torch.nn.functional as F
-
-try:
-    from cuda.bindings import driver as cuda_driver
-except ImportError:
-    from cuda import cuda as cuda_driver
+from cutlass.cute.typing import Numeric, Pointer, Type
 
 from ..._utils import get_sm_version
 from ...logger import logger
@@ -36,12 +25,10 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..cute_dsl_kernels.blackwell.dspark.attention import DSparkAttention
-from ..cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from ..cute_dsl_kernels.blackwell.utils import make_ptr
+from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..utils import fp8_scale_infer_shape, mxfp8_scale_infer_shape, next_positive_power_of_2
-from .dspark_rmsnorm_rope_custom_op import (
-    _get_dspark_arch_str,
-    precompile_dspark_attention_preparation,
-)
+from .dspark_rmsnorm_rope_custom_op import _get_dspark_arch_str
 
 _DSPARK_NUM_HEADS = 128
 _DSPARK_HEAD_DIM = 512
@@ -126,281 +113,67 @@ def _gen_dspark_context_wkv_m_profiles(max_m: int) -> Tuple[int, ...]:
 
 # Worker initialization is process-local and single-threaded. These transient
 # values let the memoized builder consume the real cache only during precompile.
-_dspark_compile_arch: str | None = None
-_dspark_compile_window_specimen: torch.Tensor | None = None
+_DSV4_DSPARK_NUM_HEADS = (64, 128)
+_DSV4_DSPARK_HEAD_DIM = 512
+_DSV4_DSPARK_WINDOW_SIZE = 128
+_DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
+_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
+_DSV4_DSPARK_ROPE_DIM = 64
 
 
-def _as_dynamic_data(t: torch.Tensor, stride_order, compact: bool = True):
-    ct = cute.runtime.from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-    if compact:
-        ct = ct.mark_compact_shape_dynamic(mode=1, stride_order=stride_order, divisibility=8)
-    return ct
+_dspark_attention_kernel_cache: dict[
+    tuple[int, int, int, str, int | None], Callable[..., None]
+] = {}
 
 
-def _as_dynamic_lead0(t: torch.Tensor):
-    return cute.runtime.from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-
-
-def _as_dynamic_lead2(t: torch.Tensor):
-    return cute.runtime.from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-
-
-def _as_dynamic_1d(t: torch.Tensor):
-    return cute.runtime.from_dlpack(t, assumed_align=16).mark_layout_dynamic()
-
-
-def is_cute_dsl_dspark_attention_supported(
-    q: torch.Tensor,
-    main_kv: torch.Tensor,
-    block_kv: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slots: torch.Tensor,
-    start_pos: torch.Tensor,
-    valid_len: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-) -> bool:
-    """Return whether the production DSpark shape can use the CuteDSL op."""
-    if _get_dspark_arch_str() is None:
-        return False
-    if not all(
-        t.is_cuda
-        for t in (
-            q,
-            main_kv,
-            block_kv,
-            kv_cache,
-            slots,
-            start_pos,
-            valid_len,
-            attn_sink,
-            inverse_rope_freqs,
-        )
-    ):
-        return False
-    if q.dtype != torch.bfloat16:
-        return False
-    if main_kv.dtype != q.dtype or block_kv.dtype != q.dtype or kv_cache.dtype != q.dtype:
-        return False
-    if attn_sink.dtype != torch.float32 or inverse_rope_freqs.dtype != torch.float32:
-        return False
-    if slots.dtype not in (torch.int32, torch.int64) or start_pos.dtype not in (
-        torch.int32,
-        torch.int64,
-    ):
-        return False
-    if valid_len.dtype != torch.int64:
-        return False
-    if q.ndim != 4 or main_kv.ndim != 2 or block_kv.ndim != 3 or kv_cache.ndim != 3:
-        return False
-    return (
-        q.shape[1] in _DSPARK_BLOCK_SIZES
-        and q.shape[2] == _DSPARK_NUM_HEADS
-        and q.shape[3] == _DSPARK_HEAD_DIM
-        and main_kv.shape == (q.shape[0], _DSPARK_HEAD_DIM)
-        and block_kv.shape == (q.shape[0], q.shape[1], _DSPARK_HEAD_DIM)
-        and kv_cache.shape[1:] == (_DSPARK_WINDOW_SIZE, _DSPARK_HEAD_DIM)
-        and kv_cache.stride(1) == _DSPARK_HEAD_DIM
-        and kv_cache.stride(2) == 1
-        and attn_sink.shape == (_DSPARK_NUM_HEADS,)
-        and slots.shape == (q.shape[0],)
-        and start_pos.shape == (q.shape[0],)
-        and valid_len.shape == (q.shape[0],)
-        and inverse_rope_freqs.shape == (q.shape[0], q.shape[1], _DSPARK_ROPE_DIM // 2, 2)
-        and inverse_rope_freqs.is_contiguous()
-        and q.is_contiguous()
-        and main_kv.is_contiguous()
-        and block_kv.is_contiguous()
-        and slots.is_contiguous()
-        and start_pos.is_contiguous()
-        and valid_len.is_contiguous()
-        and attn_sink.is_contiguous()
+def _make_compile_gmem_pointer(dtype: Type[Numeric], assumed_align: int) -> Pointer:
+    """Create a compile-only pointer specimen without allocating device memory."""
+    return make_ptr(
+        dtype,
+        0,
+        cute.AddressSpace.gmem,
+        assumed_align=assumed_align,
     )
 
 
-def is_cute_dsl_dspark_attention_prepared_supported(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    valid_len: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-) -> bool:
-    """Return whether prepared tensors can use the production attention kernel."""
-    if _get_dspark_arch_str() is None:
-        return False
-    if not all(t.is_cuda for t in (q, kv_cache, valid_len, attn_sink, inverse_rope_freqs)):
-        return False
-    if q.dtype != torch.bfloat16 or kv_cache.dtype != q.dtype:
-        return False
-    if valid_len.dtype != torch.int64:
-        return False
-    if attn_sink.dtype != torch.float32 or inverse_rope_freqs.dtype != torch.float32:
-        return False
-    if q.ndim != 4 or kv_cache.ndim != 3:
-        return False
-    return (
-        q.shape[1] in _DSPARK_BLOCK_SIZES
-        and q.shape[2:] == (_DSPARK_NUM_HEADS, _DSPARK_HEAD_DIM)
-        and kv_cache.shape[1:] == (_DSPARK_WINDOW_SIZE, _DSPARK_HEAD_DIM)
-        and kv_cache.stride(1) == _DSPARK_HEAD_DIM
-        and kv_cache.stride(2) == 1
-        and valid_len.shape == (q.shape[0],)
-        and attn_sink.shape == (_DSPARK_NUM_HEADS,)
-        and inverse_rope_freqs.shape == (q.shape[0], q.shape[1], _DSPARK_ROPE_DIM // 2, 2)
-        and q.is_contiguous()
-        and valid_len.is_contiguous()
-        and attn_sink.is_contiguous()
-        and inverse_rope_freqs.is_contiguous()
-    )
-
-
-def precompile_dspark_attention(
-    block_size: int,
-    num_heads: int,
-    kv_cache: torch.Tensor,
-    softmax_scale: float,
-    eps: float = 1e-6,
-    output_groups: int | None = None,
-) -> None:
-    """Compile one dynamic-batch kernel up front (one-time, host-side).
-
-    The specimen tensor marks below carry batch extents as runtime MLIR values,
-    so one compiled object covers every supported runtime batch and cache-pool layout.
-    Runtime never compiles or pads: every call is a hot cache hit populated
-    here. This helper owns the full support policy and silently no-ops when
-    runtime dispatch would not route to this kernel anyway.
-    """
-    global _dspark_compile_arch, _dspark_compile_window_specimen
-    arch_str = _get_dspark_arch_str()
-    if not (
-        arch_str is not None
-        and block_size in _DSPARK_BLOCK_SIZES
-        and num_heads == _DSPARK_NUM_HEADS
-        and kv_cache.is_cuda
-        and kv_cache.dtype == torch.bfloat16
-        and kv_cache.ndim == 3
-        and kv_cache.shape[1:] == (_DSPARK_WINDOW_SIZE, _DSPARK_HEAD_DIM)
-        and kv_cache.stride(1) == _DSPARK_HEAD_DIM
-        and kv_cache.stride(2) == 1
-        and (
-            output_groups is None
-            or (arch_str == "sm_107" and output_groups > 0 and num_heads % output_groups == 0)
-        )
-    ):
-        logger.debug(
-            "DSpark attention precompile skipped: geometry or architecture "
-            "outside the CuteDSL kernel contract"
-        )
-        return
-    if _dspark_compile_arch is not None:
-        raise RuntimeError("DSpark attention precompile is already in progress")
-
-    _dspark_compile_arch = arch_str
-    _dspark_compile_window_specimen = kv_cache
-    try:
-        precompile_dspark_attention_preparation(block_size, eps)
-        # Keep the BF16 compatibility variant available when a runtime input
-        # misses the preparation predicate; serving must never JIT that fallback.
-        _compile_dspark_attention(block_size, softmax_scale, None)
-        if output_groups is not None:
-            _compile_dspark_attention(block_size, softmax_scale, output_groups)
-    finally:
-        _dspark_compile_arch = None
-        _dspark_compile_window_specimen = None
-
-
-@functools.cache
 def _compile_dspark_attention(
     block_size: int,
-    softmax_scale: float,
-    output_groups: int | None = None,
-):
-    arch_str = _dspark_compile_arch
-    window_specimen = _dspark_compile_window_specimen
-    if arch_str is None or window_specimen is None:
-        raise RuntimeError(
-            "DSpark attention kernel was not precompiled during worker initialization: "
-            f"block={block_size}"
-        )
-
-    # Use inexpensive B=1 query/output specimens plus the worker-owned window.
-    # Dynamic marks carry extents and strides as runtime MLIR values, so no
-    # second window allocation is needed. The scheduler round-trips
-    # problem_shape_b and its fast-divmod divisor as dynamic fields, so the
-    # resulting object serves every runtime batch. Keeping real specimens also
-    # preserves the optimized scheduler lowering that regressed with the older
-    # all-symbolic fake-tensor path.
-    num_heads, head_dim = _DSPARK_NUM_HEADS, _DSPARK_HEAD_DIM
-    specimen_batch = 1
-    device = torch.device("cuda")
-
-    # The kernel's native layouts are [H, D, Sq, B] for Q/O and [page, D,
-    # physical_page] for both KV streams. The real tensors are inexpensive
-    # permuted views of TRT-LLM's row-major buffers; the specimen tensors
-    # below replicate those layouts so the compiled strides match runtime.
-    q_spec = _as_dynamic_data(
-        torch.empty(
-            (specimen_batch, block_size, num_heads, head_dim), dtype=torch.bfloat16, device=device
-        ).permute(2, 3, 1, 0),
-        (3, 2, 0, 1),
+    arch_str: str,
+    page_size: int,
+    output_groups: int | None,
+    num_heads: int,
+) -> Callable[..., None]:
+    """Compile the pointer host wrapper without runtime tensor specimens."""
+    head_dim = _DSV4_DSPARK_HEAD_DIM
+    batch = cute.sym_int()
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (batch, block_size, num_heads, head_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=16,
     )
-    # The production window pool is a strided stage view (gaps between pages),
-    # so it cannot be marked compact; leave its strides fully dynamic.
-    window_spec = _as_dynamic_data(
-        window_specimen.permute(1, 2, 0),
-        None,
-        compact=False,
-    )
-    block_spec = _as_dynamic_data(
-        torch.empty(
-            (specimen_batch, _DSPARK_PAGE_SIZE, head_dim), dtype=torch.bfloat16, device=device
-        ).permute(1, 2, 0),
-        (2, 0, 1),
-    )
-    page_table_spec = _as_dynamic_lead0(
-        torch.empty((specimen_batch, 1), dtype=torch.int32, device=device).permute(1, 0)
-    )
-    if output_groups is None:
-        output_spec = _as_dynamic_data(
-            torch.empty(
-                (specimen_batch, block_size, num_heads, head_dim),
-                dtype=torch.bfloat16,
-                device=device,
-            ).permute(2, 3, 1, 0),
-            (3, 2, 0, 1),
-        )
-        output_scale_spec = None
-    else:
-        rows = specimen_batch * block_size
+    output_scale_fake = None
+    if output_groups is not None:
         group_dim = num_heads * head_dim // output_groups
-        output_spec = _as_dynamic_lead2(
-            torch.empty(
-                (output_groups, rows, group_dim),
-                dtype=torch.float8_e4m3fn,
-                device=device,
-            )
+        rows = batch * block_size
+        output_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float8E4M3FN,
+            (output_groups, rows, group_dim),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
         )
-        output_scale_spec = _as_dynamic_lead2(
-            torch.empty(
-                (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
-                dtype=torch.float32,
-                device=device,
-            )
+        output_scale_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
         )
-    cache_seqs_spec = _as_dynamic_1d(
-        torch.empty((specimen_batch,), dtype=torch.int32, device=device)
-    )
-    valid_len_spec = _as_dynamic_1d(
-        torch.empty((specimen_batch,), dtype=torch.int64, device=device)
-    )
-    sink_spec = _as_dynamic_1d(torch.empty((num_heads,), dtype=torch.float32, device=device))
-    freqs_spec = _as_dynamic_1d(
-        torch.empty(
-            (specimen_batch * block_size * _DSPARK_ROPE_DIM,), dtype=torch.float32, device=device
-        )
-    )
-    stream_arg = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
+    # Real tensor specimens used to make PyTorch's primary CUDA context current
+    # implicitly. Fake-only compilation must do so before querying occupancy;
+    # the returned stream is not part of the compiled TVM-FFI launch ABI.
+    torch.cuda.current_stream()
     hardware_info = cutlass_utils.HardwareInfo()
     max_active_clusters = hardware_info.get_max_active_clusters(2)
     kernel = DSparkAttention(
@@ -408,164 +181,201 @@ def _compile_dspark_attention(
         (128, 128),
         (128, 256),
         max_active_clusters,
-        _DSPARK_PAGE_SIZE,
-        _DSPARK_WINDOW_SIZE,
+        _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
+        _DSV4_DSPARK_WINDOW_SIZE,
         0.0,
         seq_len_q=block_size,
         mma_qk_tiler_k=128,
-        inverse_rope_dim=_DSPARK_ROPE_DIM,
-        output_groups=output_groups,
+        inverse_rope_dim=_DSV4_DSPARK_ROPE_DIM,
         arch_str=arch_str,
+        history_page_size=page_size,
+        output_groups=output_groups,
+        num_heads=num_heads,
     )
+    # Scalars and typed, aligned compile-only pointers define the runtime ABI.
+    # ``output_fake`` keeps one tensor argument for TVM-FFI environment-stream
+    # detection without tying compilation to a real worker buffer.
     compiled = cute.compile(
-        kernel,
-        q_spec,
-        window_spec,
-        block_spec,
-        page_table_spec,
-        output_spec,
-        output_scale_spec,
-        cache_seqs_spec,
-        valid_len_spec,
-        softmax_scale,
-        1.0,
-        sink_spec,
-        freqs_spec,
-        stream_arg,
-        options="--opt-level 2",
+        kernel.wrapper,
+        1,
+        1,
+        page_size * head_dim,
+        1,
+        1,
+        _make_compile_gmem_pointer(cutlass.BFloat16, 16),
+        _make_compile_gmem_pointer(cutlass.BFloat16, 16),
+        _make_compile_gmem_pointer(cutlass.BFloat16, 16),
+        _make_compile_gmem_pointer(cutlass.Int32, 4),
+        _make_compile_gmem_pointer(cutlass.Int64, 8),
+        _make_compile_gmem_pointer(cutlass.Int64, 8),
+        _make_compile_gmem_pointer(cutlass.Int64, 8),
+        _make_compile_gmem_pointer(cutlass.Float32, 4),
+        _make_compile_gmem_pointer(cutlass.Float32, 4),
+        output_fake,
+        output_scale_fake,
+        cutlass.Float32(1.0),
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
     )
     logger.info(
         "DSpark Attention enabled: implementation=dspark_attn, "
-        f"block={block_size}, heads={num_heads}, head_dim={head_dim}, "
-        f"output_groups={output_groups}"
+        f"block={block_size}, heads={num_heads}, head_dim={head_dim}"
     )
     return compiled
 
 
-def _run_dspark_attention(
+def _run_paged_dspark_attention(
     q: torch.Tensor,
-    block_page: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slots_i32: torch.Tensor,
-    cache_seqs: torch.Tensor,
-    valid_len: torch.Tensor,
+    draft_block: torch.Tensor,
+    kv_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    positions: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    capacities: torch.Tensor,
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
     output_groups: int | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    block_size = q.shape[1]
-    compiled = _compile_dspark_attention(block_size, softmax_scale, output_groups)
-    page_table_win = _as_dynamic_lead0(slots_i32.unsqueeze(1).permute(1, 0))
-    if output_groups is None:
-        output = torch.empty_like(q)
-        output_native = _as_dynamic_data(output.permute(2, 3, 1, 0), (3, 2, 0, 1))
-        output_scale = None
-        output_scale_native = None
-    else:
-        rows = q.shape[0] * block_size
-        group_dim = q.shape[2] * q.shape[3] // output_groups
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Attend to a 128-token context window and fuse the inverse-RoPE epilogue."""
+    arch_str = _get_dspark_arch_str()
+    if arch_str is None:
+        raise RuntimeError("Embedded DSpark attention requires SM100, SM103, or SM107")
+    batch, block, heads, dim = q.shape
+    page_size = kv_pages.shape[1]
+    if (
+        block not in _DSV4_DSPARK_BLOCK_SIZES
+        or heads not in _DSV4_DSPARK_NUM_HEADS
+        or dim != _DSV4_DSPARK_HEAD_DIM
+        or page_size not in (16, 32, 64, 128, 256)
+    ):
+        raise ValueError(
+            "DSpark requires block 5/6, 64/128 heads, head_dim 512 and 16/32/64/128/256-token pages"
+        )
+    if q.dtype != torch.bfloat16 or draft_block.dtype != q.dtype or kv_pages.dtype != q.dtype:
+        raise ValueError("DSpark Q, draft KV and pages must use BF16")
+    if draft_block.shape != (batch, 8, dim) or kv_pages.shape[2] != dim:
+        raise ValueError("DSpark draft KV must have shape [batch, 8, 512]")
+    if (
+        block_tables.dtype != torch.int32
+        or block_tables.shape[0] != batch
+        or block_tables.stride(1) != 1
+    ):
+        raise ValueError("DSpark page tables must have contiguous INT32 rows")
+    for value in (positions, valid_lengths, capacities):
+        if value.dtype != torch.int64 or value.shape != (batch,) or not value.is_contiguous():
+            raise ValueError(
+                "DSpark positions, lengths and capacities must be contiguous INT64 batch vectors"
+            )
+    if attn_sink.dtype != torch.float32 or attn_sink.shape != (heads,):
+        raise ValueError("DSpark attention sink must be FP32 with one entry per head")
+    if inverse_rope_freqs.dtype != torch.float32 or inverse_rope_freqs.shape != (
+        batch,
+        block,
+        32,
+        2,
+    ):
+        raise ValueError("DSpark inverse RoPE frequencies must be FP32 [batch, block, 32, 2]")
+    if kv_pages.stride(1) != dim or kv_pages.stride(2) != 1 or kv_pages.stride(0) % 8:
+        raise ValueError("DSpark pages require contiguous tokens and an aligned page stride")
+    for value in (q, draft_block, attn_sink, inverse_rope_freqs):
+        if not value.is_contiguous():
+            raise ValueError("DSpark query, draft, sink and frequencies must be contiguous")
+    if not all(
+        value.is_cuda and value.device == q.device
+        for value in (
+            q,
+            draft_block,
+            kv_pages,
+            block_tables,
+            positions,
+            valid_lengths,
+            capacities,
+            attn_sink,
+            inverse_rope_freqs,
+        )
+    ):
+        raise ValueError("All DSpark attention inputs must be on the same CUDA device")
+    cache_key = (block, heads, page_size, arch_str, output_groups)
+    compiled = _dspark_attention_kernel_cache.get(cache_key)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DSpark paged attention must run eagerly before graph capture")
+        compiled = _compile_dspark_attention(block, arch_str, page_size, output_groups, heads)
+        _dspark_attention_kernel_cache[cache_key] = compiled
+    output = torch.empty_like(q)
+    output_scale = None
+    if output_groups is not None:
+        rows = batch * block
+        group_dim = heads * dim // output_groups
         output = torch.empty(
-            (output_groups, rows, group_dim),
-            dtype=torch.float8_e4m3fn,
-            device=q.device,
+            (output_groups, rows, group_dim), dtype=torch.float8_e4m3fn, device=q.device
         )
         output_scale = torch.empty(
             (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
             dtype=torch.float32,
             device=q.device,
         )
-        output_native = _as_dynamic_lead2(output)
-        output_scale_native = _as_dynamic_lead2(output_scale)
-
-    stream_arg = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled(
-        _as_dynamic_data(q.permute(2, 3, 1, 0), (3, 2, 0, 1)),
-        _as_dynamic_data(kv_cache.permute(1, 2, 0), None, compact=False),
-        _as_dynamic_data(block_page.permute(1, 2, 0), (2, 0, 1)),
-        page_table_win,
-        output_native,
-        output_scale_native,
-        _as_dynamic_1d(cache_seqs),
-        _as_dynamic_1d(valid_len),
+        batch,
+        kv_pages.shape[0],
+        kv_pages.stride(0),
+        block_tables.shape[1],
+        block_tables.stride(0),
+        q.data_ptr(),
+        kv_pages.data_ptr(),
+        draft_block.data_ptr(),
+        block_tables.data_ptr(),
+        positions.data_ptr(),
+        valid_lengths.data_ptr(),
+        capacities.data_ptr(),
+        attn_sink.data_ptr(),
+        inverse_rope_freqs.data_ptr(),
+        output,
+        output_scale,
         softmax_scale,
-        1.0,
-        _as_dynamic_1d(attn_sink),
-        _as_dynamic_1d(inverse_rope_freqs.reshape(-1)),
-        stream_arg,
     )
-    if output_scale is not None:
-        return output, output_scale
-    return output
+    return output, output_scale
 
 
 @torch.library.custom_op(
-    "trtllm::cute_dsl_dspark_attention",
-    mutates_args=("kv_cache",),
-    device_types="cuda",
+    "trtllm::fused_dsv4_dspark_attention", mutates_args=(), device_types="cuda"
 )
-def cute_dsl_dspark_attention(
+def fused_dsv4_dspark_attention(
     q: torch.Tensor,
-    main_kv: torch.Tensor,
-    block_kv: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slots: torch.Tensor,
-    start_pos: torch.Tensor,
-    valid_len: torch.Tensor,
+    draft_block: torch.Tensor,
+    kv_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    positions: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    capacities: torch.Tensor,
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """Run the direct/test compatibility path from already-normalized K/V."""
-    if not is_cute_dsl_dspark_attention_supported(
+    return _run_paged_dspark_attention(
         q,
-        main_kv,
-        block_kv,
-        kv_cache,
-        slots,
-        start_pos,
-        valid_len,
-        attn_sink,
-        inverse_rope_freqs,
-    ):
-        raise ValueError(
-            "cute_dsl_dspark_attention requires contiguous BF16 production DSpark tensors "
-            "([B, 5|6, 128, 512] with a 128-row window) on a supported "
-            "SM100, SM103, or SM107 GPU; "
-            f"got SM {get_sm_version()}"
-        )
-    block_size = q.shape[1]
-
-    # Compatibility path for direct callers with already-normalized K/V. The
-    # production model uses the prepared op below and does not execute these
-    # auxiliary kernels.
-    _compile_dspark_attention(block_size, softmax_scale, None)
-    kv_cache[slots, start_pos % _DSPARK_WINDOW_SIZE] = main_kv
-    block_page = F.pad(block_kv, (0, 0, 0, _DSPARK_PAGE_SIZE - block_size))
-    slots_i32 = slots.to(torch.int32)
-    cache_seqs = start_pos.to(torch.int32)
-    return _run_dspark_attention(
-        q,
-        block_page,
-        kv_cache,
-        slots_i32,
-        cache_seqs,
-        valid_len,
+        draft_block,
+        kv_pages,
+        block_tables,
+        positions,
+        valid_lengths,
+        capacities,
         attn_sink,
         inverse_rope_freqs,
         softmax_scale,
-    )
+    )[0]
 
 
-@torch.library.register_fake("trtllm::cute_dsl_dspark_attention")
+@torch.library.register_fake("trtllm::fused_dsv4_dspark_attention")
 def _(
     q: torch.Tensor,
-    main_kv: torch.Tensor,
-    block_kv: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slots: torch.Tensor,
-    start_pos: torch.Tensor,
-    valid_len: torch.Tensor,
+    draft_block: torch.Tensor,
+    kv_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    positions: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    capacities: torch.Tensor,
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
@@ -574,119 +384,65 @@ def _(
 
 
 @torch.library.custom_op(
-    "trtllm::cute_dsl_dspark_attention_prepared",
-    mutates_args=(),
-    device_types="cuda",
+    "trtllm::fused_dsv4_dspark_attention_fp8", mutates_args=(), device_types="cuda"
 )
-def cute_dsl_dspark_attention_prepared(
+def fused_dsv4_dspark_attention_fp8(
     q: torch.Tensor,
-    block_page: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slots_i32: torch.Tensor,
-    cache_seqs: torch.Tensor,
-    valid_len: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    """Run prepared attention after the caller validates the fused contract."""
-
-    return _run_dspark_attention(
-        q,
-        block_page,
-        kv_cache,
-        slots_i32,
-        cache_seqs,
-        valid_len,
-        attn_sink,
-        inverse_rope_freqs,
-        softmax_scale,
-    )
-
-
-@torch.library.register_fake("trtllm::cute_dsl_dspark_attention_prepared")
-def _(
-    q: torch.Tensor,
-    block_page: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slots_i32: torch.Tensor,
-    cache_seqs: torch.Tensor,
-    valid_len: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    del block_page, kv_cache, slots_i32, cache_seqs, valid_len, attn_sink, inverse_rope_freqs
-    del softmax_scale
-    return torch.empty_like(q)
-
-
-@torch.library.custom_op(
-    "trtllm::cute_dsl_dspark_attention_prepared_fp8",
-    mutates_args=(),
-    device_types="cuda",
-)
-def cute_dsl_dspark_attention_prepared_fp8(
-    q: torch.Tensor,
-    block_page: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slots_i32: torch.Tensor,
-    cache_seqs: torch.Tensor,
-    valid_len: torch.Tensor,
+    draft_block: torch.Tensor,
+    kv_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    positions: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    capacities: torch.Tensor,
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
     output_groups: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run prepared attention and emit grouped FP8 OA inputs and scales."""
-
-    output = _run_dspark_attention(
+    output, scales = _run_paged_dspark_attention(
         q,
-        block_page,
-        kv_cache,
-        slots_i32,
-        cache_seqs,
-        valid_len,
+        draft_block,
+        kv_pages,
+        block_tables,
+        positions,
+        valid_lengths,
+        capacities,
         attn_sink,
         inverse_rope_freqs,
         softmax_scale,
         output_groups,
     )
-    assert isinstance(output, tuple)
-    return output
+    assert scales is not None
+    return output, scales
 
 
-@torch.library.register_fake("trtllm::cute_dsl_dspark_attention_prepared_fp8")
+@torch.library.register_fake("trtllm::fused_dsv4_dspark_attention_fp8")
 def _(
     q: torch.Tensor,
-    block_page: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slots_i32: torch.Tensor,
-    cache_seqs: torch.Tensor,
-    valid_len: torch.Tensor,
+    draft_block: torch.Tensor,
+    kv_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    positions: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    capacities: torch.Tensor,
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
     output_groups: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del block_page, kv_cache, slots_i32, cache_seqs, valid_len, attn_sink, inverse_rope_freqs
-    del softmax_scale
     rows = q.shape[0] * q.shape[1]
     group_dim = q.shape[2] * q.shape[3] // output_groups
-    output = torch.empty(
-        (output_groups, rows, group_dim),
-        dtype=torch.float8_e4m3fn,
-        device=q.device,
+    return (
+        torch.empty((output_groups, rows, group_dim), dtype=torch.float8_e4m3fn, device=q.device),
+        torch.empty(
+            (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
+            dtype=torch.float32,
+            device=q.device,
+        ),
     )
-    output_scale = torch.empty(
-        (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    return output, output_scale
 
 
-if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
     from .cute_dsl_custom_ops import CuteDSLFp8RubinBmmQuantRunner, CuteDSLMXFP8RubinLinear
 
     @functools.cache
@@ -813,6 +569,9 @@ if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
 
     class CuteDSLDSparkMXFP8RubinLinear(CuteDSLMXFP8RubinLinear):
         """DSpark MXFP8 runner with process-local tuning and launch plans."""
+
+        # DSpark runs its own launch plans: no B-stationary tactics (TRTLLM_CUTEDSL_MXFP8_STATIONARY).
+        stationary_supported = False
 
         tuning_config = TuningConfig(
             # DSpark warmup runs the real generation shapes. Keep those M

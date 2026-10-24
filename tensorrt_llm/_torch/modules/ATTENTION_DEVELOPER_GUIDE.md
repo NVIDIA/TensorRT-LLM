@@ -340,14 +340,14 @@ request shape.
 #### 3.2.3 MLA cached-context semantics
 
 For Kimi K3 with NVFP4 KV cache enabled, the last two MLA layers in the global
-`linear_attn_config.full_attn_layers` schedule use BF16 KV cache by default.
+`linear_attn_config.full_attn_layers` schedule use FP8 KV cache by default.
 The model, cache allocation, and memory estimator share this policy; KDA state
-is unaffected. `TLLM_KIMI_K3_BF16_KV_LAYERS` overrides the default with a
+is unaffected. `TLLM_KIMI_K3_FP8_KV_LAYERS` overrides the default with a
 comma-separated list of zero-based global MLA layer IDs. Set it to an empty
 string to use NVFP4 for every MLA layer. The default does not apply to other
 KV-cache dtypes or model families.
 The existing FP4 cache layout requires at least one NVFP4 MLA layer on each
-PP rank; a stage containing only BF16 fallback MLA layers is not supported.
+PP rank; a stage containing only FP8 fallback MLA layers is not supported.
 
 MLA cached state is not regular dense K and V. The paged cache stores
 latent-cache state rather than separate K and V planes. Backend ops handle

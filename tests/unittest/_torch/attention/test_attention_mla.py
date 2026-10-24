@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import random
 from dataclasses import dataclass
@@ -502,6 +505,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
     import tensorrt_llm._torch.modules.mla as mla_module
 
     class FakeTrtllmAttention:
+        uses_fp4_mla_attention = False
 
         @staticmethod
         def has_cached_kv_for_mla_context_warmup(_metadata):
@@ -522,6 +526,10 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
 
         def __init__(self):
             self.mha = FakeTrtllmAttention()
+
+        @staticmethod
+        def _fp8_kv_split_k_context_capable(*_args):
+            return False
 
         @staticmethod
         def forward_context_with_chunked_prefill(*_args, **_kwargs):
@@ -557,6 +565,92 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
         latent_cache,
     )
     assert result == expected_path
+
+
+@pytest.mark.parametrize(
+    "capable,kv_tokens,expected_path,expected_warmups",
+    [
+        (False, 5000, "chunked_prefill", 0),
+        (True, 999, "chunked_prefill", 1),
+        (True, 1000, "split_k", 1),
+    ],
+    ids=["not_capable", "below_threshold", "at_threshold"],
+)
+@pytest.mark.cpu_only
+def test_mla_fp8_kv_split_k_context_dispatch(capable, kv_tokens, expected_path,
+                                             expected_warmups, monkeypatch):
+    """FP8-KV chunked prefill uses split-K only when capable and the batch is large enough."""
+    import tensorrt_llm._torch.modules.mla as mla_module
+
+    class FakeTrtllmAttention:
+        uses_fp4_mla_attention = False
+        has_fp8_kv_cache = capable
+
+        @staticmethod
+        def has_cached_kv_for_mla_context_warmup(_metadata):
+            return False
+
+        @staticmethod
+        def is_chunked_prefill_for_mla_context(_metadata):
+            return True
+
+        @staticmethod
+        def has_cached_kv_for_mla_context(_metadata):
+            return False
+
+        @staticmethod
+        def supports_k3_fp8_split_k_context():
+            return True
+
+    class FakeMetadata:
+        num_ctx_tokens = 64
+        num_ctx_cached_tokens = kv_tokens - 64
+
+    class FakeAttention:
+        out_scale = None
+        num_heads_tp = 96
+        _fp8_kv_split_k_context_capable = (
+            mla_module.MLA._fp8_kv_split_k_context_capable)
+
+        def __init__(self):
+            self.mha = FakeTrtllmAttention()
+
+        @staticmethod
+        def forward_context_with_chunked_prefill_fp4(*_args, **_kwargs):
+            return "split_k"
+
+        @staticmethod
+        def forward_context_with_chunked_prefill(*_args, **_kwargs):
+            return "chunked_prefill"
+
+        @staticmethod
+        def forward_context_with_cached_kv(*_args, **_kwargs):
+            return "cached_kv"
+
+        @staticmethod
+        def forward_context_default(*_args, **_kwargs):
+            return "default"
+
+    warmups = []
+    monkeypatch.setattr(mla_module, "TrtllmAttention", FakeTrtllmAttention)
+    monkeypatch.setattr(mla_module, "TrtllmAttentionMetadata", FakeMetadata)
+    monkeypatch.setattr(mla_module, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(mla_module, "_K3_SPLIT_K_CONTEXT_MIN_KV_TOKENS", 1000)
+    monkeypatch.setattr(mla_module, "_warmup_k3_split_k_context_fmha",
+                        lambda *args: warmups.append(args))
+
+    result = mla_module.MLA.forward_context(
+        FakeAttention(),
+        torch.empty((1, 8), dtype=torch.bfloat16),
+        torch.empty((1, 4), dtype=torch.bfloat16),
+        torch.empty((1, 4), dtype=torch.bfloat16),
+        torch.zeros((1, ), dtype=torch.int64),
+        FakeMetadata(),
+        torch.empty((1, 8), dtype=torch.bfloat16),
+        torch.empty((1, 1, 8), dtype=torch.bfloat16),
+    )
+    assert result == expected_path
+    assert len(warmups) == expected_warmups
 
 
 # Convert parameterized tests to pytest parametrize

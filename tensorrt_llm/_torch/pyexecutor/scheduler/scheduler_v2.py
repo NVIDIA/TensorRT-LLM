@@ -184,18 +184,32 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
         )
+        from .. import kv_cache_manager_v2
         from ..kv_cache_manager_v2 import KVCacheManagerV2
 
         assert isinstance(kv_cache_manager, KVCacheManagerV2), (
             f"KVCacheV2Scheduler requires KVCacheManagerV2, got {type(kv_cache_manager).__name__}"
         )
         self.kv_cache_manager = kv_cache_manager
+        # TRTLLM_KV_V2_WAIT_FOR_INFLIGHT_PREFIX: ask the manager which new
+        # context requests wait for a prefix another request computes.
+        self._wait_for_inflight_prefix = kv_cache_manager_v2._WAIT_FOR_INFLIGHT_PREFIX
         self.draft_kv_cache_manager = draft_kv_cache_manager
         self.enable_joint_kv_cache_reuse = kv_cache_manager.enable_joint_kv_cache_reuse
         # The draft pool to keep in lockstep with the target, or None when
         # unpaired. Resolved once so the admission paths cannot disagree.
         self._joint_draft_manager = (
             draft_kv_cache_manager if self.enable_joint_kv_cache_reuse else None
+        )
+        # The draft pool whose generation-side admission is checked with the target's:
+        # the paired one, or a decode-only mirror (KVCacheManagerV2.decode_only_draft_kv).
+        # The latter holds far fewer tokens than the target pool, so it must backpressure
+        # through the same evict / suspend ladder instead of failing in prepare_resources.
+        self._gen_alloc_draft_manager = (
+            draft_kv_cache_manager
+            if self.enable_joint_kv_cache_reuse
+            or getattr(draft_kv_cache_manager, "decode_only_draft_kv", False) is True
+            else None
         )
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
@@ -562,9 +576,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         let_through_ids: set[int] = set()
         if self._ctx_demote_uncached_tokens:
             pending_ctx, demoted_ids, let_through_ids = self._defer_long_context(pending_ctx)
+        waiting_ids = (
+            self.kv_cache_manager.plan_context_waits(pending_ctx)
+            if self._wait_for_inflight_prefix
+            else ()
+        )
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            if req.py_request_id in waiting_ids:
+                continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
                 continue
@@ -690,11 +711,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
         """
-        # Cache-transceiver mode disables the separate one-model draft manager,
-        # so disagg generation init has no paired-reuse path. Supporting one
-        # would also require draft KV transfer and history_length=prompt_len.
         if not self.kv_cache_manager.prepare_disagg_gen_init(req):
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
+            return ScheduleAction.SKIP, 0
+        draft_manager = self._gen_alloc_draft_manager
+        if draft_manager is not None and not draft_manager.try_allocate_draft_disagg_gen_init(req):
+            # No transfer has started. Undo the target reservation before retrying;
+            # its history watermark may require dropping the cache altogether.
+            self.kv_cache_manager.revert_allocate_context(req)
+            draft_manager.free_resources(req)
+            self._suspend_request(req)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
 
@@ -1305,16 +1331,16 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _try_allocate_generation(self, req: LlmRequest) -> bool:
         """Atomically admit one generation step in target and draft pools.
 
-        The draft pool mirrors the target pool (same requests, same block
-        boundaries, same ``tokens_per_block``), so a draft-side failure just
-        means this request does not fit. Roll the target growth back and report
+        The draft pool mirrors the target pool's requests (a paired pool with the
+        same block boundaries, or a decode-only mirror), so a draft-side failure
+        just means this request does not fit. Roll the target growth back and report
         a plain allocation failure, letting the caller run the same evict /
         recompute-pause / self-suspend ladder it uses for target-pool pressure.
         """
         if not self.kv_cache_manager.try_allocate_generation(req):
             return False
 
-        draft_manager = self._joint_draft_manager
+        draft_manager = self._gen_alloc_draft_manager
         if draft_manager is None or draft_manager.try_allocate_generation(req):
             return True
 

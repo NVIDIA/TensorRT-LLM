@@ -1519,7 +1519,7 @@ legacy-files: &legacy_files |
 # list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$)'
+exclude: '(^tensorrt_llm/_torch/cute_dsl_kernels/blackwell/kimi_k3_kda/kda_chunked_bt16(_small_bh)?\.py$|^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
@@ -1613,6 +1613,13 @@ repos:
         files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
+    -   id: vendor-sources-check
+        name: Check vendored source digests
+        entry: python3 scripts/vendor_sources.py check
+        language: python
+        additional_dependencies: [PyYAML]
+        pass_filenames: false
+        always_run: true
     -   id: model-registry-check
         name: Validate AutoDeploy model registry
         entry: python scripts/check_model_registry.py

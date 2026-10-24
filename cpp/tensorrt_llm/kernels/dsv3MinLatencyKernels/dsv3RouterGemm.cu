@@ -214,12 +214,14 @@ __device__ __forceinline__ void mma_bf16_m16n8k16(float (&c)[4], uint32_t const 
 // two MMAs as k-pairs {0,1},{2,3} and {4,5},{6,7}), which is legal because the dot product is order-invariant.
 // Motivation (B200, M=8): router_gemm_kernel executes ~4M warp-instructions (M x 896 x 7168 FMAs + bf16->fp32
 // converts) and is issue-bound (~26% issue utilisation, time ~linear in M); one MMA replaces 64 warp-FFMAs.
-template <int kNumTokens, int kNumExperts, int kHiddenDim, int kExpertsPerCta, int kBlockSize>
-__global__ __launch_bounds__(kBlockSize, 1) void router_gemm_mma_kernel(
-    float* out, __nv_bfloat16 const* mat_a, __nv_bfloat16 const* mat_b)
+template <int kNumTokens, int kNumExperts, int kHiddenDim, int kExpertsPerCta, int kBlockSize, int kLatentDim = 0>
+__device__ __forceinline__ void routerGemmMma(float* out, __nv_bfloat16 const* mat_a, __nv_bfloat16 const* mat_b,
+    __nv_bfloat16* projection, __nv_bfloat16 const* downWeight)
 {
     static_assert(kNumTokens >= 1 && kNumTokens <= 16, "one m16 tile in the token dimension");
     static_assert(kExpertsPerCta % 8 == 0, "expert columns per CTA must be whole n8 tiles");
+    static_assert(kLatentDim == 0 || (kNumExperts % kExpertsPerCta == 0 && kLatentDim % kExpertsPerCta == 0),
+        "gate and latent output boundaries must align to CTA tiles");
     constexpr int kNumWarps = kBlockSize / 32;
     constexpr int kTilesN = kExpertsPerCta / 8;
     constexpr int kChunk = 32; // k elements per lane load (8 per lane group) = two m16n8k16 MMAs
@@ -246,6 +248,16 @@ __global__ __launch_bounds__(kBlockSize, 1) void router_gemm_mma_kernel(
 
     __nv_bfloat16 const* a_row0 = mat_a + g * kHiddenDim;
     __nv_bfloat16 const* a_row1 = mat_a + (g + 8) * kHiddenDim;
+    __nv_bfloat16 const* weight = mat_b;
+    int weightColumn = n_base;
+    if constexpr (kLatentDim > 0)
+    {
+        if (n_base >= kNumExperts)
+        {
+            weight = downWeight;
+            weightColumn -= kNumExperts;
+        }
+    }
     bool const row0_valid = g < kNumTokens;
     bool const row1_valid = kTwoRows && (g + 8 < kNumTokens);
     uint4 const zero4 = make_uint4(0u, 0u, 0u, 0u);
@@ -266,7 +278,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void router_gemm_mma_kernel(
             for (int t = 0; t < kTilesN; t++)
             {
                 b[c][t] = *reinterpret_cast<uint4 const*>(
-                    mat_b + static_cast<int64_t>(n_base + t * 8 + g) * kHiddenDim + k);
+                    weight + static_cast<int64_t>(weightColumn + t * 8 + g) * kHiddenDim + k);
             }
         }
 #pragma unroll
@@ -314,12 +326,40 @@ __global__ __launch_bounds__(kBlockSize, 1) void router_gemm_mma_kernel(
         int const col = n_base + t * 8 + (l % 4) * 2 + (i & 1);
         if (row < kNumTokens)
         {
-            out[row * kNumExperts + col] = sum;
+            if constexpr (kLatentDim > 0)
+            {
+                if (n_base >= kNumExperts)
+                {
+                    projection[row * kLatentDim + col - kNumExperts] = __float2bfloat16_rn(sum);
+                }
+                else
+                {
+                    out[row * kNumExperts + col] = sum;
+                }
+            }
+            else
+            {
+                out[row * kNumExperts + col] = sum;
+            }
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
+}
+
+template <int kNumTokens, int kNumExperts, int kHiddenDim, int kExpertsPerCta, int kBlockSize>
+__global__ __launch_bounds__(kBlockSize, 1) void router_gemm_mma_kernel(
+    float* out, __nv_bfloat16 const* mat_a, __nv_bfloat16 const* mat_b)
+{
+    routerGemmMma<kNumTokens, kNumExperts, kHiddenDim, kExpertsPerCta, kBlockSize>(out, mat_a, mat_b, nullptr, nullptr);
+}
+
+template <int kNumTokens>
+__global__ __launch_bounds__(448, 1) void router_latent_gemm_mma_kernel(float* logits, __nv_bfloat16* projection,
+    __nv_bfloat16 const* input, __nv_bfloat16 const* gateWeight, __nv_bfloat16 const* downWeight)
+{
+    routerGemmMma<kNumTokens, 896, 7168, 8, 448, 3584>(logits, input, gateWeight, projection, downWeight);
 }
 
 template <int kNumTokens, int kNumExperts, int kHiddenDim>
@@ -343,6 +383,26 @@ void invokeRouterGemmMma(float* output, __nv_bfloat16 const* mat_a, __nv_bfloat1
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config,
         router_gemm_mma_kernel<kNumTokens, kNumExperts, kHiddenDim, kExpertsPerCta, kBlockSize>, output, mat_a, mat_b));
+}
+
+template <int kNumTokens>
+void invokeRouterLatentGemmMma(float* logits, __nv_bfloat16* projection, __nv_bfloat16 const* input,
+    __nv_bfloat16 const* gateWeight, __nv_bfloat16 const* downWeight, cudaStream_t stream)
+{
+    constexpr int kColumns = 896 + 3584;
+    constexpr int kColumnsPerCta = 8;
+    constexpr int kBlockSize = 448;
+    cudaLaunchConfig_t config{};
+    config.gridDim = kColumns / kColumnsPerCta;
+    config.blockDim = kBlockSize;
+    config.stream = stream;
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = &attr;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+        &config, router_latent_gemm_mma_kernel<kNumTokens>, logits, projection, input, gateWeight, downWeight));
 }
 
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 1, 256, 7168>(
@@ -512,6 +572,27 @@ INSTANTIATE_ROUTER_GEMM_MMA_K3(14)
 INSTANTIATE_ROUTER_GEMM_MMA_K3(15)
 INSTANTIATE_ROUTER_GEMM_MMA_K3(16)
 #undef INSTANTIATE_ROUTER_GEMM_MMA_K3
+
+#define INSTANTIATE_ROUTER_LATENT_GEMM_MMA(kNumTokens)                                                                 \
+    template void invokeRouterLatentGemmMma<kNumTokens>(                                                               \
+        float*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(1)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(2)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(3)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(4)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(5)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(6)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(7)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(8)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(9)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(10)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(11)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(12)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(13)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(14)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(15)
+INSTANTIATE_ROUTER_LATENT_GEMM_MMA(16)
+#undef INSTANTIATE_ROUTER_LATENT_GEMM_MMA
 
 } // namespace kernels::dsv3MinLatencyKernels
 

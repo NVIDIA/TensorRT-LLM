@@ -45,8 +45,9 @@
 #                        GSM8K task default of 256 truncates half the corpus
 #                        inside the thinking block.
 # TLLM_EVAL_SPEC_STATS=1 Prints the AL/AR summary this script exists for.
-# KIMI_K3_ROUTER_BF16=0  With attention-DP off the MoE router gate would
-#                        otherwise take its bf16 fast path, which can flip
+# KIMI_K3_ROUTER_BF16=0  Keeps the MoE router gate on the fp32 upcast path
+#                        the reference scores were measured with; the default
+#                        bf16 path sums in a different order, which can flip
 #                        borderline expert picks.
 #
 # ---------------------------------------------------------------------------
@@ -189,7 +190,7 @@ srun --mpi=pmix \
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
         # The point of this script.
         export TLLM_EVAL_SPEC_STATS=1
-        # See the header: keeps the router gate off its bf16 fast path.
+        # See the header: keeps the router gate off its default bf16 path.
         export KIMI_K3_ROUTER_BF16=\"\${KIMI_K3_ROUTER_BF16:-0}\"
 
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \

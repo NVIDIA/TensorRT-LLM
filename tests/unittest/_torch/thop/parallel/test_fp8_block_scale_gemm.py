@@ -26,8 +26,8 @@ from utils.util import getSMVersion, isSM100Family
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
-from tensorrt_llm._torch.cute_dsl_utils import (
-    IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
+from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 
 
 @pytest.mark.skipif(
@@ -405,7 +405,7 @@ def test_cute_dsl_fp8_block_scale_bmm_autotune_profiles() -> None:
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 @pytest.mark.parametrize(
@@ -452,7 +452,7 @@ def test_cute_dsl_fp8_block_scale_gemm_rubin(dtype, m, k, n, use_tvm_ffi):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
@@ -530,7 +530,7 @@ def test_mxfp8_alpha_cache_rejects_first_init_during_capture():
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 @pytest.mark.parametrize("m", [1, 32, 128, 192, 256])
@@ -678,8 +678,8 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
 
 
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-    reason="The test requires internal CuTe DSL support.",
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="The test requires CuTe DSL Rubin (SM107) support.",
 )
 def test_cute_dsl_blockscaled_rubin_runner_hierarchy():
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
@@ -701,7 +701,7 @@ def test_cute_dsl_blockscaled_rubin_runner_hierarchy():
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 @pytest.mark.parametrize(
@@ -776,7 +776,7 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_multi_wave(
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave():
@@ -839,7 +839,7 @@ def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave():
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 def test_cute_dsl_mxfp8_gemm_rubin_rejects_clc_grid_z_overflow():
@@ -875,7 +875,7 @@ def test_cute_dsl_mxfp8_gemm_rubin_rejects_clc_grid_z_overflow():
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 @pytest.mark.parametrize("m", [1, 7, 128])
@@ -957,7 +957,7 @@ def _assert_valid_fp8_bmm_quant_scales_equal(fused_scale, ref_scale, m, flat_n):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 @pytest.mark.parametrize("m", [1, 16, 128, 256])
@@ -1007,7 +1007,7 @@ def test_cute_dsl_fp8_bmm_quantize_rubin_matches_separate(m):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 def test_cute_dsl_fp8_bmm_quantize_rubin_cuda_graph():
@@ -1059,7 +1059,7 @@ def test_cute_dsl_fp8_bmm_quantize_rubin_cuda_graph():
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
 def test_cute_dsl_fp8_block_scale_bmm_rubin_cuda_graph():

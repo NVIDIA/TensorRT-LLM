@@ -229,6 +229,7 @@ else:
     SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
     UniqueToken = _cpp.UniqueToken
+    CacheDomain = _cpp.CacheDomain
 
     BeamIndex = int
     CacheLevel = int
@@ -361,3 +362,6 @@ __all__ = [
     "rawref",
     "typed_range",
 ]
+
+if _BACKEND == "cpp":
+    __all__.append("CacheDomain")

@@ -22,7 +22,7 @@ import torch
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, TunableRunner
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
-    IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from tensorrt_llm._torch.ugpu.autotune import UgpuConcurrentTunableRunner
 from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
@@ -38,8 +38,8 @@ RUBIN_CUTE_DSL_MARKS = [
     ),
     pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available"),
     pytest.mark.skipif(
-        not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-        reason="Rubin CuTe DSL internal package is not available",
+        not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+        reason="the CuTe DSL Rubin helpers are not available",
     ),
 ]
 

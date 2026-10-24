@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend.fmha import (
     Fmha, Fp4MlaFmha, get_enabled_fmha_lib_classes)
+from tensorrt_llm._torch.attention_backend.fmha.fp4_mla import (
+    k3_fp8_split_k_context_supported, run_k3_fp8_split_k_context_partition)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
@@ -39,6 +41,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from ..pyexecutor.config_utils import is_mla
 from ..ugpu.runtime import UgpuRuntime
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -48,7 +51,7 @@ from .fp4_mla import (FP4_MLA_KV_GLOBAL_SCALE, FP4_MLA_Q_GLOBAL_SCALE,
                       configure_fp4_mla_device_page_table,
                       load_fp4_mla_chunked_kv_cache,
                       populate_fp4_mla_append_metadata,
-                      scatter_fp4_mla_kv_cache)
+                      populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -210,6 +213,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _fp4_mla_generation_cache_scattered: bool = field(init=False,
                                                       default=False,
                                                       repr=False)
+    # Packed FP4 MLA decode plans its KV split once per step (the plan only
+    # depends on the step's lengths); this key marks the plan as current.
+    _fp4_mla_packed_plan_key: Optional[tuple] = field(init=False,
+                                                      default=None,
+                                                      repr=False)
+    # CuTe DSL MLA decode plans its per-request split-KV counts once per step
+    # (cute_dsl_mla.py); the plan buffer and the key that marks it current.
+    _cute_dsl_mla_split_plan: Optional[torch.Tensor] = field(init=False,
+                                                             default=None,
+                                                             repr=False)
+    _cute_dsl_mla_split_plan_key: Optional[tuple] = field(init=False,
+                                                          default=None,
+                                                          repr=False)
     _fp4_mla_device_page_table: bool = field(init=False,
                                              default=False,
                                              repr=False)
@@ -921,6 +937,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # buffers below must be rebuilt before the next MLA layer reads them.
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
+        self._cute_dsl_mla_split_plan_key = None
 
     def restore_from_spec_dec(self) -> None:
         # The spec-dec draft loop pointed the FP4 MLA length aliases at the
@@ -1002,34 +1019,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         real committed length even though the host packed provisional values.
         Static shapes only; safe under CUDA graph capture.
         """
-        pos = self.helix_position_offsets[num_ctx_tokens:num_ctx_tokens +
-                                          num_gen_tokens]
-        phys = self.kv_cache_manager.tokens_per_block
-        cp_rank = self.mapping.cp_rank
-        cp_size = self.mapping.cp_size
-        owner = torch.div(pos, phys, rounding_mode='floor') % cp_size
-        active = owner == cp_rank
-        local_before = self.helix_local_len_vec(pos)
-        # Scalar overload: no per-step allocation (CUDA-graph capture treats
-        # these ops as part of the graph; keep them allocation-free).
-        self.helix_local_slots[num_ctx_tokens:num_ctx_tokens +
-                               num_gen_tokens].copy_(
-                                   torch.where(active, local_before, -1))
-        self.helix_kv_bounds[num_ctx_tokens:num_ctx_tokens +
-                             num_gen_tokens].copy_(
-                                 self.helix_local_len_vec(pos + 1))
-        # Per-sequence rank-local kv length = bound of the sequence's last
-        # token (attention over committed + owned in-flight tokens).
         assert num_gen_tokens % tokens_per_gen_seq == 0, (
             f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
             f"tokens not divisible by group size {tokens_per_gen_seq}")
         num_gen_seqs = num_gen_tokens // tokens_per_gen_seq
-        last_bounds = self.helix_kv_bounds[num_ctx_tokens:num_ctx_tokens +
-                                           num_gen_tokens].view(
-                                               num_gen_seqs,
-                                               tokens_per_gen_seq)[:, -1]
-        self.kv_lens_cuda[self.num_contexts:self.num_contexts +
-                          num_gen_seqs].copy_(last_bounds)
+        gen_tokens = slice(num_ctx_tokens, num_ctx_tokens + num_gen_tokens)
+        # One launch derives the write slots, the attention bounds and the
+        # per-sequence rank-local kv length (the bound of the sequence's last
+        # token: committed + owned in-flight tokens) from the positions; it
+        # replaces a chain of elementwise ops on the step's critical path.
+        populate_helix_spec_buffers(
+            self.helix_position_offsets[gen_tokens],
+            self.helix_local_slots[gen_tokens],
+            self.helix_kv_bounds[gen_tokens],
+            self.kv_lens_cuda[self.num_contexts:self.num_contexts +
+                              num_gen_seqs],
+            num_tokens=num_gen_tokens,
+            tokens_per_seq=tokens_per_gen_seq,
+            tokens_per_block=self.kv_cache_manager.tokens_per_block,
+            cp_size=self.mapping.cp_size,
+            cp_rank=self.mapping.cp_rank)
 
     def build_ugpu_block_offsets(
         self,
@@ -1495,6 +1504,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fp4_mla_generation_lengths_num_seqs = -1
         self.fp4_mla_generation_lengths_num_contexts = -1
         self._fp4_mla_generation_lengths_capture_recorded = False
+        self._fp4_mla_packed_plan_key = None
 
     def _configure_fp4_mla_page_metadata(self, kv_lens: torch.Tensor) -> None:
         """Configure fixed-stride device page metadata."""
@@ -2533,8 +2543,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 (latent_dim + nvfp4_gather_aux_bytes_per_compressed_token) /
                 min_compress_ratio)
 
-        fp8_context_mla = (quant_config is not None
-                           and quant_config.quant_mode.has_fp8_kv_cache()
+        fp8_fallback_layers = frozenset()
+        if quant_mode is not None and getattr(quant_mode, "has_fp4_kv_cache",
+                                              lambda: False)():
+            fp8_fallback_layers = get_kimi_k3_fp8_kv_layer_ids(
+                config, nvfp4_enabled=True)
+        has_local_fp8_fallback = bool(
+            fp8_fallback_layers and fp8_fallback_layers.intersection(
+                mapping.pp_layers(config.num_hidden_layers)))
+        # FP8 fallback layers stage the same context buffers as an all-FP8
+        # model, even though the model-wide cache quantization is NVFP4.
+        fp8_context_mla = (quant_mode is not None
+                           and (quant_mode.has_fp8_kv_cache()
+                                or has_local_fp8_fallback)
                            and get_sm_version() in (90, 100, 103, 107, 120))
         if not fp8_context_mla:
             return 0
@@ -2547,12 +2568,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
         #     so those layers still run dense MLA. The workspace is shared, so one dense layer forces the
         #     reserve.
-        #   * SM 100 / 103 -- mUseTllmGen is `sm >= 100 && sm != 120`.
+        #   * SM 100 / 103 / 107 -- mUseTllmGen is `sm >= 100 && sm != 120`.
         #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
         # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
-                      and get_sm_version() in (100, 103))
+                      and get_sm_version() in (100, 103, 107))
         short_seq_mha_enabled = int(
             os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled
@@ -3238,7 +3259,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         chunked_global_offset: torch.Tensor,
         chunked_max_seq_len: int,
         out_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output_format: str = "dense",
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
@@ -3252,9 +3274,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 chunked_global_offset=chunked_global_offset,
                 chunked_max_seq_len=chunked_max_seq_len,
                 out_dtype=out_dtype,
+                output_format=output_format,
                 kv_lora_rank=self.mla_params.kv_lora_rank,
                 qk_rope_head_dim=self.mla_params.qk_rope_head_dim,
             )
+
+        if output_format != "dense":
+            raise ValueError(
+                "MXFP8 chunk gathering requires NVFP4 MLA storage.")
 
         if metadata.max_ctx_cached_token_len == 0:
             empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
@@ -3345,6 +3372,70 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 )
         raise RuntimeError(
             "Dense FP4 MLA FMHA is unavailable for chunked prefill.")
+
+    def supports_k3_fp8_split_k_context(self) -> bool:
+        if not self.fmha_libs:
+            self.create_fmha_libs()
+        if self._fp4_mla_fmha is not None:
+            return self._fp4_mla_fmha.supports_k3_fp8_split_k_context()
+        # FP8 latent caches feed the same kernel through FP8 scratch tensors.
+        return (self.is_mla_enable and self.has_fp8_kv_cache
+                and k3_fp8_split_k_context_supported(self))
+
+    def forward_k3_fp8_split_k_context_partition(
+        self,
+        q: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+        output: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        merge_op: torch.Tensor,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        *,
+        max_q_len: int,
+        max_kv_len: int,
+        is_causal: bool,
+    ) -> None:
+        if not self.fmha_libs:
+            self.create_fmha_libs()
+        if self._fp4_mla_fmha is not None:
+            self._fp4_mla_fmha.forward_k3_fp8_split_k_context_partition(
+                q,
+                k_nope,
+                k_pe,
+                v,
+                output,
+                softmax_stats,
+                merge_op,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                max_q_len=max_q_len,
+                max_kv_len=max_kv_len,
+                is_causal=is_causal,
+            )
+            return
+        if self.is_mla_enable and self.has_fp8_kv_cache:
+            run_k3_fp8_split_k_context_partition(
+                self,
+                q,
+                k_nope,
+                k_pe,
+                v,
+                output,
+                softmax_stats,
+                merge_op,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                max_q_len=max_q_len,
+                max_kv_len=max_kv_len,
+                is_causal=is_causal,
+            )
+            return
+        raise RuntimeError(
+            "Rubin K3 FP8 split-K context FMHA is unavailable for chunked prefill."
+        )
 
     def mla_rope_append_paged_kv_assign_q(
         self,

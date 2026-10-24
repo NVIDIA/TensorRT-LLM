@@ -73,6 +73,7 @@ add_library(
   fp4GemmTrtllmGen.cpp
   fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
+  nvfp4QuantKfOp.cpp
   fp4BatchedQuantize.cpp
   fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
@@ -84,6 +85,8 @@ add_library(
   inverseRopeFp8QuantOp.cpp
   kdaDecodeOp.cpp
   attnResOp.cpp
+  attnResPersistentExtOp.cpp
+  attnResKfOp.cpp
   fusedQKNormRopeOp.cpp
   fusedAdaptiveLayerNormOp.cpp
   fusedDiTQKNormRopeOp.cpp
@@ -118,6 +121,7 @@ add_library(
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
+  kimiK3KdaMtpVerifyKfOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
   IndexerKCacheGatherOp.cpp

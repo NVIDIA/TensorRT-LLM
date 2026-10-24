@@ -18,6 +18,8 @@ import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
@@ -35,6 +37,140 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
+    )
+
+
+# Per-request split-KV plan for the CuTe DSL MLA decode kernels. The kernel grid
+# carries the tactic's split_kv slots per request; the plan decides how many a
+# request uses this step from the batch's KV lengths (the kernel clamps it to
+# the grid and the slots beyond exit before their mainloop).
+_SPLIT_PLAN_MAX_REQUESTS = 1024
+# CuteDSLNVMlaDecodeBlackwellRunner._MAX_SPLIT_KV: the largest grid any tactic uses.
+_SPLIT_PLAN_MAX_SPLIT = 32
+# mma_qk_tiler N of every tactic: the KV tile a split is made of.
+_SPLIT_PLAN_KV_TILE = 128
+# Shortest piece worth its partial-output write and reduction read.
+_SPLIT_PLAN_MIN_TILES = 4
+# Fixed cost of one piece (cluster launch, Q load, pipeline fill, partial store
+# and its reduction) in KV tiles, fitted on forced-split sweeps: with it the
+# wave-quantized makespan picks a near-optimal split.
+_SPLIT_PLAN_PIECE_COST_TILES = 60
+
+
+@triton.jit(
+    do_not_specialize=["num_requests", "rows_per_request", "wave_clusters", "max_split"],
+    do_not_specialize_on_alignment=[
+        "num_requests",
+        "rows_per_request",
+        "wave_clusters",
+        "max_split",
+    ],
+)
+def _mla_split_kv_plan_kernel(
+    cache_seqs_ptr,
+    plan_ptr,
+    num_requests,
+    rows_per_request,
+    wave_clusters,
+    max_split,
+    KV_TILE: tl.constexpr,
+    MIN_TILES: tl.constexpr,
+    PIECE_COST: tl.constexpr,
+    MAX_PIECES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_requests
+    kv_len = tl.load(cache_seqs_ptr + offsets, mask=mask, other=0)
+    tiles = tl.maximum((kv_len + KV_TILE - 1) // KV_TILE, 1)
+    tiles = tl.where(mask, tiles, 0)
+    longest = tl.max(tiles, axis=0)
+    # Cut the longest request into k equal pieces (every request then takes
+    # ceil(tiles / piece) pieces) and keep the k whose wave-quantized makespan,
+    # waves x (piece + fixed piece cost), is smallest; ties go to fewer pieces.
+    best_piece = longest
+    best_cost = tl.full([], 2**31 - 1, tl.int32)
+    for pieces in tl.static_range(1, MAX_PIECES + 1):
+        piece = tl.maximum((longest + pieces - 1) // pieces, MIN_TILES)
+        splits = tl.minimum(tl.maximum((tiles + piece - 1) // piece, 1), max_split)
+        clusters = tl.sum(tl.where(mask, splits, 0), axis=0) * rows_per_request
+        waves = (clusters + wave_clusters - 1) // wave_clusters
+        cost = waves * (piece + PIECE_COST)
+        better = cost < best_cost
+        best_cost = tl.where(better, cost, best_cost)
+        best_piece = tl.where(better, piece, best_piece)
+    plan = tl.minimum(tl.maximum((tiles + best_piece - 1) // best_piece, 1), max_split)
+    tl.store(plan_ptr + offsets, plan, mask=mask)
+
+
+def plan_mla_split_kv(
+    kv_lens: list[int],
+    *,
+    rows_per_request: int,
+    wave_clusters: int,
+    max_split: int = _SPLIT_PLAN_MAX_SPLIT,
+    kv_tile: int = _SPLIT_PLAN_KV_TILE,
+    min_tiles: int = _SPLIT_PLAN_MIN_TILES,
+    piece_cost: int = _SPLIT_PLAN_PIECE_COST_TILES,
+) -> list[int]:
+    """Host mirror of ``_mla_split_kv_plan_kernel``: per-request split counts.
+
+    ``rows_per_request`` is the kernel's (folded) query rows per request, each
+    a 2-CTA cluster per split; ``wave_clusters`` the clusters one wave holds.
+    The longest request is cut into ``k`` equal pieces (every request takes
+    ``ceil(tiles / piece)`` of them) for the ``k`` with the smallest
+    wave-quantized makespan ``waves * (piece + piece_cost)``.
+    """
+    num_requests = len(kv_lens)
+    if num_requests <= 0 or rows_per_request <= 0 or wave_clusters <= 0 or max_split <= 0:
+        raise ValueError("split plan needs requests, rows, wave clusters and a split cap")
+    tiles = [max(math.ceil(max(kv, 0) / kv_tile), 1) for kv in kv_lens]
+    longest = max(tiles)
+    best_piece, best_cost = longest, None
+    for pieces in range(1, max_split + 1):
+        piece = max(math.ceil(longest / pieces), min_tiles)
+        splits = [min(max(math.ceil(t / piece), 1), max_split) for t in tiles]
+        waves = math.ceil(sum(splits) * rows_per_request / wave_clusters)
+        cost = waves * (piece + piece_cost)
+        if best_cost is None or cost < best_cost:
+            best_piece, best_cost = piece, cost
+    return [min(max(math.ceil(t / best_piece), 1), max_split) for t in tiles]
+
+
+def launch_mla_split_kv_plan(
+    cache_seqs: torch.Tensor,
+    plan: torch.Tensor,
+    *,
+    num_requests: int,
+    rows_per_request: int,
+    wave_clusters: int,
+    max_split: int = _SPLIT_PLAN_MAX_SPLIT,
+) -> None:
+    """Write the per-request split counts for ``cache_seqs`` into ``plan`` (one launch)."""
+    if not 0 < num_requests <= _SPLIT_PLAN_MAX_REQUESTS:
+        raise ValueError(f"split plan supports 1..{_SPLIT_PLAN_MAX_REQUESTS} requests")
+    for name, tensor in (("cache_seqs", cache_seqs), ("plan", plan)):
+        if (
+            tensor.dtype != torch.int32
+            or tensor.ndim != 1
+            or tensor.stride(0) != 1
+            or tensor.numel() < num_requests
+            or not tensor.is_cuda
+        ):
+            raise ValueError(f"{name} must be a contiguous CUDA int32 vector of >= {num_requests}")
+    _mla_split_kv_plan_kernel[(1,)](
+        cache_seqs,
+        plan,
+        num_requests,
+        max(rows_per_request, 1),
+        max(wave_clusters, 1),
+        max(max_split, 1),
+        KV_TILE=_SPLIT_PLAN_KV_TILE,
+        MIN_TILES=_SPLIT_PLAN_MIN_TILES,
+        PIECE_COST=_SPLIT_PLAN_PIECE_COST_TILES,
+        MAX_PIECES=_SPLIT_PLAN_MAX_SPLIT,
+        BLOCK=_SPLIT_PLAN_MAX_REQUESTS,
+        num_warps=4,
     )
 
 
@@ -143,8 +279,19 @@ class CuteDslMlaFmha(PhasedFmha):
     def _supports_mixed_batch(
         attn: "TrtllmAttention",
         meta: "TrtllmAttentionMetadata",
+        num_tokens: int = 0,
+        kernel_dtype: Optional[torch.dtype] = None,
     ) -> bool:
         if meta.num_contexts == 0:
+            return True
+
+        # FP8 KV with CuTe-DSL explicitly selected (Kimi K3 forces it: TRTLLM-Gen has no 96-head FP8-KV MLA decode
+        # that takes device scales). The CuTe-DSL kernel is then the only working generation backend, so the
+        # generation slice of a mixed (IFB) batch must run here too; otherwise it falls through to the thop
+        # fallback, which JIT-compiles through Jitify/nvJitLink at the first mixed batch. PhasedFmha.forward hands
+        # this library only the generation slice (q tokens, sequence_lengths[num_contexts:]) and _run_mla_decode
+        # slices the page table past num_contexts, so the mixed case is the decode-only kernel call on that slice.
+        if CuteDslMlaFmha._is_fp8_cute_dsl_selected(attn, meta, num_tokens, kernel_dtype):
             return True
 
         kv_cache_manager = meta.kv_cache_manager
@@ -155,7 +302,7 @@ class CuteDslMlaFmha(PhasedFmha):
         return (
             callable(get_kv_cache_dtype)
             and attn.layer_idx in layer_offsets
-            and get_kv_cache_dtype(attn.layer_idx) == DataType.BF16
+            and get_kv_cache_dtype(attn.layer_idx) in (DataType.BF16, DataType.FP8)
         )
 
     @staticmethod
@@ -232,7 +379,7 @@ class CuteDslMlaFmha(PhasedFmha):
             mma_qk_tiler_mn,
             mma_pv_tiler_mn,
             1,  # split_kv
-            True,  # is_persistent
+            False,  # is_persistent
             True,  # is_var_seq
             False,  # is_var_split_kv
             page_size,
@@ -262,12 +409,12 @@ class CuteDslMlaFmha(PhasedFmha):
         )
         if supported and metadata.num_contexts > 0 and self.attn.num_heads != 96:
             logger.info_once(
-                "CuTe DSL MLA FMHA selected for an NVFP4-manager BF16 fallback "
+                "CuTe DSL MLA FMHA selected for an NVFP4-manager fallback "
                 f"layer in a mixed batch: layer={self.attn.layer_idx}, "
                 f"num_contexts={metadata.num_contexts}, "
                 f"num_generations={metadata.num_generations}, "
                 f"q_shape={tuple(q.shape)}.",
-                key=f"cute_dsl_mla_mixed_bf16_layer:{self.attn.layer_idx}",
+                key=f"cute_dsl_mla_mixed_fallback_layer:{self.attn.layer_idx}",
             )
         if not supported:
             logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
@@ -338,11 +485,13 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Keep the general mixed-batch performance gate, except when an
-        # NVFP4 manager exposes this layer through its BF16 fallback pool.
+        # NVFP4 manager exposes this layer through its BF16 or FP8 fallback pool.
         # TRTLLM-Gen cannot consume that combination with 128-token pages,
         # while the CuTeDSL path below already slices all generation inputs
         # and page tables past meta.num_contexts.
-        if meta.num_generations <= 0 or not self._supports_mixed_batch(attn, meta):
+        if meta.num_generations <= 0 or not self._supports_mixed_batch(
+            attn, meta, q.shape[0], self._get_kernel_dtype(attn, q)
+        ):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -541,6 +690,9 @@ class CuteDslMlaFmha(PhasedFmha):
         if kernel_dtype == torch.float8_e4m3fn:
             softmax_scale, output_scale = self._get_fp8_scales(q, params.fwd)
 
+        block_split_kvs = self._split_kv_plan(
+            meta, cache_seqs_base, batch_size, seq_len_q, num_heads
+        )
         output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
 
         q_latent = q_view[..., :d_latent].permute(2, 3, 1, 0)
@@ -576,7 +728,51 @@ class CuteDslMlaFmha(PhasedFmha):
                 )
                 else None
             ),
+            block_split_kvs,
         )
+
+    @staticmethod
+    def _split_kv_plan(
+        meta: "TrtllmAttentionMetadata",
+        cache_seqs: torch.Tensor,
+        batch_size: int,
+        seq_len_q: int,
+        num_heads: int,
+    ) -> Optional[torch.Tensor]:
+        """This step's per-request split-KV counts, planned once per step.
+
+        The plan depends only on the step's KV lengths and the decode geometry,
+        so the first CuTe DSL MLA layer of a step launches it and the others
+        reuse it (``_invalidate_mla_scheduler_buffers`` resets the key when the
+        lengths change). None (uniform split) when it cannot be planned here.
+        """
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            CuteDSLNVMlaDecodeBlackwellRunner,
+        )
+
+        if not 0 < batch_size <= _SPLIT_PLAN_MAX_REQUESTS:
+            return None
+        plan = getattr(meta, "_cute_dsl_mla_split_plan", None)
+        capacity = max(int(getattr(meta, "max_num_requests", 0) or 0), batch_size)
+        if plan is None or plan.numel() < batch_size or plan.device != cache_seqs.device:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            plan = torch.empty(capacity, dtype=torch.int32, device=cache_seqs.device)
+            meta._cute_dsl_mla_split_plan = plan
+        runner = CuteDSLNVMlaDecodeBlackwellRunner
+        rows_per_request = runner.get_folded_seq_len_q(num_heads, seq_len_q)
+        wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
+        key = (batch_size, rows_per_request, wave_clusters, cache_seqs.data_ptr(), plan.data_ptr())
+        if getattr(meta, "_cute_dsl_mla_split_plan_key", None) != key:
+            launch_mla_split_kv_plan(
+                cache_seqs,
+                plan,
+                num_requests=batch_size,
+                rows_per_request=rows_per_request,
+                wave_clusters=wave_clusters,
+            )
+            meta._cute_dsl_mla_split_plan_key = key
+        return plan[:batch_size]
 
     def run_mla_generation(
         self,

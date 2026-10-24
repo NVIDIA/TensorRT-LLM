@@ -217,7 +217,12 @@ struct FwdSmemPlan
 {
     alignas(16) uint64_t bar_ready[CHUNK_DEPTH];
     alignas(16) uint64_t bar_consumed[CHUNK_DEPTH];
-    alignas(16) float2 ws_stats[CONSUMER_WARPS][NC];
+    // Cross-warp reduction workspace, double-buffered by chunk parity. A single buffer is a WAR race in the
+    // multi-chunk loop: one NamedBarrier separates a chunk's writes from its reads, but nothing separates a slow
+    // warp still reading chunk k from a fast warp already writing chunk k+1. With two buffers, writing chunk k+1
+    // reuses chunk k-1's buffer, and every warp has finished reading k-1 before it arrives at chunk k's barrier,
+    // which the writer has already passed. (The N == 1 kernel keeps buffer 0: it has its own second barrier.)
+    alignas(16) float2 ws_stats[2][CONSUMER_WARPS][NC];
     alignas(16) float logits_all[N_MAX];
     uint32_t tmem_base;
 };
@@ -411,9 +416,19 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                                     float2 f[2] = {__bfloat1622float2(v2[0]), __bfloat1622float2(v2[1])};
                                     if constexpr (FULL_N12)
                                     {
-                                        if (n == AN - 1 && lane == 0)
+                                        if (n == AN - 1)
                                         {
-                                            cute::arrive_barrier(plan.bar_consumed[chunk_slot]);
+                                            // The producer refills the slots through the async proxy (TMA): a
+                                            // cross-proxy fence orders this lane's generic-proxy reads before it.
+                                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                            // Every lane's reads of the chunk's slots before lane 0 releases them:
+                                            // lanes are not guaranteed to be converged here (independent thread
+                                            // scheduling), and the producer refills a released slot immediately.
+                                            __syncwarp();
+                                            if (lane == 0)
+                                            {
+                                                cute::arrive_barrier(plan.bar_consumed[chunk_slot]);
+                                            }
                                         }
                                     }
                                     tmem_st_32dp32bNx<4>(
@@ -492,6 +507,11 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                 }
                 if constexpr (!FULL_N12)
                 {
+                    // The producer refills the slots through the async proxy (TMA): a cross-proxy fence orders this
+                    // lane's generic-proxy reads before it.
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    // Every lane's reads of the chunk's slots before lane 0 releases them to the producer.
+                    __syncwarp();
                     if (lane == 0)
                     {
                         cute::arrive_barrier(plan.bar_consumed[chunk_slot]);
@@ -525,7 +545,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
 #pragma unroll
                     for (int n = 0; n < N_CHUNK; n++)
                     {
-                        plan.ws_stats[comp_wid][n] = reduce_pair[n];
+                        plan.ws_stats[gci & 1][comp_wid][n] = reduce_pair[n];
                     }
                 }
                 cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 0);
@@ -538,7 +558,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
 #pragma unroll
                     for (int w = 0; w < CONSUMER_WARPS; w++)
                     {
-                        totals = float2_add(totals, plan.ws_stats[w][n]);
+                        totals = float2_add(totals, plan.ws_stats[gci & 1][w][n]);
                     }
                     local_rsig = rsqrtf(totals.x / H + eps_cache);
                     local_logit = totals.y * local_rsig;
@@ -951,7 +971,7 @@ __global__ void __launch_bounds__(BLK, 1)
                 }
                 if (lane == 0)
                 {
-                    plan.ws_stats[comp_wid][0] = make_float2(sq_local, dot_local);
+                    plan.ws_stats[0][comp_wid][0] = make_float2(sq_local, dot_local);
                 }
                 cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 0);
 
@@ -961,7 +981,7 @@ __global__ void __launch_bounds__(BLK, 1)
 #pragma unroll
                     for (int w = 0; w < CONSUMER_WARPS; w++)
                     {
-                        totals = float2_add(totals, plan.ws_stats[w][0]);
+                        totals = float2_add(totals, plan.ws_stats[0][w][0]);
                     }
                     float rs = rsqrtf(totals.x / H + rms_eps);
                     rsigma_out[tb] = rs;
@@ -972,6 +992,9 @@ __global__ void __launch_bounds__(BLK, 1)
                 }
                 cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
             }
+            // The producer refills the tile through the async proxy (TMA): a cross-proxy fence orders this thread's
+            // generic-proxy reads before it.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             cute::arrive_barrier(plan.bar_consumed[slot]);
         }
     }

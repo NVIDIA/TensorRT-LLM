@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -344,4 +344,22 @@ def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
+    )
+
+
+@dsl_user_op
+def read_smid(*, loc=None, ip=None) -> cutlass.Int32:
+    """Physical SM id of the executing CTA (%smid); used to find the CTA's die."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %smid;",
+            "=r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )

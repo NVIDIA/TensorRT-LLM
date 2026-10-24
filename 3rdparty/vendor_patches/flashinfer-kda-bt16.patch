@@ -1,0 +1,431 @@
+diff --git a/kda_chunked_bt16_small_bh.py b/kda_chunked_bt16_small_bh.py
+index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..0ef2dcbe0f62a33f101a6b4c215e105909cef2e4 100644
+--- a/kda_chunked_bt16_small_bh.py
++++ b/kda_chunked_bt16_small_bh.py
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -12,7 +13,20 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++"""FlashInfer Small-BH KDA, with indexed recurrent-state pool access.
++
++Vendored from flashinfer-ai/flashinfer commit
++b8e81a7dae6c2aa5c9aa19c06e81e9a729271493,
++flashinfer/kda_kernels/kda_chunked_bt16_small_bh.py (Apache-2.0).
++Local changes add state-slot indirection and padded pool-row strides (64-bit row
++offsets), reject unwarmed graph specializations, use the active device SM count
++for scheduling, and replace K1's 16x16 Neumann-chain chunk inverse with the BT16
++engine's FP16 block inverse (the chain is unstable on repeated tokens).
++The other K1/K2 arithmetic and the layouts are retained from upstream.
++"""
++
+ import functools
++import math
+ from typing import Optional
+ 
+ import cutlass
+@@ -24,7 +38,6 @@ from cutlass._mlir.dialects import llvm
+ from cutlass.cute.core import _pack_shape
+ from cutlass.cute.nvgpu import cpasync, warp
+ from cutlass.cutlass_dsl import dsl_user_op
+-from flashinfer.cute_dsl.utils import get_max_active_clusters
+ 
+ 
+ RCP_LN2 = 1.4426950408889634
+@@ -282,6 +295,12 @@ class ChunkKdaFwdK1:
+             warp.MmaF16BF16Op(mQ.element_type, cutlass.Float32, (16, 8, 16)),
+             permutation_mnk=(self.BT, self.BT, 16),
+         )
++        # The chunk inverse runs on FP16 operands (FP32 accumulation) whatever the
++        # input dtype; same atom shape, so its fragments share the layouts above.
++        tiled_mma_inv = cute.make_tiled_mma(
++            warp.MmaF16BF16Op(cutlass.Float16, cutlass.Float32, (16, 8, 16)),
++            permutation_mnk=(self.BT, self.BT, 16),
++        )
+         copy_atom_QKd = cute.make_copy_atom(
+             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+             mQ.element_type,
+@@ -514,6 +533,7 @@ class ChunkKdaFwdK1:
+             sAlog_layout,
+             sQKd_layout_staged,
+             tiled_mma,
++            tiled_mma_inv,
+             tiled_copy_QKG,
+             tiled_copy_dtBias,
+             tiled_copy_Gk,
+@@ -560,6 +580,7 @@ class ChunkKdaFwdK1:
+         sAlog_layout: cute.Layout,
+         sQKd_layout_staged: cute.ComposedLayout,
+         tiled_mma: cute.TiledMma,
++        tiled_mma_inv: cute.TiledMma,
+         tiled_copy_QKG: cute.TiledCopy,
+         tiled_copy_dtBias: cute.TiledCopy,
+         tiled_copy_Gk: cute.TiledCopy,
+@@ -957,6 +978,7 @@ class ChunkKdaFwdK1:
+             cute.arch.setmaxregister_increase(self.mma_register_requirement)
+ 
+             thr_mma = tiled_mma.get_slice(lane_idx)
++            thr_mma_inv = tiled_mma_inv.get_slice(lane_idx)
+             tAcA = thr_mma.partition_C(cute.make_identity_tensor((self.BT, self.BT)))
+             a_shape_L = thr_mma.partition_shape_A((self.BT, self.BT))
+             b_shape_L = thr_mma.partition_shape_B((self.BT, self.BT))
+@@ -1176,63 +1198,90 @@ class ChunkKdaFwdK1:
+                     tArAqk_f16.store(tArAqk.load().to(tArAqk_f16.element_type))
+                     cute.autovec_copy(tArAqk_f16, tAgMqk)
+ 
+-                    tArL = thr_mma.make_fragment_A(a_shape_L)
+-                    tBrL = thr_mma.make_fragment_B(_pack_shape(b_shape_L))
+-                    tCrL = thr_mma.make_fragment_C(c_shape_L)
+-
+-                    tArL.store(tArAkk.load().to(tArL.element_type))
+-                    self.transpose(tArL, tBrL)
+-                    tArIL = thr_mma.make_fragment_A(a_shape_L)
+-                    tArIL.store(
+-                        self.add_identity(tArAkk, tCrI).load().to(tArIL.element_type)
+-                    )
+-                    tCrL.fill(0.0)
+-                    cute.gemm(tiled_mma, tCrL, tArL, tBrL, tCrL)
+-
+-                    tArL.store(tCrL.load().to(tArL.element_type))
+-                    self.transpose(tArL, tBrL)
+-                    tArIL2 = thr_mma.make_fragment_A(a_shape_L)
+-                    tArIL2.store(
+-                        self.add_identity(tCrL, tCrI).load().to(tArIL2.element_type)
++                    # (I - L)^-1 for the strictly lower L = tArAkk by the hierarchical
++                    # block inverse of the BT16 engine (super_mma_stage_blockwise_inverse),
++                    # on FP16 operands with FP32 accumulation:
++                    #   D = blockdiag(L11, L22), nilpotent 8x8 blocks:
++                    #       Binv = (I + D)(I + D^2)(I + D^4)       (exact)
++                    #   (I - L)^-1 = Binv + Binv @ L21 @ Binv      (exact)
++                    # The 16x16 Neumann chain (I + L)(I + L^2)(I + L^4)(I + L^8) it
++                    # replaces materializes L^2..L^8, whose entries grow combinatorially
++                    # for near-identical keys at high beta; 16-bit rounding then destroys
++                    # the alternating-sign cancellation of the bounded true inverse, the
++                    # chunk's state map gains eigenvalues far above 1 and a run of
++                    # repeated tokens drives the state to inf/NaN. D^2 and D^4 stay O(10).
++                    tCrA21 = cute.make_rmem_tensor_like(tArAkk, cutlass.Float32)
++                    tCrD = cute.make_rmem_tensor_like(tArAkk, cutlass.Float32)
++                    for e in cutlass.range_constexpr(cute.size(tAcA)):
++                        m, n = tAcA[e]
++                        a21 = tArAkk[e] if m >= self.BT // 2 else cutlass.Float32(0.0)
++                        tCrA21[e] = a21 if n < self.BT // 2 else cutlass.Float32(0.0)
++                        # The upper-right block of the strictly lower L is zero.
++                        tCrD[e] = tArAkk[e] - tCrA21[e]
++
++                    tCrP = thr_mma_inv.make_fragment_C(c_shape_L)
++                    tArD = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tBrD = thr_mma_inv.make_fragment_B(_pack_shape(b_shape_L))
++                    tArD.store(tCrD.load().to(tArD.element_type))
++                    self.transpose(tArD, tBrD)
++                    tCrP.fill(0.0)
++                    cute.gemm(tiled_mma_inv, tCrP, tArD, tBrD, tCrP)  # D^2
++
++                    tArD2 = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tBrD2 = thr_mma_inv.make_fragment_B(_pack_shape(b_shape_L))
++                    tArD2.store(tCrP.load().to(tArD2.element_type))
++                    self.transpose(tArD2, tBrD2)
++                    tArID2 = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tArID2.store(
++                        self.add_identity(tCrP, tCrI).load().to(tArID2.element_type)
+                     )
+-                    tBrIL2 = thr_mma.make_fragment_B(_pack_shape(b_shape_L))
+-                    self.transpose(tArIL2, tBrIL2)
+-                    tCrL.fill(0.0)
+-                    cute.gemm(tiled_mma, tCrL, tArL, tBrL, tCrL)
+-
+-                    tArL.store(tCrL.load().to(tArL.element_type))
+-                    self.transpose(tArL, tBrL)
+-                    tArIL4 = thr_mma.make_fragment_A(a_shape_L)
+-                    tArIL4.store(
+-                        self.add_identity(tCrL, tCrI).load().to(tArIL4.element_type)
++                    tBrID2 = thr_mma_inv.make_fragment_B(_pack_shape(b_shape_L))
++                    self.transpose(tArID2, tBrID2)
++                    tCrP.fill(0.0)
++                    cute.gemm(tiled_mma_inv, tCrP, tArD2, tBrD2, tCrP)  # D^4
++
++                    tArID4 = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tArID4.store(
++                        self.add_identity(tCrP, tCrI).load().to(tArID4.element_type)
+                     )
+-                    tCrIL8 = thr_mma.make_fragment_C(c_shape_L)
+-                    # cute.gemm(tiled_mma, tCrIL8, tArL4, tBrL, tCrI) # CuTe DSL bug not supporting different C and D
+-                    tCrIL8.fill(0.0)
+-                    cute.gemm(tiled_mma, tCrIL8, tArL, tBrL, tCrIL8)
+-
+-                    tArIL8 = thr_mma.make_fragment_A(a_shape_L)
+-                    # tArIL8.store(tCrIL8.load().to(tArIL8.element_type))
+-                    tArIL8.store(
+-                        self.add_identity(tCrIL8, tCrI).load().to(tArIL8.element_type)
++                    tBrID4 = thr_mma_inv.make_fragment_B(_pack_shape(b_shape_L))
++                    self.transpose(tArID4, tBrID4)
++                    tArID = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tArID.store(
++                        self.add_identity(tCrD, tCrI).load().to(tArID.element_type)
+                     )
+-                    tBrIL8 = thr_mma.make_fragment_B(_pack_shape(b_shape_L))
+-                    self.transpose(tArIL8, tBrIL8)
+-
+-                    tCrL.fill(0.0)
+-                    cute.gemm(tiled_mma, tCrL, tArIL, tBrIL2, tCrL)
+-                    tArL12 = thr_mma.make_fragment_A(a_shape_L)
+-                    tArL12.store(tCrL.load().to(tArL12.element_type))
+-
+-                    tCrL.fill(0.0)
+-                    cute.gemm(tiled_mma, tCrL, tArIL4, tBrIL8, tCrL)
+-                    tArL48 = thr_mma.make_fragment_A(a_shape_L)
+-                    tArL48.store(tCrL.load().to(tArL48.element_type))
+-                    tBrL48 = thr_mma.make_fragment_B(_pack_shape(b_shape_L))
+-                    self.transpose(tArL48, tBrL48)
+-
++                    tCrP.fill(0.0)
++                    cute.gemm(tiled_mma_inv, tCrP, tArID, tBrID2, tCrP)  # (I+D)(I+D^2)
++
++                    tArB01 = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tArB01.store(tCrP.load().to(tArB01.element_type))
++                    tCrBinv = thr_mma_inv.make_fragment_C(c_shape_L)
++                    tCrBinv.fill(0.0)
++                    cute.gemm(tiled_mma_inv, tCrBinv, tArB01, tBrID4, tCrBinv)  # Binv
++
++                    tArBinv = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tBrBinv = thr_mma_inv.make_fragment_B(_pack_shape(b_shape_L))
++                    tArBinv.store(tCrBinv.load().to(tArBinv.element_type))
++                    self.transpose(tArBinv, tBrBinv)
++                    tArA21 = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tBrA21 = thr_mma_inv.make_fragment_B(_pack_shape(b_shape_L))
++                    tArA21.store(tCrA21.load().to(tArA21.element_type))
++                    self.transpose(tArA21, tBrA21)
++                    tCrP.fill(0.0)
++                    cute.gemm(tiled_mma_inv, tCrP, tArBinv, tBrA21, tCrP)  # Binv L21
++
++                    tArT1 = thr_mma_inv.make_fragment_A(a_shape_L)
++                    tArT1.store(tCrP.load().to(tArT1.element_type))
++                    tCrL = thr_mma_inv.make_fragment_C(c_shape_L)
+                     tCrL.fill(0.0)
+-                    cute.gemm(tiled_mma, tCrL, tArL12, tBrL48, tCrL)
++                    cute.gemm(tiled_mma_inv, tCrL, tArT1, tBrBinv, tCrL)  # Binv L21 Binv
++                    # Binv is block diagonal and Binv L21 Binv lives in the lower-left
++                    # block only (exact zeros elsewhere): their sum is the inverse.
++                    for i in cutlass.range_constexpr(cute.size(tCrL) // 2):
++                        tCrL[2 * i], tCrL[2 * i + 1] = cute.arch.add_packed_f32x2(
++                            (tCrL[2 * i], tCrL[2 * i + 1]),
++                            (tCrBinv[2 * i], tCrBinv[2 * i + 1]),
++                        )
+                     self.sigmoid(tMrBeta_post_mn, tMrBeta_post_mn_f32)
+                     tCrL_mn = cute.make_tensor(
+                         tCrL.iterator, layout_acc_mn(tiled_mma, tCrL.layout)
+@@ -1803,6 +1852,7 @@ class ChunkKdaFwdK2:
+         mS_in: Optional[cute.Tensor] = None,  # (B, H, D, D)
+         mS_out: Optional[cute.Tensor] = None,  # (B, H, D, D)
+         mCuSeqlens: Optional[cute.Tensor] = None,  # (B + 1,)
++        mStateIndices: Optional[cute.Tensor] = None,  # (B,)
+         stream=None,
+     ):
+         if cutlass.const_expr(mCuSeqlens is not None):
+@@ -2076,6 +2126,7 @@ class ChunkKdaFwdK2:
+             mS_in,
+             mS_out,
+             mCuSeqlens,
++            mStateIndices,
+             sQK_layout_staged,
+             sQKt_layout_staged,
+             sV_layout_staged,
+@@ -2123,6 +2174,7 @@ class ChunkKdaFwdK2:
+         mS_in: Optional[cute.Tensor],
+         mS_out: Optional[cute.Tensor],
+         mCuSeqlens: Optional[cute.Tensor],
++        mStateIndices: Optional[cute.Tensor],
+         sQK_layout_staged: cute.ComposedLayout,
+         sQKt_layout_staged: cute.ComposedLayout,
+         sV_layout_staged: cute.ComposedLayout,
+@@ -2148,6 +2200,9 @@ class ChunkKdaFwdK2:
+         warpgroup_idx = cute.arch.make_warp_uniform(tidx // self.warpgroup_threads)
+ 
+         v_idx, h_idx, b_idx = cute.arch.block_idx()
++        state_idx = b_idx
++        if cutlass.const_expr(mStateIndices is not None):
++            state_idx = mStateIndices[b_idx]
+ 
+         seq_len = cute.size(tma_tensor_Q, mode=[0])
+         seq_offset = 0
+@@ -2475,11 +2530,11 @@ class ChunkKdaFwdK2:
+             if cutlass.const_expr(mS_in is not None):
+                 if cutlass.const_expr(self.transpose_S):
+                     gS_in = cute.local_tile(
+-                        mS_in[None, None, h_idx, b_idx], (self.BV, self.D), (v_idx, 0)
++                        mS_in[None, None, h_idx, state_idx], (self.BV, self.D), (v_idx, 0)
+                     )
+                 else:
+                     gS_in = cute.local_tile(
+-                        mS_in[None, None, h_idx, b_idx], (self.D, self.BV), (0, v_idx)
++                        mS_in[None, None, h_idx, state_idx], (self.D, self.BV), (0, v_idx)
+                     )
+                     gS_in = cute.make_tensor(
+                         gS_in.iterator, cute.select(gS_in.layout, mode=[1, 0])
+@@ -2763,11 +2818,11 @@ class ChunkKdaFwdK2:
+             if cutlass.const_expr(mS_out is not None):
+                 if cutlass.const_expr(self.transpose_S):
+                     gS_out = cute.local_tile(
+-                        mS_out[None, None, h_idx, b_idx], (self.BV, self.D), (v_idx, 0)
++                        mS_out[None, None, h_idx, state_idx], (self.BV, self.D), (v_idx, 0)
+                     )
+                 else:
+                     gS_out = cute.local_tile(
+-                        mS_out[None, None, h_idx, b_idx], (self.D, self.BV), (0, v_idx)
++                        mS_out[None, None, h_idx, state_idx], (self.D, self.BV), (0, v_idx)
+                     )
+                     gS_out = cute.make_tensor(
+                         gS_out.iterator, cute.select(gS_out.layout, mode=[1, 0])
+@@ -2808,12 +2863,12 @@ def _cute_dtype(dtype: torch.dtype):
+     raise ValueError(f"unsupported dtype: {dtype}")
+ 
+ 
+-def _fake(dtype, shape):
++def _fake(dtype, shape, assumed_align=16):
+     return cute.runtime.make_fake_compact_tensor(
+         dtype,
+         shape,
+         stride_order=tuple(reversed(range(len(shape)))),
+-        assumed_align=16,
++        assumed_align=assumed_align,
+     )
+ 
+ 
+@@ -2838,6 +2893,8 @@ def _compile_k1(
+     is_varlen: bool,
+     max_active_clusters: int,
+ ):
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("Warm Small-BH KDA before CUDA graph capture")
+     cu_dtype = _cute_dtype(dtype)
+     b, t, tp, nt = (cute.sym_int() for _ in range(4))
+     feature: tuple[object, ...]
+@@ -2851,7 +2908,7 @@ def _compile_k1(
+         beta_shape = (t, h)
+         matrix = (nt, h, _BT, _BT)
+         gate = (nt, h, d)
+-        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (b,))
++        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (b,), assumed_align=4)
+     else:
+         feature = (b, t, h, d)
+         padded_feature = feature
+@@ -2904,7 +2961,11 @@ def _compile_k2(
+     has_state_output: bool,
+     transpose_state: bool,
+     is_varlen: bool,
++    state_row_divisibility: int | None,
++    has_state_indices: bool,
+ ):
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("Warm Small-BH KDA before CUDA graph capture")
+     cu_dtype = _cute_dtype(dtype)
+     b, bs, t, tp, h, nt = (cute.sym_int() for _ in range(6))
+     feature: tuple[object, ...]
+@@ -2917,7 +2978,7 @@ def _compile_k2(
+         value = output = (t, h, d)
+         matrix = (nt, h, _BT, _BT)
+         gate = (nt, h, d)
+-        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (bs,))
++        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (bs,), assumed_align=4)
+     else:
+         feature = value = output = (b, t, h, d)
+         matrix = (b, nt, h, _BT, _BT)
+@@ -2925,6 +2986,19 @@ def _compile_k2(
+         cu_seqlens = None
+     state = (b, h, d, d)
+ 
++    def fake_state():
++        if state_row_divisibility is None:
++            return _fake(_cute_dtype(state_dtype), state)
++        # An indexed pool row starts slot * row_stride elements from the base. Pools that coalesce
++        # every layer's state of a slot (KV cache manager V2; Kimi K3: 69 layers x 96 x 128 x 128 =
++        # 108,527,616 elements per slot) take that product past int32 from slot 20 on, so the row
++        # stride is a 64-bit runtime value; its divisibility keeps the rows' 16-byte alignment.
++        return cute.runtime.make_fake_tensor(
++            _cute_dtype(state_dtype), state,
++            stride=(cute.sym_int64(divisibility=state_row_divisibility), d * d, d, 1),
++            assumed_align=16,
++        )
++
+     q, k, kr = [_fake(cu_dtype, feature) for _ in range(3)]
+     kernel = ChunkKdaFwdK2(D=d, BT=_BT, BV=bv, transpose_S=transpose_state)
+     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+@@ -2938,9 +3012,10 @@ def _compile_k2(
+         _fake(cu_dtype, matrix),
+         _fake(cutlass.Float32, gate),
+         _fake(cu_dtype, output),
+-        _fake(_cute_dtype(state_dtype), state) if has_state_input else None,
+-        _fake(_cute_dtype(state_dtype), state) if has_state_output else None,
++        fake_state() if has_state_input else None,
++        fake_state() if has_state_output else None,
+         cu_seqlens,
++        _fake(cutlass.Int32, (cute.sym_int(),), assumed_align=4) if has_state_indices else None,
+         stream,
+         options="--enable-tvm-ffi",
+     )
+@@ -3040,6 +3115,7 @@ def chunk_kda_fwd_k2(
+     output: torch.Tensor | None = None,
+     state_input: torch.Tensor | None = None,
+     state_output: torch.Tensor | None = None,
++    state_indices: torch.Tensor | None = None,
+     max_active_clusters: int = 152,
+ ) -> tuple[torch.Tensor, torch.Tensor | None]:
+     is_varlen = cu_seqlens is not None
+@@ -3062,6 +3138,14 @@ def chunk_kda_fwd_k2(
+         if state_output is not None
+         else q.dtype
+     )
++    # Indexed pool rows start slot * stride(0) elements from the base: one divisibility
++    # (16-byte alignment at most) must hold for every state view the kernel addresses.
++    state_views = [t for t in (state_input, state_output) if t is not None]
++    state_row_divisibility = (
++        math.gcd(*(t.stride(0) for t in state_views), 16 // state_views[0].element_size())
++        if state_indices is not None
++        else None
++    )
+     compiled = _compile_k2(
+         q.dtype,
+         cu_seqlens.dtype if cu_seqlens is not None else torch.int32,
+@@ -3072,6 +3156,8 @@ def chunk_kda_fwd_k2(
+         has_output,
+         transpose_state,
+         is_varlen,
++        state_row_divisibility,
++        state_indices is not None,
+     )
+     compiled(
+         q,
+@@ -3085,6 +3171,7 @@ def chunk_kda_fwd_k2(
+         state_input,
+         state_output,
+         cu_seqlens,
++        state_indices,
+     )
+     return output, state_output
+ 
+@@ -3108,11 +3195,12 @@ def chunk_kda_fwd(
+     output: torch.Tensor | None = None,
+     state_input: torch.Tensor | None = None,
+     state_output: torch.Tensor | None = None,
++    state_indices: torch.Tensor | None = None,
+     workspace_tensors: tuple[torch.Tensor, ...] | None = None,
+     max_active_clusters: int = 0,
+ ) -> tuple[torch.Tensor, torch.Tensor | None]:
+     if max_active_clusters <= 0:
+-        max_active_clusters = get_max_active_clusters(1)
++        max_active_clusters = torch.cuda.get_device_properties(q.device).multi_processor_count
+     qd, kd, kr, mqk, mkk, gk = chunk_kda_fwd_k1(
+         q,
+         k,
+@@ -3142,6 +3230,7 @@ def chunk_kda_fwd(
+         output=output,
+         state_input=state_input,
+         state_output=state_output,
++        state_indices=state_indices,
+         max_active_clusters=max_active_clusters,
+     )
+ 

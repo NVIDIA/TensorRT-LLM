@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
+#include "tensorrt_llm/kernels/kimiK3NoAuxTcKf.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -158,6 +159,38 @@ std::tuple<at::Tensor, at::Tensor> noaux_tc_op(th::Tensor const& scores, th::Ten
     return {topk_values, topk_indices};
 }
 
+// noaux_tc_op(scores, bias, 1, 1, 16, 1.0) for Kimi K3 (FP32 scores [M, 896], FP32 bias [896]) through the
+// persistent warp-per-token kernel of invokeKimiK3NoAuxTcKf: bit-identical (values, indices) on SM10x.
+std::tuple<at::Tensor, at::Tensor> kimi_k3_noaux_tc_kf_op(th::Tensor const& scores, th::Tensor const& bias)
+{
+    constexpr int64_t numExperts = 896;
+    constexpr int64_t topK = 16;
+
+    int const smVersion = tl::common::getSMVersion();
+    TORCH_CHECK(smVersion >= 100 && smVersion < 110, "kimi_k3_noaux_tc_kf_op requires an SM10x architecture");
+    TORCH_CHECK(scores.is_cuda() && bias.is_cuda(), "scores and bias must be CUDA tensors");
+    TORCH_CHECK(scores.get_device() == bias.get_device(), "scores and bias must be on the same device");
+    TORCH_CHECK(scores.scalar_type() == torch::kFloat32 && bias.scalar_type() == torch::kFloat32,
+        "scores and bias must be float32");
+    TORCH_CHECK(scores.dim() == 2 && scores.size(1) == numExperts, "scores must have shape [M, 896]");
+    TORCH_CHECK(bias.dim() == 1 && bias.numel() == numExperts, "bias must have shape [896]");
+
+    // The kernel reads the rows with 16-byte vector loads.
+    bool const scoresReady = scores.is_contiguous() && reinterpret_cast<uintptr_t>(scores.data_ptr()) % 16 == 0;
+    th::Tensor const scoresIn = scoresReady ? scores : scores.clone(at::MemoryFormat::Contiguous);
+    th::Tensor const biasContig = bias.contiguous();
+    int64_t const numTokens = scores.size(0);
+
+    auto const device = th::Device(th::kCUDA, scores.get_device());
+    th::Tensor topkValues = th::empty({numTokens, topK}, th::dtype(torch::kFloat32).device(device));
+    th::Tensor topkIndices = th::empty({numTokens, topK}, th::dtype(torch::kInt32).device(device));
+
+    auto stream = at::cuda::getCurrentCUDAStream(scores.get_device());
+    tk::invokeKimiK3NoAuxTcKf(scoresIn.data_ptr<float>(), biasContig.data_ptr<float>(), topkValues.data_ptr<float>(),
+        topkIndices.data_ptr<int32_t>(), numTokens, stream);
+    return {topkValues, topkIndices};
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> kimi_k3_noaux_tc_mxfp8_quant(
     th::Tensor const& scores, th::Tensor const& bias, th::Tensor const& hiddenStates, double routedScalingFactor)
 {
@@ -214,10 +247,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "kimi_k3_noaux_tc_mxfp8_quant(Tensor scores, Tensor bias, Tensor hidden_states, float "
         "routed_scaling_factor) -> (Tensor, Tensor, Tensor, Tensor)");
+    m.def("kimi_k3_noaux_tc_kf_op(Tensor scores, Tensor bias) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("noaux_tc_op", &tensorrt_llm::torch_ext::noaux_tc_op);
     m.impl("kimi_k3_noaux_tc_mxfp8_quant", &tensorrt_llm::torch_ext::kimi_k3_noaux_tc_mxfp8_quant);
+    m.impl("kimi_k3_noaux_tc_kf_op", &tensorrt_llm::torch_ext::kimi_k3_noaux_tc_kf_op);
 }

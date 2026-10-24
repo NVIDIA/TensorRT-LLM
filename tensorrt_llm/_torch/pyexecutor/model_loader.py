@@ -41,7 +41,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
-from ..ugpu.policy import UgpuPolicy
+from ..ugpu.policy import build_ugpu_policy
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, resolve_auto_ssm_cache_dtype,
@@ -336,6 +336,32 @@ def _apply_to_buffers_only(model: torch.nn.Module, fn):
         for key, buf in module._buffers.items():
             if buf is not None:
                 module._buffers[key] = fn(buf)
+
+
+def _reject_dense_dwdp_update(model: torch.nn.Module, action: str) -> None:
+    """Refuse to rewrite the weights of a model that dense DWDP sharded.
+
+    Dense DWDP repoints the dense weights of the MoE decoder layers into staging
+    slots that several layers share and that the next gather overwrites, so
+    weights written through the modules would be lost. Its setup marks the
+    model and its decoder with ``_dense_dwdp_active``; the mark stays after the
+    dense DWDP teardown, which leaves zero-size tensors behind.
+
+    Args:
+        model: The model about to be updated.
+        action: What the caller was about to do, for the error message.
+
+    Raises:
+        RuntimeError: The model or its decoder (``model.model``) is marked.
+    """
+    decoder = getattr(model, "model", None)
+    if getattr(model, "_dense_dwdp_active", False) or getattr(
+            decoder, "_dense_dwdp_active", False):
+        raise RuntimeError(
+            f"Cannot {action}: dense DWDP (TRTLLM_DWDP_DENSE) moved this "
+            "model's dense weights into staging slots shared across layers, so "
+            "they cannot be rewritten in place. Launch without "
+            "TRTLLM_DWDP_DENSE to update weights.")
 
 
 class ModelLoader:
@@ -1340,7 +1366,12 @@ class ModelLoader:
 
         Returns:
             None.
+
+        Raises:
+            RuntimeError: Dense DWDP sharded the model's dense weights, or the
+                weight mapper was not initialized.
         """
+        _reject_dense_dwdp_update(model, "reload weights")
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot reload weights: weight_mapper was not initialized. "
@@ -1355,10 +1386,16 @@ class ModelLoader:
         torch.cuda.current_stream().synchronize()
 
     def begin_update_weights(self) -> None:
-        """Start an incremental update session on the persistent mapper."""
+        """Start an incremental update session on the persistent mapper.
+
+        Raises:
+            RuntimeError: The weight mapper was not initialized, or dense DWDP
+                sharded the dense weights of the model it is bound to.
+        """
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot update weights: weight_mapper was not initialized")
+        _reject_dense_dwdp_update(self.weight_mapper.model, "update weights")
         self.weight_mapper.begin_update_weights()
 
     def finalize_update_weights(self) -> None:
@@ -1440,7 +1477,7 @@ class ModelLoader:
             video_pruning_rate,
             multimodal_config=self.llm_args.multimodal_config,
             use_lamport_sync=self.llm_args.use_lamport_sync,
-            ugpu_policy=UgpuPolicy(enabled=self.llm_args.enable_ugpu),
+            ugpu_policy=build_ugpu_policy(self.llm_args.enable_ugpu),
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)

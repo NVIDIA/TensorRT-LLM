@@ -12,13 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the DSpark captured-context attention primitives (CPU).
-
-The two primitives are validated against fully independent computations:
-``dspark_sparse_attn`` vs (a) a per-element loop reference of the kernel formula
-and (b) ``torch.nn.functional.scaled_dot_product_attention`` for the no-sink,
-all-valid case; ``get_dspark_topk_idxs`` vs the reference index formula.
-"""
+"""DSpark attention math and managed-page addressing tests."""
 
 import types
 from unittest.mock import Mock
@@ -33,12 +27,12 @@ from tensorrt_llm._torch.models.modeling_dspark import (
     _output_projection,
     _qkv_projections,
     apply_dspark_rotary,
-    dspark_attention_forward,
-    dspark_sparse_attn,
-    get_dspark_topk_idxs,
     precompute_dspark_freqs_cis,
 )
 from tensorrt_llm._torch.modules.linear import Linear
+
+__extra_import_path__ = [".."]
+
 
 # The captured-context attention primitives were folded into
 # modeling_dspark; keep the historical alias so monkeypatch targets
@@ -89,33 +83,17 @@ def test_rmsnorm_rope_skips_frequency_view_on_unsupported_arch(monkeypatch):
 
 
 def test_batched_attention_rejects_mismatched_window_size():
-    unused_tensor = torch.empty(0)
-    with pytest.raises(ValueError, match="does not match window_size"):
-        dspark_attention.dspark_attention_forward_batched(
-            torch.empty(1, 1, 1),
-            torch.empty(1, 1, 1),
-            torch.zeros(1, dtype=torch.long),
-            torch.empty(1, 2, 1),
-            torch.zeros(1, dtype=torch.long),
-            torch.zeros(1, dtype=torch.long),
-            wq_a=unused_tensor,
-            q_norm_w=unused_tensor,
-            wq_b=unused_tensor,
-            wkv=unused_tensor,
-            kv_norm_w=unused_tensor,
-            wo_a=unused_tensor,
-            wo_b=unused_tensor,
-            attn_sink=unused_tensor,
-            n_heads=1,
-            head_dim=1,
-            rope_head_dim=0,
-            n_groups=1,
-            o_lora_rank=1,
-            window_size=3,
-            eps=1e-6,
-            softmax_scale=1.0,
-            freqs_cis=unused_tensor,
-        )
+    import inspect
+
+    forward = modeling_dspark.dspark_attention_forward
+    args = {
+        name: None
+        for name, param in inspect.signature(forward).parameters.items()
+        if param.default is inspect.Parameter.empty
+    }
+    args.update(window_size=64, rope_head_dim=64)
+    with pytest.raises(ValueError, match="128-token window"):
+        forward(**args)
 
 
 @pytest.mark.parametrize(
@@ -301,7 +279,7 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
         packed_scale.zero_()
 
     monkeypatch.setattr(dspark_attention, "get_sm_version", lambda: 107)
-    monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_INTERNAL_AVAILABLE", True)
+    monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
     monkeypatch.setattr(
         torch.ops.trtllm,
         "fp8_batched_quantize_1x128_permute102",
@@ -337,12 +315,13 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
 def test_fp8_output_projection_uses_prepared_attention_quantized_output(monkeypatch):
     import tensorrt_llm._torch.models.modeling_dspark as dspark_attention
 
-    batch, block, hidden = 1, 2, 4
-    heads, head_dim, rope_dim, groups, rank, window = 2, 4, 2, 2, 2, 4
+    batch, block, hidden = 1, 5, 4
+    heads, head_dim, rope_dim, groups, rank, window = 2, 64, 64, 2, 2, 128
     x = torch.zeros(batch, block, hidden, dtype=torch.bfloat16)
     main_x = torch.zeros(batch, 1, hidden, dtype=torch.bfloat16)
     start_pos = torch.tensor([3], dtype=torch.long)
-    slots = torch.tensor([0], dtype=torch.long)
+    block_tables = torch.tensor([[0]], dtype=torch.int32)
+    capacities = torch.tensor([window], dtype=torch.long)
     valid_len = torch.tensor([3], dtype=torch.long)
     kv_cache = torch.zeros(batch, window, head_dim, dtype=torch.bfloat16)
     q_latent = torch.zeros(batch, block, 2, dtype=torch.bfloat16)
@@ -355,6 +334,7 @@ def test_fp8_output_projection_uses_prepared_attention_quantized_output(monkeypa
     calls = []
 
     monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(dspark_attention, "_get_dspark_arch_str", lambda: "sm_107")
     monkeypatch.setattr(
         dspark_attention,
         "_qkv_projections",
@@ -372,27 +352,13 @@ def test_fp8_output_projection_uses_prepared_attention_quantized_output(monkeypa
     )
     monkeypatch.setattr(
         dspark_attention,
-        "is_cute_dsl_dspark_attention_prepared_supported",
-        lambda *args: True,
-        raising=False,
+        "cute_dsl_dspark_rmsnorm_rope_page_write",
+        lambda *args: None,
     )
     monkeypatch.setattr(
         dspark_attention,
-        "is_fused_dspark_attention_preparation_supported",
-        lambda *args: True,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        dspark_attention,
-        "cute_dsl_dspark_rmsnorm_rope_cache_write",
-        lambda *args: (slots.to(torch.int32), start_pos.to(torch.int32)),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        dspark_attention,
-        "cute_dsl_dspark_rmsnorm_rope_block_page",
+        "cute_dsl_dspark_rmsnorm_rope_draft_block",
         lambda *args: torch.zeros(batch, 8, head_dim, dtype=torch.bfloat16),
-        raising=False,
     )
 
     def prepared_attention_fp8(*args):
@@ -409,14 +375,14 @@ def test_fp8_output_projection_uses_prepared_attention_quantized_output(monkeypa
         return expected_output
 
     monkeypatch.setattr(
-        dspark_attention,
-        "cute_dsl_dspark_attention_prepared_fp8",
+        torch.ops.trtllm,
+        "fused_dsv4_dspark_attention_fp8",
         prepared_attention_fp8,
         raising=False,
     )
     monkeypatch.setattr(
-        dspark_attention,
-        "cute_dsl_dspark_attention_prepared",
+        torch.ops.trtllm,
+        "fused_dsv4_dspark_attention",
         lambda *args: pytest.fail("BF16 prepared attention should not run"),
         raising=False,
     )
@@ -431,12 +397,13 @@ def test_fp8_output_projection_uses_prepared_attention_quantized_output(monkeypa
         lambda *args, **kwargs: pytest.fail("standalone output quantization should not run"),
     )
 
-    actual = dspark_attention.dspark_attention_forward_batched(
+    actual = dspark_attention.dspark_attention_forward(
         x,
         main_x,
         start_pos,
         kv_cache,
-        slots,
+        block_tables,
+        capacities,
         valid_len,
         wq_a=None,
         q_norm_w=torch.ones(2, dtype=torch.bfloat16),
@@ -455,7 +422,6 @@ def test_fp8_output_projection_uses_prepared_attention_quantized_output(monkeypa
         eps=1e-6,
         softmax_scale=head_dim**-0.5,
         freqs_cis=torch.ones(16, rope_dim // 2, dtype=torch.complex64),
-        persist=True,
         qkv_proj=object(),
         o_a_proj=torch.empty(groups, rank, heads * head_dim // groups, dtype=torch.float8_e4m3fn),
         o_a_scale=torch.ones(1),
@@ -750,7 +716,7 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
         mtp_layers=[stage],
     )
     monkeypatch.setattr(dspark_attention, "get_sm_version", lambda: 107)
-    monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_INTERNAL_AVAILABLE", True)
+    monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
 
     DSv4DSparkDraftModel._bind_attn_projections(model)
 
@@ -906,7 +872,7 @@ def test_bind_bf16_attn_projections_disables_every_fp8_projection():
     assert model._context_wkv_fp8 is None
 
 
-def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
+def test_context_wkv_fp8_quantizes_once_per_page_write(monkeypatch):
     num_stages, hidden, head_dim, window = 3, 4, 2, 8
     model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
     torch.nn.Module.__init__(model)
@@ -966,60 +932,42 @@ def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
         fake_gemm,
     )
     monkeypatch.setattr(modeling_dspark, "_rmsnorm", lambda value, *args: value)
-    monkeypatch.setattr(modeling_dspark, "_rope_last_dims", lambda value, *args: value)
     monkeypatch.setattr(modeling_dspark, "_rope_last_dims_batched", lambda value, *args: value)
 
-    main_hidden = torch.arange(2 * hidden, dtype=torch.float32).view(2, hidden)
-    positions = torch.tensor([1, 2])
-    stage_windows = torch.zeros(num_stages, window, head_dim)
-    model.write_context_windows(main_hidden, positions, stage_windows)
-
-    assert len(quant_calls) == 1
-    assert len(gemm_calls) == 1
-    for stage_id, weight in enumerate(weights):
-        torch.testing.assert_close(
-            stage_windows[stage_id, positions], F.linear(main_hidden, weight)
-        )
-
-    batched_hidden = torch.arange(2 * 2 * hidden, dtype=torch.float32).view(2, 2, hidden)
-    batched_positions = torch.tensor([[1, 32], [3, 4]])
-    request_slots = torch.tensor([0, 1])
-    mask = torch.tensor([[True, False], [True, True]])
-    kv_windows = torch.zeros(2, num_stages, window, head_dim)
-    model.write_context_windows_batched(
-        batched_hidden, batched_positions, request_slots, mask, kv_windows
+    # Capture the paged-store boundary; projection math runs on CPU.
+    writes = []
+    monkeypatch.setattr(
+        modeling_dspark,
+        "write_dspark_context",
+        lambda values, *args: writes.append((values.clone(), args)),
     )
+    main_hidden = torch.arange(2 * 2 * hidden, dtype=torch.float32).view(2, 2, hidden)
+    positions = torch.tensor([[1, 32], [3, 4]])
+    mask = torch.tensor([[True, False], [True, True]])
+    pools = tuple(torch.zeros(4, 1, 1, window, head_dim) for _ in stages)
+    tables = torch.tensor([[2], [1]], dtype=torch.int32)
+    capacities = torch.tensor([window, window])
+    model.write_context_pages(main_hidden, positions, mask, pools, tables, capacities)
 
-    assert len(quant_calls) == 2
-    assert len(gemm_calls) == 2
-    for request in range(2):
-        for token in range(2):
-            for stage_id, weight in enumerate(weights):
-                expected = (
-                    F.linear(batched_hidden[request, token], weight)
-                    if mask[request, token]
-                    else torch.zeros(head_dim)
-                )
-                torch.testing.assert_close(
-                    kv_windows[request, stage_id, batched_positions[request, token] % window],
-                    expected,
-                )
+    assert len(quant_calls) == len(gemm_calls) == 1
+    assert len(writes) == num_stages
+    for stage_id, weight in enumerate(weights):
+        values, args = writes[stage_id]
+        torch.testing.assert_close(values, F.linear(main_hidden, weight))
+        assert args[0] is positions and args[1] is mask
+        assert args[2].data_ptr() == pools[stage_id].data_ptr()
+        assert args[3] is tables and args[4] is capacities
     assert all(projection.call_count == 0 for projection in qkv_projections)
 
-    expected_stage_windows = stage_windows.clone()
-    expected_kv_windows = kv_windows.clone()
+    expected = [values for values, _ in writes]
+    writes.clear()
     model._context_wkv_fp8 = None
     for stage in stages:
         stage._dspark_attn["qkv_proj"] = None
-    stage_windows.zero_()
-    kv_windows.zero_()
-    model.write_context_windows(main_hidden, positions, stage_windows)
-    model.write_context_windows_batched(
-        batched_hidden, batched_positions, request_slots, mask, kv_windows
-    )
-    torch.testing.assert_close(stage_windows, expected_stage_windows)
-    torch.testing.assert_close(kv_windows, expected_kv_windows)
-    assert len(quant_calls) == len(gemm_calls) == 2
+    model.write_context_pages(main_hidden, positions, mask, pools, tables, capacities)
+    for (actual, _), wanted in zip(writes, expected):
+        torch.testing.assert_close(actual, wanted)
+    assert len(quant_calls) == len(gemm_calls) == 1
 
 
 @pytest.mark.parametrize("enable_fused_hc", [True, False])
@@ -1095,9 +1043,13 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
         stage,
         h,
         torch.randn(num_requests, hidden_size),
-        1,
+        torch.ones(num_requests, dtype=torch.long),
         torch.empty(0),
         torch.zeros(num_requests, block_size, dtype=torch.long),
+        torch.empty(1, 128, 1),
+        torch.zeros(num_requests, 1, dtype=torch.int32),
+        torch.full((num_requests,), 128, dtype=torch.long),
+        torch.ones(num_requests, dtype=torch.long),
     )
 
     assert actual is final_h
@@ -1146,123 +1098,6 @@ def _ref_apply_rotary_emb(x, freqs_cis, inverse=False):
     return torch.view_as_real(xc * fc).flatten(-2).to(x.dtype)
 
 
-def _loop_reference(q, kv, attn_sink, topk_idxs, scale):
-    """Obvious, slow per-(b,m,h) reference of the exact kernel math."""
-    b, m, h, d = q.shape
-    out = torch.zeros(b, m, h, d, dtype=torch.float32)
-    qf, kvf, sink = q.float(), kv.float(), attn_sink.float()
-    for bi in range(b):
-        for mi in range(m):
-            idxs = topk_idxs[bi, mi].tolist()
-            for hi in range(h):
-                scores, vecs = [], []
-                for j in idxs:
-                    if j < 0:
-                        continue
-                    k = kvf[bi, j]
-                    scores.append(torch.dot(qf[bi, mi, hi], k) * scale)
-                    vecs.append(k)
-                if not scores:
-                    continue
-                s = torch.stack(scores)
-                smax = s.max()
-                p = torch.exp(s - smax)
-                denom = p.sum() + torch.exp(sink[hi] - smax)
-                num = (p.unsqueeze(-1) * torch.stack(vecs)).sum(0)
-                out[bi, mi, hi] = num / denom
-    return out
-
-
-@pytest.mark.parametrize("seed", [0, 1, 2])
-def test_sparse_attn_matches_loop_reference(seed):
-    torch.manual_seed(seed)
-    b, m, h, d, n, topk = 2, 5, 3, 16, 40, 12
-    q = torch.randn(b, m, h, d)
-    kv = torch.randn(b, n, d)
-    attn_sink = torch.randn(h)
-    idx = torch.stack(
-        [torch.stack([torch.randperm(n)[:topk] for _ in range(m)]) for _ in range(b)]
-    ).int()
-    scale = d**-0.5
-    got = dspark_sparse_attn(q, kv, attn_sink, idx, scale).float()
-    ref = _loop_reference(q, kv, attn_sink, idx, scale)
-    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
-
-
-def test_sparse_attn_no_sink_matches_sdpa():
-    """With a -inf sink (no sink mass) and all-valid contiguous indices, the
-    primitive must equal standard scaled-dot-product attention over the gathered
-    KV — an independent implementation."""
-    torch.manual_seed(0)
-    b, m, h, d, topk = 2, 4, 5, 16, 9
-    q = torch.randn(b, m, h, d)
-    kv = torch.randn(b, topk, d)  # n == topk, attend to all
-    attn_sink = torch.full((h,), float("-inf"))
-    idx = torch.arange(topk).view(1, 1, -1).expand(b, m, topk).int()
-    scale = d**-0.5
-    got = dspark_sparse_attn(q, kv, attn_sink, idx, scale).float()
-
-    # SDPA: q [b,h,m,d], k/v [b,h,topk,d] (broadcast the shared KV over heads).
-    qh = q.permute(0, 2, 1, 3)
-    kvh = kv.unsqueeze(1).expand(b, h, topk, d)
-    ref = F.scaled_dot_product_attention(qh, kvh, kvh, scale=scale).permute(0, 2, 1, 3)
-    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
-
-
-def test_sparse_attn_sink_reduces_mass():
-    """A finite sink must strictly shrink the attention output magnitude vs an
-    infinitely-negative (disabled) sink, because it adds denominator mass only."""
-    torch.manual_seed(0)
-    b, m, h, d, topk = 1, 2, 2, 16, 6
-    q = torch.randn(b, m, h, d)
-    kv = torch.randn(b, topk, d)
-    idx = torch.arange(topk).view(1, 1, -1).expand(b, m, topk).int()
-    scale = d**-0.5
-    no_sink = dspark_sparse_attn(q, kv, torch.full((h,), float("-inf")), idx, scale)
-    with_sink = dspark_sparse_attn(q, kv, torch.zeros(h), idx, scale)
-    assert with_sink.abs().sum() < no_sink.abs().sum()
-
-
-def test_sparse_attn_masked_indices_excluded():
-    """An index of -1 must be excluded exactly (equiv. to dropping that column)."""
-    torch.manual_seed(0)
-    b, m, h, d = 1, 1, 2, 16
-    q = torch.randn(b, m, h, d)
-    kv = torch.randn(b, 5, d)
-    sink = torch.full((h,), float("-inf"))
-    scale = d**-0.5
-    full = torch.tensor([[[0, 1, 2, 3]]]).int()
-    masked = torch.tensor([[[0, 1, 2, -1]]]).int()
-    drop3 = torch.tensor([[[0, 1, 2]]]).int()
-    got_masked = dspark_sparse_attn(q, kv, sink, masked, scale)
-    got_drop = dspark_sparse_attn(q, kv, sink, drop3, scale)
-    torch.testing.assert_close(got_masked, got_drop, rtol=1e-5, atol=1e-5)
-    # And masking genuinely changes the result vs attending to position 3.
-    got_full = dspark_sparse_attn(q, kv, sink, full, scale)
-    assert not torch.allclose(got_full, got_masked, rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.parametrize(
-    "start_pos,window,block", [(1, 128, 5), (3, 128, 5), (10, 4, 5), (200, 128, 6)]
-)
-def test_get_dspark_topk_idxs_matches_reference(start_pos, window, block):
-    bsz = 3
-    got = get_dspark_topk_idxs(window, bsz, block, start_pos)
-    # Reference formula (DeepSpec get_dspark_topk_idxs).
-    ctx = torch.arange(min(window, start_pos + 1))
-    blk = window + torch.arange(block)
-    ref_row = torch.cat([ctx, blk]).int()
-    assert got.shape == (bsz, block, ref_row.numel())
-    for bi in range(bsz):
-        for mi in range(block):
-            torch.testing.assert_close(got[bi, mi], ref_row)
-
-
-def test_get_dspark_topk_idxs_requires_generation():
-    with pytest.raises(AssertionError):
-        get_dspark_topk_idxs(128, 1, 5, 0)
-
-
 @pytest.mark.parametrize("rope_head_dim,seqlen", [(64, 16), (64, 1), (128, 8)])
 def test_precompute_freqs_cis_matches_reference(rope_head_dim, seqlen):
     got = precompute_dspark_freqs_cis(rope_head_dim, seqlen, rope_theta=10000.0)
@@ -1290,140 +1125,3 @@ def test_apply_rotary_inverse_roundtrip(ndim):
     fc = precompute_dspark_freqs_cis(rd, s)
     roundtrip = apply_dspark_rotary(apply_dspark_rotary(x, fc), fc, inverse=True)
     torch.testing.assert_close(roundtrip, x, rtol=1e-5, atol=1e-5)
-
-
-def _make_attn_inputs(seed=0):
-    """Small synthetic DSpark attention inputs/weights (CPU bf16)."""
-    torch.manual_seed(seed)
-    dim, n_heads, head_dim, rd = 12, 4, 8, 4
-    q_lora, o_lora, n_groups = 6, 5, 2
-    window, block, start_pos = 8, 3, 5
-    b = 2
-    g = dict(
-        dim=dim,
-        n_heads=n_heads,
-        head_dim=head_dim,
-        rope_head_dim=rd,
-        q_lora=q_lora,
-        o_lora=o_lora,
-        n_groups=n_groups,
-        window=window,
-        block=block,
-        start_pos=start_pos,
-        b=b,
-        eps=1e-6,
-        softmax_scale=head_dim**-0.5,
-    )
-    bf = torch.bfloat16
-    g["x"] = torch.randn(b, block, dim, dtype=bf)
-    g["main_x"] = torch.randn(b, 1, dim, dtype=bf)
-    g["kv_cache0"] = torch.randn(b, window, head_dim, dtype=bf)
-    g["wq_a"] = torch.randn(q_lora, dim, dtype=bf) * 0.1
-    g["wq_b"] = torch.randn(n_heads * head_dim, q_lora, dtype=bf) * 0.1
-    g["wkv"] = torch.randn(head_dim, dim, dtype=bf) * 0.1
-    g["wo_a"] = torch.randn(n_groups * o_lora, n_heads * head_dim // n_groups, dtype=bf) * 0.1
-    g["wo_b"] = torch.randn(dim, n_groups * o_lora, dtype=bf) * 0.1
-    g["q_norm"] = torch.ones(q_lora)
-    g["kv_norm"] = torch.ones(head_dim)
-    g["attn_sink"] = torch.randn(n_heads)
-    g["freqs"] = precompute_dspark_freqs_cis(rd, start_pos + 1 + block + 2)
-    return g
-
-
-def _run(g):
-    return dspark_attention_forward(
-        g["x"],
-        g["main_x"],
-        g["start_pos"],
-        g["kv_cache0"],
-        wq_a=g["wq_a"],
-        q_norm_w=g["q_norm"],
-        wq_b=g["wq_b"],
-        wkv=g["wkv"],
-        kv_norm_w=g["kv_norm"],
-        wo_a=g["wo_a"],
-        wo_b=g["wo_b"],
-        attn_sink=g["attn_sink"],
-        n_heads=g["n_heads"],
-        head_dim=g["head_dim"],
-        rope_head_dim=g["rope_head_dim"],
-        n_groups=g["n_groups"],
-        o_lora_rank=g["o_lora"],
-        window_size=g["window"],
-        eps=g["eps"],
-        softmax_scale=g["softmax_scale"],
-        freqs_cis=g["freqs"],
-    )
-
-
-def test_attention_forward_shape_and_determinism():
-    g = _make_attn_inputs()
-    o = _run(g)
-    assert tuple(o.shape) == (g["b"], g["block"], g["dim"])
-    assert torch.isfinite(o.float()).all()
-    torch.testing.assert_close(o, _run(g))  # deterministic
-
-
-def test_attention_forward_accepts_loaded_projection_modules(monkeypatch):
-    """The production module path matches the tensor-weight reference path."""
-    from tensorrt_llm._torch.modules import mla
-
-    g = _make_attn_inputs(seed=13)
-    o_a_proj = g["wo_a"].view(g["n_groups"], g["o_lora"], -1).to(torch.float8_e4m3fn)
-    reference = dict(g)
-    reference["wo_a"] = o_a_proj.to(g["wo_a"].dtype).flatten(0, 1)
-    expected = _run(reference)
-
-    def fake_blockscaled_bmm(
-        mat1,
-        mat2_fp8,
-        mat2_scale,
-        out,
-        mat2_dequant=None,
-        use_cute_dsl_blockscaling_bmm=False,
-    ):
-        del mat2_scale, mat2_dequant
-        assert use_cute_dsl_blockscaling_bmm is True
-        torch.bmm(
-            mat1.transpose(0, 1),
-            mat2_fp8.to(mat1.dtype).transpose(1, 2),
-            out=out,
-        )
-
-    monkeypatch.setattr(mla, "fp8_block_scaling_bmm_out", fake_blockscaled_bmm)
-    actual = dspark_attention_forward(
-        g["x"],
-        g["main_x"],
-        g["start_pos"],
-        g["kv_cache0"],
-        wq_a=None,
-        q_norm_w=g["q_norm"],
-        wq_b=lambda x: F.linear(x, g["wq_b"]),
-        wkv=None,
-        kv_norm_w=g["kv_norm"],
-        wo_a=None,
-        wo_b=lambda x: F.linear(x, g["wo_b"]),
-        attn_sink=g["attn_sink"],
-        n_heads=g["n_heads"],
-        head_dim=g["head_dim"],
-        rope_head_dim=g["rope_head_dim"],
-        n_groups=g["n_groups"],
-        o_lora_rank=g["o_lora"],
-        window_size=g["window"],
-        eps=g["eps"],
-        softmax_scale=g["softmax_scale"],
-        freqs_cis=g["freqs"],
-        qkv_proj=lambda x: torch.cat((F.linear(x, g["wq_a"]), F.linear(x, g["wkv"])), dim=-1),
-        o_a_proj=o_a_proj,
-        o_a_scale=torch.ones(g["n_groups"], 1, 1),
-    )
-
-    torch.testing.assert_close(actual, expected)
-
-
-def test_attention_forward_does_not_mutate_kv_cache():
-    """The rolling window write must be functional (cache cloned, not mutated)."""
-    g = _make_attn_inputs()
-    before = g["kv_cache0"].clone()
-    _run(g)
-    torch.testing.assert_close(g["kv_cache0"], before)

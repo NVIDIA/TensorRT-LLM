@@ -111,7 +111,7 @@ def test_activation_controls_fp8_quant_fusion_capability(
     down_proj.disable_deep_gemm = False
     mlp.down_proj = down_proj
     monkeypatch.setattr(gated_mlp_module, "get_sm_version", lambda: 107)
-    monkeypatch.setattr(gated_mlp_module, "IS_CUTLASS_DSL_INTERNAL_AVAILABLE", True)
+    monkeypatch.setattr(gated_mlp_module, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
 
     assert mlp._can_fuse_swiglu_fp8_quant() is expected
 

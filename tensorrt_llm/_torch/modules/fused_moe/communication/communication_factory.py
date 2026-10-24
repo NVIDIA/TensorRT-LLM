@@ -34,7 +34,7 @@ from .base import Communication
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
 from .nccl_ep import NcclEP
-from .nvlink_one_sided import NVLinkOneSided
+from .nvlink_one_sided import NVLinkOneSided, quantize_on_send_setting
 from .nvlink_two_sided import NVLinkTwoSided
 from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 
@@ -142,6 +142,12 @@ class CommunicationFactory:
         # AlltoAll cannot support MoE TP
         if mapping.moe_tp_size != 1:
             return AllGatherReduceScatter(mapping)
+
+        # A bad TRTLLM_MOE_A2A_QUANTIZE_ON_SEND fails here, on every rank that has it. NVLinkOneSided
+        # validates it too, but the auto selection below takes any exception of that constructor for
+        # "not available" and moves on: ranks that disagree on the value would end up in different
+        # strategies (a hang), and ranks that agree would silently lose the one-sided path.
+        quantize_on_send_setting()
 
         # A forced method comes either from the environment, which wins, or from the
         # model-selected argument. Keep the source with the value so the log below can

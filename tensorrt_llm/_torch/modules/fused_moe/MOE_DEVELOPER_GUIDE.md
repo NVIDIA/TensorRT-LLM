@@ -40,6 +40,7 @@ ConfigurableMoE
 ├── Backend           (pure computation: routing → quantize → FC1 → act → FC2)
 ├── Communication     (distributed, optional: dispatch tokens → compute → combine)
 ├── EPLB              (optional: dynamic expert migration across GPUs)
+├── DWDP              (optional: bind composite-VA weights; no EP communication)
 └── MoEScheduler      (forward-execution strategy: chunking, EPLB hook ordering,
                        comm orchestration; selected by backend.scheduler_kind)
 ```
@@ -48,6 +49,8 @@ ConfigurableMoE
 
 ```python
 def forward_impl(self, x, router_logits, ...):
+    if self.enable_dwdp:
+        self.dwdp_manager.wait_and_bind(self.backend, self.layer_idx)
     outputs = self.scheduler.forward(x, router_logits, ...)
     if self.enable_dwdp:
         self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
@@ -65,6 +68,59 @@ Each backend declares one of two scheduler kinds via the `scheduler_kind` class 
 | `FUSED_COMM` | `FusedCommMoEScheduler` | MegaMoEDeepGemm, MegaMoECuteDsl | Comm is fused into the backend kernel via SymmBuffer / NVSHMEM-equivalent peer-pointer mapping; no host comm; lockstep chunk launches; EPLB stats AllReduced internally |
 
 The two paths have *deliberately opposite* invariants (`use_dp_padding` honored vs ignored, ADP padding kept vs stripped, empty-chunk substituted vs zero-token kernel launch, multi-stream overlap allowed vs forbidden). See `moe_scheduler.py` class docstrings and `MOE_SCHEDULER_DESIGN.md` for the full contract.
+
+### DWDP execution boundary
+
+DWDP is wrapper-owned lifecycle, not a scheduler or backend variant:
+
+```text
+Executor construction
+  → register eligible MoE layer indices
+  → after weight loading: create VMM transport + composite VA + page pool
+
+PyExecutor forward start
+  → DwdpManager.prefetch_first_layers() for the first two MoE layers
+  → ConfigurableMoE.wait_and_bind(composite VA)
+  → MoEScheduler.forward(... ordinary CuTeDSL kernel ...)
+  → main stream joins scheduler auxiliary work
+  → DwdpManager records current-slot consumption
+  → prefetch the MoE layer two positions ahead
+
+Executor shutdown or construction rollback
+  → detach model references
+  → synchronize outstanding device work
+  → release composite VA, page pool, transport, and MPI sub-communicator
+```
+
+`modules/dwdp/` owns the shareable CUDA VMM transport, MNNVL fabric
+allocations on GB200, composite mappings, page pool, copy stream, and event
+protocol. `ConfigurableMoE` owns wait/bind/record placement so those calls
+happen once per layer rather than once per scheduler chunk. Schedulers must not
+perform DWDP lifecycle calls.
+
+Dense DWDP (`TRTLLM_DWDP_DENSE`, which row-shards the replicated dense weights
+of the MoE decoder layers the same way) is owned by `DwdpManager` and the
+model's decoder-layer hooks, which enqueue each layer's dense weights on the
+same copy stream ahead of its experts; with it on, the model's forward entry
+(`DwdpManager.ensure_primed`) also primes the first two MoE layers, each
+layer's experts right after its dense weights, for every forward the executor
+loop did not prime (warmup, KV-cache estimation, the forward after an aborted
+one), `prefetch_first_layers` skips when they are already primed or the
+previous forward aborted, and `ConfigurableMoE` is unaware of dense DWDP and
+keeps the expert wait/bind/record protocol above unchanged.
+
+The composite mapping exposes the full expert table through the backend's
+ordinary weight attributes, so DWDP returns `None` from
+`_create_comm_strategy_auto` and continues through the `EXTERNAL_COMM`
+CuTeDSL scheduler without dispatch/combine. `DwdpConfig.contention_opt=True`
+changes only remote-copy submission: it uses a cached, peer-interleaved
+`cudaMemcpyBatchAsync` plan instead of the default per-peer tensor copies.
+
+The currently supported activation path is NVFP4 + CuTeDSL, TP=1 per context
+worker, an MPI worker launch, overlap scheduling disabled, and no EPLB on the
+same MoE path. Rubin SM107 also requires `use_fused_finalize`. Treat these as
+supported-path constraints; the CuTeDSL/NVFP4 activation predicate is not a
+comprehensive early-validation layer for every incompatible feature.
 
 ### External-comm execution flow (most backends)
 

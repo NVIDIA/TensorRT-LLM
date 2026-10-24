@@ -21,53 +21,12 @@ from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
     _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
-    _validate_fp4_mla_chunk_size,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, ContextChunkingPolicy
 from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.mark.parametrize(
-    ("enable_chunked_prefill", "max_num_tokens"),
-    [(True, 4096), (False, 4097)],
-)
-def test_dense_fp4_mla_accepts_aligned_or_disabled_chunking(
-    enable_chunked_prefill: bool,
-    max_num_tokens: int,
-) -> None:
-    model_config = SimpleNamespace(
-        attn_backend="TRTLLM",
-        sparse_attention_config=None,
-        quant_config=None,
-    )
-    kv_cache_config = SimpleNamespace(dtype="nvfp4")
-
-    _validate_fp4_mla_chunk_size(
-        model_config,
-        kv_cache_config,
-        enable_chunked_prefill=enable_chunked_prefill,
-        max_num_tokens=max_num_tokens,
-    )
-
-
-def test_dense_fp4_mla_rejects_unaligned_chunk_size() -> None:
-    model_config = SimpleNamespace(
-        attn_backend="TRTLLM",
-        sparse_attention_config=None,
-        quant_config=None,
-    )
-    kv_cache_config = SimpleNamespace(dtype="nvfp4")
-
-    with pytest.raises(ValueError, match="multiple of 16"):
-        _validate_fp4_mla_chunk_size(
-            model_config,
-            kv_cache_config,
-            enable_chunked_prefill=True,
-            max_num_tokens=4097,
-        )
 
 
 class _DummyCalibrator:

@@ -65,6 +65,27 @@ void launch_silu_and_mul_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_
     __nv_bfloat16 const* input, int m, int k, int scale_leading_dim_uint32, bool use_r128c4_layout, float swiglu_limit,
     bool has_swiglu_limit, cudaStream_t stream);
 
+// Largest row width supported by the fused RMSNorm + quantize kernel (one CTA
+// per row, one warp per 512 columns).
+constexpr int kRmsNormFp8QuantMaxK = 16384;
+
+// Launches RMSNorm (y = bf16(x * rsqrt(mean(x^2) + eps) * weight), no residual)
+// fused with the 1x128 FP8 quantization of launch_fp8_quantize_1x128_cutedsl_bf16_e4m3.
+//
+// Inputs:
+//   input  : BF16 [m, k], unit column stride, row stride `input_row_stride`
+//            elements (16-byte aligned rows)
+//   weight : BF16 [k]; read before the PDL wait, so it must not be produced by
+//            the preceding kernels on the stream (model weights are static)
+// Outputs:
+//   fp8_output            : E4M3 [m, k] row-major contiguous
+//   swizzled_scale_output : uint8 [padded_m * k / 32], CuTe/CUTLASS 128x4
+//                           swizzled; rows in [m, padded_m) get zero scales
+// Requires k % 128 == 0, k <= kRmsNormFp8QuantMaxK and padded_m a multiple of 128.
+void launch_rmsnorm_fp8_quantize_1x128_cutedsl_bf16_e4m3(__nv_fp8_e4m3* fp8_output, uint8_t* swizzled_scale_output,
+    __nv_bfloat16 const* input, int64_t input_row_stride, __nv_bfloat16 const* weight, float eps, int m, int k,
+    int padded_m, cudaStream_t stream);
+
 } // namespace kernels::fp8_blockscale_gemm
 
 TRTLLM_NAMESPACE_END

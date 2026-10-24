@@ -38,6 +38,11 @@ static_assert(kRankMaskWords * 64 >= kMaxRanks, "active_rank_mask too small for 
 static constexpr size_t kCftCounterStride = 256;
 static constexpr size_t kCftCounterStrideU64 = kCftCounterStride / sizeof(uint64_t);
 
+// Largest expert-id receive buffer ([ep_size, max_tokens_per_rank, top_k] int32) whose padding rows the dispatch
+// kernel fills itself (MoeA2ADispatchParams::sanitize_expert_ids). Its last CTA does the fill, so a larger buffer
+// (prefill-sized max_tokens_per_rank) is filled by moe_a2a_sanitize_expert_ids_launch after the dispatch instead.
+static constexpr int64_t kFusedSanitizeMaxBytes = 256 * 1024;
+
 // Smem slot reserved for an mbarrier in the CFT dispatch / push-combine kernels.
 // The mbarrier itself is only 8 B (a uint64_t initialized via mbarrier.init.shared.b64);
 // the 64 B reservation is padding so the staging buffer that immediately follows is
@@ -101,11 +106,21 @@ struct DispatchKernelPointers
     // LE counters grow monotonically; the baseline tracks the previous cumulative value.
     uint64_t* dispatch_counter_baseline; // [ep_size]
 
-    // Optional CFT dispatch-side expert-id sanitization.  Invalid padding tokens in the received
+    // Optional dispatch-side expert-id sanitization (both dispatch kernels). Invalid padding tokens in the received
     // expert-id payload are filled after recv_counters are known, avoiding a separate sanitize kernel.
     bool sanitize_expert_ids;
     int expert_id_payload_index;
     int32_t invalid_expert_id;
+
+    // Fence dispatch: load the token's payload vectors before routing (TLLM_MOE_A2A_DISPATCH_PRELOAD, default on).
+    bool preload_payloads;
+
+    // Quantize on send (fence dispatch only): when quant_global_scale is not null, src_data_ptrs[0] is the BF16 hidden
+    // state [local_num_tokens, quant_hidden] and the kernel sends its NVFP4 quantization (nvfp4QuantKfBlock.cuh): the
+    // E2M1 codes as payload 0 and the E4M3 scales as payload 1, which has no source. payload_bytes_per_token and
+    // recv_buffers describe what is sent, so the other payloads keep their indices.
+    float const* quant_global_scale;
+    int quant_hidden;
 
     // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
     // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. Tokens routed to a masked
@@ -194,10 +209,19 @@ struct MoeA2ADispatchParams
     // Cumulative counter baselines (regular device memory)
     uint64_t* cft_dispatch_counter_baseline; // [ep_size]
 
-    // Optional CFT dispatch-side expert-id sanitization.
+    // Optional dispatch-side expert-id sanitization: the expert-id payload (int32 [local_num_tokens, top_k]) of every
+    // received padding row is set to invalid_expert_id inside the dispatch kernel.
     bool sanitize_expert_ids;
     int expert_id_payload_index;
     int32_t invalid_expert_id;
+
+    // Quantize on send (fence dispatch of the fused-round kernels, top_k 16, no CFT counted writes): payloads[0] has
+    // src_data = the BF16 hidden state [local_num_tokens, quantize_hidden] and describes the NVFP4 codes that are sent
+    // (1-byte elements, quantize_hidden / 2 per token); payloads[1] describes the E4M3 scales (1-byte elements,
+    // quantize_hidden / 16 per token, src_data unused); the other payloads are as without it. quantize_global_scale
+    // points to the one device float of fp4_quantize(..., global_scale, 16, false, false). Null: off.
+    float const* quantize_global_scale{nullptr};
+    int quantize_hidden{0};
 
     // Whether to instantiate a kernel with active-rank checks.
     // This is a launch-lifetime mode, independent of future execution-abort handling.
@@ -213,9 +237,12 @@ struct MoeA2ADispatchParams
     cudaStream_t stream;
 };
 
-// Dispatch kernels
+// Dispatch kernels. The fence dispatch (use_cft_counted_writes == false) prepares its own round: its last CTA takes
+// the next odd value of flag_val as the round's flag, zeroes send_counters and local_token_counter, and marks the next
+// recv_counters bank pending. The counted-write dispatch must be preceded by moe_a2a_prepare_dispatch_launch.
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
-// Prepare for dispatch: zero send_counters, local_token_counter and increment flag_val
+// Prepare for a counted-write dispatch: zero send_counters and local_token_counter, advance flag_val to the next odd
+// value
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 
 // Combine phase parameters

@@ -55,3 +55,8 @@ add_gtest(staticThreadPoolTest staticThreadPoolTest.cpp)
 add_gtest(rnnCacheFormatterTest rnnCacheFormatterTest.cpp)
 add_gtest(agentTreeTest agentTreeTest.cpp)
 add_gtest(truncateBlocksTest truncateBlocksTest.cpp)
+
+add_gtest(kvCacheManagerV2ConfigTest kvCacheManagerV2ConfigTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ConfigTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)

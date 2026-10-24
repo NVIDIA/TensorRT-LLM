@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,6 +71,9 @@ enum class AllReduceFusionPattern : int
     // AllReduce + RMSNorm + FP8 1x128 block-scale quant (UE8M0, deep_gemm's
     // packed MN-major layout). No residual, no bf16 norm output.
     kARRMSNormFP8BlockScale = 7,
+    // Same quantization, scales in the 128x4-swizzled uint8 layout ("R128c4") consumed by the
+    // Rubin CuTe DSL MXFP8 GEMM, each 1x128 scale replicated over its four 1x32 slots.
+    kARRMSNormFP8BlockScaleR128c4 = 8,
 };
 
 enum class QuantType : int
@@ -79,6 +82,7 @@ enum class QuantType : int
     kFP8 = 1,
     kFP4 = 2,
     kFP8BlockScale = 3,
+    kFP8BlockScaleR128c4 = 4,
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -111,6 +115,8 @@ DEFINE_FUSION_PATTERN_TRAITS(
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARRMSNorm, false, false, false, true, true, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARRMSNormFP8BlockScale, false, false, false, true, false, QuantType::kFP8BlockScale);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARRMSNormFP8BlockScaleR128c4, false, false, false, true, false,
+    QuantType::kFP8BlockScaleR128c4);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>

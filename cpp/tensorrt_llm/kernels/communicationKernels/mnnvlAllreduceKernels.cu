@@ -15,9 +15,12 @@
  */
 #include "mnnvlAllreduceKernels.h"
 #include "tensorrt_llm/common/config.h"
+#include <algorithm>
+#include <atomic>
 #include <cooperative_groups.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cuda/atomic>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
@@ -207,10 +210,22 @@ inline __device__ __host__ T divUp(T m, T n)
     return (m + n - 1) / n;
 }
 
-inline bool requiresTwoAccessScaleGroup(ar_fusion::AllReduceFusionPattern pattern)
+// Threads whose 16-byte accesses must stay inside one CTA: NVFP4 scale generation pairs two accesses; the FP8 1x128
+// block-scale epilogue reduces the amax of a 128-element block over 16 consecutive threads with a width-16 shuffle,
+// so a CTA must hold whole 16-thread groups.
+inline int getAccessGroupSize(ar_fusion::AllReduceFusionPattern pattern)
 {
-    return pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant
-        || pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
+    if (pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant
+        || pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant)
+    {
+        return 2;
+    }
+    if (pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale
+        || pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScaleR128c4)
+    {
+        return 16;
+    }
+    return 1;
 }
 
 // A helper function to tune the grid configuration for fused oneshot and RMSNorm kernels.
@@ -336,7 +351,12 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    // FP8 block-scale quant: uint32 elements per packed-sf_k row (DeepGEMM layout), or the 128-row padded token
+    // count of the scale buffer (R128c4 layout).
     int sfLeadingDim = 0;
+    // One-shot only: trigger the dependent launch right after this rank's payload is published instead of after
+    // the reduction (TRTLLM_MNNVL_AR_EARLY_TRIGGER). Dependents still wait for this grid's completion.
+    bool earlyTrigger = false;
 };
 
 template <typename PackedType, typename T>
@@ -539,9 +559,11 @@ inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
         }
         reinterpret_cast<PackedQuantizedType*>(params.quantOutPtr)[packedAccessIdx] = quantized;
     }
-    else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8BlockScale)
+    else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8BlockScale
+        || ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8BlockScaleR128c4)
     {
-        // 1x128 UE8M0 block scale in deep_gemm's packed MN-major layout.
+        // 1x128 UE8M0 block scale, in deep_gemm's packed MN-major layout (kFP8BlockScale) or in the 128x4-swizzled
+        // R128c4 layout of the Rubin CuTe DSL MXFP8 GEMM (kFP8BlockScaleR128c4).
         // 16 consecutive threads cover one 128-element block, which holds
         // because loadStride == blockDim.x and blockChunkSize % 128 == 0.
         static_assert(kELTS_PER_THREAD == 8, "FP8 block-scale quant expects eight elements per 16-byte access.");
@@ -584,6 +606,32 @@ inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
 
         auto* sfBytes = reinterpret_cast<uint8_t*>(params.scaleOutPtr);
         int const numSfK = params.tokenDim / kQuantBlock;
+        if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8BlockScaleR128c4)
+        {
+            // Same bytes as fp8_quantize_1x128_cutedsl_ue8m0: one uint32 per (row, 1x128 block) holding the UE8M0
+            // scale replicated over the block's four 1x32 slots, at the 128x4-swizzled offset; the rows padded up to
+            // the next multiple of 128 (sfLeadingDim) read as zero. The 16 threads of a quant block share the zero
+            // fill of that block's padded rows across all tokens, so no thread loops over more than a few rows.
+            int const sfK = accessIdInToken / kThreadsPerQuantBlock;
+            int const laneInBlock = accessIdInToken % kThreadsPerQuantBlock;
+            auto const r128c4Offset = [numSfK, sfK](int row)
+            {
+                return static_cast<size_t>(row / 128) * numSfK * 512 + static_cast<size_t>(sfK) * 512
+                    + static_cast<size_t>(row % 32) * 16 + static_cast<size_t>((row % 128) / 32) * 4;
+            };
+            if (laneInBlock == 0)
+            {
+                *reinterpret_cast<uint32_t*>(sfBytes + r128c4Offset(token))
+                    = static_cast<uint32_t>(ue8m0Scale.__x) * 0x01010101u;
+            }
+            int const fillWorkers = params.numTokens * kThreadsPerQuantBlock;
+            for (int row = params.numTokens + token * kThreadsPerQuantBlock + laneInBlock; row < params.sfLeadingDim;
+                 row += fillWorkers)
+            {
+                *reinterpret_cast<uint32_t*>(sfBytes + r128c4Offset(row)) = 0u;
+            }
+            return;
+        }
         if (accessIdInToken % kThreadsPerQuantBlock == 0)
         {
             int const sfK = accessIdInToken / kThreadsPerQuantBlock;
@@ -672,8 +720,9 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     int threadOffset = token * params.tokenDim + packedIdx * kELTS_PER_THREAD;
 #endif
 
-    // We only use 1 stage for the oneshot allreduce
-    LamportFlags<PackedType, true> flag(params.bufferFlags, 1);
+    // We only use 1 stage for the oneshot allreduce. Arrivals are counted per CTA: the RMSNorm epilogue's cluster
+    // reduction below must be each thread's only phase of the cluster barrier.
+    LamportFlags<PackedType> flag(params.bufferFlags, 1);
     T* stagePtrMcast = reinterpret_cast<T*>(flag.getCurLamportBuf(params.mcastPtr, 0));
     T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], 0));
     bool const inBounds = packedIdx * kELTS_PER_THREAD < params.tokenDim;
@@ -691,6 +740,14 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     }
 
     flag.ctaArrive();
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (params.earlyTrigger)
+    {
+        // Let the dependent grid launch while this one polls (warps past the first may still be storing their
+        // payload; that is fine because a PDL dependent's griddepcontrol.wait waits for this whole grid to finish).
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
     // ======================= Lamport Sync and clear the output buffer from previous iteration
     // =============================
     flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
@@ -746,7 +803,10 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
+    if (!params.earlyTrigger)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
     if constexpr (ar_fusion::HasResidual<Pattern>)
     {
@@ -785,11 +845,12 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
             fullSum = 0.F;
             // Need to reduce over the entire cluster
             int const blockRank = cluster.block_rank();
+            // Every CTA of the cluster must have started before another CTA writes its shared memory.
+            cluster.sync();
             if (threadIdx.x < numBlocks)
             {
                 cluster.map_shared_rank(&sharedVal[0], threadIdx.x)[blockRank] = blockSum;
             }
-            // cluster.sync();
             cluster.barrier_wait(cluster.barrier_arrive());
             for (int i = 0; i < numBlocks; ++i)
             {
@@ -812,11 +873,94 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
 }
 
 using detail::adjustGridConfig;
-using detail::requiresTwoAccessScaleGroup;
+using detail::getAccessGroupSize;
+
+namespace
+{
+
+bool isFp8BlockScalePattern(ar_fusion::AllReduceFusionPattern pattern)
+{
+    return pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale
+        || pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScaleR128c4;
+}
+
+//! TRTLLM_MNNVL_AR_NORM_MAX_CLUSTER (read once): largest thread-block cluster for the RMSNorm-fused kernels. Their
+//! norm epilogue reduces the row's sum of squares across the cluster with two cluster barriers; a cluster of one
+//! reduces inside the CTA. 0 (default) keeps the cluster that adjustGridConfig picks. The cluster width sets the
+//! FP32 order of that sum, so a cap can change the norm output's low bits: set it identically on every rank of
+//! the group, or the replicas of a tensor-parallel layer hold slightly different values.
+int getNormMaxClusterSize()
+{
+    static int const kMaxCluster = []()
+    {
+        char const* env = std::getenv("TRTLLM_MNNVL_AR_NORM_MAX_CLUSTER");
+        return env != nullptr ? std::max(0, std::atoi(env)) : 0;
+    }();
+    return kMaxCluster;
+}
+
+//! TRTLLM_MNNVL_AR_EARLY_TRIGGER=1 (read once): the one-shot kernel triggers its dependent launch as soon as its
+//! payload is published rather than after the reduction. Dependents still wait for the whole grid to finish; only
+//! their launch and pre-wait prologue overlap. Off by default: the gain is unmeasured end to end, and enabling it
+//! needs every PDL-dependent kernel that follows a one-shot all-reduce to read only data that precedes the wait.
+bool getEarlyTrigger()
+{
+    static bool const kEarlyTrigger = []()
+    {
+        char const* env = std::getenv("TRTLLM_MNNVL_AR_EARLY_TRIGGER");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return kEarlyTrigger;
+}
+
+//! Once per process: a requested cluster cap that a shape cannot honor keeps the shape's own cluster, so say so.
+void warnNormClusterCapUnreachable(int tokenDim, int clusterSize, int maxCluster)
+{
+    static std::atomic<bool> kWarned{false};
+    if (!kWarned.exchange(true))
+    {
+        TLLM_LOG_WARNING(
+            "[MNNVL] TRTLLM_MNNVL_AR_NORM_MAX_CLUSTER=%d cannot be applied to hidden dimension %d (the row needs %d "
+            "CTAs per cluster at one 16-byte load per thread and at most 1024 threads per CTA); this shape keeps its "
+            "cluster. This is reported once per process.",
+            maxCluster, tokenDim, clusterSize);
+    }
+}
+
+//! Narrow an RMSNorm-fused kernel's cluster to getNormMaxClusterSize() CTAs when the row still fits one cluster of
+//! that size with one 16-byte load per thread. Returns the (block size, cluster size, loads per thread) to launch.
+std::tuple<int, int, int> capNormClusterSize(
+    std::tuple<int, int, int> config, int tokenDim, int eltsPerThread, int accessGroupSize)
+{
+    auto const [blockSize, clusterSize, loadsPerThread] = config;
+    int const maxCluster = getNormMaxClusterSize();
+    if (maxCluster <= 0 || clusterSize <= maxCluster)
+    {
+        return config;
+    }
+    if (loadsPerThread == 1)
+    {
+        int const threadsNeeded = divUp(tokenDim, eltsPerThread);
+        int cappedCluster = clusterSize;
+        while (cappedCluster > maxCluster)
+        {
+            cappedCluster /= 2;
+        }
+        int const cappedBlock = divUp(threadsNeeded, cappedCluster);
+        if (threadsNeeded % cappedCluster == 0 && cappedBlock <= 1024 && cappedBlock % accessGroupSize == 0)
+        {
+            return {cappedBlock, cappedCluster, 1};
+        }
+    }
+    warnNormClusterCapUnreachable(tokenDim, clusterSize, maxCluster);
+    return config;
+}
+
+} // namespace
 
 void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
-    if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale)
+    if (isFp8BlockScalePattern(params.pattern))
     {
         TLLM_CHECK_WITH_INFO(params.tokenDim % 128 == 0 && params.sfLeadingDim > 0,
             "[MNNVL] FP8 block-scale quant needs tokenDim %% 128 == 0 and a scale leading dim");
@@ -827,10 +971,14 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     int const numTokens = params.numTokens;
     int const tokenDim = params.tokenDim;
     int const eltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
-    int const accessGroupSize = requiresTwoAccessScaleGroup(params.pattern) ? 2 : 1;
+    int const accessGroupSize = getAccessGroupSize(params.pattern);
 
-    auto [blockSize, clusterSize, loadsPerThread]
-        = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread, accessGroupSize);
+    auto gridConfig = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread, accessGroupSize);
+    if (params.pattern != ar_fusion::AllReduceFusionPattern::kAllReduce)
+    {
+        gridConfig = capNormClusterSize(gridConfig, tokenDim, eltsPerThread, accessGroupSize);
+    }
+    auto [blockSize, clusterSize, loadsPerThread] = gridConfig;
     dim3 grid(numTokens, clusterSize, 1);
 
     TLLM_LOG_DEBUG(
@@ -840,6 +988,11 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 
     TLLM_CHECK_WITH_INFO(blockSize <= 1024 && loadsPerThread == 1,
         "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim, 1024 * 8 * eltsPerThread);
+    TLLM_CHECK_WITH_INFO(blockSize % accessGroupSize == 0,
+        "[MNNVL AllReduceOneShot] hidden dimension %d gives %d-thread CTAs, not a multiple of the %d-thread access "
+        "group "
+        "of this fusion pattern",
+        tokenDim, blockSize, accessGroupSize);
 
     cudaLaunchAttribute attrs[2];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -914,6 +1067,17 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] FP8 block-scale quant needs FP16/BF16 input.");      \
         }                                                                                                              \
     }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScaleR128c4)                       \
+    {                                                                                                                  \
+        if constexpr (std::is_same_v<T, __nv_bfloat16>)                                                                \
+        {                                                                                                              \
+            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScaleR128c4);  \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] FP8 block-scale R128c4 quant needs BF16 input.");    \
+        }                                                                                                              \
+    }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] Unsupported fusion pattern.");                           \
@@ -933,6 +1097,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
             false, params.layout, params.sfLeadingDim};
+        kernelParams.earlyTrigger = getEarlyTrigger();
 
         switch (params.nRanks)
         {
@@ -981,7 +1146,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
-    LamportFlags<PackedType, false> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+    LamportFlags<PackedType> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
 
     T* scatterBufLocal
         = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::SCATTER));
@@ -1107,7 +1272,9 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
     T* smemResidual = reinterpret_cast<T*>(&smem[smemBufferSize]);
     T* smemGamma = reinterpret_cast<T*>(&smem[2 * smemBufferSize]);
 
-    LamportFlags<float4, UseCGA> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+    // Arrivals are counted per CTA: with UseCGA the RMSNorm cluster reduction below must be each thread's only phase
+    // of the cluster barrier.
+    LamportFlags<float4> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
     T* input = reinterpret_cast<T*>(
         flag.getCurLamportBuf(reinterpret_cast<void*>(params.bufferInputPtr), MNNVLTwoShotStage::BROADCAST));
 
@@ -1228,11 +1395,12 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
             fullSum = 0.F;
             // Need to reduce over the entire cluster
             int const blockRank = cluster.block_rank();
+            // Every CTA of the cluster must have started before another CTA writes its shared memory.
+            cluster.sync();
             if (threadIdx.x < numBlocks)
             {
                 cluster.map_shared_rank(&sharedVal[0], threadIdx.x)[blockRank] = blockSum;
             }
-            // cluster.sync();
             cluster.barrier_wait(cluster.barrier_arrive());
             for (int i = 0; i < numBlocks; ++i)
             {
@@ -1281,7 +1449,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
 
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
-    if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale)
+    if (isFp8BlockScalePattern(params.pattern))
     {
         TLLM_CHECK_WITH_INFO(params.tokenDim % 128 == 0 && params.sfLeadingDim > 0,
             "[MNNVL] FP8 block-scale quant needs tokenDim %% 128 == 0 and a scale leading dim");
@@ -1353,8 +1521,10 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     // Launch the rmsnorm lamport kernel if fusion is enabled
     if (params.rmsNormFusion)
     {
-        int const accessGroupSize = requiresTwoAccessScaleGroup(params.pattern) ? 2 : 1;
-        auto gridConfig = adjustGridConfig<true>(numTokens, tokenDim, numEltsPerThread, accessGroupSize);
+        int const accessGroupSize = getAccessGroupSize(params.pattern);
+        auto gridConfig
+            = capNormClusterSize(adjustGridConfig<true>(numTokens, tokenDim, numEltsPerThread, accessGroupSize),
+                tokenDim, numEltsPerThread, accessGroupSize);
         int rnBlockSize = std::get<0>(gridConfig);
         int rnClusterSize = std::get<1>(gridConfig);
         int rnLoadsPerThread = std::get<2>(gridConfig);
@@ -1367,6 +1537,10 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             rnLoadsPerThread = std::get<2>(gridConfig);
         }
 
+        TLLM_CHECK_WITH_INFO(rnBlockSize % accessGroupSize == 0 && (accessGroupSize < 16 || rnLoadsPerThread == 1),
+            "[MNNVL AllReduceTwoShot] hidden dimension %d gives %d-thread RMSNorm CTAs (%d loads per thread), not "
+            "whole %d-thread access groups of this fusion pattern",
+            tokenDim, rnBlockSize, rnLoadsPerThread, accessGroupSize);
         int rnNumThreads = rnClusterSize * rnBlockSize;
         dim3 rnGrid(numTokens, rnClusterSize, 1);
         cudaLaunchConfig_t rnConfig;
@@ -1457,6 +1631,18 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
         else                                                                                                           \
         {                                                                                                              \
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] FP8 block-scale quant needs FP16/BF16 input.");      \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScaleR128c4)                       \
+    {                                                                                                                  \
+        if constexpr (std::is_same_v<T, __nv_bfloat16>)                                                                \
+        {                                                                                                              \
+            RUN_RMSNORM_KERNEL(                                                                                        \
+                T, ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScaleR128c4, USE_CGA, LOADS_PER_THREAD);       \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] FP8 block-scale R128c4 quant needs BF16 input.");    \
         }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \

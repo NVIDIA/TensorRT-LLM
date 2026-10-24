@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import array
 import asyncio
 import base64
@@ -180,6 +183,38 @@ if _MSGSPEC_ENABLED:
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+GRACEFUL_SHUTDOWN_TIMEOUT_ENV = "TRTLLM_SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_S"
+
+
+def _graceful_shutdown_timeout_from_env() -> int | None:
+    """Return the uvicorn graceful-shutdown bound requested by the environment.
+
+    A positive integer N in ``TRTLLM_SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_S`` makes
+    uvicorn wait at most N seconds, after a shutdown signal, for open
+    connections and running request handlers. Handlers still running then are
+    cancelled, and the application lifespan shutdown runs as usual. When the
+    variable is unset or empty, uvicorn waits for every handler to finish.
+
+    Returns:
+        The bound in seconds, or None when the variable is unset or empty.
+
+    Raises:
+        ValueError: The variable is set to anything but a positive integer.
+    """
+    raw = os.environ.get(GRACEFUL_SHUTDOWN_TIMEOUT_ENV)
+    if not raw:
+        return None
+    try:
+        seconds = int(raw)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        raise ValueError(
+            f"{GRACEFUL_SHUTDOWN_TIMEOUT_ENV}={raw!r} is invalid: expected a "
+            "positive integer number of seconds")
+    return seconds
+
 
 _warned_unresolvable_thinking = False
 
@@ -2837,11 +2872,21 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
+        # Unless GRACEFUL_SHUTDOWN_TIMEOUT_ENV is set, uvicorn keeps its default
+        # and waits for every request handler during graceful shutdown.
+        config_kwargs = {}
+        shutdown_timeout = _graceful_shutdown_timeout_from_env()
+        if shutdown_timeout is not None:
+            config_kwargs["timeout_graceful_shutdown"] = shutdown_timeout
+            logger.info(f"{GRACEFUL_SHUTDOWN_TIMEOUT_ENV}={shutdown_timeout}: "
+                        "uvicorn graceful shutdown cancels request handlers "
+                        f"still running after {shutdown_timeout}s")
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                                **config_kwargs)
         server = uvicorn.Server(config)
 
         async def _register_after_serving():

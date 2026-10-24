@@ -35,19 +35,19 @@ from tensorrt_llm._torch.ugpu.layout import (
 )
 from tensorrt_llm._torch.ugpu.policy import (
     DISABLED_PLAN,
+    UGPU_WEIGHT_ONLY_OPS_ENV,
     LinearPartitionPlan,
     PartitionPlan,
     UgpuExecutionPlanner,
     UgpuPolicy,
+    build_ugpu_policy,
 )
 from tensorrt_llm._torch.utils import model_extra_attrs
 
 
 @pytest.fixture(autouse=True)
-def _enable_cutedsl_internal(monkeypatch):
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_INTERNAL_AVAILABLE", True
-    )
+def _enable_cutedsl_rubin_helpers(monkeypatch):
+    monkeypatch.setattr("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +134,38 @@ class TestUgpuPolicy:
     def test_custom_allowed_ops(self):
         policy = UgpuPolicy(allowed_ops=frozenset({"nvfp4_linear"}))
         assert "nvfp4_moe" not in policy.allowed_ops
+
+
+class TestBuildUgpuPolicy:
+    """enable_ugpu vs the weight-only TRTLLM_UGPU_WEIGHT_ONLY_OPS knob."""
+
+    def test_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv(UGPU_WEIGHT_ONLY_OPS_ENV, raising=False)
+        assert not build_ugpu_policy(False).enabled
+
+    def test_enable_ugpu_enables_every_op(self, monkeypatch):
+        monkeypatch.setenv(UGPU_WEIGHT_ONLY_OPS_ENV, "nvfp4_moe")
+        policy = build_ugpu_policy(True)
+        assert policy.enabled
+        assert policy.allowed_ops == UgpuPolicy().allowed_ops
+
+    def test_weight_only_ops(self, monkeypatch):
+        monkeypatch.setenv(UGPU_WEIGHT_ONLY_OPS_ENV, " nvfp4_moe ,")
+        policy = build_ugpu_policy(False)
+        assert policy.enabled
+        assert policy.allowed_ops == frozenset({"nvfp4_moe"})
+
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    def test_weight_only_moe_plan(self, mock_ugpu, monkeypatch):
+        monkeypatch.setenv(UGPU_WEIGHT_ONLY_OPS_ENV, "nvfp4_moe")
+        planner = UgpuExecutionPlanner(build_ugpu_policy(False))
+        assert planner.plan_moe(_FakeMoeQuantConfig(nvfp4=True)).enabled
+        assert not planner.plan_moe(None, dtype_activation=torch.bfloat16).enabled
+
+    def test_unknown_op_rejected(self, monkeypatch):
+        monkeypatch.setenv(UGPU_WEIGHT_ONLY_OPS_ENV, "nvfp4_moe,fp8_linear")
+        with pytest.raises(ValueError, match="fp8_linear"):
+            build_ugpu_policy(False)
 
 
 # ---------------------------------------------------------------------------
@@ -314,13 +346,13 @@ class TestUgpuExecutionPlanner:
 
     @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
-    def test_cutedsl_internal_unavailable_disables(self, mock_ugpu, monkeypatch):
+    def test_cutedsl_rubin_helpers_unavailable_disables(self, mock_ugpu, monkeypatch):
         monkeypatch.setattr(
-            "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_INTERNAL_AVAILABLE", False
+            "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", False
         )
         plan = self._plan()
         assert not plan.enabled
-        assert "internal" in plan.reason_if_disabled
+        assert "Rubin helpers" in plan.reason_if_disabled
 
     # --- Weight mode check ---
 
@@ -694,14 +726,14 @@ class TestUgpuMoePlanner:
         assert not plan.enabled
 
     @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
-    def test_moe_disabled_without_cutedsl_internal(self, mock_ugpu, monkeypatch):
+    def test_moe_disabled_without_cutedsl_rubin_helpers(self, mock_ugpu, monkeypatch):
         monkeypatch.setattr(
-            "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_INTERNAL_AVAILABLE", False
+            "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", False
         )
         planner = UgpuExecutionPlanner(UgpuPolicy(enabled=True))
         plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=True))
         assert not plan.enabled
-        assert "internal" in plan.reason_if_disabled
+        assert "Rubin helpers" in plan.reason_if_disabled
 
 
 class TestUgpuBf16BmmPlanner:

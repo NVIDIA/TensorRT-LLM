@@ -45,6 +45,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
@@ -268,6 +269,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
+        prompt_len = self._global_prompt_len(req)
+        prompt_blocks = (prompt_len + tpb - 1) // tpb
+        manager = self._kv_cache_manager
+        cp_size = getattr(manager, "_helix_cp_size", 1)
+        cp_rank = getattr(manager, "_helix_cp_rank", 0)
 
         is_gen_only = req.is_generation_only_request()
         cached_per_lg = (
@@ -276,8 +282,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(layer_groups)
         )
 
+        unified_draft = isinstance(manager, KVCacheManagerV2) and bool(manager.draft_layer_ids)
+        transfer_length = prompt_len if unified_draft else req.prompt_len
         token_range = None
-        if req.prompt_len > 0:
+        if transfer_length > 0:
             # end must match the trimmed block list below (ceil(prompt_len / tpb)
             # blocks). num_extra_kv_tokens slots (speculative decoding) are not
             # transferred. In the previously added support for ctx disabling
@@ -287,12 +295,29 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # TODO: the accuracy impact of not transferring num_extra_kv_tokens
             # on MTP and other speculative decoding paths is currently unclear;
             # revisit whether these extra KV slots need to be transferred.
-            token_range = TokenRange(start=0, end=req.prompt_len)
+            token_range = TokenRange(start=0, end=transfer_length)
 
         groups = []
         for idx, lg in enumerate(layer_groups):
             if isinstance(lg, MambaLayerGroup):
                 groups.append(np.array([], dtype=np.int64))
+                continue
+            if unified_draft:
+                # KVSlice carries a contiguous retained suffix in this protocol.
+                local_prompt_blocks = (
+                    prompt_blocks if lg.cp_as_tp else len(range(cp_rank, prompt_blocks, cp_size))
+                )
+                stale_end = 0
+                if lg.sliding_window_size is not None:
+                    stale_end = max(0, (prompt_len + 1 - lg.sliding_window_size) // tpb)
+                    if not lg.cp_as_tp:
+                        stale_end = len(range(cp_rank, stale_end, cp_size))
+                ordinals = adapter.get_block_ordinals(req, idx, lg)
+                pages = ordinals[stale_end:local_prompt_blocks]
+                if pages.size != local_prompt_blocks - stale_end or np.any(pages < 0):
+                    raise ValueError("Missing allocated prompt pages for unified draft KV transfer")
+                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
+                groups.append(pages[cache_skip:])
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
@@ -461,10 +486,69 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return beam0_block_ids
         return np.concatenate([beam0_block_ids, tail_block_ids])
 
-    @staticmethod
-    def _need_aux_transfer(req: LlmRequest) -> bool:
+    def _need_aux_transfer(self, req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
-        return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        return bool(getattr(self._kv_cache_manager, "draft_layer_ids", ())) or (
+            params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        )
+
+    def _global_prompt_len(self, req: LlmRequest) -> int:
+        if getattr(self._kv_cache_manager, "_has_cp_helix", False):
+            return req.total_input_len_cp
+        return req.prompt_len
+
+    def _validate_draft_history_range(self, req: LlmRequest, history: dict) -> None:
+        # Full-attention drafters can skip an oversized context store; rolling
+        # drafters retain their complete live suffix. Neither includes scratch.
+        window_size = history["layout"]["window_size"]
+        max_positions = self._kv_cache_manager.draft_max_position_embeddings
+        prompt_len = self._global_prompt_len(req)
+        expected_length = prompt_len
+        if window_size is not None:
+            if type(window_size) is not int or window_size <= 0:
+                raise ValueError("Invalid draft history window size")
+            expected_length = min(expected_length, window_size)
+        elif max_positions is not None and prompt_len > max_positions:
+            expected_length = min(history["valid_length"], max_positions)
+        if history["valid_length"] != expected_length or history["position"] != prompt_len:
+            raise ValueError(
+                "DSpark transfer requires valid draft history and sequence position "
+                f"covering the complete prompt ({prompt_len} tokens, "
+                f"{expected_length} retained)."
+            )
+
+    def _pack_draft_history(self, req: LlmRequest) -> None:
+        manager = getattr(self, "_kv_cache_manager", None)
+        if not getattr(manager, "draft_layer_ids", ()):
+            return
+        history = self._kv_cache_manager.export_draft_history(req.py_request_id)
+        self._validate_draft_history_range(req, history)
+        req.py_draft_transfer_history = history
+
+    def _restore_draft_history(self, req: LlmRequest) -> None:
+        history = getattr(req, "py_draft_transfer_history", None)
+        manager = getattr(self, "_kv_cache_manager", None)
+        has_draft = bool(getattr(manager, "draft_layer_ids", ()))
+        if history is None:
+            if has_draft:
+                raise ValueError(
+                    "Standalone DSpark generation requires draft history from a prefill worker "
+                    "with matching speculative configuration; draft history metadata is missing."
+                )
+            return
+        if not has_draft:
+            raise ValueError(
+                "Received standalone DSpark draft history without a manager-owned draft cache."
+            )
+        self._validate_draft_history_range(req, history)
+        # K/V already occupies receiver-local pages; restore only validity and position.
+        self._kv_cache_manager.restore_draft_history(req.py_request_id, history)
+
+    def _prepare_received_history(self, session: RxSessionBase, req: LlmRequest) -> None:
+        if self._need_aux_transfer(req):
+            self._apply_aux(session, req)
+        self._assert_disagg_history_declared(req)
+        self._restore_draft_history(req)
 
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
@@ -682,6 +766,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
+        params = req.py_disaggregated_params
+        if params is not None and params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
+            # Context-first tokens and usage already arrived in the context response.
+            session.unpack_draft_history(req)
+            return
         session.unpack_aux(req)
         first_gen_tokens = req.py_first_gen_tokens  # type: ignore[attr-defined]
         draft_tokens = req.py_draft_tokens
@@ -750,6 +839,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # the matching request while that partial dispatch drains.
         self._send_reqs[rid] = req
         try:
+            self._pack_draft_history(req)
             session.send(self._create_kv_slice(req))
             self._finalize_send(req, session)
         except Exception as exc:
@@ -796,9 +886,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if result == WaitResult.COMPLETED:
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor)
-                if self._need_aux_transfer(req):
-                    self._apply_aux(session, req)
-                self._assert_disagg_history_declared(req)
+                self._prepare_received_history(session, req)
                 self._rebuild_fp4_mla_disagg_imported_cache(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
                 completed = True
@@ -962,7 +1050,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             0 if need_progress else wait_num,
             block_all,
         )
-
         completed, failed, cancelled = [], [], []
         for rid in to_process:
             session = self._recv_sessions[rid]
@@ -1027,9 +1114,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req = self._recv_reqs[rid]
             completed_reqs[rid] = req
             try:
-                if self._need_aux_transfer(req):
-                    self._apply_aux(session, req)
-                self._assert_disagg_history_declared(req)
+                self._prepare_received_history(session, req)
                 self._rebuild_fp4_mla_disagg_imported_cache(req)
             except Exception as exc:
                 local_postprocess_failed.append(rid)

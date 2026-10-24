@@ -188,6 +188,10 @@ private:
     std::unique_ptr<StagingBufferManager> mStagingManager;
 };
 
+// Size of the host staging buffer used for two-hop GPU<->Disk copies. Defaults to 64 MB and can be
+// overridden with TLLM_KV_CACHE_MANAGER_V2_STAGING_BUFFER_SIZE_MB. It must be at least the largest slot.
+size_t stagingBufferSizeBytes();
+
 // ---------------------------------------------------------------------------
 // Module-level singleton (mirrors Python's _copy_engine global).
 // ---------------------------------------------------------------------------

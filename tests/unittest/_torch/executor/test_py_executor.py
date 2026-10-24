@@ -1667,6 +1667,11 @@ def _make_adp_request(
 
 
 class _StubADPExecutor:
+    @property
+    def _draft_gen_alloc_paired(self):
+        # PyExecutor.__init__: joint reuse or a decode-only draft mirror.
+        return self.enable_joint_kv_cache_reuse or self.decode_only_draft_paired
+
     def __init__(
         self,
         *,
@@ -1681,6 +1686,7 @@ class _StubADPExecutor:
         enable_scheduler_aware_adp_dummy=None,
         enable_non_overlap_adp_forward_intent=None,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
+        tp_size=2,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1711,12 +1717,16 @@ class _StubADPExecutor:
         self.inflight_req_ids = Mock()
         self._terminate_request = Mock()
         self._is_kv_manager_v2 = True
+        self.enable_joint_kv_cache_reuse = False
+        self.decode_only_draft_paired = False
         self._terminate_attention_dp_dummy_requests = types.MethodType(
             PyExecutor._terminate_attention_dp_dummy_requests, self
         )
 
         self.dist = Mock()
-        self.dist.tp_size = 1
+        # Peers are modeled through peer_forward_intent; tp_size only tells the
+        # executor whether attention DP has any peer at all.
+        self.dist.tp_size = tp_size
         self.dist.tp_allgather.side_effect = lambda value: [value]
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
 
@@ -1772,6 +1782,37 @@ def _run_pad(stub):
 
 def _run_update_role(stub, candidates):
     PyExecutor._update_adp_dummy_role(stub, candidates)
+
+
+@pytest.mark.parametrize("enable_non_overlap_adp_forward_intent", [False, True])
+def test_pad_dummy_is_context_on_context_only_fp4_mla_cache(enable_non_overlap_adp_forward_intent):
+    # A ctx-only FP4 MLA cache cannot run generation, so the pad dummy must be a
+    # context request even when the default/peer role would be generation.
+    stub = _StubADPExecutor(
+        enable_non_overlap_adp_forward_intent=enable_non_overlap_adp_forward_intent,
+        peer_forward_intent=_ADPForwardIntent.GENERATION,
+    )
+    stub.kv_cache_manager.fp4_mla_context_only_cache = True
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    call = stub.add_dummy_calls[0]
+    assert call["is_gen"] is False
+    assert call["token_nums"] == [1]
+    assert call["prepare_resource"] is False
+
+
+def test_pad_dummy_skipped_for_single_rank_attention_dp():
+    # tp1 attention DP (e.g. DWDP ctx workers) has no peer to keep in step.
+    stub = _StubADPExecutor(tp_size=1)
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert stub.active_requests == []
 
 
 def test_adp_dummy_role_set_to_ctx_on_context_only_request():
@@ -2211,6 +2252,100 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
 
+@pytest.mark.parametrize("allocated", [False, True])
+@pytest.mark.parametrize("joint_kv_reuse", [False, True])
+@pytest.mark.parametrize("can_queue", [False, True])
+def test_adp_context_dummy_scheduler_kv_rollback(allocated, joint_kv_reuse, can_queue):
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+    stub = _StubADPExecutor()
+    stub.enable_joint_kv_cache_reuse = joint_kv_reuse
+    dummy = _make_adp_request(
+        LlmRequestState.CONTEXT_INIT,
+        request_id=ATTENTION_DP_DUMMY_REQUEST_ID,
+        is_dummy_request=True,
+    )
+    dummy.is_attention_dp_dummy = True
+    dummy.py_adp_dummy_resources_prepared = False
+    stub.active_requests = [dummy]
+    stub._pending_adp_dummy_request = dummy
+    spec_manager = Mock()
+    stub.resource_manager.get_resource_manager.return_value = spec_manager
+
+    # Model the interval after V2 scheduling and before prepare_resources():
+    # context KV may exist, but no sequence slot or speculative state does.
+    managers = [stub.kv_cache_manager]
+    if joint_kv_reuse:
+        stub.draft_kv_cache_manager = Mock()
+        managers.append(stub.draft_kv_cache_manager)
+    caches = []
+    for manager in managers:
+        cache = Mock()
+        caches.append(cache)
+        manager.conversation_manager = None
+        manager.kv_cache_map = {dummy.py_request_id: cache} if allocated else {}
+        manager._allocated_draft_lens = {}
+        manager._pending_overlap_slack = {}
+        manager._early_freed_index_requests = set()
+        manager.free_resources.side_effect = types.MethodType(
+            KVCacheManagerV2.free_resources, manager
+        )
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
+
+    assert stub._pending_adp_dummy_request is None
+    assert stub.active_requests == ([dummy] if can_queue else [])
+    stub._terminate_request.assert_not_called()
+    spec_manager.free_resources.assert_not_called()
+    for manager, cache in zip(managers, caches):
+        if can_queue:
+            manager.free_resources.assert_not_called()
+            assert (dummy.py_request_id in manager.kv_cache_map) == allocated
+        else:
+            manager.free_resources.assert_called_once_with(dummy)
+            assert dummy.py_request_id not in manager.kv_cache_map
+        if allocated and not can_queue:
+            cache.close.assert_called_once_with()
+            manager.index_mapper.remove_sequence.assert_called_once_with(dummy.py_request_id)
+        else:
+            cache.close.assert_not_called()
+            manager.index_mapper.remove_sequence.assert_not_called()
+
+    if not can_queue:
+        # The next empty scheduled batch must be able to allocate ID 0 again.
+        original_add_dummy = stub.kv_cache_manager.add_dummy_requests.side_effect
+
+        def allocate_retry(**kwargs):
+            request_id = kwargs["request_ids"][0]
+            assert request_id not in stub.kv_cache_manager.kv_cache_map
+            stub.kv_cache_manager.kv_cache_map[request_id] = Mock()
+            return original_add_dummy(**kwargs)
+
+        stub.kv_cache_manager.add_dummy_requests.side_effect = allocate_retry
+        stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
+        scheduled_batch = ScheduledRequests()
+        _run_pad_empty(stub, scheduled_batch)
+        assert scheduled_batch.batch_size == 1
+        assert scheduled_batch.generation_requests[0].py_request_id == dummy.py_request_id
+
+
+def test_adp_context_dummy_v1_rollback_before_prepare():
+    stub = _StubADPExecutor()
+    stub._is_kv_manager_v2 = False
+    dummy = _make_adp_request(LlmRequestState.CONTEXT_INIT, is_dummy_request=True)
+    dummy.py_adp_dummy_resources_prepared = False
+    stub.active_requests = [dummy]
+    stub._pending_adp_dummy_request = dummy
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue=False)
+
+    assert stub.active_requests == []
+    assert stub._pending_adp_dummy_request is None
+    stub.kv_cache_manager.free_resources.assert_not_called()
+    stub.resource_manager.get_resource_manager.assert_not_called()
+    stub._terminate_request.assert_not_called()
+
+
 def test_adp_dummy_rollback_only_frees_pending_candidate():
     stub = _StubADPExecutor()
     prior_dummy = _make_adp_request(
@@ -2551,6 +2686,39 @@ def test_pad_empty_batch_no_op_when_batch_is_not_empty():
 
     assert stub.add_dummy_calls == []
     assert scheduled_batch.generation_requests == []
+
+
+def test_pad_empty_batch_no_op_for_single_rank_attention_dp():
+    stub, scheduled_batch = _unfittable_rank(tp_size=1)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.batch_size == 0
+
+
+@pytest.mark.parametrize("is_kv_manager_v2", [True, False])
+def test_pad_empty_batch_adds_context_dummy_on_context_only_fp4_mla_cache(is_kv_manager_v2):
+    # A context-only FP4 MLA cache has no generation V cache.
+    stub, scheduled_batch = _unfittable_rank()
+    stub._is_kv_manager_v2 = is_kv_manager_v2
+    stub.kv_cache_manager.fp4_mla_context_only_cache = True
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert len(stub.add_dummy_calls) == 1
+    call = stub.add_dummy_calls[0]
+    assert call["is_gen"] is False
+    assert call["token_nums"] == [1]
+    # Scheduling has already run, so only V2 needs the cache created here; V1
+    # allocates context requests in prepare_resources().
+    assert call["prepare_resource"] is is_kv_manager_v2
+    assert scheduled_batch.generation_requests == []
+    assert len(scheduled_batch.context_requests_last_chunk) == 1
+    dummy = scheduled_batch.context_requests_last_chunk[0]
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy.py_adp_dummy_resources_prepared is False
+    assert stub._pending_adp_dummy_request is dummy
 
 
 def test_pad_empty_batch_no_op_when_attention_dp_disabled():
@@ -3307,3 +3475,142 @@ class TestAdpBalanceExcludesPadDummies:
         gathered = executor.dist.tp_allgather_int64.call_args[0][0]
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
+
+
+@pytest.mark.parametrize("post_schedule", [False, True])
+@pytest.mark.parametrize("pairing", ["unpaired", "joint", "decode_only"])
+def test_adp_generation_dummy_allocates_paired_draft_before_scheduling(post_schedule, pairing):
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    paired = pairing != "unpaired"
+    stub = _StubADPExecutor()
+    stub.enable_joint_kv_cache_reuse = pairing == "joint"
+    stub.decode_only_draft_paired = pairing == "decode_only"
+    stub.draft_kv_cache_manager = Mock()
+    target_caches = set()
+    draft_caches = set()
+    original_add = stub.kv_cache_manager.add_dummy_requests.side_effect
+
+    def allocate_dummy(**kwargs):
+        requests = original_add(**kwargs)
+        target_caches.update(req.py_request_id for req in requests)
+        if kwargs.get("draft_kv_cache_manager") is stub.draft_kv_cache_manager:
+            draft_caches.update(req.py_request_id for req in requests)
+        return requests
+
+    stub.kv_cache_manager.add_dummy_requests.side_effect = allocate_dummy
+    stub.kv_cache_manager.try_allocate_generation.side_effect = (
+        lambda req: req.py_request_id in target_caches
+    )
+    stub.draft_kv_cache_manager.try_allocate_generation.side_effect = (
+        lambda req: req.py_request_id in draft_caches
+    )
+    if post_schedule:
+        stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
+        _run_pad_empty(stub, ScheduledRequests())
+    else:
+        _run_pad(stub)
+    dummy = stub._pending_adp_dummy_request
+    scheduler = types.SimpleNamespace(
+        kv_cache_manager=stub.kv_cache_manager,
+        _gen_alloc_draft_manager=stub.draft_kv_cache_manager if paired else None,
+    )
+
+    assert KVCacheV2Scheduler._try_allocate_generation(scheduler, dummy)
+    assert bool(draft_caches) is paired
+    stub.kv_cache_manager.revert_allocate_generation.assert_not_called()
+
+
+@pytest.mark.parametrize("post_schedule", [False, True])
+@pytest.mark.parametrize("spec_slots_exhausted", [False, True])
+@pytest.mark.parametrize("pairing", ["joint", "decode_only"])
+def test_adp_generation_dummy_releases_paired_draft_on_early_exit(
+    pairing, post_schedule, spec_slots_exhausted
+):
+    stub = _StubADPExecutor()
+    stub.enable_joint_kv_cache_reuse = pairing == "joint"
+    stub.decode_only_draft_paired = pairing == "decode_only"
+    stub.draft_kv_cache_manager = Mock()
+    spec_manager = Mock()
+    stub.resource_manager.get_resource_manager.return_value = spec_manager
+    if spec_slots_exhausted:
+        spec_manager.add_dummy_requests.side_effect = NoFreeSlotsError("No free slots")
+    if post_schedule:
+        stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
+        _run_pad_empty(stub, ScheduledRequests())
+    else:
+        _run_pad(stub)
+    if not spec_slots_exhausted:
+        PyExecutor._finalize_adp_dummy_allocation(stub, can_queue=False)
+
+    stub.kv_cache_manager.free_resources.assert_called_once()
+    stub.draft_kv_cache_manager.free_resources.assert_called_once_with(
+        stub.kv_cache_manager.free_resources.call_args.args[0]
+    )
+    assert stub._pending_adp_dummy_request is None
+    assert not any(req.is_attention_dp_dummy for req in stub.active_requests)
+
+
+def test_adp_context_dummy_keeps_joint_draft_allocation_deferred():
+    stub = _StubADPExecutor(peer_forward_intent=_ADPForwardIntent.CONTEXT)
+    stub.enable_joint_kv_cache_reuse = True
+    stub.draft_kv_cache_manager = Mock()
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls[0]["prepare_resource"] is False
+    assert stub.add_dummy_calls[0].get("draft_kv_cache_manager") is None
+
+
+@pytest.mark.parametrize("post_schedule", [False, True])
+def test_adp_generation_dummy_repeated_peer_veto_does_not_leak(post_schedule):
+    stub = _StubADPExecutor()
+    stub.enable_joint_kv_cache_reuse = True
+    stub.draft_kv_cache_manager = Mock()
+    target_caches = set()
+    draft_caches = set()
+    original_add = stub.kv_cache_manager.add_dummy_requests.side_effect
+
+    def allocate_dummy(**kwargs):
+        assert not target_caches
+        assert not draft_caches
+        requests = original_add(**kwargs)
+        target_caches.update(req.py_request_id for req in requests)
+        manager = kwargs.get("draft_kv_cache_manager")
+        if manager is not None:
+            draft_caches.update(req.py_request_id for req in requests)
+        return requests
+
+    stub.kv_cache_manager.add_dummy_requests.side_effect = allocate_dummy
+    stub.kv_cache_manager.free_resources.side_effect = lambda req: target_caches.discard(
+        req.py_request_id
+    )
+    stub.draft_kv_cache_manager.free_resources.side_effect = lambda req: draft_caches.discard(
+        req.py_request_id
+    )
+    for _ in range(100):
+        if post_schedule:
+            stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
+            _run_pad_empty(stub, ScheduledRequests())
+        else:
+            _run_pad(stub)
+        assert target_caches == draft_caches == {ATTENTION_DP_DUMMY_REQUEST_ID}
+        PyExecutor._finalize_adp_dummy_allocation(stub, can_queue=False)
+        assert target_caches == draft_caches == set()
+        assert stub._pending_adp_dummy_request is None
+
+
+@pytest.mark.parametrize("enable_fixes", [False, True])
+def test_adp_generation_dummy_joint_cache_normal_termination(enable_fixes):
+    stub = _StubADPExecutor(enable_adp_dummy_fixes=enable_fixes)
+    stub.enable_joint_kv_cache_reuse = True
+    stub.draft_kv_cache_manager = Mock()
+
+    _run_pad(stub)
+    dummy = stub.active_requests[-1]
+    assert stub.add_dummy_calls[0]["draft_kv_cache_manager"] is stub.draft_kv_cache_manager
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue=True)
+    PyExecutor._terminate_attention_dp_dummy_requests(stub)
+
+    stub._terminate_request.assert_called_once_with(dummy)
+    assert stub.active_requests == []

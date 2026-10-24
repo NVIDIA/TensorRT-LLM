@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import inspect
@@ -11,23 +14,29 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.model_config
+import tensorrt_llm._torch.pyexecutor.config_utils
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
+from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+from tensorrt_llm._torch.pyexecutor._util import _mamba_conv_layout_kwargs, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
+    extract_mamba_kv_cache_params,
+    get_kimi_linear_layer_masks,
     get_qwen3_hybrid_layer_masks,
+    is_hybrid_linear,
+    is_kimi_linear,
     is_mla,
     is_nemotron_hybrid,
     is_qwen3_hybrid,
     load_pretrained_config,
+    unwrap_kimi_text_config,
 )
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
     _construct_checkpoint_loader,
@@ -38,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm._utils import local_mpi_size, mpi_rank, mpi_world_size, torch_dtype_to_binding
 from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
     KvCacheConfig,
     MoeConfig,
     MTPDecodingConfig,
@@ -415,18 +425,19 @@ class Runner:
         num_mtp_layers: Optional[int] = None,
         use_cute_dsl_bf16_gemm: bool = False,
         use_cute_dsl_bf16_bmm: bool = False,
-    ):
+        spec_config: Optional[DecodingBaseConfig] = None,
+        vision_config: Optional[str] = None,
+    ) -> None:
         super().__init__()
 
         checkpoint_loader = _construct_checkpoint_loader("pytorch", None, "HF")
-        spec_config = (
-            MTPDecodingConfig(
+        if num_mtp_layers:
+            if spec_config is not None:
+                raise ValueError("Pass either num_mtp_layers or spec_config, not both.")
+            spec_config = MTPDecodingConfig(
                 num_nextn_predict_layers=num_mtp_layers,
                 use_mtp_vanilla=True,
             )
-            if num_mtp_layers
-            else None
-        )
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
@@ -441,6 +452,9 @@ class Runner:
             moe_cluster_parallel_size=mapping.moe_cluster_size,
             enable_attention_dp=mapping.enable_attention_dp,
             gpus_per_node=mapping.gpus_per_node,
+            # `ModelLoader(spec_config=...)` below is what reaches
+            # `model_config.spec_config`; this keeps `llm_args` consistent with it.
+            **({"speculative_config": spec_config} if spec_config is not None else {}),
             **{} if use_cuda_graph else {"cuda_graph_config": None},
             moe_config=MoeConfig(
                 backend=moe_backend,
@@ -472,12 +486,24 @@ class Runner:
             max_seq_len=max_seq_len,
         )
 
-        with self.scaled_from_ctx(scaled_from, mapping), self.skip_unused_layers_ctx(layer_indices):
+        with (
+            self.scaled_from_ctx(scaled_from, mapping),
+            self.vision_config_ctx(vision_config),
+            self.skip_unused_layers_ctx(layer_indices),
+        ):
             model, _ = model_loader.load(
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
 
         num_hidden_layers = model.model_config.pretrained_config.num_hidden_layers
+        finalize_weight_load = getattr(model, "_finalize_weight_load", None)
+        if load_format == "DUMMY" and finalize_weight_load is not None:
+            # Models that build decode fast-path constants at the end of
+            # `load_weights` never get them under DUMMY, and then silently run a
+            # reference path instead (Kimi K3's KDA decode: glue around a short
+            # kernel). Run the hook so DUMMY measures the same
+            # kernels as a real load. The arguments only feed a log line.
+            finalize_weight_load(0, 0)
 
         def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
             # TODO: to be more general, we should call DecoderModel.forward
@@ -513,11 +539,70 @@ class Runner:
                         )
             return hidden_states, residual
 
-        model.forward = forward
+        def forward_block_residual(
+            position_ids: torch.Tensor,
+            hidden_states: torch.Tensor,
+            attn_metadata,
+            residual: torch.Tensor,
+            num_snapshots: int = 0,
+            **kwargs,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Kimi K3 layers take a preallocated snapshot bank plus the count of
+            # valid rows, and no `position_ids` -- MLA derives RoPE positions from
+            # `attn_metadata`. `create_run_pack` passes the bank through the
+            # `residual` slot and seeds the count for a mid-model slice.
+            block_residual = residual
+            for layer_idx in layer_indices:
+                layer = model.model.layers[layer_idx]
+                hidden_states, num_snapshots = layer(
+                    hidden_states, block_residual, num_snapshots, attn_metadata
+                )
+            return hidden_states, block_residual
+
+        # Layers carrying a snapshot stack take `block_residual` where the generic
+        # ones take `residual`, and derive positions from `attn_metadata`.
+        first_layer = model.model.layers[layer_indices[0]]
+        if "block_residual" in inspect.signature(first_layer.forward).parameters:
+            model.forward = forward_block_residual
+        else:
+            model.forward = forward
 
         self.model_config = model.model_config
         self.model = model
         self.layer_indices = layer_indices
+
+    @staticmethod
+    @contextlib.contextmanager
+    def vision_config_ctx(vision_config: Optional[str]):
+        """Pick which config a composite multimodal checkpoint resolves to.
+
+        A checkpoint shipping `vision_config` beside `text_config` is kept composite
+        by config loading and resolved to a `*ForConditionalGeneration` wrapper so
+        the vision tower stays available; the text-only path is the fallback for
+        checkpoints without one. This harness profiles text decoder layers, so the
+        default drops the tower and uses the inner text config, which already names
+        its own architecture. Keyed on `vision_config` rather than a model check
+        because the same condition gates every such route.
+        """
+        if vision_config != "none":
+            yield
+            return
+
+        model_config_module = tensorrt_llm._torch.model_config
+        load_pretrained_config_orig = model_config_module.load_pretrained_config
+
+        def load_pretrained_config_text_only(*args, **kwargs):
+            config = load_pretrained_config_orig(*args, **kwargs)
+            text_config = getattr(config, "text_config", None)
+            if getattr(config, "vision_config", None) is not None and text_config is not None:
+                return text_config
+            return config
+
+        model_config_module.load_pretrained_config = load_pretrained_config_text_only
+        try:
+            yield
+        finally:
+            model_config_module.load_pretrained_config = load_pretrained_config_orig
 
     @staticmethod
     @contextlib.contextmanager
@@ -530,7 +615,6 @@ class Runner:
             # To run the problem size of $B$ GPUs on $A$ GPUs, we need:
             # (1) Attention: If TP, reduce the number of attention heads; If DP, nothing to change.
             # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
-            #     Maintain the result of AllToAll method selection because it is affected by EP size.
             def load_pretrained_config(*args, **kwargs):
                 pretrained_config = load_pretrained_config_orig(*args, **kwargs)
                 if not mapping.enable_attention_dp:
@@ -551,33 +635,13 @@ class Runner:
 
             return load_pretrained_config
 
-        def make_select_alltoall_method_type(select_alltoall_method_type_orig):
-            def select_alltoall_method_type(
-                cls: type, mapping: Mapping, top_k: int, *args, **kwargs
-            ):
-                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
-                # by replacing `top_k` with `fake_top_k`
-                if scaled_from <= top_k:
-                    fake_top_k = mapping.moe_ep_size + 1
-                else:
-                    fake_top_k = mapping.moe_ep_size - 1
-                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
-                return select_alltoall_method_type_orig(mapping, fake_top_k, *args, **kwargs)
-
-            return select_alltoall_method_type
-
-        select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
         tensorrt_llm._torch.model_config.load_pretrained_config = make_load_pretrained_config(
             mapping, load_pretrained_config
-        )
-        WideEPMoE.select_alltoall_method_type = make_select_alltoall_method_type(
-            select_alltoall_method_type_wide_ep
         )
         try:
             yield
         finally:
             tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
-            WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
     @contextlib.contextmanager
@@ -593,7 +657,14 @@ class Runner:
             num_hidden_layers = model.model_config.pretrained_config.num_hidden_layers
             has_mtp_layers = any(idx >= num_hidden_layers for idx in layer_indices)
             if hasattr(model.model, "embed_tokens") and not has_mtp_layers:
-                skip_forward(model.model.embed_tokens)
+                embed_tokens = model.model.embed_tokens
+                if hasattr(embed_tokens, "skip_forward"):
+                    skip_forward(embed_tokens)
+                else:
+                    # Plain `nn.Embedding` (Kimi K3): no `skip_forward` to swap in,
+                    # but `model.forward` never reaches it, so dropping the
+                    # weights is enough and saves vocab_size * hidden_size bytes.
+                    remove_weights(embed_tokens)
             total_layers = len(model.model.layers)
             for layer_idx in range(total_layers):
                 layer = model.model.layers[layer_idx]
@@ -636,7 +707,6 @@ class Runner:
         kv_cache_manager: KVCacheManager,
         attn_workspace: Optional[torch.Tensor] = None,
     ):
-        world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
         sparse_attention_config = self.model_config.sparse_attention_config
         sparse_params = (
@@ -678,7 +748,11 @@ class Runner:
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
         )
-        attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
+        # One entry per attention-DP rank, not per world rank: the non-DP MoE path
+        # asserts len(all_rank_num_tokens) == 1.
+        attn_metadata.all_rank_num_tokens = [
+            batch_size * seq_len_q
+        ] * self.model_config.mapping.dp_size
         # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
         # serving the executor announces that via update_spec_dec_param(), the only
         # place max_draft_tokens is set. Without it the DSA indexer's context_lens
@@ -690,7 +764,11 @@ class Runner:
         # base sets max_total_draft_tokens unconditionally -- which reaches the
         # attention op cache key and FMHA kernel selection. kv_lens_cuda_2d exists
         # only on DSA metadata, which is the backend that needs this.
-        if run_type == "GEN" and seq_len_q > 1 and hasattr(attn_metadata, "kv_lens_cuda_2d"):
+        # FP4 MLA caches size their Q buffers from max_total_draft_tokens too.
+        needs_spec_shape = hasattr(attn_metadata, "kv_lens_cuda_2d") or callable(
+            getattr(kv_cache_manager, "_fp4_mla_compact_layer_idx", None)
+        )
+        if run_type == "GEN" and seq_len_q > 1 and needs_spec_shape:
             attn_metadata.update_spec_dec_param(
                 batch_size=batch_size,
                 is_spec_decoding_enabled=False,
@@ -714,7 +792,44 @@ class Runner:
         )
         kwargs = {}
 
-        # DeepSeek-V4 MHC layers use a 3D initial state and require input IDs.
+        # Fail here rather than deep inside the model's verify path, which reads
+        # buffers the cache manager only allocates for a speculative config.
+        if (
+            run_type == "GEN"
+            and seq_len_q > 1
+            and getattr(kv_cache_manager, "is_speculative", None) is not None
+            and not kv_cache_manager.is_speculative()
+        ):
+            raise ValueError(
+                f"seq_len_q {seq_len_q} needs --spec-max-draft-len {seq_len_q - 1}:"
+                " multi-token verify reads speculative recurrent-state buffers"
+            )
+
+        # An attn-residual model (Kimi K3) carries a
+        # [num_snapshots, num_tokens, hidden_size] stack instead of a residual
+        # tensor, pushing one snapshot every `attn_res_block_size` layers. A slice
+        # starting at `layer_indices[0]` inherits `ceil(that / block_size)` of them;
+        # since the mixing cost scales with the depth, a slice started mid-model
+        # must not begin from an empty stack.
+        attn_res_block_size = getattr(
+            unwrap_kimi_text_config(pretrained_config), "attn_res_block_size", None
+        )
+        if attn_res_block_size is not None:
+            # The bank is preallocated at full-model capacity and `num_snapshots`
+            # counts the valid rows, so a slice starting at `layer_indices[0]`
+            # inherits `ceil(that / block_size)` of them. The mixing cost scales
+            # with the count, so a mid-model slice must not start from zero.
+            kwargs["num_snapshots"] = ceil_div(self.layer_indices[0], attn_res_block_size)
+            residual = torch.rand(
+                (self.model.model.num_attn_res_snapshots, batch_size * seq_len_q, hidden_size),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+
+        # DeepSeek-V4 (multi-head hyper-connection) decoder layers take the initial residual
+        # as ``hc_state`` shaped ``[num_tokens, hc_mult, hidden_size]`` (not a 2D hidden-states
+        # tensor), and their MoE routing requires ``input_ids``. Both are absent from the
+        # generic single-layer harness, so synthesize them when the model exposes ``hc_mult``.
         hc_mult = getattr(pretrained_config, "hc_mult", None)
         if hc_mult is not None:
             hidden_states = hidden_states.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
@@ -787,6 +902,10 @@ class Runner:
                     moe_modules.append(layer.mixer.experts)
             elif layer.__class__.__name__ in ["GatedMLP"]:
                 pass
+            elif (block_sparse_moe := getattr(layer, "block_sparse_moe", None)) is not None:
+                # Latent-MoE layout (Kimi K3): the routed experts sit behind the
+                # block, and layers below `first_k_dense_replace` are dense.
+                moe_modules.append(block_sparse_moe.routed_experts)
             elif not hasattr(layer.mlp, "experts"):
                 pass
             else:
@@ -850,9 +969,15 @@ class Runner:
         mamba_ssm_cache_dtype,
         layer_indices,
         num_mtp_layers=None,
-    ):
+        kv_pool_headroom: Optional[int] = None,
+        enable_swa_scratch_reuse=False,
+        spec_config: Optional[DecodingBaseConfig] = None,
+        vision_config: Optional[str] = None,
+        use_kv_cache_manager_v2: bool = True,
+    ) -> KVCacheManager:
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
-        model_config = ModelConfig.from_pretrained(pretrained_model_name_or_path)
+        with Runner.vision_config_ctx(vision_config):
+            model_config = ModelConfig.from_pretrained(pretrained_model_name_or_path)
         validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
         validate_and_set_mamba_ssm_cache_dtype(model_config, mamba_ssm_cache_dtype)
         if model_config.enable_flash_mla:
@@ -860,9 +985,30 @@ class Runner:
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
+        if is_kimi_linear(config):
+            if not use_kv_cache_manager_v2:
+                raise ValueError("Kimi K3 layer-wise benchmarks require KV cache manager V2.")
+            if kv_pool_headroom is None:
+                # KDA state and the MLA latent cache share one byte quota.
+                full_mask, mamba_mask = get_kimi_linear_layer_masks(config)
+                has_mla = any(full_mask[i] for i in layer_indices)
+                has_kda = any(mamba_mask[i] for i in layer_indices)
+                kv_pool_headroom = 2 if has_mla and has_kda else 1
+        if kv_pool_headroom is None:
+            kv_pool_headroom = 1
+        # Reserve one token of headroom before rounding to a block boundary.
+        # kv_pool_headroom oversizes max_tokens when the manager splits it across
+        # several pools. DeepSeek-V4 needs 3; the default 1 keeps every other model
+        # on its previous allocation.
         kv_cache_config = KvCacheConfig(
-            max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
+            max_tokens=kv_pool_headroom
+            * max_batch_size
+            * round_up(max_seq_len + 1, tokens_per_block),
             enable_block_reuse=False,
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            # Every dummy request uses max_seq_len tokens, so this is the actual average.
+            avg_seq_len=max_seq_len,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
@@ -870,7 +1016,9 @@ class Runner:
             "NVFP4": tensorrt_llm.bindings.DataType.NVFP4,
             None: torch_dtype_to_binding(config.torch_dtype),
         }[model_config.quant_config.kv_cache_quant_algo]
-        if is_mla(config):
+        # Hybrids below also carry MLA fields, but only some of their layers
+        # are MLA, so the pure-MLA route must exclude them.
+        if is_mla(config) and not is_hybrid_linear(config):
             total_layers = config.num_hidden_layers + (num_mtp_layers or 0)
             layer_mask = [i in layer_indices for i in range(total_layers)]
             num_layers = sum(layer_mask)
@@ -891,6 +1039,69 @@ class Runner:
                 vocab_size=config.vocab_size,
                 sparse_attention_config=model_config.sparse_attention_config,
                 pretrained_config=model_config.pretrained_config,
+            )
+        elif is_kimi_linear(config):
+            # Needs its own branch: neither pure-MLA nor pure-mamba fits. KDA
+            # recurrent/conv state goes on the mamba side and the MLA latent cache
+            # on the paged-KV side. Mirrors `_util._create_kv_cache_manager`.
+            # spec_config=None: it only feeds `num_draft_layers`, and the masks
+            # below come from `layer_indices` instead.
+            mamba_params = extract_mamba_kv_cache_params(
+                config, spec_config=None, quant_config=model_config.quant_config
+            )
+            # Dimensions live on the inner config for a composite checkpoint.
+            text_config = unwrap_kimi_text_config(config)
+            full_layer_mask, full_mamba_layer_mask = get_kimi_linear_layer_masks(config)
+            layer_mask = [
+                full_layer_mask[i] and i in layer_indices
+                for i in range(text_config.num_hidden_layers)
+            ]
+            mamba_layer_mask = [
+                full_mamba_layer_mask[i] and i in layer_indices
+                for i in range(text_config.num_hidden_layers)
+            ]
+            assert issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2), kv_cache_manager_cls
+            kimi_extra_kwargs = {}
+            if any(layer_mask):
+                # V2 managers derive the NVFP4 MLA cache layout from pretrained_config,
+                # and that layout rejects a window without MLA layers.
+                kimi_extra_kwargs["pretrained_config"] = text_config
+            if spec_config is not None:
+                # Multi-token verify reads per-slot replay caches when the fused
+                # kernel is available, else the legacy per-step buffers.
+                from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
+                    is_kda_mtp_verify_available,
+                )
+
+                if is_kda_mtp_verify_available():
+                    kimi_extra_kwargs["kda_replay_num_spec"] = spec_config.tokens_per_gen_step - 1
+            kv_cache_manager = kv_cache_manager_cls(
+                # mamba (KDA) cache parameters
+                mamba_params.state_size,
+                mamba_params.conv_kernel,
+                mamba_params.num_heads,
+                mamba_params.n_groups,
+                mamba_params.head_dim,
+                sum(mamba_layer_mask),
+                mamba_layer_mask,
+                mamba_params.dtype,
+                mamba_params.mamba_ssm_cache_dtype,
+                # kv cache parameters (MLA latent cache)
+                kv_cache_config,
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+                num_layers=sum(layer_mask),
+                layer_mask=layer_mask,
+                num_kv_heads=1,
+                head_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=mapping,
+                dtype=kv_cache_dtype,
+                spec_config=spec_config,
+                # KDA conv state is [Q | K | V]: the qwen3_next section layout.
+                **_mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"),
+                **kimi_extra_kwargs,
             )
         elif is_nemotron_hybrid(config):
             mamba_layer_mask = [
@@ -966,9 +1177,35 @@ class Runner:
             )
         else:
             raise NotImplementedError("Unsupported config")
-        kv_cache_manager.add_dummy_requests(
-            list(range(max_batch_size)), token_nums=[max_seq_len] * max_batch_size
-        )
+        # is_gen regardless of --run-type: these dummies only reserve blocks. The
+        # measured step takes its shape from the attn_metadata built in forward(),
+        # which sets num_contexts and prompt_lens per run type.
+        # The prefill pass below writes the history itself, so ask for materialized
+        # blocks where the manager takes the argument. Checked by signature, not by
+        # class: MambaHybridCacheManagerV2 subclasses KVCacheManagerV2 but overrides
+        # add_dummy_requests without this parameter.
+        add_dummy_kwargs = {}
+        if (
+            "materialize_history"
+            in inspect.signature(kv_cache_manager.add_dummy_requests).parameters
+        ):
+            add_dummy_kwargs["materialize_history"] = True
+        # add_dummy_requests returns None only after releasing every request it had
+        # registered, so a later lookup fails far from the cause.
+        if (
+            kv_cache_manager.add_dummy_requests(
+                list(range(max_batch_size)),
+                token_nums=[max_seq_len] * max_batch_size,
+                is_gen=True,
+                **add_dummy_kwargs,
+            )
+            is None
+        ):
+            raise RuntimeError(
+                f"add_dummy_requests could not allocate KV cache for {max_batch_size} "
+                f"dummy requests of {max_seq_len} tokens. Raise KvCacheConfig.max_tokens "
+                f"above {kv_cache_config.max_tokens}, or lower max_batch_size / max_seq_len."
+            )
         return kv_cache_manager
 
     @staticmethod

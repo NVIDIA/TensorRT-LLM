@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for ADP (Attention Data Parallelism) abstractions.
 
 Tests for:
@@ -1259,6 +1262,59 @@ class TestConversationAwareADPRouter:
         assert pos[2] != home
         # ...but the mapping is unchanged so it can return home later.
         assert router._conv_to_rank["A"] == home
+
+    def test_home_rank_disabled_by_default(self):
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2))
+        self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
+        assert router.home_rank(_make_conv_request_item(2, "A")) is None
+
+    def test_wait_for_home_rank_holds_turn_in_queue(self, monkeypatch):
+        """With TLLM_ADP_CONV_WAIT_HOME_RANK=1 a returning turn whose home rank is
+        full stays in the waiting queue (instead of overflowing off home), while
+        turns for other ranks and new conversations are still admitted."""
+        monkeypatch.setenv("TLLM_ADP_CONV_WAIT_HOME_RANK", "1")
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2))
+        self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
+        self._route(router, self._states(2), [_make_conv_request_item(2, "B")])
+        home_a, home_b = router._conv_to_rank["A"], router._conv_to_rank["B"]
+        assert home_a != home_b
+        active = [0, 0]
+        active[home_a] = 5
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.extend(
+            [
+                _make_conv_request_item(3, "A"),
+                _make_conv_request_item(4, "B"),
+                _make_conv_request_item(5, "C"),
+            ]
+        )
+        admitted = get_from_waiting_queue(
+            waiting_queue, 10, True, 5, active, home_rank_fn=router.home_rank
+        )
+        assert [it.id for it in admitted] == [4, 5]
+        assert [it.id for it in waiting_queue] == [3]
+        pos = self._route(router, self._states(2, active), admitted, cap=5)
+        assert pos[4] == home_b
+        assert router._conv_to_rank["A"] == home_a
+
+    def test_wait_for_home_rank_routes_returning_turns_first(self, monkeypatch):
+        """A new conversation must not take the slot reserved for a returning turn."""
+        monkeypatch.setenv("TLLM_ADP_CONV_WAIT_HOME_RANK", "1")
+        router = ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=2), new_conv_placement="least_queued"
+        )
+        self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
+        home = router._conv_to_rank["A"]
+        active = [4, 4]
+        # One free slot per rank; the new conversation comes first in queue order.
+        pos = self._route(
+            router,
+            self._states(2, active),
+            [_make_conv_request_item(2, "NEW"), _make_conv_request_item(3, "A")],
+            cap=5,
+        )
+        assert pos[3] == home
+        assert pos[2] != home
 
     def test_create_rank_state(self):
         router = ConversationAwareADPRouter(dist=_mock_dist(tp_rank=2))

@@ -57,10 +57,7 @@ def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, fl
     ],
 )
 @torch.no_grad()
-def test_fused_attn_res_matches_torch_reference(
-    num_tokens: int, num_snapshots: int, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("KIMI_K3_ATTN_RES_CHUNKED_FUSION", "1")
+def test_fused_attn_res_matches_torch_reference(num_tokens: int, num_snapshots: int) -> None:
     torch.manual_seed(0)
     projection = nn.Linear(HIDDEN_SIZE, 1, bias=False, dtype=torch.bfloat16, device="cuda")
     norm = KimiK3RMSNorm(HIDDEN_SIZE, eps=RMS_EPS).to(device="cuda", dtype=torch.bfloat16)
@@ -95,12 +92,6 @@ def test_fused_attn_res_matches_torch_reference(
     cosine, relative_l2 = _similarity(actual, expected)
     assert cosine > 0.999
     assert relative_l2 < 3e-2
-    monkeypatch.setenv("KIMI_K3_ATTN_RES_CHUNKED_FUSION", "0")
-    disabled = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
-    if num_tokens > 16384:
-        assert disabled is None
-    else:
-        assert torch.equal(disabled, actual)
 
 
 class _AddConstant(nn.Module):

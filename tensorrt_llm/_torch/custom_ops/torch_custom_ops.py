@@ -36,7 +36,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
-                              IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
 
@@ -55,7 +55,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
 
-if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4RubinLinear
 
@@ -1115,8 +1115,8 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     # Blackwell: SM 100 (B200) or SM 103 (B300)
                     cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
                         self.output_dtype, self.output_buffer_kind, self.group)
-                elif sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
-                    # Rubin: SM 107 (requires nvidia-cutlass-dsl-internal)
+                elif sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+                    # Rubin: SM 107 (requires the CuTe DSL Rubin helpers)
                     assert self.output_buffer_kind != int(
                         BufferKind.NCCL_WINDOW
                     ), "CuteDSL Rubin backend does not support NCCL_WINDOW buffer kind."
@@ -1176,7 +1176,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
                                                self.output_buffer_kind,
                                                self.group)
-        if sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        if sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
                 CuteDSLNVFP4RubinLinear
             assert self.output_buffer_kind != int(
@@ -1253,8 +1253,8 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         elif backend == "cutedsl":
             # Dispatch to appropriate CuteDSL runner based on SM version
             sm_version = get_sm_version()
-            if sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
-                # Rubin: SM 107 (requires nvidia-cutlass-dsl-internal)
+            if sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+                # Rubin: SM 107 (requires the CuTe DSL Rubin helpers)
                 assert self.output_buffer_kind != int(
                     BufferKind.NCCL_WINDOW
                 ), "CuteDSL Rubin backend does not support NCCL_WINDOW buffer kind."
@@ -1550,15 +1550,15 @@ class NVFP4GemmInplaceUnifiedRunner(TunableRunner):
         if self._is_backend_allowed("cutedsl"):
             if IS_CUTLASS_DSL_AVAILABLE:
                 sm_version = get_sm_version()
-                if sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
-                    # Rubin: SM 107 (requires nvidia-cutlass-dsl-internal)
+                if sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+                    # Rubin: SM 107 (requires the CuTe DSL Rubin helpers)
                     cutedsl_runner = CuteDSLNVFP4RubinLinear(self.output_dtype)
                 elif sm_version == 107:
                     cutedsl_runner = None
                     if self._is_only_backend("cutedsl"):
                         raise ValueError(
                             "CuteDSL NVFP4 inplace backend on Rubin requires "
-                            "nvidia-cutlass-dsl-internal.")
+                            "the CuTe DSL Rubin helpers.")
                 else:
                     cutedsl_runner = None
                     if self._is_only_backend("cutedsl"):
@@ -1623,10 +1623,10 @@ class NVFP4GemmInplaceUnifiedRunner(TunableRunner):
                     "partition_id must be 0 or 1 for inplace NVFP4 GEMM.")
             sm_version = get_sm_version()
             if sm_version == 107:
-                if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+                if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                     raise ValueError(
                         "CuteDSL NVFP4 inplace GEMM on Rubin requires "
-                        "nvidia-cutlass-dsl-internal.")
+                        "the CuTe DSL Rubin helpers.")
                 # Rubin: native inplace support via output_tensor parameter
                 torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin(
                     act_fp4, weight, act_sf, weight_scale, alpha,

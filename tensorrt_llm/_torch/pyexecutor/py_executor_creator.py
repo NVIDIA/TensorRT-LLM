@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import functools
 import gc
 import importlib
 import os
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,7 +17,9 @@ import torch
 from strenum import StrEnum
 
 import tensorrt_llm
-from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
+from tensorrt_llm._torch.modules.dwdp import (dense_dwdp_requested,
+                                              dwdp_global_rank)
+from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
@@ -44,7 +48,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .dwdp import DwdpManager
+from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
@@ -60,7 +64,6 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 FLASH_MLA_TOKENS_PER_BLOCK = 64
 FP4_MLA_TOKENS_PER_BLOCK = 128
-FP4_MLA_QUANTIZATION_TILE_SIZE = 16
 
 
 class _ExecutorMemoryMonitor:
@@ -192,6 +195,20 @@ class _ExecutorMemoryMonitor:
                 ))
 
 
+def _check_dense_dwdp_launch(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
+    """Run the dense DWDP launch gate if ``TRTLLM_DWDP_DENSE`` asks for it.
+
+    It runs before the DWDP manager and the model are built, so a launch that
+    dense DWDP cannot serve fails before the weights load.
+
+    Raises:
+        ValueError: Dense DWDP is requested and the launch violates one of its
+            requirements (see ``validate_dense_gate``).
+    """
+    if dense_dwdp_requested():
+        validate_dense_gate(llm_args, mapping)
+
+
 def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
     for engine in model_engines:
         if engine is None:
@@ -231,24 +248,6 @@ def _supports_mla_kv_cache_reuse_quantization(model_config,
             or kv_cache_quant_algo == QuantAlgo.NO_QUANT
             or kv_cache_quant_algo == QuantAlgo.FP8
             or _has_fp4_kv_cache(model_config, kv_cache_config))
-
-
-def _validate_fp4_mla_chunk_size(
-    model_config,
-    kv_cache_config,
-    *,
-    enable_chunked_prefill: bool,
-    max_num_tokens: int,
-) -> None:
-    """Require tile-aligned non-final chunks for dense FP4 MLA cache writes."""
-    if (enable_chunked_prefill
-            and _uses_fp4_mla_attention(model_config, kv_cache_config)
-            and max_num_tokens % FP4_MLA_QUANTIZATION_TILE_SIZE != 0):
-        raise ValueError(
-            "Dense NVFP4 MLA chunked prefill requires max_num_tokens to be "
-            f"a multiple of {FP4_MLA_QUANTIZATION_TILE_SIZE}, got "
-            f"{max_num_tokens}. Only the final chunk may contain a partial "
-            "FP4 quantization tile backed by the HP pool.")
 
 
 def _select_mla_tokens_per_block(config, model_config, kv_cache_config,
@@ -413,7 +412,7 @@ def log_memory_usage(stage: str):
     )
 
 
-def create_py_executor(
+def _create_py_executor_impl(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
@@ -621,6 +620,10 @@ def create_py_executor(
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     # Initialize DWDP Manager (only for context workers in disaggregated serving)
+    #
+    # The dense DWDP gate runs outside the block below, so that it also rejects
+    # a dense DWDP launch without dwdp_config.
+    _check_dense_dwdp_launch(llm_args, mapping)
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
         assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
@@ -816,13 +819,6 @@ def create_py_executor(
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
-
-    _validate_fp4_mla_chunk_size(
-        model_engine.model.model_config,
-        kv_cache_config,
-        enable_chunked_prefill=enable_chunked_context,
-        max_num_tokens=max_num_tokens,
-    )
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
@@ -1178,3 +1174,34 @@ def create_py_executor(
     py_executor.start_worker()
 
     return py_executor
+
+
+@functools.wraps(_create_py_executor_impl)
+def create_py_executor(
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    profiling_stage_data: Optional[dict] = None,
+    resource_governor_queue=None,
+) -> PyExecutor:
+    """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
+    previous_dwdp_manager = get_global_dwdp_manager()
+    try:
+        return _create_py_executor_impl(
+            llm_args=llm_args,
+            checkpoint_dir=checkpoint_dir,
+            tokenizer=tokenizer,
+            profiling_stage_data=profiling_stage_data,
+            resource_governor_queue=resource_governor_queue,
+        )
+    except BaseException:
+        current_dwdp_manager = get_global_dwdp_manager()
+        if (current_dwdp_manager is not None
+                and current_dwdp_manager is not previous_dwdp_manager):
+            try:
+                current_dwdp_manager.__exit__(None, None, None)
+            except BaseException:
+                logger.error(
+                    "Failed to roll back DWDP after PyExecutor construction error\n"
+                    f"{traceback.format_exc()}")
+        raise

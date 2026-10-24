@@ -870,6 +870,26 @@ class ConversationAwareADPRouter(ADPRouter):
             "least_queued" if new_conv_placement == "least_queued" else "round_robin"
         )
         self._round_robin_cursor = 0
+        # Opt-in (TLLM_ADP_CONV_WAIT_HOME_RANK=1): a returning turn waits in the
+        # waiting queue for a free slot on its conversation's rank instead of
+        # overflowing to another rank, where its cached prefix (and recurrent-state
+        # snapshot) is absent and the whole prompt would be recomputed. Without
+        # it, a context server whose ranks all run at max_num_active_requests
+        # sends most returning turns to whichever rank freed a slot first.
+        self._wait_for_home_rank = os.environ.get("TLLM_ADP_CONV_WAIT_HOME_RANK", "0") == "1"
+
+    def home_rank(self, req_item) -> "int | None":
+        """Rank a returning turn must be admitted to, or None to admit it freely.
+
+        Used by ``get_from_waiting_queue``; every rank calls it with identical
+        inputs, so all ranks make the same admission decision.
+        """
+        if not self._wait_for_home_rank:
+            return None
+        conv_id = self._conversation_id(req_item)
+        if conv_id is None:
+            return None
+        return self._conv_to_rank.get(conv_id)
 
     def create_rank_state(
         self,
@@ -983,6 +1003,15 @@ class ConversationAwareADPRouter(ADPRouter):
             all_ranks_num_active_requests,
             max_num_active_requests,
         )
+
+        if self._wait_for_home_rank:
+            # Admission reserved a slot on the home rank of every returning turn;
+            # place those before new conversations so a new conversation cannot
+            # take a reserved slot and push the returning turn off its rank.
+            remaining_unscheduled = sorted(
+                remaining_unscheduled,
+                key=lambda r: self._conversation_id(r) not in self._conv_to_rank,
+            )
 
         # 2) Soft cap for spreading new conversations across ranks, clamped to
         #    the per-rank seq-slot capacity: every placement path must respect

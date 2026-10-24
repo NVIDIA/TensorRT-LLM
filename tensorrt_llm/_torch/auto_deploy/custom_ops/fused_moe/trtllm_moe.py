@@ -38,10 +38,10 @@ def _hybrid_runtime_max_tokens_per_rank(
     """Pick the MoE all-to-all per-rank token budget (dispatch/sanitize/combine/GEMM stride).
 
     Hybrid of the cross-rank-max (per-layer ``.item()``) and static-``max_num_tokens``
-    strategies that avoids the pitfalls of each. Callers never pad ``x``: the dispatch kernel
-    writes only the real ``local_num_tokens`` rows and ``moe_a2a_sanitize_expert_ids``
-    invalidates the unfilled slots, so the returned value controls only the workspace stride /
-    recv-view / GEMM row count, not how many real rows are moved.
+    strategies that avoids the pitfalls of each. Callers never pad ``x``: the dispatch writes
+    only the real ``local_num_tokens`` rows and sets the expert ids of the unfilled slots to the
+    invalid id, so the returned value controls only the workspace stride / recv-view / GEMM row
+    count, not how many real rows are moved.
 
     - **Capture / warm-up path** (decode/extend): use ``local_num_tokens``. Under attention-DP
       every rank pads to the same ``cg_batch_size``, so the per-rank count already equals the
@@ -332,9 +332,9 @@ def _run_moe_with_alltoall(
 
     invalid_expert_id = global_num_experts
 
-    # Do NOT pad x to runtime_max_tokens_per_rank: the dispatch kernel writes only the real
-    # ``local_num_tokens`` rows per rank, and moe_a2a_sanitize_expert_ids marks the unfilled
-    # slots invalid so the downstream MoE GEMM skips them. ``runtime_max_tokens_per_rank``
+    # Do NOT pad x to runtime_max_tokens_per_rank: the dispatch writes only the real
+    # ``local_num_tokens`` rows per rank and marks the unfilled slots' expert ids invalid,
+    # so the downstream MoE GEMM skips them. ``runtime_max_tokens_per_rank``
     # controls only the workspace stride / recv-view shape.
 
     # Build payload list: x, selected_experts, routing_weights
@@ -494,7 +494,7 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     )
 
     invalid_expert_id = global_num_experts
-    # No x padding: dispatch writes only the real rows; sanitize invalidates the rest.
+    # No x padding: dispatch writes only the real rows and invalidates the rest.
     recv_results = moe_a2a.dispatch(
         selected_experts,
         [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()],

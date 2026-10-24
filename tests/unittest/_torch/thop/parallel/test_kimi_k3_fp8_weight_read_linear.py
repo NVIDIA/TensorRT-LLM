@@ -37,7 +37,7 @@ SHAPES = [(512, 1024), (2048, 1024)]
 MS = [1, 32, 128]
 
 RUBIN = pytest.mark.skipif(
-    not _rubin_mxfp8_is_available(), reason="needs SM107 with CuTe DSL internal"
+    not _rubin_mxfp8_is_available(), reason="needs SM107 with the CuTe DSL Rubin helpers"
 )
 
 

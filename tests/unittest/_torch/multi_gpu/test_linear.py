@@ -27,7 +27,7 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
 from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
@@ -613,8 +613,8 @@ def test_fp4_row_linear_allreduce(seq_len, output_size, hidden_size, dtype,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-    reason="Rubin CuTe DSL internal package is not available",
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="the CuTe DSL Rubin helpers are not available",
 )
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
@@ -656,8 +656,8 @@ def test_fp4_row_linear_allreduce_ugpu_freed_weights(mpi_pool_executor,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-    reason="Rubin CuTe DSL internal package is not available",
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="the CuTe DSL Rubin helpers are not available",
 )
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")

@@ -12,19 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe DSL FP8 MLA decode: flat (q_tok, head) fold vs the unfolded kernel.
+"""CuTe DSL MLA decode with Kimi K3's 96 heads.
 
-K3 has 96 MLA heads and verifies 1 + 3 draft tokens per request. 96 heads fill
-only 3/4 of the 128-row M tile and no integer token fold fits, so the kernel
-used to run S_q = 4 tiles of 96 valid rows per request. The flat fold packs the
-384 (q_tok, head) rows into 3 full M tiles; each row's math is unchanged, so the
-output must be BITWISE identical to the unfolded kernel (TRTLLM_MLA_FLAT_FOLD=0)
-at any split_kv, and agree with an fp32 reference of the MTP-causal attention.
-
-Also covers the opt-in split-KV policies (multi-wave heuristic and per-batch
-table) and that their split stays inside the runner's workspace.
-
-Requires 1 SM100/SM103/SM107 GPU and nvidia-cutlass-dsl.
+FP8: the flat (q_tok, head) fold and the balanced split. FP8 and FP16/BF16: a
+large uniform split keeps its LSE partials inside the workspace.
 """
 
 import math
@@ -37,291 +28,223 @@ _DEP_ERR = None
 try:
     import cutlass
 
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-        CuteDSLNVMlaDecodeBlackwellRunner,
-        _parse_mla_split_kv_table,
-    )
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import (
-        BlackwellMultiHeadLatentAttentionForwardFP8,
-    )
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 except ImportError as e:
     _HAVE_DEPS = False
     _DEP_ERR = str(e)
 
 
-def _is_sm100_family():
+def _is_supported_sm():
     if not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability(0) in ((10, 0), (10, 3), (10, 7))
 
 
 pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
-    pytest.mark.skipif(not _is_sm100_family(), reason="needs sm100/sm103/sm107"),
+    pytest.mark.skipif(not _is_supported_sm(), reason="needs sm100/sm103/sm107"),
     pytest.mark.skipif(not _HAVE_DEPS, reason=f"deps: {_DEP_ERR}"),
 ]
 
-D, R, PAGE = 512, 64, 64
+D, R, PAGE, H = 512, 64, 64, 96
+_MAX_BATCH = 64
+# the compiled-kernel cache is keyed by shape and tactic, not by the fold
+_KERNEL_CACHES = {"0": {}, "1": {}}
 
 
-def _make_inputs(lens, S, H, seed=0):
+def _inputs(lens, S, helix, seed):
     torch.manual_seed(seed)
-    dev = "cuda"
-    B = len(lens)
-    pages_per = [math.ceil(L / PAGE) for L in lens]
-    max_blocks = max(pages_per) + 1
-    num_pages = sum(pages_per) + 8
-    perm = torch.randperm(num_pages, device=dev).to(torch.int32)
-    pt = torch.zeros(B, max_blocks, dtype=torch.int32, device=dev)
+    pages = [math.ceil(L / PAGE) for L in lens]
+    perm = torch.randperm(sum(pages) + 8, device="cuda").to(torch.int32)
+    pt = torch.zeros(len(lens), max(pages) + 1, dtype=torch.int32, device="cuda")
     off = 0
-    for b, n in enumerate(pages_per):
+    for b, n in enumerate(pages):
         pt[b, :n] = perm[off : off + n]
         off += n
-    kv = (torch.randn(num_pages, 1, PAGE, 1, D + R, device=dev) * 0.5).to(torch.float8_e4m3fn)
-    kv_pages = kv[:, 0, :, 0, :]
-    q = (torch.randn(B, S, H, D + R, device=dev) * 0.5).to(torch.float8_e4m3fn)
-    o = torch.empty(B, S, H, D, dtype=torch.bfloat16, device=dev)
-    return dict(
-        q=q,
-        kv_pages=kv_pages,
-        pt=pt,
-        o=o,
-        inputs=[
-            q[..., :D].permute(2, 3, 1, 0),
-            q[..., D:].permute(2, 3, 1, 0),
-            kv_pages[..., :D].permute(1, 2, 0),
-            kv_pages[..., D:].permute(1, 2, 0),
-            pt.transpose(0, 1),
-            torch.tensor(lens, dtype=torch.int32, device=dev),
-            o.permute(2, 3, 1, 0),
-            torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device=dev),
-            None,
-            None,
-            torch.tensor([1.0 / math.sqrt(192)], dtype=torch.float32, device=dev),
-            torch.tensor([1.0], dtype=torch.float32, device=dev),
-        ],
-    )
+    kv = (torch.randn(perm.numel(), PAGE, D + R, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    q = (torch.randn(len(lens), S, H, D + R, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    bounds = None
+    if helix:
+        # rank-local verify bounds: each token sees between K - S_q and K entries
+        bounds = [int(torch.randint(max(0, L - S), L + 1, (1,))) for L in lens for _ in range(S)]
+        bounds = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+    return dict(lens=lens, q=q, kv=kv, pt=pt, bounds=bounds)
 
 
-def _run(x, H, S, split_kv, flat_fold, monkeypatch):
-    monkeypatch.setenv("TRTLLM_MLA_FLAT_FOLD", "1" if flat_fold else "0")
-    # the compiled-kernel cache is keyed by shape/tactic only
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", {})
+def _run(x, S, split_kv, flat_fold, monkeypatch):
+    """(O, LSE, Helix stats); NaN guard rows check nothing is stored past the batch."""
+    flag = "1" if flat_fold else "0"
+    monkeypatch.setenv("TRTLLM_MLA_FLAT_FOLD", flag)
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", _KERNEL_CACHES[flag])
+    B, helix = len(x["lens"]), x["bounds"] is not None
     runner = CuteDSLNVMlaDecodeBlackwellRunner(
-        in_dtype=cutlass.Float8E4M3FN, num_heads=H, seq_len_q=S, page_size=PAGE, max_batch_size=64
+        in_dtype=cutlass.Float8E4M3FN,
+        num_heads=H,
+        seq_len_q=S,
+        page_size=PAGE,
+        max_batch_size=_MAX_BATCH,
+        emit_softmax_stats=helix,
     )
-    runner.forward(x["inputs"], ((128, 128), (128, 256), split_kv, False))
+    n_o = B * S * H * D
+    o_buf = torch.full((n_o + S * H * D,), float("nan"), dtype=torch.bfloat16, device="cuda")
+    lse_off, lse_size, _, _, ws_size = runner.get_workspace_layout(
+        H, S, D, _MAX_BATCH, cutlass.Float32
+    )
+    ws = torch.full((ws_size,), 0xFF, dtype=torch.uint8, device="cuda")
+    stats = torch.full(((B + 1) * S, H, 2), float("nan"), device="cuda") if helix else None
+    q, kv = x["q"], x["kv"]
+    inputs = [
+        q[..., :D].permute(2, 3, 1, 0),
+        q[..., D:].permute(2, 3, 1, 0),
+        kv[..., :D].permute(1, 2, 0),
+        kv[..., D:].permute(1, 2, 0),
+        x["pt"].t(),
+        torch.tensor(x["lens"], dtype=torch.int32, device="cuda"),
+        o_buf[:n_o].view(B, S, H, D).permute(2, 3, 1, 0),
+        ws,
+        stats[: B * S] if helix else None,
+        x["bounds"],
+        torch.tensor([1.0 / math.sqrt(192)], device="cuda"),
+        torch.tensor([1.0], device="cuda"),
+    ]
+    runner.forward(inputs, ((128, 128), (128, 256), split_kv, False))
     torch.cuda.synchronize()
-    return x["o"].clone()
+    lse = ws[lse_off : lse_off + lse_size].view(torch.float32).view(_MAX_BATCH, S, H)
+    assert torch.isnan(o_buf[n_o:].float()).all()
+    assert torch.isnan(lse[B:]).all()
+    if helix:
+        assert torch.isnan(stats[B * S :]).all()
+        stats = stats[: B * S].clone()
+    return o_buf[:n_o].view(B, S, H, D).clone(), lse[:B].clone(), stats
 
 
-def _reference(x, lens, S, H):
-    q = x["q"].float()
-    kv = x["kv_pages"].float()
-    out = torch.empty(len(lens), S, H, D, dtype=torch.float32, device="cuda")
-    scale = 1.0 / math.sqrt(192)
-    for b, L in enumerate(lens):
-        pages = x["pt"][b, : math.ceil(L / PAGE)].long()
-        c = kv[pages].reshape(-1, D + R)[:L]
+def _reference(x, S):
+    """fp32 MTP-causal (or Helix-bounded) attention."""
+    q, kv = x["q"].float(), x["kv"].float()
+    out = torch.zeros(len(x["lens"]), S, H, D, device="cuda")
+    for b, L in enumerate(x["lens"]):
+        c = kv[x["pt"][b, : math.ceil(L / PAGE)].long()].reshape(-1, D + R)[:L]
         for s in range(S):
-            bound = L - (S - 1) + s
-            logits = (q[b, s] @ c[:bound].T) * scale  # [H, bound]
-            p = torch.softmax(logits, dim=-1)
-            out[b, s] = p @ c[:bound, :D]
+            bound = L - (S - 1) + s if x["bounds"] is None else int(x["bounds"][b * S + s])
+            if bound > 0:
+                p = torch.softmax(q[b, s] @ c[:bound].T / math.sqrt(192), dim=-1)
+                out[b, s] = p @ c[:bound, :D]
     return out
 
 
-def test_k3_shape_takes_the_flat_fold(monkeypatch):
+@pytest.mark.parametrize("helix", [False, True])
+@pytest.mark.parametrize("split_kv", [1, 4])
+@pytest.mark.parametrize("S", [4, 7, 8])  # 4 and 8 fill whole M tiles, 7 pads the last one
+def test_flat_fold_is_bitwise_identical(S, split_kv, helix, monkeypatch):
+    x = _inputs([3000, 70, 1500, 8191, 64, 513, 2048, 4500], S, helix, seed=11)
+    ref = _run(x, S, split_kv, False, monkeypatch)
+    new = _run(x, S, split_kv, True, monkeypatch)
+    for a, b in zip(new, ref):
+        if a is not None:
+            assert torch.equal(a, b)
+    gold = _reference(x, S)
+    assert (new[0].float() - gold).abs().max() <= 0.05 * gold.abs().max()
+
+
+@pytest.mark.parametrize("lookahead", [True, False])
+@pytest.mark.parametrize("helix", [False, True])
+@pytest.mark.parametrize("S", [4, 7])
+def test_balanced_split(S, helix, lookahead, monkeypatch):
+    # forced on: unset, the balanced split and its lookahead skip Helix
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_BALANCED_SPLIT", True)
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_MMA_LOOKAHEAD", lookahead)
+    lens = [600, 0, 61000, 2048, 9000, 0, 130, 15000, 7300, 64]  # skewed, two without KV
+    x = _inputs(lens, S, helix, seed=13)
+    ref_o, ref_lse, _ = _run(x, S, 1, True, monkeypatch)
+    o, lse, stats = _run(
+        x, S, CuteDSLNVMlaDecodeBlackwellRunner.BALANCED_SPLIT_TACTIC, True, monkeypatch
+    )
+    kv = torch.tensor([L > 0 for L in lens], device="cuda")
+    gold = _reference(x, S)
+    tol = 0.05 * gold.abs().max()
+    # tiles cut across clusters round P to fp8 per piece
+    assert (o[kv].float() - ref_o[kv].float()).abs().max() <= tol
+    assert (o[kv].float() - gold[kv]).abs().max() <= tol
+    assert (lse[kv] - ref_lse[kv]).abs().max() <= 1e-4
+    assert (o[~kv] == 0).all() and torch.isinf(lse[~kv]).all()
+    if helix:
+        st = stats.view(len(lens), S, H, 2)[~kv]
+        assert torch.isinf(st[..., 0]).all() and (st[..., 1] == 0).all()
+
+
+# fp32 split-KV partials whose bytes-first acc_lse offset (cosize * 4) no longer fits Int32
+_LSE_OFFSET_WRAP_ELEMENTS = 1 << 29
+
+
+def _clear_split_kv_sizing():
+    # Cached per shape and occupancy, not per _SPLIT_KV_WAVES.
+    CuteDSLNVMlaDecodeBlackwellRunner._max_split_kv_rows.cache_clear()
+    CuteDSLNVMlaDecodeBlackwellRunner._max_split_kv_acc_rows.cache_clear()
+
+
+@pytest.fixture
+def uniform_split_kv_32(monkeypatch):
+    """Size the split-KV workspace for split_kv 32 at every batch bucket and keep the
+    uniform split, whose initialize_workspace places acc_lse behind the O partials."""
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_KV_WAVES", 1 << 16)
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_BALANCED_SPLIT", False)
+    _clear_split_kv_sizing()
+    yield
+    _clear_split_kv_sizing()
+
+
+@pytest.mark.parametrize("in_dtype", ["fp8", "bf16"])
+def test_large_split_partials_keep_lse_in_workspace(in_dtype, uniform_split_kv_32, monkeypatch):
+    """B * split_kv * rows * D >= 2^29 fp32 partials: the acc_lse byte offset wrapped in
+    Int32 and put acc_lse before the workspace (NaN outputs or an illegal address)."""
     monkeypatch.setenv("TRTLLM_MLA_FLAT_FOLD", "1")
-    k = BlackwellMultiHeadLatentAttentionForwardFP8(
-        cutlass.Float32,
-        cutlass.Float32,
-        (128, 128),
-        (128, 256),
-        76,
-        PAGE,
-        0.0,
-        False,
-        True,
-        False,
-        num_heads=96,
-        seq_len_q=4,
-        fold_sq=True,
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", _KERNEL_CACHES["1"])
+    fp8 = in_dtype == "fp8"
+    S, B, max_batch = 4, 96, 128
+    runner = CuteDSLNVMlaDecodeBlackwellRunner(
+        in_dtype=cutlass.Float8E4M3FN if fp8 else cutlass.BFloat16,
+        num_heads=H,
+        seq_len_q=S,
+        page_size=PAGE,
+        max_batch_size=max_batch,
     )
-    assert k.fold_rows == 128 and k.flat_fold
-    # integer folds are unchanged
-    k32 = BlackwellMultiHeadLatentAttentionForwardFP8(
-        cutlass.Float32,
-        cutlass.Float32,
-        (128, 128),
-        (128, 256),
-        76,
-        PAGE,
-        0.0,
-        False,
-        True,
-        False,
-        num_heads=32,
-        seq_len_q=4,
-        fold_sq=True,
-    )
-    assert k32.fold_rows == 128 and not k32.flat_fold
-
-
-@pytest.mark.parametrize("split_kv", [1, 2, 4])
-@pytest.mark.parametrize("H,S", [(96, 4), (48, 8)])
-def test_flat_fold_is_bitwise_identical(H, S, split_kv, monkeypatch):
-    lens = [3000, 70, 1500, 8191, 64, 513, 2048, 4500]
-    x = _make_inputs(lens, S, H, seed=7)
-    ref = _run(x, H, S, split_kv, flat_fold=False, monkeypatch=monkeypatch)
-    new = _run(x, H, S, split_kv, flat_fold=True, monkeypatch=monkeypatch)
-    assert torch.equal(new, ref)
-    gold = _reference(x, lens, S, H)
-    err = (new.float() - gold).abs().max().item()
-    assert err <= 0.05 * gold.abs().max().item(), err
-
-
-def test_multi_wave_split_heuristic(monkeypatch):
-    R = CuteDSLNVMlaDecodeBlackwellRunner
-    monkeypatch.setattr(R, "_cute_dsl_max_active_blocks", 152, raising=False)
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_MIN_WAVES", 0)
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_KV_TABLE", ())
-    # default (off): at most one wave -> split 1 once the batch fills the GPU
-    assert R.get_split_kv_for_batch(32, 96, 4, 152) == 1
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_MIN_WAVES", 4)
-    # K3: 32 requests x 3 flat-folded tiles = 96 clusters, 76 cluster slots
-    assert R.get_seq_len_q_eff(96, 4) == 3
-    assert R.get_split_kv_for_batch(32, 96, 4, 152) == 4
-    assert R.get_split_kv_for_batch(64, 96, 4, 152) == 2
-    assert R.get_split_kv_for_batch(1024, 96, 4, 152) == 1
-    # never below the default heuristic, never above 32
-    assert R.get_split_kv_for_batch(1, 128, 1, 152) == 32
-    # the workspace covers the largest batch of every bucket
-    ws = R.get_multi_wave_split_kv_workspace_size(96, 4, 512, 64, cutlass.Float32)
-    assert ws >= 63 * 4 * 96 * 4 * 513 * 4
-
-
-def test_split_kv_table(monkeypatch):
-    R = CuteDSLNVMlaDecodeBlackwellRunner
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_MIN_WAVES", 0)
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_KV_TABLE", ())
-    assert not R.uses_split_policy()
-    monkeypatch.setattr(R, "_SPLIT_KV_TABLE", _parse_mla_split_kv_table("64:6, 16:8,32:6,128:4"))
-    assert R.uses_split_policy()
-    assert R.get_split_kv_table() == ((16, 8), (32, 6), (64, 6), (128, 4))
-    # below the smallest key: unchanged default (1 once the batch fills the GPU)
-    assert R.get_split_kv_for_batch(8, 96, 4, 212) == R.get_default_split_kv(8, 4, 212)
-    assert R.get_split_kv_for_batch(16, 96, 4, 212) == 8
-    assert R.get_split_kv_for_batch(40, 96, 4, 212) == 6
-    assert R.get_split_kv_for_batch(96, 96, 4, 212) == 6
-    assert R.get_split_kv_for_batch(128, 96, 4, 212) == 4
-    assert R.get_split_kv_for_batch(4096, 96, 4, 212) == 4
-    # the table overrides the multi-wave heuristic where it has an entry
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_MIN_WAVES", 4)
-    assert R.get_split_kv_for_batch(64, 96, 4, 212) == 6
-    for bad in ("64", "64:0", "0:4", "64:33", "x:2"):
-        with pytest.raises(ValueError):
-            _parse_mla_split_kv_table(bad)
-
-
-@pytest.mark.parametrize(
-    "env",
-    [
-        ("TRTLLM_CUTE_DSL_MLA_SPLIT_MIN_WAVES", "4"),
-        ("TRTLLM_CUTE_DSL_MLA_SPLIT_KV_TABLE", "16:8,32:6,64:6,128:4"),
-    ],
-)
-def test_split_policy_stays_inside_workspace(env, monkeypatch):
-    """Run the policy's split at the largest batch of its bucket with the
-    exact workspace size from get_workspace_layout and a canary behind it."""
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_MIN_WAVES", 0)
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_KV_TABLE", ())
-    if env[0].endswith("MIN_WAVES"):
-        monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_MIN_WAVES", int(env[1]))
+    assert not runner._uses_balanced_split(B)
+    split_kv = min(32, runner.get_fitting_split_kv(B, max_batch))
+    rows = runner._split_kv_rows_per_request()
+    assert split_kv == 32, split_kv
+    assert B * split_kv * rows * D >= _LSE_OFFSET_WRAP_ELEMENTS, rows
+    lens = [4096 + 37 * i for i in range(B)]
+    x = _inputs(lens, S, False, seed=5)
+    q, kv = x["q"], x["kv"]
+    if not fp8:
+        # fp8 values are exact in bf16, so the fp32 reference is shared
+        q, kv = q.to(torch.bfloat16), kv.to(torch.bfloat16)
+    size = runner.get_workspace_layout(H, S, D, max_batch, cutlass.Float32)[4]
+    canary = 1 << 20
+    ws = torch.full((size + canary,), 0x5A, dtype=torch.uint8, device="cuda")
+    o = torch.full((B, S, H, D), float("nan"), dtype=torch.bfloat16, device="cuda")
+    inputs = [
+        q[..., :D].permute(2, 3, 1, 0),
+        q[..., D:].permute(2, 3, 1, 0),
+        kv[..., :D].permute(1, 2, 0),
+        kv[..., D:].permute(1, 2, 0),
+        x["pt"].t(),
+        torch.tensor(lens, dtype=torch.int32, device="cuda"),
+        o.permute(2, 3, 1, 0),
+        ws[:size],
+        None,
+        None,
+    ]
+    tactic = ((128, 128), (128, 256), split_kv, False)
+    scale = 1.0 / math.sqrt(192)
+    if fp8:
+        inputs += [torch.tensor([scale], device="cuda"), torch.tensor([1.0], device="cuda")]
+        runner.forward(inputs, tactic)
     else:
-        monkeypatch.setattr(
-            CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_KV_TABLE", _parse_mla_split_kv_table(env[1])
-        )
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", {})
-    H, S, max_batch = 96, 4, 63
-    lens = [64 + (997 * i) % 4000 for i in range(max_batch)]
-    x = _make_inputs(lens, S, H, seed=3)
-    R = CuteDSLNVMlaDecodeBlackwellRunner
-    mab = R._get_max_active_blocks()
-    split_kv = R.get_split_kv_for_batch(32, H, S, mab)  # bucket of B = 63
-    assert split_kv > 1
-    size = R.get_workspace_layout(H, S, D, max_batch, cutlass.Float32)[4]
-    canary = 1 << 20
-    ws = torch.full((size + canary,), 0x5A, dtype=torch.uint8, device="cuda")
-    x["inputs"][7] = ws[:size]
-    runner = R(
-        in_dtype=cutlass.Float8E4M3FN,
-        num_heads=H,
-        seq_len_q=S,
-        page_size=PAGE,
-        max_batch_size=max_batch,
-    )
-    runner.forward(x["inputs"], ((128, 128), (128, 256), split_kv, False))
+        runner.forward(inputs, tactic, softmax_scale=scale, output_scale=1.0)
     torch.cuda.synchronize()
     assert bool((ws[size:] == 0x5A).all()), "split-KV partials overflowed the workspace"
-    gold = _reference(x, lens, S, H)
-    err = (x["o"].float() - gold).abs().max().item()
-    assert err <= 0.05 * gold.abs().max().item(), err
-
-
-def test_large_split_partials_keep_lse_in_workspace(monkeypatch):
-    """B * split_kv * 384 rows * 512 >= 2^26 fp32 partials: the acc_lse byte
-    offset used to overflow int32 (NaN outputs or an illegal address)."""
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_KV_TABLE", ())
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_SPLIT_MIN_WAVES", 64)
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", {})
-    H, S, max_batch = 96, 4, 15
-    R = CuteDSLNVMlaDecodeBlackwellRunner
-    split_kv = R.get_split_kv_for_batch(8, H, S, R._get_max_active_blocks())
-    assert max_batch * split_kv * H * S * D >= 1 << 26, split_kv
-    lens = [4096 + 509 * i for i in range(max_batch)]
-    x = _make_inputs(lens, S, H, seed=5)
-    size = R.get_workspace_layout(H, S, D, max_batch, cutlass.Float32)[4]
-    canary = 1 << 20
-    ws = torch.full((size + canary,), 0x5A, dtype=torch.uint8, device="cuda")
-    x["inputs"][7] = ws[:size]
-    runner = R(
-        in_dtype=cutlass.Float8E4M3FN,
-        num_heads=H,
-        seq_len_q=S,
-        page_size=PAGE,
-        max_batch_size=max_batch,
-    )
-    runner.forward(x["inputs"], ((128, 128), (128, 256), split_kv, False))
-    torch.cuda.synchronize()
-    assert bool((ws[size:] == 0x5A).all()), "split-KV partials overflowed the workspace"
-    gold = _reference(x, lens, S, H)
-    out = x["o"].float()
+    out = o.float()
     assert torch.isfinite(out).all()
+    gold = _reference(x, S)
     err = (out - gold).abs().max().item()
     assert err <= 0.05 * gold.abs().max().item(), err
-
-
-def test_multi_wave_policy_ignores_later_environment_changes(monkeypatch):
-    R = CuteDSLNVMlaDecodeBlackwellRunner
-    monkeypatch.setattr(R, "_cute_dsl_max_active_blocks", 152, raising=False)
-    monkeypatch.setattr(R, "_SPLIT_MIN_WAVES", 4)
-    before = R.get_workspace_layout(96, 4, 512, 64, cutlass.Float32)
-    monkeypatch.setenv("TRTLLM_CUTE_DSL_MLA_SPLIT_MIN_WAVES", "0")
-    assert R.get_split_min_waves() == 4
-    assert R.get_split_kv_for_batch(32, 96, 4, 152) == 4
-    assert R.get_workspace_layout(96, 4, 512, 64, cutlass.Float32) == before
-
-
-def test_split_table_ignores_later_environment_changes(monkeypatch):
-    R = CuteDSLNVMlaDecodeBlackwellRunner
-    table = _parse_mla_split_kv_table("64:6,16:8,32:6,128:4")
-    monkeypatch.setattr(R, "_SPLIT_KV_TABLE", table)
-    monkeypatch.setattr(R, "_SPLIT_MIN_WAVES", 0)
-    monkeypatch.setattr(R, "_cute_dsl_max_active_blocks", 152, raising=False)
-    before = R.get_workspace_layout(96, 4, 512, 128, cutlass.Float32)
-    monkeypatch.setenv("TRTLLM_CUTE_DSL_MLA_SPLIT_KV_TABLE", "malformed")
-    assert R.get_split_kv_table() is table
-    assert R.get_split_kv_for_batch(64, 96, 4, 152) == 6
-    assert R.get_workspace_layout(96, 4, 512, 128, cutlass.Float32) == before
-    assert _parse_mla_split_kv_table("  ") == ()
