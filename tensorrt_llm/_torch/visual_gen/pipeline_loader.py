@@ -49,7 +49,7 @@ from tensorrt_llm.visual_gen.args import VisualGenArgs
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
-from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent, resolve_checkpoint
+from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
     from .models import BasePipeline
@@ -140,43 +140,6 @@ class PipelineLoader:
                 f"HuggingFace Hub model ID: {e}"
             ) from e
         return str(local_dir)
-
-    def _resolve_pipeline_config(
-        self, checkpoint_dir: str, checkpoint_config: dict | None = None
-    ) -> dict:
-        """Validate VisualGenArgs.pipeline_config against the registry and merge.
-
-        The user-facing dict on ``VisualGenArgs.pipeline_config`` is strict:
-        keys must appear in the resolved pipeline family's ``defaults``
-        (the schema-by-example carried on the registry entry). Unknown
-        keys raise immediately so typos surface at load time. The merged
-        dict combines registry defaults, adapter-inferred options, and explicit
-        user options in that order; user-supplied values win.
-        """
-        user_pipeline_config = dict(checkpoint_config or {})
-        user_pipeline_config.update(self.args.pipeline_config)
-
-        # Detect _class_name from the resolved checkpoint, look up the
-        # registry entry. If detection fails (or the class_name isn't
-        # registered) leave the validation to AutoPipeline.from_config
-        # so the user gets the existing "Unknown pipeline" error rather
-        # than a confusing pipeline_config validation error.
-        try:
-            class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
-        except ValueError:
-            return user_pipeline_config
-
-        entry = PIPELINE_REGISTRY.get(class_name)
-        if entry is None:
-            return user_pipeline_config
-
-        unknown = set(user_pipeline_config) - set(entry.defaults)
-        if unknown:
-            raise ValueError(
-                f"Unknown pipeline_config keys for {class_name} ({checkpoint_dir}): "
-                f"{sorted(unknown)}. Valid keys: {sorted(entry.defaults)}"
-            )
-        return {**entry.defaults, **user_pipeline_config}
 
     def _setup_visual_gen_mapping(self, config: DiffusionPipelineConfig) -> None:
         ws = dist.get_world_size() if dist.is_initialized() else 1
@@ -270,18 +233,13 @@ class PipelineLoader:
             raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
 
-        checkpoint = resolve_checkpoint(checkpoint_dir, self.args.pipeline_config)
-        checkpoint_dir = checkpoint.path
-
-        # Strict pipeline_config validation: detect _class_name from the
-        # checkpoint, look up the registry entry, reject unknown keys.
-        resolved_pipeline_config = self._resolve_pipeline_config(
-            checkpoint_dir, checkpoint.pipeline_config
-        )
+        resolved = AutoPipeline.resolve(checkpoint_dir, self.args.pipeline_config)
+        checkpoint_dir = resolved.path
+        resolved_pipeline_config = resolved.pipeline_config
 
         load_start = time.time()
         # text_encoder_path is an LTX-2 pipeline_config knob; it lives in
-        # the merged dict that _resolve_pipeline_config produced, not on
+        # the merged dict from pipeline resolution, not on
         # VisualGenArgs directly.
         text_encoder_path = resolved_pipeline_config.get("text_encoder_path", "")
 
@@ -332,13 +290,13 @@ class PipelineLoader:
 
         # =====================================================================
         # STEP 2: Create Pipeline with MetaInit
-        # Pipeline type is auto-detected from model_index.json
+        # Reuse the pipeline family selected during checkpoint resolution
         # - Meta tensors (no GPU memory until materialization)
         # - If quant_config specifies FP8, Linear layers have FP8 weight buffers
         # =====================================================================
         logger.info("Creating pipeline with MetaInitMode")
         with MetaInitMode():
-            pipeline = AutoPipeline.from_config(config, checkpoint_dir)
+            pipeline = AutoPipeline.from_config(config, resolved)
 
         if sleep_restore_mode is not None:
             if loading_stack is None:

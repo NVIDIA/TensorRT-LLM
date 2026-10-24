@@ -45,7 +45,7 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image imp
     qwen_complex_freqs_to_cos_sin,
     qwen_joint_freqs_to_cos_sin,
 )
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import (
@@ -79,7 +79,7 @@ def test_qwen_pipeline_config_defaults_to_empty_dict(tmp_path):
     checkpoint_dir = _write_minimal_qwen_checkpoint(tmp_path)
 
     args = VisualGenArgs(model=str(checkpoint_dir))
-    resolved = PipelineLoader(args)._resolve_pipeline_config(str(checkpoint_dir))
+    resolved = AutoPipeline.resolve(str(checkpoint_dir), args.pipeline_config).pipeline_config
 
     assert resolved == {}
 
@@ -92,7 +92,7 @@ def test_qwen_pipeline_config_rejects_unknown_keys(tmp_path):
         pipeline_config={"text_encoder_path": "/tmp/not-a-qwen-knob"},
     )
     with pytest.raises(ValueError, match="Unknown pipeline_config keys for QwenImagePipeline"):
-        PipelineLoader(args)._resolve_pipeline_config(str(checkpoint_dir))
+        AutoPipeline.resolve(str(checkpoint_dir), args.pipeline_config).pipeline_config
 
 
 @pytest.mark.parametrize(

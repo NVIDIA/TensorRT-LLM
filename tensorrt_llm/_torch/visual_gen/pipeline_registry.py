@@ -156,64 +156,85 @@ def register_pipeline(
     return decorator
 
 
-def resolve_checkpoint(checkpoint_dir: str, pipeline_config: Dict[str, Any]) -> ResolvedCheckpoint:
-    """Resolve one registered model's native layout, or keep the original path.
+@dataclass(frozen=True)
+class ResolvedPipeline:
+    """One pipeline selection, shared by config loading and construction."""
 
-    A normal pipeline manifest is already resolved. For other layouts, probe
-    every registered family before allowing any adapter to download components.
-    """
-    path = Path(checkpoint_dir)
-    if any((path / name).is_file() for name in ("model_index.json", "modular_model_index.json")):
-        return ResolvedCheckpoint(checkpoint_dir)
-    options = MappingProxyType(dict(pipeline_config))
-    matches = {}
-    for name, entry in PIPELINE_REGISTRY.items():
-        if entry.checkpoint_probe is not None:
-            adapter = entry.checkpoint_probe(path, options)
-            if adapter is not None:
-                matches[name] = adapter
-    if not matches:
-        return ResolvedCheckpoint(checkpoint_dir)
-    if len(matches) != 1:
-        raise ValueError(
-            f"Multiple pipeline adapters recognize {checkpoint_dir}: {sorted(matches)}"
-        )
-    return next(iter(matches.values())).resolve()
+    path: str
+    class_name: str
+    entry: _PipelineEntry
+    pipeline_config: Dict[str, Any]
 
 
 class AutoPipeline:
-    """Factory for creating pipelines from config."""
+    """Resolve checkpoints and construct their selected pipeline."""
+
+    @staticmethod
+    def resolve(checkpoint_dir: str, pipeline_config: Dict[str, Any]) -> ResolvedPipeline:
+        """Select a family once, resolve its layout, and validate pipeline options.
+
+        Manifests use the existing detection rules. Native adapters are probed
+        before any supporting components are fetched; only a unique match resolves.
+        """
+        path = Path(checkpoint_dir)
+        checkpoint = ResolvedCheckpoint(checkpoint_dir)
+        matches = {}
+        if not any(
+            (path / name).is_file() for name in ("model_index.json", "modular_model_index.json")
+        ):
+            probe_options = MappingProxyType(dict(pipeline_config))
+            for name, entry in PIPELINE_REGISTRY.items():
+                if entry.checkpoint_probe is not None:
+                    adapter = entry.checkpoint_probe(path, probe_options)
+                    if adapter is not None:
+                        matches[name] = (entry, adapter)
+        if len(matches) > 1:
+            raise ValueError(
+                f"Multiple pipeline adapters recognize {checkpoint_dir}: {sorted(matches)}"
+            )
+        if matches:
+            class_name, (entry, adapter) = next(iter(matches.items()))
+            checkpoint = adapter.resolve()
+        else:
+            class_name, entry = AutoPipeline._select_existing_pipeline(checkpoint_dir)
+        options = {**checkpoint.pipeline_config, **pipeline_config}
+        unknown = set(options) - set(entry.defaults)
+        if unknown:
+            raise ValueError(
+                f"Unknown pipeline_config keys for {class_name} ({checkpoint_dir}): "
+                f"{sorted(unknown)}. Valid keys: {sorted(entry.defaults)}"
+            )
+        return ResolvedPipeline(checkpoint.path, class_name, entry, {**entry.defaults, **options})
 
     @staticmethod
     def from_config(
         config: "DiffusionPipelineConfig",
-        checkpoint_dir: str,
+        checkpoint_dir: str | ResolvedPipeline,
     ) -> "BasePipeline":
-        """
-        Create pipeline instance from DiffusionPipelineConfig.
-        """
-        # Detect pipeline type from model_index.json or from model safetensors
-        class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+        """Construct a selected pipeline, or detect an existing pipeline layout.
 
+        A caller supplying an already-built config must resolve native layouts
+        before loading that config and pass the resulting selection here.
+        """
+        if isinstance(checkpoint_dir, str):
+            class_name, entry = AutoPipeline._select_existing_pipeline(checkpoint_dir)
+            resolved = ResolvedPipeline(checkpoint_dir, class_name, entry, {})
+        else:
+            resolved = checkpoint_dir
+        AutoPipeline._validate_vae_quantization(config, resolved.class_name, resolved.entry)
+        pipeline_class = resolved.entry.pipeline_cls.resolve_variant(config)
+        logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {resolved.path}")
+        return pipeline_class(config)
+
+    @staticmethod
+    def _select_existing_pipeline(checkpoint_dir: str) -> tuple[str, _PipelineEntry]:
+        class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
         if class_name not in PIPELINE_REGISTRY:
             raise ValueError(
                 f"Unknown pipeline: '{class_name}'. "
-                f"Available: {list(PIPELINE_REGISTRY.keys())}\n"
-                f"Checkpoint: {checkpoint_dir}"
+                f"Available: {list(PIPELINE_REGISTRY.keys())}\nCheckpoint: {checkpoint_dir}"
             )
-
-        entry = PIPELINE_REGISTRY[class_name]
-        AutoPipeline._validate_vae_quantization(config, class_name, entry)
-        pipeline_class = entry.pipeline_cls
-
-        # Let the pipeline class upgrade itself to a specialised variant
-        # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
-        pipeline_class = pipeline_class.resolve_variant(config)
-
-        logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
-
-        # Instantiate pipeline with DiffusionPipelineConfig
-        return pipeline_class(config)
+        return class_name, PIPELINE_REGISTRY[class_name]
 
     @staticmethod
     def _validate_vae_quantization(

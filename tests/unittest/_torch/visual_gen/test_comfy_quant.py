@@ -26,7 +26,7 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3 import checkpoint as h3_ch
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.adaln_curves import interpolate_adaln_curve
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, resolve_checkpoint
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen import VisualGenArgs
@@ -746,7 +746,7 @@ def test_native_h3_dimensions_checked_before_component_download(native_h3_direct
 def test_native_discovery_leaves_pipeline_and_unrelated_weights_alone(tmp_path):
     save_file({"not_h3.weight": torch.ones(2, 2)}, tmp_path / "h3_ref2va.safetensors")
     assert h3_checkpoint.discover_native_h3(tmp_path) is None
-    (tmp_path / "model_index.json").write_text("{}")
+    (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "Model"}))
     assert h3_checkpoint.discover_native_h3(tmp_path) is None
 
 
@@ -840,11 +840,16 @@ def test_registered_checkpoint_adapter_is_model_independent(tmp_path, monkeypatc
 
     monkeypatch.setattr(
         "tensorrt_llm._torch.visual_gen.pipeline_registry.PIPELINE_REGISTRY",
-        {"UnrelatedPipeline": SimpleNamespace(checkpoint_probe=probe)},
+        {
+            "UnrelatedPipeline": SimpleNamespace(
+                checkpoint_probe=probe, defaults={"mode": "default"}
+            )
+        },
     )
-    result = resolve_checkpoint(str(tmp_path), {"mode": "requested"})
+    result = AutoPipeline.resolve(str(tmp_path), {"mode": "requested"})
     assert result.path == resolved_path
-    assert result.pipeline_config == {"mode": "detected"}
+    assert result.pipeline_config == {"mode": "requested"}
+    assert result.class_name == "UnrelatedPipeline"
     assert resolutions == [True]
 
 
@@ -859,26 +864,28 @@ def test_adapter_ambiguity_rejected_before_resolution(tmp_path, monkeypatch):
         {"First": entry, "Second": entry},
     )
     with pytest.raises(ValueError, match="Multiple pipeline adapters"):
-        resolve_checkpoint(str(tmp_path), {})
+        AutoPipeline.resolve(str(tmp_path), {})
 
 
 def test_standard_pipeline_bypasses_native_adapters(tmp_path, monkeypatch):
-    (tmp_path / "model_index.json").write_text("{}")
-    entry = SimpleNamespace(checkpoint_probe=lambda *args: pytest.fail("Already resolved"))
+    (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "Model"}))
+    entry = SimpleNamespace(
+        checkpoint_probe=lambda *args: pytest.fail("Already resolved"),
+        defaults={"workflow": "default"},
+    )
     monkeypatch.setattr(
         "tensorrt_llm._torch.visual_gen.pipeline_registry.PIPELINE_REGISTRY", {"Model": entry}
     )
-    assert resolve_checkpoint(str(tmp_path), {"workflow": "untouched"}).path == str(tmp_path)
+    assert AutoPipeline.resolve(str(tmp_path), {"workflow": "untouched"}).path == str(tmp_path)
 
 
-def test_unrecognized_checkpoint_keeps_original_path(tmp_path, monkeypatch):
+def test_unrecognized_checkpoint_fails_during_resolution(tmp_path, monkeypatch):
     entry = SimpleNamespace(checkpoint_probe=lambda *args: None)
     monkeypatch.setattr(
         "tensorrt_llm._torch.visual_gen.pipeline_registry.PIPELINE_REGISTRY", {"Model": entry}
     )
-    result = resolve_checkpoint(str(tmp_path), {})
-    assert result.path == str(tmp_path)
-    assert result.pipeline_config == {}
+    with pytest.raises(ValueError, match="Cannot detect pipeline type"):
+        AutoPipeline.resolve(str(tmp_path), {})
 
 
 def test_h3_adapter_registered_by_model():
@@ -892,14 +899,18 @@ def test_adapter_options_use_normal_validation_and_user_precedence(tmp_path, mon
     (tmp_path / "model_index.json").write_text(
         json.dumps({"_class_name": "MiniMaxH3ModularPipeline"})
     )
-    loader = PipelineLoader(
-        VisualGenArgs(model=str(tmp_path), pipeline_config={"workflow": "fl2va"}), device="cpu"
-    )
-    inferred = {"workflow": "ref2va"}
-    assert loader._resolve_pipeline_config(str(tmp_path), inferred)["workflow"] == "fl2va"
-    assert inferred == {"workflow": "ref2va"}
+
+    class Adapter:
+        def resolve(self):
+            return ResolvedCheckpoint(str(tmp_path), {"workflow": "ref2va"})
+
+    entry = PIPELINE_REGISTRY["MiniMaxH3ModularPipeline"]
+    monkeypatch.setattr(entry, "checkpoint_probe", lambda path, options: Adapter())
+    (tmp_path / "model_index.json").unlink()
+    result = AutoPipeline.resolve(str(tmp_path), {"workflow": "fl2va"})
+    assert result.pipeline_config["workflow"] == "fl2va"
     with pytest.raises(ValueError, match="Unknown pipeline_config keys"):
-        loader._resolve_pipeline_config(str(tmp_path), {"unknown_adapter_option": True})
+        AutoPipeline.resolve(str(tmp_path), {"unknown_adapter_option": True})
 
 
 @pytest.fixture(params=[1, 2])
@@ -985,7 +996,7 @@ def native_flux_directory(request, tmp_path, monkeypatch):
 
 def test_native_flux_directory_resolution(native_flux_directory):
     directory, base, calls, version = native_flux_directory
-    resolved = resolve_checkpoint(str(directory), {})
+    resolved = AutoPipeline.resolve(str(directory), {})
     selected = Path(resolved.path) / "transformer" / "diffusion_pytorch_model.safetensors"
     assert selected.resolve() == directory / "weights.safetensors"
     assert (Path(resolved.path) / "text_encoder" / "marker").read_text() == "supporting component"
@@ -994,7 +1005,7 @@ def test_native_flux_directory_resolution(native_flux_directory):
     assert calls[1][2] == base.name
     assert "transformer/*" not in calls[1][1]
     assert ("text_encoder_2/*" in calls[1][1]) == (version == 1)
-    assert resolve_checkpoint(str(directory), {}).path == resolved.path
+    assert AutoPipeline.resolve(str(directory), {}).path == resolved.path
     config = DiffusionPipelineConfig.from_pretrained(resolved.path, device="cpu")
     assert config.model_configs["transformer"].quant_config.quant_algo == QuantAlgo.NVFP4
 
@@ -1026,7 +1037,7 @@ def test_native_flux_rejects_wrong_base_before_component_download(
     config[field] = value
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match="do not match"):
-        resolve_checkpoint(str(directory), {})
+        AutoPipeline.resolve(str(directory), {})
     assert len(calls) == 1
 
 
@@ -1034,7 +1045,7 @@ def test_native_flux_rejects_ambiguous_directory(native_flux_directory):
     directory, _, calls, _ = native_flux_directory
     (directory / "second.safetensors").symlink_to(directory / "weights.safetensors")
     with pytest.raises(ValueError, match="Multiple FLUX checkpoints"):
-        resolve_checkpoint(str(directory), {})
+        AutoPipeline.resolve(str(directory), {})
     assert not calls
 
 
@@ -1045,7 +1056,7 @@ def test_native_flux_rejects_unsupported_variant(native_flux_directory):
     del weights["model.diffusion_model.guidance_in.in_layer.weight"]
     save_file(weights, path)
     with pytest.raises(ValueError, match="not a supported dev variant"):
-        resolve_checkpoint(str(directory), {})
+        AutoPipeline.resolve(str(directory), {})
     assert not calls
 
 
@@ -1054,8 +1065,68 @@ def test_native_flux_nested_directory(native_flux_directory):
     nested = directory / "diffusion_models"
     nested.mkdir()
     (directory / "weights.safetensors").rename(nested / "weights.safetensors")
-    resolved = resolve_checkpoint(str(directory), {})
+    resolved = AutoPipeline.resolve(str(directory), {})
     assert (
         Path(resolved.path, "transformer", "diffusion_pytorch_model.safetensors").resolve()
         == nested / "weights.safetensors"
     )
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_selected_pipeline_is_reused_for_construction(tmp_path, monkeypatch, native):
+    class Pipeline:
+        @classmethod
+        def resolve_variant(cls, config):
+            return cls
+
+        def __init__(self, config):
+            self.config = config
+
+    entry = SimpleNamespace(
+        pipeline_cls=Pipeline, checkpoint_probe=None, defaults={"mode": "default"}
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.pipeline_registry.PIPELINE_REGISTRY", {"Model": entry}
+    )
+    if native:
+        entry.checkpoint_probe = lambda path, options: SimpleNamespace(
+            resolve=lambda: ResolvedCheckpoint(str(path), {"mode": "inferred"})
+        )
+        monkeypatch.setattr(
+            AutoPipeline, "_detect_from_checkpoint", lambda path: pytest.fail("Already recognized")
+        )
+    else:
+        (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "Model"}))
+    selected = AutoPipeline.resolve(str(tmp_path), {"mode": "explicit"})
+    assert selected.entry is entry
+    assert selected.pipeline_config == {"mode": "explicit"}
+    monkeypatch.setattr(
+        AutoPipeline, "_detect_from_checkpoint", lambda path: pytest.fail("Already selected")
+    )
+    config = SimpleNamespace(model_configs={}, vae_conv_quant_config=None)
+    assert AutoPipeline.from_config(config, selected).config is config
+
+
+def test_from_config_does_not_adapt_an_already_configured_model(native_h3_directory):
+    directory, _, calls = native_h3_directory
+    with pytest.raises(ValueError, match="Cannot detect pipeline type"):
+        AutoPipeline.from_config(SimpleNamespace(), str(directory))
+    assert not calls
+
+
+def test_ltx_embedded_checkpoint_resolution_preserves_options(tmp_path):
+    save_file(
+        {"marker": torch.ones(1)},
+        tmp_path / "weights.safetensors",
+        metadata={"config": json.dumps({"transformer": {}, "vae": {}})},
+    )
+    options = {
+        "spatial_upsampler_path": "/models/upsampler",
+        "distilled_lora_path": "/models/lora",
+    }
+    selected = AutoPipeline.resolve(str(tmp_path), options)
+    assert selected.class_name == "LTX2Pipeline"
+    assert selected.path == str(tmp_path)
+    assert selected.pipeline_config == {"text_encoder_path": "google/gemma-3-12b-it", **options}
+    options["text_encoder_path"] = "/models/text"
+    assert AutoPipeline.resolve(str(tmp_path), options).pipeline_config == options
