@@ -1071,6 +1071,8 @@ class PyTorchModelEngine(ModelEngine):
             if early_start:
                 self._runner.before_warmup_forwards_callable = None
                 self._runner.warmup_batch_callable = None
+                from ..modules.top_k import TopK
+                TopK.on_first_forward = None
             if record_decode:
                 jit_prefetch_decode.stop_recording()
             if record_msa:
@@ -1122,8 +1124,9 @@ class PyTorchModelEngine(ModelEngine):
         engine limits alone before warmup's first forward, so they plan the
         warmup forwards' batches (``_plan_warmup_batch``), and queue the
         batches tune ahead will run at the end of warmup
-        (``JitPrefetcher.queue_early_batches``). MiniMax-M3's MSA decode
-        provider is registered too: it plans each decode launch class as
+        (``JitPrefetcher.queue_early_batches``). The radix top-k and CSA2
+        candidate-publication variants start here too, and MiniMax-M3's MSA
+        decode provider is registered: it plans each decode launch class as
         warmup records it (``JitPrefetcher.plan_recorded``)."""
         try:
             from ..jit_prefetch import JitPrefetcher
@@ -1132,6 +1135,7 @@ class PyTorchModelEngine(ModelEngine):
                 return
             self._register_tune_ahead_providers(prefetcher)
             prefetcher.queue_early_batches()
+            self._start_cute_dsl_topk_builds(prefetcher)
             if self._uses_minimax_m3_sparse():
                 from ..attention.backends.sparse.minimax_m3 import \
                     jit_prefetch_msa
@@ -1344,18 +1348,7 @@ class PyTorchModelEngine(ModelEngine):
             norm_provider = jcd.FlashInferNormProvider(self.model)
             if norm_provider:
                 prefetcher.enable_flashinfer_norm(norm_provider)
-            topk_provider = jcd.TopKProvider(self.model,
-                                             max_num_tokens=self.max_num_tokens,
-                                             max_seq_len=self.max_seq_len)
-            if topk_provider:
-                spec_cfg = getattr(self, "spec_config", None)
-                draft = getattr(spec_cfg, "max_draft_len", 0) or 0
-                prefetcher.enable_cute_dsl_topk(topk_provider,
-                                                next_ns=sorted({1, 1 + draft}))
-            publish_provider = jcd.Csa2PublishProvider(self.model,
-                                                       self.max_seq_len)
-            if publish_provider:
-                prefetcher.enable_csa2_publish(publish_provider)
+            self._start_cute_dsl_topk_builds(prefetcher)
         from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
         kv_cache_manager = (resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -1413,6 +1406,48 @@ class PyTorchModelEngine(ModelEngine):
         # tune ahead is on (TLLM_JIT_TUNE_AHEAD, default: TLLM_JIT_AHEAD).
         prefetcher.tune()
         prefetcher.start_background()
+
+    def _start_cute_dsl_topk_builds(self, prefetcher) -> None:
+        """Queue the CuTe DSL radix top-k and CSA2 candidate-publication
+        variants for the helpers. They follow from the model and the engine
+        limits, so they start before warmup's first forward, whose top-k
+        launches would otherwise compile them; later calls do nothing."""
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+            return
+        from .. import jit_prefetch_cute_dsl as jcd
+        from ..modules.top_k import TopK
+        spec_cfg = getattr(self, "spec_config", None)
+        draft = getattr(spec_cfg, "max_draft_len", 0) or 0
+        next_ns = sorted({1, 1 + draft})
+        max_num_tokens, max_seq_len = self.max_num_tokens, self.max_seq_len
+        topk_provider = jcd.TopKProvider(self.model,
+                                         max_num_tokens=max_num_tokens,
+                                         max_seq_len=max_seq_len)
+        if topk_provider:
+            prefetcher.enable_cute_dsl_topk(topk_provider, next_ns=next_ns)
+
+        # A sparse backend builds its indexer's TopK in its first forward:
+        # queue that instance's variants as it first runs, ahead of other work.
+        def on_first_forward(mod) -> None:
+            try:
+                provider = jcd.TopKProvider(None,
+                                            max_num_tokens=max_num_tokens,
+                                            max_seq_len=max_seq_len,
+                                            modules=[mod])
+                if provider:
+                    prefetcher.enable_cute_dsl_topk(provider,
+                                                    next_ns=next_ns,
+                                                    urgent=True,
+                                                    background=True)
+            except Exception as e:  # noqa: BLE001 - its variants compile in place
+                logger.warning(f"[JIT prefetch] TopK variants not queued: "
+                               f"{type(e).__name__}: {e}")
+
+        TopK.on_first_forward = on_first_forward
+        publish_provider = jcd.Csa2PublishProvider(self.model, self.max_seq_len)
+        if publish_provider:
+            prefetcher.enable_csa2_publish(publish_provider)
 
     def _register_tune_ahead_providers(self, prefetcher) -> None:
         """Register the providers that also tune ahead (``tune_batches``);

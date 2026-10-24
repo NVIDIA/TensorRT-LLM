@@ -1460,17 +1460,21 @@ class TopKProvider:
     dispatch (``torch.ops.trtllm.cute_dsl_indexer_topk_decode`` /
     ``..._prefill_blackwell``) on ``meta`` scores for every width bucket up to
     the longest score row and every row band up to the token budget, with the
-    runners' compiles capturing their key instead of compiling.
+    runners' compiles capturing their key instead of compiling. ``modules``
+    replaces the model's modules by the given ``TopK`` instances (one a sparse
+    backend built in its first forward, ``TopK.on_first_forward``). The specs
+    come in the order warmup reaches them: prefill, then decode, each from the
+    narrowest scores up.
     """
 
-    def __init__(self, model, max_num_tokens: int, max_seq_len: int):
+    def __init__(self, model, max_num_tokens: int, max_seq_len: int, modules=None):
         import torch
 
         from .modules.top_k import TopK, TopKImplementation
 
         self.cfgs = set()
         radix = TopKImplementation.CUTE_DSL_RADIX
-        for mod in _modules_with_attention_backends(model):
+        for mod in _modules_with_attention_backends(model) if modules is None else modules:
             if not isinstance(mod, TopK):
                 continue
             for phase, impl in (
@@ -1487,8 +1491,12 @@ class TopKProvider:
         return bool(self.cfgs)
 
     def _widths(self) -> List[int]:
-        out, w = [], 16
-        while w < 2 * self.max_cols:
+        # Every bucket from one column (short prefixes, compressed rows) to
+        # the one above max_seq_len's: a CUDA graph's decode scores can be a
+        # little wider than max_seq_len.
+        top = 2 * (1 << (self.max_cols - 1).bit_length())
+        out, w = [], 1
+        while w <= top:
             out.append(w)
             w *= 2
         return out
@@ -1513,7 +1521,7 @@ class TopKProvider:
         prefill = getattr(ops.cute_dsl_indexer_topk_prefill_blackwell, "_init_fn", None)
         specs = []
         meta = torch.device("meta")
-        for phase, top_k in sorted(self.cfgs):
+        for phase, top_k in sorted(self.cfgs, key=lambda c: (c[0] != "prefill", c[1])):
             body = prefill if phase == "prefill" else decode
             if body is None:
                 continue
@@ -1540,7 +1548,7 @@ class TopKProvider:
                             pass
                     for runner, key in keys:
                         specs.append(topk_spec(runner, key))
-        return sorted(set(specs))
+        return list(dict.fromkeys(specs))
 
 
 class Csa2PublishProvider:
@@ -1555,7 +1563,8 @@ class Csa2PublishProvider:
     gives it, which is fixed: 4 bytes for the fp32 scores and the int32
     outputs (their element size), 8 for the int64 visible lengths (whose
     rows start at a multiple of 8 bytes). Every capacity up to the kernel's
-    limit of 4096 blocks, or the widest ``max_seq_len`` positions reach, is
+    limit of 4096 blocks, or the one above the widest ``max_seq_len``
+    positions reach (a CUDA graph's scores can be a little wider), is
     enumerated up front.
     """
 
@@ -1598,7 +1607,7 @@ class Csa2PublishProvider:
         for block_size, sparse_block in sorted(self.geometries):
             blocks = min(4096, -(-self.max_seq_len // block_size))
             padded = 1
-            while padded < 2 * blocks and padded <= 4096:
+            while padded < 4 * blocks and padded <= 4096:
                 specs.append(csa2_publish_spec(block_size, padded, sparse_block, ptrs))
                 padded *= 2
         return specs

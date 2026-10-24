@@ -353,3 +353,53 @@ def test_recorded_launches_are_planned_on_a_thread_of_their_own(prefetcher):
     for t in threads:
         t.join(10.0)
     assert seen == ["jit_prefetch_recorded"]
+
+
+@pytest.mark.cpu_only
+def test_top_k_and_csa2_builds_are_queued_once(prefetcher, monkeypatch):
+    """The radix top-k and CSA2 publication variants are queued before
+    warmup's first forward. A later call queues only top-k variants not
+    queued before (a TopK a sparse backend builds in its first forward), on
+    a thread of its own when asked, and installs no loader twice; CSA2's
+    later calls do nothing."""
+    from tensorrt_llm._torch import jit_prefetch_cute_dsl as jcd
+
+    p = prefetcher
+    installed = []
+    monkeypatch.setattr(jp.JitPrefetcher, "_start_cute_dsl_helpers", lambda self: True)
+    monkeypatch.setattr(
+        jcd, "install_topk_loader", lambda loader: installed.append("topk") or ["r"]
+    )
+    monkeypatch.setattr(jcd, "install_csa2_loader", lambda loader: installed.append("csa2") or True)
+    p._queues[jcd.KIND] = queue.PriorityQueue()
+    topk = SimpleNamespace(enumerate_specs=lambda next_ns: ["t1", "t2"])
+    csa2 = SimpleNamespace(enumerate_specs=lambda: ["c1"])
+    assert p.enable_cute_dsl_topk(topk, next_ns=[1]) and p.enable_csa2_publish(csa2)
+    assert p.enable_cute_dsl_topk(topk, next_ns=[1]) and not p.enable_csa2_publish(csa2)
+    assert p._queues[jcd.KIND].qsize() == 3
+    later = SimpleNamespace(enumerate_specs=lambda next_ns: ["t2", "t3"])
+    assert p.enable_cute_dsl_topk(later, next_ns=[1], urgent=True, background=True)
+    for t in list(p._enum_threads):
+        t.join(10.0)
+    assert installed == ["topk", "csa2"]
+    assert p._queues[jcd.KIND].qsize() == 4
+
+
+@pytest.mark.cpu_only
+def test_a_topk_reports_itself_at_its_first_forward(monkeypatch):
+    """A TopK reaches the prefetcher's hook at its first forward, once, with
+    the implementation its owner chose after building it, so a TopK a sparse
+    backend builds in its first forward has its variants queued then."""
+    from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+
+    seen = []
+    monkeypatch.setattr(
+        TopK, "on_first_forward", lambda mod: seen.append(mod.prefill_implementation)
+    )
+    mod = TopK(2)
+    mod.prefill_implementation = TopKImplementation.TORCH
+    scores = torch.tensor([[0.1, 0.9, 0.5, 0.3]])
+    out = torch.zeros(1, 2, dtype=torch.int32)
+    for _ in range(2):
+        mod(scores, out, is_prefill=True, row_starts=torch.tensor([0]), row_ends=torch.tensor([4]))
+    assert seen == [TopKImplementation.TORCH]

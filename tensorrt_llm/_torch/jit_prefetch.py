@@ -1961,30 +1961,63 @@ class JitPrefetcher:
         )
         return True
 
-    def enable_cute_dsl_topk(self, topk_provider, next_ns=(1,)) -> bool:
-        """Compile the radix top-k variants the model's TopK modules can reach
-        in the CuTe DSL helpers, and have the runners load them."""
+    def enable_cute_dsl_topk(
+        self, topk_provider, next_ns=(1,), urgent: bool = False, background: bool = False
+    ) -> bool:
+        """Compile the radix top-k variants ``topk_provider``'s TopK modules
+        can reach in the CuTe DSL helpers, and have the runners load them.
+
+        Additive: the first call installs the loader, and each call queues
+        the variants no call queued before (the model's TopK modules before
+        warmup's first forward and at the end of each warmup; one a sparse
+        backend builds in its first forward, ahead of other work, ``urgent``,
+        with the enumeration on a thread of its own, ``background``)."""
         from . import jit_prefetch_cute_dsl as jcd
 
         if not topk_provider or not self._start_cute_dsl_helpers():
             return False
-        if not jcd.install_topk_loader(self._cute_dsl_load):
-            return False
-        specs = topk_provider.enumerate_specs(next_ns)
-        for spec in specs:
-            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
-        self._event(f"CuTe DSL top-k prefetch: {len(specs)} variant(s)")
+        if not getattr(self, "_topk_loader_installed", False):
+            if not jcd.install_topk_loader(self._cute_dsl_load):
+                return False
+            self._topk_loader_installed = True
+
+        def queue_specs() -> None:
+            seen = self.__dict__.setdefault("_topk_specs", set())
+            try:
+                specs = topk_provider.enumerate_specs(next_ns)
+            except Exception as e:  # noqa: BLE001 - those variants compile in place
+                logger.warning_once(
+                    f"[JIT prefetch] top-k variants not planned: {type(e).__name__}: {e}",
+                    key="jitp_topk_specs",
+                )
+                return
+            new = [spec for spec in specs if spec not in seen]
+            seen.update(new)
+            priority = _PRIO_URGENT if urgent else _PRIO_BATCH
+            for spec in new:
+                self._submit(spec, spec, "cute_dsl", priority, kind=jcd.KIND)
+            if new:
+                self._event(f"CuTe DSL top-k prefetch: {len(new)} variant(s)")
+
+        if background:
+            self._start_enumeration(queue_specs, "jit_prefetch_topk")
+        else:
+            queue_specs()
         return True
 
     def enable_csa2_publish(self, publish_provider) -> bool:
         """Compile CSA2's candidate-publication variants in the CuTe DSL
-        helpers and have CSA2's glue-kernel launcher load them."""
+        helpers and have CSA2's glue-kernel launcher load them. Only the first
+        call does anything."""
         from . import jit_prefetch_cute_dsl as jcd
 
+        if getattr(self, "_csa2_enabled", False):
+            return False
         if not publish_provider or not self._start_cute_dsl_helpers():
             return False
         if not jcd.install_csa2_loader(self._cute_dsl_load):
             return False
+        self._csa2_enabled = True
         specs = publish_provider.enumerate_specs()
         for spec in specs:
             self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)

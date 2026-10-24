@@ -216,7 +216,8 @@ def test_topk_export_is_what_the_op_runs(tmp_path):
     """Radix top-k variants enumerated by TopKProvider, compiled by the
     helper and loaded through the wrapped runners, give the same indices as
     an in-process compile, for decode batches of several row bands and
-    widths, and the runners compile nothing themselves."""
+    widths (from a few columns to a little more than max_seq_len, as a CUDA
+    graph's scores can be), and the runners compile nothing themselves."""
     from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
     from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 
@@ -231,7 +232,7 @@ def test_topk_export_is_what_the_op_runs(tmp_path):
     assert all(r["ok"] for r in replies), [r for r in replies if not r["ok"]][:3]
 
     g = torch.Generator(device="cuda").manual_seed(0)
-    cases = [(1, 600), (8, 1000), (40, 4096), (160, 2049)]
+    cases = [(1, 600), (8, 1000), (40, 4096), (160, 2049), (3, 5), (64, max_cols + 100)]
 
     def run():
         outs = []
@@ -332,7 +333,8 @@ def test_csa2_publish_export_is_what_the_op_runs(tmp_path):
     def run():
         g = torch.Generator(device="cuda").manual_seed(0)
         outs = []
-        for rows, width, start in [(5, 101, 0), (3, 13, 1), (2, 1000, 3)]:
+        # The last scores are a little wider than max_seq_len.
+        for rows, width, start in [(5, 101, 0), (3, 13, 1), (2, 1000, 3), (2, 1030, 0)]:
             scores = torch.rand(rows + start, width, generator=g, device="cuda")[start:]
             visible = torch.full((rows + start,), width, dtype=torch.int64, device="cuda")[start:]
             published = min(topk_blocks, -(-width // block_size)) * block_size

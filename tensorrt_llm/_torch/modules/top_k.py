@@ -38,6 +38,13 @@ class TopK(nn.Module):
     caller's eager or CUDA-graph metadata.
     """
 
+    # Called with an instance at its first forward, if set: JIT compile ahead
+    # queues the CuTe DSL top-k variants of an instance a sparse backend builds
+    # in its first forward (jit_prefetch_cute_dsl.TopKProvider). The first
+    # forward, not the constructor, since owners choose the implementation
+    # after constructing it.
+    on_first_forward = None
+
     def __init__(
         self,
         top_k: int,
@@ -74,6 +81,7 @@ class TopK(nn.Module):
         self._gvr_emission_state = None
         self._gvr_emission_route = None
         self._gvr_emission_armed = False
+        self._first_forward_reported = False
 
     @property
     def needs_gvr_prior(self) -> bool:
@@ -133,6 +141,10 @@ class TopK(nn.Module):
         Returns:
             ``output_indices`` after the selected implementation writes it.
         """
+        hook = TopK.on_first_forward
+        if hook is not None and not self._first_forward_reported:
+            self._first_forward_reported = True
+            hook(self)
         if is_prefill:
             assert row_starts is not None and row_ends is not None
             return self._forward_prefill(scores, row_starts, row_ends, output_indices)
