@@ -122,6 +122,29 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,
 # Run Kimi K3 at the serving parallelism (DEP16, see examples/kimi_k3/eval_extra_llm_options.yaml)
 NP=16 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --seq-len-q 1 --moe-max-num-tokens 33024 --use-low-precision-moe-combine
 
+# Run DeepSeek-V4 with MegaMoE, $DSV4 being a local checkpoint directory, as three arms:
+# load balancer off, per-layer dynamic EPLB (num_slots = experts + helper slots per rank * EP,
+# here 384 + 3 * 8), and perfectly balanced routing with the load balancer off (the upper
+# bound for any MoE load balancer). MEGAMOE_CUTEDSL is not in the balance-method whitelist,
+# so the arms use --balance-method NotModified. DeepSeek-V4 needs --tokens-per-block 128 or
+# 256, and --max-seq-len above 256 (an assert in its sparse-attention top-k); 512 is tested.
+# MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 selects the FP4 combine. A slice may start mid-model
+# (here 7,8).
+NP=8 ./mpi_launch.sh -x MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --tokens-per-block 128 --batch-size 64 --seq-len-q 128 --max-seq-len 512 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified
+NP=8 ./mpi_launch.sh -x MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --tokens-per-block 128 --batch-size 64 --seq-len-q 128 --max-seq-len 512 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified --moe-load-balancer eplb_per_layer_dynamic.yaml
+NP=8 ./mpi_launch.sh -x MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 -x ENABLE_PERFECT_ROUTER=expert_ids ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --tokens-per-block 128 --batch-size 64 --seq-len-q 128 --max-seq-len 512 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified
+# with eplb_per_layer_dynamic.yaml holding:
+#   mode: per_layer_dynamic
+#   num_slots: 408
+# Per-layer dynamic EPLB runs without CUDA graphs only, and online standard EPLB is not
+# supported on a layer slice; the runner rejects both.
+# To replay the routing of an end-to-end run, add --replay-file-path (see "Performance
+# alignment" below) to the first two arms only, each with a recording made with the same
+# num_slots: a recording with the load balancer off (384 slots) cannot be replayed into the
+# per-layer dynamic arm (408 slots), nor the reverse. Replay overrides the expert IDs that
+# ENABLE_PERFECT_ROUTER=expert_ids substitutes, so run the third arm without it; run.py
+# rejects that combination. Replay with MEGAMOE_CUTEDSL and the CTX phase is untested.
+
 # Run with DeepEP A2A
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_gen.yaml --moe-backend CUTEDSL

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import json
 import os
 from abc import ABC, abstractmethod
@@ -665,7 +666,7 @@ class SamplingParams:
         # | Sampling    | use_beam_search | beam_width == 1        |
         # | Sampling    | n               | num_return_sequences   |
         # | Sampling    | best_of         | no corresponding param |
-        fields = {f for f in dir(tllme.SamplingConfig) if not f.startswith("__")}
+        fields = _sampling_config_fields()
         unmatched_params = [
             "num_return_sequences",
             "beam_width",
@@ -684,12 +685,7 @@ class SamplingParams:
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
     def _get_output_config(self) -> tllme.OutputConfig:
-        sampling_param_fields = set(dir(SamplingParams))
-        fields = [
-            f
-            for f in dir(tllme.OutputConfig)
-            if not f.startswith("__") and f in sampling_param_fields
-        ]
+        fields = _output_config_fields()
 
         config_kwargs = {f: getattr(self, f) for f in fields}
 
@@ -747,3 +743,21 @@ class SamplingParams:
             )
         else:
             return None
+
+
+@functools.cache
+def _sampling_config_fields() -> frozenset[str]:
+    """Return the ``tllme.SamplingConfig`` field names.
+
+    They are fixed by the bindings, so the ``dir()`` scan runs once instead of once per request.
+    """
+    return frozenset(f for f in dir(tllme.SamplingConfig) if not f.startswith("__"))
+
+
+@functools.cache
+def _output_config_fields() -> tuple[str, ...]:
+    """Return the ``tllme.OutputConfig`` field names that ``SamplingParams`` also defines."""
+    sampling_param_fields = set(dir(SamplingParams))
+    return tuple(
+        f for f in dir(tllme.OutputConfig) if not f.startswith("__") and f in sampling_param_fields
+    )

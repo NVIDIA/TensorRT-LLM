@@ -420,6 +420,9 @@ def _request_flag(request, name: str) -> bool:
 
 
 class PyExecutor:
+    # Shutdown publication is leader-only, while join/finalize runs on every rank.
+    shutdown_all_ranks = True
+
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
     # If the number of micro batches is too small, the executor will spend too much time in synchronization.
@@ -2000,11 +2003,28 @@ class PyExecutor:
         Model-owned graphs are terminal model resources, unlike executor-owned
         graphs that may reference the resource managers torn down below.
         """
+        # Capture model owners before any rank-local shutdown step can fail;
+        # outer workers still need them for an all-rank unsafe preflight.
+        terminal_engines = list(getattr(self, "_terminal_model_engines", ()))
+        for engine in (getattr(self, "model_engine",
+                               None), getattr(self, "draft_model_engine",
+                                              None)):
+            if engine is not None and all(engine is not item
+                                          for item in terminal_engines):
+                terminal_engines.append(engine)
+        self._terminal_model_engines = tuple(terminal_engines)
+        if getattr(self, "_shutdown_runtime_complete", False):
+            self._finish_shutdown()
+            return
+
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
             node_server.close()
             self._openengine_node_server = None
-        self.executor_request_queue.enqueue_shutdown_request()
+        # Rank zero owns the request queue, but every rank receives the
+        # broadcast shutdown sentinel and must execute the common finalize path.
+        if self.can_shutdown():
+            self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         # Tear down any profile window an HTTP caller left open (i.e.
         # /start_profile without a matching /stop_profile).  Runs before the
@@ -2021,9 +2041,11 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             # Stop the relay thread and the native progress thread from
             # probing while the hang detector aborts MPI. A relay-thread probe
-            # already in flight is not interrupted.
+            # already in flight is not interrupted. Do not let the outer worker
+            # enter model collectives on a broken rank set.
             self._pp_mpi_progress_stop.set()
             self._stop_mpi_progress_thread()
+            self._terminal_model_engines = ()
             return
         self.worker_thread.join()
         if self.kv_connector_manager is not None:
@@ -2056,10 +2078,9 @@ class PyExecutor:
         # empty_cache), the subsequent CUDA graph teardown can trigger a
         # device-wide cudaErrorIllegalAddress when the driver touches metadata
         # for the now-freed memory regions.
-        for engine in (self.model_engine, self.draft_model_engine):
-            if engine is not None:
-                engine.release_executor_resources(
-                    release_model_owned_graphs=release_model_owned_graphs)
+        for engine in self._terminal_model_engines:
+            engine.release_executor_resources(
+                release_model_owned_graphs=release_model_owned_graphs)
         # Ensure graph destruction has fully completed on device before
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
@@ -2067,30 +2088,99 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
-        # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
-        # paired with shutdown_for_kv_cache_estimation() mid-init in
-        # configure_kv_cache_capacity(); that path immediately reads
-        # model_engine.model.model_config
-        # to compute kv_cache_max_memory. cleanup() would set
-        # model_engine.model = None, breaking that read with
-        # `'NoneType' object has no attribute 'model_config'`.
-        # The engine's __del__ still calls cleanup() at terminal teardown
-        # (when the executor's reference is dropped), which is sufficient for
-        # the GMS daemon registry eviction the cleanup hook was added for.
-        del self.model_engine
-        if self.draft_model_engine is not None:
-            del self.draft_model_engine
-        if self.virtual_memory_pools is not None:
-            keys = list(self.virtual_memory_pools.keys())
+        # Retry a later rank-local failure without repeating request
+        # publication, graph release, or resource-manager shutdown.
+        self._shutdown_runtime_complete = True
+        self._finish_shutdown()
+
+    def _finish_shutdown(self):
+        virtual_memory_pools = getattr(self, "virtual_memory_pools", None)
+        if virtual_memory_pools is not None:
+            keys = list(virtual_memory_pools.keys())
             for key in keys:
-                del self.virtual_memory_pools[key]
-        # Stop the sampler's async worker, if it was used
-        if (isinstance(self.sampler, AsyncWorkerMixin)
-                and self.sampler.async_worker_enabled()):
-            self.sampler.async_worker_stop()
-        if self.dwdp_manager is not None:
-            self.dwdp_manager.__exit__(None, None, None)
+                del virtual_memory_pools[key]
+        # Stop the sampler's async worker, if it was used.
+        if not getattr(self, "_shutdown_sampler_complete", False):
+            sampler = getattr(self, "sampler", None)
+            if (isinstance(sampler, AsyncWorkerMixin)
+                    and sampler.async_worker_enabled()):
+                sampler.async_worker_stop()
+            self._shutdown_sampler_complete = True
+        dwdp_manager = getattr(self, "dwdp_manager", None)
+        if dwdp_manager is not None:
+            dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        # Keep model owners reachable until every rank-local step succeeds. The
+        # outer worker runs collective terminal cleanup from the snapshot above.
+        self.model_engine = None
+        self.draft_model_engine = None
+
+    def terminal_cleanup(self, *, local_safe: bool = True) -> None:
+        """Collectively release model resources after all worker threads stop.
+
+        Every rank first completes local graph preparation for every engine,
+        then participates in every manager preflight/collective in the same
+        order. Rank-local model and FC12 cache release happens only afterwards.
+        """
+        engines = getattr(self, "_terminal_model_engines", ())
+        if not engines:
+            return
+
+        prepare_errors = []
+        if local_safe:
+            for engine in engines:
+                try:
+                    engine.prepare_cleanup()
+                except BaseException as error:
+                    prepare_errors.append(error)
+
+        collective_errors = []
+        collective_safe = bool(local_safe and not prepare_errors)
+        for engine in engines:
+            try:
+                manager_safe = engine.shutdown_moe_load_balancer(
+                    local_safe=collective_safe)
+            except BaseException as error:
+                collective_errors.append(error)
+                collective_safe = False
+            else:
+                collective_safe = collective_safe and manager_safe
+
+        if prepare_errors:
+            raise prepare_errors[0]
+        if collective_errors:
+            raise collective_errors[0]
+        if not collective_safe:
+            raise RuntimeError(
+                "MoE load-balancer collective shutdown was not safe on every rank"
+            )
+
+        local_errors = []
+        for engine in engines:
+            try:
+                engine.finish_cleanup()
+            except BaseException as error:
+                local_errors.append(error)
+
+        # FC12 runners are rank-local and may be released only after every
+        # model-owned collective resource has been closed.
+        try:
+            from ..moe.kernels.megamoe_shared_fc12 import \
+                release_shared_fc12_cache
+
+            device = self.execution_stream.device
+            device_index = device.index if hasattr(device,
+                                                   "index") else int(device)
+            release_shared_fc12_cache(
+                device_index,
+                stream_handle=int(self.execution_stream.cuda_stream),
+            )
+        except BaseException as error:
+            local_errors.append(error)
+
+        if local_errors:
+            raise local_errors[0]
+        self._terminal_model_engines = ()
 
     def can_enqueue_requests(self) -> bool:
         """

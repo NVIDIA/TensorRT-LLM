@@ -54,7 +54,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
-from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
@@ -1045,7 +1045,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
+    ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -1569,7 +1569,7 @@ class ModelLoader:
                 # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
                 # follow-up, drop the validator gate AFTER moving these calls
                 # into the pool scope.
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()

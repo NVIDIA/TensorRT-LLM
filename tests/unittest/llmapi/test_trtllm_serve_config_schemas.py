@@ -59,6 +59,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend_typo": "CUTLASS"}}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "not-a-backend"}}, False),
+        (generator.SERVE_SCHEMA, {"moe_config": {"load_balancer": "eplb.yaml"}}, True),
         (generator.SERVE_SCHEMA, {"backend": "pytorch"}, True),
         (generator.SERVE_SCHEMA, {"backend": "_autodeploy"}, False),
         (
@@ -140,6 +141,40 @@ def test_config_validation(
 ) -> None:
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize(
+    ("load_balancer", "valid"),
+    [
+        ({"num_slots": 288}, True),
+        ({"mode": "standard", "num_slots": 288, "layer_updates_per_iter": 1}, True),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 4}, True),
+        (
+            {"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "shared_banks"},
+            True,
+        ),
+        # A mapping without mode is standard EPLB, which has no auxiliary_sms.
+        ({"num_slots": 320, "auxiliary_sms": 4}, False),
+        ({"mode": "per_layer_dynamic"}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "layer_updates_per_iter": 1}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "private"}, False),
+        ({"mode": "dynamic", "num_slots": 320}, False),
+    ],
+)
+def test_load_balancer_schema_matches_runtime(
+    schemas: dict[str, dict], load_balancer: dict, valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import MoeConfig
+
+    config = {"moe_config": {"load_balancer": load_balancer}}
+    errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+    if valid:
+        MoeConfig(load_balancer=load_balancer)
+    else:
+        with pytest.raises(ValueError):
+            MoeConfig(load_balancer=load_balancer)
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
