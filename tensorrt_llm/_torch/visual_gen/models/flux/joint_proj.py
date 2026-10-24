@@ -30,6 +30,47 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm.mapping import Mapping
 
 
+def _split_nvfp4_projection(
+    weights: dict[str, torch.Tensor], sizes: list[int], *, dim: int
+) -> list[dict[str, torch.Tensor]]:
+    """Split normalized NVFP4 weights at logical row/column boundaries.
+
+    Packed columns contain two values per byte; block-scale columns cover
+    sixteen logical values. Global and activation scales remain shared.
+    Column splits omit bias, which the output wrapper applies after reduction.
+    """
+    weight = weights["weight"]
+    scales = weights.get("weight_scale")
+    if dim not in (0, 1) or not sizes or any(size <= 0 for size in sizes):
+        raise ValueError("NVFP4 projection splits require positive sizes and dim 0 or 1")
+    if weight.dtype != torch.uint8 or weight.ndim != 2:
+        raise ValueError("Expected packed NVFP4 projection weights")
+    if scales is None or tuple(scales.shape) != (weight.shape[0], weight.shape[1] // 8):
+        raise ValueError("Expected linear NVFP4 block scales before projection splitting")
+    logical_extent = weight.shape[dim] * (2 if dim == 1 else 1)
+    if sum(sizes) != logical_extent or (dim == 1 and any(size % 16 for size in sizes)):
+        raise ValueError("NVFP4 projection splits must cover the tensor and align to scale blocks")
+    result = [{} for _ in sizes]
+    for name, tensor in weights.items():
+        if name == "weight":
+            spans = [size // 2 for size in sizes] if dim == 1 else sizes
+            parts = tensor.split(spans, dim=dim)
+        elif name == "weight_scale":
+            spans = [size // 16 for size in sizes] if dim == 1 else sizes
+            parts = tensor.split(spans, dim=dim)
+        elif name == "bias":
+            if dim == 1:
+                continue
+            parts = tensor.split(sizes, dim=0)
+        elif tensor.numel() == 1:
+            parts = [tensor] * len(sizes)
+        else:
+            raise ValueError(f"Unsupported NVFP4 projection parameter: {name}")
+        for target, part in zip(result, parts):
+            target[name] = part.contiguous()
+    return result
+
+
 class FluxJointAttnMLPProj(nn.Module):
     """Output projection that accepts split attn + mlp inputs.
 
@@ -131,11 +172,14 @@ class FluxJointAttnMLPProj(nn.Module):
             loader.load_linear_weights(self.proj, "proj_out", [weight_dict])
         else:
             W = weight_dict["weight"]  # [out_dim, attn_dim + mlp_dim]
-            W_attn = W[:, : self.attn_dim]
-            W_mlp = W[:, self.attn_dim :]
-
-            for sub_module, sub_weight in [(self.attn_proj, W_attn), (self.mlp_proj, W_mlp)]:
-                loader.load_linear_weights(sub_module, "proj_out", [{"weight": sub_weight}])
+            if W.dtype == torch.uint8 and "weight_scale_2" in weight_dict:
+                parts = _split_nvfp4_projection(
+                    weight_dict, [self.attn_dim, W.shape[1] * 2 - self.attn_dim], dim=1
+                )
+            else:
+                parts = [{"weight": W[:, : self.attn_dim]}, {"weight": W[:, self.attn_dim :]}]
+            for sub_module, part in zip((self.attn_proj, self.mlp_proj), parts):
+                loader.load_linear_weights(sub_module, "proj_out", [part])
 
             if self.has_bias and "bias" in weight_dict:
                 self.bias.data.copy_(weight_dict["bias"].to(self.bias.dtype))
@@ -295,6 +339,21 @@ class FluxJointQKVMLPProj(nn.Module):
             return
 
         W = weight_dict["weight"]  # [full_qkv_dim + full_mlp_dim, in_dim]
+        if W.dtype == torch.uint8 and "weight_scale_2" in weight_dict:
+            parts = _split_nvfp4_projection(
+                weight_dict,
+                [
+                    self.full_q_dim,
+                    self.full_kv_dim,
+                    self.full_kv_dim,
+                    self.mlp_hidden_dim,
+                    self.mlp_hidden_dim,
+                ],
+                dim=0,
+            )
+            loader.load_linear_weights(self.qkv_proj, "to_qkv_mlp_proj", parts[:3])
+            loader.load_linear_weights(self.mlp_proj, "to_qkv_mlp_proj", parts[3:])
+            return
         W_qkv = W[: self.full_qkv_dim]
         W_mlp = W[self.full_qkv_dim :]
 

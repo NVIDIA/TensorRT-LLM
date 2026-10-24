@@ -27,6 +27,7 @@ from tqdm import tqdm
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_flux import convert_comfy_flux_weights
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import (
     Flux2ParallelSelfAttention,
@@ -602,12 +603,16 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
         )
 
         # Input embedders
-        # NOTE: x_embedder quantization is excluded when in_channels < 128.
+        # FP8 block quantization requires at least 128 input channels.
         # FLUX.2 has in_channels=128 (OK), but future variants with smaller latent
         # channels would hit the same fp8_block_scaling_gemm NVRTC failure as FLUX.1
         # (in_channels=64). This layer runs once per forward pass, so the perf
         # impact is negligible.
-        if in_channels < 128 and quant_config is not None:
+        if (
+            in_channels < 128
+            and quant_config is not None
+            and quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        ):
             if quant_config.exclude_modules is None:
                 quant_config.exclude_modules = []
             if "*x_embedder*" not in quant_config.exclude_modules:
@@ -824,6 +829,13 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
         Args:
             weights: Dictionary of parameter name -> tensor (from safetensors)
         """
+        if any(key.endswith(".comfy_quant") for key in weights):
+            if self.model_config.quant_config.quant_algo != QuantAlgo.NVFP4:
+                raise ValueError(
+                    "Comfy NVFP4 weights require NVFP4 modules before model construction"
+                )
+            weights = convert_comfy_flux_weights(weights, version=2, hidden_size=self.inner_dim)
+
         # Remap HF checkpoint keys to our module attribute names
         weights = _remap_checkpoint_keys(weights)
         # Remap FLUX.2 FFN keys (linear_out -> down_proj)
