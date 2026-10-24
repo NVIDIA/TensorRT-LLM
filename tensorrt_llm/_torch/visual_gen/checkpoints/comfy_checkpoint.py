@@ -98,11 +98,17 @@ def discover_native_h3(path: Path, workflow: str | None = None) -> NativeH3Check
             "Set pipeline_config.workflow to 'fl2va' or 'ref2va', or retain the publisher's "
             "workflow-labelled checkpoint filename."
         )
-    if inspect_comfy_quantization([file]) is None:
+    quantization = inspect_comfy_quantization([file])
+    if quantization is None:
         raise ValueError(
             f"Detected native H3 at {file}, but its weight encoding is unsupported: "
             "expected explicit Comfy NVFP4 metadata."
         )
+    logical_shapes = {
+        name.removeprefix("model.diffusion_model.") + ".weight": shape
+        for name, shape in quantization.nvfp4_layers.items()
+    }
+    shapes = {name: logical_shapes.get(name, shape) for name, shape in shapes.items()}
     return NativeH3Checkpoint(file.resolve(), selected_workflow, shapes)
 
 

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from tensorrt_llm._torch.visual_gen.checkpoints import comfy_checkpoint
 from tensorrt_llm._torch.visual_gen.checkpoints.comfy_bundle import prepare_comfy_bundle
@@ -778,3 +778,42 @@ def test_native_h3_rejects_untagged_encoding(native_h3_directory):
     with pytest.raises(ValueError, match="encoding is unsupported"):
         comfy_checkpoint.discover_native_h3(directory)
     assert not calls
+
+
+def test_legacy_fp8_metadata_remains_with_existing_loader(tmp_path):
+    path = tmp_path / "fp8.safetensors"
+    weight = torch.ones(32, 32).to(torch.float8_e4m3fn)
+    save_file(
+        {"proj.weight": weight},
+        path,
+        metadata={
+            "config": json.dumps({"transformer": {"_class_name": "LTX2VideoTransformer3DModel"}}),
+            "_quantization_metadata": json.dumps(
+                {"format_version": "1.0", "layers": {"proj": {"format": "float8_e4m3fn"}}}
+            ),
+        },
+    )
+    assert inspect_comfy_quantization([path]) is None
+    config = DiffusionPipelineConfig.from_pretrained(str(path), device="cpu")
+    assert config.model_configs["transformer"].quant_config.quant_algo == QuantAlgo.FP8
+    weights = WeightLoader().load_weights(str(path), Mapping())
+    assert set(weights) == {"proj.weight"}
+    torch.testing.assert_close(weights["proj.weight"].float(), weight.float())
+
+
+def test_native_h3_quantized_signature_uses_logical_shape(native_h3_directory):
+    directory, _, _ = native_h3_directory
+    path = directory / "minimax_h3_ref2va.safetensors"
+    weights = load_file(path)
+    quantized, _ = _checkpoint(64, 128)
+    weights.update(
+        {
+            name.replace("proj.", "condition_proj."): value
+            for name, value in quantized.items()
+            if name.startswith("proj.")
+        }
+    )
+    save_file(weights, path)
+    detected = comfy_checkpoint.discover_native_h3(directory)
+    assert detected.shapes["condition_proj.weight"] == (64, 128)
+    assert Path(comfy_checkpoint.resolve_native_h3(detected)).is_dir()

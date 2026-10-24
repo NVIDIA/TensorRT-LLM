@@ -35,13 +35,20 @@ def comfy_metadata_from_header(metadata: dict[str, str] | None) -> dict[str, tor
     if not metadata or "_quantization_metadata" not in metadata:
         return {}
     raw = metadata["_quantization_metadata"]
-    if len(raw) > 1024 * 1024:
-        raise ValueError("Comfy quantization metadata header is too large")
     try:
         config = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError("Invalid Comfy quantization metadata header") from exc
-    if not isinstance(config, dict) or config.get("format_version") != "1.0":
+    # The legacy header is shared with existing FP8 loaders. Claim only
+    # explicitly tagged NVFP4 recipes, then validate the entire recipe.
+    layers = config.get("layers", {}) if isinstance(config, dict) else {}
+    if not isinstance(layers, dict) or not any(
+        isinstance(recipe, dict) and recipe.get("format") == "nvfp4" for recipe in layers.values()
+    ):
+        return {}
+    if len(raw) > 1024 * 1024:
+        raise ValueError("Comfy quantization metadata header is too large")
+    if config.get("format_version") != "1.0":
         raise ValueError("Unsupported Comfy quantization metadata header version")
     if config.keys() - {"format_version", "layers"}:
         raise ValueError("Unsupported Comfy quantization metadata header fields")
