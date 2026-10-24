@@ -1396,6 +1396,11 @@ class MLA(nn.Module):
                 chunked_global_offset=chunked_global_offset,
                 chunked_max_seq_len=chunked_max_seq_len,
                 out_dtype=q.dtype,
+                helix_plan=(
+                    attn_metadata.helix_mla_chunk_plans[loop_idx]
+                    if attn_metadata.helix_mla_chunk_plans is not None
+                    else None
+                ),
             )
 
             # up proj to uncompressed kv
@@ -1598,7 +1603,10 @@ class MLA(nn.Module):
                 attn_metadata.helix_context_local_slots is not None
                 and attn_metadata.num_ctx_cached_tokens > 0
             ):
-                raise NotImplementedError("Helix cached context requires distributed KV gathering")
+                if not attn_metadata.runtime_features.chunked_prefill or get_sm_version() < 100:
+                    raise NotImplementedError(
+                        "Helix cached context requires chunked prefill on SM100 or newer"
+                    )
             trtllm_attention = cast(TrtllmAttention, self.mha)
             # Warm up maybe_compiled_cat for both the chunked-prefill path and
             # the cached-kv path; without this, the cached-kv prefill
