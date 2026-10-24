@@ -20,6 +20,7 @@ conversion functions and the streaming reframer state machine.
 
 import asyncio
 import json
+import re
 
 import pytest
 from pydantic import ValidationError
@@ -1488,3 +1489,40 @@ def test_cached_tokens_exceeding_prompt_tokens_is_logged(monkeypatch):
     assert converted.input_tokens == 0
     assert converted.cache_read_input_tokens == 99
     assert any("exceeds prompt_tokens" in str(w) for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# Message ids carry the engine request id
+# ---------------------------------------------------------------------------
+
+
+def test_message_id_carries_the_engine_request_id():
+    """``chatcmpl-<engine id>`` becomes ``msg_<engine id>_<hex>``, unique per message."""
+    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
+    response.id = "chatcmpl-123"
+
+    first = convert_chat_response(response).id
+    second = convert_chat_response(response).id
+
+    assert re.fullmatch(r"msg_123_[0-9a-f]{16}", first)
+    assert re.fullmatch(r"msg_123_[0-9a-f]{16}", second)
+    assert first != second
+
+
+def test_message_id_without_an_engine_request_id_is_random():
+    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
+    response.id = "chatcmpl-0a1b2c3d4e5f"
+
+    assert re.fullmatch(r"msg_[0-9a-f]{32}", convert_chat_response(response).id)
+
+
+def test_streamed_message_id_carries_the_engine_request_id():
+    first = chunk({"role": "assistant", "content": "hi"})
+    first.id = "chatcmpl-77"
+    last = chunk({}, finish_reason="stop", usage=UsageInfo(prompt_tokens=3, completion_tokens=1))
+    last.id = "chatcmpl-77"
+
+    events = run_reframer([first, last])
+
+    start = next(payload for name, payload in events if name == "message_start")
+    assert re.fullmatch(r"msg_77_[0-9a-f]{16}", start["message"]["id"])
