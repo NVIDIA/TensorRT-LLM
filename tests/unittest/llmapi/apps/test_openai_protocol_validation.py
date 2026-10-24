@@ -36,16 +36,18 @@ def _completion(**kw):
 
 
 def _chat(**kw):
-    return ChatCompletionRequest(model="m",
-                                 messages=[{
-                                     "role": "user",
-                                     "content": "hi"
-                                 }],
-                                 **kw)
+    return ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], **kw)
 
 
 def _responses(**kw):
     return ResponsesRequest(model="m", input="hi", **kw)
+
+
+def _rejected_field(build, **kw):
+    """Return the set of top-level field names that failed validation."""
+    with pytest.raises(ValidationError) as exc_info:
+        build(**kw)
+    return {err["loc"][0] for err in exc_info.value.errors()}
 
 
 # top_k only exists on completion / chat requests.
@@ -63,30 +65,32 @@ def test_valid_sampling_params_accepted(build):
 
 @pytest.mark.parametrize("build", ALL_BUILDERS)
 def test_negative_temperature_rejected(build):
-    with pytest.raises(ValidationError):
-        build(temperature=-0.1)
+    assert "temperature" in _rejected_field(build, temperature=-0.1)
 
 
 @pytest.mark.parametrize("build", ALL_BUILDERS)
 @pytest.mark.parametrize("bad_top_p", [-0.1, 1.1, 2.0])
 def test_out_of_range_top_p_rejected(build, bad_top_p):
-    with pytest.raises(ValidationError):
-        build(top_p=bad_top_p)
+    assert "top_p" in _rejected_field(build, top_p=bad_top_p)
 
 
 @pytest.mark.parametrize("build", BUILDERS_WITH_TOP_K)
 @pytest.mark.parametrize("bad_min_p", [-0.1, 1.1])
 def test_out_of_range_min_p_rejected(build, bad_min_p):
-    with pytest.raises(ValidationError):
-        build(min_p=bad_min_p)
+    assert "min_p" in _rejected_field(build, min_p=bad_min_p)
 
 
 @pytest.mark.parametrize("build", BUILDERS_WITH_TOP_K)
 def test_negative_top_k_rejected(build):
     # top_k = -1 is vLLM's default; TRT-LLM's backend requires top_k >= 0, so
     # reject it cleanly at the boundary rather than crashing.
-    with pytest.raises(ValidationError):
-        build(top_k=-1)
+    assert "top_k" in _rejected_field(build, top_k=-1)
+
+
+@pytest.mark.parametrize("build", BUILDERS_WITH_TOP_K)
+@pytest.mark.parametrize("edge_min_p", [0.0, 1.0])
+def test_min_p_boundaries_accepted(build, edge_min_p):
+    assert build(min_p=edge_min_p).min_p == edge_min_p
 
 
 @pytest.mark.parametrize("build", BUILDERS_WITH_TOP_K)
