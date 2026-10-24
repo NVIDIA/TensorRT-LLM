@@ -1277,6 +1277,7 @@ def _make_transfer_state_transceiver(session=None, rid: int = 42):
 
     sessions = {rid: session} if session is not None else {}
     transceiver = SimpleNamespace(
+        _pending_rank_info_admissions=None,
         _wait_reqs={},
         _send_sessions=dict(sessions),
         _send_reqs={rid: MagicMock()} if session is not None else {},
