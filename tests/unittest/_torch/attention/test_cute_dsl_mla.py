@@ -311,3 +311,21 @@ def test_generation_kv_lengths_keep_the_runner_alignment(num_contexts: int) -> N
     torch.testing.assert_close(aligned, generation_lengths)
     if generation_lengths.data_ptr() % 16 == 0:
         assert aligned is generation_lengths
+
+
+@pytest.mark.parametrize("num_contexts", [0, 1, 3, 4])
+def test_decode_kv_lengths_keep_one_pointer_per_step(num_contexts: int) -> None:
+    """Every layer of a step passes the same pointer, so the split plan runs once."""
+    meta = SimpleNamespace(max_num_requests=16)
+    sequence_lengths = torch.arange(1, 17, dtype=torch.int32)
+    generation_lengths = sequence_lengths[num_contexts:]
+
+    first_layer = CuteDslMlaFmha._decode_kv_lengths(meta, generation_lengths)
+    second_layer = CuteDslMlaFmha._decode_kv_lengths(meta, generation_lengths)
+
+    assert first_layer.data_ptr() % 16 == 0
+    assert second_layer.data_ptr() == first_layer.data_ptr()
+    torch.testing.assert_close(second_layer, generation_lengths)
+    if generation_lengths.data_ptr() % 16 == 0:
+        assert first_layer is generation_lengths
+        assert not hasattr(meta, "_cute_dsl_mla_kv_lens_staging")
