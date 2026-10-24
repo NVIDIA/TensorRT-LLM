@@ -14,5 +14,5 @@
 # the License.
 
 # Sources for the KVCM cold-page compression codec bridge. These are added to
-# the tensorrt_llm_batch_manager_static target by the parent CMakeLists.txt.
+# the KV-cache component target by the parent CMakeLists.txt.
 set(KV_CACHE_COMPRESSION_SRCS kv_cache_compression/nativeColdPageCodec.cpp)

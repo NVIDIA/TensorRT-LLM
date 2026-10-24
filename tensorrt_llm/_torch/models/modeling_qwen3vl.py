@@ -495,7 +495,9 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         if not isinstance(mm_handles, list):
             raise TypeError("mm_handles must be a list")
 
-        num_deepstack_levels = len(self.config.vision_config.deepstack_visual_indexes)
+        # Edge has no deepstack indexes. A missing field is zero levels.
+        deepstack_indexes = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
+        num_deepstack_levels = len(deepstack_indexes or [])
         # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
         # feature maps from deepstack layers.
         expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
@@ -601,15 +603,26 @@ class Qwen3VLVisionBlock(torch.nn.Module):
 
 class Qwen3VLVisionPatchMerger(torch.nn.Module):
     def __init__(
-        self, model_config: ModelConfig[PretrainedConfig], use_postshuffle_norm: bool = False
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        use_postshuffle_norm: bool = False,
+        merger_intermediate_size: Optional[int] = None,
+        norm_eps: Optional[float] = None,
     ) -> None:
         super().__init__()
         config = model_config.pretrained_config.vision_config
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
+        # Default keeps the historical square projection (merged width -> merged
+        # width). Callers such as Cosmos3-Edge pass a wider intermediate size.
+        self.merger_intermediate_size = (
+            self.hidden_size if merger_intermediate_size is None else merger_intermediate_size
+        )
+        if norm_eps is None:
+            norm_eps = model_config.pretrained_config.text_config.rms_norm_eps
         self.norm = LayerNorm(
             hidden_size=self.hidden_size if use_postshuffle_norm else config.hidden_size,
-            eps=model_config.pretrained_config.text_config.rms_norm_eps,
+            eps=norm_eps,
             dtype=model_config.pretrained_config.text_config.dtype,
         )
 
@@ -632,7 +645,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
 
         self.linear_fc1 = Linear(
             in_features=self.hidden_size,
-            out_features=self.hidden_size,
+            out_features=self.merger_intermediate_size,
             bias=True,
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
@@ -640,7 +653,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = Linear(
-            in_features=self.hidden_size,
+            in_features=self.merger_intermediate_size,
             out_features=config.out_hidden_size,
             bias=True,
             mapping=mapping,
@@ -1340,6 +1353,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             "Qwen3VLForConditionalGeneration": "Qwen3ForCausalLM",
             "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
             "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
+            "Cosmos3EdgeForConditionalGeneration": "Cosmos3EdgeForCausalLM",
             "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
             "Qwen4ExpForConditionalGeneration": "Qwen4ExpForCausalLM",
@@ -1351,7 +1365,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         llm_model_config.pretrained_config = config.text_config
         # The LM attention modules use extra_attrs through the outer wrapper.
         # Share the dict after deepcopy so compiled LM attention lookups see
-        # the same per-layer metadata as DecoderRunner.model_forward.
+        # the same per-layer metadata as DecoderRunner._model_forward.
         # Vision attention unregisters itself from this dict during init,
         # so it does not pollute LM lookups.
         llm_model_config.extra_attrs = model_config.extra_attrs
@@ -1364,9 +1378,13 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         # embeddings; disable_mm_encoder serves the checkpoint text-only and
         # saves the encoder's GPU memory for the KV cache pool.
         if not (_is_mm_disagg() or model_config.disable_mm_encoder):
-            self.mm_encoder = Qwen3VisionModelBase(
-                copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
-            ).eval()
+            vision_encoder_class = kwargs.get("vision_encoder_class")
+            if vision_encoder_class is None:
+                self.mm_encoder = Qwen3VisionModelBase(
+                    copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
+                ).eval()
+            else:
+                self.mm_encoder = vision_encoder_class(copy.deepcopy(model_config)).eval()
             # Reuse the encoder's own group definition so the aggregated and
             # mm-encoder-only paths share a single source of truth.
             self.mm_encoder_groups = self.mm_encoder.mm_encoder_groups
