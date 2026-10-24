@@ -22,6 +22,7 @@ import math
 import tempfile
 import unittest
 import unittest.mock
+from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -547,7 +548,10 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         backend_output = torch.zeros_like(hidden_states)
         starts = torch.tensor([0, 0, 0, 3], dtype=torch.int32)
         ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32)
-        attn_metadata = SimpleNamespace(num_tokens=4)
+        attn_metadata = SimpleNamespace(
+            num_tokens=4,
+            mixed_precision_kv_staging=lambda _: nullcontext(),
+        )
 
         with (
             unittest.mock.patch.object(attn.qkv_proj, "forward", return_value=qkv),
