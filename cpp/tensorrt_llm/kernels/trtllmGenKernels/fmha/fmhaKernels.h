@@ -38,6 +38,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/packageLocation.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 #include "cubin/kernelMetaInfo.h"
@@ -932,110 +933,27 @@ private:
             }
 #endif
 
-            // Always use pip show to find installation location at runtime
-            char const* cmd = "pip show tensorrt_llm 2>/dev/null";
-
-            // Buffer to store the output
-            std::array<char, 128> buffer;
-            std::string result;
-            // Open pipe to command
-#ifdef _MSC_VER
-            FILE* pipe = _popen(cmd, "r");
-#else
-            FILE* pipe = popen(cmd, "r");
-#endif
-            if (pipe)
+            auto const location = tensorrt_llm::common::getPackageLocation();
+            if (location)
             {
-                // Read the output
-                while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
+                // Build the exec path: try candidate paths in order of priority. The build directory only exists
+                // for an editable install, where the package location is the source root.
+                std::vector<std::filesystem::path> const candidatePaths{
+                    *location / buildRelPath, *location / "tensorrt_llm" / "include" / "trtllm_gen_kernels" / "fmha"};
+
+                bool pathFound = false;
+                for (auto const& candidate : candidatePaths)
                 {
-                    result += buffer.data();
+                    if (std::filesystem::exists(candidate))
+                    {
+                        execPathStr = (candidate / "numb").string();
+                        pathFound = true;
+                        break;
+                    }
                 }
-// Close the pipe
-#ifdef _MSC_VER
-                _pclose(pipe);
-#else
-                pclose(pipe);
-#endif
-                // Parse the location using regex
-                // `pip show tensorrt_llm` will output something like:
-                // Location: /usr/local/lib/python3.12/dist-packages
-                // Editable project location: /code
-                std::regex locationRegex("(Location|Editable project location): (.+)");
-                // Find all matches
-                auto match_begin = std::sregex_iterator(result.begin(), result.end(), locationRegex);
-                auto match_end = std::sregex_iterator();
-
-                // Get the number of matches
-                auto match_count = std::distance(match_begin, match_end);
-
-                if (match_count > 0)
-                {
-                    std::string location;
-                    bool foundEditable = false;
-
-                    // First, try to find "Editable project location" (preferred)
-                    for (auto it = match_begin; it != match_end; ++it)
-                    {
-                        std::string matchType = it->str(1);
-                        if (matchType == "Editable project location")
-                        {
-                            location = it->str(2);
-                            foundEditable = true;
-                            break;
-                        }
-                    }
-
-                    // If not found, use "Location" as fallback
-                    if (!foundEditable)
-                    {
-                        for (auto it = match_begin; it != match_end; ++it)
-                        {
-                            std::string matchType = it->str(1);
-                            if (matchType == "Location")
-                            {
-                                location = it->str(2);
-                                break;
-                            }
-                        }
-                    }
-
-                    // If still not found, use the last match as fallback
-                    if (location.empty())
-                    {
-                        TLLM_LOG_WARNING("No location found, using the last match as fallback.");
-                        auto last_match_iter = match_begin;
-                        std::advance(last_match_iter, match_count - 1);
-                        location = last_match_iter->str(2);
-                    }
-
-                    // Trim whitespace
-                    location.erase(location.find_last_not_of(" \n\r\t") + 1);
-
-                    // Build the exec path: try candidate paths in order of priority.
-                    std::vector<std::filesystem::path> candidatePaths;
-                    if (foundEditable)
-                    {
-                        candidatePaths.push_back(std::filesystem::path(location) / buildRelPath);
-                    }
-                    auto fmhaIncludeSuffix
-                        = std::filesystem::path("tensorrt_llm") / "include" / "trtllm_gen_kernels" / "fmha";
-                    candidatePaths.push_back(std::filesystem::path(location) / fmhaIncludeSuffix);
-
-                    bool pathFound = false;
-                    for (auto const& candidate : candidatePaths)
-                    {
-                        if (std::filesystem::exists(candidate))
-                        {
-                            execPathStr = (candidate / "numb").string();
-                            pathFound = true;
-                            break;
-                        }
-                    }
-                    TLLM_CHECK_WITH_INFO(pathFound,
-                        "FMHA NVRTC kernel headers not found in any candidate path. "
-                        "FMHA JIT compilation may fail. Please check the installation of TensorRT-LLM.");
-                }
+                TLLM_CHECK_WITH_INFO(pathFound,
+                    "FMHA NVRTC kernel headers not found in any candidate path. "
+                    "FMHA JIT compilation may fail. Please check the installation of TensorRT-LLM.");
             }
             else
             {

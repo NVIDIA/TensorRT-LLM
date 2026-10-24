@@ -28,6 +28,16 @@ add_tllm_gtest(
   LABELS
   "unit;common;host")
 add_tllm_gtest(
+  packageLocationTest
+  OWNER
+  common
+  SOURCES
+  packageLocationTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  LABELS
+  "unit;common;host")
+add_tllm_gtest(
   quantizationTest
   OWNER
   common
