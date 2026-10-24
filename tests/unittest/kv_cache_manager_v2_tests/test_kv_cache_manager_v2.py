@@ -696,6 +696,16 @@ class TestRetention(TestKVCacheManagerV2):
             with self.subTest(level=level), self.assertRaises(IndexError):
                 self.manager.prefetch_reuse(ReuseScope(), [1, 2, 3, 4], CacheLevel(level))
 
+    def test_prefetch_without_a_live_kv_cache(self) -> None:
+        """Prefetch works while no KV cache holds the manager, as on a server's first step."""
+        self._prepare_retention(host_quota=2 << 20)
+        tokens = list(range(8))
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
+        self._cache(tokens)
+        self._close_caches()
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, CacheLevel(1)))
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
+
     def test_offload_reload_preserves_priority_and_partial_reuse(self) -> None:
         self._prepare_retention(host_quota=2 << 20)
         tokens = [1, 2, 3, 4]
