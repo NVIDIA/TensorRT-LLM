@@ -1003,6 +1003,8 @@ def test_stream_whitespace_inside_an_open_text_block_stays_with_the_text():
         if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
     ]
     assert "".join(texts) == "hello world"
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["text"]
 
 
 def test_stream_trailing_whitespace_opens_no_text_block():
