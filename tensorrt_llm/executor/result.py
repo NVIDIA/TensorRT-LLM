@@ -1209,6 +1209,7 @@ class GenerationResult(GenerationResultBase):
                 self._disaggregated_params,
                 multimodal_positions=list(mm_positions),
                 multimodal_lengths=list(mm_lengths),
+                multimodal_input=dataclasses.asdict(mm_input),
             )
 
     @property

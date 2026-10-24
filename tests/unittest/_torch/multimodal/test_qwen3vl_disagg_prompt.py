@@ -242,6 +242,7 @@ def test_disagg_preprocess_keeps_processor_params_and_mrope(monkeypatch, deepsta
 def test_disagg_decode_rebuilds_only_mrope_params():
     llm = object.__new__(BaseLLM)
     llm._hf_model_config = SimpleNamespace(is_encoder_decoder=False)
+    llm.input_processor = SimpleNamespace()
     mrope_ids, mrope_deltas = {"position_ids": "handle"}, {"position_deltas": "handle"}
     disagg = DisaggregatedParams(
         request_type="generation_only",

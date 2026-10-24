@@ -57,6 +57,9 @@ class DisaggregatedParams:
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
         multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
         multimodal_lengths (List[int]): Prompt-token count of each multimodal item.
+        multimodal_input (Dict[str, Any]): The context worker's MultimodalInput as a dict
+         (hashes, positions, lengths, UUIDs and runs). The generation worker uses it as the
+         multimodal KV cache identity.
         multimodal_input_layout (MultimodalInputLayout): Exact encoder-side
          prompt and multimodal layout to preserve during E/P handoff.
     """
@@ -87,6 +90,7 @@ class DisaggregatedParams:
     multimodal_hashes: Optional[List[List[int]]] = (
         None  # user provided mm hashes should be a list of 8 integers
     )
+    multimodal_input: Optional[Dict[str, Any]] = None
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
     multimodal_input_layout: Optional["MultimodalInputLayout"] = None

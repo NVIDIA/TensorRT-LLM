@@ -32,7 +32,7 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
@@ -338,6 +338,17 @@ def _multimodal_params_have_encoder_features(
     audio_data = multimodal_params.multimodal_data.get("audio")
     return isinstance(audio_data,
                       dict) and "encoder_input_features" in audio_data
+
+
+def _config_uses_mrope(config: Any) -> bool:
+    """True when a HF config or its text config declares mRoPE."""
+    for cfg in (config, getattr(config, "text_config", None)):
+        for name in ("rope_scaling", "rope_parameters"):
+            rope = getattr(cfg, name, None)
+            if isinstance(rope, dict) and ("mrope_section" in rope
+                                           or rope.get("type") == "mrope"):
+                return True
+    return False
 
 
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -1013,6 +1024,9 @@ class BaseLLM:
         is_mm_disagg = (disaggregated_params is not None
                         and disaggregated_params.multimodal_embedding_handles
                         is not None)
+        from tensorrt_llm._torch.shared_tensor import (
+            SharedTensorContainer, _SharedTensorRebuildMethodRegistry)
+
         is_gen_only = (disaggregated_params is not None and
                        disaggregated_params.request_type == "generation_only")
 
@@ -1077,6 +1091,35 @@ class BaseLLM:
               and inputs.get("multi_modal_data") is None
               and inputs.get("multi_modal_embeddings") is None):
             prompt_token_ids = inputs['prompt_token_ids']
+            if is_gen_only:
+                get_mm_token_ids = getattr(self.input_processor,
+                                           "get_mm_token_ids", None)
+                mm_token_ids = (get_mm_token_ids()
+                                if callable(get_mm_token_ids) else None)
+                has_mm_tokens = (mm_token_ids is not None and not set(
+                    mm_token_ids.tolist()).isdisjoint(prompt_token_ids))
+                if has_mm_tokens:
+                    has_mrope = (
+                        disaggregated_params.mrope_position_ids_handle
+                        or disaggregated_params.mrope_position_deltas_handle)
+                    if has_mrope or _config_uses_mrope(
+                            getattr(self.input_processor, "config", None)):
+                        for name in ("mrope_position_ids_handle",
+                                     "mrope_position_deltas_handle"):
+                            handle = getattr(disaggregated_params, name)
+                            if (not handle or handle.get("method_key")
+                                    != _SharedTensorRebuildMethodRegistry.
+                                    REBUILD_BYTES):
+                                raise ValueError(
+                                    "Generation-only multimodal input requires "
+                                    "portable mRoPE position IDs and deltas "
+                                    "from the context worker")
+                    kv_config = getattr(self.args, "kv_cache_config", None)
+                    if (getattr(kv_config, "enable_block_reuse", False)
+                            and disaggregated_params.multimodal_input is None):
+                        raise ValueError(
+                            "Generation-only multimodal input with KV reuse "
+                            "requires cache identity from the context worker")
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
@@ -1091,8 +1134,14 @@ class BaseLLM:
                 mrope_config[
                     "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
                 multimodal_data["mrope_config"] = mrope_config
-            if multimodal_data:
+            multimodal_input = None
+            if (is_gen_only
+                    and disaggregated_params.multimodal_input is not None):
+                multimodal_input = MultimodalInput(
+                    **disaggregated_params.multimodal_input)
+            if multimodal_data or multimodal_input is not None:
                 multimodal_params = MultimodalParams(
+                    multimodal_input=multimodal_input,
                     multimodal_data=multimodal_data)
         # This is the fast path for token IDs & MM data, as well as the slow path for text prompt and/or MM data,
         # for both encode or aggregated workers.
@@ -1142,15 +1191,9 @@ class BaseLLM:
                 if not multimodal_params.has_content():
                     multimodal_params = None
                 else:
-                    # Convert to shared tensor handle to reduce IPC overhead
-                    multimodal_params.to_handle("multimodal_data")
-                    if (disaggregated_params is not None) and (
-                            "mrope_config"
-                            in multimodal_params.multimodal_data):
-                        # Propagate mRoPE handles during context-only P -> D so decode-only
-                        # can rebuild mrope_config without raw multimodal inputs.
-                        mrope_config = multimodal_params.multimodal_data[
-                            "mrope_config"]
+                    if disaggregated_params is not None:
+                        mrope_config = multimodal_params.multimodal_data.get(
+                            "mrope_config", {})
                         mrope_position_ids = mrope_config.get(
                             "mrope_position_ids")
                         mrope_position_deltas = mrope_config.get(
@@ -1158,9 +1201,12 @@ class BaseLLM:
                         if (mrope_position_ids is not None
                                 and mrope_position_deltas is not None):
                             disaggregated_params.mrope_position_ids_handle = (
-                                mrope_position_ids)
+                                SharedTensorContainer.from_tensor_bytes(
+                                    mrope_position_ids).dump_to_dict())
                             disaggregated_params.mrope_position_deltas_handle = (
-                                mrope_position_deltas)
+                                SharedTensorContainer.from_tensor_bytes(
+                                    mrope_position_deltas).dump_to_dict())
+                    multimodal_params.to_handle("multimodal_data")
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
