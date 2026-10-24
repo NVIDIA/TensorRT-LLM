@@ -564,6 +564,48 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     assert creator._get_multimodal_encoder_memory_reserve(64) == expected_reserve
 
 
+@pytest.mark.parametrize(
+    ("batch_size", "max_num_tokens", "beam_width", "tokens_per_step", "expected_rows"),
+    [(512, 8192, 1, 1, 512), (512, 64, 1, 1, 64), (4, 1024, 2, 4, 32)],
+)
+def test_logits_reserve_covers_serving_rows(
+    batch_size: int,
+    max_num_tokens: int,
+    beam_width: int,
+    tokens_per_step: int,
+    expected_rows: int,
+) -> None:
+    """Cover eager logits and their cast at batch, token and speculative limits."""
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            vocab_size_padded=248320,
+            model_config=SimpleNamespace(torch_dtype=torch.bfloat16),
+        )
+    )
+    creator._mapping = Mapping()
+    creator._max_batch_size = batch_size
+    creator._max_num_tokens = max_num_tokens
+    creator._max_beam_width = beam_width
+    creator._speculative_config = (
+        SimpleNamespace(tokens_per_gen_step=tokens_per_step) if tokens_per_step > 1 else None
+    )
+
+    assert creator._get_logits_memory_reserve() == expected_rows * 248320 * (2 + 4)
+
+
+@pytest.mark.parametrize("last_pp_rank", [False, True])
+def test_logits_reserve_skips_models_without_lm_head(last_pp_rank: bool) -> None:
+    """Pipeline intermediates and models without a vocabulary need no reserve."""
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = Mapping(world_size=2, rank=int(last_pp_rank), pp_size=2)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace() if last_pp_rank else SimpleNamespace(vocab_size_padded=248320)
+    )
+
+    assert creator._get_logits_memory_reserve() == 0
+
+
 def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
     model = _EncoderCacheMultimodalModel(64)
     creator = _make_reserve_creator(
@@ -1440,6 +1482,7 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
         (90, False, True, False, 384, 128),
     ],
 )
+@pytest.mark.parametrize("vocab_size_padded", [None, 1000])
 def test_estimation_temporarily_uses_inferred_pool_sizing(
     sm: int,
     chunked_workspace_profiled: bool,
@@ -1447,6 +1490,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     bounded: bool,
     expected_budget: int,
     expected_cap: int | None,
+    vocab_size_padded: int | None,
 ) -> None:
     """Verify measured chunk capacity and preserve Hopper's existing reserve policy."""
 
@@ -1466,6 +1510,8 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     # Explicit False: try_prepare_estimation skips estimation for
     # encoder-decoder models, and a bare Mock attribute is truthy.
     model_engine.model.model_config.is_encoder_decoder = False
+    model_engine.model.vocab_size_padded = vocab_size_padded
+    model_engine.model.model_config.torch_dtype = torch.bfloat16
     # A bare Mock would auto-create the attribute; real engines set it to
     # None unless the model opted into MM item scheduling.
     model_engine.mm_encoder_output_budget_bytes = None
@@ -1513,7 +1559,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
             "_get_token_num_for_estimation",
             return_value=estimation_max_tokens,
         ),
-        patch.object(creator, "_cal_max_memory", return_value=512),
+        patch.object(creator, "_cal_max_memory", return_value=512) as calculate_memory,
         patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
         patch.object(
             torch.cuda,
@@ -1543,6 +1589,8 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
         creator.configure_kv_cache_capacity(py_executor)
 
     assert kv_cache_config.max_gpu_total_bytes == expected_budget
+    logits_reserve = 8 * (vocab_size_padded or 0) * (2 + 4)
+    assert calculate_memory.call_args.args[0] == 384 + logits_reserve
     assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
     py_executor.warmup_scope.assert_called_once_with()
     py_executor.start_worker.assert_called_once()

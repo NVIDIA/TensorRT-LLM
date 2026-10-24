@@ -1529,6 +1529,28 @@ class KvCacheCreator:
             reserve += 2 * chunk_output_bytes
         return reserve
 
+    def _get_logits_memory_reserve(self) -> int:
+        """Reserve model-dtype logits and their simultaneous float32 copy.
+
+        Context-only profiling does not materialize the logits of a full
+        serving batch. Eager mixed context/decode steps need those rows even
+        when decode-only steps use CUDA graphs.
+        """
+        if not self._mapping.is_last_pp_rank():
+            return 0
+        model = self._model_engine.model
+        vocab_size = getattr(model, "vocab_size_padded", None)
+        if not vocab_size:
+            return 0
+        tokens_per_step = (1 if self._speculative_config is None else
+                           self._speculative_config.tokens_per_gen_step)
+        num_rows = min(
+            self._max_num_tokens,
+            self._max_batch_size * self._max_beam_width * tokens_per_step)
+        bytes_per_row = vocab_size * (model.model_config.torch_dtype.itemsize +
+                                      torch.float32.itemsize)
+        return num_rows * bytes_per_row
+
     def _get_penalty_workspace_reserve(self, py_executor) -> int:
         """Reserve the overlap-headroom seats' penalty workspace.
 
@@ -1864,6 +1886,13 @@ class KvCacheCreator:
             logger.info(
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
+
+        logits_memory_reserve = self._get_logits_memory_reserve()
+        peak_memory += logits_memory_reserve
+        if logits_memory_reserve:
+            logger.info(
+                f"Reserving {logits_memory_reserve / GB:.2f} GiB for the "
+                "logits of a full-batch step not materialized by profiling.")
 
         fixed_workspace_reserve = get_attention_workspace_fixed_bytes(
             self._model_engine.model.model_config,
