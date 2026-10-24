@@ -469,6 +469,29 @@ def test_kimi_fp4_mla_rejects_v1(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
+def test_kimi_fp4_mla_rejects_block_reuse_with_kv_pool_rebalance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    model_config = _kimi_model_config()
+    model_config.quant_config = _fp4_kv_quant_config()
+    model_config.attn_backend = "TRTLLM"
+
+    # The FP4 MLA route keeps the hybrid V2 manager's reuse/rebalance check.
+    with pytest.raises(ValueError, match="enable_kv_pool_rebalance"):
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(
+                dtype="nvfp4",
+                tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+                use_kv_cache_manager_v2=True,
+                enable_block_reuse=True,
+                enable_kv_pool_rebalance=True,
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     "runtime,expected",
     [("PYTHON", KimiK3HybridCacheManager), ("CPP", ValueError)],
