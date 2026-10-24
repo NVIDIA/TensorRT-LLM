@@ -1182,3 +1182,68 @@ def test_confidence_state_is_absent_when_scheduling_is_disabled():
     assert worker.staged_confidence_buffer() is None
     assert worker.confidence_stamp_buffer() is None
     assert worker.verify_planner is None
+
+
+def test_prepare_does_not_synchronize_the_stream():
+    """prepare() runs on the host while the previous iteration's graph is still
+    executing under the overlap scheduler, so it must not synchronize the stream.
+
+    Covers the per-iteration scratch-row reset, a finished request's slot release
+    and a new generation request's slot assignment.
+    """
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    stale = worker._assign_slot(100, reset=True)
+    worker._assign_slot(101, reset=True)
+    scratch = worker._scratch_slot
+    for slot in (stale, scratch):
+        worker._ctx_len[slot] = 17
+        worker._valid_len[slot] = 8
+        worker._position_initialized[slot] = True
+    torch.cuda.synchronize()
+
+    meta.request_ids = [101, 102]
+    meta.num_generations = 2
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        meta.prepare()
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+    assert 100 not in worker._req_to_slot
+    fresh = worker._req_to_slot[102]
+    for slot in (stale, scratch, fresh):
+        assert int(worker._ctx_len[slot]) == 0
+        assert int(worker._valid_len[slot]) == 0
+        assert not bool(worker._position_initialized[slot])
+
+
+def test_assign_slot_reset_does_not_synchronize_the_stream():
+    """Re-seeding a request from position 0 releases and reassigns its slot from
+    the host, so it must not synchronize the stream either."""
+    worker = _make_worker()
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=4))
+
+    old = worker._assign_slot(100, reset=False)
+    worker._ctx_len[old] = 42
+    worker._valid_len[old] = 8
+    worker._position_initialized[old] = True
+    worker._kv_windows[old].fill_(1.0)
+    torch.cuda.synchronize()
+
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        fresh = worker._assign_slot(100, reset=True)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+    for slot in (old, fresh):
+        assert int(worker._ctx_len[slot]) == 0
+        assert int(worker._valid_len[slot]) == 0
+        assert not bool(worker._position_initialized[slot])
+        assert float(worker._kv_windows[slot].abs().sum()) == 0.0
