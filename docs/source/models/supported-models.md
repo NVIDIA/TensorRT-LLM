@@ -232,15 +232,15 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
-|---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | No |
-| **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image-Layered** [^vg2] | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No |
-| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | Text Encoder TP |
+|---|---|---|---|---|---|---|---|---|---|--|--|--|---|
+| **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | No | Yes |
+| **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image-Layered** [^vg2] | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
+| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
