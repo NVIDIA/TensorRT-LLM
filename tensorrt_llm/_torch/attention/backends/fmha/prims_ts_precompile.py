@@ -21,8 +21,22 @@ worker ends with every variant on disk whether the workspace is private to the
 rank (TRT-LLM's default) or shared between ranks. Failures are best-effort:
 the caller falls back to compiling in-process.
 
+Host load. Every worker is an interpreter that imports torch and the CuTe DSL,
+opens a CUDA context on its rank's GPU and runs ``cute.compile`` (one to a few
+GB of host memory and one busy core each). Under the default launcher each
+rank owns a private FlashInfer workspace, so the ranks of one host do not
+share compiles and every rank fans out on its own. The default worker count
+therefore follows the number of ranks on the host (from the model's
+``Mapping``, or the launcher's environment): at most 4 per rank and at most
+``_HOST_COMPILE_BUDGET`` (16) workers per host in total, so a TP=8 node runs 2
+workers per rank, not 32 subprocesses at once. Set
+``TLLM_PRIMTS_WARM_WORKERS`` explicitly to trade startup time against host
+memory and CPU on a given node.
+
 Environment:
-    TLLM_PRIMTS_WARM_WORKERS   subprocess count, default 4; 0 or 1 disables.
+    TLLM_PRIMTS_WARM_WORKERS   subprocess count per rank; default 4 capped so
+                               that all ranks on the host start at most 16;
+                               0 or 1 disables.
     TLLM_PRIMTS_WARM_TIMEOUT   seconds to wait for the workers, default 1800.
     TLLM_PRIMTS_WARM_STRICT    1 turns a worker failure into an error (tests).
 """
@@ -31,7 +45,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+import subprocess  # nosec B404 - runs sys.executable workers with a fixed argv, no shell
 import sys
 import tempfile
 import time
@@ -49,9 +63,46 @@ sys.exit(_main(sys.argv))
 """
 
 
-def worker_count(num_payloads: int) -> int:
-    """Subprocess count from ``TLLM_PRIMTS_WARM_WORKERS`` (default 4); ``0``/``1`` disables.
+_MAX_DEFAULT_WORKERS = 4
+_HOST_COMPILE_BUDGET = 16  # default workers of all ranks on one host, together
+_LOCAL_RANK_ENV = ("OMPI_COMM_WORLD_LOCAL_SIZE", "RAY_LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE")
 
+
+def local_rank_count(mapping) -> int:
+    """Ranks of this job on this host, without any MPI call.
+
+    From the model's ``Mapping`` (``min(world_size, gpus_per_node)``) when the
+    caller has one, else from the launcher's environment, else 1. No
+    communicator query: this runs inside the first forward, where a collective
+    would hang if the ranks reached it at different points.
+    """
+    if mapping is not None:
+        world = int(getattr(mapping, "world_size", 0) or 0)
+        per_node = int(getattr(mapping, "gpus_per_node", 0) or 0)
+        if world > 0 and per_node > 0:
+            return max(1, min(world, per_node))
+        if world > 0:
+            return world
+    for name in _LOCAL_RANK_ENV:
+        raw = os.environ.get(name)
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                continue
+    return 1
+
+
+def default_worker_count(local_ranks: int = 1) -> int:
+    """Per-rank default: 4, lowered so the ranks on the host start at most 16 workers."""
+    return max(1, min(_MAX_DEFAULT_WORKERS, _HOST_COMPILE_BUDGET // max(1, int(local_ranks))))
+
+
+def worker_count(num_payloads: int, *, local_ranks: int = 1) -> int:
+    """Subprocess count from ``TLLM_PRIMTS_WARM_WORKERS``; ``0``/``1`` disables.
+
+    Without the variable the default comes from ``default_worker_count()``
+    for ``local_ranks`` ranks on this host (see the module note on host load).
     Zero when the on-disk cache or JIT compilation is disabled: a worker could
     then compile but keep nothing.
     """
@@ -59,12 +110,18 @@ def worker_count(num_payloads: int) -> int:
         "FLASHINFER_DISABLE_JIT"
     ):
         return 0
-    raw = os.environ.get("TLLM_PRIMTS_WARM_WORKERS", "4")
-    try:
-        workers = int(raw)
-    except ValueError:
-        logger.warning(f"Ignoring TLLM_PRIMTS_WARM_WORKERS={raw!r}; expected an integer.")
-        workers = 4
+    raw = os.environ.get("TLLM_PRIMTS_WARM_WORKERS")
+    if raw is None:
+        workers = default_worker_count(local_ranks)
+    else:
+        try:
+            workers = int(raw)
+        except ValueError:
+            workers = default_worker_count(local_ranks)
+            logger.warning(
+                f"Ignoring TLLM_PRIMTS_WARM_WORKERS={raw!r}; expected an integer "
+                f"(using the default of {workers})."
+            )
     return max(0, min(workers, num_payloads))
 
 

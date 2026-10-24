@@ -730,6 +730,7 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
 
 
 @pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
+@pytest.mark.parametrize("library", ["prims_ts", "fallback"])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 @pytest.mark.parametrize(
     "batch_name",
@@ -741,24 +742,89 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
         "mixed_heavy_decode",
     ],
 )
-def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_dtype):
-    """Run the DeepSeek-V4 module test on the default library set.
+def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_dtype, library):
+    """Run the DeepSeek-V4 module test on the default library set and on the opt-out.
 
-    No ``TLLM_FMHA_LIBS`` override: the PrimTS library is in the default set and
-    must win the generation phase on its own.
+    ``prims_ts``: no ``TLLM_FMHA_LIBS`` override; the PrimTS library is in the
+    default set and must win the generation phase on its own. ``fallback``:
+    ``TLLM_FMHA_LIBS=-prims_ts_sparse_mla``, the documented opt-out, must hand
+    generation back to the TRTLLM-Gen fallback (``FallbackFmha``) with PrimTS
+    never entered, so a regression on that path (what SM103, ``fp8_ds_mla`` and
+    NVFP4 deployments run) still fails here.
+    """
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+
+    if library == "prims_ts":
+        _skip_unless_toolchain()
+        monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{LIB_NAME}")
+    prims_calls: list = []
+    fallback_calls: list = []
+    original_forward = PrimsTSSparseMlaFmha.forward
+    original_fallback = FallbackFmha.forward
+
+    def counting_forward(self, *args, **kwargs):
+        prims_calls.append(1)
+        return original_forward(self, *args, **kwargs)
+
+    def counting_fallback(self, q, k, v, metadata, forward_args, *args, **kwargs):
+        if (
+            metadata.num_generations > 0
+            and forward_args.attention_input_type != AttentionInputType.context_only
+        ):
+            fallback_calls.append(1)
+        return original_fallback(self, q, k, v, metadata, forward_args, *args, **kwargs)
+
+    monkeypatch.setattr(PrimsTSSparseMlaFmha, "forward", counting_forward)
+    monkeypatch.setattr(FallbackFmha, "forward", counting_fallback)
+    _run_unified_sparse_mla_forward(batch_name, kv_cache_dtype, "deepseek_v4")
+    if library == "prims_ts":
+        assert prims_calls, "the PrimTS sparse MLA FMHA did not serve the generation phase"
+    else:
+        assert not prims_calls, "TLLM_FMHA_LIBS=-prims_ts_sparse_mla did not disable PrimTS"
+        assert fallback_calls, "the TRTLLM-Gen fallback did not serve the generation phase"
+
+
+@pytest.mark.parametrize(
+    "generation_seq_len_q",
+    [2, 6, [1, 2, 4]],
+    ids=["mtp_next_n_2", "mtp_next_n_6", "ragged_1_2_4"],
+)
+def test_speculative_decoding_rows_run_on_prims_ts(monkeypatch, generation_seq_len_q):
+    """MTP generation (``max_draft_tokens > 0``) on the default library set.
+
+    ``test_deepseek_v4_sparse_mla`` drives the DeepSeek-V4 attention module with
+    several query tokens per request (uniform ``next_n`` widths and a ragged
+    batch) and checks the output against its reference; here it is run with the
+    library default and the spy asserts that PrimTS served those steps with one
+    row per query token (``rows = sum(generation_lens)``, not one per request),
+    which is the per-token-row contract the kernel is planned for
+    (``max_seq_len_q = 1``).
     """
     _skip_unless_toolchain()
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
-    calls = []
+    from . import test_deepseek_v4_sparse_mla as module_test
+
+    context_lengths = [14, 508, 3947]
+    generation_lens = (
+        generation_seq_len_q
+        if isinstance(generation_seq_len_q, list)
+        else [generation_seq_len_q] * len(context_lengths)
+    )
+    rows_seen: list[int] = []
     original_forward = PrimsTSSparseMlaFmha.forward
 
-    def counting_forward(self, *args, **kwargs):
-        calls.append(1)
-        return original_forward(self, *args, **kwargs)
+    def spy_forward(self, q, k, v, metadata, forward_args):
+        rows_seen.append(int(q.shape[0]))
+        return original_forward(self, q, k, v, metadata, forward_args)
 
-    monkeypatch.setattr(PrimsTSSparseMlaFmha, "forward", counting_forward)
-    _run_unified_sparse_mla_forward(batch_name, kv_cache_dtype, "deepseek_v4")
-    assert calls, "the PrimTS sparse MLA FMHA did not serve the generation phase"
+    monkeypatch.setattr(PrimsTSSparseMlaFmha, "forward", spy_forward)
+    module_test.test_deepseek_v4_sparse_mla(context_lengths, generation_seq_len_q)
+    assert rows_seen, "PrimTS did not serve the speculative-decoding generation steps"
+    assert set(rows_seen) == {sum(generation_lens)}, rows_seen
+    assert sum(generation_lens) > len(context_lengths)  # more rows than requests: draft tokens
 
 
 def _dequant_fused(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -941,14 +1007,24 @@ def test_kernel_variants_are_warmed_once_per_profile(monkeypatch) -> None:
         device=torch.device("cuda"), q_dtype=torch.bfloat16, has_sinks=False, fused_groups=None
     )
     eager = SimpleNamespace(
-        fmha_plan_caches={}, max_num_tokens=20, max_num_requests=20, is_cuda_graph=False
+        fmha_plan_caches={},
+        max_num_tokens=20,
+        max_num_requests=20,
+        max_total_draft_tokens=None,
+        mapping=None,
+        is_cuda_graph=False,
     )
     lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
     assert planned == [(20, 512), (15, 512), (7, 512)]  # one per signature, largest first
     lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
     assert len(planned) == 3  # same profile: already warmed in this process
     graph = SimpleNamespace(
-        fmha_plan_caches={}, max_num_tokens=20, max_num_requests=20, is_cuda_graph=True
+        fmha_plan_caches={},
+        max_num_tokens=20,
+        max_num_requests=20,
+        max_total_draft_tokens=None,
+        mapping=None,
+        is_cuda_graph=True,
     )
     lib._warm_kernel_variants(metadata=graph, extra=32, **profile)
     assert len(planned) == 3  # CUDA graph metadata never warms
@@ -956,6 +1032,56 @@ def test_kernel_variants_are_warmed_once_per_profile(monkeypatch) -> None:
     assert planned[3:] == [(20, 32), (15, 32), (7, 32)]  # another layer group warms its own
     assert lib._get_plan(metadata=eager, rows=15, extra=512, **profile) is not None
     assert len(planned) == 6  # the warmed plan is reused
+
+
+def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
+    """With MTP the generation step carries ``requests * (1 + draft)`` rows; the warm-up
+    plans the largest row count of every variant up to that ceiling (bounded by the
+    token budget), so the MTP row counts never compile during the first serving step."""
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
+
+    planned: list = []
+    _fake_sparse_plan(monkeypatch, planned, signature_div=8)
+    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "0")
+    attn, profile, _ = _attn_and_profile()
+    lib = PrimsTSSparseMlaFmha(attn)
+
+    mtp = SimpleNamespace(
+        fmha_plan_caches={},
+        max_num_tokens=256,
+        max_num_requests=4,
+        max_total_draft_tokens=5,  # DeepSeek-V4 MTP: next_n = 6 rows per request
+        mapping=None,
+        is_cuda_graph=False,
+    )
+    lib._warm_kernel_variants(metadata=mtp, extra=512, **profile)
+    rows = [r for r, _ in planned]
+    assert rows[0] == 4 * (1 + 5), rows
+    assert rows == sorted(rows, reverse=True)
+    assert set(rows) == {24, 23, 15, 7}  # the largest row count of each variant
+
+    # The step's token budget bounds the rows even when the MTP ceiling is larger.
+    planned.clear()
+    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+    budget = SimpleNamespace(
+        fmha_plan_caches={},
+        max_num_tokens=10,
+        max_num_requests=4,
+        max_total_draft_tokens=5,
+        mapping=None,
+        is_cuda_graph=False,
+    )
+    lib._warm_kernel_variants(metadata=budget, extra=512, **profile)
+    assert [r for r, _ in planned][0] == 10
+
+    # A metadata class that does not declare the fields fails loudly.
+    monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
+    renamed = SimpleNamespace(
+        fmha_plan_caches={}, max_num_tokens=10, max_num_requests=4, is_cuda_graph=False
+    )
+    with pytest.raises(AttributeError):
+        lib._warm_kernel_variants(metadata=renamed, extra=512, **profile)
 
 
 def test_index_contract_is_validated_once_per_process(monkeypatch) -> None:
@@ -1009,7 +1135,12 @@ def _attn_and_profile():
         device=torch.device("cuda", 0), q_dtype=torch.bfloat16, has_sinks=False, fused_groups=None
     )
     eager = SimpleNamespace(
-        fmha_plan_caches={}, max_num_tokens=20, max_num_requests=20, is_cuda_graph=False
+        fmha_plan_caches={},
+        max_num_tokens=20,
+        max_num_requests=20,
+        max_total_draft_tokens=None,
+        mapping=None,
+        is_cuda_graph=False,
     )
     return attn, profile, eager
 
@@ -1077,7 +1208,12 @@ def test_warm_up_fans_out_only_when_a_variant_is_missing(monkeypatch) -> None:
     monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "0")  # the module fixture sets strict mode
     planned.clear()
     fresh = SimpleNamespace(  # a new metadata object: the earlier plans are cached on `eager`
-        fmha_plan_caches={}, max_num_tokens=20, max_num_requests=20, is_cuda_graph=False
+        fmha_plan_caches={},
+        max_num_tokens=20,
+        max_num_requests=20,
+        max_total_draft_tokens=None,
+        mapping=None,
+        is_cuda_graph=False,
     )
     lib._warm_kernel_variants(metadata=fresh, extra=32, **profile)
     assert planned == [(20, 32), (15, 32), (7, 32)]
@@ -1094,12 +1230,12 @@ def test_precompile_worker_count_follows_the_env(monkeypatch) -> None:
     monkeypatch.delenv("TLLM_PRIMTS_WARM_WORKERS", raising=False)
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
-    assert pp.worker_count(12) == 4  # default
+    assert pp.worker_count(12) == 4  # default for a single rank
     assert pp.worker_count(3) == 3  # never more workers than variants
     monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "0")
     assert pp.worker_count(12) == 0
     monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "8")
-    assert pp.worker_count(12) == 8
+    assert pp.worker_count(12) == 8  # explicit values are never capped
     monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "many")
     assert pp.worker_count(12) == 4  # unparsable: default with a warning
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
@@ -1107,6 +1243,39 @@ def test_precompile_worker_count_follows_the_env(monkeypatch) -> None:
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE")
     monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
     assert pp.worker_count(12) == 0  # compiling is forbidden
+
+
+def test_default_worker_count_is_capped_by_the_ranks_on_the_host(monkeypatch) -> None:
+    """Under the default launcher every rank has a private FlashInfer workspace and fans
+    out on its own, so the per-rank default shrinks with the ranks on the host: the
+    host never starts more than 16 compile subprocesses at the default, and an
+    explicit ``TLLM_PRIMTS_WARM_WORKERS`` still wins."""
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
+
+    monkeypatch.delenv("TLLM_PRIMTS_WARM_WORKERS", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    expected = {1: 4, 2: 4, 4: 4, 8: 2, 16: 1, 32: 1}
+    for ranks, workers in expected.items():
+        assert pp.default_worker_count(ranks) == workers, ranks
+        assert pp.worker_count(12, local_ranks=ranks) == workers, ranks
+        assert ranks * workers <= 16 or workers == 1
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "4")
+    assert pp.worker_count(12, local_ranks=8) == 4  # explicit values are never capped
+
+    # The rank count comes from the model's Mapping (no MPI call inside the
+    # forward), else from the launcher's environment, else 1.
+    for name in pp._LOCAL_RANK_ENV:
+        monkeypatch.delenv(name, raising=False)
+    assert pp.local_rank_count(SimpleNamespace(world_size=8, gpus_per_node=8)) == 8
+    assert pp.local_rank_count(SimpleNamespace(world_size=16, gpus_per_node=8)) == 8
+    assert pp.local_rank_count(SimpleNamespace(world_size=4, gpus_per_node=8)) == 4
+    assert pp.local_rank_count(None) == 1
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_SIZE", "8")
+    assert pp.local_rank_count(None) == 8
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_SIZE", "many")
+    monkeypatch.setenv("RAY_LOCAL_WORLD_SIZE", "4")
+    assert pp.local_rank_count(None) == 4
 
 
 def test_precompile_worker_entry_compiles_its_shard_first_then_the_rest(monkeypatch) -> None:

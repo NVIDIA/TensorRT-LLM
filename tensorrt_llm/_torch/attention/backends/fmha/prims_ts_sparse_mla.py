@@ -596,12 +596,17 @@ class PrimsTSSparseMlaFmha(Fmha):
         _WARMED_PROFILES.add(profile_key)
         from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
 
+        from . import prims_ts_precompile
+
         plan_kwargs, _ = self._plan_kwargs(extra, q_dtype, has_sinks, fused_groups)
         # Generation rows per step: one per request, plus its draft tokens with
-        # speculative decoding, within the step's token budget.
-        requests = int(getattr(metadata, "max_num_requests", 0) or 0)
-        draft = int(getattr(metadata, "max_total_draft_tokens", 0) or 0)
-        tokens = int(getattr(metadata, "max_num_tokens", 0) or 0)
+        # speculative decoding, within the step's token budget. The fields are
+        # declared on TrtllmAttentionMetadata; read them directly so a rename
+        # fails here instead of silently shrinking the warmed set and moving
+        # the MTP row counts' compiles to the first serving step.
+        requests = int(metadata.max_num_requests or 0)
+        draft = int(metadata.max_total_draft_tokens or 0)
+        tokens = int(metadata.max_num_tokens or 0)
         max_rows = requests * (1 + draft)
         if tokens:
             max_rows = min(max_rows, tokens) if max_rows else tokens
@@ -614,7 +619,11 @@ class PrimsTSSparseMlaFmha(Fmha):
             signature = mla_decode._mla_kernel_compile_signature(spec.kernel)
             representative[signature] = rows  # the largest row count of each variant
         self._precompile_variants(
-            device, heads, plan_kwargs, sorted(representative.values(), reverse=True)
+            device,
+            heads,
+            plan_kwargs,
+            sorted(representative.values(), reverse=True),
+            local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping),
         )
         for rows in sorted(representative.values(), reverse=True):
             self._get_plan(
@@ -633,7 +642,12 @@ class PrimsTSSparseMlaFmha(Fmha):
 
     @staticmethod
     def _precompile_variants(
-        device: torch.device, heads: int, plan_kwargs: dict, rows_list: list
+        device: torch.device,
+        heads: int,
+        plan_kwargs: dict,
+        rows_list: list,
+        *,
+        local_ranks: int = 1,
     ) -> None:
         """Populate the on-disk kernel cache for ``rows_list`` with worker subprocesses.
 
@@ -646,7 +660,7 @@ class PrimsTSSparseMlaFmha(Fmha):
 
         from . import prims_ts_precompile
 
-        workers = prims_ts_precompile.worker_count(len(rows_list))
+        workers = prims_ts_precompile.worker_count(len(rows_list), local_ranks=local_ranks)
         if workers <= 1:
             return
         try:
