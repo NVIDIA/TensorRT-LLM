@@ -1,41 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime-integration soundness tests for indexed optimized KDA prefill.
+"""Prefill must use the caller's stream and current packed sequence metadata.
 
-Covers the two classes of bug that ordinary op-math parity tests cannot see:
-
-1. STREAM soundness. The executor runs the model on a dedicated non-blocking
-   ``torch.cuda.Stream`` (``py_executor.execution_stream``); the CuTe DSL
-   kernels must launch on torch's current stream, not the DSL default stream.
-   A default-stream launch races with the projections producing q/k/v/g/beta
-   and with consumers of the output and mutated state-pool rows — silent,
-   intermittent corruption e2e (GSM8K 68.99 vs 97.01 on the FLA control)
-   while single-stream unit tests all pass.
-   ``test_indexed_prefill_uses_current_stream`` reproduces this
-   deterministically by delaying the execution stream with ``_sleep`` so any
-   kernel launched on the default stream reads not-yet-written inputs.
-
-2. id()-keyed cache soundness under the runtime's fresh-tensor-per-call
-   pattern. CPython recycles an object's address (= its id) as soon as it is
-   freed; the ``_prune_on_gc`` weakref guard must pop the cache entry at
-   dealloc, before a new tensor can alias the key. The recycled-ID test
-   attempts to engineer exactly that aliasing: cache a verdict under id(t1),
-   free t1, re-allocate until a new tensor lands on the same id, refill it
-   with data for which the stale verdict would be WRONG, and parity-check
-   against FLA. ``test_repeated_single_sequence_metadata_matches_fla``
-   additionally covers the Phase 2.1 poisoning case (same cu_seqlens object,
-   two calls).
-
-3. Bounded scratch. The prefill scratch cache ``_buf_cache`` keeps at most
-   ``_BUF_CACHE_MAX_ENTRIES`` token-count shapes, and the runtime calls with a
-   new token count for most prefill batches, so entries are evicted all the
-   time. ``test_evicted_prefill_scratch_is_released`` checks that an evicted
-   entry's scratch is freed: nothing else, such as a cached CuTe wrapper, may
-   keep it alive.
+Delayed producer operations exercise stream ordering. Repeated calls with
+changed sequence boundaries exercise metadata regeneration.
 """
 
 import gc
-import weakref
 
 import pytest
 import torch
@@ -55,12 +26,14 @@ HEAD_DIM = 128
 
 
 def _has_supported_gpu() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(0) in {(10, 0), (10, 3), (10, 7)}
 
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="Kimi K3 is supported only on Blackwell (SM100/SM103)",
+    reason="FlashInfer KDA prefill requires SM100/SM103/SM107",
 )
 
 
@@ -116,47 +89,6 @@ def _make_cu_seqlens(sequence_lengths: list[int]) -> torch.Tensor:
     )
 
 
-def _op_module():
-    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops
-
-    return cute_dsl_kimi_k3_custom_ops
-
-
-def _flush_tensor_cache_pins() -> None:
-    from fla.ops.utils.index import prepare_chunk_indices as fla_prepare_chunk_indices
-    from fla.ops.utils.index import prepare_chunk_offsets
-
-    from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
-
-    for _ in range(5):
-        dummy = torch.tensor([0, 64], dtype=torch.long, device="cuda")
-        fla_prepare_chunk_indices(dummy, 64)
-        prepare_chunk_offsets(dummy, 64)
-        prepare_chunk_indices(dummy, 64)
-
-
-def _release_cu_seqlens(module, holder: list[torch.Tensor]) -> tuple[int, bool]:
-    old_id = id(holder[0])
-    holder.clear()
-    _flush_tensor_cache_pins()
-    gc.collect()
-    return old_id, old_id not in module._varlen_pure_cache
-
-
-def _allocate_with_recycled_id(target_id: int, make, attempts: int = 512):
-    retained = []
-    for _ in range(attempts):
-        candidate = make()
-        if id(candidate) == target_id:
-            return candidate
-        retained.append(candidate)
-    return None
-
-
-def _tensor_weakrefs(values) -> list[weakref.ref]:
-    return [weakref.ref(value) for value in values if isinstance(value, torch.Tensor)]
-
-
 @pytest.mark.parametrize("regime", ["eqlen", "varlen"])
 @torch.no_grad()
 def test_indexed_prefill_uses_current_stream(
@@ -208,117 +140,66 @@ def test_indexed_prefill_uses_current_stream(
     ids=["varlen", "single_sequence"],
 )
 @torch.no_grad()
-def test_recycled_cu_seqlens_id_matches_fla(
+def test_replaced_packed_metadata_matches_fla(
     dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
     gate_params: tuple[torch.Tensor, torch.Tensor],
     aligned_lengths: list[int],
     unaligned_lengths: list[int],
 ) -> None:
-    """A recycled tensor ID cannot reuse stale alignment or length metadata."""
+    """Each invocation must use its current packed sequence boundaries."""
     optimized, reference = dispatch_pair
-    module = _op_module()
-    cu_holder = [_make_cu_seqlens(aligned_lengths)]
-    inputs = _make_inputs(sum(aligned_lengths), seed=11)
-    run_indexed_prefill(optimized, gate_params, inputs, cu_holder[0])
-    torch.cuda.synchronize()
-    assert module._varlen_pure_cache.get(id(cu_holder[0])) is True
-
-    old_id, pruned = _release_cu_seqlens(module, cu_holder)
-    if not pruned:
-        collision = _allocate_with_recycled_id(
-            old_id,
-            lambda: _make_cu_seqlens(unaligned_lengths),
-            attempts=64,
-        )
-        assert collision is None, "a live cache entry allowed its tensor ID to be recycled"
-        pytest.skip("cu_seqlens remains pinned, so its ID cannot be recycled")
-
-    cu_seqlens = _allocate_with_recycled_id(
-        old_id,
-        lambda: _make_cu_seqlens(unaligned_lengths),
-    )
-    if cu_seqlens is None:
-        pytest.skip("could not obtain a recycled cu_seqlens tensor ID")
-
-    inputs = _make_inputs(sum(unaligned_lengths), seed=12)
-    actual_output, actual_state, _ = run_indexed_prefill(
-        optimized,
-        gate_params,
-        inputs,
-        cu_seqlens,
-    )
-    expected_output, expected_state = run_fla_prefill(
-        reference,
-        gate_params,
-        inputs,
-        _make_cu_seqlens(unaligned_lengths),
-    )
-    assert_kda_close("recycled_id/output", actual_output, expected_output)
-    assert_kda_close("recycled_id/state", actual_state, expected_state)
-    assert module._varlen_pure_cache.get(id(cu_seqlens)) is False
-
-
-@torch.no_grad()
-def test_evicted_prefill_scratch_is_released(
-    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
-    gate_params: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """Scratch evicted from the bounded prefill buffer cache is freed."""
-    optimized, _ = dispatch_pair
-    module = _op_module()
-    # Every call has its own token count, and one pass has more shapes than the
-    # cache holds, so the cyclic passes below miss and evict on every call.
-    # Two sequences per call keep the batch at four or more chunks.
-    first_lengths = [300 + 64 * i for i in range(module._BUF_CACHE_MAX_ENTRIES + 4)]
-
-    def run_pass() -> None:
-        for i, first_length in enumerate(first_lengths):
-            sequence_lengths = [first_length, 200]
-            inputs = _make_inputs(sum(sequence_lengths), seed=500 + i)
-            run_indexed_prefill(optimized, gate_params, inputs, _make_cu_seqlens(sequence_lengths))
-        torch.cuda.synchronize()
-        _flush_tensor_cache_pins()
-        gc.collect()
-
-    # The first pass compiles the kernels and leaves the cache holding the last
-    # shapes of the cycle; every later pass evicts all of those entries and
-    # ends with the same shapes cached again.
-    run_pass()
-    baseline = torch.cuda.memory_allocated()
-    evicted_scratch = _tensor_weakrefs(next(iter(module._buf_cache.values())))
-    assert evicted_scratch
-    for iteration in range(2):
-        run_pass()
-        assert len(module._buf_cache) <= module._BUF_CACHE_MAX_ENTRIES
-        grown = torch.cuda.memory_allocated() - baseline
-        assert grown <= 16 << 20, (
-            f"pass {iteration}: {grown / (1 << 20):.1f} MiB more allocated after the evictions"
-        )
-        alive = sum(ref() is not None for ref in evicted_scratch)
-        assert alive == 0, f"pass {iteration}: {alive} tensors of an evicted entry are still alive"
-
-
-@torch.no_grad()
-def test_repeated_single_sequence_metadata_matches_fla(
-    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
-    gate_params: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """Repeated unaligned calls cannot poison cached single-sequence metadata."""
-    optimized, reference = dispatch_pair
-    cu_seqlens = _make_cu_seqlens([300])
-    for iteration in range(2):
-        inputs = _make_inputs(300, seed=40 + iteration)
+    for iteration, lengths in enumerate((aligned_lengths, unaligned_lengths, aligned_lengths)):
+        inputs = _make_inputs(sum(lengths), seed=11 + iteration)
+        cu = _make_cu_seqlens(lengths)
         actual_output, actual_state, _ = run_indexed_prefill(
             optimized,
             gate_params,
             inputs,
-            cu_seqlens,
+            cu,
         )
         expected_output, expected_state = run_fla_prefill(
             reference,
             gate_params,
             inputs,
-            _make_cu_seqlens([300]),
+            cu.clone(),
         )
-        assert_kda_close(f"iteration_{iteration}/output", actual_output, expected_output)
-        assert_kda_close(f"iteration_{iteration}/state", actual_state, expected_state)
+        assert_kda_close("metadata/output", actual_output, expected_output)
+        assert_kda_close("metadata/state", actual_state, expected_state)
+
+
+@torch.no_grad()
+def test_prefill_scratch_plateaus_over_distinct_token_counts(
+    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
+    gate_params: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Prefill must not retain GPU scratch for every distinct packed token count."""
+    optimized, _ = dispatch_pair
+
+    def run(first_length: int, seed: int) -> None:
+        lengths = [first_length, 200]
+        inputs = _make_inputs(sum(lengths), seed=seed)
+        run_indexed_prefill(optimized, gate_params, inputs, _make_cu_seqlens(lengths))
+
+    def settle() -> None:
+        torch.cuda.synchronize()
+        gc.collect()
+
+    # Warm compilation before measuring retained tensor storage. The measured
+    # calls each use a new token count, so a cache retaining per-shape scratch
+    # cannot hide behind reuse of the warmup allocations.
+    for i in range(2):
+        run(100 + 64 * i, seed=700 + i)
+    settle()
+    baseline = torch.cuda.memory_allocated()
+
+    num_calls = 24
+    for i in range(num_calls):
+        run(300 + 64 * i, seed=800 + i)
+    settle()
+    grown = torch.cuda.memory_allocated() - baseline
+    # Allow fixed runtime overhead, but not one large scratch set per shape.
+    budget = 128 << 20
+    assert grown <= budget, (
+        f"prefill retains {grown / (1 << 20):.0f} MiB after {num_calls} new token counts; "
+        f"budget is {budget / (1 << 20):.0f} MiB"
+    )

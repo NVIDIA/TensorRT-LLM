@@ -461,6 +461,7 @@ class TestSplitGpuBudgetForDraft:
         creator._max_batch_size = max_batch_size
         creator._max_num_tokens = 128
         creator._speculative_config = None
+        creator._is_disagg = False
         # The second of two pipeline ranks: it holds global layers 2 and 3.
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [2, 3]
@@ -1213,7 +1214,7 @@ class TestStandaloneDrafterPageSize:
     def test_allocation_uses_the_page_size_the_cost_charged(self, mocker):
         c, draft_model_config = self._creator(mocker)
         draft_model_config.sparse_attention_config = None
-        c._model_engine._max_cuda_graph_batch_size = 1
+        c._model_engine.max_cuda_graph_batch_size = 1
         c._skip_est = False
         c._enable_kv_cache_stats = Mock(return_value=False)
         c._execution_stream = None

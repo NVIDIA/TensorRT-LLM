@@ -10,6 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -81,7 +82,6 @@ def _make_mla_profile_creator() -> KvCacheCreator:
     creator._model_engine = SimpleNamespace(
         model=SimpleNamespace(model_config=config),
         attn_runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=8192),
-        use_mrope=False,
     )
     creator._mapping = Mapping()
     creator._max_num_tokens = 8192
@@ -341,7 +341,6 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
         input_processor=input_processor,
         encoder_batch_size=4,
         encoder_max_num_tokens=8192,
-        use_mrope=False,
     )
     creator._llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
     creator._profiling_stage_data = {"enable_mm_reqs": True}
@@ -414,7 +413,7 @@ def _make_creator(
     c._model_engine = Mock(
         batch_size=batch_size,
         max_seq_len=model_max_seq_len,
-        _max_cuda_graph_batch_size=max_cuda_graph_batch_size,
+        max_cuda_graph_batch_size=max_cuda_graph_batch_size,
     )
     c._model_engine.model = Mock(model_config=model_config)
 
@@ -1241,6 +1240,7 @@ def test_creator_uses_v2_affine_cache_cost():
     creator._max_num_tokens = 1024
     creator._kv_cache_config = KvCacheConfig()
     creator._speculative_config = None
+    creator._is_disagg = False
 
     cost = creator._per_manager_cache_cost(FakeV2Manager, Mock())
 
@@ -1497,6 +1497,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
 
     creator._mla_chunked_profile_length = 2304 if chunked_workspace_profiled else None
     py_executor = Mock()
+    py_executor.warmup_scope.return_value = nullcontext()
     py_executor.dist.mapping.rank = 0
     py_executor.dist.broadcast.side_effect = lambda value, root: value
     py_executor.enqueue_requests.return_value = [1]
@@ -1543,6 +1544,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
 
     assert kv_cache_config.max_gpu_total_bytes == expected_budget
     assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
+    py_executor.warmup_scope.assert_called_once_with()
     py_executor.start_worker.assert_called_once()
     py_executor.shutdown_for_kv_cache_estimation.assert_called_once()
     py_executor.shutdown.assert_not_called()
@@ -1658,7 +1660,7 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
 
 def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator = object.__new__(KvCacheCreator)
-    creator._model_engine = Mock(_max_cuda_graph_batch_size=4)
+    creator._model_engine = Mock(max_cuda_graph_batch_size=4)
     target_pool_ratio = [0.32, 0.68]
     creator._kv_cache_config = KvCacheConfig(
         pool_ratio=target_pool_ratio,

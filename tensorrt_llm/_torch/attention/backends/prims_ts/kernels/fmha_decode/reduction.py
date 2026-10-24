@@ -42,7 +42,6 @@ from cutlass.experimental import primitives as prims
 
 from .fmha_decode_constants import (
     FP32_BYTES,
-    FP8_P_QUANT_LOG2_SCALE,
     FP8_PACKED_OUTPUT_REGS_PER_THREAD,
     FP8_VALUES_PER_REG,
     FP16_VALUES_PER_REG,
@@ -350,7 +349,7 @@ def _attention_sink_log2_lse(
     )
     sink_lse = sink_ptr.load() * Float32(1.4426950408889634)
     if cutlass.const_expr(cfg.use_fp8_pv):
-        sink_lse += Float32(FP8_P_QUANT_LOG2_SCALE)
+        sink_lse += Float32(cfg.fp8_p_quant_log2_scale)
     return sink_lse
 
 
