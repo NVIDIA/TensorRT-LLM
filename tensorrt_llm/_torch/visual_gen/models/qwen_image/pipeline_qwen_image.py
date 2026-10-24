@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from tensorrt_llm._torch.visual_gen.batching import BatchInfo, randn_tensor_for_batch
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
@@ -30,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, 
 from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
+from .request_batch import QwenImageBatchLayout, collate_prompt_encodings
 from .transformer_qwen_image import QwenImageTransformer2DModel
 
 # TeaCache polynomial coefficients for Qwen-Image.
@@ -108,6 +110,17 @@ class QwenImagePipeline(BasePipeline):
     @property
     def dtype(self):
         return self.pipeline_config.torch_dtype
+
+    @property
+    def supports_dynamic_batching(self) -> bool:
+        config = self.pipeline_config
+        return (
+            config.mapping.world_size == 1
+            and config.attention.backend == "VANILLA"
+            and config.quant_config.quant_algo is None
+            and not config.quant_config_dict
+            and not config.dynamic_weight_quant
+        )
 
     @property
     def device(self):
@@ -351,6 +364,27 @@ class QwenImagePipeline(BasePipeline):
             return prompt_embeds, None
         return prompt_embeds, prompt_embeds_mask
 
+    def _encode_prompt_for_requests(
+        self,
+        prompt: list[str],
+        device: torch.device,
+        max_sequence_length: int,
+        batch_info: BatchInfo | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, QwenImageBatchLayout | None]:
+        if batch_info is None:
+            embeds, mask = self._encode_prompt(prompt, device, max_sequence_length)
+            return embeds, mask, None
+        if sum(batch_info.sample_counts) != len(prompt):
+            raise ValueError("Qwen batch sample counts do not match the expanded prompts")
+        encodings = []
+        offset = 0
+        for count in batch_info.sample_counts:
+            encodings.append(
+                self._encode_prompt(prompt[offset : offset + count], device, max_sequence_length)
+            )
+            offset += count
+        return collate_prompt_encodings(encodings, batch_info.sample_counts)
+
     # ------------------------------------------------------------------
     # Latent prep / packing (identical shape to FLUX).
     # ------------------------------------------------------------------
@@ -389,13 +423,14 @@ class QwenImagePipeline(BasePipeline):
         dtype: torch.dtype,
         device: torch.device,
         generator: Optional[torch.Generator],
+        batch_info: BatchInfo | None = None,
     ) -> torch.Tensor:
-        from diffusers.utils.torch_utils import randn_tensor
-
         h = 2 * (int(height) // (self.vae_scale_factor * 2))
         w = 2 * (int(width) // (self.vae_scale_factor * 2))
         shape = (batch_size, 1, num_channels_latents, h, w)
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        latents = randn_tensor_for_batch(
+            shape, generator=generator, device=device, dtype=dtype, batch_info=batch_info
+        )
         return self._pack_latents(latents, batch_size, num_channels_latents, h, w)
 
     def _decode_latents(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -527,6 +562,7 @@ class QwenImagePipeline(BasePipeline):
             negative_prompt_cfg_scale=params.guidance_scale,
             seed=params.seed,
             max_sequence_length=params.max_sequence_length,
+            _batch_info=getattr(req, "batch_info", None),
         )
 
     @torch.inference_mode()
@@ -541,6 +577,7 @@ class QwenImagePipeline(BasePipeline):
         seed: int = 42,
         max_sequence_length: int = 1024,
         sigmas: Optional[list] = None,
+        _batch_info: BatchInfo | None = None,
     ) -> PipelineOutput:
         """Text-to-image generation.
 
@@ -565,13 +602,19 @@ class QwenImagePipeline(BasePipeline):
 
         # Text encoding.
         logger.info("Encoding prompt...")
-        prompt_embeds, prompt_embeds_mask = self._encode_prompt(prompt, device, max_sequence_length)
+        prompt_embeds, prompt_embeds_mask, prompt_batch = self._encode_prompt_for_requests(
+            prompt, device, max_sequence_length, _batch_info
+        )
+        prompt_batch_kwargs = {"request_batch": prompt_batch} if prompt_batch is not None else {}
         neg_prompt_embeds = neg_prompt_embeds_mask = None
+        neg_batch_kwargs = {}
         if use_negative_prompt_cfg:
             negative_prompt = self._normalize_negative_prompt(negative_prompt, batch_size)
-            neg_prompt_embeds, neg_prompt_embeds_mask = self._encode_prompt(
-                negative_prompt, device, max_sequence_length
+            neg_prompt_embeds, neg_prompt_embeds_mask, neg_batch = self._encode_prompt_for_requests(
+                negative_prompt, device, max_sequence_length, _batch_info
             )
+            if neg_batch is not None:
+                neg_batch_kwargs = {"request_batch": neg_batch}
 
         # Latents.
         num_channels_latents = self.transformer.in_channels // 4  # 16
@@ -583,6 +626,7 @@ class QwenImagePipeline(BasePipeline):
             prompt_embeds.dtype,
             device,
             generator,
+            batch_info=_batch_info,
         )
         # img_shapes: list-of-list-of-(frame, h_patch, w_patch), one per batch item.
         img_shapes = [
@@ -645,6 +689,7 @@ class QwenImagePipeline(BasePipeline):
                     encoder_hidden_states=local_embeds,
                     img_shapes=img_shapes,
                     return_dict=False,
+                    **(prompt_batch_kwargs if cfg_rank == 0 else neg_batch_kwargs),
                 )[0].contiguous()
                 gather_list = [torch.empty_like(noise_pred_local) for _ in range(cfg_size)]
                 dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
@@ -661,6 +706,7 @@ class QwenImagePipeline(BasePipeline):
                     encoder_hidden_states=prompt_embeds,
                     img_shapes=img_shapes,
                     return_dict=False,
+                    **prompt_batch_kwargs,
                 )[0]
 
                 if use_negative_prompt_cfg:
@@ -677,6 +723,7 @@ class QwenImagePipeline(BasePipeline):
                         encoder_hidden_states=neg_prompt_embeds,
                         img_shapes=img_shapes,
                         return_dict=False,
+                        **neg_batch_kwargs,
                     )[0]
                     if cache_acc is not None:
                         self.transformer._cache_branch = None

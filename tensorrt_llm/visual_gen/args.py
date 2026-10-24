@@ -658,6 +658,30 @@ class CpuOffloadConfig(StrictBaseModel):
     )
 
 
+class BatchingConfig(StrictBaseModel):
+    """Request-level dynamic batching of compatible text-to-image requests."""
+
+    max_batch_size: int = Field(
+        1,
+        ge=1,
+        status="prototype",
+        description=(
+            "Maximum generated images in a dynamic batch; 1 disables request merging. "
+            "A larger single request still runs independently."
+        ),
+    )
+    max_queue_delay_ms: float = Field(
+        0.0,
+        ge=0,
+        allow_inf_nan=False,
+        status="prototype",
+        description=(
+            "Maximum milliseconds spent collecting compatible requests when a worker is ready; "
+            "0 merges only requests already queued."
+        ),
+    )
+
+
 class CompilationConfig(StrictBaseModel):
     """Configuration for torch.compile / CUDA graph warmup shapes.
 
@@ -792,6 +816,11 @@ class VisualGenArgs(StrictBaseModel):
             "DiffusionPipelineConfig.from_pretrained."
         ),
     )
+    batching_config: BatchingConfig = Field(
+        default_factory=BatchingConfig,
+        status="prototype",
+        description="Request batching limits shared by offline generation and serving.",
+    )
     compilation_config: CompilationConfig = Field(
         default_factory=CompilationConfig,
         status="prototype",
@@ -922,6 +951,7 @@ __all__ = [
     "TorchCompileConfig",
     "CudaGraphConfig",
     "CompilationConfig",
+    "BatchingConfig",
     "RuntimeLoRAConfig",
     "VisualGenArgs",
 ]

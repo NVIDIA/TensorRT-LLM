@@ -107,6 +107,7 @@ def _pipeline_with_test_doubles():
         dtype,
         device,
         generator,
+        batch_info=None,
     ):
         captured["prepared_latents"] = {
             "batch_size": batch_size,
