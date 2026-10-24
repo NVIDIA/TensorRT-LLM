@@ -55,7 +55,7 @@ from ..attention.backends.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..attention.backends.sparse.minimax_m3.common import index_head_range
+from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
@@ -437,26 +437,6 @@ def _validate_sparse_attention_runtime_config(
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 or NVFP4 main KV cache."
             )
-
-
-def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
-    """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
-    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-    n_layers = int(text_config.num_hidden_layers)
-    if sparse_cfg is None:
-        return list(range(n_layers)), []
-    if not sparse_cfg.get("use_sparse_attention", True):
-        return list(range(n_layers)), []
-    freq = sparse_cfg.get("sparse_attention_freq")
-    if freq is None:
-        return list(range(n_layers)), []
-    if len(freq) != n_layers:
-        raise ValueError(
-            f"sparse_attention_freq length {len(freq)} does not match num_hidden_layers {n_layers}"
-        )
-    dense = [i for i, f in enumerate(freq) if int(f) == 0]
-    sparse = [i for i, f in enumerate(freq) if int(f) != 0]
-    return dense, sparse
 
 
 def get_sparse_disable_index_value_layer_ids(
