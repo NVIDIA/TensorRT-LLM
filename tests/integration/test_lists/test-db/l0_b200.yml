@@ -43,6 +43,11 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
+  # MiniMax-M3 VL checkpoint-backed processor parity (the CPU stage's -m cpu_only leaves these out)
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_input_ids_match_trt_build_helper
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_video_input_ids_match_trt_build_helper
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_video_fast_path_matches_processor_input_ids
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_float_media_match_uint8_pixels
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_stays_fp32_when_tf32_is_allowed
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_bf16_split_matches_fp32_router
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
@@ -211,6 +216,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_enumerate_megamoe_candidate_tactics_curated_space
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout

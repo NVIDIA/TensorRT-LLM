@@ -1214,7 +1214,7 @@ class TestStandaloneDrafterPageSize:
     def test_allocation_uses_the_page_size_the_cost_charged(self, mocker):
         c, draft_model_config = self._creator(mocker)
         draft_model_config.sparse_attention_config = None
-        c._model_engine._max_cuda_graph_batch_size = 1
+        c._model_engine.max_cuda_graph_batch_size = 1
         c._skip_est = False
         c._enable_kv_cache_stats = Mock(return_value=False)
         c._execution_stream = None
