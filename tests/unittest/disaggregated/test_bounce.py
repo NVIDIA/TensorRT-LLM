@@ -58,6 +58,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 
 _MIB = 1024 * 1024
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +189,14 @@ class TestResultTail:
         # non-bounced result: only [msg_type, prefix] -> no tail.
         assert btr.decode_result_tail([b"KV_AGENT_RESULT", b"prefix"]) == (None, None, None)
 
+    def test_extra_frames_are_ignored(self):
+        wm = self._wm([100], [16], 0xABCD)
+        message = [b"KV_AGENT_RESULT", b"prefix", *btr.encode_result_tail(wm), b"extra"]
+        dst, sizes, src_base = btr.decode_result_tail(message)
+        assert np.array_equal(dst, wm.dst_ptrs)
+        assert np.array_equal(sizes, wm.sizes)
+        assert src_base == 0xABCD
+
     def test_encode_tail_handles_unset_base(self):
         wm = self._wm([1, 2], [8, 8], None)
         tail = btr.encode_result_tail(wm)
@@ -200,27 +209,38 @@ def test_kv_result_prefix_roundtrip():
     for rank, rid, sl, last, status, size in [
         (7, 6925227277844486, 42, True, tfr.AgentResult.SUCCESS, 4096),
         (0, 1, 0, False, tfr.AgentResult.FAILED, 0),
+        (0, 3, 0, True, tfr.AgentResult.IN_DOUBT, 0),
         (31, 2**62, 9999, True, tfr.AgentResult.SUCCESS, 2**40),
     ]:
         packed = tfr._KV_RESULT_PREFIX.pack(
-            rank, rid, sl, last, tfr._AGENT_RESULT_CODE[status], size
+            rank, rid, sl, last, tfr._AGENT_RESULT_CODE[status], size, _KV_RESULT_REPORT_TOKEN
         )
-        r, i, s, last_out, c, sz = tfr._KV_RESULT_PREFIX.unpack(packed)
+        r, i, s, last_out, c, sz, report_token = tfr._KV_RESULT_PREFIX.unpack(packed)
         assert (r, i, s, last_out, sz) == (rank, rid, sl, last, size)
         assert tfr._AGENT_RESULT_BY_CODE[c] is status
+        assert report_token == _KV_RESULT_REPORT_TOKEN
 
 
-@pytest.mark.parametrize("result_name", ["SUCCESS", "FAILED"])
+@pytest.mark.parametrize("result_name", ["SUCCESS", "FAILED", "IN_DOUBT"])
 def test_make_kv_result_msg_uses_binary_frame(result_name):
     """Every KV result (success and failure) uses the binary frame so the receiver can decode it."""
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     result = getattr(tfr.AgentResult, result_name)
-    msg = tfr._make_kv_result_msg(3, 12345, 7, True, result, transfer_size=8192)
+    msg = tfr._make_kv_result_msg(
+        3,
+        12345,
+        7,
+        True,
+        result,
+        transfer_size=8192,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     assert msg[0] == tfr.MessageType.KV_AGENT_RESULT
     assert len(msg) == 2  # prefix only; no bounce tail when none is passed
-    r, rid, sl, last, code, size = tfr._KV_RESULT_PREFIX.unpack(msg[1])
+    r, rid, sl, last, code, size, report_token = tfr._KV_RESULT_PREFIX.unpack(msg[1])
     assert (r, rid, sl, last, size) == (3, 12345, 7, True, 8192)
     assert tfr._AGENT_RESULT_BY_CODE[code] is result
+    assert report_token == _KV_RESULT_REPORT_TOKEN
 
 
 # --------------------------------------------------------------------------- #
@@ -238,8 +258,13 @@ def test_fanin_bounce_safe_gate() -> None:
 
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
-        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
+    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,), peer_dup: int = 1) -> SimpleNamespace:
+        return SimpleNamespace(
+            duplicate_head_factor=dup,
+            peer_duplicate_head_factor=peer_dup,
+            overlap_pp_size=pp,
+            ranks=list(ranks),
+        )
 
     def ri(lpp: list[int], page_table: SimpleNamespace | None = None) -> SimpleNamespace:
         return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
@@ -252,6 +277,10 @@ def test_fanin_bounce_safe_gate() -> None:
     assert safe(ov(1, 1), ri([24]), None) is True
     assert safe(ov(1, 0), ri([24]), None) is True
     assert safe(ov(2, 1), ri([24]), None) is False  # duplicate heads / MLA -> some don't send
+    # context-side duplication (MLA, or ctx TP wider than gen TP): only one of the paired
+    # writers sends the full payload, so the equal split would reject it -> fall back
+    assert safe(ov(1, 1, ranks=(0, 1), peer_dup=2), ri([24]), None) is False
+    assert safe(ov(1, 4, ranks=(0, 1), peer_dup=2), ri([20, 20, 20, 20]), None) is False
     # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
     assert safe(ov(1, 4), ri([20, 20, 20, 20]), None) is True
     # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
@@ -296,6 +325,7 @@ class TestNoBounce:
         assert nb.reserve(SimpleNamespace()) is False
         assert nb.build_request(SimpleNamespace()) is None
         assert nb.writer_base(("r", 0), 1) is None
+        assert nb.writer_span(("r", 0), 1) is None
         assert nb.is_bounced(("r", 0)) is False
         nb.record_result(("r", 0), 1)  # no-op, must not raise
         nb.record_failure(("r", 0), 1)  # no-op, must not raise
@@ -464,6 +494,9 @@ class TestFanInReserve:
         # writer i lands at base + i * (total // num_writers); per_writer = 100.
         assert t.writer_base((req.unique_rid, req.slice_id), 0) == 0x100000
         assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 100
+        assert t.writer_span((req.unique_rid, req.slice_id), 0) == (0x100000, 100)
+        assert t.writer_span((req.unique_rid, req.slice_id), 1) == (0x100000 + 100, 100)
+        assert t.writer_span((req.unique_rid, req.slice_id), 2) is None
 
     def test_reserve_uneven_fanin_falls_back(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[3])

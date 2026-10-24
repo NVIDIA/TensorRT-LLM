@@ -25,6 +25,27 @@ from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 
+# Wire-format version of the native transfer protocol: RankInfo, the request frame
+# (RecvReqInfo) and the KV_AGENT_RESULT frame. Bump it whenever any of those change
+# shape. Peers on different versions are rejected while they register, so a mixed
+# deployment fails its first request with a clear message instead of timing out on
+# every request.
+NATIVE_TRANSFER_PROTOCOL_VERSION = 2
+# Builds that predate the field never send it.
+_LEGACY_PROTOCOL_VERSION = 1
+
+
+def validate_protocol_version(peer_ri: "RankInfo") -> None:
+    """Raise ValueError unless the peer speaks this build's wire format."""
+    if peer_ri.protocol_version != NATIVE_TRANSFER_PROTOCOL_VERSION:
+        raise ValueError(
+            "native transfer protocol version mismatch: "
+            f"local={NATIVE_TRANSFER_PROTOCOL_VERSION}, "
+            f"peer '{peer_ri.instance_name}' rank {peer_ri.instance_rank}="
+            f"{peer_ri.protocol_version}; context and generation servers must run "
+            "the same TensorRT-LLM build"
+        )
+
 
 @dataclass
 class RankInfo:
@@ -48,6 +69,7 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    protocol_version: int = NATIVE_TRANSFER_PROTOCOL_VERSION
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -117,6 +139,9 @@ class RankInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
+        # A payload without the field comes from a build that predates it; do not let the
+        # dataclass default make it look current.
+        unpacked.setdefault("protocol_version", _LEGACY_PROTOCOL_VERSION)
         if unpacked.get("attention") is not None:
             unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:

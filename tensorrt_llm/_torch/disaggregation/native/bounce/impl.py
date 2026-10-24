@@ -363,9 +363,16 @@ class VmmBounceTransport(BounceTransport):
 
     def writer_base(self, rid_slice: RidSlice, writer_index: int) -> Optional[int]:
         """Where the given fan-in writer writes in the region."""
+        span = self.writer_span(rid_slice, writer_index)
+        return None if span is None else span[0]
+
+    def writer_span(self, rid_slice: RidSlice, writer_index: int) -> Optional[tuple[int, int]]:
+        """Return the address and capacity of a live writer region."""
         with self._reserved_map_lock:
             ctx = self._reserved_map.get(rid_slice)
-            return None if ctx is None else ctx.writer_base(writer_index)
+            if ctx is None or not 0 <= writer_index < ctx.num_writers:
+                return None
+            return ctx.writer_base(writer_index), ctx.per_writer_bytes
 
     def is_bounced(self, rid_slice: RidSlice) -> bool:
         with self._reserved_map_lock:
@@ -529,6 +536,9 @@ class NoBounceTransport(BounceTransport):
         return False
 
     def writer_base(self, rid_slice, writer_index: int):
+        return None
+
+    def writer_span(self, rid_slice, writer_index: int) -> Optional[tuple[int, int]]:
         return None
 
     def is_bounced(self, rid_slice) -> bool:

@@ -24,7 +24,7 @@ from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo, validate_protocol_version
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
 from tensorrt_llm._torch.disaggregation.resource.utils import (
@@ -154,6 +154,9 @@ class PeerRegistrar:
         return name + str(rank)
 
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
+        # Wire-format gate first: a peer on another protocol version cannot be
+        # trusted on any other field. Raises ValueError with the two versions.
+        validate_protocol_version(peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
 

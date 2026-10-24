@@ -532,6 +532,17 @@ def test_peer_registrar_incompatible_peer_raises():
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
+def test_peer_registrar_rejects_protocol_version_mismatch():
+    """The sender side refuses to register a peer on another wire-format version."""
+    self_rankinfo = make_rankinfo(instance_name="local")
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(instance_name="peer", instance_rank=1, page_table=make_page_table())
+    peer_ri.protocol_version = self_rankinfo.protocol_version + 1
+    with pytest.raises(ValueError, match="protocol version mismatch"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg._peer_ri_cache == {}
+
+
 def test_peer_registrar_self_rank_info_property():
     self_rankinfo = make_rankinfo(instance_name="local")
     reg = _make_peer_registrar(self_rankinfo)

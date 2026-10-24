@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -22,7 +23,11 @@ from tensorrt_llm import bindings
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import (
+    NATIVE_TRANSFER_PROTOCOL_VERSION,
+    RankInfo,
+    validate_protocol_version,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -194,3 +199,47 @@ def test_rank_info_represents_cache_element_bytes(
     restored = RankInfo.from_bytes(rank_info.to_bytes())
     assert restored.attention.element_bytes == expected_element_bytes
     assert isinstance(restored.attention.element_bytes, expected_type)
+
+
+def _minimal_rank_info() -> RankInfo:
+    return RankInfo(
+        instance_name="ctx_0",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[32],
+        sender_endpoints=["tcp://10.0.0.1:5000"],
+        self_endpoint="tcp://10.0.0.1:5001",
+        transfer_engine_info=b"",
+    )
+
+
+def test_rank_info_carries_the_current_protocol_version():
+    ri = _minimal_rank_info()
+    assert ri.protocol_version == NATIVE_TRANSFER_PROTOCOL_VERSION
+    restored = RankInfo.from_bytes(ri.to_bytes())
+    assert restored.protocol_version == NATIVE_TRANSFER_PROTOCOL_VERSION
+    validate_protocol_version(restored)
+
+
+def test_rank_info_without_the_version_field_decodes_as_legacy():
+    """A build that predates the field never sends it; it must not pass as current."""
+    payload = msgpack.unpackb(_minimal_rank_info().to_bytes(), strict_map_key=False)
+    del payload["protocol_version"]
+    legacy = RankInfo.from_bytes(msgpack.packb(payload))
+    assert legacy.protocol_version == 1
+    assert legacy.protocol_version != NATIVE_TRANSFER_PROTOCOL_VERSION
+    with pytest.raises(ValueError, match="protocol version mismatch"):
+        validate_protocol_version(legacy)
+
+
+def test_validate_protocol_version_names_both_versions():
+    peer = _minimal_rank_info()
+    peer.protocol_version = NATIVE_TRANSFER_PROTOCOL_VERSION + 1
+    with pytest.raises(ValueError) as excinfo:
+        validate_protocol_version(peer)
+    message = str(excinfo.value)
+    assert f"local={NATIVE_TRANSFER_PROTOCOL_VERSION}" in message
+    assert f"={NATIVE_TRANSFER_PROTOCOL_VERSION + 1}" in message

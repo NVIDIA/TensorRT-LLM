@@ -27,6 +27,7 @@ import pytest
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.receive_bounds import ReceiveBounds
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -41,6 +42,7 @@ from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 pytestmark = pytest.mark.cpu_only
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -107,6 +109,9 @@ def _make_rx_session(num_slices: int, rid: int = 42, prompt_len: int = 8) -> RxS
             is_last=(i == num_slices - 1),
         )
         session.receive(s)
+        task = session._kv_tasks[-1]
+        task._receive_bounds = ReceiveBounds.from_chunk(s, None, {0: None})
+        task._kv_result_report_tokens = {0: _KV_RESULT_REPORT_TOKEN}
     return session
 
 
@@ -332,6 +337,7 @@ def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
         receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
     assert session._kv_tasks[0].status == TaskStatus.TRANSFERRED
@@ -341,12 +347,13 @@ def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
     """Indexing is bounded by the receiver's own task count."""
     session = _make_rx_session(1)
 
-    with pytest.raises(AssertionError, match=r"receiver_slice_id=2"):
+    with pytest.raises(ValueError, match=r"receiver_slice_id=2"):
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=2,
             is_last_slice=True,
             status=AgentResult.SUCCESS,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
 
 

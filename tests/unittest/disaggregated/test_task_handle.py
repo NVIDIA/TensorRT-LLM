@@ -39,6 +39,7 @@ from tensorrt_llm._torch.disaggregation.base import (
 from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
+from tensorrt_llm._torch.disaggregation.native.receive_bounds import ReceiveBounds
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -54,6 +55,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
 pytestmark = pytest.mark.cpu_only
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
 
 
 def _owes_a_report(outcome) -> bool:
@@ -100,6 +102,10 @@ def _receiving_from(
     session.receive(_sole_piece())
     task = session._kv_tasks[0]
     task.expected_transfers = writers
+    task._receive_bounds = ReceiveBounds.from_chunk(
+        task._chunk, None, {rank: None for rank in range(writers)}
+    )
+    task._kv_result_report_tokens = {rank: _KV_RESULT_REPORT_TOKEN for rank in range(writers)}
     cohort = set(range(writers)) if owns_transfers else None
     session.mark_transferring(task.slice_id, cohort)
     return session, TaskHandle(session, task, TOKENS)
@@ -118,6 +124,7 @@ def _report(
         is_last_slice=is_last_slice,
         status=status,
         transfer_size=transfer_size,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
 
@@ -593,6 +600,7 @@ def test_a_transferring_piece_the_peer_cancelled_says_who_asked():
     session.receive(_sole_piece())
     task = session._kv_tasks[0]
     task.expected_transfers = 1
+    task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {0: None})
     session.mark_transferring(task.slice_id)
 
     _cancel_off_the_wire(receiver, 18)
@@ -716,6 +724,8 @@ def test_receive_aux_failure_precedes_late_kv_success() -> None:
     session.receive(_sole_piece())
     task = session._kv_tasks[0]
     task.expected_transfers = 1
+    task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {0: None})
+    task._kv_result_report_tokens = {0: _KV_RESULT_REPORT_TOKEN}
     session.mark_transferring(task.slice_id)
     handle = TaskHandle(session, task, TOKENS)
 
@@ -768,6 +778,7 @@ def test_queued_sender_abort_preserves_the_committed_cancellation(
         receiver_slice_id=0,
         peer_rank=0,
         peer_endpoint="tcp://receiver:1234",
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         task=task,
     )
 
