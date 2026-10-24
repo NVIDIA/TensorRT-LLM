@@ -297,4 +297,5 @@ block, before `run`: it writes each role's composed system prompt verbatim to
 handed in, since that is what the agents are built from (`AgentTeamWorkflow`
 appends its MCP-tool protocol to the bundle it is given). The `perf-analyze`
 and `perf-optimize` CLIs use it to snapshot `<workspace>/prompts/` at every
-launch.
+launch; `trtllm-modeling-v2` does the same from preflight, once the launch
+environment its prompts carry is resolved.

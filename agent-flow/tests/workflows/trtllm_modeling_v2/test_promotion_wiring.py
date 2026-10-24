@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The orchestrator adds the promote task itself, and does not deliver past a variant.
+
+Kernel tasks on a shared entry land local variants in the target so they run
+side by side (``onboard/promotion.py``). Nothing merged them back unless a
+planner remembered to: the run would deliver a target whose catalog never
+gained the cells it measured.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from agent_flow.workflows.trtllm_modeling_v2.onboard import delivery
+from agent_flow.workflows.trtllm_modeling_v2.onboard import promotion as promo
+from agent_flow.workflows.trtllm_modeling_v2.onboard import vocabulary as vocab
+from agent_flow.workflows.trtllm_modeling_v2.run import contract as c
+from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
+from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import (
+    GraphOrchestrator,
+    PlannerAnswer,
+    Services,
+)
+from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
+
+from .test_workflow import _workflow
+
+TARGET = f"{delivery.MODELING_V2_PACKAGE}/models/newmodel/base__sm_103__tp1"
+VARIANT = f"{TARGET}/ops/attention/thop__r3.py"
+_CONTRACT = c.Contract(checks=(c.Check("core", "boot", "tp1", c.TIER_INNER),))
+
+
+def _write(root: Path, rel: str, text: str = "") -> None:
+    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+    (root / rel).write_text(text, encoding="utf-8")
+
+
+def _run(tmp_path, promote_decision="LANDED", **kw):
+    repo = tmp_path / "repo"
+    _write(repo, f"{delivery.CATALOG_DIR}/attention/thop.py")
+    kernel = g.Task(id="k3-thop", kind="kernel", goal="verify", ref="3", gpus=1,
+                    touches=list(vocab.entry_paths(
+                        vocab.QueueItem(n=3, mode="verify", target="attention/thop"), TARGET)))  # fmt: skip
+    core = g.Task(id="core", kind="assemble", goal="core", depends_on=["k3-thop"], gpus=1,
+                  touches=[f"{TARGET}/modeling.py"], satisfies=["core:boot@tp1"])  # fmt: skip
+    turns, worked = [], []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            return PlannerAnswer("GRAPH_UPDATED", "kernel and core", g.Graph(tasks=[kernel, core]))
+        return PlannerAnswer("DONE", "all green")
+
+    def work(task):
+        worked.append(task.id)
+        if task.id == "k3-thop":
+            _write(repo, VARIANT)
+        elif task.id == "core":
+            _write(repo, f"{TARGET}/modeling.py", "from .ops.attention.thop__r3 import thop\n")
+        elif task.ref.startswith("promote:") and promote_decision == "LANDED":
+            (repo / VARIANT).unlink()
+            _write(repo, f"{TARGET}/modeling.py", "from tensorrt_llm._torch._experimental."
+                   "modeling_v2.catalog.attention.thop import thop\n")  # fmt: skip
+        return promote_decision if task.ref.startswith("promote:") else "LANDED"
+
+    services = Services(
+        plan=plan,
+        work=work,
+        check=lambda check: SimpleNamespace(
+            name=check.gate, member=check.member, passed=True, detail=""
+        ),
+        free_gpus=lambda: 8,
+        promotion=lambda graph: promo.plan(graph.tasks, repo, TARGET),
+    )
+    orchestrator = GraphOrchestrator(
+        services, _CONTRACT, c.ContractStatus.load(tmp_path), tmp_path, poll_s=0.01, **kw
+    )
+    verdict = orchestrator.run()
+    heard = [e for turn in turns for e in turn.events] + list(orchestrator.events)
+    return orchestrator, verdict, worked, heard
+
+
+def test_once_the_target_imports_an_entrys_variants_the_orchestrator_promotes_it(tmp_path):
+    orchestrator, verdict, worked, heard = _run(tmp_path)
+    assert verdict == "delivered"
+    # Due once the core, which imports the variant, has landed: it rewrites code that exists.
+    assert worked == ["k3-thop", "core", "promote"]
+    promote = orchestrator.graph.by_id()["promote"]
+    assert promote.ref == "promote:attention/thop" and promote.status == "done"
+    assert VARIANT in promote.touches and f"{TARGET}/modeling.py" in promote.touches
+    assert any("the orchestrator added promote" in e for e in heard)
+    assert orchestrator.graph.revisions[-1].reason.startswith("orchestrator: promote promotes")
+
+
+def test_a_failed_promote_keeps_a_holding_contract_from_delivery(tmp_path):
+    orchestrator, verdict, worked, heard = _run(tmp_path, "BLOCKED", revision_cap=2)
+    assert verdict != "delivered"
+    assert worked.count("promote") == 1  # no second promote behind a failed one
+    assert any("local variants wait for promotion" in e for e in heard)
+
+
+def test_a_planner_added_promote_reaches_its_smith(tmp_path):
+    workflow = _workflow(tmp_path)
+    task = g.Task(id="promote", kind="kernel", goal="merge", ref="promote:attention/thop")
+    item = workflow._queue_item(task)
+    assert item.mode == vocab.MODE_PROMOTE and item.entries == ("attention/thop",)
+    site = g.Task(id="k-x", kind="kernel", goal="", ref="verify:attention/thop@decode")
+    assert workflow._queue_item(site).variant == "ops/attention/thop__decode"
+
+
+@pytest.mark.parametrize("keep, ok", [(["attention/thop"], True), ("attention/thop", False),
+                                      (["Attention/Thop"], False)])  # fmt: skip
+def test_the_spec_names_entries_to_keep_local(keep, ok):
+    errors: list[str] = []
+    task_schema._validate_target({"keep_local": keep}, errors)
+    assert (not errors) is ok, errors
