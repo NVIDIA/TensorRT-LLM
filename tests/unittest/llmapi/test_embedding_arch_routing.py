@@ -58,15 +58,15 @@ _TOKEN_TYPE_IDS_SPEC = {"name": "token_type_ids", "shape": ["num_tokens"], "dtyp
     ids=["yaml_mapping", "parsed_config"],
 )
 def test_embeddings_server_rejects_extra_model_inputs(cuda_graph_config):
-    from tensorrt_llm.commands.serve import _reject_embedding_extra_model_inputs
+    from tensorrt_llm.commands.serve import _reject_encode_only_extra_model_inputs
     from tensorrt_llm.llmapi import EncodeCudaGraphConfig
 
     if cuda_graph_config == "parsed":
         cuda_graph_config = EncodeCudaGraphConfig(
             num_tokens=[64], seq_lens=[32], extra_model_inputs=[_TOKEN_TYPE_IDS_SPEC]
         )
-    with pytest.raises(click.BadParameter, match="extra_model_inputs"):
-        _reject_embedding_extra_model_inputs(cuda_graph_config)
+    with pytest.raises(click.BadParameter, match="trtllm-serve embeddings"):
+        _reject_encode_only_extra_model_inputs(cuda_graph_config, "embeddings")
 
 
 @pytest.mark.parametrize(
@@ -79,6 +79,6 @@ def test_embeddings_server_rejects_extra_model_inputs(cuda_graph_config):
     ids=["unset", "graphs_without_extra_inputs", "empty_extra_inputs"],
 )
 def test_embeddings_server_accepts_config_without_extra_model_inputs(cuda_graph_config):
-    from tensorrt_llm.commands.serve import _reject_embedding_extra_model_inputs
+    from tensorrt_llm.commands.serve import _reject_encode_only_extra_model_inputs
 
-    _reject_embedding_extra_model_inputs(cuda_graph_config)
+    _reject_encode_only_extra_model_inputs(cuda_graph_config, "embeddings")
