@@ -134,6 +134,54 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
             assert fallback.is_supported(q, None, None, metadata, forward_args, phase=phase)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fallback_has_kernel", [True, False])
+def test_small_paged_context_uses_fallback_only_with_a_fused_kernel(
+    monkeypatch: pytest.MonkeyPatch, fallback_has_kernel: bool
+) -> None:
+    """A paged (cached-KV) small BF16 context leaves FlashInfer only when the fallback
+    build has a fused paged-context kernel for its head size and page size."""
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen
+
+    lookups = []
+
+    def kernel_exists(head_size, kv_cache_dtype, tokens_per_block):
+        lookups.append((head_size, kv_cache_dtype, tokens_per_block))
+        return fallback_has_kernel
+
+    monkeypatch.setattr(flashinfer_trtllm_gen, "_fallback_has_paged_context_kernel", kernel_exists)
+    monkeypatch.setattr(flashinfer_trtllm_gen, "get_sm_version", lambda: 100)
+    attn = FakeAttention()
+    attn.head_dim = 128
+    attn.sparse_params = None
+    attn.position_embedding_type = 0
+    fmha = FlashInferTrtllmGenFmha(attn)
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        num_generations=0,
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        kv_cache_block_offsets=object(),
+        kv_cache_manager=None,
+        tokens_per_block=64,
+        is_cross=False,
+        beam_width=1,
+        use_paged_context_fmha=True,
+    )
+    q = torch.empty((256, 3 * attn.head_dim), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((256, attn.head_dim), dtype=torch.bfloat16),
+        attention_input_type=AttentionInputType.context_only,
+        is_fused_qkv=True,
+    )
+    supported, reason = fmha._is_supported_with_reason(
+        q, None, None, attn, metadata, forward_args, phase=FmhaPhase.CONTEXT
+    )
+    assert supported is not fallback_has_kernel, reason
+    assert lookups == [(128, DataType.BF16, 64)]
+
+
 @pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize(
     "attention_mask", [PredefinedAttentionMask.CAUSAL, CustomAttentionMask.CUSTOM]
