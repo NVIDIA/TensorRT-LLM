@@ -288,6 +288,9 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
         executor.enable_kv_cache_events = True
         executor._is_kv_manager_v2 = True
         executor.kv_cache_manager = manager
+        executor.model_engine = SimpleNamespace(
+            attn_metadata=None, kv_cache_dtype_byte_size=None, is_spec_decode=False
+        )
         executor.enable_kv_pool_rebalance = False
         executor.dist = Mock(rank=rank, tp_size=2, world_size=2)
         executor.speculation_gate = None

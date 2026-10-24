@@ -300,6 +300,17 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         """
         del post_quant_comm  # single path: always quantized ahead of comm
         assert self.has_nvfp4
+        # An NVFP4_AWQ / NVFP4_ARC checkpoint carries a per-channel pre-quant
+        # scale, which the quantization method loads into ``fc31_act_scale``,
+        # and its ``fc31_input_scale`` was calibrated on the scaled activation.
+        # This is the only place the activation is quantized, so apply the
+        # scale here, as ``CutlassFusedMoE.quantize_input`` does.
+        fc31_act_scale = getattr(self, "fc31_act_scale", None)
+        if fc31_act_scale is not None:
+            assert not isinstance(x, Fp4QuantizedTensor), (
+                "Fp4QuantizedTensor is not expected for AWQ quantization."
+            )
+            x = x * fc31_act_scale
         if isinstance(x, Fp4QuantizedTensor):
             assert not x.is_sf_swizzled, (
                 "Fp4QuantizedTensor should not be swizzled before communication"
