@@ -297,13 +297,15 @@ def test_get_vision_encoder_cuda_graph_config():
     assert _get_vision_encoder_cuda_graph_config(mm_config) is config
 
 
-def test_get_vision_encoder_cuda_graph_config_rejects_unknown_modalities():
+def test_get_vision_encoder_cuda_graph_config_ignores_other_towers():
+    vision_config = MultimodalEncoderCudaGraphConfig(buckets=[(1280, 1)])
     mm_config = MultimodalConfig(
-        encoder_cuda_graph={"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
+        encoder_cuda_graph={
+            "vision": vision_config,
+            "audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)]),
+        }
     )
-
-    with pytest.raises(ValueError, match="Unsupported multimodal encoder CUDA graph modalities"):
-        _get_vision_encoder_cuda_graph_config(mm_config)
+    assert _get_vision_encoder_cuda_graph_config(mm_config) is vision_config
 
 
 @pytest.fixture(scope="function")

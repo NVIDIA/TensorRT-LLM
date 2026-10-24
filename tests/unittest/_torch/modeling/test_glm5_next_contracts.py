@@ -33,6 +33,8 @@ from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
     Glm5NextVLM,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_masks, is_glm5_next
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_cuda_graphs
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -880,14 +882,24 @@ def test_kda_shards_preserve_fp32_gate_parameters():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("encoder_cuda_graph", [False, True], ids=["eager", "cuda-graph"])
 @torch.inference_mode()
-def test_vision_attention_dp_is_local_and_matches_single_rank():
+def test_vision_attention_dp_is_local_and_matches_single_rank(encoder_cuda_graph: bool) -> None:
     config = _config()
     reference = Glm5NextVisionModelBase(ModelConfig(pretrained_config=config)).cuda().eval()
     reference.visual.setup_attn_metadata(max_num_tokens=128)
     torch.manual_seed(7)
     for parameter in reference.parameters():
         parameter.normal_(0, 0.05)
+    multimodal_config = (
+        MultimodalConfig(
+            encoder_cuda_graph={
+                "image": MultimodalEncoderCudaGraphConfig(buckets=[(16, 1), (32, 1)])
+            }
+        )
+        if encoder_cuda_graph
+        else None
+    )
 
     # Rank 0 has no image; the other ranks see different token counts and
     # pixels. Any TP collective on the encoder path is an error, even when
@@ -900,18 +912,30 @@ def test_vision_attention_dp_is_local_and_matches_single_rank():
         for rank, width in enumerate((0, 4, 6, 8)):
             mapping = Mapping(world_size=4, tp_size=4, rank=rank, enable_attention_dp=True)
             local = (
-                Glm5NextVisionModelBase(ModelConfig(pretrained_config=config, mapping=mapping))
+                Glm5NextVisionModelBase(
+                    ModelConfig(
+                        pretrained_config=config,
+                        mapping=mapping,
+                        multimodal_config=multimodal_config,
+                    )
+                )
                 .cuda()
                 .eval()
             )
             local.load_state_dict(reference.state_dict())
             local.visual.setup_attn_metadata(max_num_tokens=128)
+            setup_mm_encoder_cuda_graphs(local)
             if not width:
                 continue
             pixels = torch.randn(4 * width, 3 * 2 * 2 * 2, device="cuda", dtype=torch.bfloat16)
             grid = torch.tensor([[1, 4, width]])
             expected = reference.encode_batched(pixels, grid)
-            actual = local.encode_batched(pixels, grid)
+            with patch.object(
+                local.visual, "_run_blocks_eager", wraps=local.visual._run_blocks_eager
+            ) as eager_blocks:
+                actual = local.encode_batched(pixels, grid)
+            if encoder_cuda_graph:
+                eager_blocks.assert_not_called()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

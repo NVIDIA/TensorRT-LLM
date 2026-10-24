@@ -2317,6 +2317,17 @@
           "$ref": "#/$defs/LayerwiseBenchmarksConfig",
           "status": "prototype"
         },
+        "lm_head_output_dtype": {
+          "default": "auto",
+          "description": "Output dtype written by the LM head GEMM. 'auto' uses the model dtype before logits are upcast to float32. 'float32' writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.",
+          "enum": [
+            "auto",
+            "float32"
+          ],
+          "status": "prototype",
+          "title": "Lm Head Output Dtype",
+          "type": "string"
+        },
         "load_format": {
           "anyOf": [
             {
@@ -5835,29 +5846,37 @@
     },
     "MultimodalEncoderCudaGraphConfig": {
       "additionalProperties": false,
-      "description": "CUDA graph capture for multimodal vision / audio encoders.\n\nOne graph is captured per `buckets` entry; replay falls back to eager when the live workload's\npadded shape does not match any bucket.\n\nNOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for\n`buckets` corresponding to lesser compute.",
+      "description": "CUDA graph capture for multimodal vision / audio encoders.\n\nSet `max_batch_size` to generate capture shapes automatically. Advanced users can instead\nspecify `buckets`. Replay falls back to eager when no captured shape fits the live workload.\n\nNOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for\n`buckets` corresponding to lesser compute.",
       "properties": {
         "buckets": {
-          "description": "Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair captures one graph sized for up to `total_tokens` real encoder tokens across exactly `num_contexts` real contexts.",
-          "items": {
-            "maxItems": 2,
-            "minItems": 2,
-            "prefixItems": [
-              {
-                "exclusiveMinimum": 0,
-                "type": "integer"
+          "anyOf": [
+            {
+              "items": {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  }
+                ],
+                "type": "array"
               },
-              {
-                "exclusiveMinimum": 0,
-                "type": "integer"
-              }
-            ],
-            "type": "array"
-          },
-          "minItems": 1,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair captures one graph sized for up to `total_tokens` real encoder tokens across exactly `num_contexts` real contexts.",
           "status": "prototype",
-          "title": "Buckets",
-          "type": "array"
+          "title": "Buckets"
         },
         "enable_padding": {
           "default": true,
@@ -5873,6 +5892,36 @@
           "title": "Enable Replay Stats",
           "type": "boolean"
         },
+        "max_batch_size": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Maximum number of encoder contexts per CUDA graph. Automatically captures every context count from 1 to this limit, with token capacities derived from the encoder token budget. Contexts are encoder sequences, such as image or video frame groups and audio chunks; they are not concurrent requests. Mutually exclusive with buckets.",
+          "status": "prototype",
+          "title": "Max Batch Size"
+        },
+        "max_num_tokens": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional total token capacity for automatically generated graphs. Defaults to encoder_max_num_tokens, or max_num_tokens when the encoder limit is unset. The encoder adapter defines token units and layout. Larger workloads run eagerly. Mutually exclusive with buckets.",
+          "status": "prototype",
+          "title": "Max Num Tokens"
+        },
         "warmup_steps": {
           "default": 2,
           "description": "Warmup iterations to run per bucket before capturing.",
@@ -5882,9 +5931,6 @@
           "type": "integer"
         }
       },
-      "required": [
-        "buckets"
-      ],
       "title": "MultimodalEncoderCudaGraphConfig",
       "type": "object"
     },
@@ -8639,6 +8685,17 @@
     "layer_wise_benchmarks_config": {
       "$ref": "#/$defs/LayerwiseBenchmarksConfig",
       "status": "prototype"
+    },
+    "lm_head_output_dtype": {
+      "default": "auto",
+      "description": "Output dtype written by the LM head GEMM. 'auto' uses the model dtype before logits are upcast to float32. 'float32' writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.",
+      "enum": [
+        "auto",
+        "float32"
+      ],
+      "status": "prototype",
+      "title": "Lm Head Output Dtype",
+      "type": "string"
     },
     "load_format": {
       "anyOf": [

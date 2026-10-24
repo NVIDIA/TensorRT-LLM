@@ -34,7 +34,7 @@ from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
 from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
 
-from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
+from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
@@ -71,6 +71,8 @@ from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from ..modules.gated_mlp import GatedMLP
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_encoder import \
+    prepare_encoder_attn_metadata as _prepare_qwen_vl_vision_attn_metadata
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -81,60 +83,6 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              register_vision_encoder)
 
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
-
-
-def _prepare_qwen_vl_vision_attn_metadata(
-        seq_lens: List[int], attn_metadata: AttentionMetadata, *,
-        max_seq_len: int) -> AttentionMetadata:
-    seq_lens = [int(seq_len) for seq_len in seq_lens]
-    if not seq_lens:
-        raise ValueError(
-            "Qwen VL vision attention requires at least one segment")
-
-    min_seq_len = min(seq_lens)
-    if min_seq_len < 0:
-        raise ValueError(
-            f"Qwen VL vision attention segment length must be nonnegative, got {min_seq_len}"
-        )
-
-    if max_seq_len <= 0:
-        raise ValueError(
-            f"Qwen VL vision attention max_seq_len must be positive, got {max_seq_len}"
-        )
-    actual_max_seq_len = max(seq_lens)
-    if actual_max_seq_len > max_seq_len:
-        raise ValueError(
-            "Qwen VL vision attention segment length exceeds the configured "
-            f"maximum: actual={actual_max_seq_len}, maximum={max_seq_len}. "
-            "Increase encoder_max_num_tokens or reduce the input max_pixels.")
-
-    num_segments = len(seq_lens)
-    seq_lens_torch = torch.tensor(seq_lens,
-                                  dtype=torch.int,
-                                  pin_memory=prefer_pinned())
-    cu_seqlens = torch.empty(num_segments + 1,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned())
-    cu_seqlens[0] = 0
-    torch.cumsum(seq_lens_torch, dim=0, out=cu_seqlens[1:])
-
-    attn_metadata.num_contexts = num_segments
-    attn_metadata.request_ids = list(range(1, num_segments + 1))
-    attn_metadata.seq_lens = seq_lens_torch
-    cu_seqlens = cu_seqlens.to(device=attn_metadata.seq_lens_cuda.device,
-                               non_blocking=True)
-    attn_metadata.cu_q_seqlens = cu_seqlens
-    attn_metadata.cu_kv_seqlens = cu_seqlens
-    # Keep the native attention-op cache key stable across image resolutions.
-    # Actual segment lengths remain available through seq_lens / cu_seqlens.
-    attn_metadata.max_seq_len = max_seq_len
-    # The vision tower runs no-cache, context-only attention and supplies its
-    # own `cu_seqlens` above, so the heavy KV-oriented `prepare()` (kv_lens /
-    # prompt_lens / host_request_types setup) is unnecessary host work.
-    # `prepare_encoder_only` runs the lean path on backends that have one
-    # (TRTLLM) and falls back to the full `prepare()` elsewhere.
-    attn_metadata.prepare_encoder_only()
-    return attn_metadata
 
 
 def _prepare_qwen_vl_mrope_config(

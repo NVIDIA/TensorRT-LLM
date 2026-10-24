@@ -9,7 +9,7 @@ byte budget before each decode step. This is a capability facet, orthogonal to
 the runner family axis -- it has no warmup or graph-capture phase.
 """
 
-from collections.abc import Hashable
+from collections.abc import Hashable, Mapping
 from typing import Any
 
 import torch
@@ -35,7 +35,11 @@ from tensorrt_llm.inputs.registry import (
     InputProcessor,
     get_multimodal_encoder_item_metadata,
 )
-from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    MultimodalEncoderCudaGraphConfig,
+    MultimodalEncoderSchedulingPolicy,
+    TorchLlmArgs,
+)
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, MultimodalEncoderRequestError, _Unset, get_mm_items_for_chunk
@@ -157,6 +161,38 @@ def mm_encoder_cache_enabled(model: nn.Module) -> bool:
     return isinstance(model, MultimodalModelMixin) and model.encoder_cache_active
 
 
+def setup_mm_encoder_cuda_graphs(
+    model: nn.Module,
+    graph_configs: Mapping[str, MultimodalEncoderCudaGraphConfig] | None = None,
+    *,
+    max_num_tokens: int | None = None,
+) -> None:
+    """Validate local encoder capabilities, then capture graphs before KV sizing.
+
+    Args:
+        model: Loaded model whose local encoders have already initialized their metadata.
+        graph_configs: Model-wide modality configs. Validate against all local towers together;
+            models without local encoders may delegate encoding to another process.
+        max_num_tokens: Encoder token budget before any scheduling-only increase for large items.
+            Supplies the default capture capacity for automatic configs in each tower.
+    """
+    encoders = [module for module in model.modules() if isinstance(module, MultimodalEncoderMixin)]
+    if graph_configs is not None and encoders:
+        supported_modalities = {
+            module.encoder_cuda_graph_modality
+            for module in encoders
+            if module.encoder_cuda_graph_modality is not None
+        }
+        unsupported = set(graph_configs) - supported_modalities
+        if unsupported:
+            raise ValueError(
+                f"Unsupported multimodal encoder CUDA graph modalities: {sorted(unsupported)}. "
+                f"Supported modalities: {sorted(supported_modalities)}."
+            )
+    for module in encoders:
+        module.enable_blocks_cuda_graph(max_num_tokens=max_num_tokens)
+
+
 def setup_mm_encoder_attn_metadata(
     model: nn.Module,
     input_processor: InputProcessor,
@@ -188,10 +224,20 @@ def setup_mm_encoder_attn_metadata(
 
     for module in encoders:
         setup_kwargs: dict[str, Any] = dict(max_num_tokens=encoder_max_num_tokens)
+        encoder_max_seq_len = max_seq_len
         if attention_metadata_capacity is not None:
             setup_kwargs["attention_metadata_capacity"] = attention_metadata_capacity
+        graph_config = module.encoder_cuda_graph_config
+        if graph_config is not None:
+            graph_tokens = (
+                max(tokens for tokens, _ in graph_config.buckets)
+                if graph_config.buckets is not None
+                else graph_config.max_num_tokens
+            )
+            if graph_tokens is not None:
+                encoder_max_seq_len = max(max_seq_len, graph_tokens)
         module.setup_attn_metadata(**setup_kwargs)
-        module.set_attn_max_seq_len(max_seq_len)
+        module.set_attn_max_seq_len(encoder_max_seq_len)
 
 
 def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
