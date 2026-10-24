@@ -89,6 +89,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     """
 
     supports_image_edit = True
+    supports_dynamic_batching = False
     DEFAULT_GENERATION_PARAMS = _EDIT_DEFAULT_GENERATION_PARAMS
 
     def load_standard_components(

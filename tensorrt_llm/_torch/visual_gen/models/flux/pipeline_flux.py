@@ -9,9 +9,9 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
-from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
+from tensorrt_llm._torch.visual_gen.batching import BatchInfo, randn_tensor_for_batch
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
@@ -50,6 +50,8 @@ class FluxPipeline(BasePipeline):
 
     Supports FLUX.1-dev (50 steps, guidance) and FLUX.1-schnell (4 steps, no guidance).
     """
+
+    supports_dynamic_batching = True
 
     def __init__(self, pipeline_config):
         if (
@@ -269,6 +271,7 @@ class FluxPipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             num_images_per_prompt=req.params.num_images_per_prompt,
+            _batch_info=getattr(req, "batch_info", None),
         )
 
     @torch.inference_mode()
@@ -282,6 +285,7 @@ class FluxPipeline(BasePipeline):
         guidance_scale: float = 3.5,
         max_sequence_length: int = 512,
         num_images_per_prompt: int = 1,
+        _batch_info: Optional[BatchInfo] = None,
     ):
         """Generate image(s) from text prompt(s).
 
@@ -331,7 +335,9 @@ class FluxPipeline(BasePipeline):
                 num_images_per_prompt, dim=0
             )
 
-        latents, latent_ids = self._prepare_latents(batch_size, height, width, generator)
+        latents, latent_ids = self._prepare_latents(
+            batch_size, height, width, generator, batch_info=_batch_info
+        )
         logger.info(f"Latents shape: {latents.shape}")
 
         # Prepare timesteps with dynamic shifting (FLUX uses mu parameter)
@@ -550,6 +556,7 @@ class FluxPipeline(BasePipeline):
         height: int,
         width: int,
         generator: torch.Generator,
+        batch_info: Optional[BatchInfo] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare random latents in FLUX packed format and position IDs.
 
@@ -570,7 +577,9 @@ class FluxPipeline(BasePipeline):
         vae_channels = self.vae.config.latent_channels  # 16
         shape = (batch_size, vae_channels, latent_height, latent_width)
 
-        latents_4d = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
+        latents_4d = randn_tensor_for_batch(
+            shape, generator=generator, device=self.device, dtype=self.dtype, batch_info=batch_info
+        )
 
         # Prepare position IDs for packed format (shared across batch)
         latent_ids = self._prepare_latent_ids(height, width)
