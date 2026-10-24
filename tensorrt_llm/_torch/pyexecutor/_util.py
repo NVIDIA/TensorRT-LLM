@@ -23,8 +23,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_device_integrated, is_sm_100f,
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -87,6 +88,70 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
+
+
+def _read_meminfo_available_bytes(
+        meminfo_path: str = "/proc/meminfo") -> Optional[int]:
+    """Return the kernel's ``MemAvailable`` estimate in bytes, or None."""
+    try:
+        with open(meminfo_path) as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    fields = line.split()
+                    # The value is reported in kB.
+                    return int(fields[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _read_cgroup_memory_headroom_bytes(
+        cgroup_dir: str = "/sys/fs/cgroup") -> Optional[int]:
+    """Return the cgroup v2 memory headroom in bytes, or None if unlimited.
+
+    Page cache charged to the cgroup is reclaimable within it, so it does not
+    count against the headroom: ``memory.max - (memory.current - file)``.
+    """
+    try:
+        with open(os.path.join(cgroup_dir, "memory.max")) as f:
+            limit = f.read().strip()
+        if limit == "max":
+            return None
+        with open(os.path.join(cgroup_dir, "memory.current")) as f:
+            current = int(f.read().strip())
+        file_bytes = 0
+        with open(os.path.join(cgroup_dir, "memory.stat")) as f:
+            for line in f:
+                key, _, value = line.partition(" ")
+                if key == "file":
+                    file_bytes = int(value)
+                    break
+        return max(0, int(limit) - max(0, current - file_bytes))
+    except (OSError, ValueError):
+        return None
+
+
+def get_integrated_gpu_free_memory(cuda_free: int, cuda_total: int) -> int:
+    """Free device memory on an integrated GPU, counting reclaimable page cache.
+
+    On integrated GPUs (for example GB10 / DGX Spark) device allocations come
+    from the same physical pool as host memory, and ``cudaMemGetInfo`` reports
+    only memory that is free right now. Page cache left by container image
+    pulls and by reading the checkpoint is reclaimed by the kernel when a CUDA
+    allocation needs it, so it is available to the KV cache even though it is
+    not reported as free. Use the kernel's ``MemAvailable`` estimate instead,
+    bounded by the device total and by any cgroup limit, and never below the
+    CUDA value. Fall back to the CUDA value when the estimate is unavailable.
+    """
+    available = _read_meminfo_available_bytes()
+    if available is None:
+        return cuda_free
+    available = min(available, cuda_total)
+    cgroup_headroom = _read_cgroup_memory_headroom_bytes()
+    if cgroup_headroom is not None:
+        available = min(available, cgroup_headroom)
+    return max(cuda_free, available)
+
 
 # Page size of a standalone drafter's separate KV pool (DFlash, standalone
 # DSpark). Deliberately not kv_cache_config.tokens_per_block: that describes
@@ -1339,6 +1404,28 @@ class KvCacheCreator:
                         include_request_cost=include_request_cost))
         return None
 
+    def _get_device_free_memory(self) -> tuple[int, int]:
+        """Return ``(free, total)`` device bytes for KV cache sizing.
+
+        Equivalent to ``torch.cuda.mem_get_info()`` except for the V2 KV cache
+        manager on integrated GPUs, where free memory also counts reclaimable
+        page cache (see ``get_integrated_gpu_free_memory``). The V2 manager
+        fails at construction when its quota cannot hold the live recurrent
+        states, so counting page cache as consumed device memory makes hybrid
+        models fail to start on unified-memory systems after a cold image pull.
+        Discrete GPUs and the V1 manager are unchanged.
+        """
+        free, total = torch.cuda.mem_get_info()
+        if not (self._is_kv_cache_manager_v2 and is_device_integrated()):
+            return free, total
+        adjusted = get_integrated_gpu_free_memory(free, total)
+        if adjusted != free:
+            logger.info(
+                "Integrated GPU: sizing the V2 KV cache from "
+                f"{adjusted / GB:.2f} GiB of free memory including reclaimable "
+                f"page cache (CUDA reports {free / GB:.2f} GiB free).")
+        return adjusted, total
+
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
         """
@@ -1722,7 +1809,7 @@ class KvCacheCreator:
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
             self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
-                free_mem, _ = torch.cuda.mem_get_info()
+                free_mem, _ = self._get_device_free_memory()
                 max_gpu_total_bytes = int(
                     self._kv_cache_config.free_gpu_memory_fraction * free_mem)
                 if (self._max_gpu_total_bytes_in is not None
@@ -1806,7 +1893,7 @@ class KvCacheCreator:
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        end, total_gpu_memory = torch.cuda.mem_get_info()
+        end, total_gpu_memory = self._get_device_free_memory()
         total_used_bytes = total_gpu_memory - end
         model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         logger.info(
@@ -1855,7 +1942,7 @@ class KvCacheCreator:
 
                 # Clear the caching allocator before measuring the current memory usage
                 torch.cuda.empty_cache()
-                end, total_gpu_memory = torch.cuda.mem_get_info()
+                end, total_gpu_memory = self._get_device_free_memory()
                 torch_used_bytes = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
             finally:
