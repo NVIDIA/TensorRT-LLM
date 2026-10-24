@@ -466,10 +466,11 @@ public:
     //
     // The plan covers committed pages in each SWA life cycle's current attention
     // window. Sparse history, full-attention, and attention-sink blocks are excluded because
-    // later turns may still need them. An SSM life cycle contributes its final block. Must be
+    // later turns may still need them; private life cycles are excluded because they never
+    // commit pages. An SSM life cycle contributes its final block. Must be
     // called after stopCommitting(). Returns nullptr without creating a plan if
-    // any required SWA page is unavailable. Mirrors Python's
-    // _KVCache.plan_committed_block_drop().
+    // any required SWA page is unavailable; unavailable optional pages are skipped.
+    // Mirrors Python's _KVCache.plan_committed_block_drop().
     //
     // Every returned handle must be dropped -- via drop() or destruction -- before the manager is
     // shut down: applying a plan takes the manager's API lock and mutates its state.

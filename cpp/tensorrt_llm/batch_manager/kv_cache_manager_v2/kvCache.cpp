@@ -2768,11 +2768,14 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
         LifeCycleId const lcIdx = item.id;
         LifeCycle const& lc = item.lc;
         BlockOrdinal windowStart;
+        bool optionalPages = false;
         if (auto const* attn = std::get_if<AttnLifeCycle>(&lc))
         {
-            // Full-attention and sparse history may still be needed by later turns.
-            if (attn->isSparse || !attn->windowSize.has_value())
+            // Full-attention and sparse history may still be needed by later turns. Private pages are
+            // never committed, so the tree holds none of them to plan.
+            if (attn->isSparse || !attn->windowSize.has_value() || attn->isPrivate())
                 continue;
+            optionalPages = attn->allowsCheckpoint();
             auto const staleRange = _getStaleRange(numCommittedTokens(), lc);
             windowStart = std::min(staleRange.end, end);
         }
@@ -2785,7 +2788,12 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
         {
             CommittedPage* page = match.blocks[ordinal]->getPage(lcIdx);
             if (page == nullptr)
+            {
+                // Optional pages may be evicted without removing the prefix that the plan covers.
+                if (optionalPages)
+                    continue;
                 return nullptr;
+            }
             pagesToDrop.push_back(page);
         }
     }
