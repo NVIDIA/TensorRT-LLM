@@ -118,7 +118,7 @@ class TrtllmAttentionMetadata:
 
     def _create_metadata(self, batch_size: int, max_seq_len: int) -> None:
         """Create new metadata with given capacity."""
-        self._metadata = BaseTrtllmAttentionMetadata(
+        self._metadata = BaseTrtllmAttentionMetadata(  # type: ignore[call-arg]
             max_num_requests=batch_size,
             max_num_tokens=batch_size * max_seq_len,
             max_num_sequences=batch_size,

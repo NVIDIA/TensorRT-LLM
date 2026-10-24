@@ -287,7 +287,7 @@ def binding_to_torch_dtype(binding_dtype) -> torch.dtype:
 
 
 def binding_dtype_size(dtype: DataType):
-    return _binding_dtype_size[dtype]
+    return _binding_dtype_bits[dtype] // 8
 
 
 def get_size_in_bytes(num_elements: int, dtype: DataType):
@@ -1246,6 +1246,9 @@ class KVCacheEventSerializer:
             ]
         else:
             return []
+
+
+prometheus_multiproc_dir: Optional[tempfile.TemporaryDirectory] = None
 
 
 def set_prometheus_multiproc_dir() -> object:

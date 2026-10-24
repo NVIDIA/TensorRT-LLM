@@ -925,7 +925,8 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
 
         # must be fp16
         self.vision_tower.to(device=self.device, dtype=torch.float16)
-        self.mm_projector.to(device=self.device, dtype=torch.float16)
+        self.mm_projector.to(device=self.device,
+                             dtype=torch.float16)  # type: ignore[call-arg]
 
     @property
     def config(self) -> PretrainedConfig:

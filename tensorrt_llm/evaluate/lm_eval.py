@@ -1089,7 +1089,7 @@ class LmEvalEvaluator(Evaluator):
                     f"Unknown --post_process_fn={post_process_fn!r}; expected "
                     "'strip_thinking_mmmu' or 'kimi_k3_mmmu'.")
 
-        evaluator = cls(
+        evaluator = cls(  # type: ignore[call-arg]
             dataset_path=kwargs.pop("dataset_path", None),
             num_samples=kwargs.pop("num_samples", None),
             random_seed=kwargs.pop("random_seed", 0),

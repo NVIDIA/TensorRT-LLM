@@ -50,7 +50,7 @@ class AsyncTransferManager:
         self._requests_in_transfer: Dict[int, LlmRequest] = dict()
 
         # Mapping of request id to the request metadata
-        self._request_transfer_metadata: Dict[int, self.RequestTransferMetadata] = dict()
+        self._request_transfer_metadata: Dict[int, self.RequestTransferMetadata] = dict()  # type: ignore[name-defined]
 
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer

@@ -1210,7 +1210,7 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
         ``model.*`` tree, including the Gated-DeltaNet, MoE, PLE, and
         Hyper-Connection transformations.
         """
-        new_weights = weight_mapper.preprocess_weights(
+        new_weights = weight_mapper.preprocess_weights(  # type: ignore[call-arg]
             weights, allow_partial_loading=allow_partial_loading
         )
         # ``new_weights`` aliases every source tensor ``preprocess_weights`` did

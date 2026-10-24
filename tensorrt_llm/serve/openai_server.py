@@ -4088,8 +4088,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_edit_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
+                output = self.generator.generate(
+                    inputs=request.prompt,  # type: ignore[call-arg]
+                    params=params)
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:

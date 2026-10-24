@@ -459,7 +459,7 @@ def build_gxt_payload(
         parameters=event.model_dump(by_alias=True),
     )
 
-    payload = GxtPayload(
+    payload = GxtPayload(  # type: ignore[call-arg]
         client_ver=trtllm_version,
         sent_ts=now,
         session_id=session_id,

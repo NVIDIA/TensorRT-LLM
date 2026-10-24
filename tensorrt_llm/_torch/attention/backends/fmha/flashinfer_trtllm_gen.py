@@ -120,7 +120,7 @@ def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
         from flashinfer.mla import _core as _flashinfer_mla_core
 
         def _probe_spec() -> DynamicTensorSpec:
-            return DynamicTensorSpec(
+            return DynamicTensorSpec(  # type: ignore[call-arg]
                 input_idx=(0,),
                 dim_idx=(0,),
                 gen_tuning_buckets=(1,),

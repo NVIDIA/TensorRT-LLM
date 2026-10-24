@@ -676,7 +676,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             x_ready_event=x_ready_event,
         )
-        final_hidden_states = moe.backend.run_moe(
+        final_hidden_states = moe.backend.run_moe(  # type: ignore[call-arg]
             ctx,
             workspace=(
                 workspace if moe.backend.input_requirement.requires_run_moe_workspace else None

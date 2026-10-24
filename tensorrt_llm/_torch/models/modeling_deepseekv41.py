@@ -2557,7 +2557,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             if attn_metadata is None:
                 raise ValueError("Engram CUDA graph replay requires attention metadata.")
             position_ids = static_tensors.get("position_ids")
-            self.model._compute_engram_hashes(
+            self.model._compute_engram_hashes(  # type: ignore[call-arg]
                 static_tensors["input_ids"][:num_tokens],
                 None if position_ids is None else position_ids[..., :num_tokens],
                 attn_metadata,

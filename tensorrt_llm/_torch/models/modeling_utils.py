@@ -724,7 +724,9 @@ class DecoderModelForCausalLM(nn.Module,
                 module.create_weights()
 
     @classmethod
-    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+    def get_model_defaults(
+            cls,
+            llm_args: 'TorchLlmArgs') -> dict:  # type: ignore[name-defined]
         """Return model-specific LLM API default overrides.
 
         Subclasses can override this to provide defaults that are applied
@@ -897,12 +899,14 @@ class DecoderModelForCausalLM(nn.Module,
             return_context_logits,
         )
 
-    def load_weights(self,
-                     weights: dict[str, torch.Tensor],
-                     weight_mapper: Optional["BaseWeightMapper"] = None,
-                     skip_modules: list[str] = [],
-                     params_map: dict[str, str] | None = None,
-                     allow_partial_loading: bool = False) -> None:
+    def load_weights(
+            self,
+            weights: dict[str, torch.Tensor],
+            weight_mapper: Optional[
+                "BaseWeightMapper"] = None,  # type: ignore[name-defined]
+            skip_modules: list[str] = [],
+            params_map: dict[str, str] | None = None,
+            allow_partial_loading: bool = False) -> None:
         """Load checkpoint weights into this model.
 
         Basic function for an LLM class to load weights from a dict of weight
@@ -1412,13 +1416,15 @@ def register_config_loader(name: str):
     return decorator
 
 
-def get_checkpoint_weight_loader(name: str) -> Type["BaseWeightLoader"]:
+def get_checkpoint_weight_loader(
+        name: str) -> Type["BaseWeightLoader"]:  # type: ignore[name-defined]
     if name not in MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default checkpoint weight loader {name} not found.")
     return MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name]
 
 
-def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
+def get_config_loader(
+        name: str) -> Type["BaseConfigLoader"]:  # type: ignore[name-defined]
     if name not in MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default config loader {name} not found.")
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
@@ -1792,13 +1798,14 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                          num_workers=_get_load_weights_num_workers())
 
 
-def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
-                          weights,
-                          weight_mapper: "BaseWeightMapper",
-                          skip_modules: List[str] = [],
-                          params_map: Optional[Dict[str, str]] = None,
-                          preload_weight_modules: Optional[List[str]] = None,
-                          allow_partial_loading: bool = False):
+def _load_weights_impl_v2(
+        model: Union[nn.Module, DecoderModelForCausalLM],
+        weights,
+        weight_mapper: "BaseWeightMapper",  # type: ignore[name-defined]
+        skip_modules: List[str] = [],
+        params_map: Optional[Dict[str, str]] = None,
+        preload_weight_modules: Optional[List[str]] = None,
+        allow_partial_loading: bool = False):
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 and Qwen3 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     weight_mapper.add_skip_modules(skip_modules)

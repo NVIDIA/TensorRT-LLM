@@ -1179,9 +1179,11 @@ class SpecMetadata:
         """
         return False
 
-    def maybe_capture_hidden_states(self, layer_id: int,
-                                    hidden_states: torch.Tensor,
-                                    residual: torch.Tensor) -> None:
+    def maybe_capture_hidden_states(
+            self,
+            layer_id: int,
+            hidden_states: torch.Tensor,
+            residual: Optional[torch.Tensor] = None) -> None:
         """
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.

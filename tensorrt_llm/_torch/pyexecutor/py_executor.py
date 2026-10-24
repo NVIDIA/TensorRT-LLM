@@ -8550,7 +8550,7 @@ class PyExecutor:
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     cache_indirection_buffer):
-            return self.model_engine.forward(
+            return self.model_engine.forward(  # type: ignore[call-arg]
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,

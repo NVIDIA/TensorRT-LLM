@@ -6,7 +6,10 @@ from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPER_MAPPING
 class AutoCheckpointMapper():
 
     @staticmethod
-    def get(format: str, name: Optional[str] = None) -> "BaseWeightMapper":
+    def get(
+        format: str,
+        name: Optional[str] = None
+    ) -> "BaseWeightMapper":  # type: ignore[name-defined]
         if name is not None:
             try:
                 return MODEL_CLASS_MAPPER_MAPPING[f'{name}_{format}']()

@@ -940,7 +940,7 @@ class Step3p7MoE(nn.Module):
         Wasted compute is ``num_local / top_k`` over the masked version,
         negligible at Step3p7 layer dimensions.
         """
-        topk_idx, topk_weights = self.experts.routing_method.apply(router_logits)
+        topk_idx, topk_weights = self.experts.routing_method.apply(router_logits)  # type: ignore[call-arg]
         N = topk_idx.shape[0]
         num_local = self._clamp_num_local_experts
         local_start = self.mapping.moe_ep_rank * num_local
