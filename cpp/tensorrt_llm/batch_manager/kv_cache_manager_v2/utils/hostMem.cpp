@@ -41,6 +41,7 @@
 #include <system_error>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -179,18 +180,38 @@ size_t HostMem::chunkCount() const noexcept
 //! ever committed twice.
 //!
 //! With `helperCount` > 0 the range is opened up front and that many threads
-//! populate it chunk by chunk ahead of the commits, which then find the pages
-//! present. Populating in parallel slows everything else in the process, so
-//! only the initial fill, which runs before serving, uses helpers. Until it
-//! ends, a reader that skips waitUsable() reads zeros past the watermark
-//! instead of faulting.
+//! populate it chunk by chunk ahead of the commits. Populating in parallel
+//! slows everything else in the process, so only the initial fill, which runs
+//! before serving, uses helpers. Until it ends, a reader that skips
+//! waitUsable() reads zeros past the watermark instead of faulting.
+//!
+//! A step is populated by whichever thread claims it first, and one a helper
+//! has claimed is committed only once that helper is done with it; a helper
+//! that fails hands its step back. Where MADV_POPULATE_WRITE is unavailable
+//! populating means zeroing, which must not reach a step already handed out.
 void HostMem::commitRange(size_t beginOffset, int helperCount)
 {
-    std::atomic<size_t> nextHelperOffset{beginOffset};
+    enum StepState : uint8_t
+    {
+        kPending,
+        kClaimed,
+        kPopulated
+    };
+
+    bool const useHelpers = helperCount > 0 && mSize - beginOffset > mChunkSize;
+    size_t const firstChunk = beginOffset / mChunkSize;
+    // One entry per step, indexed by its chunk relative to firstChunk.
+    std::vector<std::atomic<uint8_t>> stepStates(useHelpers ? chunkCount() - firstChunk : 0);
+    auto const stepRange = [&](size_t step)
+    {
+        size_t const chunk = firstChunk + step;
+        return std::pair{std::max(chunk * mChunkSize, beginOffset), std::min((chunk + 1) * mChunkSize, mSize)};
+    };
+    std::atomic<size_t> nextHelperStep{0};
     // Declared after what they use: destruction stops and joins them on every
     // way out of this function.
     std::vector<std::jthread> helpers;
-    if (helperCount > 0 && mSize - beginOffset > mChunkSize)
+    if (useHelpers)
     {
         mBacking.open(beginOffset, mSize - beginOffset);
         try
@@ -198,16 +219,35 @@ void HostMem::commitRange(size_t beginOffset, int helperCount)
             for (int i = 0; i < helperCount; ++i)
             {
                 helpers.emplace_back(
-                    [this, &nextHelperOffset](std::stop_token stop)
+                    [this, &stepStates, &stepRange, &nextHelperStep](std::stop_token stop)
                     {
                         try
                         {
                             TLLM_CUDA_CHECK(cudaSetDevice(mDevice));
                             runtime::TopologyDetector::getInstance().bindThreadByCurrentGpu();
-                            for (size_t begin;
-                                 !stop.stop_requested() && (begin = nextHelperOffset.fetch_add(mChunkSize)) < mSize;)
+                            for (size_t step;
+                                 !stop.stop_requested() && (step = nextHelperStep.fetch_add(1)) < stepStates.size();)
                             {
-                                mBacking.populate(begin, std::min(begin + mChunkSize, mSize) - begin);
+                                auto& state = stepStates[step];
+                                uint8_t expected = kPending;
+                                if (!state.compare_exchange_strong(expected, kClaimed, std::memory_order_relaxed))
+                                {
+                                    continue;
+                                }
+                                auto const [begin, end] = stepRange(step);
+                                try
+                                {
+                                    mBacking.populate(begin, end - begin);
+                                }
+                                catch (...)
+                                {
+                                    // Handed back for commit() to populate.
+                                    state.store(kPending, std::memory_order_release);
+                                    state.notify_all();
+                                    throw;
+                                }
+                                state.store(kPopulated, std::memory_order_release);
+                                state.notify_all();
                             }
                         }
                         catch (...)
@@ -224,11 +264,31 @@ void HostMem::commitRange(size_t beginOffset, int helperCount)
         }
     }
 
+    // Whether a helper populated the step; if not, the caller now owns it.
+    auto const claimOrAwaitStep = [&](size_t step)
+    {
+        auto& state = stepStates[step];
+        for (;;)
+        {
+            uint8_t seen = kPending;
+            if (state.compare_exchange_strong(seen, kClaimed, std::memory_order_acquire))
+            {
+                return false;
+            }
+            if (seen == kPopulated)
+            {
+                return true;
+            }
+            state.wait(kClaimed, std::memory_order_acquire);
+        }
+    };
+
     size_t offset = beginOffset;
     while (offset < mSize)
     {
         size_t const end = std::min(roundUp(offset + 1, mChunkSize), mSize);
-        mBacking.commit(offset, end - offset);
+        bool const populated = useHelpers && claimOrAwaitStep(offset / mChunkSize - firstChunk);
+        mBacking.commit(offset, end - offset, populated);
         offset = end;
         // A chunk counts as usable only once it is committed to its end, so a
         // partially committed trailing chunk does not advance the watermark.

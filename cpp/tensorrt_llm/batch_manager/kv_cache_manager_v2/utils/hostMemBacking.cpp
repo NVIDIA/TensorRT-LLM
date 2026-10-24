@@ -211,7 +211,7 @@ MemAddress HostMemBacking::reserve(size_t size)
     return mAddr;
 }
 
-void HostMemBacking::commit(size_t offset, size_t size)
+void HostMemBacking::commit(size_t offset, size_t size, bool populated)
 {
     TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
     TLLM_CHECK_DEBUG(offset % mUnit == 0 && size % mUnit == 0);
@@ -220,8 +220,11 @@ void HostMemBacking::commit(size_t offset, size_t size)
     // the device, which does not give it one.
     cuCheck(cuCtxSetCurrent(static_cast<CUcontext>(mContext)));
 
-    open(offset, size);
-    populate(offset, size);
+    if (!populated)
+    {
+        open(offset, size);
+        populate(offset, size);
+    }
 
     size_t committed = 0;
     try

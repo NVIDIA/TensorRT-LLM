@@ -100,11 +100,14 @@ public:
     //!
     //! Throws HostOOMError when the system cannot back the range; that is the
     //! expected failure and callers are required to handle it.
-    void commit(size_t offset, size_t size);
+    //!
+    //! With `populated` true the caller has already run open() and populate()
+    //! on the range, and commit() only registers it.
+    void commit(size_t offset, size_t size, bool populated = false);
 
     //! The first two steps of commit(): open() makes the range reachable and
-    //! populate() allocates its pages, so a later commit() finds them present.
-    //! Neither unwinds on failure; decommit() releases what they took.
+    //! populate() allocates its pages. Neither unwinds on failure; decommit()
+    //! releases what they took.
     //!
     //! open() changes the mapping, which waits for every populate() in flight
     //! on any thread: open a range once, then populate it in parallel. Both

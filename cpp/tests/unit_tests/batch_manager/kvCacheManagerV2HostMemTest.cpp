@@ -440,6 +440,34 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
     }
 }
 
+//! Data written to the start of a deferred initial fill as soon as it is usable
+//! must survive the helpers still populating the rest of it.
+TEST(KvCacheManagerV2HostMemTest, DeferredParallelFillKeepsEarlyWrites)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    constexpr size_t kChunk = HostMem::kFillChunkSize;
+    constexpr size_t kSize = 4 * kChunk;
+
+    HostMem memory(kSize, kSize, HostMemBackingOptions{}, /*waitForFill=*/false);
+    auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
+    auto const pattern
+        = [](size_t offset) { return static_cast<unsigned char>((offset / HostMem::kAlignment) * 5 + 3); };
+    for (size_t chunkEnd = kChunk; chunkEnd <= kSize; chunkEnd += kChunk)
+    {
+        memory.waitUsable(chunkEnd);
+        for (size_t offset = chunkEnd - kChunk; offset < chunkEnd; offset += HostMem::kAlignment)
+        {
+            bytes[offset] = pattern(offset);
+        }
+    }
+
+    memory.waitUsable(kSize);
+    for (size_t offset = 0; offset < kSize; offset += HostMem::kAlignment)
+    {
+        ASSERT_EQ(bytes[offset], pattern(offset)) << "byte at " << offset << " lost during the fill";
+    }
+}
+
 //! The initial fill is populated by helper threads ahead of the commits; a grow
 //! is not. Either way every unit must end up registered, and the contents below
 //! the old size must survive a grow from inside a fill chunk.
