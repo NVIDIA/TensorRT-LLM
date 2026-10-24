@@ -7,6 +7,13 @@
 
 OpenEngine support ships in the base TensorRT-LLM package. `pip install "tensorrt_llm[openengine]"` remains available as a compatibility spelling but installs nothing extra.
 
+Native protobuf (`upb`) is recommended for gRPC throughput. TensorRT-LLM images select it
+by default. In older or custom environments, set
+`PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb` before starting Python and use a
+protobuf wheel that includes the native extension. Both gRPC launchers warn when
+Python protobuf is active and continue startup. Native `cpp` is also accepted
+without a warning.
+
 Then select OpenEngine when starting the gRPC server:
 
 ```bash
