@@ -16,7 +16,8 @@
 
     jit_prefetch_flashinfer_helper.py <parent_pid> <module> [<module> ...]
 
-Builds each named FlashInfer JIT module (see ``MODULES``), in order, into
+Builds each named FlashInfer JIT module (see ``MODULES``, and ``ssu_args``
+for the Mamba ``selective_state_update`` modules), in order, into
 FlashInfer's own JIT cache and prints one JSON line per module to stdout,
 ``{"module": str, "ok": bool, "s": float, "err": str}``, then exits. Anything
 else printed goes to stderr.
@@ -74,10 +75,55 @@ def _stop_with_parent(parent: int) -> None:
         time.sleep(1.0)
 
 
+_SSU_PREFIX = "selective_state_update_"
+
+
+def ssu_args(name: str):
+    """The generator and its arguments for FlashInfer's
+    ``selective_state_update`` module ``name``. The name spells out every
+    argument (``get_selective_state_update_uri``): ``key_value`` pairs
+    after the prefix, then the generator's ``_sm100``/``_sm90`` suffix."""
+    from flashinfer.jit.mamba import selective_state_update as ssu
+
+    rest, generator = name[len(_SSU_PREFIX) :], ssu.gen_selective_state_update_module
+    for suffix, gen in (
+        ("_sm100", ssu.gen_selective_state_update_sm100_module),
+        ("_sm90", ssu.gen_selective_state_update_sm90_module),
+    ):
+        if rest.endswith(suffix):
+            rest, generator = rest[: -len(suffix)], gen
+            break
+    tokens = rest.split("_")
+    kv = dict(zip(tokens[0::2], tokens[1::2]))
+    dtype = {v: k for k, v in ssu._filename_safe_dtype_map.items()}
+    args = (
+        dtype[kv["s"]],
+        dtype[kv["i"]],
+        dtype[kv["w"]],
+        dtype[kv["a"]],
+        dtype[kv["si"]],
+        dtype[kv["sc"]] if "sc" in kv else None,
+        int(kv["d"]),
+        int(kv["ds"]),
+        int(kv["nt"]),
+        dtype[kv["cs"]],
+        dtype[kv["na"]],
+        int(kv.get("pr", 0)),
+    )
+    return generator, args
+
+
 def _gen_spec(name: str):
-    """FlashInfer's ``JitSpec`` for module ``name`` (see ``MODULES``)."""
+    """FlashInfer's ``JitSpec`` for module ``name``: one of ``MODULES``, or a
+    ``selective_state_update`` module named by its arguments."""
     import importlib
 
+    if name.startswith(_SSU_PREFIX):
+        generator, args = ssu_args(name)
+        spec = generator(*args)
+        if spec.name != name:
+            raise ValueError(f"{name} names the module {spec.name}")
+        return spec
     module, generator = MODULES[name]
     return getattr(importlib.import_module(module), generator)()
 

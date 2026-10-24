@@ -525,7 +525,8 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
     * FlashInfer JIT modules, one helper each: each provider module that
       knows of such modules lists them (``fmha_gen``, FlashInfer's TRTLLM-GEN
       attention launcher, for the layers of any model that run on its FMHA
-      library, GLM-5.3-Flash's MLA decode and MiniMax-M3), which warmup joins
+      library, GLM-5.3-Flash's MLA decode and MiniMax-M3; the Mamba2 decode's
+      ``selective_state_update``), which warmup joins
       before its first forward (``wait_flashinfer_layer_builds``), and the
       sampling module, if the engine ``llm_args`` describes builds it in
       warmup (``warmup_builds_sampling_module``; warmup starts it otherwise);
@@ -559,6 +560,7 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
         "attention.backends.fmha.jit_prefetch",
         "attention.backends.sparse.glm_kpool.jit_prefetch",
         "attention.backends.sparse.minimax_m3.jit_prefetch_fmha",
+        "modules.mamba.jit_prefetch_flashinfer",
     ):
         try:
             planner = importlib.import_module(f".{provider_module}", __package__)
