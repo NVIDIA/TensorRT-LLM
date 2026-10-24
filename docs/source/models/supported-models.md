@@ -234,10 +234,12 @@ unsupported modality fails before any graphs are captured.
 Advanced users can supply `buckets: [[256, 1], [512, 2]]` instead of `max_batch_size`
 and `max_num_tokens`. Each pair specifies total real encoder tokens and an exact context count.
 Automatic shapes use per-context capacities starting at 256 tokens (or the available budget
-when smaller), doubling up to each batch size's token budget. Adapters can override these
-shapes for additional alignment constraints. Padded replay is enabled by default; disabling it
-requires an exact token-count match. Encoder graphs and encoder side-stream prefetch are
-mutually exclusive.
+when smaller), growing by 1.25x (rounded up to 256 tokens) up to each batch size's token
+budget. Adapters can override these shapes for additional alignment constraints. Padded replay
+is enabled by default; disabling it requires an exact token-count match and keeps doubling
+capacities. With padding, packed encoders run eager when a call has at least 4,096 real tokens
+and the smallest fitting shape would add more than 25% extra tokens. Encoder graphs and
+encoder side-stream prefetch are mutually exclusive.
 
 ### Side streams and embeddings cache
 

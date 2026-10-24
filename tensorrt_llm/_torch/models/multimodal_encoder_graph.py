@@ -107,11 +107,15 @@ class EncoderGraphIOAdapter(ABC):
     assuming that the encoder preserves the input token count.
     """
 
-    def capture_buckets(self, max_batch_size: int, max_num_tokens: int) -> list[EncoderGraphKey]:
+    def capture_buckets(
+        self, max_batch_size: int, max_num_tokens: int, *, enable_padding: bool = True
+    ) -> list[EncoderGraphKey]:
         """Generate shapes for every batch size within the total token budget.
 
-        Each context count uses per-context capacities starting at 256 tokens and doubling up
-        to its share of the budget, followed by the full token budget. Dense ``[batch, time, ...]``
+        Each context count uses per-context capacities starting at 256 tokens and growing up
+        to its share of the budget, followed by the full token budget. Padded replay grows by
+        1.25x, rounded up to 256-token tiles; exact-fit replay has no padding to cut, so it keeps
+        doubling. Dense ``[batch, time, ...]``
         layouts can round down their time dimension when allocating buffers and check it in
         ``can_replay``. Adapters with additional alignment or minimum-length constraints can
         override this.
@@ -120,6 +124,7 @@ class EncoderGraphIOAdapter(ABC):
             max_batch_size: Maximum number of independent encoder contexts.
             max_num_tokens: Maximum total tokens, including layout padding but excluding any
                 adapter-specific reservation added by ``graph_key``.
+            enable_padding: Whether partial buckets replay with padding.
         """
         buckets = []
         for num_contexts in range(1, min(max_batch_size, max_num_tokens) + 1):
@@ -127,7 +132,7 @@ class EncoderGraphIOAdapter(ABC):
             seq_len = min(256, max_seq_len)
             while seq_len < max_seq_len:
                 buckets.append(EncoderGraphKey(seq_len * num_contexts, num_contexts))
-                seq_len *= 2
+                seq_len = ((seq_len * 5 + 1023) // 1024) * 256 if enable_padding else seq_len * 2
             buckets.append(EncoderGraphKey(max_num_tokens, num_contexts))
         return sorted(buckets)
 
@@ -197,6 +202,11 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
         input_specs: Non-token dimensions, dtype, and token axis of each graph input.
         output_specs: Token axis of each graph output; outputs preserve the real input token count.
     """
+
+    def can_replay(self, bucket: EncoderGraphKey, seq_lengths: Sequence[int]) -> bool:
+        """Keep graph replay for small calls or at most 25 percent extra token work."""
+        real_tokens = sum(seq_lengths)
+        return real_tokens < 4096 or bucket.total_tokens <= real_tokens * 1.25
 
     def __init__(
         self,
@@ -360,7 +370,9 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
                     "Automatic encoder graphs require max_batch_size and a resolved "
                     "max_num_tokens budget."
                 )
-            buckets = io_adapter.capture_buckets(config.max_batch_size, config.max_num_tokens)
+            buckets = io_adapter.capture_buckets(
+                config.max_batch_size, config.max_num_tokens, enable_padding=config.enable_padding
+            )
         if not buckets:
             raise ValueError(
                 "MultimodalEncoderCudaGraphConfig.buckets is empty; the runner has "
