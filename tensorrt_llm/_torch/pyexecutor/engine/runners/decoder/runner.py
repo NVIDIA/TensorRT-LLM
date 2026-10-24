@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import Breakable
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
+    DSparkCUDAGraphRunner,
     KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -197,6 +198,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
         self._graphs = self._make_cuda_graphs()
+        self._inputs.cuda_graph_runner = self.cuda_graph_runner
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -230,7 +232,7 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _make_cuda_graphs(self) -> DecoderCudaGraphs:
         """Build the CUDA graph component; call after the input preparer."""
-        return DecoderCudaGraphs(**self._cuda_graphs_kwargs())
+        return DecoderCudaGraphs(**self._cuda_graphs_kwargs(), inputs=self._inputs)
 
     def _dummy_requests_kwargs(self) -> dict[str, Any]:
         return dict(
@@ -395,7 +397,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._dynamic_draft_len_mapping = compute_dynamic_draft_len_mapping(self._config)
 
     def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner | None:
-        cuda_graph_runner = CUDAGraphRunner(self._cuda_graph_runner_config())
+        runner_type = DSparkCUDAGraphRunner if self._dspark_confidence_enabled else CUDAGraphRunner
+        cuda_graph_runner = runner_type(self._cuda_graph_runner_config())
         register_hooks = getattr(self._model, "register_cuda_graph_pre_replay_hooks", None)
         if register_hooks is not None:
             register_hooks(cuda_graph_runner)
@@ -648,6 +651,13 @@ class DecoderRunner(ScheduledModelRunner):
                 self._inputs.record_promoted_iter_states(scheduled_requests)
             self._inputs.record_input_copy()
 
+            if (
+                can_run_graph
+                and not is_dummy
+                and getattr(self._inputs, "_dspark_device_budget", None) is not None
+            ):
+                self._inputs._apply_device_window_prologue(inputs, new_tensors_device)
+
             def run_model(model_inputs: dict[str, Any]) -> Any:
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     return self._forward_step(
@@ -882,6 +892,16 @@ class DecoderRunner(ScheduledModelRunner):
 
                 logits_processors = getattr(request, "py_logits_post_processors", None)
                 if logits_processors:
+                    if (
+                        not is_context_request
+                        and getattr(request, "py_verify_len", None) is not None
+                    ):
+                        raise RuntimeError(
+                            "per-request logits post-processors are not supported with DSpark "
+                            "ragged verification: the processor interface assumes one uniform "
+                            "row stride and would modify another request's packed logits after "
+                            "a short verify window"
+                        )
                     token_ids = (
                         [request.get_tokens(0)]
                         if is_context_request
@@ -944,3 +964,55 @@ class DecoderRunner(ScheduledModelRunner):
         # The sampler sees the original empty batch, never the execution row.
         # Copy the map because CUDA graph outputs are retained across replays.
         return {**outputs, "logits": outputs["logits"][:0]}
+
+    # Scheduler-facing state stays on the input owner that stages each layout.
+
+    @property
+    def _dspark_confidence_enabled(self):
+        return self._inputs._dspark_confidence_enabled
+
+    @property
+    def _dspark_trims_submitted_tokens(self):
+        return self._inputs._dspark_trims_submitted_tokens
+
+    @property
+    def _dspark_sps_cost_table(self):
+        return self._inputs._dspark_sps_cost_table
+
+    @property
+    def _dspark_exact_candidate_cells(self):
+        return self._inputs._dspark_exact_candidate_cells
+
+    @property
+    def _dspark_exact_identity_words(self):
+        return self._inputs._dspark_exact_identity_words
+
+    @property
+    def _dspark_device_budget(self):
+        return getattr(self._inputs, "_dspark_device_budget", None)
+
+    @_dspark_device_budget.setter
+    def _dspark_device_budget(self, value) -> None:
+        self._inputs._dspark_device_budget = value
+
+    @property
+    def previous_request_ids(self):
+        return self._inputs.previous_request_ids
+
+    @property
+    def previous_verify_lens(self):
+        return self._inputs.previous_verify_lens
+
+    @property
+    def has_previous_device_draft(self):
+        return self._inputs.has_previous_device_draft
+
+    def ragged_verify_token_buckets(self, padded_bs: int):
+        return self._inputs.ragged_verify_token_buckets(padded_bs)
+
+    def fit_ragged_verify_lens(self, *args, **kwargs):
+        return self._inputs.fit_ragged_verify_lens(*args, **kwargs)
+
+    def _get_spec_worker(self):
+        """Return the one-model speculative worker when it is initialized."""
+        return getattr(self._model, "spec_worker", None)

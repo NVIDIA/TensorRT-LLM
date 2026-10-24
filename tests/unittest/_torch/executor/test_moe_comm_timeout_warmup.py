@@ -16,6 +16,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import (
     DEFAULT_WARMUP_TIMEOUT_SEC,
     MoECommTimeoutGuard,
 )
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
@@ -55,6 +56,8 @@ class _WarmupScopeStub:
 
 
 class _GraphRunnerStub:
+    reset_padding_dummies = CUDAGraphRunner.reset_padding_dummies
+
     def __init__(self) -> None:
         self.is_warmup_only = False
         self.padding_dummy_requests: dict[str, object] = {"stale": object()}
