@@ -92,18 +92,21 @@ class Wake:
 class Stores:
     """Drivers over one store: the in-memory one, or with ``master`` a real Mooncake pool.
     ``close`` closes the Mooncake clients only once every backend built over them shut down
-    cleanly."""
+    cleanly. ``cancel_effective=False`` makes the in-memory drivers ignore a cancel."""
 
-    def __init__(self, master: str | None = None) -> None:
+    def __init__(self, master: str | None = None, cancel_effective: bool = True) -> None:
         self._store = MemoryStore() if master is None else None
         self._master = master
+        self._cancel_effective = cancel_effective
         self._clients = []
         self.backends = []
 
     def open_driver(self):
         """A driver that moves each row in a call of its own, several at once."""
         if self._store is not None:
-            return MemoryDriver(self._store, capabilities=ONE_ROW_PER_CALL, background=True)
+            driver = MemoryDriver(self._store, capabilities=ONE_ROW_PER_CALL, background=True)
+            driver.set_cancel_effective(self._cancel_effective)
+            return driver
         sdk = open_sdk(MooncakeConfig(self._master, 0, PROTOCOL, DEVICES, local_buffer_size=0))
         self._clients.append(sdk)
         return MooncakeDriver(sdk, workers=2, rows_per_call=1)
@@ -230,7 +233,10 @@ def test_publish_then_fetch_restores_pages(kit, real_manager, stores) -> None:
 
 
 def test_partial_fetch_marks_only_delivered_rows(kit, real_manager) -> None:
-    stores = Stores()
+    # Each row's call runs on a thread of its own, in any order. A later row's fault stops the
+    # fetch, and the cancel it forwards could end the first row before its thread took it; the
+    # driver ignores it, so the first row always lands.
+    stores = Stores(cancel_effective=False)
     with real_manager() as mgr_a, real_manager() as mgr_b:
         first_block_only = np.arange(BLOCKS) == 0
         source, view = publish(stores, kit, mgr_a, select=first_block_only)
