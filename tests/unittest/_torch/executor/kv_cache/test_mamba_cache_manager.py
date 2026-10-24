@@ -2844,6 +2844,57 @@ def test_v2_hybrid_fp4_mla_reuses_prefix_at_aligned_snapshot(
         mgr.shutdown()
 
 
+@skip_no_cuda
+def test_v2_hybrid_fp4_mla_reuses_prefix_after_two_chunk_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first chunk resizes the FP4 MLA cache while the only snapshot is pending."""
+    prompt_len = 2 * FP4_MLA_TOKENS_PER_BLOCK
+    chunk_len = FP4_MLA_TOKENS_PER_BLOCK
+    mgr = _build_v2_hybrid_fp4_mla(
+        monkeypatch,
+        enable_block_reuse=True,
+        additional_snapshot_offsets_from_end=(0,),
+    )
+    request = _make_v2_conversation_request(1, list(range(prompt_len)), "conv-1")
+    probe = _make_v2_conversation_request(2, list(range(prompt_len + 1)), "conv-2")
+    try:
+        assert mgr.fp4_mla_context_only_cache is False
+        mgr.prepare_expect_snapshot_points([request])
+        assert request.expect_snapshot_points == [prompt_len]
+        assert mgr.prepare_context(request)
+
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+
+        assert mgr.resize_context(request, num_tokens=chunk_len)
+        mgr.prepare_resources(batch)
+        request.context_current_position = chunk_len
+        assert request.context_remaining_length == chunk_len
+        mgr.update_context_resources(batch)
+
+        assert mgr.resize_context(request, num_tokens=chunk_len)
+        mgr.prepare_resources(batch)
+        request.context_current_position = prompt_len
+        assert request.context_remaining_length == 0
+        mgr.update_context_resources(batch)
+
+        state_index = mgr.get_state_indices([request.py_request_id], [False])[0]
+        mgr.free_resources(request)
+
+        mgr.prepare_expect_snapshot_points([probe])
+        assert mgr.prepare_context(probe)
+        probe_batch = ScheduledRequests()
+        probe_batch.append_context_request(probe)
+        mgr.prepare_resources(probe_batch)
+
+        assert probe.prepopulated_prompt_len == prompt_len
+        assert mgr.get_state_indices([probe.py_request_id], [False]) == [state_index]
+        mgr.free_resources(probe)
+    finally:
+        mgr.shutdown()
+
+
 def test_v2_hybrid_fp4_invalid_iterator_scans_physical_pools() -> None:
     physical = torch.empty((3, 4), dtype=torch.uint8)
     ssm = torch.empty((1, 2), dtype=torch.float32)
