@@ -184,6 +184,122 @@ def test_native_dual_pool(heads, extra_width, monkeypatch):
     )
 
 
+def _own_staging_rows(count, width, device=None):
+    slot = torch.arange(width, device=device)[None, :]
+    token = torch.arange(count, device=device)[:, None]
+    return torch.where(slot < 128, token * 128 + slot, token * max(width - 128, 1) + slot - 128)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("width", [128, 145, 640])
+@pytest.mark.parametrize("shared", [False, True])
+def test_native_padding_points_into_the_staging_pools(width, shared):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
+        _point_padding_at_staged_rows,
+    )
+
+    capacity, count = 6, 4
+    lens = torch.tensor([1, 2, width, 78 % width + 1])
+    own = _own_staging_rows(capacity, width)
+    lens = torch.cat((lens, torch.zeros(capacity - count, dtype=lens.dtype)))
+    valid = torch.arange(width)[None, :] < lens[:, None]
+    prepared = torch.where(valid, own, -1).to(torch.int32)
+    metadata = SimpleNamespace(
+        prepared_indices=prepared.clone(),
+        num_tokens=count,
+        shared_plan=object() if shared else None,
+    )
+    expected = prepared.clone()
+    padding = torch.zeros_like(own) if shared else own
+    expected[:count] = torch.where(valid[:count], prepared[:count], padding[:count].to(torch.int32))
+    for _ in range(2):
+        _point_padding_at_staged_rows(metadata)
+        torch.testing.assert_close(metadata.prepared_indices, expected, atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("extra_width", [0, 17, 512])
+@pytest.mark.parametrize("native_staging", [True, False])
+@torch.inference_mode()
+def test_native_padding_reads_zero_rows_of_its_own_token(
+    kv_cache_dtype, extra_width, native_staging, monkeypatch
+):
+    """The FMHA loads index slots past the prepared length inside the last partial KV tile.
+
+    Each such slot must address a zero-filled staging row of its own token, and the
+    output must not depend on which in-pool row the padding addresses. Native
+    staging publishes that padding itself; after the PyTorch staging the backend
+    rewrites its ``-1`` padding.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend, quantization
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    if not native_staging:
+        monkeypatch.setattr(quantization, "_fused_gather_supported", lambda index: False)
+    padded = []
+    point_padding = backend._point_padding_at_staged_rows
+
+    def record_padding(m):
+        padded.append(True)
+        point_padding(m)
+
+    monkeypatch.setattr(backend, "_point_padding_at_staged_rows", record_padding)
+    torch.manual_seed(452)
+    heads, count = 64, 4
+    attn = _backend(heads, kv_cache_dtype=kv_cache_dtype)
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.rand(count, 128, device="cuda") < 0.3
+    swa_valid[1] = False
+    swa_valid[2] = True
+    extra = extra_valid = None
+    if extra_width:
+        extra = torch.randn(count, extra_width, 512, device="cuda", dtype=torch.bfloat16)
+        extra_valid = torch.rand(count, extra_width, device="cuda") < 0.3
+        extra_valid[1] = False
+        extra_valid[2] = True
+    sink = torch.randn(heads, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, extra_width, staging_dtype=attn.staging_dtype)
+
+    def run():
+        args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
+        out = attn.forward(q.flatten(1), None, None, metadata, forward_args=args).view_as(q)
+        torch.cuda.synchronize()
+        return out.clone()
+
+    out = run()
+    assert padded == ([] if native_staging else [True])
+    width = metadata.num_sparse_topk
+    lens = metadata.prepared_lens[:count].long()
+    indices = metadata.prepared_indices[:count].long()
+    tail = torch.arange(width, device="cuda")[None, :] >= lens[:, None]
+    assert tail[:, :128].any()
+    torch.testing.assert_close(indices, _own_staging_rows(count, width, "cuda"), atol=0, rtol=0)
+    rows = metadata.swa_pool.flatten(0, 1)[indices[:, :128][tail[:, :128]]]
+    if extra_width:
+        extra_rows = metadata.extra_pool.flatten(0, 1)[indices[:, 128:][tail[:, 128:]]]
+        rows = torch.cat((rows, extra_rows))
+    assert (rows.view(torch.uint8) == 0).all()
+
+    stage_selected = metadata.stage_selected
+
+    def stage_and_pad_with_last_selected_row(*args, **kwargs):
+        padded_in_pool = stage_selected(*args, **kwargs)
+        lens = metadata.prepared_lens[:count].long()
+        indices = metadata.prepared_indices[:count]
+        last = indices.gather(1, (lens - 1)[:, None]).expand_as(indices)
+        slot = torch.arange(indices.shape[1], device=indices.device)[None, :]
+        indices.copy_(torch.where(slot >= lens[:, None], last, indices))
+        return padded_in_pool
+
+    monkeypatch.setattr(metadata, "stage_selected", stage_and_pad_with_last_selected_row)
+    assert torch.equal(run().view(torch.int16), out.view(torch.int16))
+
+
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
@@ -1326,33 +1442,12 @@ def test_native_fp8_rejects_incompatible_options():
         )
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize(
-    "implementation,kv_dtype", [("trtllm", "auto"), ("trtllm", "fp8"), ("flashinfer", "auto")]
-)
-@torch.inference_mode()
-def test_shared_native_context_matches_selected_rows(
-    implementation, kv_dtype, monkeypatch, record_property
-):
-    from tensorrt_llm._torch.attention.backends.interface import (
-        AttentionForwardArgs,
-        AttentionInputType,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import (
-        CSA2SharedKVPlan,
-        CSA2TrtllmMetadata,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
-        gather_rows,
-        pack_rows,
-    )
+def _shared_context_case(heads):
+    """Two context requests (3 + 2 queries) staged into one shared bank; top-k 640, one empty query."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2SharedKVPlan
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
 
-    torch.manual_seed(489)
-    count, heads, width = 5, 64, 512
-    attn = _backend(heads, kv_cache_dtype=kv_dtype, compute_backend=implementation)
+    count, width = 5, 512
     q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
     positions = torch.tensor([0, 1, 2, 1024, 1025], device="cuda", dtype=torch.int64)
     requests = torch.tensor([0, 0, 0, 1, 1], device="cuda", dtype=torch.int64)
@@ -1395,6 +1490,46 @@ def test_shared_native_context_matches_selected_rows(
         swa_rows=259,
         main_rows=1029,
     )
+    return q, swa, main, swa_slots, main_slots, main_logical, sink, plan
+
+
+def _shared_context_args(swa, main, swa_slots, main_slots, main_logical, sink):
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+
+    return AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        attention_sinks=sink,
+        sparse_backend_args=CSA2BackendForwardArgs(
+            swa_pool=swa,
+            swa_indices=swa_slots,
+            main_pool=main,
+            topk_indices=main_slots,
+            main_logical_indices=main_logical,
+        ),
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "implementation,kv_dtype", [("trtllm", "auto"), ("trtllm", "fp8"), ("flashinfer", "auto")]
+)
+@torch.inference_mode()
+def test_shared_native_context_matches_selected_rows(
+    implementation, kv_dtype, monkeypatch, record_property
+):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import gather_rows
+
+    torch.manual_seed(489)
+    count, heads, width = 5, 64, 512
+    attn = _backend(heads, kv_cache_dtype=kv_dtype, compute_backend=implementation)
+    q, swa, main, swa_slots, main_slots, main_logical, sink, plan = _shared_context_case(heads)
     calls = []
     native_stage = kernel.stage_shared_rows
 
@@ -1417,17 +1552,7 @@ def test_shared_native_context_matches_selected_rows(
             assert metadata.swa_pool is metadata.extra_pool is metadata.shared_pool
             assert metadata.shared_pool.shape == (1289, 512)
             assert metadata.shared_pool.numel() < count * (128 + width) * 512
-        args = AttentionForwardArgs(
-            attention_input_type=AttentionInputType.context_only,
-            attention_sinks=sink,
-            sparse_backend_args=CSA2BackendForwardArgs(
-                swa_pool=swa,
-                swa_indices=swa_slots,
-                main_pool=main,
-                topk_indices=main_slots,
-                main_logical_indices=main_logical,
-            ),
-        )
+        args = _shared_context_args(swa, main, swa_slots, main_slots, main_logical, sink)
         output = (
             attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
             if implementation == "trtllm"
@@ -1468,6 +1593,57 @@ def test_shared_native_context_matches_selected_rows(
         else:
             torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
         torch.testing.assert_close(actual[2], torch.zeros_like(actual[2]), atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("kv_dtype", ["auto", "fp8"])
+@torch.inference_mode()
+def test_shared_native_context_padding_reads_the_bank_zero_row(kv_dtype, monkeypatch):
+    """Shared-bank context tiles pad with the bank's zeroed row 0; other in-pool rows give the same output."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    torch.manual_seed(490)
+    count, heads = 5, 64
+    attn = _backend(heads, kv_cache_dtype=kv_dtype)
+    q, swa, main, swa_slots, main_slots, main_logical, sink, plan = _shared_context_case(heads)
+    metadata = CSA2TrtllmMetadata.for_query_tile(
+        q, 512, staging_dtype=attn.staging_dtype, context_lengths=[3, 2], shared_rows=1289
+    )
+    metadata.shared_plan = plan
+
+    def run():
+        args = _shared_context_args(swa, main, swa_slots, main_slots, main_logical, sink)
+        out = attn.forward(q.flatten(1), None, None, metadata, forward_args=args).view_as(q)
+        torch.cuda.synchronize()
+        return out.clone()
+
+    out = run()
+    lens = metadata.prepared_lens[:count].long()
+    indices = metadata.prepared_indices[:count]
+    tail = torch.arange(indices.shape[1], device="cuda")[None, :] >= lens[:, None]
+    assert tail.any()
+    assert (indices[tail] == 0).all()
+    assert (metadata.shared_pool[0].view(torch.uint8) == 0).all()
+
+    unselected = torch.nonzero(metadata._csa2_shared_selected[1:] == 0).flatten() + 1
+    assert unselected.numel()
+    row = int(unselected[-1])
+    stage = backend._point_padding_at_staged_rows
+
+    def pad_with_a_large_finite_row(m):
+        stage(m)
+        bank = m.shared_pool
+        if bank.dtype == torch.float8_e4m3fn:
+            bank[row].view(torch.uint8).fill_(0x7E)  # E4M3 448
+        else:
+            bank[row].fill_(30000.0)
+        indices = m.prepared_indices[: m.num_tokens]
+        indices.masked_fill_(tail, row)
+
+    monkeypatch.setattr(backend, "_point_padding_at_staged_rows", pad_with_a_large_finite_row)
+    assert torch.equal(run().view(torch.int16), out.view(torch.int16))
 
 
 @pytest.mark.cpu_only
