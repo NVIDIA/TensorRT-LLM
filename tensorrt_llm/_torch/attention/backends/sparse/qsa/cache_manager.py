@@ -63,10 +63,11 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
 
     V2 storage coalesces the buffers of one lifecycle by page size alone. The
     attention op addresses a layer's K/V pages and its NVFP4 block-scale pages
-    with one block-offset table, so a side page that lands in the K/V pool
-    (NVFP4 at 32 tokens per block: index-K 8192 B == K == V) changes the K/V
-    slot stride but not the block-scale one, and any side page in the K/V pool
-    breaks the K/V pool mapping. When a side page could be the size of a main
+    with one block-offset table. A side page lands in the K/V pool when it has
+    the size of a K/V page: at 32 tokens per block, index-K 8192 B == K == V for
+    FP8 at one KV head per rank and for NVFP4 at two. Any side page in the K/V
+    pool breaks the K/V pool mapping, and under NVFP4 it also changes the K/V
+    slot stride but not the block-scale one. When a side page could be the size of a main
     page, the side planes are therefore registered as one packed per-slot buffer
     whose size can be no main-cache page, and this manager serves their
     per-layer views itself. Both the choice and the packed size are the same on
