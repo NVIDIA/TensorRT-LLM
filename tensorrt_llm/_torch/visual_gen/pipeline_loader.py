@@ -33,6 +33,7 @@ Dynamic Quantization:
 import os
 import time
 from contextlib import ExitStack
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -46,6 +47,7 @@ from tensorrt_llm.llmapi.utils import download_hf_model, download_hf_partial
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
+from .checkpoints.comfy_checkpoint import discover_native_h3, resolve_native_h3
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
@@ -267,9 +269,17 @@ class PipelineLoader:
             raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
 
+        native_h3 = discover_native_h3(
+            Path(checkpoint_dir), self.args.pipeline_config.get("workflow")
+        )
+        if native_h3 is not None:
+            checkpoint_dir = resolve_native_h3(native_h3)
+
         # Strict pipeline_config validation: detect _class_name from the
         # checkpoint, look up the registry entry, reject unknown keys.
         resolved_pipeline_config = self._resolve_pipeline_config(checkpoint_dir)
+        if native_h3 is not None:
+            resolved_pipeline_config["workflow"] = native_h3.workflow
 
         load_start = time.time()
         # text_encoder_path is an LTX-2 pipeline_config knob; it lives in

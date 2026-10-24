@@ -164,6 +164,13 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
+The model path accepts pipeline directories and unambiguous native H3 Comfy NVFP4
+checkpoint directories. Format detection and packed-weight conversion happen
+inside loading; transformer-only checkpoints resolve supporting components from
+the official H3 base through the Hugging Face cache. See
+[checkpoint discovery](../../../examples/visual_gen/README.md#minimax-h3-checkpoint-discovery)
+for workflow identification and ambiguous-directory handling.
+
 MiniMax-H3 parallel VAE uses independent spatial tiles via
 `parallel_config.parallel_vae_size`, with size from 1 through the Ulysses world size.
 Tile geometry and blending follow the loaded Diffusers VAE.

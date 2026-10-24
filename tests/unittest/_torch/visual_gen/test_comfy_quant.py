@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tensorrt_llm._torch.visual_gen.checkpoints import comfy_checkpoint
 from tensorrt_llm._torch.visual_gen.checkpoints.comfy_bundle import prepare_comfy_bundle
 from tensorrt_llm._torch.visual_gen.checkpoints.comfy_flux import convert_comfy_flux_weights
 from tensorrt_llm._torch.visual_gen.checkpoints.comfy_h3 import convert_comfy_h3_weights
@@ -21,8 +23,10 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import _split_nvfp4_projection
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.adaln_curves import interpolate_adaln_curve
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.visual_gen import VisualGenArgs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -598,3 +602,179 @@ def test_prepare_h3_reference_component_routes_config_and_weights(tmp_path: Path
     assert "base_marker" not in routed
     assert (output / "transformer" / "original.safetensors").exists()
     assert not (output / "transformer_ref" / "original.safetensors").exists()
+
+
+@pytest.fixture
+def native_h3_directory(tmp_path, monkeypatch):
+    checkpoint_dir = tmp_path / "my-checkpoint"
+    checkpoint_dir.mkdir()
+    weights, _ = _checkpoint(128, 64)
+    source = {
+        name.replace("proj.", "blocks.0.mlp.fc1."): value
+        for name, value in weights.items()
+        if name.startswith("proj.")
+    }
+    source.update(
+        {
+            "video_patch_proj.weight": torch.ones(64, 96),
+            "audio_patch_proj.weight": torch.ones(64, 32),
+            "condition_proj.weight": torch.ones(64, 128),
+            "adaln_t_table": torch.ones(9, 8),
+        }
+    )
+    save_file(source, checkpoint_dir / "minimax_h3_ref2va.safetensors")
+    base = tmp_path / "base-revision"
+    base.mkdir()
+    manifest = {"_class_name": "MiniMaxH3ModularPipeline"}
+    config = {
+        "_class_name": "MiniMaxH3Transformer3DModel",
+        "num_attention_heads": 1,
+        "attention_head_dim": 64,
+        "hidden_size": 64,
+        "ffn_dim": 64,
+        "in_channels": 24,
+        "audio_in_channels": 32,
+        "patch_size": [1, 2, 2],
+        "text_dim": 128,
+        "time_embed_dim": 256,
+    }
+    for component in ("transformer", "transformer_ref"):
+        folder = base / component
+        folder.mkdir()
+        (folder / "config.json").write_text(json.dumps(config))
+        manifest[component] = ["diffusers", "MiniMaxH3Transformer3DModel"]
+    (base / "modular_model_index.json").write_text(json.dumps(manifest))
+    for component in comfy_checkpoint._H3_COMPONENTS:
+        (base / component).mkdir()
+        (base / component / "marker").write_text(component)
+    calls = []
+
+    def download(model, allow_patterns, revision=None):
+        calls.append((model, allow_patterns, revision))
+        return base
+
+    monkeypatch.setattr(comfy_checkpoint, "download_hf_partial", download)
+    monkeypatch.setattr(comfy_checkpoint, "HF_HUB_CACHE", str(tmp_path / "cache" / "hub"))
+    return checkpoint_dir, base, calls
+
+
+def test_native_h3_directory_auto_resolution(native_h3_directory):
+    directory, base, calls = native_h3_directory
+    detected = comfy_checkpoint.discover_native_h3(directory)
+    assert detected.workflow == "ref2va"
+    resolved = Path(comfy_checkpoint.resolve_native_h3(detected))
+    selected = resolved / "transformer_ref" / "diffusion_pytorch_model.safetensors"
+    assert selected.resolve() == detected.path
+    assert (resolved / "text_encoder" / "marker").read_text() == "text_encoder"
+    assert calls[0][0] == "MiniMaxAI/MiniMax-H3"
+    assert calls[1][2] == base.name
+    assert not any(
+        pattern in ("transformer/*", "transformer_ref/*")
+        for _, patterns, _ in calls
+        for pattern in patterns
+    )
+    assert comfy_checkpoint.resolve_native_h3(detected) == str(resolved)
+    config = DiffusionPipelineConfig.from_pretrained(
+        str(resolved), device="cpu", pipeline_config={"workflow": detected.workflow}
+    )
+    assert config.model_configs["transformer"].quant_config.quant_algo == QuantAlgo.NVFP4
+    assert config.model_configs["transformer"].pretrained_config.time_embed_dim == 8
+
+
+def test_native_h3_normal_loader_routes_before_config(native_h3_directory, monkeypatch):
+    directory, _, _ = native_h3_directory
+
+    class ConfigReached(Exception):
+        pass
+
+    def inspect_config(path, args, pipeline_config):
+        assert pipeline_config["workflow"] == "ref2va"
+        assert Path(path, "transformer_ref", "diffusion_pytorch_model.safetensors").is_file()
+        raise ConfigReached
+
+    monkeypatch.setattr(DiffusionPipelineConfig, "from_pretrained", inspect_config)
+    loader = PipelineLoader(VisualGenArgs(model=str(directory)), device="cpu")
+    with pytest.raises(ConfigReached):
+        loader.load(skip_warmup=True)
+
+
+def test_native_h3_rejects_ambiguous_variants(native_h3_directory):
+    directory, _, _ = native_h3_directory
+    source = directory / "minimax_h3_ref2va.safetensors"
+    (directory / "another_ref2va.safetensors").symlink_to(source)
+    with pytest.raises(ValueError, match="Multiple H3 checkpoints"):
+        comfy_checkpoint.discover_native_h3(directory)
+
+
+def test_native_h3_workflow_selection(native_h3_directory):
+    directory, _, _ = native_h3_directory
+    source = directory / "minimax_h3_ref2va.safetensors"
+    (directory / "model_fl2va.safetensors").symlink_to(source)
+    result = comfy_checkpoint.discover_native_h3(directory, "fl2va")
+    assert result.workflow == "fl2va"
+    assert result.path == source.resolve()
+
+
+def test_native_h3_requires_workflow_evidence(native_h3_directory):
+    directory, _, _ = native_h3_directory
+    (directory / "minimax_h3_ref2va.safetensors").rename(directory / "model.safetensors")
+    with pytest.raises(ValueError, match="cannot be distinguished"):
+        comfy_checkpoint.discover_native_h3(directory)
+    assert comfy_checkpoint.discover_native_h3(directory, "ref2va").workflow == "ref2va"
+
+
+def test_native_h3_workflow_conflict(native_h3_directory):
+    directory, _, _ = native_h3_directory
+    with pytest.raises(ValueError, match="do not match requested workflow"):
+        comfy_checkpoint.discover_native_h3(directory, "fl2va")
+
+
+def test_native_h3_dimensions_checked_before_component_download(native_h3_directory):
+    directory, base, calls = native_h3_directory
+    config_path = base / "transformer_ref" / "config.json"
+    config = json.loads(config_path.read_text())
+    config["hidden_size"] = 123
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="dimensions do not match"):
+        comfy_checkpoint.resolve_native_h3(comfy_checkpoint.discover_native_h3(directory))
+    assert len(calls) == 1
+
+
+def test_native_discovery_leaves_pipeline_and_unrelated_weights_alone(tmp_path):
+    save_file({"not_h3.weight": torch.ones(2, 2)}, tmp_path / "h3_ref2va.safetensors")
+    assert comfy_checkpoint.discover_native_h3(tmp_path) is None
+    (tmp_path / "model_index.json").write_text("{}")
+    assert comfy_checkpoint.discover_native_h3(tmp_path) is None
+
+
+def test_native_h3_invalid_workflow_does_not_download(native_h3_directory):
+    directory, _, calls = native_h3_directory
+    with pytest.raises(ValueError, match="workflow must be"):
+        comfy_checkpoint.discover_native_h3(directory, "ref2v")
+    assert not calls
+
+
+def test_native_h3_cache_changes_with_source(native_h3_directory):
+    directory, _, _ = native_h3_directory
+    detected = comfy_checkpoint.discover_native_h3(directory)
+    first = comfy_checkpoint.resolve_native_h3(detected)
+    stat = detected.path.stat()
+    os.utime(detected.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
+    second = comfy_checkpoint.resolve_native_h3(detected)
+    assert first != second
+
+
+def test_native_h3_rejects_untagged_encoding(native_h3_directory):
+    directory, _, calls = native_h3_directory
+    path = directory / "minimax_h3_ref2va.safetensors"
+    save_file(
+        {
+            "video_patch_proj.weight": torch.ones(64, 96),
+            "audio_patch_proj.weight": torch.ones(64, 32),
+            "condition_proj.weight": torch.ones(64, 128),
+        },
+        path,
+    )
+    with pytest.raises(ValueError, match="encoding is unsupported"):
+        comfy_checkpoint.discover_native_h3(directory)
+    assert not calls

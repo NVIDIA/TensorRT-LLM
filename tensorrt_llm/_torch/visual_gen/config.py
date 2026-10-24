@@ -772,6 +772,10 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 raise ValueError(f"Comfy NVFP4 import is not implemented for {architecture!r}")
             primary_quant = cls.load_diffusion_quant_config(recipe)
             extra_attrs["comfy_nvfp4"] = True
+            logger.info(
+                f"Detected {architecture}: Comfy NVFP4, {len(comfy.nvfp4_layers)} packed layers; "
+                "preserving mixed precision and converting weight layout during loading."
+            )
         quant_config, quant_config_dict, dynamic_weight_quant, dynamic_activation_quant = (
             primary_quant
         )
