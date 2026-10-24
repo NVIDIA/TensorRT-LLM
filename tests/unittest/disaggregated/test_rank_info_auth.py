@@ -33,6 +33,15 @@ _ENDPOINT = "tcp://127.0.0.1:1234"
 _TRANSFER_MODULE = "tensorrt_llm._torch.disaggregation.native.transfer"
 
 
+def _make_receiver() -> Receiver:
+    receiver = Receiver.__new__(Receiver)
+    # No transport resources are created by these method-level tests; mark the
+    # receiver shut down so its destructor can safely run during any later test.
+    receiver._sessions_lock = threading.Lock()
+    receiver._shutdown = True
+    return receiver
+
+
 def _make_server(key=_AUTH_KEY) -> RankInfoServer:
     server = RankInfoServer.__new__(RankInfoServer)
     server._shutdown = True
@@ -98,7 +107,7 @@ def test_rank_info_server_rejects_wrong_key_and_consumes_challenge():
 
 @pytest.mark.parametrize("key", [None, _AUTH_KEY])
 def test_receiver_rank_info_exchange(key):
-    receiver = Receiver.__new__(Receiver)
+    receiver = _make_receiver()
     receiver._rank_info_timeout_s = 60.0
     receiver._rank_info_auth_key = key
     receiver._incompatible_peers = {}
@@ -146,7 +155,7 @@ def test_transfer_worker_rejects_invalid_configured_key_before_native_setup(key)
 
 @pytest.mark.parametrize("ownership", [False, True])
 def test_authentication_failure_fails_only_affected_task(ownership):
-    receiver = Receiver.__new__(Receiver)
+    receiver = _make_receiver()
     receiver._rank_info_timeout_s = 60.0
     receiver._build_recv_req_info = Mock()
     receiver._get_sender_info = Mock(side_effect=RankInfoAuthenticationError("wrong key"))
@@ -232,7 +241,7 @@ def test_malformed_followup_consumes_challenge(extra_frames):
 
 
 def test_receiver_reports_full_cache_as_busy_not_version_mismatch():
-    receiver = Receiver.__new__(Receiver)
+    receiver = _make_receiver()
     receiver._rank_info_timeout_s = 60.0
     receiver._incompatible_peers = {}
     receiver._extract_info_endpoint = Mock(return_value=_ENDPOINT)
@@ -278,7 +287,7 @@ def test_server_without_key_returns_rank_info_without_challenge():
     ],
 )
 def test_receiver_rejects_mismatched_authentication_modes(key, reply):
-    receiver = Receiver.__new__(Receiver)
+    receiver = _make_receiver()
     receiver._rank_info_timeout_s = 60.0
     receiver._rank_info_auth_key = key
     receiver._incompatible_peers = {}
@@ -393,7 +402,7 @@ def test_cancel_pending_rank_info_admission_does_not_publish():
 
 @pytest.mark.parametrize("after_challenge", [False, True])
 def test_rank_info_timeout_uses_one_deadline_and_closes_socket(after_challenge):
-    receiver = Receiver.__new__(Receiver)
+    receiver = _make_receiver()
     receiver._rank_info_timeout_s = 1.0
     receiver._rank_info_auth_key = _AUTH_KEY
     receiver._incompatible_peers = {}
