@@ -1560,7 +1560,7 @@ def _v2_replay_manager(seed, num_gens):
         0, MIN_REPLAY_HISTORY_SIZE, (slots,), generator=g, dtype=torch.int32
     ).cuda()
     mgr.cache_buf_idx = torch.randint(0, 2, (slots,), generator=g, dtype=torch.int32).cuda()
-    mgr._dummy_request_mask = (torch.arange(num_gens + 2) % 2 == 1).cuda()
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer((torch.arange(num_gens + 2) % 2 == 1).cuda())
     mgr.intermediate_state_indices = torch.arange(num_gens + 2, dtype=torch.int32).cuda()
     mgr.intermediate_conv_states = torch.randn(
         layers, num_gens + 2, width, conv_dim, kernel - 1, generator=g
