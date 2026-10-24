@@ -83,7 +83,7 @@ import math
 import os
 import re
 from functools import lru_cache
-from typing import Dict, List, NamedTuple, Optional
+from typing import Callable, Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -125,7 +125,9 @@ from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
     build_markov_head,
+    dspark_markov_chain_ancestral,
     dspark_markov_chain_logits,
+    dspark_markov_step_bias,
 )
 from .modeling_utils import (
     DecoderModel,
@@ -2676,6 +2678,35 @@ class _DSparkHeadMixin:
         markov_w2 = self.markov_w2 if vocab_slice is None else self.markov_w2[vocab_slice]
         return dspark_markov_chain_logits(
             base_logits, first_prev_tokens, self.markov_w1, markov_w2, argmax_fn=argmax_fn
+        )
+
+    def sample_markov_chain(
+        self,
+        base_logits: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        sample_step: Callable[[int, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Draw a block ancestrally through the vanilla-Markov head.
+
+        Each position is drawn under the bias of the token drawn before it; see
+        :func:`dspark_markov_chain_ancestral`. ``base_logits`` must span the full
+        vocab. Without a Markov head the positions are drawn independently from
+        ``base_logits``.
+
+        Returns:
+            ``[B, K]`` long token ids.
+        """
+        markov_w1, markov_w2 = self.markov_w1, self.markov_w2
+        has_head = self.has_markov_head
+
+        def _step_bias(prev_tokens, step_hidden):
+            del step_hidden
+            if not has_head:
+                return torch.zeros((), dtype=base_logits.dtype, device=base_logits.device)
+            return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
+
+        return dspark_markov_chain_ancestral(
+            base_logits, first_prev_tokens, _step_bias, sample_step, cast_bias_to_logits=True
         )
 
     def _take_dspark_head_weights(self, weights: Dict) -> tuple[Dict, Dict]:
