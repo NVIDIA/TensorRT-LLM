@@ -845,9 +845,7 @@ def test_kimi_k3_fp8_kv_layer_policy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("fp8_env", [None, "", "7"], ids=["unset", "empty", "explicit"])
-def test_kimi_k3_rejects_removed_bf16_kv_layers_env(
-    monkeypatch: pytest.MonkeyPatch, fp8_env
-) -> None:
+def test_kimi_k3_deprecated_bf16_kv_layers_env(monkeypatch: pytest.MonkeyPatch, fp8_env) -> None:
     config = SimpleNamespace(
         model_type="kimi_linear",
         num_hidden_layers=8,
@@ -858,18 +856,14 @@ def test_kimi_k3_rejects_removed_bf16_kv_layers_env(
     else:
         monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, fp8_env)
     monkeypatch.setenv("TLLM_KIMI_K3_BF16_KV_LAYERS", "5")
-    # A stale deployment must not silently switch to the FP8 default.
+    # The deprecated variable selects the FP8 layers only when the new one is unset.
+    expected = {None: frozenset({5}), "": frozenset(), "7": frozenset({7})}[fp8_env]
     for nvfp4_enabled in (True, False):
-        with pytest.raises(ValueError, match="TLLM_KIMI_K3_BF16_KV_LAYERS"):
-            get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=nvfp4_enabled)
+        assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=nvfp4_enabled) == expected
     # Other model families ignore the variable.
     assert (
         get_kimi_k3_fp8_kv_layer_ids(SimpleNamespace(model_type="deepseek_v3"), nvfp4_enabled=True)
         == frozenset()
-    )
-    monkeypatch.setenv("TLLM_KIMI_K3_BF16_KV_LAYERS", "")
-    assert get_kimi_k3_fp8_kv_layer_ids(config) == (
-        frozenset({7}) if fp8_env == "7" else frozenset()
     )
 
 

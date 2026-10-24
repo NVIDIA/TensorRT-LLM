@@ -7,13 +7,16 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Optional
 
+from tensorrt_llm.logger import logger
+
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
 KIMI_K3_FP8_KV_LAYERS_ENV = "TLLM_KIMI_K3_FP8_KV_LAYERS"
-# Removed: it listed MLA layers that kept a BF16 KV cache. Setting it is an
-# error so that a stale deployment does not silently get the FP8 default.
-_REMOVED_KIMI_K3_BF16_KV_LAYERS_ENV = "TLLM_KIMI_K3_BF16_KV_LAYERS"
+# Deprecated: it listed MLA layers that kept a higher-precision KV cache.
+# It is still honored as the FP8 layer list (with a warning) when
+# KIMI_K3_FP8_KV_LAYERS_ENV is unset, so existing deployments keep working.
+_DEPRECATED_KIMI_K3_BF16_KV_LAYERS_ENV = "TLLM_KIMI_K3_BF16_KV_LAYERS"
 # MLA layers the NVFP4 default keeps in FP8, counted from the end of the
 # global layer schedule.
 _DEFAULT_NUM_FP8_KV_LAYERS = 2
@@ -38,17 +41,25 @@ def _is_kimi_k3(pretrained_config: object) -> bool:
     )
 
 
-def _reject_removed_bf16_kv_layers_env(pretrained_config: object) -> None:
-    if os.environ.get(_REMOVED_KIMI_K3_BF16_KV_LAYERS_ENV, "").strip() and _is_kimi_k3(
-        pretrained_config
-    ):
-        raise ValueError(
-            f"{_REMOVED_KIMI_K3_BF16_KV_LAYERS_ENV} is no longer supported. "
-            "With an NVFP4 KV cache, Kimi K3 now keeps its last MLA layers in "
-            f"FP8 by default; use {KIMI_K3_FP8_KV_LAYERS_ENV} to select the "
-            "FP8 MLA layers explicitly (an empty value disables the FP8 "
-            f"fallback), and unset {_REMOVED_KIMI_K3_BF16_KV_LAYERS_ENV}."
+def _get_raw_fp8_kv_layer_ids(pretrained_config: object) -> Optional[str]:
+    """Read the FP8 layer list, falling back to the deprecated variable."""
+    raw_layer_ids = os.environ.get(KIMI_K3_FP8_KV_LAYERS_ENV)
+    deprecated_layer_ids = os.environ.get(_DEPRECATED_KIMI_K3_BF16_KV_LAYERS_ENV)
+    if deprecated_layer_ids is None or not _is_kimi_k3(pretrained_config):
+        return raw_layer_ids
+    if raw_layer_ids is not None:
+        logger.warning_once(
+            f"{_DEPRECATED_KIMI_K3_BF16_KV_LAYERS_ENV} is deprecated and ignored "
+            f"because {KIMI_K3_FP8_KV_LAYERS_ENV} is set; unset it.",
+            key="kimi_k3_bf16_kv_layers_env_ignored",
         )
+        return raw_layer_ids
+    logger.warning_once(
+        f"{_DEPRECATED_KIMI_K3_BF16_KV_LAYERS_ENV} is deprecated; its layers now "
+        f"use an FP8 KV cache. Use {KIMI_K3_FP8_KV_LAYERS_ENV} instead.",
+        key="kimi_k3_bf16_kv_layers_env_deprecated",
+    )
+    return deprecated_layer_ids
 
 
 def _mla_layers_per_pp_stage(
@@ -103,8 +114,7 @@ def get_kimi_k3_fp8_kv_layer_ids(
     treated as one stage. Every caller of one model must pass the same
     mapping so that they agree on the selection.
     """
-    _reject_removed_bf16_kv_layers_env(pretrained_config)
-    raw_layer_ids = os.environ.get(KIMI_K3_FP8_KV_LAYERS_ENV)
+    raw_layer_ids = _get_raw_fp8_kv_layer_ids(pretrained_config)
     if raw_layer_ids is not None:
         raw_layer_ids = raw_layer_ids.strip()
         if not raw_layer_ids:
