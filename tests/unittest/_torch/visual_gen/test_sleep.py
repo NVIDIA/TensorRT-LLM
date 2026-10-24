@@ -404,7 +404,7 @@ def h3_loader(monkeypatch: pytest.MonkeyPatch) -> tuple:
     pipeline.load_transformer_weights = MagicMock(return_value={})
     loader = PipelineLoader(VisualGenArgs(model="checkpoint"), device="cuda:0")
     monkeypatch.setattr(loader, "_resolve_checkpoint_dir", lambda path: path)
-    monkeypatch.setattr(loader, "_resolve_pipeline_config", lambda path: {})
+    monkeypatch.setattr(loader, "_resolve_pipeline_config", lambda path, checkpoint_config=None: {})
     monkeypatch.setattr(loader, "_setup_visual_gen_mapping", lambda config: None)
     monkeypatch.setattr(DiffusionPipelineConfig, "from_pretrained", lambda *args, **kwargs: config)
     monkeypatch.setattr(loader_module.AutoPipeline, "from_config", lambda *args: pipeline)

@@ -33,7 +33,6 @@ Dynamic Quantization:
 import os
 import time
 from contextlib import ExitStack
-from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -47,11 +46,10 @@ from tensorrt_llm.llmapi.utils import download_hf_model, download_hf_partial
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-from .checkpoints.comfy_checkpoint import discover_native_h3, resolve_native_h3
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
-from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
+from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent, resolve_checkpoint
 
 if TYPE_CHECKING:
     from .models import BasePipeline
@@ -143,17 +141,20 @@ class PipelineLoader:
             ) from e
         return str(local_dir)
 
-    def _resolve_pipeline_config(self, checkpoint_dir: str) -> dict:
+    def _resolve_pipeline_config(
+        self, checkpoint_dir: str, checkpoint_config: dict | None = None
+    ) -> dict:
         """Validate VisualGenArgs.pipeline_config against the registry and merge.
 
         The user-facing dict on ``VisualGenArgs.pipeline_config`` is strict:
         keys must appear in the resolved pipeline family's ``defaults``
         (the schema-by-example carried on the registry entry). Unknown
         keys raise immediately so typos surface at load time. The merged
-        dict is ``{**entry.defaults, **user_dict}`` — user-supplied values
-        win.
+        dict combines registry defaults, adapter-inferred options, and explicit
+        user options in that order; user-supplied values win.
         """
-        user_pipeline_config = dict(self.args.pipeline_config)
+        user_pipeline_config = dict(checkpoint_config or {})
+        user_pipeline_config.update(self.args.pipeline_config)
 
         # Detect _class_name from the resolved checkpoint, look up the
         # registry entry. If detection fails (or the class_name isn't
@@ -269,17 +270,14 @@ class PipelineLoader:
             raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
 
-        native_h3 = discover_native_h3(
-            Path(checkpoint_dir), self.args.pipeline_config.get("workflow")
-        )
-        if native_h3 is not None:
-            checkpoint_dir = resolve_native_h3(native_h3)
+        checkpoint = resolve_checkpoint(checkpoint_dir, self.args.pipeline_config)
+        checkpoint_dir = checkpoint.path
 
         # Strict pipeline_config validation: detect _class_name from the
         # checkpoint, look up the registry entry, reject unknown keys.
-        resolved_pipeline_config = self._resolve_pipeline_config(checkpoint_dir)
-        if native_h3 is not None:
-            resolved_pipeline_config["workflow"] = native_h3.workflow
+        resolved_pipeline_config = self._resolve_pipeline_config(
+            checkpoint_dir, checkpoint.pipeline_config
+        )
 
         load_start = time.time()
         # text_encoder_path is an LTX-2 pipeline_config knob; it lives in

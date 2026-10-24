@@ -10,7 +10,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from tensorrt_llm._torch.visual_gen.checkpoints import comfy_checkpoint
+from tensorrt_llm._torch.visual_gen.checkpoint_adapter import ResolvedCheckpoint
 from tensorrt_llm._torch.visual_gen.checkpoints.comfy_bundle import prepare_comfy_bundle
 from tensorrt_llm._torch.visual_gen.checkpoints.comfy_flux import convert_comfy_flux_weights
 from tensorrt_llm._torch.visual_gen.checkpoints.comfy_h3 import convert_comfy_h3_weights
@@ -21,9 +21,11 @@ from tensorrt_llm._torch.visual_gen.checkpoints.comfy_quant import (
 from tensorrt_llm._torch.visual_gen.checkpoints.weight_loader import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import _split_nvfp4_projection
+from tensorrt_llm._torch.visual_gen.models.minimax_h3 import checkpoint as h3_checkpoint
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.adaln_curves import interpolate_adaln_curve
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, resolve_checkpoint
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen import VisualGenArgs
@@ -644,7 +646,7 @@ def native_h3_directory(tmp_path, monkeypatch):
         (folder / "config.json").write_text(json.dumps(config))
         manifest[component] = ["diffusers", "MiniMaxH3Transformer3DModel"]
     (base / "modular_model_index.json").write_text(json.dumps(manifest))
-    for component in comfy_checkpoint._H3_COMPONENTS:
+    for component in h3_checkpoint._H3_COMPONENTS:
         (base / component).mkdir()
         (base / component / "marker").write_text(component)
     calls = []
@@ -653,16 +655,16 @@ def native_h3_directory(tmp_path, monkeypatch):
         calls.append((model, allow_patterns, revision))
         return base
 
-    monkeypatch.setattr(comfy_checkpoint, "download_hf_partial", download)
-    monkeypatch.setattr(comfy_checkpoint, "HF_HUB_CACHE", str(tmp_path / "cache" / "hub"))
+    monkeypatch.setattr(h3_checkpoint, "download_hf_partial", download)
+    monkeypatch.setattr(h3_checkpoint, "HF_HUB_CACHE", str(tmp_path / "cache" / "hub"))
     return checkpoint_dir, base, calls
 
 
 def test_native_h3_directory_auto_resolution(native_h3_directory):
     directory, base, calls = native_h3_directory
-    detected = comfy_checkpoint.discover_native_h3(directory)
+    detected = h3_checkpoint.discover_native_h3(directory)
     assert detected.workflow == "ref2va"
-    resolved = Path(comfy_checkpoint.resolve_native_h3(detected))
+    resolved = Path(h3_checkpoint.resolve_native_h3(detected))
     selected = resolved / "transformer_ref" / "diffusion_pytorch_model.safetensors"
     assert selected.resolve() == detected.path
     assert (resolved / "text_encoder" / "marker").read_text() == "text_encoder"
@@ -673,7 +675,7 @@ def test_native_h3_directory_auto_resolution(native_h3_directory):
         for _, patterns, _ in calls
         for pattern in patterns
     )
-    assert comfy_checkpoint.resolve_native_h3(detected) == str(resolved)
+    assert h3_checkpoint.resolve_native_h3(detected) == str(resolved)
     config = DiffusionPipelineConfig.from_pretrained(
         str(resolved), device="cpu", pipeline_config={"workflow": detected.workflow}
     )
@@ -703,14 +705,14 @@ def test_native_h3_rejects_ambiguous_variants(native_h3_directory):
     source = directory / "minimax_h3_ref2va.safetensors"
     (directory / "another_ref2va.safetensors").symlink_to(source)
     with pytest.raises(ValueError, match="Multiple H3 checkpoints"):
-        comfy_checkpoint.discover_native_h3(directory)
+        h3_checkpoint.discover_native_h3(directory)
 
 
 def test_native_h3_workflow_selection(native_h3_directory):
     directory, _, _ = native_h3_directory
     source = directory / "minimax_h3_ref2va.safetensors"
     (directory / "model_fl2va.safetensors").symlink_to(source)
-    result = comfy_checkpoint.discover_native_h3(directory, "fl2va")
+    result = h3_checkpoint.discover_native_h3(directory, "fl2va")
     assert result.workflow == "fl2va"
     assert result.path == source.resolve()
 
@@ -719,14 +721,14 @@ def test_native_h3_requires_workflow_evidence(native_h3_directory):
     directory, _, _ = native_h3_directory
     (directory / "minimax_h3_ref2va.safetensors").rename(directory / "model.safetensors")
     with pytest.raises(ValueError, match="cannot be distinguished"):
-        comfy_checkpoint.discover_native_h3(directory)
-    assert comfy_checkpoint.discover_native_h3(directory, "ref2va").workflow == "ref2va"
+        h3_checkpoint.discover_native_h3(directory)
+    assert h3_checkpoint.discover_native_h3(directory, "ref2va").workflow == "ref2va"
 
 
 def test_native_h3_workflow_conflict(native_h3_directory):
     directory, _, _ = native_h3_directory
     with pytest.raises(ValueError, match="do not match requested workflow"):
-        comfy_checkpoint.discover_native_h3(directory, "fl2va")
+        h3_checkpoint.discover_native_h3(directory, "fl2va")
 
 
 def test_native_h3_dimensions_checked_before_component_download(native_h3_directory):
@@ -736,31 +738,31 @@ def test_native_h3_dimensions_checked_before_component_download(native_h3_direct
     config["hidden_size"] = 123
     config_path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match="dimensions do not match"):
-        comfy_checkpoint.resolve_native_h3(comfy_checkpoint.discover_native_h3(directory))
+        h3_checkpoint.resolve_native_h3(h3_checkpoint.discover_native_h3(directory))
     assert len(calls) == 1
 
 
 def test_native_discovery_leaves_pipeline_and_unrelated_weights_alone(tmp_path):
     save_file({"not_h3.weight": torch.ones(2, 2)}, tmp_path / "h3_ref2va.safetensors")
-    assert comfy_checkpoint.discover_native_h3(tmp_path) is None
+    assert h3_checkpoint.discover_native_h3(tmp_path) is None
     (tmp_path / "model_index.json").write_text("{}")
-    assert comfy_checkpoint.discover_native_h3(tmp_path) is None
+    assert h3_checkpoint.discover_native_h3(tmp_path) is None
 
 
 def test_native_h3_invalid_workflow_does_not_download(native_h3_directory):
     directory, _, calls = native_h3_directory
     with pytest.raises(ValueError, match="workflow must be"):
-        comfy_checkpoint.discover_native_h3(directory, "ref2v")
+        h3_checkpoint.discover_native_h3(directory, "ref2v")
     assert not calls
 
 
 def test_native_h3_cache_changes_with_source(native_h3_directory):
     directory, _, _ = native_h3_directory
-    detected = comfy_checkpoint.discover_native_h3(directory)
-    first = comfy_checkpoint.resolve_native_h3(detected)
+    detected = h3_checkpoint.discover_native_h3(directory)
+    first = h3_checkpoint.resolve_native_h3(detected)
     stat = detected.path.stat()
     os.utime(detected.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
-    second = comfy_checkpoint.resolve_native_h3(detected)
+    second = h3_checkpoint.resolve_native_h3(detected)
     assert first != second
 
 
@@ -776,7 +778,7 @@ def test_native_h3_rejects_untagged_encoding(native_h3_directory):
         path,
     )
     with pytest.raises(ValueError, match="encoding is unsupported"):
-        comfy_checkpoint.discover_native_h3(directory)
+        h3_checkpoint.discover_native_h3(directory)
     assert not calls
 
 
@@ -814,6 +816,86 @@ def test_native_h3_quantized_signature_uses_logical_shape(native_h3_directory):
         }
     )
     save_file(weights, path)
-    detected = comfy_checkpoint.discover_native_h3(directory)
+    detected = h3_checkpoint.discover_native_h3(directory)
     assert detected.shapes["condition_proj.weight"] == (64, 128)
-    assert Path(comfy_checkpoint.resolve_native_h3(detected)).is_dir()
+    assert Path(h3_checkpoint.resolve_native_h3(detected)).is_dir()
+
+
+def test_registered_checkpoint_adapter_is_model_independent(tmp_path, monkeypatch):
+    resolved_path = str(tmp_path / "resolved")
+    resolutions = []
+
+    class Adapter:
+        def resolve(self):
+            resolutions.append(True)
+            return ResolvedCheckpoint(resolved_path, {"mode": "detected"})
+
+    def probe(path, options):
+        assert path == tmp_path
+        assert options == {"mode": "requested"}
+        with pytest.raises(TypeError):
+            options["mode"] = "mutated"
+        return Adapter()
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.pipeline_registry.PIPELINE_REGISTRY",
+        {"UnrelatedPipeline": SimpleNamespace(checkpoint_probe=probe)},
+    )
+    result = resolve_checkpoint(str(tmp_path), {"mode": "requested"})
+    assert result.path == resolved_path
+    assert result.pipeline_config == {"mode": "detected"}
+    assert resolutions == [True]
+
+
+def test_adapter_ambiguity_rejected_before_resolution(tmp_path, monkeypatch):
+    class Adapter:
+        def resolve(self):
+            pytest.fail("Ambiguous recognition must not download or mutate anything")
+
+    entry = SimpleNamespace(checkpoint_probe=lambda path, options: Adapter())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.pipeline_registry.PIPELINE_REGISTRY",
+        {"First": entry, "Second": entry},
+    )
+    with pytest.raises(ValueError, match="Multiple pipeline adapters"):
+        resolve_checkpoint(str(tmp_path), {})
+
+
+def test_standard_pipeline_bypasses_native_adapters(tmp_path, monkeypatch):
+    (tmp_path / "model_index.json").write_text("{}")
+    entry = SimpleNamespace(checkpoint_probe=lambda *args: pytest.fail("Already resolved"))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.pipeline_registry.PIPELINE_REGISTRY", {"Model": entry}
+    )
+    assert resolve_checkpoint(str(tmp_path), {"workflow": "untouched"}).path == str(tmp_path)
+
+
+def test_unrecognized_checkpoint_keeps_original_path(tmp_path, monkeypatch):
+    entry = SimpleNamespace(checkpoint_probe=lambda *args: None)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.pipeline_registry.PIPELINE_REGISTRY", {"Model": entry}
+    )
+    result = resolve_checkpoint(str(tmp_path), {})
+    assert result.path == str(tmp_path)
+    assert result.pipeline_config == {}
+
+
+def test_h3_adapter_registered_by_model():
+    assert (
+        PIPELINE_REGISTRY["MiniMaxH3ModularPipeline"].checkpoint_probe
+        is h3_checkpoint.probe_native_h3
+    )
+
+
+def test_adapter_options_use_normal_validation_and_user_precedence(tmp_path, monkeypatch):
+    (tmp_path / "model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"})
+    )
+    loader = PipelineLoader(
+        VisualGenArgs(model=str(tmp_path), pipeline_config={"workflow": "fl2va"}), device="cpu"
+    )
+    inferred = {"workflow": "ref2va"}
+    assert loader._resolve_pipeline_config(str(tmp_path), inferred)["workflow"] == "fl2va"
+    assert inferred == {"workflow": "ref2va"}
+    with pytest.raises(ValueError, match="Unknown pipeline_config keys"):
+        loader._resolve_pipeline_config(str(tmp_path), {"unknown_adapter_option": True})

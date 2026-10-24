@@ -240,7 +240,9 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
     config = DiffusionPipelineConfig(runtime_lora=args.runtime_lora_config)
 
     monkeypatch.setattr(PipelineLoader, "_resolve_checkpoint_dir", lambda self, path: path)
-    monkeypatch.setattr(PipelineLoader, "_resolve_pipeline_config", lambda self, path: {})
+    monkeypatch.setattr(
+        PipelineLoader, "_resolve_pipeline_config", lambda self, path, checkpoint_config=None: {}
+    )
     monkeypatch.setattr(
         DiffusionPipelineConfig,
         "from_pretrained",

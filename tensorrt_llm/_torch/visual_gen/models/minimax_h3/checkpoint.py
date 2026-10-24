@@ -1,22 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Discover native checkpoint layouts before pipeline configuration is loaded."""
+"""MiniMax-H3 native checkpoint discovery and supporting-component resolution."""
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from filelock import FileLock
 from huggingface_hub.constants import HF_HUB_CACHE
 from safetensors import safe_open
 
+from tensorrt_llm._torch.visual_gen.checkpoint_adapter import ResolvedCheckpoint
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_bundle import prepare_comfy_bundle
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_quant import inspect_comfy_quantization
 from tensorrt_llm.llmapi.utils import download_hf_partial
 from tensorrt_llm.logger import logger
-
-from .comfy_bundle import prepare_comfy_bundle
-from .comfy_quant import inspect_comfy_quantization
 
 _H3_BASE = "MiniMaxAI/MiniMax-H3"
 _H3_COMPONENTS = (
@@ -35,6 +37,9 @@ class NativeH3Checkpoint:
     path: Path
     workflow: str
     shapes: dict[str, tuple[int, ...]]
+
+    def resolve(self) -> ResolvedCheckpoint:
+        return ResolvedCheckpoint(resolve_native_h3(self), {"workflow": self.workflow})
 
 
 def discover_native_h3(path: Path, workflow: str | None = None) -> NativeH3Checkpoint | None:
@@ -157,3 +162,8 @@ def resolve_native_h3(checkpoint: NativeH3Checkpoint) -> str:
             prepare_comfy_bundle(base, checkpoint.path, output, component=component)
     logger.info(f"H3 supporting components: {base}; selected transformer: {checkpoint.path}")
     return str(output)
+
+
+def probe_native_h3(path: Path, options: Mapping[str, Any]) -> NativeH3Checkpoint | None:
+    """Recognize H3 using local tensors and the existing task selection option."""
+    return discover_native_h3(path, options.get("workflow"))

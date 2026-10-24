@@ -33,6 +33,8 @@ the pipeline class plus four pieces of per-family metadata:
                             that contain multiple checkpoint formats/variants.
   * ``doc``     — short human-readable description for discovery tooling.
   * ``supports_nvfp4_vae`` — whether this family can execute an NVFP4 VAE.
+  * ``checkpoint_probe`` — optional model-owned recognition of native layouts;
+                          resolves supporting components only after a unique match.
 
 The dataclass and the registry itself are deliberately private — users go
 through ``VisualGenArgs(model=...)``, ``VisualGen.supported_models()``,
@@ -46,8 +48,11 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 
+from tensorrt_llm._torch.visual_gen.checkpoint_adapter import CheckpointProbe, ResolvedCheckpoint
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -91,6 +96,7 @@ class _PipelineEntry:
     download_patterns: List[str] = field(default_factory=list)
     doc: str = ""
     supports_nvfp4_vae: bool = False
+    checkpoint_probe: CheckpointProbe | None = None
 
 
 # Keyed by Diffusers ``_class_name`` (from either manifest format). ~3-5 entries
@@ -107,6 +113,7 @@ def register_pipeline(
     download_patterns: Optional[List[str]] = None,
     doc: str = "",
     supports_nvfp4_vae: bool = False,
+    checkpoint_probe: CheckpointProbe | None = None,
 ) -> Callable[[Type["BasePipeline"]], Type["BasePipeline"]]:
     """Register a pipeline class with optional per-family metadata.
 
@@ -141,11 +148,37 @@ def register_pipeline(
             download_patterns=list(download_patterns or []),
             doc=doc,
             supports_nvfp4_vae=supports_nvfp4_vae,
+            checkpoint_probe=checkpoint_probe,
         )
         logger.debug(f"Registered pipeline: {name} -> {cls.__name__}")
         return cls
 
     return decorator
+
+
+def resolve_checkpoint(checkpoint_dir: str, pipeline_config: Dict[str, Any]) -> ResolvedCheckpoint:
+    """Resolve one registered model's native layout, or keep the original path.
+
+    A normal pipeline manifest is already resolved. For other layouts, probe
+    every registered family before allowing any adapter to download components.
+    """
+    path = Path(checkpoint_dir)
+    if any((path / name).is_file() for name in ("model_index.json", "modular_model_index.json")):
+        return ResolvedCheckpoint(checkpoint_dir)
+    options = MappingProxyType(dict(pipeline_config))
+    matches = {}
+    for name, entry in PIPELINE_REGISTRY.items():
+        if entry.checkpoint_probe is not None:
+            adapter = entry.checkpoint_probe(path, options)
+            if adapter is not None:
+                matches[name] = adapter
+    if not matches:
+        return ResolvedCheckpoint(checkpoint_dir)
+    if len(matches) != 1:
+        raise ValueError(
+            f"Multiple pipeline adapters recognize {checkpoint_dir}: {sorted(matches)}"
+        )
+    return next(iter(matches.values())).resolve()
 
 
 class AutoPipeline:
