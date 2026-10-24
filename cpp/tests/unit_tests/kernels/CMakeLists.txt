@@ -23,8 +23,7 @@ add_tllm_gtest(
   tllm::kernel_logits
   tllm::runtime_buffers
   LABELS
-  "unit;kernels;logits;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;logits;gpu")
 add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
 add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
 
@@ -60,8 +59,7 @@ add_tllm_gtest(
   tllm::kernel_rope
   tllm::runtime_buffers
   LABELS
-  "unit;kernels;rope;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;rope;gpu")
 add_tllm_gtest(
   shiftKCacheKernelTest
   OWNER
@@ -72,8 +70,7 @@ add_tllm_gtest(
   tllm::kernel_rope
   tllm::runtime_buffers
   LABELS
-  "unit;kernels;rope;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;rope;gpu")
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_tllm_gtest(
@@ -86,8 +83,7 @@ add_tllm_gtest(
   tllm::kernel_mla
   tllm::runtime_buffers
   LABELS
-  "unit;kernels;mla;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;mla;gpu")
 add_tllm_gtest(
   sparseAttentionKernelsTest
   OWNER
@@ -98,8 +94,7 @@ add_tllm_gtest(
   tllm::kernel_sparse_attention
   tllm::runtime_buffers
   LABELS
-  "unit;kernels;sparse-attention;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;sparse-attention;gpu")
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
@@ -113,8 +108,7 @@ add_tllm_gtest(
   tllm::kernel_mla_chunked_prefill
   tllm::runtime_buffers
   LABELS
-  "unit;kernels;mla-chunked-prefill;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;mla-chunked-prefill;gpu")
 
 add_tllm_gtest(
   fusedMoeCommKernelTest
@@ -126,8 +120,7 @@ add_tllm_gtest(
   tllm::kernel_moe_communication
   Threads::Threads
   LABELS
-  "unit;kernels;moe-communication;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;moe-communication;gpu")
 
 add_gtest(
   gemmSwigluRunnerTest
@@ -177,8 +170,7 @@ add_tllm_gtest(
   tllm::kernel_moe_load_balance
   Threads::Threads
   LABELS
-  "unit;kernels;moe-load-balance;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;moe-load-balance;gpu")
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   add_tllm_gtest(
@@ -190,8 +182,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
     LINK_LIBRARIES
     tllm::kernel_moe_lora
     LABELS
-    "unit;kernels;moe-lora;gpu"
-    REQUIRES_GPU)
+    "unit;kernels;moe-lora;gpu")
   add_tllm_gtest(
     moeLoraProblemBuilderTest
     OWNER
@@ -201,8 +192,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
     LINK_LIBRARIES
     tllm::kernel_moe_lora
     LABELS
-    "unit;kernels;moe-lora;gpu"
-    REQUIRES_GPU)
+    "unit;kernels;moe-lora;gpu")
   add_tllm_gtest(
     moeLoraSlotExpandTest
     OWNER
@@ -212,8 +202,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
     LINK_LIBRARIES
     tllm::kernel_moe_lora
     LABELS
-    "unit;kernels;moe-lora;gpu"
-    REQUIRES_GPU)
+    "unit;kernels;moe-lora;gpu")
 endif()
 
 add_tllm_gtest(
@@ -226,8 +215,7 @@ add_tllm_gtest(
   tllm::kernel_rope
   tllm::runtime_buffers
   LABELS
-  "unit;kernels;rope;sparse-kv-cache;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;rope;sparse-kv-cache;gpu")
 add_tllm_gtest(
   prepareCustomMaskTest
   OWNER
@@ -238,8 +226,7 @@ add_tllm_gtest(
   tllm::kernel_attention_mask
   tllm::runtime_buffers
   LABELS
-  "unit;kernels;attention-mask;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;attention-mask;gpu")
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
 
 add_tllm_gtest(
@@ -252,5 +239,4 @@ add_tllm_gtest(
   tllm::kernel_nvfp4_cold_page
   tllm::kv_cache_host_memory
   LABELS
-  "unit;kernels;nvfp4-cold-page;gpu"
-  REQUIRES_GPU)
+  "unit;kernels;nvfp4-cold-page;gpu")
