@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import base64
 import copy
 import math
 import re
@@ -196,6 +197,61 @@ def _prepare_qwen_vl_mrope_config(
 
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
+
+    def export_decode_state(
+            self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        config = multimodal_data.get("mrope_config")
+        if config is None:
+            return None
+        return {
+            "mrope_config": {
+                name: {
+                    "shape":
+                    list(config[name].shape),
+                    "data":
+                    base64.b64encode(config[name].detach().cpu().numpy().astype(
+                        "<i8").tobytes()).decode("ascii"),
+                }
+                for name in ("mrope_position_ids", "mrope_position_deltas")
+            }
+        }
+
+    def restore_decode_state(self, state: Dict[str, Any],
+                             prompt_length: int) -> Dict[str, Any]:
+        if set(state) != {"mrope_config"}:
+            raise ValueError("invalid Qwen decode state")
+        config = state["mrope_config"]
+        if not isinstance(config, dict) or set(config) != {
+                "mrope_position_ids", "mrope_position_deltas"
+        }:
+            raise ValueError("invalid Qwen mRoPE fields")
+        tensors = {}
+
+        for name, value in config.items():
+            expected_shape = (
+                3, 1, prompt_length) if name == "mrope_position_ids" else (1, 1)
+            if not isinstance(value, dict) or set(value) != {"shape", "data"}:
+                raise ValueError(f"invalid Qwen {name} descriptor")
+            shape = value["shape"]
+            if (not isinstance(shape, list)
+                    or any(type(size) not in (int, float) for size in shape)
+                    or shape != list(expected_shape)):
+                raise ValueError(f"invalid Qwen {name} shape")
+            expected_bytes = math.prod(expected_shape) * 8
+            encoded = value["data"]
+            if (not isinstance(encoded, str)
+                    or len(encoded) > ((expected_bytes + 2) // 3) * 4):
+                raise ValueError(f"invalid Qwen {name} encoded length")
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, UnicodeError) as error:
+                raise ValueError(f"invalid Qwen {name} encoding") from error
+            if len(raw) != expected_bytes:
+                raise ValueError(f"invalid Qwen {name} byte length")
+            array = np.frombuffer(raw, dtype="<i8").astype(
+                np.int64).reshape(expected_shape)
+            tensors[name] = torch.from_numpy(array)
+        return {"mrope_config": tensors}
 
     def __init__(self,
                  model_path: str,

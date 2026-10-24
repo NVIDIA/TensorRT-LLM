@@ -1,0 +1,275 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Admission ownership and portable generation-only metadata regressions."""
+
+import asyncio
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+from tensorrt_llm.grpc.openengine.bindings import generation_pb2, kv_pb2
+from tensorrt_llm.grpc.openengine.disagg import prefill_ready_response
+from tensorrt_llm.grpc.openengine.preparation import (
+    _DECODE_PREPARATION_KEY,
+    _decode_preparation,
+    _prepared_decode_from_request,
+)
+from tensorrt_llm.grpc.openengine.server import OpenEngineServer
+from tensorrt_llm.grpc.openengine.servicer import _PreparationLease
+from tensorrt_llm.inputs.media_io import BaseMediaIO
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
+from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad"])
+def test_server_rejects_invalid_media_admission_environment(monkeypatch, value):
+    monkeypatch.setenv("TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT", value)
+    with pytest.raises(ValueError):
+        OpenEngineServer("localhost", 0, object(), "model")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_cancelled_worker_retains_admission_until_thread_finishes(decode, fails):
+    admission = asyncio.Semaphore(1)
+    await admission.acquire()
+    lease = _PreparationLease(admission)
+    started = threading.Event()
+    release = threading.Event()
+
+    def work():
+        started.set()
+        assert release.wait(5)
+        if fails:
+            raise ValueError("late worker failure")
+        return b"decoded"
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+
+        async def prepare():
+            try:
+                if decode:
+                    with BaseMediaIO.use_executor(pool, on_submit=lease.track):
+                        return await BaseMediaIO._run_in_executor(work)
+                return await lease.run(pool, work)
+            finally:
+                lease.close()
+
+        task = asyncio.create_task(prepare())
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert admission.locked()
+            waiter = asyncio.create_task(admission.acquire())
+            await asyncio.sleep(0)
+            assert not waiter.done()
+        finally:
+            release.set()
+        await asyncio.wait_for(waiter, 5)
+        admission.release()
+        lease.close()
+        assert admission._value == 1
+
+
+def _fixture():
+    processor = object.__new__(Qwen2VLInputProcessorBase)
+    processor._config = SimpleNamespace(
+        model_type="qwen2_vl", to_dict=lambda: {"model_type": "qwen2_vl"}
+    )
+    llm = SimpleNamespace(input_processor=processor, args=SimpleNamespace(max_seq_len=128))
+    request = generation_pb2.GenerateRequest(
+        request_id="prefill",
+        model="qwen",
+        prompt="<|image_pad|> describe",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image", mime_type="image/png"
+            )
+        ],
+    )
+    positions = torch.arange(5).reshape(1, 1, 5).expand(3, 1, 5).clone()
+    capture = {
+        "prompt_token_ids": [1, 2, 3, 4, 5],
+        "state": processor.export_decode_state(
+            {
+                "mrope_config": {
+                    "mrope_position_ids": positions,
+                    "mrope_position_deltas": torch.tensor([[-2]]),
+                }
+            }
+        ),
+    }
+    return llm, request, capture, positions
+
+
+def _handoff(request, payload):
+    session = kv_pb2.KvSessionRef(session_id="1")
+    if isinstance(payload, dict):
+        payload = json.dumps(payload)
+    session.attributes_struct.update({_DECODE_PREPARATION_KEY: payload})
+    request.kv.session.CopyFrom(session)
+
+
+def test_qwen_prepared_decode_roundtrip_preserves_tokens_and_positions():
+    llm, request, capture, positions = _fixture()
+    payload = _decode_preparation(request, llm, capture)
+    _handoff(request, payload)
+    restored = _prepared_decode_from_request(request, llm)
+    assert restored.prompt_token_ids == capture["prompt_token_ids"]
+    params = restored.multimodal_params
+    try:
+        params.to_tensor("multimodal_data")
+        assert torch.equal(params.multimodal_data["mrope_config"]["mrope_position_ids"], positions)
+        assert params.multimodal_data["mrope_config"]["mrope_position_deltas"].tolist() == [[-2]]
+        assert set(params.multimodal_data) == {"mrope_config"}
+    finally:
+        params.release_handles()
+
+
+def test_prepared_decode_preserves_multimodal_cache_identity_and_item_layout():
+    llm, request, capture, _ = _fixture()
+    identity = MultimodalInput.from_components(
+        [[-1, 2, 3, 4, 5, 6, 7, 8]],
+        [1],
+        [2],
+        ["image-uuid"],
+        [0, 1],
+        [1],
+        [2],
+    )
+    preprocessed = PreprocessedInputs(
+        prompt_token_ids=capture["prompt_token_ids"],
+        multimodal_params=MultimodalParams(multimodal_input=identity),
+    )
+    payload = _decode_preparation(request, llm, capture, preprocessed)
+    _handoff(request, payload)
+    restored = _prepared_decode_from_request(request, llm)
+    try:
+        assert restored.multimodal_params.multimodal_input == identity
+    finally:
+        restored.multimodal_params.release_handles()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["media", "prompt", "config", "tokens", "shape", "fraction", "fields", "identity_overflow"],
+)
+def test_prepared_decode_rejects_mismatched_or_invalid_payloads(mutation):
+    llm, request, capture, _ = _fixture()
+    payload = json.loads(_decode_preparation(request, llm, capture))
+    if mutation == "media":
+        request.media[0].raw_bytes = b"different-image"
+    elif mutation == "prompt":
+        request.prompt = "different prompt"
+    elif mutation == "config":
+        payload["config_digest"] = "different"
+    elif mutation == "tokens":
+        payload["prompt_token_ids_u32le"] = "%%%"
+    elif mutation == "shape":
+        payload["state"]["mrope_config"]["mrope_position_ids"] = [1, 2]
+    elif mutation == "fraction":
+        payload["state"]["mrope_config"]["mrope_position_deltas"]["shape"] = [1, 0.5]
+    elif mutation == "identity_overflow":
+        payload["multimodal_input"] = {
+            "multimodal_hashes": [[1 << 4096, 2, 3, 4, 5, 6, 7, 8]],
+            "multimodal_positions": [1],
+            "multimodal_lengths": [2],
+        }
+    else:
+        payload["state"]["unrecognized"] = []
+    _handoff(request, payload)
+    with pytest.raises(ValueError):
+        _prepared_decode_from_request(request, llm)
+
+
+def test_unknown_preparation_version_falls_back_and_missing_metadata_is_unchanged():
+    llm, request, capture, _ = _fixture()
+    assert _prepared_decode_from_request(request, llm) is None
+    payload = json.loads(_decode_preparation(request, llm, capture))
+    payload["version"] = 99
+    _handoff(request, payload)
+    assert _prepared_decode_from_request(request, llm) is None
+
+
+@pytest.mark.parametrize("invalid", ["syntax", "object", "size", "kind", "depth"])
+def test_prepared_decode_rejects_invalid_json_envelopes(invalid):
+    llm, request, _, _ = _fixture()
+    payload = {
+        "syntax": "{",
+        "object": "[]",
+        "size": "x" * (2 * 1024 * 1024),
+        "kind": 17,
+        "depth": "[" * 2000 + "0" + "]" * 2000,
+    }[invalid]
+    _handoff(request, payload)
+    with pytest.raises(ValueError):
+        _prepared_decode_from_request(request, llm)
+
+
+def test_oversized_preparation_keeps_the_ordinary_decode_path():
+    llm, request, capture, _ = _fixture()
+    llm.args.max_seq_len = 131072
+    capture["prompt_token_ids"] = [1] * 65536
+    capture["state"] = llm.input_processor.export_decode_state(
+        {
+            "mrope_config": {
+                "mrope_position_ids": torch.zeros((3, 1, 65536), dtype=torch.int64),
+                "mrope_position_deltas": torch.zeros((1, 1), dtype=torch.int64),
+            }
+        }
+    )
+    assert _decode_preparation(request, llm, capture) is None
+
+
+def test_prefill_handoff_carries_portable_preparation_metadata():
+    llm, request, capture, _ = _fixture()
+    payload = _decode_preparation(request, llm, capture)
+    params = SimpleNamespace(
+        ctx_request_id=1,
+        ctx_dp_rank=0,
+        ctx_info_endpoint="tcp://localhost:1234",
+        opaque_state=None,
+        first_gen_tokens=[7],
+        draft_tokens=None,
+        disagg_request_id=None,
+        schedule_style=None,
+        ctx_usage=None,
+        first_gen_log_probs=None,
+    )
+    response = prefill_ready_response("prefill", params, "nixl", decode_preparation=payload)
+    request.kv.session.CopyFrom(response.prefill_ready.kv_session)
+    restored = _prepared_decode_from_request(request, llm)
+    assert restored.prompt_token_ids == capture["prompt_token_ids"]
+    restored.multimodal_params.release_handles()
+
+
+def test_capture_is_request_scoped_and_does_not_modify_processor_output():
+    llm, _, capture, positions = _fixture()
+    processor = llm.input_processor
+    output = (
+        capture["prompt_token_ids"],
+        {
+            "multimodal_data": {
+                "mrope_config": {
+                    "mrope_position_ids": positions,
+                    "mrope_position_deltas": torch.tensor([[-2]]),
+                }
+            }
+        },
+    )
+    with processor.capture_decode_state() as result:
+        assert processor._capture_prepared_decode(output) is output
+    assert result == capture
+    assert processor._decode_state_capture.get() is None
+    assert processor._capture_prepared_decode(output) is output

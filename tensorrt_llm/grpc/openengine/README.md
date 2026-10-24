@@ -23,7 +23,26 @@ The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyT
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, unsupported media modalities, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+
+### Media preparation
+
+Image inputs are accepted when the loaded processor advertises image support.
+The prompt must follow that processor's placeholder policy. Media decoding and
+preprocessing use separate worker pools. Set
+`TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT` to a positive integer to bound the
+number of requests admitted before decoding (default: 4, per frontend process).
+Cancellation retains admission until outstanding worker threads finish. This
+does not bound encoded requests waiting for admission or engine KV-cache memory.
+
+Compatible token-ID processors reuse prompt-validation tokens. Other processors
+retain their text-prompt path. For Qwen vision models, context workers also attach
+versioned prepared prompt, position, and multimodal cache-identity metadata to
+`KvSessionRef.attributes_struct` as a bounded JSON string. A matching decode
+worker can reuse it without fetching or preparing the media again. Missing or
+unknown-version metadata uses the ordinary preparation path. The handoff contains
+bounded CPU metadata, not cross-process tensor handles; encoder disaggregation
+is a separate feature.
 
 ### Disaggregated serving
 
