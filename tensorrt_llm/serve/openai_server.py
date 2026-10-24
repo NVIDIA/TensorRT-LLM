@@ -80,8 +80,7 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCountTokensResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
-from tensorrt_llm.serve.chat_tokenization import (
-    render_chat_request_for_tokenizer, tokenize_harmony_chat_request)
+from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
@@ -117,10 +116,11 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
-from tensorrt_llm.serve.render import (RenderResources, UnsupportedRenderError,
-                                       legacy_render_enabled,
+from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
+                                       UnsupportedRenderError,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
+                                       render_chat_for_length,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
@@ -2588,25 +2588,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
 
-            def _count_estimate() -> int:
-                # The simplified renderer: used for requests the shared
-                # pipeline cannot render (media) and under
-                # TRTLLM_RENDER_LEGACY=1. Resolve the template the way
-                # openai_chat does, or a server started with --chat_template
-                # would count a prompt it never builds. getattr keeps this
-                # working for servers constructed without _init_llm, as the
-                # route tests do.
-                if chat_request.chat_template is None:
-                    chat_request.chat_template = getattr(
-                        self, "chat_template", None)
-                rendered = render_chat_request_for_tokenizer(
-                    chat_request, self.tokenizer)
-                # The renderer returns token ids when the template tokenizes
-                # for itself, and text otherwise; both are valid.
-                if isinstance(rendered, str):
-                    return len(self.tokenizer.encode(rendered))
-                return len(rendered)
-
             # Both the render and the encode are synchronous and both scale
             # with prompt size. Claude Code calls this before most turns with
             # the whole conversation attached, so running them inline would
@@ -2614,8 +2595,6 @@ class OpenAIServer(_VideoRoutesMixin):
             # request on this server -- for a full template render plus a
             # tokenizer pass. The chat path avoids this the same way.
             def _count() -> int:
-                if legacy_render_enabled():
-                    return _count_estimate()
                 # The count is over the prompt tokens the chat route would
                 # execute: same pipeline, same template, same tokenization.
                 resources = RenderResources.from_server(self)
@@ -2623,14 +2602,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     rendered = render_chat(chat_request,
                                            resources,
                                            tokenize=True)
-                except UnsupportedRenderError:
-                    return _count_estimate()
-                except RuntimeError:
-                    # Harmony cannot convert some messages (a tool without a
-                    # description); the count used to come from the template.
-                    if not resources.use_harmony:
-                        raise
-                    return _count_estimate()
+                except (UnsupportedRenderError, HarmonyConversionError):
+                    # Media, an own-processor model or an unconvertible Harmony
+                    # request: count the text, tools and template without the media.
+                    rendered = render_chat_for_length(chat_request, resources)
                 return len(rendered.token_ids)
 
             input_tokens = await asyncio.to_thread(_count)
@@ -2885,8 +2860,6 @@ class OpenAIServer(_VideoRoutesMixin):
             # Same pipeline as the chat route: the server template and the
             # model extension's tool serialization apply here too.
             render_resources = RenderResources.from_server(self)
-            if legacy_render_enabled():
-                render_resources = render_resources.legacy_view()
             tool_dicts = None if request.tools is None else [
                 render_resources.extension.serialize_tool(tool)
                 for tool in request.tools
