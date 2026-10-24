@@ -2231,5 +2231,55 @@ def test_helix_windowed_hp_tail_routes_to_last_page_owner(prompt_len):
     assert (1000 + last, 5000 + owner * 100 + last // cp_size) in routed[owner]
 
 
+@pytest.mark.cpu_only
+def test_failed_write_build_reports_failure_to_the_receiver():
+    """A write that cannot be built still gives its receiver a terminal result.
+
+    The receiver waits for one result from every writer it asked. When the
+    sender cannot build the write (here a geometry mismatch), the request
+    must fail at once instead of waiting out its KV transfer timeout.
+    """
+    import queue
+
+    sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = False
+    sender._instance_rank = 3
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda name, rank: SimpleNamespace(self_endpoint="gen-endpoint")
+    )
+
+    def _raise(task, info):
+        raise ValueError("Replicated cache region size mismatch: local=18432, peer=24192")
+
+    sender._build_kv_write_meta = _raise
+    task = transfer_mod.KVSendTask(
+        Chunk(
+            block_ids_per_layer_groups=[[0]],
+            kind_per_layer_group=[CacheKind.PAGED],
+            token_range=TokenRange(start=0, end=128),
+            is_last=True,
+        ),
+        DisaggregatedParams(disagg_request_id=42),
+        slice_id=0,
+    )
+    task._unique_rid = 42
+    info = SimpleNamespace(instance_name="gen", instance_rank=5, unique_rid=42, slice_id=0)
+
+    with pytest.raises(ValueError, match="size mismatch"):
+        sender._dispatch_task_to_peer(task, info)
+
+    endpoint, message = sender._send_task_queues[0].get_nowait()
+    assert endpoint == "gen-endpoint"
+    assert message[0] == transfer_mod.MessageType.KV_AGENT_RESULT
+    peer_rank, rid, slice_id, is_last, status, size = transfer_mod._KV_RESULT_PREFIX.unpack(
+        message[1]
+    )
+    assert (peer_rank, rid, slice_id, is_last, size) == (3, 42, 0, True, 0)
+    assert status == transfer_mod._AGENT_RESULT_CODE[transfer_mod.AgentResult.FAILED]
+    assert task.status == transfer_mod.TaskStatus.ERROR
+
+
 if __name__ == "__main__":
     test_transfer_worker_v2(1, 1, False, 1, 1, False, False)
