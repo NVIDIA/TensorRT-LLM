@@ -810,6 +810,35 @@ def test_kimi_k3_fp8_kv_layer_policy(monkeypatch: pytest.MonkeyPatch) -> None:
         get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True)
 
 
+@pytest.mark.parametrize("fp8_env", [None, "", "7"], ids=["unset", "empty", "explicit"])
+def test_kimi_k3_rejects_removed_bf16_kv_layers_env(
+    monkeypatch: pytest.MonkeyPatch, fp8_env
+) -> None:
+    config = SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=8,
+        linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+    )
+    if fp8_env is None:
+        monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, fp8_env)
+    monkeypatch.setenv("TLLM_KIMI_K3_BF16_KV_LAYERS", "5")
+    # A stale deployment must not silently switch to the FP8 default.
+    for nvfp4_enabled in (True, False):
+        with pytest.raises(ValueError, match="TLLM_KIMI_K3_BF16_KV_LAYERS"):
+            get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=nvfp4_enabled)
+    # Other model families ignore the variable.
+    assert (
+        get_kimi_k3_fp8_kv_layer_ids(SimpleNamespace(model_type="deepseek_v3"), nvfp4_enabled=True)
+        == frozenset()
+    )
+    monkeypatch.setenv("TLLM_KIMI_K3_BF16_KV_LAYERS", "")
+    assert get_kimi_k3_fp8_kv_layer_ids(config) == (
+        frozenset({7}) if fp8_env == "7" else frozenset()
+    )
+
+
 def _pp_mapping(pp_size: int, rank: int = 0, pp_partition=None) -> Mapping:
     return Mapping(
         world_size=pp_size, tp_size=1, pp_size=pp_size, rank=rank, pp_partition=pp_partition

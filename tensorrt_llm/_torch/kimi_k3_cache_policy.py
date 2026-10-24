@@ -11,6 +11,9 @@ if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
 KIMI_K3_FP8_KV_LAYERS_ENV = "TLLM_KIMI_K3_FP8_KV_LAYERS"
+# Removed: it listed MLA layers that kept a BF16 KV cache. Setting it is an
+# error so that a stale deployment does not silently get the FP8 default.
+_REMOVED_KIMI_K3_BF16_KV_LAYERS_ENV = "TLLM_KIMI_K3_BF16_KV_LAYERS"
 # MLA layers the NVFP4 default keeps in FP8, counted from the end of the
 # global layer schedule.
 _DEFAULT_NUM_FP8_KV_LAYERS = 2
@@ -21,6 +24,31 @@ def _get_kimi_k3_text_config(pretrained_config: object) -> object:
     if text_config is not None:
         return text_config
     return pretrained_config
+
+
+def _is_kimi_k3(pretrained_config: object) -> bool:
+    config = _get_kimi_k3_text_config(pretrained_config)
+    model_type = getattr(config, "model_type", None)
+    architectures = getattr(config, "architectures", None) or getattr(
+        pretrained_config, "architectures", None
+    )
+    return model_type in ("kimi_k3", "kimi_k3_text", "kimi_linear") or any(
+        "KimiK3" in architecture or "KimiLinear" in architecture
+        for architecture in (architectures or ())
+    )
+
+
+def _reject_removed_bf16_kv_layers_env(pretrained_config: object) -> None:
+    if os.environ.get(_REMOVED_KIMI_K3_BF16_KV_LAYERS_ENV, "").strip() and _is_kimi_k3(
+        pretrained_config
+    ):
+        raise ValueError(
+            f"{_REMOVED_KIMI_K3_BF16_KV_LAYERS_ENV} is no longer supported. "
+            "With an NVFP4 KV cache, Kimi K3 now keeps its last MLA layers in "
+            f"FP8 by default; use {KIMI_K3_FP8_KV_LAYERS_ENV} to select the "
+            "FP8 MLA layers explicitly (an empty value disables the FP8 "
+            f"fallback), and unset {_REMOVED_KIMI_K3_BF16_KV_LAYERS_ENV}."
+        )
 
 
 def _mla_layers_per_pp_stage(
@@ -75,6 +103,7 @@ def get_kimi_k3_fp8_kv_layer_ids(
     treated as one stage. Every caller of one model must pass the same
     mapping so that they agree on the selection.
     """
+    _reject_removed_bf16_kv_layers_env(pretrained_config)
     raw_layer_ids = os.environ.get(KIMI_K3_FP8_KV_LAYERS_ENV)
     if raw_layer_ids is not None:
         raw_layer_ids = raw_layer_ids.strip()
@@ -83,17 +112,10 @@ def get_kimi_k3_fp8_kv_layer_ids(
     elif not nvfp4_enabled:
         return frozenset()
 
-    config = _get_kimi_k3_text_config(pretrained_config)
-    model_type = getattr(config, "model_type", None)
-    architectures = getattr(config, "architectures", None) or getattr(
-        pretrained_config, "architectures", None
-    )
-    is_kimi_k3 = model_type in ("kimi_k3", "kimi_k3_text", "kimi_linear") or any(
-        "KimiK3" in architecture or "KimiLinear" in architecture
-        for architecture in (architectures or ())
-    )
-    if not is_kimi_k3:
+    if not _is_kimi_k3(pretrained_config):
         return frozenset()
+
+    config = _get_kimi_k3_text_config(pretrained_config)
 
     linear_attn_config = getattr(config, "linear_attn_config", None)
     if linear_attn_config is None:
