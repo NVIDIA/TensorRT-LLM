@@ -1071,3 +1071,44 @@ def test_packed_padding_guard_preserves_small_calls_and_multi_context(lengths, c
     runner._buckets = [EncoderGraphKey(capacity, len(lengths))]
     bucket = runner._select_bucket(len(lengths), sum(lengths), lengths)
     assert (bucket is not None) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lengths", [[4096], [2048, 2048]])
+def test_padding_guard_logs_once_without_consuming_missing_bucket_warning(lengths):
+    runner = _make_logic_runner(buckets=[EncoderGraphKey(8192, len(lengths))])
+    logger = encoder_graph_module.logger
+    with (
+        mock.patch.object(logger, "log") as log,
+        mock.patch.object(logger, "_appeared_keys", set()),
+    ):
+        for _ in range(2):
+            assert runner.maybe_run(seq_lengths=lengths, inputs={}) is None
+        log.assert_called_once_with(
+            logger.VERBOSE,
+            "Multimodal encoder CUDA graph padding guard: running eager because "
+            "padding 100.00% > 25%",
+        )
+        assert not runner._warned_no_bucket_match
+        assert runner.maybe_run(seq_lengths=[8193] * len(lengths), inputs={}) is None
+        assert log.call_count == 2
+        assert log.call_args.args[0] == logger.WARNING
+        assert "no configured bucket matches" in log.call_args.args[1]
+
+
+@pytest.mark.cpu_only
+def test_padding_guard_reason_in_replay_stats_and_off_without_padding():
+    logger = encoder_graph_module.logger
+    stats_runner = _make_logic_runner(buckets=[EncoderGraphKey(8192, 1)], enable_replay_stats=True)
+    exact_runner = _make_logic_runner(buckets=[EncoderGraphKey(8192, 1)], enable_padding=False)
+    with (
+        mock.patch.object(logger, "log") as log,
+        mock.patch.object(logger, "_appeared_keys", set()),
+    ):
+        assert stats_runner.maybe_run(seq_lengths=[4096], inputs={}) is None
+        infos = [call.args[1] for call in log.call_args_list if call.args[0] == logger.INFO]
+        assert len(infos) == 1 and "padding guard rejected" in infos[0]
+        log.reset_mock()
+        # Exact-fit replay has no padding to guard, so this is a real miss.
+        assert exact_runner.maybe_run(seq_lengths=[4096], inputs={}) is None
+        assert [call.args[0] for call in log.call_args_list] == [logger.WARNING]

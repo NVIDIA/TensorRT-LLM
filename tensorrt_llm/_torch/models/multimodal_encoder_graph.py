@@ -439,11 +439,6 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
 
         bucket = self._select_bucket(real_contexts, real_tokens, seq_lengths)
         if bucket is None:
-            if self._replay_stats_enabled:
-                logger.info(
-                    "Multimodal encoder CUDA graph bucket miss: no bucket for "
-                    f"{real_contexts=}, {real_tokens=}."
-                )
             return None
 
         padded_seq_lengths = self._padded_seq_lengths(list(seq_lengths), bucket=bucket)
@@ -500,6 +495,22 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
             if real_tokens > bucket.total_tokens:
                 continue
             if seq_lengths is not None and not self._io_adapter.can_replay(bucket, seq_lengths):
+                if self._config.enable_padding and isinstance(
+                    self._io_adapter, PackedEncoderGraphIOAdapter
+                ):
+                    padding = (bucket.total_tokens / real_tokens - 1) * 100
+                    logger.debug_once(
+                        "Multimodal encoder CUDA graph padding guard: running eager because "
+                        f"padding {padding:.2f}% > 25%",
+                        key="multimodal_encoder_padding_guard",
+                    )
+                    if self._replay_stats_enabled:
+                        logger.info(
+                            "Multimodal encoder CUDA graph bucket miss: padding guard rejected "
+                            f"{bucket=} for {real_contexts=}, {real_tokens=} "
+                            f"(padding {padding:.2f}% > 25%)."
+                        )
+                    return None
                 continue
             if self._config.enable_padding:
                 # Padding path: exact num_contexts match and real_tokens <= bucket budget.
@@ -513,6 +524,11 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
                 "Multimodal encoder CUDA graph: no configured bucket matches "
                 f"({real_contexts=}, {real_tokens=}). "
                 f"Falling back to eager. Configured buckets: {self._buckets}. "
+            )
+        if self._replay_stats_enabled:
+            logger.info(
+                "Multimodal encoder CUDA graph bucket miss: no bucket for "
+                f"{real_contexts=}, {real_tokens=}."
             )
         return None
 
