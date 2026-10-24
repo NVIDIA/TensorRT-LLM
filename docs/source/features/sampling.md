@@ -294,9 +294,6 @@ Parameter Configuration:
 
 Beam search rejects the following combinations, raising an error at admission:
 
-- **Disaggregated serving.** The pool of finished candidates the context server builds is not
-  part of the handoff, so a completion found there would be silently dropped. Use
-  `best_of=1` on a disaggregated deployment.
 - **A decreasing `beam_width_array`.** Only non-decreasing schedules are supported; the
   semantics of narrowing mid-decode are not defined.
 - **A `best_of` other than `max_beam_width`.** Every request in an engine runs at the same
@@ -321,6 +318,40 @@ sampling_params = SamplingParams(
 llm.generate(["Hello, my name is",
             "Hello, my name is"], sampling_params)
 ```
+
+### With disaggregated serving
+
+Beam search works with context-first disaggregated serving for dense-attention models. Both the
+context and the generation workers need the C++ KV cache manager V2, the Python transceiver with
+the NIXL backend, and the same `max_beam_width`:
+
+```yaml
+max_beam_width: 4
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+cache_transceiver_config:
+  transceiver_runtime: PYTHON
+  backend: NIXL
+```
+
+The context worker transfers the prompt's KV cache once and hands the first token and cumulative
+log-probability of every beam to the generation worker, which expands the beams after the
+transfer completes. A beam whose first token is the end token is handed off as well: the
+generation worker builds the pool of finished candidates, so `early_stopping` and `n` apply there
+and no completion is dropped. Block reuse remains supported. See
+[Selecting the KV Cache Manager](kvcache.md#selecting-the-kv-cache-manager) for the V2 manager.
+
+The following are not supported:
+
+- **Generation-first scheduling** (`schedule_style: generation_first`). Only context-first
+  scheduling, the default, hands the per-beam log-probabilities to the generation worker.
+- **Pipelined KV transfer** (`cache_transceiver_config.enable_pipelined_transfer`). Admission
+  rejects a context-only request whose beam width is greater than 1.
+- **The C++ transceiver** (`transceiver_runtime: CPP`), which transfers beam width 1 only.
+- **Hybrid Mamba and sparse-attention models.** Creating KV cache manager V2 fails at startup
+  when `max_beam_width > 1`.
+- **KV cache connectors** (`kv_connector_config`). The executor fails at startup when
+  `max_beam_width > 1`.
 
 ### Over the OpenAI-compatible API
 
