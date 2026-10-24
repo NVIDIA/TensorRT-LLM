@@ -6843,3 +6843,93 @@ def test_parse_base_json_reports_the_name_as_emitted(sample_tools):
 
     assert [(c.name, c.tool_index)
             for c in calls] == [("functions.get_weather", -1)]
+
+
+# ============================================================================
+# DeepSeek DSML layout: the newlines inside a tool-call block are not content
+# ============================================================================
+
+_DSML_FORMATS = [
+    (DeepSeekV32Parser, "function_calls", "invoke", "parameter"),
+    (DeepSeekV4Parser, "tool_calls", "invoke", "parameter"),
+    (DeepSeekV41Parser, " calls", " invoke", " parameter"),
+]
+
+
+def _dsml_block(calls_tag: str, invoke_tag: str, parameter_tag: str) -> str:
+    """Two calls laid out as the checkpoint encoders write them: one per line."""
+    dsml = "｜DSML｜"
+
+    def invoke(name: str, key: str, value: str) -> str:
+        return (f'<{dsml}{invoke_tag} name="{name}">\n'
+                f'<{dsml}{parameter_tag} name="{key}" string="true">{value}'
+                f"</{dsml}{parameter_tag}>\n"
+                f"</{dsml}{invoke_tag}>")
+
+    return (f"<{dsml}{calls_tag}>\n" +
+            invoke("get_weather", "location", "NYC") + "\n" +
+            invoke("search_web", "query", "AI") + "\n" +
+            f"</{dsml}{calls_tag}>")
+
+
+def _stream(parser, text: str, chunk_size: int,
+            tools: list[ChatCompletionToolsParam]):
+    results = [
+        parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+        for i in range(0, len(text), chunk_size)
+    ]
+    results.append(parser.finish(tools))
+    content = "".join(result.normal_text for result in results)
+    calls = [call for result in results for call in result.calls]
+    return content, calls
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 10_000])
+def test_dsml_newlines_between_calls_are_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The newline after each invoke is the block's layout, however it is chunked.
+
+    Streamed as text, it became content after every tool call: over Anthropic
+    Messages, a whitespace-only text block followed each tool_use, and a client
+    that drops such blocks sent back a turn that no longer matched what was
+    served.
+    """
+    text = "Let me check.\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Let me check.\n\n"
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+    arguments = [
+        json.loads(call.parameters) for call in calls
+        if not call.name and call.parameters
+    ]
+    assert arguments == [{"location": "NYC"}, {"query": "AI"}]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [5, 10_000])
+def test_dsml_text_after_the_block_is_still_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Only the layout inside the block is dropped; text after it is kept.
+
+    In one increment, the closing tag and the text after it follow the last
+    invoke; that text must come out of that increment, since nothing flushes
+    the parser when the stream ends.
+    """
+    text = _dsml_block(calls_tag, invoke_tag, parameter_tag) + " Done."
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == " Done."
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
