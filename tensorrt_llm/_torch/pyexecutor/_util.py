@@ -187,6 +187,17 @@ def is_disagg_enabled(
             and cache_transceiver_config.backend is not None)
 
 
+def _validate_v2_mamba_block_reuse_without_rebalance(
+        kv_cache_config: KvCacheConfig) -> None:
+    """Reject block reuse with pool rebalancing on the V2 hybrid manager."""
+    if (kv_cache_config.enable_block_reuse
+            and kv_cache_config.enable_kv_pool_rebalance):
+        raise ValueError(
+            "V2 Mamba block reuse is not compatible with "
+            "enable_kv_pool_rebalance because the rebalancer does not "
+            "yet model retained recurrent-state snapshots.")
+
+
 def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
@@ -236,6 +247,7 @@ def get_kv_cache_manager_cls(
             # its recurrent-state lifecycle and keeps the KDA replay caches
             # used by fused speculative verification. Its disaggregation
             # declarations cover both the MLA and the recurrent-state roles.
+            _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
             return MambaHybridCacheManagerV2
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
@@ -425,12 +437,7 @@ def get_kv_cache_manager_cls(
         if not use_v2:
             return CppMambaHybridCacheManager
 
-        if (kv_cache_config.enable_block_reuse
-                and kv_cache_config.enable_kv_pool_rebalance):
-            raise ValueError(
-                "V2 Mamba block reuse is not compatible with "
-                "enable_kv_pool_rebalance because the rebalancer does not "
-                "yet model retained recurrent-state snapshots.")
+        _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
         if sparse_attn_algorithm == "qsa":
             return get_sparse_attn_kv_cache_manager(
                 sparse_attn_config, use_kv_cache_manager_v2=True)
