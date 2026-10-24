@@ -145,6 +145,9 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_ltx23_registry.py
+  - unittest/_torch/visual_gen/test_ltx23_pipeline_config.py
+  - unittest/_torch/visual_gen/test_ltx23_retake_initialization.py
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
