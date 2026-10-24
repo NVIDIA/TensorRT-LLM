@@ -668,7 +668,7 @@ class CuteDslMlaFmha(PhasedFmha):
         local_layer_idx = attn.get_local_layer_idx(meta)
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
-        cache_seqs_base = self._aligned_kernel_input(params.sequence_lengths.to(torch.int32))
+        cache_seqs_base = self._decode_kv_lengths(meta, params.sequence_lengths)
         # The page-table batch dimension determines the kernel launch batch.
         page_table = self._generation_page_table(
             page_table_layer, meta.num_contexts, batch_size, layer_in_pool
@@ -749,6 +749,35 @@ class CuteDslMlaFmha(PhasedFmha):
         if tensor.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
             return tensor
         return tensor.clone(memory_format=torch.contiguous_format)
+
+    @classmethod
+    def _decode_kv_lengths(
+        cls,
+        meta: "TrtllmAttentionMetadata",
+        sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """This step's int32 KV lengths with the kernel's pointer alignment.
+
+        A misaligned view (the generation rows of a mixed batch) is copied
+        into a staging buffer kept on ``meta``, so every layer of the step
+        passes the same pointer and ``_split_kv_plan`` plans once per step
+        instead of once per layer. Under CUDA graph capture without that
+        buffer it falls back to ``_aligned_kernel_input``.
+        """
+        lengths = sequence_lengths.to(torch.int32)
+        if lengths.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
+            return lengths
+        num_lengths = lengths.numel()
+        staging = getattr(meta, "_cute_dsl_mla_kv_lens_staging", None)
+        if staging is None or staging.numel() < num_lengths or staging.device != lengths.device:
+            if lengths.is_cuda and torch.cuda.is_current_stream_capturing():
+                return cls._aligned_kernel_input(lengths)
+            capacity = max(int(getattr(meta, "max_num_requests", 0) or 0), num_lengths)
+            staging = torch.empty(capacity, dtype=torch.int32, device=lengths.device)
+            meta._cute_dsl_mla_kv_lens_staging = staging
+        staged = staging[:num_lengths].view(lengths.shape)
+        staged.copy_(lengths)
+        return staged
 
     @classmethod
     def _generation_page_table(
