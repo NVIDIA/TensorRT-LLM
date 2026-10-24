@@ -5064,6 +5064,11 @@ class PyExecutor:
                                 self.dwdp_manager.prefetch_first_layers()
                             batch_outputs = self._forward_step(scheduled_batch)
 
+                        # Under plain TP/CP, agree with peers on whether any
+                        # rank's forward failed before acting on the result.
+                        batch_outputs = self._agree_on_forward_failure(
+                            batch_outputs)
+
                         # None: _forward_step hit an exception and
                         # _handle_errors already failed the affected requests
                         # and enqueued their error responses. Skip this
@@ -6011,6 +6016,11 @@ class PyExecutor:
                         with self._step_scope(scheduled_batch):
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device)
+
+                    # Under plain TP/CP, agree with peers on whether any
+                    # rank's forward failed before acting on the result.
+                    batch_outputs = self._agree_on_forward_failure(
+                        batch_outputs)
 
                     if batch_outputs is None:
                         # _forward_step hit an exception; _handle_errors
@@ -8565,13 +8575,23 @@ class PyExecutor:
             # TLLM_TEST_INJECT_FORWARD_FAIL_STEPS is set in the worker's
             # environment.
             inject_steps = os.environ.get("TLLM_TEST_INJECT_FORWARD_FAIL_STEPS")
+            inject_ranks = os.environ.get("TLLM_TEST_INJECT_FORWARD_FAIL_RANKS")
+            inject_fail_post_forward = False
             if inject_steps and not self.is_warmup:
                 step = getattr(self, "_inject_forward_fail_step_counter", 0) + 1
                 self._inject_forward_fail_step_counter = step
                 if str(step) in inject_steps.split(","):
-                    raise RuntimeError(
-                        f"injected forward failure at forward step {step} "
-                        "(TLLM_TEST_INJECT_FORWARD_FAIL_STEPS)")
+                    if inject_ranks is None:
+                        raise RuntimeError(
+                            f"injected forward failure at forward step {step} "
+                            "(TLLM_TEST_INJECT_FORWARD_FAIL_STEPS)")
+                    # Rank-local variant: listed ranks raise AFTER the model
+                    # forward returns, so TP peers are already out of the
+                    # forward's collectives when the failure is handled
+                    # (a pre-forward raise would leave peers blocked inside
+                    # the model's allreduce, which no survival path can fix).
+                    inject_fail_post_forward = str(
+                        self.dist.rank) in inject_ranks.split(",")
 
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
@@ -8597,6 +8617,11 @@ class PyExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
+            if inject_fail_post_forward:
+                raise RuntimeError(
+                    "injected rank-local forward failure at forward step "
+                    f"{self._inject_forward_fail_step_counter} on rank "
+                    f"{self.dist.rank} (TLLM_TEST_INJECT_FORWARD_FAIL_RANKS)")
             if route_capture is not None:
                 route_capture.finish_forward()  # R3: disarm between forwards
 
@@ -8615,8 +8640,83 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(
                 f"Encountered an error in forward function: {error_msg}")
+            # Kept for _agree_on_forward_failure, which forwards the message
+            # to healthy TP peers so rank 0 can emit the client responses.
+            self._last_forward_error_msg = error_msg
             self._handle_errors(error_msg)
             return None
+
+    def _agree_on_forward_failure(self, batch_outputs):
+        """Reach group-wide agreement on a forward failure and its severity.
+
+        Under plain TP and/or CP (no attention DP) every rank runs the same
+        batch, rank 0 schedules and broadcasts the schedule, and only rank 0
+        enqueues responses. A forward exception handled on one rank alone
+        therefore desynchronizes the group: the failing rank frees its
+        requests while rank 0 keeps scheduling them, and a non-zero failing
+        rank's error responses never reach the client. Every rank enters
+        this allgather once per forward step; if any rank failed, the
+        healthy ranks join the failure so the whole group takes the same
+        path together.
+
+        The continue/shutdown decision must also be rank-uniform: each
+        failing rank's own ``_handle_errors`` (run inside ``_forward_step``)
+        classified its error against its local error budget, and two failing
+        ranks can classify differently (e.g. one transient error, one CUDA
+        OOM). Each rank therefore gathers its post-classification fatal flag
+        along with its error message, and any fatal rank drags the whole
+        group into the fatal path. Joining ranks do not re-classify or
+        charge their own budget (``charge_budget=False``): severity is
+        decided once, on the rank that failed, and propagated.
+
+        Collectives pair by call order, so on the gated path this gather is
+        unconditional per forward step. A failure raised inside the model
+        forward while peers are blocked in one of its collectives cannot be
+        recovered by this agreement (those peers never return to enter it);
+        that class still ends in the fatal/hang-detector path, as before.
+
+        Returns batch_outputs, or None when the group agreed on a failure.
+        """
+        if (self.dist.tp_size * self.dist.cp_size == 1
+                or self.enable_attention_dp):
+            return batch_outputs
+        local_error = None
+        if batch_outputs is None:
+            local_error = (getattr(self, "_last_forward_error_msg", None)
+                           or "forward failure on a TP/CP peer")
+        # Fatal only if THIS step's failure was classified fatal by
+        # _handle_errors (which sets _fatal_error). is_shutdown alone must
+        # not count: it is also set by a graceful shutdown request, which
+        # keeps forwarding until the active requests drain.
+        local_fatal = (batch_outputs is None and self._fatal_error is not None)
+        gathered = self.dist.tp_cp_allgather((local_error, local_fatal),
+                                             small_payload=True)
+        peer_error = next((e for e, _ in gathered if e is not None), None)
+        fatal_peer_error = next(
+            (e for e, fatal in gathered if fatal and e is not None), None)
+        group_fatal = fatal_peer_error is not None
+        if group_fatal and not local_fatal:
+            # A peer classified its failure as fatal; take the fatal path
+            # here too so no rank keeps serving after a peer shut down.
+            # _fatal_error is set first so _handle_errors routes into its
+            # fatal cleanup without re-charging this rank's error budget.
+            fatal_msg = (
+                local_error if batch_outputs is None else
+                f"fatal forward failure on a TP/CP peer: {fatal_peer_error}")
+            self._fatal_error = RuntimeError(f"Fatal error: {fatal_msg}")
+            self._handle_errors(fatal_msg, charge_budget=False)
+            return None
+        if batch_outputs is None:
+            # This rank failed; _forward_step already ran _handle_errors.
+            return None
+        if peer_error is None:
+            return batch_outputs
+        logger.error(
+            "A TP/CP peer hit a survivable forward failure; joining it to "
+            f"keep the group aligned: {peer_error}")
+        self._handle_errors(f"TP/CP peer forward failure: {peer_error}",
+                            charge_budget=False)
+        return None
 
     def _update_generation_requests_that_will_complete_next_iteration(
             self, generation_requests: list[LlmRequest]):
