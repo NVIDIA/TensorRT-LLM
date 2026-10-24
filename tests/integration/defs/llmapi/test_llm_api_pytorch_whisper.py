@@ -164,9 +164,6 @@ def _make_llm(
         ),
         max_batch_size=2,
         max_beam_width=max_beam_width,
-        # Cross-KV pool capacity; the default (1024) is smaller than the
-        # 1500 encoder positions every Whisper request produces.
-        max_input_len=_ENCODER_OUTPUT_LEN,
         max_num_tokens=2 * _ENCODER_OUTPUT_LEN,
         scheduler_config=SchedulerConfig(use_python_scheduler=use_python_scheduler),
         tensor_parallel_size=tensor_parallel_size,
