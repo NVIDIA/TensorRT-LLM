@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Registry of published benchmark results that this directory reproduces. One item per entry directory;
+# examples/perf_reproductions/_common/validate.py checks that it matches the directories on disk.
+entries:
+  - path: inferencex/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/GB300/agentx-disagg
+    benchmark: InferenceX
+    model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+    hardware: GB300 NVL72
+    scenario: AgentX agentic coding, disaggregated serving
+    status: branch
