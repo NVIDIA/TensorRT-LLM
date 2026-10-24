@@ -19,27 +19,25 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
-    MODELING_V2_ROUTERS,
-    routing_module,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import registered_routes
 
 # The package, not this file: these paths address the tree under test, and this
 # test lives in tests/ while that tree lives in tensorrt_llm/.
 pytestmark = pytest.mark.cpu_only
 
 _ROOT = Path(_modeling_v2.__file__).resolve().parent
-_ARCHS = sorted(MODELING_V2_ROUTERS)
+_ARCHS = sorted(registered_routes())
 
 
-def _module_path(dotted: str) -> Path:
-    """Resolve a package-relative dotted module name to its file."""
-    return _ROOT / (dotted.replace(".", "/") + ".py")
+def _routing_path(arch: str) -> Path:
+    """The routing.py whose ``route`` is registered for ``arch``."""
+    return Path(sys.modules[registered_routes()[arch].__module__].__file__).resolve()
 
 
 # ``route`` hands back the class itself, imported from the target directory
@@ -50,23 +48,19 @@ _TARGET_IMPORT = re.compile(r"^\s*from \.(\w+)\.modeling import (\w+)$", re.MULT
 
 def _routed_targets(arch: str):
     """(target directory, class name) for every target ``route`` can return."""
-    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
-    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    source = _routing_path(arch).read_text()
+    family_dir = _routing_path(arch).parent
     return [(family_dir / target, name) for target, name in _TARGET_IMPORT.findall(source)]
 
 
-def test_every_routed_architecture_has_an_importable_routing_module():
-    for arch in _ARCHS:
-        assert routing_module(arch) is not None, arch
-
-
 def test_no_routing_module_is_orphaned():
-    """A routing.py the index does not name would never be consulted."""
-    indexed = {_module_path(m) for m in MODELING_V2_ROUTERS.values()}
+    """A routing.py that models/__init__.py does not import, or whose ``route``
+    carries no ``@routes``, would never be consulted."""
+    registered = {_routing_path(arch) for arch in _ARCHS}
     on_disk = set((_ROOT / "models").glob("*/routing.py"))
-    assert on_disk == indexed, (
-        f"routing modules on disk but not in MODELING_V2_ROUTERS: "
-        f"{sorted(p.relative_to(_ROOT) for p in on_disk - indexed)}"
+    assert on_disk == registered, (
+        f"routing modules on disk with no registered route: "
+        f"{sorted(p.relative_to(_ROOT) for p in on_disk - registered)}"
     )
 
 
@@ -74,7 +68,7 @@ def test_no_routing_module_is_orphaned():
 def test_no_target_directory_is_orphaned(arch):
     """A target directory ``route`` never imports from is dead code: nothing
     else can reach it."""
-    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    family_dir = _routing_path(arch).parent
     on_disk = {p.parent for p in family_dir.glob("*/modeling.py")}
     routed = {target_dir for target_dir, _ in _routed_targets(arch)}
     assert on_disk == routed, (
