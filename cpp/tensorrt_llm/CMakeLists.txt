@@ -316,7 +316,7 @@ set_target_properties(
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Keep host code, unwind tables, and the GOT within PC-relative addressing
-  # range by placing large CUDA payloads after host data.
+  # range, including after BOLT appends code, by placing CUDA payloads first.
   set(CUDA_FATBIN_LINKER_SCRIPT
       "${PROJECT_SOURCE_DIR}/cmake/templates/cuda_fatbin.ld")
   foreach(target ${SHARED_TARGET} ${DECODER_SHARED_TARGET_0}

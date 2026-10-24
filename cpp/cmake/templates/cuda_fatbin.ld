@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
-/* Augment the default ELF layout. CUDA payloads can exceed 2 GiB, so place
- * them after host code, unwind tables, and data. Keep .nvFatBinSegment (the
- * registration wrappers containing pointers to the payloads) near host data.
+/* CUDA payloads can exceed 2 GiB. Place them before all host code so that
+ * code, unwind tables, the GOT, and code appended by BOLT remain close to
+ * each other. Keep .nvFatBinSegment (the registration wrappers containing
+ * pointers to the payloads) near host data.
+ * .dynsym precedes both code and unwind sections in GNU ld and LLD layouts.
  */
 SECTIONS
 {
     .nv_fatbin : { *(.nv_fatbin) }
     __nv_relfatbin : { *(__nv_relfatbin) }
 }
-INSERT AFTER .bss;
+INSERT BEFORE .dynsym;
