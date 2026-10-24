@@ -107,7 +107,8 @@ The sbatch log gets a summary block: per-instance verdicts
 
 ```
 status/{ctx,gen}_<i>.json     # per-case detail: PASS/TIMEOUT/TRANSFER_ERROR/
-                              # MISMATCH/INIT_ERROR + reason + UCX env snapshot
+                              # MISMATCH/INIT_ERROR/UNHANDLED_ERROR + reason +
+                              # UCX env snapshot
 status/{ctx,gen}_<i>.status   # one-line verdict (parsed by the launch script)
 logs/{ctx,gen}_<i>.log        # merged per-rank logs (UCX_PROTO_INFO=used table)
 csv/gen_<i>/<uuid>_<rank>_recv.csv  # C++ transceiver per-request bandwidth
