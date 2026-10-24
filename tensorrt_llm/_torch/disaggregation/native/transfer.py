@@ -1584,7 +1584,9 @@ class Sender(SenderBase):
         except Exception:
             if owned:
                 task.retire_unsubmitted_physical_operation(info.instance_rank)
-                self._send_failed_task_result_to_receiver(task, info)
+            # The receiver counts on one terminal result from every writer it
+            # asked; without it the request would wait out its transfer timeout.
+            self._send_failed_task_result_to_receiver(task, info)
             raise
 
     def _start_listener(self):
