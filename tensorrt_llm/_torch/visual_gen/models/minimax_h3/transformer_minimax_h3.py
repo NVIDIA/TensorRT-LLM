@@ -36,6 +36,7 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_h3 import convert_comfy_h3_weights
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -43,6 +44,7 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .adaln_curves import interpolate_adaln_curve
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 
 MINIMAX_H3_MODALITY_NUM = 3
@@ -275,11 +277,13 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.apply_silu = "adaln_curve_grid" not in model_config.extra_attrs
+        self.output_dtype = model_config.torch_dtype
         self.linear = Linear(
             time_embed_dim,
             6 * hidden_size * MINIMAX_H3_MODALITY_NUM,
             bias=True,
-            dtype=model_config.torch_dtype,
+            dtype=model_config.torch_dtype if self.apply_silu else torch.float32,
             mapping=model_config.mapping,
             quant_config=model_config.quant_config,
             skip_create_weights_in_init=model_config.skip_create_weights_in_init,
@@ -293,8 +297,9 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
         One row per ``(timestep, modality)`` pair; the six column blocks are
         shift, scale and gate for attention, then shift, scale and gate for the MLP.
         """
-        temb = self.linear(F.silu(temb).to(self.linear.dtype))
-        return temb.view(-1, 6 * self.hidden_size)
+        temb = F.silu(temb) if self.apply_silu else temb
+        temb = self.linear(temb.to(self.linear.dtype))
+        return temb.view(-1, 6 * self.hidden_size).to(self.output_dtype)
 
     def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return self.table(temb).chunk(6, dim=-1)
@@ -311,6 +316,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         model_config: DiffusionModelConfig,
     ) -> None:
         super().__init__()
+        self.apply_silu = "adaln_curve_grid" not in model_config.extra_attrs
         self.norm = RMSNorm(
             hidden_size=hidden_size, eps=eps, dtype=model_config.torch_dtype, has_weights=True
         )
@@ -318,7 +324,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
             time_embed_dim,
             2 * hidden_size,
             bias=True,
-            dtype=model_config.torch_dtype,
+            dtype=model_config.torch_dtype if self.apply_silu else torch.float32,
             mapping=model_config.mapping,
             quant_config=model_config.quant_config,
             skip_create_weights_in_init=model_config.skip_create_weights_in_init,
@@ -332,7 +338,10 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         temb: torch.Tensor,
         timestep_indices: torch.Tensor,
     ) -> torch.Tensor:
-        shift, scale = self.linear(F.silu(temb).to(self.linear.dtype)).chunk(2, dim=-1)
+        temb = F.silu(temb) if self.apply_silu else temb
+        # Pruned checkpoints keep final modulation in FP32 through the output
+        # heads; unlike block modulation, it must not round to the hidden dtype.
+        shift, scale = self.linear(temb.to(self.linear.dtype)).chunk(2, dim=-1)
         hidden_states = _norm_2d(self.norm, hidden_states)
         return hidden_states * (1.0 + scale.index_select(0, timestep_indices)) + shift.index_select(
             0, timestep_indices
@@ -612,13 +621,14 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         # Only VANILLA supports arbitrary padding between packed modalities.
         self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
         quant_algo = model_config.quant_config.quant_algo
-        # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
         if quant_algo is not None and not (
             quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4)
             and model_config.dynamic_weight_quant
+            or quant_algo == QuantAlgo.NVFP4
+            and model_config.extra_attrs.get("comfy_nvfp4", False)
         ):
             raise NotImplementedError(
-                "MiniMax-H3 supports BF16, or dynamically quantized FP8 / FP8_BLOCK_SCALES / NVFP4 weights only."
+                "MiniMax-H3 requires BF16, dynamic FP8 / FP8_BLOCK_SCALES / NVFP4, or detected Comfy NVFP4 weights."
             )
         # The released checkpoint keeps proj_in / audio_proj_in / proj_out /
         # audio_proj_out in FP32 and feeds them FP32 activations.  NVFP4
@@ -734,11 +744,17 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             flip_sin_to_cos=True,
             downscale_freq_shift=0,
         )
-        self.time_embedder = TimestepEmbedding(
-            in_channels=freq_dim,
-            time_embed_dim=time_embed_hidden_dim,
-            out_dim=time_embed_dim,
-        )
+        curve_grid = model_config.extra_attrs.get("adaln_curve_grid")
+        self.register_buffer("adaln_t_table", None, persistent=False)
+        if curve_grid is None:
+            self.time_embedder = TimestepEmbedding(
+                in_channels=freq_dim,
+                time_embed_dim=time_embed_hidden_dim,
+                out_dim=time_embed_dim,
+            )
+        else:
+            self.time_embedder = None
+            self.adaln_t_table = torch.empty(curve_grid, time_embed_dim, dtype=torch.float32)
         self.rope = MiniMaxH3RotaryPosEmbed(rope_freq_dim, rope_theta)
 
         self.token_refiner = MiniMaxH3TokenRefiner(
@@ -904,8 +920,16 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         if static_context.text_embeds.shape[1] != text_indices.numel():
             raise ValueError("text_indices must contain one entry for every cached text embedding.")
 
-        video_embeds = self.proj_in(hidden_states.to(self._projection_act_dtype))
-        audio_embeds = self.audio_proj_in(audio_hidden_states.to(self._projection_act_dtype))
+        video_dtype = (
+            self._projection_act_dtype if self.proj_in.has_any_quant else self.proj_in.dtype
+        )
+        audio_dtype = (
+            self._projection_act_dtype
+            if self.audio_proj_in.has_any_quant
+            else self.audio_proj_in.dtype
+        )
+        video_embeds = self.proj_in(hidden_states.to(video_dtype))
+        audio_embeds = self.audio_proj_in(audio_hidden_states.to(audio_dtype))
         text_embeds = static_context.text_embeds
         packed_hidden_states = text_embeds.new_zeros(
             (text_embeds.shape[0], sequence_length, text_embeds.shape[-1])
@@ -918,8 +942,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             1, audio_indices, audio_embeds.to(text_embeds.dtype)
         )
 
-        temb = self.time_proj(conditioning_timesteps)
-        temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
+        if self.adaln_t_table is not None:
+            temb = interpolate_adaln_curve(self.adaln_t_table, conditioning_timesteps)
+        else:
+            temb = self.time_proj(conditioning_timesteps)
+            temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags.clamp(min=0)
         timestep_indices_for_norm = timestep_indices
         rotary_emb = static_context.rotary_emb
@@ -983,12 +1010,20 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             dim=1,
             unpad_to=sequence_length,
         )
-        video_output = self.proj_out(
-            packed_hidden_states.to(self._projection_act_dtype)
-        ).index_select(1, video_indices)
-        audio_output = self.audio_proj_out(
-            packed_hidden_states.to(self._projection_act_dtype)
-        ).index_select(1, audio_indices)
+        video_dtype = (
+            self._projection_act_dtype if self.proj_out.has_any_quant else self.proj_out.dtype
+        )
+        audio_dtype = (
+            self._projection_act_dtype
+            if self.audio_proj_out.has_any_quant
+            else self.audio_proj_out.dtype
+        )
+        video_output = self.proj_out(packed_hidden_states.to(video_dtype)).index_select(
+            1, video_indices
+        )
+        audio_output = self.audio_proj_out(packed_hidden_states.to(audio_dtype)).index_select(
+            1, audio_indices
+        )
 
         if not return_dict:
             return video_output, audio_output
@@ -1013,8 +1048,34 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         return remapped
 
     def load_weights(self, weights: dict[str, torch.Tensor]) -> None:
-        """Load the official converted Diffusers checkpoint layout."""
+        """Load Diffusers weights or a detected native Comfy NVFP4 checkpoint."""
 
+        if any(key.endswith(".comfy_quant") for key in weights):
+            if not self.model_config.extra_attrs.get("comfy_nvfp4", False):
+                raise ValueError("Comfy H3 metadata must be detected before model construction")
+            weights = convert_comfy_h3_weights(
+                weights,
+                attention_dim=self.config.num_attention_heads * self.config.attention_head_dim,
+                ffn_dim=self.config.ffn_dim,
+            )
+        if self.adaln_t_table is not None:
+            table = weights.get("adaln_t_table")
+            if (
+                table is None
+                or table.shape != self.adaln_t_table.shape
+                or table.dtype != torch.float32
+            ):
+                raise ValueError("H3 pruned checkpoint is missing its float32 AdaLN curve table")
+            if not torch.isfinite(table).all():
+                raise ValueError("H3 AdaLN curve contains non-finite coordinates")
+            self.adaln_t_table = table.to(device=self.device)
+        if "rope.inv_freq" in weights:
+            frequencies = weights["rope.inv_freq"]
+            if frequencies.shape != self.rope.inv_freq.shape:
+                raise ValueError(
+                    "H3 checkpoint RoPE frequencies do not match the model configuration"
+                )
+            self.rope.inv_freq = frequencies.to(device=self.device, dtype=torch.float32)
         weights = self._remap_feed_forward_weights(weights)
         loader = DynamicLinearWeightLoader(
             self.model_config,
@@ -1084,4 +1145,5 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         ):
             if not module.has_any_quant:
                 module.to(torch.float32)
-        self.time_embedder.to(torch.float32)
+        if self.time_embedder is not None:
+            self.time_embedder.to(torch.float32)

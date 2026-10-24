@@ -33,6 +33,7 @@ from tensorrt_llm._torch.modules.mlp import (
     is_nvfp4_gemm_gelu_fusion_eligible,
 )
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh, maybe_compile
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_flux import convert_comfy_flux_weights
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj
@@ -42,6 +43,7 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 # HF checkpoint key → our module attribute name
 _WEIGHT_KEY_REMAPS = [
@@ -726,11 +728,15 @@ class FluxTransformer2DModel(BaseDiffusionModel):
             force_dynamic_quantization=force_dynamic_quant,
             reduce_output=False,
         )
-        # NOTE: x_embedder quantization is excluded when in_channels < 128.
+        # FP8 block quantization requires at least 128 input channels.
         # FLUX.1 has in_channels=64, which is below the 128-block size required by
         # fp8_block_scaling_gemm (causes NVRTC compilation failure). This layer runs
         # once per forward pass (not in the block loop), so the perf impact is negligible.
-        if in_channels < 128 and quant_config is not None:
+        if (
+            in_channels < 128
+            and quant_config is not None
+            and quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        ):
             if quant_config.exclude_modules is None:
                 quant_config.exclude_modules = []
             if "*x_embedder*" not in quant_config.exclude_modules:
@@ -930,6 +936,13 @@ class FluxTransformer2DModel(BaseDiffusionModel):
         Args:
             weights: Dictionary of parameter name -> tensor
         """
+
+        if any(key.endswith(".comfy_quant") for key in weights):
+            if self.model_config.quant_config.quant_algo != QuantAlgo.NVFP4:
+                raise ValueError(
+                    "Comfy NVFP4 weights require NVFP4 modules before model construction"
+                )
+            weights = convert_comfy_flux_weights(weights, version=1, hidden_size=self.inner_dim)
 
         # Remap HF checkpoint keys to our module attribute names
         weights = _remap_checkpoint_keys(weights)

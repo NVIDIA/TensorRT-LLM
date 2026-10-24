@@ -24,6 +24,10 @@ import torch
 from pydantic import BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_flux import comfy_flux_quantization_config
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_h3 import comfy_h3_quantization_config
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_quant import inspect_comfy_quantization
+from tensorrt_llm._torch.visual_gen.checkpoints.weight_loader import WeightLoader
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -734,6 +738,44 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         primary_quant = cls._resolve_quant_config(
             user_quant, getattr(pretrained_config, "quantization_config", None)
         )
+        weight_path = components[component].parent if components else checkpoint_path
+        weight_files = WeightLoader()._find_weight_files(weight_path)
+        comfy = (
+            inspect_comfy_quantization([Path(path) for path in weight_files])
+            if weight_files and all(path.endswith(".safetensors") for path in weight_files)
+            else None
+        )
+        if comfy is not None:
+            architecture = getattr(pretrained_config, "_class_name", None)
+            flux_versions = {"FluxTransformer2DModel": 1, "Flux2Transformer2DModel": 2}
+            if primary_quant[0].quant_algo not in (None, QuantAlgo.NVFP4):
+                raise ValueError("Comfy NVFP4 checkpoint conflicts with the requested quantization")
+            attention_dim = (
+                pretrained_config.num_attention_heads * pretrained_config.attention_head_dim
+            )
+            if architecture in flux_versions:
+                recipe = comfy_flux_quantization_config(
+                    comfy,
+                    version=flux_versions[architecture],
+                    hidden_size=attention_dim,
+                    mlp_ratio=getattr(pretrained_config, "mlp_ratio", 4.0),
+                )
+            elif architecture == "MiniMaxH3Transformer3DModel":
+                recipe = comfy_h3_quantization_config(
+                    comfy, attention_dim=attention_dim, ffn_dim=pretrained_config.ffn_dim
+                )
+                if comfy.adaln_curve_shape is not None:
+                    grid_size, curve_dim = comfy.adaln_curve_shape
+                    pretrained_config.time_embed_dim = curve_dim
+                    extra_attrs["adaln_curve_grid"] = grid_size
+            else:
+                raise ValueError(f"Comfy NVFP4 import is not implemented for {architecture!r}")
+            primary_quant = cls.load_diffusion_quant_config(recipe)
+            extra_attrs["comfy_nvfp4"] = True
+            logger.info(
+                f"Detected {architecture}: Comfy NVFP4, {len(comfy.nvfp4_layers)} packed layers; "
+                "preserving mixed precision and converting weight layout during loading."
+            )
         quant_config, quant_config_dict, dynamic_weight_quant, dynamic_activation_quant = (
             primary_quant
         )

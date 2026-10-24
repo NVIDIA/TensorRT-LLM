@@ -22,8 +22,14 @@ from typing import Any, Dict, List, Union
 
 import torch
 import tqdm
+from safetensors import safe_open
+from safetensors.torch import load_file
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
+from tensorrt_llm._torch.visual_gen.checkpoints.comfy_quant import (
+    _validate_metadata,
+    comfy_metadata_from_header,
+)
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm.logger import logger
@@ -161,6 +167,11 @@ class WeightLoader(BaseWeightLoader):
         """
         weight_dir = Path(weight_dir)
 
+        if weight_dir.is_file():
+            if weight_dir.suffix not in (".safetensors", ".bin", ".pth"):
+                raise ValueError(f"Unsupported checkpoint file: {weight_dir}")
+            return [str(weight_dir)]
+
         # Check for sharded safetensors index
         index_file = weight_dir / "diffusion_pytorch_model.safetensors.index.json"
         if not index_file.exists():
@@ -194,8 +205,15 @@ class WeightLoader(BaseWeightLoader):
         """Load weights from a single file."""
         logger.debug(f"Loading {filepath}")
         if filepath.endswith(".safetensors"):
-            from safetensors.torch import load_file
-
-            return load_file(filepath)
+            weights = load_file(filepath)
+            with safe_open(filepath, framework="pt", device="cpu") as checkpoint:
+                legacy_metadata = comfy_metadata_from_header(checkpoint.metadata())
+            for key, value in legacy_metadata.items():
+                if key in weights:
+                    if _validate_metadata(weights[key], key) != _validate_metadata(value, key):
+                        raise ValueError(f"Conflicting Comfy metadata for {key}")
+                else:
+                    weights[key] = value
+            return weights
         else:
             return torch.load(filepath, map_location="cpu", weights_only=True)
