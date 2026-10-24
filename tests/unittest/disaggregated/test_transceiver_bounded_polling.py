@@ -780,6 +780,7 @@ def _make_cache_config(**overrides) -> SimpleNamespace:
     Every attribute the KvCacheTransceiverV2 constructor reads must be present here.
     """
     fields = dict(
+        _rank_info_auth_key=None,
         kv_transfer_timeout_ms=60_000,
         kv_transfer_poll_interval_ms=5_000,
         kv_transfer_sender_future_timeout_ms=1_000,
