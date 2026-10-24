@@ -13,6 +13,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import click
@@ -112,6 +113,12 @@ class OpenEngineServer:
         options = list(_SERVER_OPTIONS)
         options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
         self._server = grpc.aio.server(options=options)
+        self._input_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="openengine_input"
+        )
+        self._media_executor = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="openengine_media"
+        )
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(
             llm,
@@ -119,6 +126,8 @@ class OpenEngineServer:
             kv_transfer_backend=kv_transfer_backend,
             frontend=frontend,
             subagent_affinity_auth_key=subagent_affinity_auth_key,
+            input_executor=self._input_executor,
+            media_executor=self._media_executor,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
@@ -147,7 +156,12 @@ class OpenEngineServer:
             )
         # grpc.aio raises RuntimeError itself when the bind fails, naming the
         # address, so there is no zero return to check for.
-        bound_port = self._server.add_insecure_port(bind_address)
+        try:
+            bound_port = self._server.add_insecure_port(bind_address)
+        except BaseException:
+            self._input_executor.shutdown(wait=True, cancel_futures=True)
+            self._media_executor.shutdown(wait=True, cancel_futures=True)
+            raise
         if port == 0:
             self.port = bound_port
 
@@ -170,7 +184,13 @@ class OpenEngineServer:
         Args:
             grace: Maximum time in seconds to allow active RPCs to finish.
         """
-        await self._server.stop(grace=grace)
+        try:
+            await self._server.stop(grace=grace)
+        finally:
+            await asyncio.gather(
+                asyncio.to_thread(self._input_executor.shutdown, wait=True, cancel_futures=True),
+                asyncio.to_thread(self._media_executor.shutdown, wait=True, cancel_futures=True),
+            )
         logger.info("OpenEngine server stopped")
 
     async def wait_for_termination(self) -> None:

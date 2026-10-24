@@ -34,6 +34,7 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
+from .model_config import resolve_top_level_model_type
 from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
@@ -543,6 +544,16 @@ class BaseMultimodalInputProcessor(ABC):
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
             "Please override this method to provide the vocabulary size. ")
         return None
+
+    def requires_input_placeholders(self, *, tokenized: bool = False) -> bool:
+        """Whether the selected input path needs caller-supplied media markers."""
+        if tokenized and self.supports_token_id_mm_expansion:
+            return True
+        model_type = getattr(type(self), "_registered_model_type", None)
+        if model_type is None:
+            model_type = resolve_top_level_model_type(self.config)
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+            model_type) != ContentFormat.PASSTHROUGH
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
         """Token IDs for a logical multimodal unit; include framing tokens for one contiguous span per unit.

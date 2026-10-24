@@ -11,7 +11,10 @@ import os
 import socket
 import tempfile
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from concurrent.futures import Executor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from stat import S_ISREG
@@ -43,6 +46,10 @@ from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.logger import logger
+
+
+class MediaFetchError(RuntimeError):
+    """A transient failure while fetching remote media."""
 
 
 def rgba_to_rgb(
@@ -87,13 +94,24 @@ _SUPPORTED_VIDEO_FORMATS = ("pt", "np", "pil")
 # Created lazily on first use inside the async event loop, then reused so that
 # TCP connections are kept alive and not re-established per request.
 _global_aiohttp_session: aiohttp.ClientSession | None = None
+_global_aiohttp_session_loop: asyncio.AbstractEventLoop | None = None
 
 
 async def _get_aiohttp_session() -> aiohttp.ClientSession:
-    """Return the shared aiohttp.ClientSession, creating it on first call."""
-    global _global_aiohttp_session
-    if _global_aiohttp_session is None or _global_aiohttp_session.closed:
-        _global_aiohttp_session = aiohttp.ClientSession()
+    """Return the aiohttp session owned by the current event loop."""
+    global _global_aiohttp_session, _global_aiohttp_session_loop
+    current_loop = asyncio.get_running_loop()
+    if (
+        _global_aiohttp_session is None
+        or _global_aiohttp_session.closed
+        or _global_aiohttp_session_loop is not current_loop
+    ):
+        previous_session = _global_aiohttp_session
+        connector = aiohttp.TCPConnector(resolver=_ValidatingResolver())
+        _global_aiohttp_session = aiohttp.ClientSession(connector=connector)
+        _global_aiohttp_session_loop = current_loop
+        if previous_session is not None and not previous_session.closed:
+            await previous_session.close()
     return _global_aiohttp_session
 
 
@@ -134,6 +152,48 @@ def _allow_private_urls() -> bool:
     return True
 
 
+def _validate_resolved_address(address: str) -> None:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError as exc:
+        raise MediaFetchError(f"DNS resolver returned an invalid address: {address!r}") from exc
+    if ip.is_multicast:
+        raise RuntimeError(f"URL resolves to a multicast address ({ip})")
+    if not ip.is_global and not _allow_private_urls():
+        raise RuntimeError(
+            f"URL resolves to a non-public address ({ip}); set "
+            f"{_ALLOW_PRIVATE_URLS_ENV}=1 to allow private media URLs "
+            f"in trusted network environments"
+        )
+
+
+def _dns_resolution_error(host: str, error: OSError) -> RuntimeError:
+    if isinstance(error, socket.gaierror) and error.errno == socket.EAI_AGAIN:
+        return MediaFetchError(f"Could not resolve hostname {host!r}")
+    return RuntimeError(f"Could not resolve hostname {host!r}")
+
+
+class _ValidatingResolver(aiohttp.abc.AbstractResolver):
+    """Reject unsafe addresses in the DNS result used by the TCP connector."""
+
+    def __init__(self) -> None:
+        self._resolver = aiohttp.DefaultResolver()
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> List[Dict[str, Any]]:
+        try:
+            addresses = await self._resolver.resolve(host, port, family)
+        except OSError as exc:
+            raise _dns_resolution_error(host, exc) from exc
+        for address in addresses:
+            _validate_resolved_address(address["host"])
+        return addresses
+
+    async def close(self) -> None:
+        await self._resolver.close()
+
+
 def _validate_url(url: str) -> None:
     """Validate that *url* points to a public, non-internal HTTP(S) resource.
 
@@ -143,11 +203,9 @@ def _validate_url(url: str) -> None:
     rejection (scheme, hostname, and multicast checks still apply); see
     ``_ALLOW_PRIVATE_URLS_ENV`` above for the security tradeoff.
 
-    Note: validation is performed at DNS-resolution time. A DNS-rebinding
-    attack (TTL=0, resolves to a public IP during validation then a private IP
-    during the actual TCP connect) could bypass this check. For strict
-    isolation, supplement with network-level egress filtering that blocks
-    non-global address ranges at the host firewall.
+    Async fetches repeat the address check in the resolver used by their TCP
+    connector, so the address admitted here cannot be replaced with an unsafe
+    one before connection.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -161,19 +219,10 @@ def _validate_url(url: str) -> None:
     try:
         infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
-        raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
+        raise _dns_resolution_error(hostname, exc) from exc
 
-    allow_private = _allow_private_urls()
     for _family, _type, _proto, _canon, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if ip.is_multicast:
-            raise RuntimeError(f"URL resolves to a multicast address ({ip})")
-        if not ip.is_global and not allow_private:
-            raise RuntimeError(
-                f"URL resolves to a non-public address ({ip}); set "
-                f"{_ALLOW_PRIVATE_URLS_ENV}=1 to allow private media URLs "
-                f"in trusted network environments"
-            )
+        _validate_resolved_address(sockaddr[0])
 
 
 def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
@@ -247,19 +296,15 @@ async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
         content.write(chunk)
 
 
-async def _safe_aiohttp_get(
-    url: str, timeout_sec: int = 30, session: Optional[aiohttp.ClientSession] = None
-) -> bytes:
+async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
     await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-
-    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
-        current_url = url
-        for _ in range(_MAX_REDIRECTS + 1):
-            async with fetch_session.get(
-                current_url, timeout=timeout, allow_redirects=False
-            ) as response:
+    session = await _get_aiohttp_session()
+    current_url = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        try:
+            async with session.get(current_url, timeout=timeout, allow_redirects=False) as response:
                 if response.status in _REDIRECT_STATUSES:
                     redirect_url = response.headers.get("Location", "")
                     current_url = urljoin(current_url, redirect_url)
@@ -269,13 +314,19 @@ async def _safe_aiohttp_get(
                 if asyncio.iscoroutine(maybe_coro):
                     await maybe_coro
                 return await _read_aiohttp_content(response)
-        raise RuntimeError("Too many redirects")
-
-    if session is not None:
-        return await _fetch(session)
-
-    async with aiohttp.ClientSession(timeout=timeout) as owned_session:
-        return await _fetch(owned_session)
+        except MediaFetchError:
+            raise
+        except aiohttp.ClientResponseError as error:
+            if error.status in (408, 429) or error.status >= 500:
+                raise MediaFetchError(
+                    f"remote media server returned HTTP {error.status}"
+                ) from error
+            raise
+        except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            raise MediaFetchError(f"remote media fetch failed: {error}") from error
+    raise RuntimeError("Too many redirects")
 
 
 def _load_and_convert_image(image):
@@ -935,6 +986,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     # Servers can publish a dedicated pool via `set_executor` so
     # media decoding does not contend with unrelated `to_thread` callers.
     _executor: ClassVar[Optional[Executor]] = None
+    _request_executor: ClassVar[ContextVar[Optional[Executor]]] = ContextVar(
+        "media_io_executor", default=None
+    )
 
     # Required MIME type prefix for `data:` URIs handled by this modality
     # (e.g. `"image/"`). A data URI whose declared media type falls outside
@@ -950,6 +1004,16 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         than once replaces the previously configured executor.
         """
         BaseMediaIO._executor = executor
+
+    @classmethod
+    @contextmanager
+    def use_executor(cls, executor: Optional[Executor]) -> Iterator[None]:
+        """Scope decode work to a server-owned executor without replacing other servers' pools."""
+        token = BaseMediaIO._request_executor.set(executor)
+        try:
+            yield
+        finally:
+            BaseMediaIO._request_executor.reset(token)
 
     @classmethod
     def create(
@@ -1005,8 +1069,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         """
         parsed = urlparse(url)
         if parsed.scheme in ("http", "https"):
-            session = await _get_aiohttp_session()
-            data = await _safe_aiohttp_get(url, session=session)
+            data = await _safe_aiohttp_get(url)
             return await self._run_in_executor(self.load_bytes, data)
         elif parsed.scheme == "data":
             data_spec, b64_data = parsed.path.split(",", 1)
@@ -1027,13 +1090,18 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
 
+    async def async_load_bytes(self, data: bytes) -> _MediaT:
+        """Decode in-memory media without blocking the event loop."""
+        return await self._run_in_executor(self.load_bytes, data)
+
     @staticmethod
     async def _run_in_executor(fn, *args, **kwargs):
         """Run a blocking decode callable on the configured executor."""
         if kwargs:
             fn = functools.partial(fn, **kwargs)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(BaseMediaIO._executor, fn, *args)
+        executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
+        return await loop.run_in_executor(executor, fn, *args)
 
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):

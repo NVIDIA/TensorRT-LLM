@@ -16,7 +16,9 @@
 
 import asyncio
 import gc
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -45,6 +47,31 @@ def test_format_bind_address_brackets_ipv6() -> None:
     assert _format_bind_address("127.0.0.1", 8000) == "127.0.0.1:8000"
     assert _format_bind_address("::1", 8000) == "[::1]:8000"
     assert _format_bind_address("[::1]", 8000) == "[::1]:8000"
+
+
+@pytest.mark.parametrize("fail_stop", [False, True])
+def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> None:
+    async def exercise_stop():
+        server = OpenEngineServer.__new__(OpenEngineServer)
+        server._server = SimpleNamespace(
+            stop=AsyncMock(side_effect=RuntimeError("stop failed") if fail_stop else None)
+        )
+        server._input_executor = ThreadPoolExecutor(max_workers=1)
+        server._media_executor = ThreadPoolExecutor(max_workers=1)
+        futures = [
+            pool.submit(lambda: True) for pool in (server._input_executor, server._media_executor)
+        ]
+        if fail_stop:
+            with pytest.raises(RuntimeError, match="stop failed"):
+                await server.stop(grace=0)
+        else:
+            await server.stop(grace=0)
+        assert all(future.result() for future in futures)
+        for pool in (server._input_executor, server._media_executor):
+            with pytest.raises(RuntimeError, match="shutdown"):
+                pool.submit(lambda: None)
+
+    asyncio.run(exercise_stop())
 
 
 def test_openengine_server_serves_the_control_contract() -> None:
