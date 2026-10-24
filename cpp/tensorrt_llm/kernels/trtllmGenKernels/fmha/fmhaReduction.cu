@@ -31,7 +31,11 @@ namespace kernels
 
 #define NumThreadsPerCta 512
 
-template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, typename DtypeO, typename DtypePartialO>
+// KvSplit > 1: the CTA's threads form KvSplit groups that each reduce every KvSplit-th partial (ctaIdxKv) of the same
+// rows, then group 0 merges the KvSplit (max, sum, O) partial results through shared memory. Each CTA covers KvSplit
+// times fewer rows, so the grid has KvSplit times more CTAs and each thread walks KvSplit times fewer partials. With
+// KvSplit == 1 every thread walks all partials of its row.
+template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, typename DtypeO, typename DtypePartialO, int32_t KvSplit>
 __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha::KernelParams const params,
     bool isTokenSparse, bool groupsTokensHeadsQ, bool supportsVarSparseMlaTopKLens, float softmaxPScale,
     int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t headDimV, int32_t numHeadDimCtasV)
@@ -62,8 +66,11 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
     int32_t const numHeadsQPerKvCta{min(params.mNumHeadsQPerKv, TileSizePerCtaQ)};
     // The headIdxO.
     int32_t const headIdxO{headGrpIdxO * numHeadsQPerKvCta};
+    // The threads per KV group, the KV group of this thread and its index inside the group.
+    int32_t constexpr NumThreadsPerGrp{NumThreadsPerCta / KvSplit};
+    int32_t const kvGrpIdx{static_cast<int32_t>(threadIdx.x) / NumThreadsPerGrp};
     // The warpGrpThreadIdx.
-    int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x)};
+    int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x) % NumThreadsPerGrp};
 
     // The seqOffsetQ.
     int32_t const seqOffsetQ{
@@ -152,7 +159,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
 
     // The number of processed rows in one slice where each CTA will process one slice.
     int32_t constexpr NumBytesPerHeadDim{HeadDimPerCta * NumBytesPerPartialElt};
-    int32_t constexpr NumBytePerSlice{NumThreadsPerCta * 16};
+    int32_t constexpr NumBytePerSlice{NumThreadsPerGrp * 16};
     static_assert(NumBytePerSlice % NumBytesPerHeadDim == 0, "Not implemented");
     int32_t constexpr NumRowsPerSlice{NumBytePerSlice / NumBytesPerHeadDim};
     // The actual number of tensor slices for the reduction.
@@ -167,6 +174,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
 
     // The total number of rows in the partial buffers.
     int32_t numRowsInPartialBuffers{TileSizePerCtaQ};
+
+    // Per-thread (max, sum, O) of every KV group, merged by group 0.
+    __shared__ float smemStats[KvSplit > 1 ? 2 * NumThreadsPerCta : 1];
+    __shared__ float4 smemO[KvSplit > 1 ? 2 * NumThreadsPerCta : 1];
 
     // Iterate over different slices.
     // Split the reduction work across multiple CtasKv to reduce the latency.
@@ -214,7 +225,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         float sumVal{0.f};
         float oldMaxVal{-FLT_MAX}, maxVal{-FLT_MAX};
         float outputVals[NumEltsPer16BVec] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-        for (int32_t ii = 0; ii < numCtasKv; ii += UnrollSize)
+        for (int32_t ii = kvGrpIdx; ii < numCtasKv; ii += UnrollSize * KvSplit)
         {
             // The partialStats array and partialO array.
             float2 partialStatsArray[UnrollSize];
@@ -222,7 +233,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
 #pragma unroll
             for (int32_t jj = 0; jj < UnrollSize; ++jj)
             {
-                int32_t ctaIdxKv = min(ii + jj, numCtasKv - 1);
+                // An out-of-range slot re-reads a partial this group has already merged (ii), so the running max is
+                // unchanged.
+                int32_t ctaIdxKv = KvSplit == 1 ? min(ii + jj, numCtasKv - 1)
+                                                : (ii + jj * KvSplit < numCtasKv ? ii + jj * KvSplit : ii);
                 partialStatsArray[jj] = localPartialStatsPtr[ctaIdxKv * numRowsInPartialBuffers];
                 partialOArray[jj] = *reinterpret_cast<uint4 const*>(
                     localPartialOPtr + ctaIdxKv * numRowsInPartialBuffers * HeadDimPerCta);
@@ -231,7 +245,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
             for (int32_t jj = 0; jj < UnrollSize; ++jj)
             {
                 // Whether the ctaIdxKv is valid.
-                bool const isValidCtaIdxKv = (ii + jj) < numCtasKv;
+                bool const isValidCtaIdxKv = (ii + jj * KvSplit) < numCtasKv;
                 // The local max and sum values.
                 auto partialStats = partialStatsArray[jj];
                 float localMax = partialStats.x;
@@ -249,6 +263,60 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
                 sumVal = sumVal * corrScale0 + localSum * corrScale1;
                 convertToFloatAndAccumulate<DtypePartialO>(outputVals, vec, corrScale0, corrScale1);
             }
+        }
+
+        if constexpr (KvSplit > 1)
+        {
+            // Make sure that the previous slice has been merged before overwriting the shared memory.
+            __syncthreads();
+            smemStats[2 * threadIdx.x] = maxVal;
+            smemStats[2 * threadIdx.x + 1] = sumVal;
+            smemO[2 * threadIdx.x] = make_float4(outputVals[0], outputVals[1], outputVals[2], outputVals[3]);
+            smemO[2 * threadIdx.x + 1] = make_float4(outputVals[4], outputVals[5], outputVals[6], outputVals[7]);
+            __syncthreads();
+            if (kvGrpIdx == 0)
+            {
+                float grpMax{maxVal};
+#pragma unroll
+                for (int32_t gg = 1; gg < KvSplit; ++gg)
+                {
+                    grpMax = fmaxf(grpMax, smemStats[2 * (gg * NumThreadsPerGrp + warpGrpThreadIdx)]);
+                }
+                float const scale0{exp2f(softmaxScaleLog2 * (maxVal - grpMax))};
+                sumVal *= scale0;
+#pragma unroll
+                for (int32_t kk = 0; kk < NumEltsPer16BVec; ++kk)
+                {
+                    outputVals[kk] *= scale0;
+                }
+#pragma unroll
+                for (int32_t gg = 1; gg < KvSplit; ++gg)
+                {
+                    int32_t const tt{gg * NumThreadsPerGrp + warpGrpThreadIdx};
+                    float const grpSum{smemStats[2 * tt + 1]};
+                    if (grpSum == 0.f)
+                    {
+                        continue;
+                    }
+                    float const scale{exp2f(softmaxScaleLog2 * (smemStats[2 * tt] - grpMax))};
+                    sumVal += grpSum * scale;
+                    float4 const o0{smemO[2 * tt]};
+                    float4 const o1{smemO[2 * tt + 1]};
+                    outputVals[0] += o0.x * scale;
+                    outputVals[1] += o0.y * scale;
+                    outputVals[2] += o0.z * scale;
+                    outputVals[3] += o0.w * scale;
+                    outputVals[4] += o1.x * scale;
+                    outputVals[5] += o1.y * scale;
+                    outputVals[6] += o1.z * scale;
+                    outputVals[7] += o1.w * scale;
+                }
+                maxVal = grpMax;
+            }
+        }
+        if (KvSplit > 1 && kvGrpIdx != 0)
+        {
+            continue;
         }
 
         // Update the sums with the attention sink value.
@@ -301,20 +369,44 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+using FmhaReductionKernelFn
+    = void (*)(fmha::KernelParams const, bool, bool, bool, float, int32_t, int32_t, int32_t, int32_t);
+
+template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, typename DtypeO, typename DtypePartialO>
+FmhaReductionKernelFn selectFmhaReductionKvSplit(int32_t kvSplit)
+{
+    // A KV group needs at least one full row (NumThreadsPerCta / KvSplit * 16 bytes >= HeadDimPerCta * 2 bytes).
+    if constexpr (NumThreadsPerCta / 16 * 16 >= HeadDimPerCta * 2)
+    {
+        if (kvSplit == 16)
+        {
+            return &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, DtypeO, DtypePartialO, 16>;
+        }
+    }
+    switch (kvSplit)
+    {
+    case 8: return &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, DtypeO, DtypePartialO, 8>;
+    case 4: return &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, DtypeO, DtypePartialO, 4>;
+    case 2: return &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, DtypeO, DtypePartialO, 2>;
+    default: return &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, DtypeO, DtypePartialO, 1>;
+    }
+}
+
 #define SELECT_FMHA_REDUCTION_KERNEL(TileSizePerCtaQ, HeadDimPerCta)                                                   \
     if (kernelMeta.mDataTypeQ == DATA_TYPE_E4M3)                                                                       \
     {                                                                                                                  \
         if (kernelMeta.mDataTypeO == DATA_TYPE_E4M3)                                                                   \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, __nv_fp8_e4m3, half>;                        \
+            kernel = selectFmhaReductionKvSplit<TileSizePerCtaQ, HeadDimPerCta, __nv_fp8_e4m3, half>(kvSplit);         \
         }                                                                                                              \
         else if (kernelMeta.mDataTypeO == DATA_TYPE_FP16)                                                              \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, half, half>;                                 \
+            kernel = selectFmhaReductionKvSplit<TileSizePerCtaQ, HeadDimPerCta, half, half>(kvSplit);                  \
         }                                                                                                              \
         else if (kernelMeta.mDataTypeO == DATA_TYPE_BF16)                                                              \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, __nv_bfloat16, __nv_bfloat16>;               \
+            kernel                                                                                                     \
+                = selectFmhaReductionKvSplit<TileSizePerCtaQ, HeadDimPerCta, __nv_bfloat16, __nv_bfloat16>(kvSplit);   \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
@@ -326,11 +418,12 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         TLLM_CHECK_WITH_INFO(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");                       \
         if (kernelMeta.mDataTypeQ == DATA_TYPE_FP16)                                                                   \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, half, half>;                                 \
+            kernel = selectFmhaReductionKvSplit<TileSizePerCtaQ, HeadDimPerCta, half, half>(kvSplit);                  \
         }                                                                                                              \
         else if (kernelMeta.mDataTypeQ == DATA_TYPE_BF16)                                                              \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, __nv_bfloat16, __nv_bfloat16>;               \
+            kernel                                                                                                     \
+                = selectFmhaReductionKvSplit<TileSizePerCtaQ, HeadDimPerCta, __nv_bfloat16, __nv_bfloat16>(kvSplit);   \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
@@ -377,8 +470,8 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelP
         headDimPerCtaV == 64 || headDimPerCtaV == 128 || headDimPerCtaV == 256 || headDimPerCtaV == 512,
         "Not implemented");
 
-    // The number of slices for the reduction work.
-    int32_t const numSlices
+    // The number of slices for the reduction work (one slice per CTA without the KV split).
+    int32_t const numSlicesPerKvGrp
         = (headDimPerCtaV * /* bytesPerPartialElt */ 2 * kernelMeta.mTileSizeQ) / (NumThreadsPerCta * 16);
     // The number of heads computed by a single CTA.
     int numHeadsPerCta{1};
@@ -405,6 +498,21 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelP
     // This avoids having too many waves of CTAs which can have obvious launching overheads.
     int32_t const maxNumCtasForReduction{
         (multiProcessorCount * 2) / static_cast<int32_t>(gridDim.x * gridDim.y * gridDim.z)};
+    // TLLM_FMHA_REDUCTION_KV_SPLIT=<2|4|8|16>: split the partials of each row across up to that many thread groups
+    // (and that many times more CTAs) while the grid stays within the same CTA budget; unset or 1 keeps one group.
+    static int32_t const maxKvSplit = []
+    {
+        int32_t const v = tensorrt_llm::common::getIntEnv("TLLM_FMHA_REDUCTION_KV_SPLIT").value_or(1);
+        return v >= 16 ? 16 : v >= 8 ? 8 : v >= 4 ? 4 : v >= 2 ? 2 : 1;
+    }();
+    int32_t kvSplit{maxKvSplit};
+    while (kvSplit > 1
+        && ((NumThreadsPerCta / kvSplit) * 16 < headDimPerCtaV * 2
+            || numSlicesPerKvGrp * kvSplit > maxNumCtasForReduction))
+    {
+        kvSplit /= 2;
+    }
+    int32_t const numSlices{numSlicesPerKvGrp * kvSplit};
     // The number of Ctas for the reduction work.
     int32_t const numCtasForReduction{std::min(maxNumCtasForReduction, numSlices)};
     // Launch more CTAs to split the reduction work if needed.
@@ -423,7 +531,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelP
     config.numAttrs = 1;
 
     // Select the kernel function pointer.
-    void (*kernel)(fmha::KernelParams const, bool, bool, bool, float, int32_t, int32_t, int32_t, int32_t) = nullptr;
+    FmhaReductionKernelFn kernel = nullptr;
     if (headDimPerCtaV == 64)
     {
         SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(64);
