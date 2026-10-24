@@ -259,10 +259,10 @@ set_target_properties(
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL
-                                          "aarch64")
-  # Keep large CUDA payloads out of the signed 32-bit displacement between host
-  # code and its unwind tables.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES
+                                          "^(aarch64|x86_64)$")
+  # Keep host code, unwind tables, and the GOT within PC-relative addressing
+  # range by placing large CUDA payloads after host data.
   set(CUDA_FATBIN_LINKER_SCRIPT
       "${PROJECT_SOURCE_DIR}/cmake/templates/cuda_fatbin.ld")
   target_link_options(${SHARED_TARGET} PRIVATE
