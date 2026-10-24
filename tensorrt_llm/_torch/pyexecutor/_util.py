@@ -59,10 +59,10 @@ from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
-                           get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
-                           resolve_vocab_size, uses_vswa_kv_cache_layout)
+                           get_layer_attention_window, is_hybrid_linear,
+                           is_kimi_linear, is_mla, is_nemotron_hybrid,
+                           is_qwen3_hybrid, is_qwen4_exp, resolve_vocab_size,
+                           uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -2263,9 +2263,10 @@ class KvCacheCreator:
             return f"context_parallel_size is {self._mapping.cp_size}, not 1"
         if self._llm_args.attn_backend != "TRTLLM":
             return f"the target attn_backend is {self._llm_args.attn_backend}, not TRTLLM"
-        if is_gemma4_hybrid(
-                self._model_engine.model.model_config.pretrained_config):
-            return "the target uses Gemma 4 hybrid attention"
+        if _has_variable_kv_cache_geometry(
+                self._model_engine.model.model_config):
+            # e.g. Gemma 4 hybrid attention, whose layer types differ in head geometry.
+            return "the target's KV head geometry varies per layer"
         if self._llm_args.kv_cache_compression_config is not None:
             return "KV cache compression is enabled"
         # Specialized managers add cache roles and lifecycle protocols that an
