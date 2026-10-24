@@ -11,12 +11,12 @@ raises that error.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget, routes
+from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -29,19 +29,17 @@ _SHAPE = (78, 6144, 256, 2048)
 
 @routes("GlmMoeDsaForCausalLM")
 def route(
-    pretrained_config: Any,
-    mapping: Any,
-    compute_capability: Tuple[int, int],
-    spec_config: Optional[Any],
-    kv_cache_quant_algo: Optional[Any],
-    model_config: Optional[ModelConfig] = None,
-    llm_args: Optional[TorchLlmArgs] = None,
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
     Each target is imported where it is returned, so declining costs no import
     of modeling code.
     """
+    pretrained_config = model_config.pretrained_config
+    mapping = model_config.mapping
+    spec_config = model_config.spec_config
+    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
     shape = (
         pretrained_config.num_hidden_layers,
         pretrained_config.hidden_size,

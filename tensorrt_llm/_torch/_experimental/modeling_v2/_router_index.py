@@ -18,13 +18,14 @@ Two levels, on purpose:
   new checkpoint, GPU arch or parallel topology never touches either -- only
   a new architecture family does.
 * That ``route`` owns the rest of the decision as one
-  forward-reading tree over the facts that fix which code runs: the
-  checkpoint's config, the parallel mapping, the GPU's compute capability, the
-  speculative-decoding config and the KV-cache algorithm the engine will run
-  with. It also receives the ``ModelConfig`` and the LLM arguments, from which a
-  family derives any other engine choice its targets depend on. It returns the
-  target class, or raises :class:`NoTarget` with the reason in words. Reading
-  that one file tells you where any configuration lands.
+  forward-reading tree over the facts that fix which code runs. It receives
+  the ``ModelConfig``, the LLM arguments and the GPU's compute capability, and
+  reads from the first two the checkpoint's config, the parallel mapping, the
+  speculative-decoding config, the KV-cache algorithm the engine will run with
+  (:func:`engine_kv_cache_quant_algo`) and any other engine choice its targets
+  depend on. It returns the target class, or raises :class:`NoTarget` with the
+  reason in words. Reading that one file tells you where any configuration
+  lands.
 
 Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
 are deliberately not routing inputs. They do not change which code runs, so a
@@ -154,7 +155,7 @@ def _device_compute_capability() -> Tuple[int, int]:
     return torch.cuda.get_device_capability()
 
 
-def _kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
+def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     """The KV-cache algorithm the engine will run with, which routing runs too early to read.
 
     The loader resolves the target before `validate_and_set_kv_cache_quant`
@@ -196,15 +197,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         if route is None:
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
-        return route(
-            pretrained_config,
-            config.mapping,
-            _device_compute_capability(),
-            config.spec_config,
-            _kv_cache_quant_algo(config, llm_args),
-            model_config=config,
-            llm_args=llm_args,
-        )
+        return route(config, llm_args, _device_compute_capability())
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
