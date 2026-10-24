@@ -4,7 +4,7 @@
 
 Head-only cases replicate KV history to isolate projection/layout correctness.
 Storage cases use Helix pages, check exact ownership and unchanged storage,
-and decode directly from prefill. Historical attention gathering is separate.
+and decode directly from prefill, including multiple context chunks.
 """
 
 import pickle
@@ -53,6 +53,7 @@ class _Scenario:
     check_kv_ownership: bool = False
     fp8_cache: bool = False
     compact_cache: bool = False
+    chunked_history: bool = False
 
 
 @torch.no_grad()
@@ -257,10 +258,13 @@ def _check_owner_only_kv(runtime, mixer, reference, config, mapping, scenario):
     # Default cases overallocate so the old writer can fail safely. Compact
     # cases reserve only the ledger pages needed by the global maximum.
     lengths = [31, 64, 65, 127, 128, 129, 191, 193]
+    if scenario.chunked_history:
+        lengths = [31, 64, 65, 127, 128, 257, 383, 577]
     if scenario.compact_cache:
         # Amortize the VMM slab even for one-byte FP8 cache elements.
         lengths *= 4
-    batch, max_length = len(lengths), max(lengths) + 4
+    batch = len(lengths)
+    max_length = max(lengths) + (5 if scenario.chunked_history else 4)
     generator = torch.Generator(device="cuda").manual_seed(5678)
     hidden = torch.randn(
         batch,
@@ -273,7 +277,7 @@ def _check_owner_only_kv(runtime, mixer, reference, config, mapping, scenario):
     mask = torch.full((max_length, max_length), float("-inf"), device="cuda").triu(1)[None, None]
     expected = reference(hidden, attention_mask=mask)
     cache_context = max_length
-    if scenario.compact_cache:
+    if scenario.compact_cache or scenario.chunked_history:
         # The helper reserves (context_per_rank + 1) * CP global tokens.
         # Reserve only the physical pages needed by the global maximum.
         cache_context = (max_length + mapping.cp_size) // mapping.cp_size - 1
@@ -339,6 +343,11 @@ def _check_owner_only_kv(runtime, mixer, reference, config, mapping, scenario):
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
             mapping=mapping,
             enable_context_mla_with_cached_kv=True,
+            runtime_features=AttentionRuntimeFeatures(
+                chunked_prefill=scenario.chunked_history,
+                chunk_size=64,
+                chunked_prefill_buffer_batch_size=2,
+            ),
         )
         if global_positions is not None:
             metadata.update_helix_param(
@@ -376,14 +385,80 @@ def _check_owner_only_kv(runtime, mixer, reference, config, mapping, scenario):
         ), f"CP rank {mapping.cp_rank} wrote a non-owned KV slot"
 
     try:
-        metadata = metadata_for(lengths, [0] * batch, batch)
-        context = torch.cat([hidden[i, :length] for i, length in enumerate(lengths)])
-        with model_extra_attrs(attrs):
-            actual = runtime(context, metadata)
-        target = torch.cat([expected[i, :length] for i, length in enumerate(lengths)])
-        _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
-        history = list(captured[0].split(lengths))
-        check_cache(metadata, history)
+        history = [
+            hidden.new_empty((0, config.kv_lora_rank + config.qk_rope_head_dim)) for _ in lengths
+        ]
+        prefixes = [0] * batch
+        rounds = 3 if scenario.chunked_history else 1
+        for part in range(rounds):
+            query_lengths = [
+                length - prefix if part == rounds - 1 else length // rounds
+                for length, prefix in zip(lengths, prefixes)
+            ]
+            metadata = metadata_for(query_lengths, prefixes, batch)
+            if scenario.chunked_history and part > 0:
+                assert metadata.chunked_loop_num > 1
+                plans = MPI.COMM_WORLD.allgather(metadata.chunked_loop_num)
+                assert plans == [metadata.chunked_loop_num] * mapping.world_size
+            context = torch.cat(
+                [
+                    hidden[i, prefix : prefix + count]
+                    for i, (prefix, count) in enumerate(zip(prefixes, query_lengths))
+                ]
+            )
+            original_lengths = metadata.kv_lens_runtime.clone()
+            original_total = metadata.host_total_kv_lens.clone()
+            with model_extra_attrs(attrs):
+                actual = runtime(context, metadata)
+            torch.testing.assert_close(metadata.kv_lens_runtime, original_lengths)
+            torch.testing.assert_close(metadata.host_total_kv_lens, original_total)
+            target = torch.cat(
+                [
+                    expected[i, prefix : prefix + count]
+                    for i, (prefix, count) in enumerate(zip(prefixes, query_lengths))
+                ]
+            )
+            _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
+            history = [
+                torch.cat((old, new))
+                for old, new in zip(history, captured[-1].split(query_lengths))
+            ]
+            check_cache(metadata, history)
+            prefixes = [prefix + count for prefix, count in zip(prefixes, query_lengths)]
+        if scenario.chunked_history:
+            # Cached context and generation share one batch and their metadata
+            # must retain global context lengths and local decode lengths.
+            context_query = 3
+            metadata = metadata_for(
+                [context_query] + [1] * (batch - 1),
+                [lengths[0]] + [len(owned_positions(g)) for g in lengths[1:]],
+                1,
+                lengths[1:],
+            )
+            context_start = lengths[0]
+            mixed = torch.cat(
+                (
+                    hidden[0, context_start : context_start + context_query],
+                    torch.stack([hidden[i, g] for i, g in enumerate(lengths) if i > 0]),
+                )
+            )
+            original_total = metadata.host_total_kv_lens.clone()
+            with model_extra_attrs(attrs):
+                actual = runtime(mixed, metadata)
+            torch.testing.assert_close(metadata.host_total_kv_lens, original_total)
+            target = torch.cat(
+                (
+                    expected[0, context_start : context_start + context_query],
+                    torch.stack([expected[i, g] for i, g in enumerate(lengths) if i > 0]),
+                )
+            )
+            _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
+            history[0] = torch.cat((history[0], captured[-1]))
+            for req in range(1, batch):
+                history[req] = torch.cat((history[req], generated[-1][req - 1 : req]))
+            check_cache(metadata, history)
+            lengths = [lengths[0] + context_query] + [g + 1 for g in lengths[1:]]
+
         # No cache injection or repair: these are the pages written by prefill.
         metadata = metadata_for(
             [lengths[0]] + [1] * (batch - 1),
@@ -441,9 +516,9 @@ def _check_owner_only_kv(runtime, mixer, reference, config, mapping, scenario):
             dtype=torch.bfloat16,
             device="cuda",
         )
-        if mapping.cp_size > 1:
+        if mapping.cp_size > 1 and not scenario.chunked_history:
             saved_cache = cache.clone()
-            with pytest.raises(NotImplementedError, match="distributed KV gathering"):
+            with pytest.raises(NotImplementedError, match="requires chunked prefill"):
                 original_context(
                     q=q,
                     compressed_kv=latent[:, : mixer.kv_lora_rank],
@@ -527,6 +602,50 @@ def test_k3_mla_helix_compact_cache(fp8_cache):
         ),
         "nccl",
         world_size=4,
+        max_mismatch_ratio=0.0,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+@skip_pre_blackwell
+@pytest.mark.parametrize("fp8_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16-weights", "fp8-weights"])
+@pytest.mark.parametrize(
+    "tp_size,cp_size,num_heads",
+    [
+        (1, 1, 32),
+        (1, 2, 32),
+        pytest.param(
+            2,
+            2,
+            32,
+            marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs"),
+        ),
+        pytest.param(
+            1,
+            4,
+            32,
+            marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs"),
+        ),
+        (1, 2, 6),
+    ],
+    ids=["tp1-cp1", "tp1-cp2", "tp2-cp2", "tp1-cp4", "tp1-cp2-unaligned"],
+)
+def test_k3_mla_helix_chunked_history(fp8, fp8_cache, tp_size, cp_size, num_heads):
+    run_helix_test(
+        _check_context_heads,
+        _Scenario(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            num_heads=num_heads,
+            gate=num_heads != 6,
+            fp8=fp8,
+            fp8_cache=fp8_cache,
+            check_kv_ownership=True,
+            chunked_history=True,
+        ),
+        "nccl",
+        world_size=tp_size * cp_size,
         max_mismatch_ratio=0.0,
     )
 

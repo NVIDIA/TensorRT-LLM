@@ -40,6 +40,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...distributed import cp_allgather
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
@@ -122,6 +123,23 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
         mask[:, blk * 32:blk * 32 + n, blk] = vals
         remaining -= 32
     return mask
+
+
+@dataclass(frozen=True)
+class HelixMlaChunkPlan:
+    """CP-local read ranges for one global MLA history iteration.
+
+    Tensor fields are CUDA int64 tensors. ``cu_seq_lens`` has shape
+    [CP, contexts + 1], ``local_offsets`` has shape [CP, contexts], and
+    ``rank_offsets`` has shape [CP + 1]. Host ``rank_sizes`` drives the
+    variable-size collective; ``max_local_seq_len`` sizes this rank's read.
+    """
+
+    cu_seq_lens: torch.Tensor
+    local_offsets: torch.Tensor
+    rank_offsets: torch.Tensor
+    rank_sizes: list[int]
+    max_local_seq_len: int
 
 
 @dataclass(kw_only=True)
@@ -223,6 +241,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Int32 slots in each request's rank-local KV cache, one per context
     # token. -1 skips persistence; temporary Q/K still cover every token.
     helix_context_local_slots: Optional[torch.Tensor] = None
+    helix_mla_chunk_plans: list[HelixMlaChunkPlan] | None = None
 
     # Per-token helix state for speculative verify groups (a 1 + draft_len
     # group may straddle a ledger-page boundary onto two CP ranks, so the
@@ -1418,9 +1437,50 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             else:
                 merge_op_tensor[chunked_loop_num, s] = 1  # merge
 
+    def _prepare_helix_mla_chunks(self) -> None:
+        """Map global history chunks to compact reads on every CP rank."""
+        self.helix_mla_chunk_plans = None
+        if self.helix_context_local_slots is None:
+            return
+        mapping = self.kv_cache_manager.mapping
+        page = self.kv_cache_manager.tokens_per_block
+        offsets = self.host_chunked_global_offset[:-1]
+        lengths = self.host_chunked_seq_len[:, :self.num_contexts].to(
+            torch.int64)
+        local_starts = torch.stack([
+            helix_local_len_tensor(offsets, page, mapping.cp_size, rank)
+            for rank in range(mapping.cp_size)
+        ],
+                                   dim=1)
+        local_lengths = torch.stack([
+            helix_local_len_tensor(offsets + lengths, page, mapping.cp_size,
+                                   rank) for rank in range(mapping.cp_size)
+        ],
+                                    dim=1) - local_starts
+        cu_local = torch.nn.functional.pad(local_lengths.cumsum(-1), (1, 0))
+        sizes = cu_local[:, :, -1]
+        rank_offsets = torch.nn.functional.pad(sizes.cumsum(-1), (1, 0))
+        device = self.seq_lens_cuda.device
+        device_cu = maybe_pin_memory(cu_local).to(device, non_blocking=True)
+        device_starts = maybe_pin_memory(local_starts).to(device,
+                                                          non_blocking=True)
+        device_rank_offsets = maybe_pin_memory(rank_offsets).to(
+            device, non_blocking=True)
+        self.helix_mla_chunk_plans = [
+            HelixMlaChunkPlan(
+                cu_seq_lens=device_cu[loop],
+                local_offsets=device_starts[loop],
+                rank_offsets=device_rank_offsets[loop],
+                rank_sizes=sizes[loop].tolist(),
+                max_local_seq_len=local_lengths[loop,
+                                                mapping.cp_rank].max().item(),
+            ) for loop in range(self.chunked_loop_num)
+        ]
+
     def prepare_context_mla_with_cached_kv(self,
                                            cached_token_lens: torch.Tensor,
                                            kv_lens: torch.Tensor) -> None:
+        self.helix_mla_chunk_plans = None
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[:self.
                                                            num_contexts].sum(
@@ -1497,6 +1557,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                            non_blocking=True)
                 self.chunked_global_offset.copy_(
                     self.host_chunked_global_offset, non_blocking=True)
+                self._prepare_helix_mla_chunks()
         else:
             self.num_ctx_cached_tokens = 0
             self.max_ctx_cached_token_len = 0
@@ -2712,10 +2773,40 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         chunked_global_offset: torch.Tensor,
         chunked_max_seq_len: int,
         out_dtype: torch.dtype,
+        helix_plan: HelixMlaChunkPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
+
+        if helix_plan is not None:
+            mapping = metadata.kv_cache_manager.mapping
+            rank = mapping.cp_rank
+            local_tokens = helix_plan.rank_sizes[rank]
+            if local_tokens:
+                local_kv, local_pe = self.load_chunked_kv_cache_for_mla(
+                    metadata, local_tokens, helix_plan.cu_seq_lens[rank],
+                    helix_plan.local_offsets[rank],
+                    helix_plan.max_local_seq_len, out_dtype)
+                local = torch.cat((local_kv, local_pe), dim=-1)
+            else:
+                local = torch.empty((0, self.mla_params.kv_lora_rank +
+                                     self.mla_params.qk_rope_head_dim),
+                                    dtype=out_dtype,
+                                    device=cu_chunked_seq_len.device)
+            # Every rank enters the collective using the same global plan,
+            # including ranks with no tokens in this history iteration.
+            gathered = cp_allgather(local,
+                                    mapping,
+                                    dim=0,
+                                    sizes=helix_plan.rank_sizes)
+            assert isinstance(gathered, torch.Tensor)
+            return torch.ops.trtllm.reorder_helix_mla_kv(
+                gathered, cu_chunked_seq_len, chunked_global_offset,
+                helix_plan.cu_seq_lens, helix_plan.local_offsets,
+                helix_plan.rank_offsets,
+                metadata.kv_cache_manager.tokens_per_block,
+                self.mla_params.kv_lora_rank, self.mla_params.qk_rope_head_dim)
 
         if metadata.max_ctx_cached_token_len == 0:
             empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
