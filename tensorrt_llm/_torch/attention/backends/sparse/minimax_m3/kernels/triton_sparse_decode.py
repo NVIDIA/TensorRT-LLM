@@ -16,6 +16,11 @@ verification. Split-K, query pairing and launch tables require four KV heads;
 the linear-softmax policy also covers one and two KV heads. Other hardware
 and shapes retain the default policies, including supported SM100 NVFP4.
 
+The two-KV-head (TP2) NVFP4 shape on GB300 takes its split-K, query pairing,
+producer warps/stages and merge warps from the measured table in
+sparse_decode_tp2_policy; M3_O8_SPARSE_TABLES=0 (or M3AX_STACK_A=0) restores
+the routing above exactly.
+
 Vendored from the vLLM source linked in the file header (v0.26.1rc0-77-g6f91edf96).
 Differences from upstream:
 
@@ -45,6 +50,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
+from . import sparse_decode_tp2_policy as _o8_policy
 from .msa_utils import check_decode_span_shape
 
 # One sparse block is exactly one KV page.
@@ -1039,6 +1045,7 @@ def minimax_m3_sparse_attn_decode(
     k_global_scale: Optional[torch.Tensor] = None,
     v_global_scale: Optional[torch.Tensor] = None,
     num_topk_chunks: Optional[int] = None,
+    policy_override: Optional[_o8_policy.SparseDecodePolicy] = None,
 ) -> None:
     """Block-sparse GQA decode attention, written into output in place.
 
@@ -1057,6 +1064,12 @@ def minimax_m3_sparse_attn_decode(
 
     num_topk_chunks overrides the split-K factor and exists for tests: the
     merged result must not depend on it.
+
+    policy_override (benchmarks and tests only; production callers never pass
+    it) forces a whole NVFP4 launch policy: split-K, query pairing, producer
+    warps/stages and merge warps. Without it, the two-KV-head GB300 shape takes
+    sparse_decode_tp2_policy's measured policy when that module is enabled and
+    lists the local batch, and every other shape the default policies.
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
@@ -1112,8 +1125,14 @@ def minimax_m3_sparse_attn_decode(
     else:
         compute_dtype = tl.float32
 
-    query_group_size = (
-        _sm100f_nvfp4_query_group_size(
+    if policy_override is not None and (not kv_nvfp4 or num_topk_chunks is not None):
+        raise ValueError(
+            "policy_override applies to the NVFP4 cache only, without num_topk_chunks."
+        )
+    # The GB300 TP2 table; None keeps every choice below on the default policy.
+    o8 = policy_override
+    if o8 is None and kv_nvfp4 and num_topk_chunks is None:
+        o8 = _o8_policy.tp2_policy(
             total_q=total_q,
             num_kv_heads=num_kv_heads,
             gqa_group_size=gqa_group_size,
@@ -1121,10 +1140,26 @@ def minimax_m3_sparse_attn_decode(
             decode_query_len=decode_query_len,
             capability=capability,
         )
-        if kv_nvfp4
-        else 1
+
+    query_group_size = (
+        o8.query_group_size
+        if o8 is not None
+        else (
+            _sm100f_nvfp4_query_group_size(
+                total_q=total_q,
+                num_kv_heads=num_kv_heads,
+                gqa_group_size=gqa_group_size,
+                max_topk=max_topk,
+                decode_query_len=decode_query_len,
+                capability=capability,
+            )
+            if kv_nvfp4
+            else 1
+        )
     )
-    if num_topk_chunks is None:
+    if num_topk_chunks is None and o8 is not None:
+        num_topk_chunks = o8.num_topk_chunks
+    elif num_topk_chunks is None:
         if query_group_size == 2:
             measured_chunks = 8
         else:
@@ -1187,7 +1222,9 @@ def minimax_m3_sparse_attn_decode(
         decode_query_len=decode_query_len,
         capability=capability,
     )
-    if query_group_size == 2:
+    if o8 is not None:
+        launch_options = o8.launch_options()
+    elif query_group_size == 2:
         launch_options = {"num_warps": 4, "num_stages": 1}
     else:
         launch_options = (
@@ -1280,16 +1317,20 @@ def minimax_m3_sparse_attn_decode(
     )
     if not direct_output:
         merge_launch_options = (
-            _sm100f_nvfp4_merge_launch_options(
-                total_q=total_q,
-                num_kv_heads=num_kv_heads,
-                gqa_group_size=gqa_group_size,
-                max_topk=max_topk,
-                decode_query_len=decode_query_len,
-                capability=capability,
+            o8.merge_launch_options()
+            if o8 is not None
+            else (
+                _sm100f_nvfp4_merge_launch_options(
+                    total_q=total_q,
+                    num_kv_heads=num_kv_heads,
+                    gqa_group_size=gqa_group_size,
+                    max_topk=max_topk,
+                    decode_query_len=decode_query_len,
+                    capability=capability,
+                )
+                if kv_nvfp4
+                else {}
             )
-            if kv_nvfp4
-            else {}
         )
         _merge_topk_attn_out_kernel[(total_q, num_heads)](
             o_arg,
