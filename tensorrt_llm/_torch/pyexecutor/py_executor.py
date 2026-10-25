@@ -2246,10 +2246,9 @@ class PyExecutor:
                 return
         else:
             for engine in (self.model_engine, self.draft_model_engine):
-                release_model_graphs = getattr(
-                    engine, "_release_model_owned_cuda_graphs", None)
-                if release_model_graphs is not None:
-                    release_model_graphs()
+                if engine is not None:
+                    engine.release_executor_resources(
+                        release_model_owned_graphs=True)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         self._closed = True

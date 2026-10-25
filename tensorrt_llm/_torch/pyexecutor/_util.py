@@ -4488,6 +4488,7 @@ def create_py_executor_instance(
         max_num_sequences=max_num_sequences,
     )
     spec_config = model_engine.spec_config
+    config = model_engine.model.model_config.pretrained_config
     return PyExecutor(
         execution_resources.resource_manager,
         execution_resources.scheduler,

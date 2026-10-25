@@ -47,9 +47,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    compute_max_num_sequences, create_py_executor_instance,
-                    create_py_executor_resources, instantiate_sampler,
-                    is_disagg_enabled, is_mla)
+                    create_py_executor_instance, create_py_executor_resources,
+                    instantiate_sampler, is_disagg_enabled, is_mla)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -1290,7 +1289,8 @@ def _create_py_executor(
                     ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
                         ctx_chunk_config,
                         resources.get(ResourceManagerType.KV_CACHE_MANAGER),
-                        tokens_per_block, scheduler_config.context_chunking_policy),
+                        tokens_per_block,
+                        scheduler_config.context_chunking_policy),
                     model_engine=model_engine,
                     lora_config=lora_config,
                     kv_connector_manager=kv_connector_manager,

@@ -30,6 +30,12 @@ def executor(monkeypatch):
         attn_metadata=object(),
         _release_cuda_graphs=lambda: events.append("graphs"),
     )
+
+    def release_engine_resources(*, release_model_owned_graphs):
+        engine._release_cuda_graphs()
+        engine.attn_metadata = None
+
+    engine.release_executor_resources = Mock(side_effect=release_engine_resources)
     cache = SimpleNamespace(shutdown=lambda: events.append("cache"))
     transceiver = SimpleNamespace(shutdown=lambda: events.append("unregister"))
     ex = object.__new__(PyExecutor)
@@ -82,6 +88,12 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
         attn_metadata=object(),
         _release_cuda_graphs=lambda: events.append("draft_graphs"),
     )
+
+    def release_draft_resources(*, release_model_owned_graphs):
+        draft_engine._release_cuda_graphs()
+        draft_engine.attn_metadata = None
+
+    draft_engine.release_executor_resources = Mock(side_effect=release_draft_resources)
     ex.draft_model_engine = draft_engine
     ex.sampler = Mock(spec=AsyncWorkerMixin)
     ex.sampler.async_worker_enabled.return_value = True
@@ -133,10 +145,11 @@ def test_final_shutdown_after_release_does_not_release_resources_twice(executor)
         ex.release_resources()
     assert events == before
     engine = ex.model_engine
-    engine._release_model_owned_cuda_graphs = Mock()
+    engine.release_executor_resources.assert_called_once_with(release_model_owned_graphs=False)
+    engine.release_executor_resources.reset_mock(side_effect=True)
     ex.shutdown()
     ex.shutdown()
-    engine._release_model_owned_cuda_graphs.assert_called_once()
+    engine.release_executor_resources.assert_called_once_with(release_model_owned_graphs=True)
     assert events == before + ["synchronize"]
     assert ex._closed
     assert not hasattr(ex, "model_engine")
@@ -213,6 +226,12 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         enable_kv_pool_rebalance=False,
     )
     ex.model_engine.enable_attention_dp = False
+    ex.model_engine.mm_encoder_item_scheduling_enabled = False
+    ex.model_engine.enable_in_graph_sampling = False
+    ex.model_engine.is_spec_decode = False
+    ex.model_engine.spec_config = None
+    ex.model_engine.enable_overlap_headroom = False
+    ex.model_engine.warmup_scope = nullcontext
     ex.model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
     ex.model_engine.get_max_num_sequences = Mock(return_value=2)
     ex.model_engine.warmup = Mock()
