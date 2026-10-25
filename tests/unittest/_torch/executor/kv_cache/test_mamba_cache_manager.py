@@ -2047,8 +2047,8 @@ def test_v2_hybrid_fp4_mla_snapshot_points_align_to_cache_blocks():
         additional_snapshot_offsets_from_end=[0, 13],
     )
     requests = [
-        SimpleNamespace(prompt_len=350, expect_snapshot_points=[]),
-        SimpleNamespace(prompt_len=100, expect_snapshot_points=[]),
+        SimpleNamespace(py_request_id=0, prompt_len=350, expect_snapshot_points=[]),
+        SimpleNamespace(py_request_id=1, prompt_len=100, expect_snapshot_points=[]),
     ]
 
     mgr.prepare_expect_snapshot_points(requests)
