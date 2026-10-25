@@ -49,6 +49,14 @@ from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
+# TRTLLM_M3_CHEAP_PAD=1: sample CUDA-graph padding rows from a one-hot logits row
+# instead of a zero one (see SpecWorkerBase._zero_padding_rows). Read once.
+CHEAP_PAD_SAMPLING = os.environ.get("TRTLLM_M3_CHEAP_PAD", "0") == "1"
+# Logit given to token 0 of a padding row under CHEAP_PAD_SAMPLING. Finite in
+# every logits dtype, and large enough that softmax is exactly one-hot at any
+# temperature a row can carry (<= the 1.0 a non-greedy row resolves to).
+_PADDING_ONEHOT_LOGIT = 1.0e4
+
 # An optional replacement of the tensor-seeded deterministic chain sampler,
 # installed by a model at load time: it takes the op's arguments and returns
 # its (accepted_tokens, num_tokens), or None to keep the stock op for that
@@ -2498,6 +2506,51 @@ class SpecWorkerBase(nn.Module, ABC):
             logits, temperatures, top_ks, top_ps)
 
     @staticmethod
+    def _padding_row_mask(spec_metadata,
+                          num_rows: int,
+                          num_contexts: int,
+                          batch_size: int,
+                          rows_per_request: int,
+                          *,
+                          packed_verify: bool = False) -> Optional[torch.Tensor]:
+        """Bool mask over ``num_rows`` sampling rows marking CUDA-graph padding requests.
+
+        Padding requests are the ones ``populate_sampling_params_for_one_model``
+        routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
+        extra host-side state. Shapes are static: CUDA-graph safe. None while
+        ``dummy_slot_row`` is still 0, which is a live request's row rather than
+        a padding marker (``prepare_rejection_sampling_buffers`` and
+        ``prepare_penalty_buffers`` are the two places that publish it), and
+        when the rows do not match the batch layout.
+
+        Args:
+            num_rows: rows of the logits / probs the mask is applied to.
+            rows_per_request: rows each request contributes.
+            packed_verify: use the ragged verification lengths for target rows;
+                draft-step rows retain their uniform layout.
+        """
+        slot_ids = getattr(spec_metadata, "batch_slot_ids", None)
+        dummy_slot_row = getattr(spec_metadata, "dummy_slot_row", 0)
+        num_gens = batch_size - num_contexts
+        if slot_ids is None or dummy_slot_row <= 0 or num_gens <= 0:
+            return None
+        is_padding = slot_ids[num_contexts:batch_size] == dummy_slot_row
+        if packed_verify and spec_metadata.is_ragged_verify:
+            lens = spec_metadata.verify_lens
+            if (lens is None or lens.dim() != 1 or lens.numel() != num_gens
+                    or spec_metadata.total_verify_tokens != num_rows):
+                raise ValueError(
+                    "ragged padding rows do not match the verification layout")
+            return torch.repeat_interleave(is_padding,
+                                           lens.to(torch.long),
+                                           output_size=num_rows)
+        if num_rows != num_gens * rows_per_request:
+            return None
+        if rows_per_request > 1:
+            is_padding = is_padding.repeat_interleave(rows_per_request)
+        return is_padding
+
+    @staticmethod
     def _zero_padding_rows(logits: torch.Tensor,
                            spec_metadata,
                            num_contexts: int,
@@ -2505,7 +2558,7 @@ class SpecWorkerBase(nn.Module, ABC):
                            rows_per_request: int,
                            *,
                            packed_verify: bool = False) -> torch.Tensor:
-        """Zero the logits rows belonging to CUDA-graph padding requests.
+        """Replace the logits rows belonging to CUDA-graph padding requests.
 
         A padding request decodes from an uninitialized KV/hidden state, so its
         logits can be non-finite and its probs degenerate. flashinfer's
@@ -2513,12 +2566,12 @@ class SpecWorkerBase(nn.Module, ABC):
         ``relu(target - draft)`` residual has no mass, reads an uninitialized
         shared-memory slot and emits an out-of-range token id. Zeroed logits are legal.
 
-        Padding requests are the ones ``populate_sampling_params_for_one_model``
-        routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
-        extra host-side state. Shapes are static: CUDA-graph safe. No-op while
-        ``dummy_slot_row`` is still 0, which is a live request's row rather than
-        a padding marker; ``prepare_rejection_sampling_buffers`` and
-        ``prepare_penalty_buffers`` are the two places that publish it.
+        Zeroed logits give a uniform distribution, though, which is the worst
+        case of the radix top-p renormalization: every entry falls in one
+        bucket, and the launch lasts as long as its slowest row. With
+        TRTLLM_M3_CHEAP_PAD=1 the rows instead get a one-hot logits row (token
+        0), which the filters pass through cheaply; the caller then restores
+        the uniform probs that zeroed logits give with ``_uniform_padding_probs``.
 
         Args:
             logits: ``[num_generation_tokens, vocab]``.
@@ -2526,28 +2579,50 @@ class SpecWorkerBase(nn.Module, ABC):
             packed_verify: use the ragged verification lengths for target logits;
                 draft-step logits retain their uniform layout.
         Returns:
-            ``logits`` with the padding requests' rows zeroed.
+            ``logits`` with the padding requests' rows replaced.
         """
-        slot_ids = getattr(spec_metadata, "batch_slot_ids", None)
-        dummy_slot_row = getattr(spec_metadata, "dummy_slot_row", 0)
-        num_gens = batch_size - num_contexts
-        if slot_ids is None or dummy_slot_row <= 0 or num_gens <= 0:
+        is_padding = SpecWorkerBase._padding_row_mask(
+            spec_metadata,
+            logits.shape[0],
+            num_contexts,
+            batch_size,
+            rows_per_request,
+            packed_verify=packed_verify)
+        if is_padding is None:
             return logits
-        is_padding = slot_ids[num_contexts:batch_size] == dummy_slot_row
-        if packed_verify and spec_metadata.is_ragged_verify:
-            lens = spec_metadata.verify_lens
-            if (lens is None or lens.dim() != 1 or lens.numel() != num_gens
-                    or spec_metadata.total_verify_tokens != logits.shape[0]):
-                raise ValueError(
-                    "ragged padding rows do not match the verification layout")
-            is_padding = torch.repeat_interleave(is_padding,
-                                                 lens.to(torch.long),
-                                                 output_size=logits.shape[0])
-        elif logits.shape[0] != num_gens * rows_per_request:
-            return logits
-        elif rows_per_request > 1:
-            is_padding = is_padding.repeat_interleave(rows_per_request)
-        return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
+        logits = logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
+        if CHEAP_PAD_SAMPLING:
+            logits[:, 0].masked_fill_(is_padding, _PADDING_ONEHOT_LOGIT)
+        return logits
+
+    @staticmethod
+    def _uniform_padding_probs(probs: torch.Tensor,
+                               spec_metadata,
+                               num_contexts: int,
+                               batch_size: int,
+                               rows_per_request: int,
+                               *,
+                               packed_verify: bool = False) -> torch.Tensor:
+        """Give padding rows the uniform probs zeroed logits would have produced.
+
+        Pairs with ``_zero_padding_rows`` under TRTLLM_M3_CHEAP_PAD=1, after
+        the filters ran on its one-hot rows: rejection then sees uniform
+        target and draft probs for a padding row and accepts whatever stale
+        draft token it carries, as it does without the switch. In place;
+        a no-op without the switch.
+        """
+        if not CHEAP_PAD_SAMPLING:
+            return probs
+        is_padding = SpecWorkerBase._padding_row_mask(
+            spec_metadata,
+            probs.shape[0],
+            num_contexts,
+            batch_size,
+            rows_per_request,
+            packed_verify=packed_verify)
+        if is_padding is not None:
+            probs.masked_fill_(is_padding.unsqueeze(-1), 1.0 / probs.shape[-1])
+        return probs
 
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
@@ -2590,6 +2665,8 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
+            probs = self._uniform_padding_probs(probs, spec_metadata, 0,
+                                                batch_size, 1)
             # Scatter probs into the slot-indexed buffer so each request's data
             # lands at its stable py_seq_slot row regardless of batch shifts.
             assert spec_metadata.batch_slot_ids is not None, (
@@ -2796,6 +2873,13 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.top_ks[gen_start:gen_end],
                 spec_metadata.top_ps[gen_start:gen_end],
                 spec_metadata.min_ps[gen_start:gen_end])
+            target_probs_flat = self._uniform_padding_probs(
+                target_probs_flat,
+                spec_metadata,
+                num_contexts,
+                batch_size,
+                runtime_draft_len + 1,
+                packed_verify=True)
             if is_ragged:
                 from .ragged_helpers import (fill_padded_rows_onehot,
                                              scatter_ragged_to_padded)
@@ -3169,6 +3253,9 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
+            flat_probs = self._uniform_padding_probs(flat_probs, spec_metadata,
+                                                     num_contexts, batch_size,
+                                                     K)
             # Scatter the K prob rows per gen request into its stable slot row.
             if spec_metadata.draft_probs is not None:
                 assert spec_metadata.batch_slot_ids is not None, (
