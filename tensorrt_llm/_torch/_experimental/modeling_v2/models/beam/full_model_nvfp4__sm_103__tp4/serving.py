@@ -24,11 +24,15 @@ scheduler batches up to ``--max-batch-size`` requests per engine step (default 1
 at a time). It owns no scheduler, sampler, route or evaluator::
 
     python -m tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.serving \\
-        --checkpoint <dir> [--port 8000] [--max-seq-len 69632] [--max-num-tokens 8192] \\
-        [--max-batch-size 1] [--iter-stats]
+        --checkpoint <dir> [--draft-checkpoint <dir>] [--port 8000] [--max-seq-len 69632] \\
+        [--max-num-tokens 8192] [--max-batch-size 1] [--iter-stats]
 
-``--iter-stats`` enables the engine's iteration statistics (``GET /metrics``: per-step
-scheduled, context and generation request counts, latency and memory).
+``--draft-checkpoint`` adds DFlash speculative decoding with that DFlash 2 drafter: the native
+one-model DFlash worker with ``max_draft_len`` 7 (a verification block of eight rows), TRTLLM
+draft attention over the engine's paged draft KV pool and strict greedy verification; the
+one-model speculative sampler replaces the TorchSampler and only target-verified tokens reach
+the client. ``--iter-stats`` enables the engine's iteration statistics (``GET /metrics``:
+per-step scheduled, context and generation request counts, latency and memory).
 """
 
 from __future__ import annotations
@@ -183,6 +187,25 @@ def load_tokenizer(checkpoint: str):
     return PreTrainedTokenizerFast.from_pretrained(checkpoint)
 
 
+def dflash_config(draft_checkpoint: str):
+    """The DFlash speculative config of the supported deployment for ``draft_checkpoint``.
+
+    ``max_draft_len`` is the one verification width the target serves (``routing``); the
+    capture layers and mask token come from the drafter's own ``dflash_config``.
+    """
+    from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
+
+    from ..routing import DFLASH_MAX_DRAFT_LEN
+
+    if not os.path.isfile(os.path.join(draft_checkpoint, "config.json")):
+        raise ValueError(f"the drafter checkpoint {draft_checkpoint!r} has no config.json")
+    return DFlashDecodingConfig(
+        max_draft_len=DFLASH_MAX_DRAFT_LEN,
+        speculative_model=draft_checkpoint,
+        attention_backend="TRTLLM",
+    )
+
+
 def llm_args(
     checkpoint: str,
     *,
@@ -191,11 +214,14 @@ def llm_args(
     max_batch_size: int = 1,
     kv_cache_max_tokens: Optional[int] = None,
     iter_stats: bool = False,
+    draft_checkpoint: Optional[str] = None,
 ) -> dict:
     """Native LLM API arguments of the supported deployment for ``checkpoint``.
 
     ``max_batch_size`` bounds the requests the native scheduler runs in one engine step;
     ``kv_cache_max_tokens`` (default ``2 * max_seq_len``) sizes the shared KV cache.
+    ``draft_checkpoint`` adds DFlash speculative decoding with that drafter
+    (``dflash_config``); its draft KV pool is the engine's separate draft manager.
     """
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
@@ -204,7 +230,7 @@ def llm_args(
 
     if not 1 <= max_num_tokens <= MAX_NUM_TOKENS:
         raise ValueError(f"max_num_tokens must be in [1, {MAX_NUM_TOKENS}], got {max_num_tokens}")
-    return {
+    args = {
         "model": checkpoint,
         "tokenizer": load_tokenizer(checkpoint),
         "backend": "pytorch",
@@ -223,6 +249,9 @@ def llm_args(
         "reasoning_parser": PARSER_KEY,
         "enable_iter_perf_stats": iter_stats,
     }
+    if draft_checkpoint is not None:
+        args["speculative_config"] = dflash_config(draft_checkpoint)
+    return args
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -239,6 +268,11 @@ def main(argv: Optional[list] = None) -> None:
     ap.add_argument("--max-batch-size", type=int, default=1)
     ap.add_argument("--kv-cache-max-tokens", type=int, default=None)
     ap.add_argument("--iter-stats", action="store_true")
+    ap.add_argument(
+        "--draft-checkpoint",
+        default=None,
+        help="DFlash 2 drafter directory; without it, speculation is off",
+    )
     args = ap.parse_args(argv)
 
     from tensorrt_llm.commands.serve import launch_server
@@ -256,6 +290,7 @@ def main(argv: Optional[list] = None) -> None:
             max_batch_size=args.max_batch_size,
             kv_cache_max_tokens=args.kv_cache_max_tokens,
             iter_stats=args.iter_stats,
+            draft_checkpoint=args.draft_checkpoint,
         ),
         chat_template=template,
         served_model_name=args.served_model_name,

@@ -15,7 +15,7 @@ ModelingV2 explicitly; it does not fall back to the built-in model implementatio
 | Parameters and arithmetic | Packed NVFP4 experts with native W4A4 GEMMs; BF16 excluded modules/activations; FP32 routing |
 | Attention | TRTLLM backend; 512-token sliding attention and full attention according to the checkpoint's layer schedule |
 | KV cache | BF16, native `KVCacheManagerV2`, full-block prefix reuse |
-| Generation | Native `TorchSampler`; greedy decoding is the evaluated policy |
+| Generation | Native `TorchSampler` for ordinary decoding; native DFlash worker and speculative sampler for optional DFlash2 greedy decoding |
 | Execution | Eager; CUDA graphs, overlap scheduling, and chunked prefill disabled |
 | Serving | Native OpenAI-compatible server, one frontend, streaming and non-streaming text |
 
@@ -64,6 +64,39 @@ native batching can be enabled with `--max-batch-size`. The benchmark used 128 a
 capacity must cover concurrently active requests; do not infer capacity from batch
 size alone. `--iter-stats` enables native iteration statistics.
 
+## Optional DFlash2 speculative decoding
+
+Supply a compatible DFlash2 drafter directory with `--draft-checkpoint`. The
+launcher uses the native DFlash worker, greedy verifier, and separate target/draft
+KV cache pools. The target supplies completed-block captures at the layers named
+by the drafter; the drafter shares the target's embedding and vocabulary head.
+
+```bash
+python -m tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.serving \
+  --checkpoint /path/to/target-checkpoint \
+  --draft-checkpoint /path/to/dflash2-checkpoint \
+  --served-model-name beam-nvfp4 \
+  --host 127.0.0.1 --port 8000 \
+  --max-seq-len 8192 --max-num-tokens 8192 --max-batch-size 4
+```
+
+The evaluated configuration uses four GB300 GPUs, TP4, BF16 KV for both models,
+seven proposals per step (eight target verification rows), and eager execution
+without overlap or chunked prefill. Validation covers batches of one and four,
+prompts through 4097 tokens, and at most 64 generated tokens; the configured 8192
+sequence capacity is not a claim of qualification at every length. The default
+shared KV capacity can queue a request when four long prompts compete for space.
+
+Draft context uses the native paged cache. Non-causal windowed draft block
+attention uses Torch SDPA over that same pool because TRTLLM-Gen does not support
+that mask. Target verification retains TRTLLM attention. Accepted proposals must
+match the target's greedy choice on the verification logits; independent ordinary
+and speculative runs can still diverge at near ties when GEMM/collective shapes
+change. The GSM8K result below is for ordinary decoding, not DFlash2.
+
+FP8 KV, CUDA graphs, overlap scheduling, and disaggregated serving remain future
+work. The bounded eager timing measurements are not a production throughput claim.
+
 ## Validation and regression coverage
 
 The initial full-model evaluation completed all 1,319 GSM8K test questions with
@@ -96,6 +129,16 @@ These unit tests do not reproduce the full 52-layer accuracy evaluation. A
 checkpoint-backed end-to-end regression and its CI model staging remain separate
 integration work; generated tests must not be presented as that coverage.
 
+L0 includes the CPU parser/routing and attention-selection checks, plus the
+single-GPU generated-input operator, block, six-layer and metadata regressions.
+The GPU tests are selected by the ModelingV2 directory entry in `l0_b300.yml`;
+the six-layer suites need up to approximately 200 GiB of free device memory and
+release their cached models at module teardown. Real-checkpoint multi-GPU smoke
+coverage is outside L0 and may run manually or in a separately provisioned
+nightly/long-running job. Full Beam GSM8K evaluation is manual-only and must not
+be registered in L0, nightly or long-running CI. No Beam multi-GPU CI job is
+registered by this change.
+
 ## File organization and limits
 
 - `full_model_nvfp4__sm_103__tp4/` contains the engine-facing target, full-depth
@@ -110,7 +153,7 @@ integration work; generated tests must not be presented as that coverage.
   built-in component implementation. The result above belongs to the routed
   ModelingV2 target, not to that built-in model path.
 
-Other GPU architectures, parallel layouts, FP8 KV cache, speculative decoding,
+Other GPU architectures, parallel layouts, FP8 KV cache, other speculative modes,
 CUDA graphs, overlap scheduling, chunked prefill, tool calling, and disaggregated
 serving are not qualified by this implementation. Subsequent feature/performance
 work should preserve this functional and accuracy baseline in follow-up PRs.

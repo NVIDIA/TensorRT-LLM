@@ -32,6 +32,7 @@ test constructs a second model. No model files.
 from __future__ import annotations
 
 import contextlib
+import gc
 import math
 import types
 import zlib
@@ -203,6 +204,15 @@ def generate_ids(seed: int, length: int) -> torch.Tensor:
 
 
 _CACHE: dict = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def device_memory():
+    """Release the generated weights and model before the next module runs."""
+    yield
+    _CACHE.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def loaded(seed: int) -> tuple[BeamSmallModelPrefillBf16Sm103Tp1, dict]:

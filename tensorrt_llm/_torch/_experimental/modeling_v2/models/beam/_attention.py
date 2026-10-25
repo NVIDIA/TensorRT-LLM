@@ -35,6 +35,15 @@ context requests first, then its generation requests, each with its own ``past``
 and pages, their new tokens concatenated in that order. Every operation but the attention
 op is per token; the op reads each request's own metadata row.
 
+A speculative verification step (one-model speculative decoding) is the same batch whose
+generation requests each append ``P`` rows instead of one: the pending token and its
+``P - 1`` proposals at ``past .. past + P - 1``. The op takes ``P`` as
+``predicted_tokens_per_seq`` (``call_constants``), which alone makes the mask inside each
+block bottom-right causal: row ``t`` attends ``[0, past + t]`` (within the layer's window).
+On sm_103 the metadata keeps ``is_spec_decoding_enabled`` False for such a linear draft. The
+one-model runtime reserves extra KV slots per request (``num_extra_kv_tokens``) beyond the
+lengths the op reads; the KV lengths in the metadata exclude them.
+
 Logical layer and cache slot. A block's ``layer_idx`` is its depth in the model: it fixes
 the block's semantics (its residual coefficients, its attention and feed-forward kind).
 The KV cache it appends to is a ``KVCacheManagerV2`` that holds that layer, so its storage
@@ -134,6 +143,16 @@ CALL_CONSTANTS = dict(
     kv_norm_eps=1e-6,
     skip_correction_threshold=0.0,
 )
+
+
+def call_constants(generation_rows: int = 1) -> dict:
+    """``CALL_CONSTANTS`` for a step whose generation requests each append ``generation_rows``.
+
+    1 is an ordinary step; a speculative verification step passes its ``P``.
+    """
+    if type(generation_rows) is not int or generation_rows < 1:
+        raise ValueError(f"generation_rows must be a positive int, got {generation_rows!r}")
+    return {**CALL_CONSTANTS, "predicted_tokens_per_seq": generation_rows}
 
 
 def local_layer_index(md: TrtllmAttentionMetadata, layer_idx: int) -> int:
@@ -253,40 +272,59 @@ def check_batch_metadata(
     layer_idx: int,
     num_kv_heads: int,
     head_dim: int,
+    generation_rows: int = 1,
+    extra_kv_tokens: int = 0,
 ) -> list:
     """Raise ValueError unless ``md`` is one prepared step of its requests; return their spans.
 
     The native runtime orders a step's ``num_seqs`` requests with its ``num_contexts``
     context requests first, and their new tokens fill the call's ``num_tokens`` rows in that
     order. Accepted on a BF16 ``KVCacheManagerV2`` holding logical layer ``layer_idx`` with
-    ``num_kv_heads`` kv heads of ``head_dim``, beam width 1, no cross attention or
-    speculative decoding, where each request ``i`` with KV length ``L_i`` (at most the
-    manager's ``max_seq_len``) is
+    ``num_kv_heads`` kv heads of ``head_dim``, beam width 1, no cross attention and no
+    tree-mask speculative decoding, where each request ``i`` with KV length ``L_i`` (at most
+    the manager's ``max_seq_len``) is
 
     * a context request of ``n_i >= 1`` new tokens: context length ``n_i``,
       ``past_i = L_i - n_i >= 0`` tokens already cached, and paged-context FMHA whenever
       ``past_i > 0``; or
-    * a generation request: one new token after ``past_i = L_i - 1 >= 0`` cached tokens
-      (the native runtime's warmup issues generation steps over a cache that holds only the
-      new token).
+    * a generation request of ``generation_rows`` new tokens after ``past_i = L_i - n_i >= 0``
+      cached ones (the native runtime's warmup issues generation steps over a cache that
+      holds only the new tokens): one for an ordinary step, ``P`` for a speculative
+      verification step (the pending token and its ``P - 1`` proposals).
+
+    ``extra_kv_tokens`` is the per-request KV reservation the metadata must carry beyond the
+    lengths above: 0 for an ordinary engine, the one-model runtime's ``num_extra_kv_tokens``
+    for a speculative one.
 
     Returns ``[(past_i, n_i), ...]`` in row order: request ``i``'s new tokens sit at the
     absolute positions ``past_i .. past_i + n_i - 1``. Reads host-side state only.
     """
     if not isinstance(md, TrtllmAttentionMetadata):
         raise ValueError(f"attn_metadata must be TrtllmAttentionMetadata, got {type(md).__name__}")
+    if type(generation_rows) is not int or generation_rows < 1:
+        raise ValueError(f"generation_rows must be a positive int, got {generation_rows!r}")
+    if type(extra_kv_tokens) is not int or extra_kv_tokens < 0:
+        raise ValueError(f"extra_kv_tokens must be a non-negative int, got {extra_kv_tokens!r}")
     mgr = md.kv_cache_manager
     if mgr is None:
         raise ValueError("attn_metadata needs a KV cache manager for the paged append")
     if md.is_cross or md.is_spec_decoding_enabled or md.beam_width != 1:
-        raise ValueError("cross attention, speculative decoding and beams are not supported")
+        raise ValueError(
+            "cross attention, tree-mask speculative decoding and beams are not supported"
+        )
     num_seqs, num_contexts = md.num_seqs, md.num_contexts
     if num_seqs < 1 or not 0 <= num_contexts <= num_seqs:
         raise ValueError(
             f"the metadata holds {num_seqs} requests of which {num_contexts} are contexts"
         )
-    if md.kv_cache_params is None or md.kv_cache_params.num_extra_kv_tokens:
-        raise ValueError("the metadata must use the KV cache without extra KV tokens")
+    if md.kv_cache_params is None:
+        raise ValueError("the metadata must use the KV cache")
+    reserved = md.kv_cache_params.num_extra_kv_tokens or 0
+    if reserved != extra_kv_tokens:
+        raise ValueError(
+            f"the metadata reserves {reserved} extra KV tokens per request; this step needs "
+            f"{extra_kv_tokens} (0 without speculative decoding)"
+        )
     if num_tokens > md.max_num_tokens:
         raise ValueError(
             f"the call has {num_tokens} tokens; the metadata holds {md.max_num_tokens} per call"
@@ -320,14 +358,15 @@ def check_batch_metadata(
                     "paged-context FMHA is required"
                 )
         else:
-            if n != 1 or request_type != 1:
+            if n != generation_rows or request_type != 1:
+                rows = "one token" if generation_rows == 1 else f"{generation_rows} tokens"
                 raise ValueError(
-                    f"generation request {i} appends exactly one token, got {n} (request type "
-                    f"{request_type})"
+                    f"generation request {i} appends exactly {rows} this step, got {n} "
+                    f"(request type {request_type})"
                 )
             if past < 0:
                 raise ValueError(
-                    f"request {i}'s KV length {kv_len} is shorter than its generation token"
+                    f"request {i}'s KV length {kv_len} is shorter than its {n} generation rows"
                 )
         spans.append((past, n))
     if max(kv_lens) > mgr.max_seq_len or md.max_seq_len != mgr.max_seq_len:

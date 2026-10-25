@@ -43,6 +43,7 @@ free device memory (generated state and loaded model). No model files.
 from __future__ import annotations
 
 import contextlib
+import gc
 import math
 import types
 import zlib
@@ -155,6 +156,15 @@ def token_stream(name: str, length: int) -> list:
 
 
 _CACHE: dict = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def device_memory():
+    """Release the cached model before the next module runs."""
+    yield
+    _CACHE.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def loaded() -> model_module.BeamSmallModelPrefillBf16Sm103Tp1:

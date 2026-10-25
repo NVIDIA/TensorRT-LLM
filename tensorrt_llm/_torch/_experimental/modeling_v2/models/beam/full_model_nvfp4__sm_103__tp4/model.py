@@ -18,11 +18,16 @@ One call is one engine step of one or more requests (``_attention.check_batch_me
 the step's context requests first, then its generation requests, their new tokens
 concatenated into the call's T rows. A context request appends its ``n`` tokens after the
 ``past`` tokens the cache already holds for it (none, a reused prefix or earlier chunks), a
-generation request appends one token. Each request's ``position_ids`` must be exactly
-``past .. past + n - 1``. ``logit_rows`` selects the hidden rows that reach the final norm and
-the head before either runs: ``None`` (default) is the last row of each request, in request
-order -- the next-token logits a sampler needs -- ``"all"`` every row, or explicit row
-indices.
+generation request appends ``generation_rows`` tokens: one, or in a speculative
+verification step ``P`` (its pending token and ``P - 1`` proposals). Each request's
+``position_ids`` must be exactly ``past .. past + n - 1``. ``logit_rows`` selects the hidden
+rows that reach the final norm and the head before either runs: ``None`` (default) is the
+last row of each request, in request order -- the next-token logits a sampler needs --
+``"all"`` every row, ``"verification"`` the last row of each context request and every row
+of each generation request (what a speculative verifier reads), or explicit row indices.
+``block_output(layer, x)``, when given, receives each logical layer's completed block output
+``x`` ``[T, hidden]`` (the residual stream after the block, before the next block or the
+final norm) as soon as the block returns.
 
 The cache must be a BF16 ``KVCacheManagerV2`` holding all 52 logical layers in logical order
 with 2 kv heads of 128 per rank, a 512-token window on every sliding layer and the whole
@@ -31,8 +36,9 @@ sequence (``max_seq_len``) on the full-attention layers 5, 11, 17, 23, 29, 35, 4
 runs; a call with T above ``max_tokens`` is rejected (the default ``MAX_NUM_TOKENS`` matches
 the supported deployment's native ``max_num_tokens``).
 
-Host synchronization: the position check reads one device comparison back per call; the
-component's router agreement and expert dispatch synchronize per sparse layer.
+Host synchronization: the position check reads one device comparison back per call (and the
+``gather_ids`` check, when given, one more); the component's router agreement and expert
+dispatch synchronize per sparse layer.
 """
 
 from __future__ import annotations
@@ -129,7 +135,9 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
                     f"{window} (max_seq_len {manager.max_seq_len})"
                 )
 
-    def _select_rows(self, logit_rows: LogitRows, spans: Sequence[tuple]) -> list:
+    def _select_rows(
+        self, logit_rows: LogitRows, spans: Sequence[tuple], num_contexts: int = 0
+    ) -> list:
         num_tokens = sum(n for _, n in spans)
         if logit_rows is None:
             ends, end = [], 0
@@ -138,11 +146,18 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
                 ends.append(end - 1)
             return ends
         if isinstance(logit_rows, str):
-            if logit_rows != "all":
+            if logit_rows == "all":
+                return list(range(num_tokens))
+            if logit_rows != "verification":
                 raise ValueError(
-                    f"logit_rows must be None, 'all' or row indices, got {logit_rows!r}"
+                    "logit_rows must be None, 'all', 'verification' or row indices, got "
+                    f"{logit_rows!r}"
                 )
-            return list(range(num_tokens))
+            rows, start = [], 0
+            for i, (_, n) in enumerate(spans):
+                rows.extend([start + n - 1] if i < num_contexts else range(start, start + n))
+                start += n
+            return rows
         rows = list(logit_rows)
         if (
             not rows
@@ -159,15 +174,19 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         attn_metadata: TrtllmAttentionMetadata,
+        *,
+        generation_rows: int = 1,
+        extra_kv_tokens: int = 0,
     ) -> tuple:
         """Validate one call; return the flat ids, the flat positions and the request spans.
 
         ``input_ids``: ``[T]`` or ``[1, T]`` torch.int64 ids in ``[0, vocab)`` on the model's
         device, 1 <= T <= ``max_tokens``; ``attn_metadata``: one prepared step of its requests
-        on a manager that passes ``check_cache_manager``; ``position_ids``: an integer tensor
-        of T positions, each request's ``past .. past + n - 1`` in request order. Returns the
-        spans ``[(past, n), ...]`` of ``_attention.check_batch_metadata``. Raises ValueError
-        otherwise.
+        on a manager that passes ``check_cache_manager``, ``generation_rows`` rows per
+        generation request and ``extra_kv_tokens`` reserved KV slots per request;
+        ``position_ids``: an integer tensor of T positions, each request's
+        ``past .. past + n - 1`` in request order. Returns the spans ``[(past, n), ...]`` of
+        ``_attention.check_batch_metadata``. Raises ValueError otherwise.
         """
         if not isinstance(input_ids, torch.Tensor) or input_ids.dtype != torch.int64:
             raise ValueError("input_ids must be a torch.int64 tensor")
@@ -205,6 +224,8 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             layer_idx=0,
             num_kv_heads=self.local_kv_heads,
             head_dim=self.head_dim,
+            generation_rows=generation_rows,
+            extra_kv_tokens=extra_kv_tokens,
         )
         positions = position_ids.reshape(-1).to(torch.int64)
         expected = torch.cat([torch.arange(past, past + n, dtype=torch.int64) for past, n in spans])
@@ -230,24 +251,52 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         logit_rows: LogitRows = None,
         layer_capture: Optional[Callable[[int], Optional[dict]]] = None,
         trace: Optional[list] = None,
-    ) -> torch.Tensor:
+        generation_rows: int = 1,
+        extra_kv_tokens: int = 0,
+        block_output: Optional[Callable[[int, torch.Tensor], None]] = None,
+        gather_ids: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
+    ) -> Union[torch.Tensor, tuple]:
         """One engine step through all 52 layers; FP32 softcapped logits ``[R, vocab]``.
 
         ``layer_capture(layer)`` may return a dict that receives that block's named
         intermediates (``block``'s capture); ``trace``, when a list, receives one record per
         executed stage in execution order (embedding with the step's request spans, each
-        logical layer with its kind and window, final norm, head).
+        logical layer with its kind and window, final norm, head). ``generation_rows`` and
+        ``extra_kv_tokens`` state the step's speculative shape (``check_call``);
+        ``block_output`` is called with each layer's completed block output. ``gather_ids``,
+        the engine's own logits rows when it states them, must name exactly the rows
+        ``logit_rows`` selects. With ``return_hidden`` the result is ``(logits, x)``, ``x``
+        the last block's output ``[T, hidden]`` before the final norm.
         """
         self._check_usable()
-        ids, positions, spans = self.check_call(input_ids, position_ids, attn_metadata)
+        ids, positions, spans = self.check_call(
+            input_ids,
+            position_ids,
+            attn_metadata,
+            generation_rows=generation_rows,
+            extra_kv_tokens=extra_kv_tokens,
+        )
         num_tokens = ids.shape[0]
-        rows = self._select_rows(logit_rows, spans)
+        rows = self._select_rows(logit_rows, spans, attn_metadata.num_contexts)
+        if gather_ids is not None:
+            self._check_gather_ids(gather_ids, rows)
         x = self.embed(ids)
         if trace is not None:
             trace.append({"stage": "embed", "tokens": num_tokens, "requests": spans})
         for layer in range(NUM_LAYERS):
             capture = layer_capture(layer) if layer_capture is not None else None
-            x = self.block(layer, x, positions, attn_metadata, capture)
+            x = self.block(
+                layer,
+                x,
+                positions,
+                attn_metadata,
+                capture,
+                generation_rows=generation_rows,
+                extra_kv_tokens=extra_kv_tokens,
+            )
+            if block_output is not None:
+                block_output(layer, x)
             if trace is not None:
                 sliding = self.schedule.is_sliding(layer)
                 trace.append(
@@ -267,7 +316,32 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         if trace is not None:
             trace.append({"stage": "final_norm", "rows": rows})
             trace.append({"stage": "head", "rows": len(rows), "vocab": int(logits.shape[-1])})
-        return logits
+        return (logits, x) if return_hidden else logits
+
+    def _check_gather_ids(self, gather_ids: torch.Tensor, rows: list) -> None:
+        """Raise ValueError unless the engine's ``gather_ids`` are exactly ``rows``, in order.
+
+        One device comparison read back per call.
+        """
+        if (
+            not isinstance(gather_ids, torch.Tensor)
+            or gather_ids.is_floating_point()
+            or gather_ids.dim() != 1
+            or gather_ids.numel() != len(rows)
+            or gather_ids.device != self.device
+        ):
+            raise ValueError(
+                f"the engine gathers logits rows "
+                f"{None if not isinstance(gather_ids, torch.Tensor) else list(gather_ids.shape)} "
+                f"on {getattr(gather_ids, 'device', None)}; this step's verifier reads "
+                f"{len(rows)} rows on {self.device}"
+            )
+        expected = torch.tensor(rows, dtype=torch.int64).to(self.device, non_blocking=True)
+        if not torch.equal(gather_ids.to(torch.int64), expected):
+            raise ValueError(
+                f"the engine gathers logits rows {gather_ids.tolist()}; the step's requests "
+                f"need the rows {rows} (each context's last row, every generation row)"
+            )
 
 
 __all__ = [

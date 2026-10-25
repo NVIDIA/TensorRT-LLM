@@ -127,6 +127,20 @@ _BEAM_SLIDING = dict(
 )
 _BEAM_FULL = dict(_BEAM_SLIDING, window=None)
 
+#: The Beam full model's layers on one of four TP ranks (12q/2kv d128) as a DFlash2
+#: verification step runs them: P = 8 rows per generation sequence (the anchor and seven
+#: proposals), on the paged-context path, with a 768-token per-sequence pool (24 pages) so
+#: histories cross the 512-token window. `_BEAM_TP4_FULL` is a full-attention layer.
+_BEAM_TP4_SLIDING = dict(
+    _BEAM_SLIDING,
+    num_heads=12,
+    num_kv_heads=2,
+    num_blocks=96,
+    max_num_requests=4,
+    max_blocks_per_seq=24,
+)
+_BEAM_TP4_FULL = dict(_BEAM_TP4_SLIDING, window=None)
+
 #: A GQA 24/4/256 full-attention layer (Qwen3.8-27B) over an fp8-e4m3 pool at
 #: the production kv scale 1.0. Same chosen pool sizes as `_QWEN4_DENSE`.
 _FP8_24_4_256 = dict(
@@ -851,6 +865,48 @@ class ThopAttention(OpWrapper):
             why="beam full layer, paged context: 17 rows over a 64-token reused prefix",
             spec=dict(
                 _BEAM_FULL, cached=(64,), new=(17,), num_contexts=1, predicted_tokens_per_seq=1
+            ),
+        ),
+        Cell(
+            why="beam tp4 sliding verify P=8: blocks after histories 503, 504 and 505 end "
+            "at 511, 512 and 513, crossing the 512-token window",
+            spec=dict(
+                _BEAM_TP4_SLIDING,
+                cached=(503, 504, 505),
+                new=(8, 8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="beam tp4 full verify P=8: the same blocks on a full-attention layer",
+            spec=dict(
+                _BEAM_TP4_FULL,
+                cached=(503, 504, 505),
+                new=(8, 8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="beam tp4 sliding mixed step P=8: a 20-row context over a 31-token prefix "
+            "ahead of three blocks over histories 17, 600 and 129",
+            spec=dict(
+                _BEAM_TP4_SLIDING,
+                cached=(31, 17, 600, 129),
+                new=(20, 8, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="beam tp4 full mixed step P=8: the same step on a full-attention layer",
+            spec=dict(
+                _BEAM_TP4_FULL,
+                cached=(31, 17, 600, 129),
+                new=(20, 8, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
             ),
         ),
     )

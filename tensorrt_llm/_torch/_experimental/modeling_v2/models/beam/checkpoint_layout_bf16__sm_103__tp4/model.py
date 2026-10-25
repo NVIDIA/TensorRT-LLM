@@ -398,18 +398,28 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         positions: torch.Tensor,
         md: TrtllmAttentionMetadata,
         capture: Optional[dict] = None,
+        *,
+        generation_rows: int = 1,
+        extra_kv_tokens: int = 0,
     ) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> attention output after the one o_proj all-reduce.
 
-        ``md`` is one prepared step of one or more requests (``_attention.check_batch_metadata``)
-        whose new tokens are the T rows, contexts first; ``positions`` are their absolute
-        positions.
+        ``md`` is one prepared step of one or more requests (``_attention.check_batch_metadata``
+        with ``generation_rows`` rows per generation request and ``extra_kv_tokens`` reserved
+        KV slots) whose new tokens are the T rows, contexts first; ``positions`` are their
+        absolute positions.
         """
         self._check_usable(layer)
         _check_hidden(h, self.hidden, self.device, self.max_tokens)
         T = h.shape[0]
         _attention.check_batch_metadata(
-            md, T, layer_idx=layer, num_kv_heads=self.local_kv_heads, head_dim=self.head_dim
+            md,
+            T,
+            layer_idx=layer,
+            num_kv_heads=self.local_kv_heads,
+            head_dim=self.head_dim,
+            generation_rows=generation_rows,
+            extra_kv_tokens=extra_kv_tokens,
         )
         step = _attention.step_args(md, layer)
         heads, kv_heads, d = self.local_heads, self.local_kv_heads, self.head_dim
@@ -439,7 +449,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             head_size=d,
             attention_window_size=self.window if sliding else step["max_seq_len"],
             **step,
-            **_attention.CALL_CONSTANTS,
+            **_attention.call_constants(generation_rows),
         )
         gated = beam_output_gate(
             core.view(T, heads, d), g.view(T, heads, d), self._layer(layer, "self_attn.gate_bias")
@@ -592,17 +602,29 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         positions: torch.Tensor,
         md: TrtllmAttentionMetadata,
         capture: Optional[dict] = None,
+        *,
+        generation_rows: int = 1,
+        extra_kv_tokens: int = 0,
     ) -> torch.Tensor:
         """One decoder block of logical layer ``layer`` on ``x`` ``[T, hidden]``, one engine step.
 
         The input norm runs the source model's torch op order (``beam_rmsnorm_fp32``), so the
         q/k/v/gate projections read the source's normalized bytes for the same block input.
-        The other norms use the flashinfer kernel.
+        The other norms use the flashinfer kernel. ``generation_rows`` and ``extra_kv_tokens``
+        are the step's speculative shape (see ``attention``).
         """
         self._check_usable(layer)
         p = f"model.layers.{layer}."
         h = beam_rmsnorm_fp32(x, self.tensor(p + "input_layernorm.weight"), self.eps)
-        a = self.attention(layer, h, positions, md, capture)
+        a = self.attention(
+            layer,
+            h,
+            positions,
+            md,
+            capture,
+            generation_rows=generation_rows,
+            extra_kv_tokens=extra_kv_tokens,
+        )
         pa = flashinfer_rmsnorm(a, self.tensor(p + "post_attention_layernorm.weight"), self.eps)
         x1 = beam_depth_residual(pa, x, *depth_scales(layer, is_attention=True))
         pf = flashinfer_rmsnorm(x1, self.tensor(p + "pre_feedforward_layernorm.weight"), self.eps)

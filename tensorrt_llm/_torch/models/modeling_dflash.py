@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 from dataclasses import replace
-from typing import Dict, Optional
+from typing import Dict, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,7 @@ from tensorrt_llm.logger import logger
 
 from ...functional import RotaryScalingType
 from ..attention.rotary_embedding import RotaryEmbedding
+from ..modules.logits_processor import LogitsProcessor
 
 try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
@@ -167,6 +168,127 @@ def dflash2_walk_candidate_paths(
         realized[:, step] = scores
         predecessor = scores.argmax(-1).view(batch, 1, 1)
     return realized
+
+
+def dflash_final_logit_softcap(pretrained_config: PretrainedConfig) -> Optional[float]:
+    """The drafter checkpoint's ``dflash_config.final_logit_softcapping``, or None if absent."""
+    dflash_config = getattr(pretrained_config, "dflash_config", None) or {}
+    cap = dflash_config.get("final_logit_softcapping")
+    if cap is None:
+        return None
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not cap > 0:
+        raise ValueError(
+            f"dflash_config.final_logit_softcapping must be a positive number, got {cap!r}"
+        )
+    return float(cap)
+
+
+class DFlashSoftcapLogitsProcessor(LogitsProcessor):
+    """Draft logits of a drafter whose checkpoint declares ``final_logit_softcapping``.
+
+    The native processor's projection through the draft head and its FP32 widening, then
+    ``cap * tanh(logits / cap)`` exactly once. The DFlash worker calls the drafter's
+    ``logits_processor`` before its global candidate merge, so with a vocabulary-sharded head
+    each TP rank caps its own shard; the candidate selector's unary scores are those capped
+    values, and nothing caps again after selection.
+    """
+
+    def __init__(self, cap: float):
+        super().__init__()
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not cap > 0:
+            raise ValueError(f"the draft logit softcap must be a positive number, got {cap!r}")
+        self.cap = float(cap)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: nn.Module,
+        attn_metadata,
+        return_context_logits: bool = False,
+    ) -> torch.Tensor:
+        logits = super().forward(hidden_states, lm_head, attn_metadata, return_context_logits)
+        return self.cap * torch.tanh(logits / self.cap)
+
+
+class DFlashWindowGather(NamedTuple):
+    """Where one draft block's non-causal windowed attention reads its keys, per batch row.
+
+    ``positions`` ``[B, S]`` are the slot-local key positions the block's queries can reach,
+    ``S = window + block_size - 1`` (see :func:`dflash_window_gather`); ``valid`` marks those
+    that hold a key of the request (its committed context and the current block, nothing at
+    or past ``num_ctx + block_size``); ``mask`` ``[B, 1, block_size, S]`` is query ``j``'s
+    visibility: a valid key at most ``window - 1`` positions from ``num_ctx + j``. ``pages``
+    and ``offsets`` address every position in the paged pool; an invalid position is
+    redirected to the block's own first slot, a page the request owns and the append wrote.
+    """
+
+    positions: torch.Tensor
+    valid: torch.Tensor
+    mask: torch.Tensor
+    pages: torch.Tensor
+    offsets: torch.Tensor
+
+
+def dflash_window_gather(
+    block_tables: torch.Tensor,
+    num_ctx: torch.Tensor,
+    block_size: int,
+    window: int,
+    page_size: int,
+) -> DFlashWindowGather:
+    """Key addressing of a non-causal ``window``-token block attention over a paged pool.
+
+    Query ``j`` of a request's block sits at slot-local position ``num_ctx + j`` (the block's
+    K/V were appended at ``num_ctx .. num_ctx + block_size - 1``) and sees every key of the
+    request within ``window - 1`` positions on either side, so the block together spans
+    ``[num_ctx - (window - 1), num_ctx + block_size)``. A single most-recent-``window`` gather
+    would be wrong for every query but the last.
+
+    Args:
+        block_tables: ``[B, pages_per_row]`` page indices of each batch row's slot-local pages.
+        num_ctx: ``[B]`` context length per row before the block.
+    Fixed shapes and device arithmetic only: no host synchronization.
+    """
+    device = num_ctx.device
+    ctx = num_ctx.long()
+    span = window + block_size - 1
+    positions = (ctx - (window - 1)).unsqueeze(1) + torch.arange(span, device=device)
+    valid = (positions >= 0) & (positions < (ctx + block_size).unsqueeze(1))
+    queries = ctx.unsqueeze(1) + torch.arange(block_size, device=device)
+    distance = (queries.unsqueeze(2) - positions.unsqueeze(1)).abs()
+    mask = (valid.unsqueeze(1) & (distance <= window - 1)).unsqueeze(1)
+    safe = torch.where(valid, positions, ctx.unsqueeze(1))
+    pages = block_tables.long().gather(1, torch.div(safe, page_size, rounding_mode="floor"))
+    return DFlashWindowGather(positions, valid, mask, pages, safe % page_size)
+
+
+def dflash_windowed_block_attention(
+    q: torch.Tensor,
+    layer_cache: torch.Tensor,
+    gather: DFlashWindowGather,
+    scale: float,
+) -> torch.Tensor:
+    """Non-causal windowed attention of draft blocks over the HND paged pool, in torch SDPA.
+
+    ``q`` ``[B, block_size, Hq, D]`` (post-norm/RoPE), ``layer_cache`` one layer's pool
+    ``[pages, 2, Hkv, page_size, D]`` holding the context and the block's own K/V. Gathers the
+    ``S`` positions ``gather`` names, zeroes the invalid ones and lets ``gather.mask`` select
+    each query's keys; Hq / Hkv query heads share a KV head. Returns ``[B, block_size, Hq, D]``.
+    """
+    keep = gather.valid.unsqueeze(-1).unsqueeze(-1)
+    k = layer_cache[gather.pages, 0, :, gather.offsets].masked_fill(~keep, 0)
+    v = layer_cache[gather.pages, 1, :, gather.offsets].masked_fill(~keep, 0)
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=gather.mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scale,
+        enable_gqa=True,
+    )
+    return out.transpose(1, 2)
 
 
 class DFlash2BlockConv(nn.Module):
@@ -1306,12 +1428,13 @@ class DFlashForCausalLM(nn.Module):
         return causal, window_size
 
     def validate_block_attention_windows(self) -> None:
-        """Refuse windows the TRTLLM block-decode kernel cannot apply.
+        """Refuse windows the TRTLLM block decode cannot apply.
 
         TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
-        rejects ``causal=False`` with any finite ``window_left`` outright. A
-        non-causal windowed layer must therefore run on VANILLA or FA4, which
-        take a two-sided window.
+        rejects ``causal=False`` with any finite ``window_left`` outright. On the
+        TRTLLM backend a non-causal layer with a two-sided window of equal sides
+        runs :func:`dflash_windowed_block_attention` over the same paged pool
+        instead; any other non-causal windowed layer must run on VANILLA or FA4.
         """
         if self.dflash_attention_backend != "TRTLLM":
             return
@@ -1319,14 +1442,15 @@ class DFlashForCausalLM(nn.Module):
         if num_layers is None:
             num_layers = len(self.model.layers)
         for layer_idx in range(num_layers):
-            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
-            if causal or window_left < 0:
+            causal, (window_left, window_right) = self._resolve_block_attention(layer_idx)
+            if causal or window_left < 0 or window_left == window_right:
                 continue
             raise ValueError(
                 f"DFlash draft layer {layer_idx} attends non-causally within a "
-                f"{window_left + 1}-token sliding window. The TRTLLM DFlash "
-                "attention backend does not support non-causal sliding-window "
-                "attention. Use attention_backend=VANILLA or FA4."
+                f"window of {window_left} keys before and {window_right} after "
+                "each query. The TRTLLM DFlash attention backend supports a "
+                "non-causal window only with equal sides. Use "
+                "attention_backend=VANILLA or FA4."
             )
 
     def _prepare_dflash_trtllm_gen_buffers(
@@ -1580,6 +1704,8 @@ class DFlashForCausalLM(nn.Module):
 
         residual = None
         has_block_conv = self.has_block_conv
+        # Non-causal windowed layers share one key addressing per window size.
+        window_gathers: dict[int, DFlashWindowGather] = {}
 
         for layer_idx, layer in enumerate(self.model.layers):
             attn_mod = layer.self_attn
@@ -1720,6 +1846,19 @@ class DFlashForCausalLM(nn.Module):
                         uses_shared_paged_kv_idx=True,
                         bmm1_scale_log2=None,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                    )
+                elif window_left >= 0:
+                    # TRTLLM-Gen has no non-causal sliding window (see
+                    # validate_block_attention_windows): torch SDPA over the
+                    # same pages the append just wrote.
+                    gather = window_gathers.get(window_left)
+                    if gather is None:
+                        gather = dflash_window_gather(
+                            block_tables, cache_seqlens_i32, block_size, window_left + 1, page_size
+                        )
+                        window_gathers[window_left] = gather
+                    out = dflash_windowed_block_attention(
+                        Q_bshd, layer_cache, gather, head_dim**-0.5
                     )
                 else:
                     cum_seq_lens_q = torch.arange(
