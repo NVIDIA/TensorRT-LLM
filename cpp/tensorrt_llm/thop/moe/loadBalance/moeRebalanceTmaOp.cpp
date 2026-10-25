@@ -43,6 +43,11 @@ void checkTmaResult(int error, char const* operation)
     TORCH_CHECK(error == 0, operation, " failed: ", megamoe_tma_copy_error_string(error), " (", error, ")");
 }
 
+void checkCudaResult(cudaError_t error, char const* operation)
+{
+    TORCH_CHECK(error == cudaSuccess, operation, " failed: ", cudaGetErrorString(error));
+}
+
 int checkedInt(int64_t value, char const* name)
 {
     TORCH_CHECK(value >= std::numeric_limits<int>::min() && value <= std::numeric_limits<int>::max(), name,
@@ -115,6 +120,7 @@ public:
             // available when the caller needs a synchronous error result.
             static_cast<void>(megamoe_tma_copy_destroy(&mState));
         }
+        releaseFusedEvents();
     }
 
     void configureGpuPlan(int64_t world, int64_t rank, int64_t helperCount, int64_t planes, int64_t globalExperts,
@@ -229,12 +235,17 @@ public:
         mBound = true;
     }
 
-    // Launches the bound HALO-Q scheduler and this copy as one kernel; see megamoe_tma_copy_submit_fused.
-    void submitFused(int64_t flagMc, kernels::MoeRebalanceHaloQParams const& scheduler, torch::Tensor const& routeEpoch,
-        int64_t routeTarget)
+    // Binds every argument that the fused launches share: the HALO-Q scheduler workspace and outputs, the route
+    // epoch, and the static copy stream. A launch then passes only its routes.
+    void bindFused(int64_t flagMc, torch::Tensor routeEpoch, torch::Tensor outSlots, torch::Tensor outIds,
+        torch::Tensor outLevels, torch::Tensor outOwners, torch::Tensor peerBases, torch::Tensor status,
+        torch::Tensor partial, torch::Tensor routeAux, torch::Tensor gridSync, torch::Tensor planWorkspace,
+        torch::Tensor routePrefix, int64_t ep, int64_t experts, int64_t helpers, int64_t localRank, int64_t topk,
+        int64_t routeCapacity, int64_t ctas, int64_t threads, int64_t copyStream)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireBound();
+        TORCH_CHECK(!mFusedBound, "moe rebalance fused launch is already bound");
         TORCH_CHECK(
             routeEpoch.is_cuda() && routeEpoch.get_device() == mDevice, "route_epoch must be on CUDA device ", mDevice);
         TORCH_CHECK(
@@ -242,15 +253,82 @@ public:
             "route_epoch must be a contiguous one-element torch.int64 tensor");
         uint64_t const flag = checkedUnsigned(flagMc, "flag_mc");
         TORCH_CHECK(flag != 0, "flag_mc must be nonzero");
-        kernels::checkMoeRebalanceHaloQParams(scheduler);
+        TORCH_CHECK(topk > 0 && routeCapacity % topk == 0, "route_capacity must be a positive multiple of topk");
+        TORCH_CHECK(copyStream != 0, "copy_stream must be a non-default CUDA stream");
+        TORCH_CHECK(
+            outSlots.is_cuda() && outSlots.get_device() == mDevice, "out_slots must be on CUDA device ", mDevice);
+        // Validate the shared arguments once, with no routes; a launch only adds its routes.
+        auto params = makeMoeRebalanceHaloQParams(torch::empty({0, topk}, outSlots.options()), outSlots, outIds,
+            outLevels, outOwners, peerBases, status, partial, routeAux, gridSync, planWorkspace, routePrefix, ep,
+            experts, helpers, localRank, routeCapacity, ctas, threads, 0, 0);
+        kernels::checkMoeRebalanceHaloQParams(params);
+
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
-        auto const stream = at::cuda::getCurrentCUDAStream(mDevice).stream();
-        checkTmaResult(megamoe_tma_copy_submit_fused(mState, scheduler,
-                           reinterpret_cast<uint64_t*>(routeEpoch.data_ptr<int64_t>()),
-                           static_cast<uint64_t>(routeTarget), flag, mGeneration, reinterpret_cast<void*>(stream)),
+        cudaEvent_t inputReady{nullptr};
+        checkCudaResult(
+            cudaEventCreateWithFlags(&inputReady, cudaEventDisableTiming), "cudaEventCreate(rebalance input ready)");
+        cudaEvent_t consumerDone{nullptr};
+        cudaError_t const error = cudaEventCreateWithFlags(&consumerDone, cudaEventDisableTiming);
+        if (error != cudaSuccess)
+        {
+            static_cast<void>(cudaEventDestroy(inputReady));
+            checkCudaResult(error, "cudaEventCreate(rebalance consumer done)");
+        }
+
+        mRouteEpochPtr = reinterpret_cast<uint64_t*>(routeEpoch.data_ptr<int64_t>());
+        // The fused launch reads and writes these by address; retaining them prevents allocator reuse.
+        mFusedTensors = {std::move(routeEpoch), std::move(outSlots), std::move(outIds), std::move(outLevels),
+            std::move(outOwners), std::move(peerBases), std::move(status), std::move(partial), std::move(routeAux),
+            std::move(gridSync), std::move(planWorkspace), std::move(routePrefix)};
+        mFusedParams = params;
+        mFlagMc = flag;
+        mTopk = topk;
+        mCopyStream = reinterpret_cast<cudaStream_t>(copyStream);
+        mInputReady = inputReady;
+        mConsumerDone = consumerDone;
+        mFusedBound = true;
+    }
+
+    // Launches the bound HALO-Q scheduler and this copy as one kernel on the copy stream, ordered after the work
+    // already queued on the current stream; see megamoe_tma_copy_submit_fused.
+    void submitFused(torch::Tensor const& routes, int64_t routeTarget, int64_t spinCycles)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        requireFusedBound();
+        TORCH_CHECK_VALUE(routes.is_cuda() && routes.get_device() == mDevice
+                && routes.scalar_type() == at::ScalarType::Int && routes.is_contiguous() && routes.dim() == 2
+                && routes.size(1) == mTopk && routes.numel() <= mFusedParams.routeCapacity,
+            "routes must be a contiguous CUDA int32 [tokens, ", mTopk, "] tensor on device ", mDevice, " with at most ",
+            mFusedParams.routeCapacity / mTopk, " tokens");
+        TORCH_CHECK_VALUE(spinCycles > 0, "spin_cycles must be positive");
+        auto scheduler = mFusedParams;
+        scheduler.routes = routes.data_ptr<int>();
+        scheduler.validRouteCount = static_cast<int>(routes.numel());
+        scheduler.spinCycles = static_cast<uint64_t>(spinCycles);
+
+        c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
+        cudaStream_t const execution = currentExecutionStream();
+        checkCudaResult(cudaEventRecord(mInputReady, execution), "cudaEventRecord(rebalance input ready)");
+        checkCudaResult(cudaStreamWaitEvent(mCopyStream, mInputReady, 0), "cudaStreamWaitEvent(rebalance input ready)");
+        checkTmaResult(
+            megamoe_tma_copy_submit_fused(mState, scheduler, mRouteEpochPtr, static_cast<uint64_t>(routeTarget),
+                mFlagMc, mGeneration, reinterpret_cast<void*>(mCopyStream)),
             "moe rebalance fused HALO-Q + TMA submit");
         ++mGeneration;
         TORCH_CHECK(mGeneration != 0, "moe rebalance TMA generation overflow");
+    }
+
+    // Orders the copy stream after the work already queued on the current stream, such as the consumer of the
+    // live bank that the next fused launch overwrites.
+    void releaseAfterCurrentStream()
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        requireFusedBound();
+        c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
+        cudaStream_t const execution = currentExecutionStream();
+        checkCudaResult(cudaEventRecord(mConsumerDone, execution), "cudaEventRecord(rebalance consumer done)");
+        checkCudaResult(
+            cudaStreamWaitEvent(mCopyStream, mConsumerDone, 0), "cudaStreamWaitEvent(rebalance consumer done)");
     }
 
     int64_t currentGeneration() const
@@ -312,6 +390,11 @@ public:
             mGridSync = torch::Tensor();
             mConfigured = false;
             mBound = false;
+            releaseFusedEvents();
+            mFusedTensors.clear();
+            mRouteEpochPtr = nullptr;
+            mCopyStream = nullptr;
+            mFusedBound = false;
         }
         checkTmaResult(error, "moe rebalance TMA destroy");
     }
@@ -326,6 +409,35 @@ private:
     {
         requireLive();
         TORCH_CHECK(mBound, "moe rebalance TMA state must be bound before submit");
+    }
+
+    void requireFusedBound() const
+    {
+        requireBound();
+        TORCH_CHECK(mFusedBound, "moe rebalance fused launch must be bound before submit");
+    }
+
+    // The stream whose queued work a launch or release follows; it must differ from the copy stream.
+    cudaStream_t currentExecutionStream() const
+    {
+        cudaStream_t const stream = at::cuda::getCurrentCUDAStream(mDevice).stream();
+        TORCH_CHECK(stream != mCopyStream, "the current stream must differ from the bound copy stream");
+        return stream;
+    }
+
+    void releaseFusedEvents() noexcept
+    {
+        // Pending records complete normally after an event is destroyed.
+        if (mInputReady != nullptr)
+        {
+            static_cast<void>(cudaEventDestroy(mInputReady));
+            mInputReady = nullptr;
+        }
+        if (mConsumerDone != nullptr)
+        {
+            static_cast<void>(cudaEventDestroy(mConsumerDone));
+            mConsumerDone = nullptr;
+        }
     }
 
     static int64_t checkedDiagnostic(uint64_t value)
@@ -348,6 +460,16 @@ private:
     torch::Tensor mWorkspace;
     torch::Tensor mStatus;
     torch::Tensor mGridSync;
+    // Arguments bound by bindFused() and shared by every fused launch.
+    kernels::MoeRebalanceHaloQParams mFusedParams{};
+    std::vector<torch::Tensor> mFusedTensors;
+    uint64_t* mRouteEpochPtr{nullptr};
+    uint64_t mFlagMc{0};
+    int64_t mTopk{0};
+    cudaStream_t mCopyStream{nullptr};
+    cudaEvent_t mInputReady{nullptr};
+    cudaEvent_t mConsumerDone{nullptr};
+    bool mFusedBound{false};
 };
 
 using MoeRebalanceTmaStatePtr = c10::intrusive_ptr<MoeRebalanceTmaState>;
@@ -379,18 +501,47 @@ void moeRebalanceTmaBindGpuDirect(MoeRebalanceTmaStatePtr const& state, torch::T
         std::move(gridSync), capacity, helperResidency);
 }
 
-void moeRebalanceTmaSubmitFused(MoeRebalanceTmaStatePtr const& state, int64_t flagMc, torch::Tensor& routeEpoch,
-    int64_t routeTarget, torch::Tensor const& routes, torch::Tensor& outSlots, torch::Tensor& outIds,
-    torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases, torch::Tensor& status,
-    torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync, torch::Tensor& planWorkspace,
-    torch::Tensor& routePrefix, int64_t ep, int64_t experts, int64_t helpers, int64_t localRank, int64_t routeCapacity,
-    int64_t ctas, int64_t threads, int64_t spinCycles, int64_t validRouteCount)
+void moeRebalanceTmaBindFused(MoeRebalanceTmaStatePtr const& state, int64_t flagMc, torch::Tensor routeEpoch,
+    torch::Tensor outSlots, torch::Tensor outIds, torch::Tensor outLevels, torch::Tensor outOwners,
+    torch::Tensor peerBases, torch::Tensor status, torch::Tensor partial, torch::Tensor routeAux,
+    torch::Tensor gridSync, torch::Tensor planWorkspace, torch::Tensor routePrefix, int64_t ep, int64_t experts,
+    int64_t helpers, int64_t localRank, int64_t topk, int64_t routeCapacity, int64_t ctas, int64_t threads,
+    int64_t copyStream)
 {
     TORCH_CHECK(state, "moe rebalance TMA state is null");
-    auto const scheduler = makeMoeRebalanceHaloQParams(routes, outSlots, outIds, outLevels, outOwners, peerBases,
-        status, partial, routeAux, gridSync, planWorkspace, routePrefix, ep, experts, helpers, localRank, routeCapacity,
-        ctas, threads, spinCycles, validRouteCount);
-    state->submitFused(flagMc, scheduler, routeEpoch, routeTarget);
+    state->bindFused(flagMc, std::move(routeEpoch), std::move(outSlots), std::move(outIds), std::move(outLevels),
+        std::move(outOwners), std::move(peerBases), std::move(status), std::move(partial), std::move(routeAux),
+        std::move(gridSync), std::move(planWorkspace), std::move(routePrefix), ep, experts, helpers, localRank, topk,
+        routeCapacity, ctas, threads, copyStream);
+}
+
+// The per-layer launch and release ops take this handle instead of the custom class, whose conversion costs several
+// microseconds of host time per operator call. The caller keeps the state alive while it uses the handle.
+int64_t moeRebalanceTmaHandle(MoeRebalanceTmaStatePtr const& state)
+{
+    TORCH_CHECK(state, "moe rebalance TMA state is null");
+    return reinterpret_cast<int64_t>(state.get());
+}
+
+namespace
+{
+
+MoeRebalanceTmaState& stateFromHandle(int64_t handle)
+{
+    TORCH_CHECK(handle != 0, "moe rebalance TMA handle is null");
+    return *reinterpret_cast<MoeRebalanceTmaState*>(handle);
+}
+
+} // namespace
+
+void moeRebalanceTmaSubmitFused(int64_t handle, torch::Tensor const& routes, int64_t routeTarget, int64_t spinCycles)
+{
+    stateFromHandle(handle).submitFused(routes, routeTarget, spinCycles);
+}
+
+void moeRebalanceTmaRelease(int64_t handle)
+{
+    stateFromHandle(handle).releaseAfterCurrentStream();
 }
 
 int64_t moeRebalanceTmaCurrentGeneration(MoeRebalanceTmaStatePtr const& state)
@@ -439,13 +590,17 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, Tensor ids, Tensor levels, Tensor owners, "
         "Tensor workspace, Tensor status, Tensor grid_sync, int capacity, bool helper_residency) -> ()");
     m.def(
-        "moe_rebalance_tma_submit_fused("
-        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int flag_mc, Tensor(a!) route_epoch, "
-        "int route_target, Tensor routes, Tensor(b!) out_slots, Tensor(c!) out_ids, Tensor(d!) out_levels, "
-        "Tensor(e!) out_owners, Tensor peer_bases, Tensor(f!) status, Tensor(g!) partial, Tensor(h!) route_aux, "
-        "Tensor(i!) grid_sync, Tensor(j!) plan_workspace, Tensor(k!) route_prefix, int ep, int experts, "
-        "int helpers, int local_rank, int route_capacity, int ctas, int threads, int spin_cycles, "
-        "int valid_route_count) -> ()");
+        "moe_rebalance_tma_bind_fused("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int flag_mc, Tensor route_epoch, "
+        "Tensor out_slots, Tensor out_ids, Tensor out_levels, Tensor out_owners, Tensor peer_bases, Tensor status, "
+        "Tensor partial, Tensor route_aux, Tensor grid_sync, Tensor plan_workspace, Tensor route_prefix, int ep, "
+        "int experts, int helpers, int local_rank, int topk, int route_capacity, int ctas, int threads, "
+        "int copy_stream) -> ()");
+    m.def(
+        "moe_rebalance_tma_handle("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int");
+    m.def("moe_rebalance_tma_submit_fused(int handle, Tensor routes, int route_target, int spin_cycles) -> ()");
+    m.def("moe_rebalance_tma_release(int handle) -> ()");
     m.def(
         "moe_rebalance_tma_current_gen("
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int");
@@ -465,7 +620,10 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
     m.impl("moe_rebalance_tma_create", &tensorrt_llm::torch_ext::moeRebalanceTmaCreate);
     m.impl("moe_rebalance_tma_configure_gpu_plan", &tensorrt_llm::torch_ext::moeRebalanceTmaConfigureGpuPlan);
     m.impl("moe_rebalance_tma_bind_gpu_direct", &tensorrt_llm::torch_ext::moeRebalanceTmaBindGpuDirect);
+    m.impl("moe_rebalance_tma_bind_fused", &tensorrt_llm::torch_ext::moeRebalanceTmaBindFused);
+    m.impl("moe_rebalance_tma_handle", &tensorrt_llm::torch_ext::moeRebalanceTmaHandle);
     m.impl("moe_rebalance_tma_submit_fused", &tensorrt_llm::torch_ext::moeRebalanceTmaSubmitFused);
+    m.impl("moe_rebalance_tma_release", &tensorrt_llm::torch_ext::moeRebalanceTmaRelease);
     m.impl("moe_rebalance_tma_current_gen", &tensorrt_llm::torch_ext::moeRebalanceTmaCurrentGeneration);
     m.impl("moe_rebalance_tma_result", &tensorrt_llm::torch_ext::moeRebalanceTmaResult);
     m.impl("moe_rebalance_tma_config", &tensorrt_llm::torch_ext::moeRebalanceTmaConfig);

@@ -2660,7 +2660,6 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
 @pytest.mark.cpu_only
 def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
     trace = []
-    completion_event = object()
     outputs = SimpleNamespace(physical_slot_ids=[3, 4])
     part = (outputs, 2)
     copy_stream = object()
@@ -2674,8 +2673,6 @@ def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
     group._route_wait_generation = 0
     group._pending_release = None
     group.plan_calls = 0
-    group._consumer_done = completion_event
-    group._consumer_done_handle = 17
     group._execution_stream_handle = 23
     group.copy_stream = copy_stream
     group.scheduler_stream = copy_stream
@@ -2684,20 +2681,18 @@ def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
         trace.append("wait_routes")
         group._route_wait_generation = group._generation
 
-    def record_event(event_handle, stream_handle):
-        assert (event_handle, stream_handle) == (17, 23)
-        trace.append("record_consumer_done")
+    def release_generation_after(generation, event):
+        # Without an event, the release follows the MAIN work queued so far.
+        assert (generation, event) == (1, None)
+        trace.append("release_generation")
 
     broadcaster = SimpleNamespace(
-        release_generation_after=MagicMock(
-            side_effect=lambda generation, event: trace.append("release_generation")
-        ),
+        release_generation_after=MagicMock(side_effect=release_generation_after),
         mark_collective_reuse_safe=MagicMock(
             side_effect=lambda authority, generation: trace.append("prove_reuse")
         ),
     )
     group.wait_for_routes = wait_for_routes
-    group._record_event = record_event
     group.broadcaster = broadcaster
 
     group.discard_plan(part)
@@ -2705,8 +2700,8 @@ def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
     assert group._plan_part is None
     assert group.plan_calls == 1
     assert group._finished_generation == 1
-    assert group._pending_release == (1, completion_event)
-    assert trace == ["wait_routes", "record_consumer_done", "release_generation"]
+    assert group._pending_release == (1, None)
+    assert trace == ["wait_routes", "release_generation"]
 
     # The next schedule advances this counter before proving that generation 1
     # can be reused. Exercise the real lease check to show cleanup left a valid

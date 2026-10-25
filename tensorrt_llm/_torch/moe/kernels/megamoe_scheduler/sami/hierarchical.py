@@ -14,7 +14,6 @@ from cuda.bindings import driver as cuda
 
 from .arena import BoundLiveWeightArena, LiveWeightArena, _TensorIdentity
 from ._util import check_cuda
-from ..cuda_scheduler.runtime import enter_cuda_stream, exit_cuda_stream
 from ..geometry import hierarchy_group_sizes
 from .geometry import BundleLayout
 
@@ -344,10 +343,14 @@ class HierarchicalSamiWeightBroadcast:
             ))
             if int(torch.ops.trtllm.moe_rebalance_tma_current_gen(ctx)) != 1:
                 raise RuntimeError("hierarchical SAMI context is not fresh")
+            # The per-layer launch and release ops take this handle of ctx;
+            # passing the custom-class object costs microseconds per call.
+            handle = int(torch.ops.trtllm.moe_rebalance_tma_handle(ctx))
         except BaseException:
             torch.ops.trtllm.moe_rebalance_tma_destroy(ctx)
             raise
         self.ctx = ctx
+        self._handle = handle
 
         self._lock = threading.Lock()
         self._scheduler: object | None = None
@@ -406,8 +409,15 @@ class HierarchicalSamiWeightBroadcast:
             if stream_context != current_context:
                 raise ValueError("scheduler stream is from a different CUDA context")
 
-    def bind_scheduler(self, scheduler: object, stream: object) -> None:
-        """Bind the four-field CUDA scheduler and one static stream for life."""
+    def bind_scheduler(
+        self, scheduler: object, stream: object, route_epoch: torch.Tensor
+    ) -> None:
+        """Bind the four-field CUDA scheduler and one static stream for life.
+
+        The native context also binds every argument that the fused launches
+        share, including ``route_epoch``, the caller-owned int64 that each
+        launch raises once its routes are written.
+        """
 
         with self._lock:
             if self._handoff_aborted:
@@ -484,7 +494,7 @@ class HierarchicalSamiWeightBroadcast:
                 if stream_device != scheduler_device:
                     raise ValueError("scheduler stream and output devices differ")
             bind = getattr(scheduler, "bind_gpu_direct", None)
-            fused_args = getattr(scheduler, "fused_submit_args", None)
+            fused_args = getattr(scheduler, "fused_launch_args", None)
             if not callable(bind) or not callable(fused_args):
                 raise TypeError("scheduler lacks the fused copy launch lifecycle")
             workspace = getattr(scheduler, "plan_workspace", None)
@@ -515,12 +525,16 @@ class HierarchicalSamiWeightBroadcast:
                     capacity,
                     self.helper_residency,
                 )
+                torch.ops.trtllm.moe_rebalance_tma_bind_fused(
+                    self.ctx, self.flags_mc, route_epoch, *fused_args(), handle
+                )
             except BaseException:
                 self._handoff_aborted = True
                 raise
             self._scheduler = scheduler
             self._outputs = outputs
             self._stream = handle
+            # The native context launches on this stream by handle; keep it alive.
             self._stream_owner = stream
 
     def _validate_reuse_authority(self, authority: object) -> None:
@@ -568,20 +582,24 @@ class HierarchicalSamiWeightBroadcast:
             self._reuse_authority = authority
 
     def release_generation_after(
-        self, generation: int, completion_event: object
+        self, generation: int, completion_event: object | None = None
     ) -> None:
-        """Order the copy stream after this rank's live-bank consumer event.
+        """Order the copy stream after this rank's live-bank consumer.
 
-        This establishes only local stream ordering.  The bound reuse authority
-        must separately attest its bounded all-rank barrier before another
-        generation may overwrite the single live bank.
+        The consumer is ``completion_event``, or without it the work already
+        queued on the current stream. This establishes only local stream
+        ordering.  The bound reuse authority must separately attest its
+        bounded all-rank barrier before another generation may overwrite the
+        single live bank.
         """
 
         if type(generation) is not int or generation <= 0:
             raise ValueError("generation must be a positive exact int")
-        event_handle = _event_handle(completion_event)
-        if event_handle <= 0:
-            raise ValueError("completion_event must expose a positive CUDA event")
+        event_handle = 0
+        if completion_event is not None:
+            event_handle = _event_handle(completion_event)
+            if event_handle <= 0:
+                raise ValueError("completion_event must expose a positive CUDA event")
         with self._lock:
             if self._handoff_aborted or self._scheduler is None:
                 raise RuntimeError("hierarchical scheduler handoff is not operational")
@@ -589,10 +607,13 @@ class HierarchicalSamiWeightBroadcast:
                 raise ValueError("generation is not the active live bank")
             if self._local_release_generation >= generation:
                 raise RuntimeError("generation already has a local release event")
-            check_cuda(
-                self.cuda.cuStreamWaitEvent(self._stream, event_handle, 0),
-                "cuStreamWaitEvent(live-bank consumer)",
-            )
+            if completion_event is None:
+                torch.ops.trtllm.moe_rebalance_tma_release(self._handle)
+            else:
+                check_cuda(
+                    self.cuda.cuStreamWaitEvent(self._stream, event_handle, 0),
+                    "cuStreamWaitEvent(live-bank consumer)",
+                )
             self._local_release_generation = generation
 
     def mark_collective_reuse_safe(
@@ -633,17 +654,18 @@ class HierarchicalSamiWeightBroadcast:
         self,
         outputs: object,
         routes: torch.Tensor,
-        route_epoch: torch.Tensor,
         route_target: int,
         *,
         spin_cycles: int,
     ) -> HierarchicalCopyTicket:
         """Enqueue the bound scheduler and this GPU-direct copy as one kernel.
 
-        Each scheduler CTA adds one to ``route_epoch`` once its routes are
-        written, which makes it reach ``route_target``; the copy and its READY
-        publication follow in the same CTAs. ``spin_cycles`` bounds the
-        launch's cross-rank waits and its wait for the route epoch.
+        The kernel runs on the bound stream after the work already queued on
+        the current stream, which must produce ``routes``. Each scheduler CTA
+        adds one to the bound route epoch once its routes are written, which
+        makes it reach ``route_target``; the copy and its READY publication
+        follow in the same CTAs. ``spin_cycles`` bounds the launch's
+        cross-rank waits and its wait for the route epoch.
         """
 
         with self._lock:
@@ -655,16 +677,9 @@ class HierarchicalSamiWeightBroadcast:
                 raise RuntimeError("outputs are not from the bound CUDA scheduler")
             self._require_live_bank_reusable()
             try:
-                scheduler_args = self._scheduler.fused_submit_args(
-                    routes, self._stream, spin_cycles=spin_cycles
+                torch.ops.trtllm.moe_rebalance_tma_submit_fused(
+                    self._handle, routes, route_target, spin_cycles
                 )
-                state = enter_cuda_stream(self._stream_owner)
-                try:
-                    torch.ops.trtllm.moe_rebalance_tma_submit_fused(
-                        self.ctx, self.flags_mc, route_epoch, route_target, *scheduler_args
-                    )
-                finally:
-                    exit_cuda_stream(state)
                 self._active_generation = self._generation
             except BaseException:
                 self._handoff_aborted = True
@@ -682,6 +697,7 @@ class HierarchicalSamiWeightBroadcast:
         with self._lock, torch.cuda.device(self.device):
             if self.ctx is None:
                 return
+            self._handle = 0
             torch.ops.trtllm.moe_rebalance_tma_destroy(self.ctx)
             self.ctx = None
             self._scheduler = None
