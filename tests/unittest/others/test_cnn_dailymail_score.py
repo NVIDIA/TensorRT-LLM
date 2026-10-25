@@ -14,13 +14,32 @@
 # limitations under the License.
 from types import SimpleNamespace
 
+import pytest
+
 from tensorrt_llm.evaluate.cnn_dailymail import CnnDailymail
 
 
-def test_compute_score_with_no_beams_returns_zero() -> None:
-    # When outputs[0].outputs is empty the beam loop never runs; rouge1 was
-    # then returned while unbound, raising UnboundLocalError. It should now
-    # return the 0.0 default.
-    evaluator = CnnDailymail.__new__(CnnDailymail)  # skip heavy __init__
-    empty_request = SimpleNamespace(outputs=[])
-    assert evaluator.compute_score([empty_request], references=[]) == 0.0
+def _evaluator(rouge1: float = 0.0) -> CnnDailymail:
+    # Skip __init__ (it downloads the dataset and the rouge metric) and stub
+    # the only dependency compute_score touches.
+    evaluator = CnnDailymail.__new__(CnnDailymail)
+    evaluator.rouge = SimpleNamespace(
+        compute=lambda predictions, references: {"rouge1": rouge1})
+    return evaluator
+
+
+@pytest.mark.parametrize("outputs", [
+    [],
+    [SimpleNamespace(outputs=[])],
+])
+def test_compute_score_degenerate_input_returns_zero(outputs) -> None:
+    # Previously: IndexError on an empty request list, UnboundLocalError on a
+    # request with no beams. Both now return the 0.0 default.
+    assert _evaluator().compute_score(outputs, references=[]) == 0.0
+
+
+def test_compute_score_returns_rouge1_percentage() -> None:
+    outputs = [SimpleNamespace(outputs=[SimpleNamespace(text="a summary")])]
+    score = _evaluator(rouge1=0.4321).compute_score(outputs,
+                                                    references=["a summary"])
+    assert score == pytest.approx(43.21)
