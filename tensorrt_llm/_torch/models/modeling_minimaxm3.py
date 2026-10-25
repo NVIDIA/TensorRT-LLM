@@ -1647,7 +1647,11 @@ class MiniMaxM3Attention(Attention):
         if any(weight.dtype != torch.bfloat16 or not weight.is_cuda for weight in norm_weights):
             return None
 
-        if scale_buffers is None and kv_cache_manager.is_nvfp4_layer(self.layer_idx):
+        if (
+            scale_buffers is None
+            and kv_cache_manager is not None
+            and getattr(kv_cache_manager, "is_nvfp4_layer", lambda _: False)(self.layer_idx)
+        ):
             scale_buffers = kv_cache_manager.get_block_scale_buffers(
                 self.layer_idx, kv_layout="HND"
             )

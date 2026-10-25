@@ -851,7 +851,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         cache = self.__dict__.get("_pool_view_cache")
         if cache is None:
             cache = self.__dict__["_pool_view_cache"] = {}
-        key = (kind, int(layer_idx), kv_layout)
+        # None means the main layout; normalise so both spellings share one view.
+        key = (kind, int(layer_idx), kv_layout or self._main_kv_layout_name())
         view = cache.get(key)
         if view is None:
             # A view created under inference mode would be an inference tensor
