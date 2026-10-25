@@ -66,6 +66,9 @@ _R1_DEFAULT_TARGET = (
 _GLM52_TARGET = (
     "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.modeling.ModelingV2Glm52Nvfp4Sm103Tep4"
 )
+_GLM53_TARGET = (
+    "models.glm5_next.glm_5_3_flash_nvfp4__sm_10x__tp4.modeling.ModelingV2Glm53FlashNvfp4Sm10xTp4"
+)
 
 
 def _qualified(target) -> str:
@@ -129,6 +132,25 @@ def _glm52_config(**overrides):
     )
     fields.update(overrides)
     return PretrainedConfig(**fields)
+
+
+def _glm53_config(quant_algo="NVFP4", **text_overrides):
+    """The shape GLM-5.3-Flash-NVFP4's own config.json declares: a composite glm5_next config
+    whose text half carries the shape, and the ModelOpt export's weight quantization."""
+    text = dict(
+        model_type="glm5_next_text",
+        num_hidden_layers=45,
+        hidden_size=4096,
+        n_routed_experts=288,
+        q_lora_rank=1536,
+    )
+    text.update(text_overrides)
+    return PretrainedConfig(
+        architectures=["Glm5NextForConditionalGeneration"],
+        model_type="glm5_next",
+        text_config=PretrainedConfig(**text),
+        quantization_config={"quant_algo": quant_algo},
+    )
 
 
 def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
@@ -1085,3 +1107,93 @@ def test_glm52_without_an_fp8_kv_cache_does_not_match():
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match="KV cache bf16"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+# --- GLM-5.3-Flash on sm10x -----------------------------------------------------
+
+_GLM53_TP4 = dict(world_size=4, tp_size=4, moe_ep_size=1, moe_tp_size=4)
+_GLM53_TP4_EP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1)
+# The engine the target is served with: its step program takes up to 256 sequences per step.
+_GLM53_ENGINE = dict(max_batch_size=32)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "spec_config", [None, MTPDecodingConfig(max_draft_len=3)], ids=["no-spec", "mtp3"]
+)
+@pytest.mark.parametrize("layout", [_GLM53_TP4, _GLM53_TP4_EP4], ids=["tp4", "tp4-ep4"])
+def test_glm53_tp4_matches(mode, spec_config, layout):
+    config = _model_config(_glm53_config(), spec_config=spec_config, **layout)
+    target = modeling_v2_resolve(config, _llm_args(mode, **_GLM53_ENGINE))
+    assert _qualified(target) == _GLM53_TARGET
+
+
+@pytest.mark.parametrize(
+    "pretrained_config, spec_config, mapping_kwargs, engine, missed",
+    [
+        # the FP8 release of the same shape loads different tensors into different kernels
+        (_glm53_config("FP8_BLOCK_SCALES"), None, _GLM53_TP4, {}, "quantization FP8_BLOCK_SCALES"),
+        # attention DP splits the attention weights differently: another layout, not a knob
+        (
+            _glm53_config(),
+            None,
+            dict(_GLM53_TP4_EP4, enable_attention_dp=True),
+            {},
+            "attention_dp=True",
+        ),
+        # a measured layout splits the experts by expert or by intermediate, not both
+        (
+            _glm53_config(),
+            None,
+            dict(world_size=4, tp_size=4, moe_ep_size=2, moe_tp_size=2),
+            {},
+            "moe_tp=2 moe_ep=2",
+        ),
+        # the KDA replay records hold exactly three drafts
+        (_glm53_config(), MTPDecodingConfig(max_draft_len=2), _GLM53_TP4, {}, "max_draft_len=2"),
+        # vanilla MTP is the multi-model loop; the target carries the one-model drafter
+        (
+            _glm53_config(),
+            MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+            _GLM53_TP4,
+            {},
+            "speculative decoding",
+        ),
+        # the kernels read and write a BF16 latent cache
+        (
+            _glm53_config(),
+            None,
+            _GLM53_TP4,
+            dict(kv_cache_config=KvCacheConfig(dtype="fp8")),
+            "KV cache dtype fp8",
+        ),
+        # the step program's head takes up to 256 sequences per step (the LLM API's default
+        # max_batch_size is 2048)
+        (_glm53_config(), None, _GLM53_TP4, dict(max_batch_size=512), "max_batch_size 512"),
+    ],
+    ids=[
+        "fp8-checkpoint",
+        "attention-dp",
+        "moe-tp2-ep2",
+        "mtp2",
+        "vanilla-mtp",
+        "fp8-kv",
+        "batch-512",
+    ],
+)
+def test_glm53_near_misses_do_not_match(
+    pretrained_config, spec_config, mapping_kwargs, engine, missed
+):
+    config = _model_config(pretrained_config, spec_config=spec_config, **mapping_kwargs)
+    engine = {**_GLM53_ENGINE, **engine}
+    assert modeling_v2_resolve(config, _llm_args("auto", **engine)) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require", **engine))
+
+
+@pytest.mark.parametrize("sm", [(9, 0), (12, 0)], ids=["sm90", "sm120"])
+def test_glm53_on_other_sms_does_not_match(sm, monkeypatch):
+    """The target's kernels are sm_100a / sm_103a code (tcgen05, tensor memory)."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: sm)
+    config = _model_config(_glm53_config(), **_GLM53_TP4)
+    assert modeling_v2_resolve(config, _llm_args("auto", **_GLM53_ENGINE)) is None

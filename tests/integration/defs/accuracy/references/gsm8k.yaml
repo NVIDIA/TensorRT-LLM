@@ -615,3 +615,10 @@ zai-org/GLM-5.3-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 92.91
+  # B200 / GB300 TP4 (experts split by intermediate or EP4), NVFP4 checkpoint, the modeling_v2 target
+  # glm-5.3-flash-nvfp4 / sm_10x / tp4. Its latent cache is BF16; FP8 is the checkpoint's KV-cache
+  # declaration, which llm.args reports.
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 93.52
