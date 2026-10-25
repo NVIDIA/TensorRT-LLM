@@ -2909,3 +2909,86 @@ def test_mixed_format_media_fall_back_to_uint8(monkeypatch):
         assert isinstance(frame, np.ndarray) and frame.dtype == np.uint8
         np.testing.assert_array_equal(frame, array)
     assert recorder.call_kwargs[1] == {"videos_kwargs": {"do_resize": True}}
+
+
+@pytest.mark.cpu_only
+def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
+    """``VideoData.metadata`` reaches the HF processor as ``video_metadata``.
+
+    With the source fps and the sampled frame indices, the processor writes a
+    timestamp before each temporal group. Only the keys transformers'
+    ``VideoMetadata`` accepts are passed, and ``total_num_frames`` counts the
+    delivered frames. A video without timing in the same request gets
+    ``fps=None``, so only the timed video gets timestamps.
+    """
+    recorder = _MediaRecordingProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, recorder)
+    frames = [np.zeros((28, 42, 3), dtype=np.uint8)] * 4
+    timed = SimpleNamespace(
+        frames=frames,
+        metadata={
+            "total_num_frames": 40,
+            "fps": 10,
+            "duration": 4.0,
+            "frames_indices": [0, 13, 26, 39],
+            "unrelated": "dropped",
+        },
+    )
+    expected = {
+        "total_num_frames": 4,
+        "fps": 10.0,
+        "duration": 4.0,
+        "frames_indices": [0, 13, 26, 39],
+    }
+
+    proc.call_with_text_prompt(
+        {"prompt": "watch", "multi_modal_data": {"video": [timed]}}, SimpleNamespace()
+    )
+    assert recorder.call_kwargs[0] == {
+        "videos_kwargs": {"do_resize": True, "video_metadata": [expected]}
+    }
+
+    proc.call_with_text_prompt(
+        {
+            "prompt": "watch watch",
+            "multi_modal_data": {"video": [timed, SimpleNamespace(frames=frames[:2])]},
+        },
+        SimpleNamespace(),
+    )
+    assert recorder.call_kwargs[1]["videos_kwargs"]["video_metadata"] == [
+        expected,
+        {"total_num_frames": 2, "fps": None, "duration": None, "frames_indices": [0, 1]},
+    ]
+
+    video_utils = pytest.importorskip("transformers.video_utils")
+    assert video_utils.VideoMetadata(**expected).timestamps == pytest.approx([0.0, 1.3, 2.6, 3.9])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "frame_list",
+        None,
+        {"fps": 0, "frames_indices": [0, 1]},
+        {"fps": 10.0},
+        {"fps": 10.0, "frames_indices": []},
+    ],
+    ids=["frame_list", "no_metadata", "zero_fps", "no_frame_indices", "empty_frame_indices"],
+)
+def test_video_without_timing_passes_no_metadata(monkeypatch, metadata):
+    """Without usable timing the processor gets no ``video_metadata`` and adds no timestamps."""
+    recorder = _MediaRecordingProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, recorder)
+    frames = [np.zeros((28, 42, 3), dtype=np.uint8)] * 2
+    if metadata == "frame_list":
+        video = frames
+    elif metadata is None:
+        video = SimpleNamespace(frames=frames)
+    else:
+        video = SimpleNamespace(frames=frames, metadata=metadata)
+
+    proc.call_with_text_prompt(
+        {"prompt": "watch", "multi_modal_data": {"video": [video]}}, SimpleNamespace()
+    )
+    assert recorder.call_kwargs[0] == {"videos_kwargs": {"do_resize": True}}

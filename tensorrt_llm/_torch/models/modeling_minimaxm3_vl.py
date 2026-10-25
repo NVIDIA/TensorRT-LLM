@@ -2050,6 +2050,32 @@ class MiniMaxM3VLInputProcessor:
             return list(video.frames)
         return list(video) if isinstance(video, (list, tuple)) else [video]
 
+    @staticmethod
+    def _video_metadata(video: Any, num_frames: int) -> Dict[str, Any]:
+        """Timing of one raw video item, in the form the HF video processor takes.
+
+        ``VideoData.metadata`` carries the source ``fps`` and the indices of
+        the sampled frames. With both, the processor writes a
+        ``]<]{t} seconds[>[`` timestamp before each temporal group. A video
+        without usable timing (no metadata, ``fps`` missing or not positive,
+        no frame indices) gets ``fps=None`` and no timestamps. Only the keys
+        transformers' ``VideoMetadata`` accepts are passed, and
+        ``total_num_frames`` is the number of frames delivered, because the
+        media loader has already sampled them.
+        """
+        metadata = getattr(video, "metadata", None)
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        fps = metadata.get("fps")
+        frames_indices = metadata.get("frames_indices")
+        if fps is None or fps <= 0 or frames_indices is None or len(frames_indices) == 0:
+            fps, frames_indices = None, range(num_frames)
+        return {
+            "total_num_frames": num_frames,
+            "fps": None if fps is None else float(fps),
+            "duration": metadata.get("duration"),
+            "frames_indices": [int(i) for i in frames_indices],
+        }
+
     def _video_bracket_count(self, video: Any) -> int:
         """Temporal patches of a video item: one framed bracket each.
 
@@ -2273,6 +2299,15 @@ class MiniMaxM3VLInputProcessor:
             frame_iter = iter(flat_frames)
             videos = [[next(frame_iter) for _ in frames] for frames in videos]
             processor_kwargs["videos_kwargs"] = {"do_resize": True, **video_kwargs}
+            # Frame timing goes in only when some video has it; the others get
+            # fps=None, so the processor gives timestamps to exactly the videos
+            # with timing. The token-ID fast path does not add timestamps.
+            video_metadata = [
+                self._video_metadata(video, len(frames))
+                for video, frames in zip(video_inputs, videos)
+            ]
+            if any(m["fps"] is not None for m in video_metadata):
+                processor_kwargs["videos_kwargs"]["video_metadata"] = video_metadata
         processed = self.processor(
             text=[templated_text],
             images=images if images else None,
