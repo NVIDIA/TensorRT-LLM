@@ -550,6 +550,48 @@ def test_force_mode():
         assert op.force_mode(force_value(drafts, "over"), drafts) == want, drafts
 
 
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+@pytest.mark.parametrize("forced", [None, "int", "frac"])
+@pytest.mark.parametrize("captured", [False, True])
+def test_padded_replay_state(batch, forced, captured):
+    gen = torch.Generator(device="cuda").manual_seed(20261025)
+    force = force_value(7, forced)
+    with torch.inference_mode():
+        st_ref = make_state(gen, batch)
+        st_new = clone_state(st_ref)
+        packed = torch.full((SLOTS, 4), -171, device="cuda", dtype=torch.int32)
+        packed[:, 0].copy_(st_new["prev_acc"])
+        st_new["prev_acc"] = packed[:, 0]
+        neighbors = packed[:, 1:].clone()
+        logits, draft = step_inputs(gen, batch, 7, "plain", 0)
+        graph = None
+        got = None
+        if captured:
+            fused(st_new, logits, draft, force, 8)
+            for name in STATE_KEYS:
+                st_new[name].copy_(st_ref[name])
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                got = fused(st_new, logits, draft, force, 8)
+            for name in STATE_KEYS:
+                st_new[name].copy_(st_ref[name])
+        for step in range(3):
+            set_dummies((st_ref, st_new), batch, step)
+            new_logits, new_draft = step_inputs(gen, batch, 7, "plain", step)
+            logits.copy_(new_logits)
+            draft.copy_(new_draft)
+            want = reference(st_ref, logits, draft, force, 8)
+            if graph is None:
+                got = fused(st_new, logits, draft, force, 8)
+            else:
+                graph.replay()
+            assert got is not None
+            assert all(same(got, want))
+            assert all(same(state_of(st_new), state_of(st_ref)))
+            torch.testing.assert_close(packed[:, 1:], neighbors, rtol=0, atol=0)
+
+
 def test_arrival_counter_at_rest_after_back_to_back_calls():
     """Calls of several splits and block widths launched back to back on one stream, the state carried and no host
     synchronization between them, as consecutive decode steps run: each grid's arrival counter (``CTAs arrived``,

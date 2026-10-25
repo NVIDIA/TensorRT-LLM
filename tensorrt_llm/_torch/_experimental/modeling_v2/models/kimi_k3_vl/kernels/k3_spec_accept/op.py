@@ -230,6 +230,9 @@ def k3_spec_accept(
             torch.zeros(1, dtype=torch.int32, device=device),
         )
     mode, total, frac = force_mode(force, drafts)
+    replay_state = prev_acc
+    if prev_acc.view(-1).stride(0) != 1:
+        prev_acc = prev_acc.clone(memory_format=torch.contiguous_format)
     accepted = torch.empty(batch, drafts + 1, dtype=torch.int32, device=device)
     num_acc = torch.empty(batch, dtype=torch.int32, device=device)
     rewind = torch.empty(batch, dtype=torch.int32, device=device)
@@ -291,6 +294,8 @@ def k3_spec_accept(
                     cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream),
                 )  # fmt: skip
     fn(*args, *scalars, cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream))
+    if prev_acc is not replay_state:
+        replay_state.copy_(prev_acc)
     return [accepted, num_acc, rewind, bonus, qpos, cpos, noise]
 
 

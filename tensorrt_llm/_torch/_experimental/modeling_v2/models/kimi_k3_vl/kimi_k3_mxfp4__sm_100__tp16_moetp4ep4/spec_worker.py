@@ -454,6 +454,7 @@ class KimiK3DFlashWorker(DFlashWorker):
                 )
             pool, counter = dummy_rng
         embed = draft_model.draft_model_full.model.embed_tokens
+        assert self._batch_to_slot_buffer is not None
         accepted, num_acc, rewind, bonus, qpos, cpos, noise = torch.ops.trtllm.k3_spec_accept(
             logits,
             spec_metadata.draft_tokens.reshape(num_gens, K),
@@ -466,7 +467,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             attn_metadata.mamba_metadata.state_indices,
             mgr._dummy_request_mask,
             attn_metadata.kv_lens_cuda,
-            self._batch_to_slot,
+            self._batch_to_slot_buffer.tensor,
             self._ctx_len,
             self._max_ctx,
             embed.weight,
@@ -906,7 +907,8 @@ class KimiK3DFlashWorker(DFlashWorker):
             query_tokens_per_req = block_size
 
             # Get slots for gen requests from pre-computed mapping
-            slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
+            assert self._batch_to_slot_buffer is not None
+            slots = self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens]
             K_plus_1 = K + 1
 
             if prep is not None:

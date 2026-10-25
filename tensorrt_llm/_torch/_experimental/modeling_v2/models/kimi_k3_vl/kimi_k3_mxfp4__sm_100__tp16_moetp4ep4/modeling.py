@@ -2331,6 +2331,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
+        allow_prequantized_output: bool = False,
     ) -> torch.Tensor:
         """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'."""
         if not (layer_cache.has_kda_replay_caches and layer_cache.kda_state_tok is not None):
