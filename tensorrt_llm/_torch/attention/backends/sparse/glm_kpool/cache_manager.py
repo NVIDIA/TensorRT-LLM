@@ -89,6 +89,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         sparse_layer_ids: Sequence[int] | None = None,
         index_state_dim: int = 0,
         kda_replay_num_spec: int | None = None,
+        kda_draft_records: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -99,7 +100,12 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 Defaults to every attention layer in ``layer_mask``: each GLM
                 attention layer, including appended MTP layers, is sparse.
             index_state_dim: BF16 width of one indexer cache row, see
-                :func:`glm_kpool_cache_row_dim`.
+                :func:`glm_kpool_index_state_dim`.
+            kda_draft_records: With the KDA replay caches, keep the records of
+                every draft of the last verify round (``kda_state_tok``) in
+                place of the k / g / v / beta caches, for a model whose verify
+                replays from them. The replay buffers then share the
+                recurrent-state slot.
         """
         # Set before super().__init__: the base _build_base_config calls
         # _extra_buffers_per_layer, which reads both of these.
@@ -123,6 +129,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
+        self._requested_draft_records = kda_draft_records
         self._kda_replay: KDAReplayState | None = None
         self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
@@ -138,7 +145,9 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             return None
         if num_spec is not None:
             self._kda_replay = KDAReplayState(
-                num_spec, stochastic_rounding=self._mamba_ssm_stochastic_rounding
+                num_spec,
+                stochastic_rounding=self._mamba_ssm_stochastic_rounding,
+                draft_records=self._requested_draft_records,
             )
             self._kda_replay.validate(self._state_layout)
             return self._kda_replay
@@ -377,7 +386,14 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
-        return KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
+        seed_bytes = KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
+        if kwargs.get("kda_draft_records", False):
+            # With the records, the replay state shares every recurrent-state slot
+            # (KDAReplayState.replay_shares_state_slot).
+            return seed_bytes + KDAReplayState.estimate_bytes_per_slot(
+                model_config, mapping, **kwargs
+            )
+        return seed_bytes
 
     @override
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
