@@ -748,6 +748,11 @@ class TestPreparationContext:
         "{% if add_generation_prompt %}<assistant><think>{% endif %}"
     )
     PREFILLED_CLOSED = PREFILLED_OPEN.replace("<think>", "</think>")
+    # MiniMax-M3 in adaptive mode: the generation prompt is the bare assistant header.
+    M3_ADAPTIVE = (
+        "{% for m in messages %}]~b]{{ m.role }}\n{{ m.content }}[e~[\n{% endfor %}"
+        "{% if add_generation_prompt %}]~b]ai\n{% endif %}"
+    )
 
     def _context(self, template, **overrides):
         res = resources(make_tokenizer(chat_template=template), **overrides)
@@ -764,11 +769,12 @@ class TestPreparationContext:
     def test_a_prompt_that_closes_thinking_is_recorded_as_off(self) -> None:
         assert self._context(self.PREFILLED_CLOSED)["resolved_thinking"]["poolside_v1"] is False
 
-    def test_a_prompt_that_prefills_nothing_records_minimax_m3_as_off(self, tokenizer) -> None:
-        # MiniMax-M3's adaptive mode prefills nothing, so only that parser resolves the prompt.
-        context = render_chat(chat_request(), resources(tokenizer)).context
+    def test_a_prompt_that_prefills_nothing_records_nothing(self, tokenizer) -> None:
+        assert render_chat(chat_request(), resources(tokenizer)).context["resolved_thinking"] == {}
 
-        assert context["resolved_thinking"] == {"minimax_m3": False}
+    def test_the_minimax_m3_adaptive_header_is_recorded_as_off(self) -> None:
+        # The template prefills nothing after its header, so only that parser resolves the prompt.
+        assert self._context(self.M3_ADAPTIVE)["resolved_thinking"] == {"minimax_m3": False}
 
     def test_no_generation_prompt_records_nothing(self) -> None:
         res = resources(make_tokenizer(chat_template=self.PREFILLED_OPEN))

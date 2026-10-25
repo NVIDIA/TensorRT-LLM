@@ -1481,17 +1481,32 @@ def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
     assert result.reasoning_content == reasoning_content
 
 
-@pytest.mark.parametrize(("tail", "expected"), [
-    (M3_START, True),
-    (M3_END, False),
-    ("", False),
-    (f"{M3_START}a{M3_END}b\n<assistant>", False),
-])
-def test_minimax_m3_resolves_unmarked_prompt_as_not_thinking(
-        tail: str, expected: bool) -> None:
-    """Adaptive mode prefills nothing, so a bare header resolves to off."""
+# The official template: ``bos_token ~ role``, ``eos_token`` after each
+# message, and ``]~b]ai`` as the generation prompt.
+M3_HEADER = "]~b]ai\n"
+M3_PROMPT = f"]~b]user\nhi[e~[\n{M3_HEADER}"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        (f"{M3_PROMPT}{M3_START}", True),
+        (f"{M3_PROMPT}{M3_END}", False),
+        # Adaptive: nothing after the header, so the output starts outside
+        # reasoning even though a prior turn rendered its own tags.
+        (M3_PROMPT, False),
+        (f"]~b]ai\n{M3_START}a{M3_END}b[e~[\n]~b]user\nmore[e~[\n{M3_HEADER}",
+         False),
+        # Prefilled text after the opening tag is not adaptive; the tail carries
+        # no mode it can read, so `thinking_mode` decides.
+        (f"{M3_PROMPT}{M3_START}Let me think.", None),
+        # A custom template that ends elsewhere is left unresolved as before.
+        ("<user>hi</user>\n<assistant>", None),
+    ])
+def test_minimax_m3_resolves_the_prompt_tail(prompt: str,
+                                             expected: bool | None) -> None:
     assert ReasoningParserFactory.resolve_prefilled_thinking(
-        "minimax_m3", f"<user>hi</user>\n<assistant>{tail}") is expected
+        "minimax_m3", prompt) is expected
 
 
 def _m3_stream(kwargs: dict | None, chunks: list[str]) -> tuple[str, str]:

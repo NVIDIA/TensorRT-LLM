@@ -116,8 +116,9 @@ class ReasoningParserFactory:
                     parser, parser has not opted in, or neither marker is at
                     the tail). Callers must treat this as "ask elsewhere"
                     (e.g. the relayed disagg value), not as thinking-off.
-            A prompt with neither marker returns the parser's
-            `unmarked_prompt_thinking`, which is None unless the parser sets it.
+            A prompt ending with neither marker is referred to the parser's
+            `resolve_unmarked_prompt`, which returns None unless the parser
+            recognises the tail.
         """
         entry = cls._parsers.get(reasoning_parser.lower())
         if entry is None:
@@ -131,7 +132,7 @@ class ReasoningParserFactory:
             return False
         if tail.endswith(parser_cls.reasoning_start):
             return True
-        return parser_cls.unmarked_prompt_thinking
+        return parser_cls.resolve_unmarked_prompt(tail)
 
     @classmethod
     def keys(cls) -> KeysView[str]:
@@ -164,8 +165,15 @@ class BaseReasoningParser(ABC):
     resolves_thinking_from_prompt: ClassVar[bool] = False
     reasoning_start: ClassVar[str]
     reasoning_end: ClassVar[str]
-    # Mode of a prompt ending with neither marker; None leaves it unresolved.
-    unmarked_prompt_thinking: ClassVar[Optional[bool]] = None
+
+    @classmethod
+    def resolve_unmarked_prompt(cls, tail: str) -> Optional[bool]:
+        """Mode of a rendered prompt whose stripped tail ends with neither marker.
+
+        None leaves the mode unresolved, which is right for a template that
+        prefills a marker whenever it prefills anything at all.
+        """
+        return None
 
     def __init__(self,
                  *,
@@ -548,7 +556,7 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     and the model emits ``<mm:think>`` or the bare sentinel first. The parser
     takes its mode from the one the server resolved off the rendered prompt
     (relayed as ``enable_thinking``), falls back to ``thinking_mode`` when
-    nothing was rendered, and otherwise starts outside reasoning. Both tags
+    nothing was resolved, and otherwise starts outside reasoning. Both tags
     are delimiters and never appear in the result; text before an opening tag
     is content; an opening tag without a closing tag is reasoning cut off by
     the token limit. ``parse`` and ``parse_delta`` agree for every chunking.
@@ -557,8 +565,18 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     resolves_thinking_from_prompt = True
     reasoning_start = "<mm:think>"
     reasoning_end = "</mm:think>"
-    # Adaptive mode prefills neither tag, so output starts outside reasoning.
-    unmarked_prompt_thinking = False
+    # The template's generation prompt is ``bos_token ~ 'ai' ~ '\\n'``.
+    _assistant_header = "]~b]ai"
+
+    @classmethod
+    def resolve_unmarked_prompt(cls, tail: str) -> Optional[bool]:
+        # Adaptive mode prefills nothing after the header, so the output
+        # starts outside reasoning. Any other unmarked tail, such as a custom
+        # template that prefills text after ``<mm:think>``, carries no mode the
+        # tail can read and is left to ``thinking_mode``.
+        if tail.endswith(cls._assistant_header):
+            return False
+        return None
 
     def __init__(self,
                  *,
@@ -566,7 +584,7 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
         kwargs = chat_template_kwargs or {}
         # The server overwrites `enable_thinking` with the mode resolved from
         # the rendered prompt, so it wins over `thinking_mode`, which decides
-        # only when nothing was rendered. The Responses path's bare `thinking`
+        # only when nothing was resolved. The Responses path's bare `thinking`
         # is ignored because the template never reads it.
         resolved = kwargs.get("enable_thinking")
         thinking_mode = kwargs.get("thinking_mode")

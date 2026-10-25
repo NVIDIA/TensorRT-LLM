@@ -233,6 +233,18 @@ def test_minimax_m3_adaptive_prompt_ignores_request_thinking_flag(request_kwargs
     assert (content, reasoning) == ("visible", "hidden")
 
 
+def test_minimax_m3_prefilled_reasoning_text_is_left_to_thinking_mode() -> None:
+    """Text prefilled after `<mm:think>` is not the adaptive header: nothing is resolved."""
+    prompt = M3_ADAPTIVE_PROMPT + "<mm:think>Let me think."
+    args = build_args(prompt, {"thinking_mode": "enabled"}, reasoning_parser="minimax_m3")
+
+    content, reasoning = apply_reasoning_parser(
+        args, 0, "hidden</mm:think>visible", streaming=False
+    )
+
+    assert (content, reasoning) == ("visible", "hidden")
+
+
 def test_minimax_m3_context_worker_stamps_adaptive_prompt_as_off() -> None:
     args = build_args(M3_ADAPTIVE_PROMPT, {"enable_thinking": True}, reasoning_parser="minimax_m3")
 
