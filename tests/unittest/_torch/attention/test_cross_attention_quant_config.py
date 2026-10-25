@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.cross_attention import CrossAttention
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
@@ -52,9 +53,24 @@ def _cross_attention(
     )
 
 
-@pytest.mark.parametrize("backend", ["TRTLLM", "FLASHINFER"])
-def test_backend_receives_fp8_kv_cache_mode(backend):
+@pytest.mark.parametrize(
+    "backend, backend_cls_name",
+    [
+        ("TRTLLM", "TrtllmAttention"),
+        pytest.param(
+            "FLASHINFER",
+            "FlashInferAttention",
+            marks=pytest.mark.skipif(
+                not IS_FLASHINFER_AVAILABLE, reason="FlashInfer is not installed"
+            ),
+        ),
+    ],
+)
+def test_backend_receives_fp8_kv_cache_mode(backend, backend_cls_name):
     module = _cross_attention(_FP8_KV, backend=backend)
+    # Backend selection falls back to TRTLLM when FlashInfer is missing; make
+    # sure the case under test is the one that ran.
+    assert type(module.attn).__name__ == backend_cls_name
     assert module.attn.quant_config is not None
     assert module.attn.quant_config.layer_quant_mode.has_fp8_kv_cache()
     assert module.attn.has_fp8_kv_cache
