@@ -1057,3 +1057,32 @@ def test_fi_mxfp8_gemm_exports_are_what_flashinfer_runs(tmp_path):
     assert sorted(spec for _, spec in loads) == sorted(specs) and not missing, missing
     for a, b in zip(got, ref):
         assert torch.equal(a, b)
+
+
+def test_occupancy_queries_compile_the_probe_kernel_once(monkeypatch):
+    """With the cache installed, HardwareInfo's cluster-occupancy queries give
+    what uncached ones give, and its probe kernel compiles once per device
+    instead of at every query."""
+    import cutlass.cute as cute
+    from cutlass.utils.hardware_info import HardwareInfo
+
+    # From CuTe DSL's own lookup (an earlier test may have installed the
+    # cache), restored at teardown.
+    current = HardwareInfo._get_device_function
+    monkeypatch.setattr(
+        HardwareInfo, "_get_device_function", getattr(current, "_jitp_inner", current)
+    )
+    sizes = (1, 2, 4, 8)
+    want = [HardwareInfo().get_max_active_clusters(n) for n in sizes]
+    compiles = []
+    real_compile = cute.compile
+
+    def counting_compile(*args, **kwargs):
+        compiles.append(args[0])
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(cute, "compile", counting_compile)
+    assert jcd.install_occupancy_kernel_cache()
+    got = [HardwareInfo().get_max_active_clusters(n) for n in sizes + sizes]
+    assert got == want + want
+    assert len(compiles) == 1, compiles

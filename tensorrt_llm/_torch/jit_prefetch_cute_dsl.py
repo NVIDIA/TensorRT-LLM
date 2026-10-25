@@ -1072,6 +1072,42 @@ def _shim_cute_dsl_device_attributes(props: Dict[str, Any]) -> None:
     cuda_helpers.get_device_attribute = get_device_attribute
 
 
+def install_occupancy_kernel_cache() -> bool:
+    """Have CuTe DSL's ``HardwareInfo`` compile its occupancy probe kernel
+    once per device instead of at every query.
+
+    ``HardwareInfo.get_max_active_clusters`` compiles an empty kernel (into a
+    fresh temporary dump directory, so CuTe DSL's compile cache never hits)
+    to ask the driver for cluster occupancy, 60-100 ms each time, and the
+    runners call it whenever they compile or load a kernel: in warmup, and
+    for a kernel first needed while serving. The kernel is the same for
+    every query on a device; only the driver queries that follow depend on
+    the cluster size. Returns False if CuTe DSL is unavailable."""
+    import threading
+
+    try:
+        from cutlass.utils.hardware_info import HardwareInfo
+    except ImportError:
+        return False
+    orig = HardwareInfo._get_device_function
+    if getattr(orig, "_jitp_cached", False):
+        return True
+    functions: Dict[int, Any] = {}
+    lock = threading.Lock()
+
+    def _get_device_function(self):
+        with lock:
+            fn = functions.get(self.device_id)
+            if fn is None:
+                fn = functions[self.device_id] = orig(self)
+        return fn
+
+    _get_device_function._jitp_cached = True
+    _get_device_function._jitp_inner = orig
+    HardwareInfo._get_device_function = _get_device_function
+    return True
+
+
 def install_device_shim(props: Dict[str, Any]) -> None:
     """In a helper process: answer the device queries of kernel constructors
     (``torch.cuda.get_device_properties`` and friends, the radix top-k max

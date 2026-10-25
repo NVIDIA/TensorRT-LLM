@@ -624,6 +624,8 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
         if IS_CUTLASS_DSL_AVAILABLE:
             from . import jit_prefetch_cute_dsl as jcd
 
+            # Every later cluster-occupancy query reuses one probe kernel.
+            jcd.install_occupancy_kernel_cache()
             # They follow from the layers' geometry and are compiled in
             # warmup's first forwards: the FP8, NVFP4 and MoE grouped GEMM
             # tactics by the autotuner, the KDA prefill kernel by the first
