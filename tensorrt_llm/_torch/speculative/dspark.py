@@ -739,6 +739,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if capture_lens is not None and len(capture_lens) != attn_metadata.num_contexts:
             raise ValueError("DSpark capture lengths must match the context requests")
         flat_position_ids = position_ids.reshape(-1)
+        # Scalar token positions on the host. They match the device ids token for
+        # token when those hold one row (no rope expansion); the device ids may
+        # carry padding past them. Reading the device ids costs a D2H sync.
+        host_positions = getattr(spec_metadata, "host_position_ids", None)
+        if host_positions is not None and position_ids.numel() != position_ids.shape[-1]:
+            host_positions = None
         context_offset = 0
         for i in range(attn_metadata.num_contexts):
             chunk_len = int(attn_metadata._seq_lens[i])
@@ -751,7 +757,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 continue
 
             req_id = spec_metadata.request_ids[i]
-            first_position = int(chunk_positions[0].item())
+            first_position = int(
+                host_positions[context_offset]
+                if host_positions is not None and context_offset < host_positions.numel()
+                else chunk_positions[0].item()
+            )
             slot = self._assign_slot(req_id, reset=first_position == 0)
             self._ctx_len[slot] = chunk_positions[-1] + 1
             self._position_initialized[slot] = True

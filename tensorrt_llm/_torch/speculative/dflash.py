@@ -38,6 +38,42 @@ from .dflash_attention import (
 )
 from .interface import SpecMetadata, SpecWorkerBase
 
+# Read the drafter's per-row block counts back from the device instead of
+# deriving them on the host (debug A/B switch; read at import).
+_SYNC_CTX_ALLOC = os.environ.get("TRTLLM_DFLASH_SYNC_CTX_ALLOC", "0") == "1"
+
+
+def host_counted_block_width(attn_metadata) -> Optional[int]:
+    """Per-row block count the drafter's refresh computes this step, when the host can tell; else None.
+
+    ``_refresh_ctx_block_tables`` counts the entries ``>= 0`` in each row of
+    ``draft_kv_cache_block_offsets``. KVCacheManagerV2's shared-page-table copy
+    (``copy_batch_block_offsets_to_device``) rewrites every column of each row
+    it copies, mapping a missing page to 0 and every other page to a
+    non-negative offset, and it always copies on a step with context requests.
+    With source and destination rows of equal width, each row then holds no
+    negative entry, so its count is that width. Returns None for any other
+    writer (V1, the per-layer page-table path, a subclass's own copy), where
+    only the device knows the count.
+    """
+    from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    offsets = getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
+    manager = getattr(attn_metadata, "draft_kv_cache_manager", None)
+    if offsets is None or manager is None or not isinstance(manager, KVCacheManagerV2):
+        return None
+    if type(manager).copy_batch_block_offsets is not KVCacheManagerV2.copy_batch_block_offsets:
+        return None
+    if getattr(manager, "_use_per_layer_page_tables", True):
+        return None
+    host = getattr(manager, "host_kv_cache_block_offsets", None)
+    if host is None or host.dim() != 4 or offsets.dim() != 4:
+        return None
+    if host.size(-1) != offsets.size(-1):
+        return None
+    return int(offsets.size(-1))
+
+
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
 _PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
@@ -1719,6 +1755,18 @@ class DFlashWorker(SpecWorkerBase):
         if self._saved_ctx_base is not None:
             self._ctx_base_pages.copy_(self._saved_ctx_base)
 
+    def _ctx_alloc_tokens(self, attn_metadata, num_contexts: int) -> List[int]:
+        """Tokens addressable through each context row of the block table.
+
+        That is ``_ctx_block_counts[:num_contexts] * page_size``. When the host can
+        tell what the refresh counted, the list is built on the host; otherwise it
+        is read back from the device, which waits for the GPU to finish the step.
+        """
+        width = None if _SYNC_CTX_ALLOC else host_counted_block_width(attn_metadata)
+        if width is not None:
+            return [width * self._ctx_page_size] * num_contexts
+        return (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+
     def _store_prefill_context(
         self,
         draft_model,
@@ -1763,10 +1811,10 @@ class DFlashWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
         # it must fit that row's allocation as well as the arena's length.
-        # One tolist() for the whole loop: the lengths themselves come from
-        # _ctx_len_host, so the loop body below stays sync-free.
+        # Built once for the whole loop, on the host where possible; the lengths
+        # themselves come from _ctx_len_host, so the loop body stays sync-free.
         ctx_alloc = (
-            (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+            self._ctx_alloc_tokens(attn_metadata, num_contexts)
             if self._ctx_block_tables is not None
             else None
         )
