@@ -55,7 +55,8 @@ from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
-                                setup_mm_encoder_attn_metadata, use_mrope)
+                                setup_mm_encoder_attn_metadata,
+                                setup_mm_encoder_cuda_graphs, use_mrope)
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache)
@@ -225,9 +226,10 @@ class PyTorchModelEngine(ModelEngine):
         # The multimodal encoder token budget falls back to the LLM-side value
         # when unset. It may be raised after model load because atomic MM items
         # cannot be split.
-        self.encoder_max_num_tokens = (llm_args.encoder_max_num_tokens
-                                       if llm_args.encoder_max_num_tokens
-                                       is not None else self.max_num_tokens)
+        configured_encoder_max_num_tokens = (
+            llm_args.encoder_max_num_tokens if llm_args.encoder_max_num_tokens
+            is not None else self.max_num_tokens)
+        self.encoder_max_num_tokens = configured_encoder_max_num_tokens
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -538,6 +540,14 @@ class PyTorchModelEngine(ModelEngine):
                 set_torch_compiling(False)
                 self._nccl_window_tensor_scope_hooks = (
                     install_eager_nccl_window_tensor_scopes(self.model))
+
+            # Capture local encoders after their metadata is sized and before
+            # KV-cache estimation, so graph memory is included in the profile.
+            mm_config = self.llm_args.multimodal_config
+            setup_mm_encoder_cuda_graphs(
+                self.model,
+                mm_config.encoder_cuda_graph if mm_config is not None else None,
+                max_num_tokens=configured_encoder_max_num_tokens)
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
