@@ -33,6 +33,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancerIterContext,
 )
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -41,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
     get_mrope_dummy_seq_slot,
 )
+from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache, copy_h2d_if_changed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
@@ -396,6 +398,8 @@ class DecoderRunner(ScheduledModelRunner):
         if self._h2d_cache is not None and self._h2d_cache.changed_span:
             logger.info("[M3 host] changed metadata uploads stage only each row's changed span")
 
+        self.guided_decoder: CapturableGuidedDecoder | None = None
+        self.lora_model_config: LoraModelConfig | None = None
         self.forward_pass_callable = None
         # Optional in-graph sampling hook, registered by PyExecutor. Called at
         # the tail of _forward_step -- i.e. right after the LM head, and inside
