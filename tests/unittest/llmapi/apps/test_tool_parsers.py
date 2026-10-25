@@ -4298,14 +4298,13 @@ class TestMiniMaxM2ToolParser:
         names = [c.name for c in result.calls if c.name]
         assert "get_weather" in names
 
-    def test_parameter_value_with_angle_brackets_streams_in_linear_time(
+    def test_parameter_value_with_angle_brackets_streams_within_time_bound(
             self, sample_tools):
-        """A long parameter value full of `>` characters, four per increment.
+        """Stream a long parameter value full of `>` within the time bound.
 
-        Code values such as `if (a > b) { p->x = q; }` hold many `>`. A
-        linear parse takes about a second here. A name pattern that may run
-        past `>` backtracks over every one of them on every increment and
-        takes tens of seconds, well past the bound.
+        Code values such as `if (a > b) { p->x = q; }` hold many `>`, four per
+        increment here. The bound guards against regex work that grows with
+        every `>` seen on each increment.
         """
         value = "if (a > b) { p->x = q; }\n" * 160 + "return;"
         text = ('<minimax:tool_call>'
