@@ -1881,6 +1881,43 @@ def test_v2_hybrid_typical_state_count(
     assert mgr._num_ssm_states_per_typical_request(capacity, config) == expected_states
 
 
+@pytest.mark.parametrize(
+    "policy, max_num_turns, expected_states",
+    [
+        # Live state + 3 boundary snapshots + two earlier turns, each keeping
+        # its own snapshots of the two from-end boundaries.
+        ("per_conversation", 3, 8),
+        ("per_conversation", 1, 4),
+        ("per_request", 3, 4),
+    ],
+)
+def test_v2_hybrid_typical_request_counts_retained_conversation_turns(
+    policy, max_num_turns, expected_states
+):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.max_batch_size = 4
+    mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    mgr.max_seq_len = 128
+    mgr.tokens_per_block = 32
+    mgr._num_reserved_dummy_slots = 0
+    config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_config=MambaStateConfig(
+            additional_snapshot_offsets_from_start=[64],
+            additional_snapshot_offsets_from_end=[0, 32, 4096],
+        ),
+        block_reuse_config=BlockReuseConfig(policy=policy, max_num_turns=max_num_turns),
+    )
+
+    assert mgr._num_ssm_states_per_typical_request(128, config) == expected_states
+    descs = mgr._typical_request_descs(128, config)
+    assert len(descs) == expected_states
+    assert sum(desc.capacity for desc in descs) == 128
+    # Retained turns are evictable cache entries, not live requirements, so
+    # they leave the quota of a token budget unchanged.
+    assert mgr._num_ssm_snapshots_for_capacity(512, config) == 4 * 3
+
+
 def test_cpp_mamba_estimator_handles_disabled_snapshots_without_attention():
     manager = object.__new__(KVCacheManager)
     manager._primary_pool_memory_bytes = 4096
