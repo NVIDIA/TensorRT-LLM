@@ -2134,6 +2134,15 @@ MHA::MHA(AttentionBase const& key)
             // TODO: add the support for cross attention + contiguous kv cache.
             TLLM_LOG_WARNING("Fall back to unfused MHA because of cross attention + contiguous kv cache.");
         }
+        else if (cross_attention && use_kv_cache && quant_mode.hasKvCacheQuant()
+            && !(mPagedKVCache && paged_context_fmha))
+        {
+            // The fused context kernel reads the encoder K/V back from the paged cross cache, and it is only told
+            // the cache's element type when paged-context FMHA is on. Without that it reads a quantized cache as
+            // the activation type. The unfused path reads K/V from the 16-bit workspace and writes the cache
+            // through the quantizing transpose, so it is correct for every cache type.
+            TLLM_LOG_WARNING("Fall back to unfused MHA because of cross attention + quantized kv cache.");
+        }
         else
         {
             mEnableContextFMHA = true;
