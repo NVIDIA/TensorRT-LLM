@@ -1419,7 +1419,7 @@ class Qwen3VisionModelBase(nn.Module):
         `split_lengths`, so the rows must be in request-then-prompt order.
         Delegating to `encode_multimodal_by_groups` runs the same
         modality-batched ViT the aggregated path uses and applies the
-        per-request `mm_item_order` reorder before returning.
+        per-request `item_metadata.item_refs` reorder before returning.
         """
         return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
