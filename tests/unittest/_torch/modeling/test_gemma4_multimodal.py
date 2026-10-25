@@ -1723,7 +1723,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         metadata = proc.get_mm_item_metadata(input_ids, mm_data["multimodal_data"])
 
         self.assertEqual(
-            metadata.output_embedding_lengths,
+            list(metadata.output_embedding_lengths),
             [proc.get_num_tokens_per_image(image=image) for image in images],
         )
         self.assertEqual(
@@ -1923,7 +1923,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         self.assertEqual(video_data["pixel_values"].shape[0], len(frames))
         self.assertEqual(video_data["num_frames"], [len(frames)])
         metadata = proc.get_mm_item_metadata(input_ids, mm_data["multimodal_data"])
-        self.assertEqual(metadata.output_embedding_lengths, [predicted_video_tokens])
+        self.assertEqual(list(metadata.output_embedding_lengths), [predicted_video_tokens])
 
         video_token_id = self._video_token_id()
         if video_token_id is not None:
