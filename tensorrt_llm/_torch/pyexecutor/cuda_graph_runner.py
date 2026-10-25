@@ -27,7 +27,8 @@ from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
-from . import step_inputs
+from . import device_copy
+from .device_copy import CopySite
 from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
@@ -832,7 +833,8 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        step_inputs.copy_(static_tensors["input_ids"][:seqlen], input_ids)
+        device_copy.copy(CopySite.GRAPH_INPUT_IDS,
+                         static_tensors["input_ids"][:seqlen], input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
@@ -879,8 +881,9 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            step_inputs.copy_(static_tensors["position_ids"][:, :seqlen],
-                              position_ids)
+            device_copy.copy(CopySite.GRAPH_POSITION_IDS,
+                             static_tensors["position_ids"][:, :seqlen],
+                             position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
@@ -904,9 +907,9 @@ class CUDAGraphRunner:
                 encoder_hidden_states)
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
-        # Issue the step's packed input copies (no-op without an open pack) before
+        # Issue the step's deferred copies (no-op without an open pack) before
         # anything below reads the static inputs on the device.
-        step_inputs.flush()
+        device_copy.flush()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if position_id_offsets is not None:

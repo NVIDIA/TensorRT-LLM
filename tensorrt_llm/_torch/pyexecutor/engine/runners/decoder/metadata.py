@@ -132,10 +132,7 @@ class DecoderMetadata:
                 f"got {type(self.attn_metadata).__name__} and {type(kv_cache_manager).__name__}"
             )
         self.attn_metadata.msa_policy = msa
-        kv_cache_manager.configure_decode_shortcuts(
-            skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
-            reuse_pool_views=msa.reuse_pool_views,
-        )
+        kv_cache_manager.configure_decode_shortcuts(reuse_pool_views=msa.reuse_pool_views)
 
     def setup_speculative(
         self, spec_resource_manager: BaseResourceManager | None

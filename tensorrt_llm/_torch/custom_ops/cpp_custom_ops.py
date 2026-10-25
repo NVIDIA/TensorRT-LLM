@@ -1883,3 +1883,8 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind, 0
+
+    @torch.library.register_fake("trtllm::device_copy_scatter")
+    def _(stage: torch.Tensor) -> None:
+        # Writes the staged copies into their destinations; returns nothing.
+        return None

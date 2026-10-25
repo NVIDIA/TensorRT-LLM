@@ -24,15 +24,15 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
-from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
+from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
     KeyType,
 )
+from tensorrt_llm._torch.pyexecutor.device_copy import CopyPlan, DeviceCopier, copy_plan_of
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
-from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
@@ -46,7 +46,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler import (
 )
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import SpecMetadata, get_draft_kv_cache_manager
@@ -143,9 +142,10 @@ class DecoderRunner(ScheduledModelRunner):
 
     # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
-    # This engine's skip cache and step-input pack (None: the hook is off), active only during its own forward.
-    _h2d_cache: H2DSkipCache | None = None
-    _step_pack: StepInputPack | None = None
+    # The copy sites the model defers to the graph replay or skips when unchanged (device_copy); empty by default.
+    copy_plan: CopyPlan = CopyPlan()
+    # This engine's copier (None: an empty plan), active only during its own forward.
+    _copier: DeviceCopier | None = None
     # Whether a batch may keep the greedy tokens a forward sampled in place of the logits. False when the executor
     # runs a guided decoder, which reads the logits of every batch.
     keep_greedy_only_outputs = True
@@ -200,10 +200,10 @@ class DecoderRunner(ScheduledModelRunner):
 
         self._config = config
         self.runtime_hooks = runtime_hooks_of(model)
-        self._h2d_cache = H2DSkipCache() if self.runtime_hooks.skip_unchanged_h2d else None
-        self._step_pack = (
-            StepInputPack(torch.device("cuda", torch.cuda.current_device()))
-            if self.runtime_hooks.pack_step_inputs
+        self.copy_plan = copy_plan_of(model)
+        self._copier = (
+            DeviceCopier(self.copy_plan, torch.device("cuda", torch.cuda.current_device()))
+            if self.copy_plan
             else None
         )
 
@@ -369,14 +369,12 @@ class DecoderRunner(ScheduledModelRunner):
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> Any:
-        with h2d_cache.active(self._h2d_cache), step_inputs.active(self._step_pack):
+        with device_copy.active(self._copier):
             try:
                 return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
             except BaseException:
-                # A failed step issues none of its packed copies, so forget the shadows recorded for them too.
-                step_inputs.discard()
-                if self._h2d_cache is not None:
-                    self._h2d_cache.clear()
+                # A failed step issues none of its deferred copies, so forget the shadows recorded for them too.
+                device_copy.discard()
                 raise
 
     def _initialize_moe_workspace_reclaimer(self) -> None:
@@ -481,7 +479,8 @@ class DecoderRunner(ScheduledModelRunner):
             kv_cache_manager_key=self.kv_cache_manager_key,
             sparse_attention_config=self.sparse_attention_config,
             short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
-            private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
+            # A skipped copy is sound only while no other engine writes the buffer.
+            private_metadata_buffers=bool(self.copy_plan.skip_unchanged),
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
         )
 
@@ -686,16 +685,17 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
-            # Pack the step's small input copies into one upload and one scatter at the
-            # graph replay. Only a replay of an already captured graph, which always
+            # Defer the plan's copies to one upload and one scatter at the graph
+            # replay. Only a replay of an already captured graph, which always
             # reaches the flush, may open a pack.
             if (
-                self.runtime_hooks.pack_step_inputs
+                self._copier is not None
+                and self._copier.defers
                 and can_run_graph
                 and not self.cuda_graph_runner.is_warmup_only
                 and not self.cuda_graph_runner.needs_capture(key)
             ):
-                step_inputs.begin()
+                device_copy.begin()
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -764,7 +764,7 @@ class DecoderRunner(ScheduledModelRunner):
                 ),
             )
             # No-op unless a pack was opened above and the replay did not issue it.
-            step_inputs.flush()
+            device_copy.flush()
             if captures_model_body:
                 return outputs
 

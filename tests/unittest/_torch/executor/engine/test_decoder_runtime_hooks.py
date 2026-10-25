@@ -100,8 +100,8 @@ def test_an_msa_policy_requires_the_msa_backend_and_cache():
 def test_an_msa_policy_reaches_the_metadata_and_the_cache():
     policy = MsaRuntimePolicy(
         short_sequence_identity=True,
-        skip_unchanged_block_offsets=True,
-        reuse_pool_views=False,
+        stage_tables_on_host=True,
+        reuse_pool_views=True,
     )
     metadata = _metadata(
         RuntimeHooks(msa=policy), object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
@@ -111,5 +111,4 @@ def test_an_msa_policy_reaches_the_metadata_and_the_cache():
     metadata._arm_msa_policy(manager)
 
     assert metadata.attn_metadata.msa_policy is policy
-    assert manager.skip_unchanged_block_offsets is True
-    assert manager.reuse_pool_views is False
+    assert manager.reuse_pool_views is True

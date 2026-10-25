@@ -106,6 +106,7 @@ from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import MsaCopySite
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     msa_paged_kv,
@@ -132,6 +133,7 @@ from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
+from tensorrt_llm._torch.pyexecutor.device_copy import CopyPlan, CopySite
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.speculative import SpecMetadata
@@ -4164,9 +4166,6 @@ def _build_speculation(shell, model_config: ModelConfig):
 def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
     """The step-loop hooks this target opts into, measured on GB300 AgentX decode (tp4 and tp8).
 
-    * ``pack_step_inputs``: a decode step's small input copies go out as one upload and one scatter at the graph
-      replay instead of a chain of copies the next graph waits on (~30 us of idle GPU at one request).
-    * ``skip_unchanged_h2d``: steady decode re-uploads slot indices, query lengths and page tables that rarely change.
     * ``loop_on_execution_stream``: the overlap loop's own stream work and the forward on one stream, so step N+1's
       inputs wait on graph N in program order rather than through two cross-stream event hops.
     * ``merge_tuned_tactics_across_ranks``: tensor-parallel peers capture the same GEMM tactics (rank-local profiling
@@ -4174,11 +4173,9 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
     * ``skip_greedy_rng_upload``: all-greedy speculative batches never read the Philox seeds.
     * ``spec_step_fold``: the spec sampler's slot stores and the engine's next-step input gathers in one launch each.
     * MSA: identity selections for short sequences (and short/long graph families), the one-launch KV-length update,
-      unchanged block-table copies skipped, pool views built once.
+      the decode tables built on the host (staged as copies, see ``_COPY_PLAN``), pool views built once.
     """
     return RuntimeHooks(
-        pack_step_inputs=True,
-        skip_unchanged_h2d=True,
         loop_on_execution_stream=True,
         merge_tuned_tactics_across_ranks=True,
         skip_greedy_rng_upload=True,
@@ -4186,10 +4183,55 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
         msa=MsaRuntimePolicy(
             short_sequence_identity=True,
             kv_update=_msa_kv_update_kernel.msa_kv_update,
-            skip_unchanged_block_offsets=True,
+            stage_tables_on_host=True,
             reuse_pool_views=True,
         ),
     )
+
+
+#: The step's copies this target defers to the graph replay (one upload and one scatter instead of a chain of copies
+#: the next graph waits on, ~30 us of idle GPU at one request) and skips when unchanged (steady decode re-uploads slot
+#: indices, query lengths and page tables that rarely change). Each entry asserts, for this target's decode step, that
+#: no device work touches the destination before the replay (``defer``) or that nothing else writes it
+#: (``skip_unchanged``); ``TLLM_DEVICE_COPY_CHECK=1`` verifies both.
+_COPY_PLAN = CopyPlan(
+    defer={
+        CopySite.GRAPH_INPUT_IDS,
+        CopySite.GRAPH_POSITION_IDS,
+        CopySite.INPUT_POSITION_IDS,
+        CopySite.ATTN_KV_LENS,
+        MsaCopySite.SHORT_TABLE,
+        MsaCopySite.N_VALID_BLOCKS,
+        MsaCopySite.OUT_CACHE_LOC,
+        MsaCopySite.KV_INDICES,
+        # Not BLOCK_TABLE: this target's KV pool has sub-pages, so write_subpage_block_table reads it before the
+        # replay. SEQ_LENS has no such reader because the runtime hooks stage tables on the host.
+        MsaCopySite.SEQ_LENS,
+        MsaCopySite.QO_LENS,
+        MsaCopySite.CU_Q_LENS,
+        MsaCopySite.CU_KV_LENS,
+        MsaCopySite.Q_BATCH_ROW,
+        MsaCopySite.Q_INTRA,
+        MsaCopySite.KV_LENS_STAGED,
+    },
+    skip_unchanged={
+        CopySite.SPEC_GATHER_IDS,
+        CopySite.SPEC_PREVIOUS_BATCH_INDICES,
+        CopySite.SPEC_NUM_ACCEPTED_DRAFT_TOKENS,
+        CopySite.SPEC_PREVIOUS_POS_INDICES,
+        CopySite.ATTN_PROMPT_LENS,
+        CopySite.EAGLE3_BATCH_INDICES,
+        CopySite.EAGLE3_SLOT_IDS,
+        MsaCopySite.SHORT_TABLE,
+        MsaCopySite.OUT_CACHE_LOC_TAIL,
+        MsaCopySite.BLOCK_TABLE,
+        MsaCopySite.QO_LENS,
+        MsaCopySite.CU_Q_LENS,
+        MsaCopySite.Q_BATCH_ROW,
+        MsaCopySite.Q_INTRA,
+        MsaCopySite.BLOCK_OFFSETS,
+    },
+)
 
 
 class ModelingV2MiniMaxM3Nvfp4Sm103Tp8(
@@ -4201,6 +4243,8 @@ class ModelingV2MiniMaxM3Nvfp4Sm103Tp8(
     speculation, the drafter (``M3Eagle3Draft``, its weights from the speculative checkpoint through
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
+
+    copy_plan = _COPY_PLAN
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         assert torch.cuda.get_device_capability() == _SM, (

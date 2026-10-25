@@ -140,21 +140,22 @@ class MsaRuntimePolicy:
     short_sequence_identity: bool = False
     # The model's one-launch replacement for the update after the KV lengths move.
     kv_update: Optional[MsaKvUpdate] = None
-    # Skip a block-table copy whose inputs equal the previous step's.
-    skip_unchanged_block_offsets: bool = False
+    # Build the decode step's slot table, page table and query/KV prefix sums on the host and stage them as copies,
+    # instead of filling them with device gathers, zero fills and scans between the decode graphs. The copies are
+    # MSA copy sites (MsaCopySite), deferred or skipped as the model's CopyPlan says.
+    stage_tables_on_host: bool = False
     # Build each KV pool view once per pool geometry instead of on every attention call.
     reuse_pool_views: bool = False
 
 
 @dataclass(frozen=True)
 class RuntimeHooks:
-    """The step-loop hooks a model opts into. All off by default."""
+    """The step-loop hooks a model opts into. All off by default.
 
-    # Pack a decode step's small host-to-device input copies into one upload and
-    # one scatter launch, issued just before the CUDA graph replay.
-    pack_step_inputs: bool = False
-    # Skip host-to-device metadata copies whose values the destination already holds.
-    skip_unchanged_h2d: bool = False
+    Which per-step copies are deferred to the graph replay or skipped is the model's ``CopyPlan``
+    (``device_copy``), not a hook.
+    """
+
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
     loop_on_execution_stream: bool = False
@@ -168,15 +169,6 @@ class RuntimeHooks:
     spec_step_fold: Optional[SpecStepFold] = None
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
-
-    @property
-    def skips_unchanged_metadata_uploads(self) -> bool:
-        """Whether a hook skips uploads into graph metadata buffers that already hold the values.
-
-        Such a skip is sound only while no other engine writes those buffers, so the engine
-        then gives its CUDA graph metadata a buffer pool of its own.
-        """
-        return self.skip_unchanged_h2d or self.msa.skip_unchanged_block_offsets
 
 
 DEFAULT_RUNTIME_HOOKS = RuntimeHooks()

@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -53,39 +54,28 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
 )
 
+from .common import MsaCopySite
+
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
-class _UnchangedCopy:
-    """Remembers the inputs of the last decode-only block-table copy into one destination.
+def _block_offsets_key(
+    request_ids: List[int],
+    beam_width: int,
+    num_contexts: int,
+    num_seqs: int,
+    max_blocks: Optional[int],
+) -> Optional[tuple]:
+    """The inputs that, with the host block-offset table, fix a decode-only block-table copy.
 
-    In steady decode the block tables change only when a request grows into a
-    new page, so a copy whose destination, batch order, decode-only shape and
-    host block-offset table equal the previous copy's can be skipped.
+    In steady decode the block tables change only when a request grows into a new page, so a copy into the same
+    destination with the same batch order, shape and host table can be skipped (``MsaCopySite.BLOCK_OFFSETS``). A step
+    with context requests is never compared: None.
     """
-
-    def __init__(self) -> None:
-        self._key: Optional[tuple] = None
-        self._host: Optional[torch.Tensor] = None
-
-    def skip(self, dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks, host) -> bool:
-        if num_contexts != 0:
-            self._key = None
-            return False
-        key = (dst.data_ptr(), tuple(request_ids), beam_width, num_seqs, max_blocks)
-        return key == self._key and self._host is not None and torch.equal(host, self._host)
-
-    def record(
-        self, dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks, host
-    ) -> None:
-        if num_contexts != 0:
-            return
-        self._key = (dst.data_ptr(), tuple(request_ids), beam_width, num_seqs, max_blocks)
-        if self._host is None or self._host.shape != host.shape:
-            self._host = host.clone()
-        else:
-            self._host.copy_(host)
+    if num_contexts != 0:
+        return None
+    return (tuple(request_ids), beam_width, num_seqs, max_blocks)
 
 
 class MiniMaxM3SparseIndexCache:
@@ -290,8 +280,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     :meth:`_prepare_page_table_tensor`.
     """
 
-    # Decode-step shortcuts a model opts into (RuntimeHooks.msa); see configure_decode_shortcuts.
-    skip_unchanged_block_offsets = False
+    # Decode-step shortcut a model opts into (RuntimeHooks.msa); see configure_decode_shortcuts.
     reuse_pool_views = False
 
     _main_kv_mapper_kind = MapperKind.HND
@@ -373,7 +362,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
         super().__init__(*args, **kwargs)
-        self._unchanged_copies: Dict[int, _UnchangedCopy] = {}
         self._pool_views: Dict[tuple, torch.Tensor] = {}
 
         if self.dtype == DataType.NVFP4:
@@ -633,20 +621,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     ) -> None:
         if self.num_attention_op_pools == 0:
             return
-        if self.skip_unchanged_block_offsets:
-            guard = self._unchanged_copies.setdefault(dst_tensor.data_ptr(), _UnchangedCopy())
-            args = (
-                dst_tensor,
-                request_ids,
-                beam_width,
-                num_contexts,
-                num_seqs,
-                max_blocks,
-                self.host_kv_cache_block_offsets,
-            )
-            if guard.skip(*args):
-                return
-            guard.record(*args)
+        if device_copy.skips(MsaCopySite.BLOCK_OFFSETS) and device_copy.inputs_unchanged(
+            MsaCopySite.BLOCK_OFFSETS,
+            dst_tensor,
+            _block_offsets_key(request_ids, beam_width, num_contexts, num_seqs, max_blocks),
+            self.host_kv_cache_block_offsets,
+        ):
+            return
         super().copy_batch_block_offsets(
             dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
         )
@@ -860,17 +841,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             transpose=kv_layout != self._main_kv_layout_name(),
         )
 
-    def configure_decode_shortcuts(
-        self, skip_unchanged_block_offsets: bool, reuse_pool_views: bool
-    ) -> None:
-        """Turn on the decode-step shortcuts a model opted into.
+    def configure_decode_shortcuts(self, reuse_pool_views: bool) -> None:
+        """Turn on the decode-step shortcut a model opted into.
 
-        ``skip_unchanged_block_offsets``: skip a decode-only block-table copy
-        whose inputs equal the previous copy's into the same destination.
         ``reuse_pool_views``: hand out one pool view per geometry instead of
         re-wrapping the pool memory on every attention call.
         """
-        self.skip_unchanged_block_offsets = skip_unchanged_block_offsets
         self.reuse_pool_views = reuse_pool_views
 
     def _pool_view(
@@ -1140,7 +1116,6 @@ class MiniMaxM3DraftKVCacheView:
                 f"got {len(draft_layer_ids)}. Multiple layers require separate pool roots."
             )
         self._manager = manager
-        self._unchanged_copy = _UnchangedCopy()
         layer_id = draft_layer_ids[0]
         local = int(manager.layer_offsets[layer_id])
         self._local_layer_idx = local
@@ -1205,19 +1180,13 @@ class MiniMaxM3DraftKVCacheView:
         """
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
         manager = self._manager
-        if manager.skip_unchanged_block_offsets:
-            args = (
-                dst_tensor,
-                request_ids,
-                beam_width,
-                num_contexts,
-                num_seqs,
-                max_blocks,
-                self.host_kv_cache_block_offsets,
-            )
-            if self._unchanged_copy.skip(*args):
-                return
-            self._unchanged_copy.record(*args)
+        if device_copy.skips(MsaCopySite.BLOCK_OFFSETS) and device_copy.inputs_unchanged(
+            MsaCopySite.BLOCK_OFFSETS,
+            dst_tensor,
+            _block_offsets_key(request_ids, beam_width, num_contexts, num_seqs, max_blocks),
+            self.host_kv_cache_block_offsets,
+        ):
+            return
         copy_idx = manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
         copy_batch_block_offsets_to_device(

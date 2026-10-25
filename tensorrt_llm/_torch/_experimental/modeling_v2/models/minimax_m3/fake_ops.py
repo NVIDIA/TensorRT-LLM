@@ -1,17 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fake (meta) implementations of the torch ops that the MiniMax-M3 decode targets add (``trtllm::step_inputs_scatter``
-and the ``trtllm::minimax_m3_*`` decode ops in ``cpp/tensorrt_llm/thop/minimaxM3/``), for torch.compile and fake-tensor
-tracing. Importing this module registers them once; the MiniMax-M3 modeling_v2 package and the step-input pack import
-it."""
+"""Fake (meta) implementations of the ``trtllm::minimax_m3_*`` decode ops the MiniMax-M3 decode targets add
+(``cpp/tensorrt_llm/thop/minimaxM3/``), for torch.compile and fake-tensor tracing. Importing this module registers them
+once; the MiniMax-M3 modeling_v2 package imports it."""
 
 import torch
-
-
-@torch.library.register_fake("trtllm::step_inputs_scatter")
-def _(stage):
-    # Writes the staged rows into their destinations; returns nothing.
-    return None
 
 
 @torch.library.register_fake("trtllm::minimax_m3_mxfp8_low_m_gemm")

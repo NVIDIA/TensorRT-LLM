@@ -16,10 +16,10 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
-from tensorrt_llm._torch.pyexecutor import step_inputs
+from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
-from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -847,7 +847,8 @@ class DecoderInputPreparer:
         self._copy_position_ids_to_device(host)
 
         if enable_spec_decode:
-            copy_h2d_if_changed(
+            device_copy.copy(
+                CopySite.SPEC_GATHER_IDS,
                 self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)],
                 torch.tensor(host.lists.gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
             )
@@ -1703,7 +1704,9 @@ class DecoderInputPreparer:
                 previous_batch_indices, dtype=torch.int, pin_memory=prefer_pinned()
             )
             previous_slots = self._buffers.previous_batch_indices_cuda[:previous_batch_len]
-            copy_h2d_if_changed(previous_slots, previous_batch_indices_host)
+            device_copy.copy(
+                CopySite.SPEC_PREVIOUS_BATCH_INDICES, previous_slots, previous_batch_indices_host
+            )
             return previous_slots
 
         if scheduled_requests.is_attention_dp_phase_idle:
@@ -1730,7 +1733,8 @@ class DecoderInputPreparer:
             num_accepted_draft_tokens = torch.tensor(
                 num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             )
-            copy_h2d_if_changed(
+            device_copy.copy(
+                CopySite.SPEC_NUM_ACCEPTED_DRAFT_TOKENS,
                 self._buffers.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)],
                 num_accepted_draft_tokens,
             )
@@ -1766,7 +1770,8 @@ class DecoderInputPreparer:
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
                 )
-                copy_h2d_if_changed(
+                device_copy.copy(
+                    CopySite.SPEC_PREVIOUS_POS_INDICES,
                     self._buffers.previous_pos_indices_cuda[
                         : previous_batch_len * runtime_tokens_per_gen_step
                     ],
@@ -1818,7 +1823,8 @@ class DecoderInputPreparer:
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
                 )
-                copy_h2d_if_changed(
+                device_copy.copy(
+                    CopySite.SPEC_PREVIOUS_POS_INDICES,
                     self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens],
                     previous_pos_indices_host,
                 )
@@ -1934,7 +1940,11 @@ class DecoderInputPreparer:
                     segment[:, :, : end_idx - start_idx], non_blocking=True
                 )
         else:
-            step_inputs.copy_(self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids)
+            device_copy.copy(
+                CopySite.INPUT_POSITION_IDS,
+                self._buffers.position_ids_cuda[:total_num_tokens],
+                host_position_ids,
+            )
 
         host.host_position_ids = host_position_ids
 
