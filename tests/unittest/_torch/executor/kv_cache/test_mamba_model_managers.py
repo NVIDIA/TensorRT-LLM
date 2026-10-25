@@ -251,6 +251,7 @@ def test_model_initialization_validates_selected_replay(manager_cls):
     manager._requested_replay = True
     manager._requested_num_spec = 2
     manager._requested_draft_records = False
+    manager._kda_commit_pending_drafts = None
     manager._kda_replay = None
     _prepare_model_layout(manager)
     manager._state_layout = replace(
@@ -277,6 +278,7 @@ def test_k3_initializes_only_the_selected_state(
     manager = object.__new__(manager_cls)
     manager._requested_num_spec = requested_num_spec
     manager._requested_draft_records = False
+    manager._kda_commit_pending_drafts = None
     manager._kda_replay = None
     manager.spec_config = (
         SimpleNamespace(decoding_type=decoding_type, tokens_per_gen_step=3)
@@ -307,9 +309,9 @@ def test_k3_initializes_only_the_selected_state(
     num_spec = requested_num_spec if requested_num_spec is not None else selected_num_spec
     if num_spec is not None:
         intermediate_factory.assert_not_called()
-        replay_kwargs = {"stochastic_rounding": False}
-        if manager_cls is KimiK3HybridCacheManager:
-            replay_kwargs["draft_records"] = False
+        replay_kwargs = {"stochastic_rounding": False, "draft_records": False}
+        if manager_cls is Glm5NextCacheManager:
+            replay_kwargs["commit_pending_drafts"] = None
         replay_factory.assert_called_once_with(num_spec, **replay_kwargs)
         assert manager._speculative_state is manager._kda_replay
         state = manager._kda_replay
@@ -348,6 +350,50 @@ def test_k3_initializes_only_the_selected_state(
     assert shutdown.call_count == 2
     if num_spec is not None:
         assert manager._speculative_state is manager._kda_replay
+
+
+def test_glm5_next_hands_the_models_draft_records_and_commit_to_kda_replay(monkeypatch):
+    manager = object.__new__(Glm5NextCacheManager)
+    manager._requested_num_spec = 2
+    manager._requested_draft_records = True
+    commit = Mock()
+    manager._kda_commit_pending_drafts = commit
+    manager._kda_replay = None
+    manager.spec_config = SimpleNamespace(decoding_type="MTP", tokens_per_gen_step=3)
+    _prepare_model_layout(manager)
+    replay_factory = Mock(wraps=KDAReplayState)
+    monkeypatch.setitem(
+        Glm5NextCacheManager._initialize_spec_state.__globals__, "KDAReplayState", replay_factory
+    )
+
+    state = manager._initialize_spec_state()
+
+    replay_factory.assert_called_once_with(
+        2, stochastic_rounding=False, draft_records=True, commit_pending_drafts=commit
+    )
+    assert state is manager._kda_replay
+    assert state.draft_records
+
+
+def test_kda_replay_commit_calls_the_models_commit():
+    commit = Mock()
+    state = KDAReplayState(2, draft_records=True, commit_pending_drafts=commit)
+    ssm, conv = torch.zeros(3, 1, 4, 4), torch.zeros(3, 12, 3)
+    q, k, v = (torch.zeros(3, 4, 5, dtype=torch.bfloat16) for _ in range(3))
+    tok = torch.zeros(3, 3, 2, 1, 4)
+    state._ssm_states, state._conv_states = (ssm,), (conv,)
+    state.pool_layers = [{"kda_conv_q": q, "kda_conv_k": k, "kda_conv_v": v, "kda_state_tok": tok}]
+    state.prev_num_accepted_tokens = torch.tensor([0, 2, 1], dtype=torch.int32)
+
+    state.commit_pending_drafts(1)
+
+    commit.assert_called_once()
+    args, kwargs = commit.call_args
+    assert all(arg is expected for arg, expected in zip(args[:5], (ssm, conv, q, k, v)))
+    assert args[5:9] == (None, None, None, None)
+    assert args[9].tolist() == [1] and args[10].tolist() == [2]
+    assert kwargs.keys() == {"state_tok"} and kwargs["state_tok"] is tok
+    assert state.prev_num_accepted_tokens.tolist() == [0, 0, 1]
 
 
 def test_base_manager_without_model_state(monkeypatch):

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 
@@ -81,6 +81,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         sparse_layer_ids: Sequence[int] | None = None,
         index_state_dim: int = 0,
         kda_replay_num_spec: int | None = None,
+        kda_draft_records: bool = False,
+        kda_commit_pending_drafts: Callable[..., None] | None = None,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -91,7 +93,13 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 Defaults to every attention layer in ``layer_mask``: each GLM
                 attention layer, including appended MTP layers, is sparse.
             index_state_dim: BF16 width of one indexer cache row, see
-                :func:`glm_kpool_cache_row_dim`.
+                :func:`glm_kpool_index_state_dim`.
+            kda_draft_records: With the KDA replay caches, also keep the
+                records of every draft of the last verify round
+                (``kda_state_tok``) for a model whose verify replays from them.
+            kda_commit_pending_drafts: That model's commit of a suspended
+                request's pending drafts (``commit_kda_pending_drafts``'
+                signature), called in place of the runtime's.
         """
         # Set before super().__init__: the base _build_base_config calls
         # _extra_buffers_per_layer, which reads both of these.
@@ -115,6 +123,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
+        self._requested_draft_records = kda_draft_records
+        self._kda_commit_pending_drafts = kda_commit_pending_drafts
         self._kda_replay: KDAReplayState | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
@@ -129,7 +139,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             return None
         if num_spec is not None:
             self._kda_replay = KDAReplayState(
-                num_spec, stochastic_rounding=self._mamba_ssm_stochastic_rounding
+                num_spec,
+                stochastic_rounding=self._mamba_ssm_stochastic_rounding,
+                draft_records=self._requested_draft_records,
+                commit_pending_drafts=self._kda_commit_pending_drafts,
             )
             self._kda_replay.validate(self._state_layout)
             return self._kda_replay

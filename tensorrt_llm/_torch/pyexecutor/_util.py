@@ -3552,6 +3552,11 @@ def _create_kv_cache_manager(
                 and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                 and getattr(backbone, "kda_draft_records", False)):
             kda_extra_kwargs["kda_draft_records"] = True
+            # A model that keeps the drafts' records in its own layout also
+            # hands over the commit of a suspended request's pending drafts.
+            commit = getattr(backbone, "kda_commit_pending_drafts", None)
+            if commit is not None:
+                kda_extra_kwargs["kda_commit_pending_drafts"] = commit
         if (not is_glm5_next and issubclass(kv_cache_manager_cls,
                                             MambaHybridCacheManagerV2)):
             # The V2 manager reads the MLA geometry and the per-layer KV
