@@ -15,6 +15,9 @@ GB300/SM103 tuning targets GQA group 16, top-k 16 and four-token Eagle3
 verification. Split-K, query pairing and launch tables require four KV heads;
 the linear-softmax policy also covers one and two KV heads. Other hardware
 and shapes retain the default policies, including supported SM100 NVFP4.
+With M3_CSD=1, the two-KV-head (TP2) NVFP4 shape on GB300 runs the CuTe kernel
+in cute_sparse_decode for the (decode_query_len, local batch) keys its table
+lists instead.
 
 The two-KV-head (TP2) NVFP4 shape on GB300 takes its split-K, query pairing,
 producer warps/stages and merge warps from the measured table in
@@ -50,6 +53,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
+from . import cute_sparse_decode as _csd
 from . import sparse_decode_tp2_policy as _o8_policy
 from .msa_utils import check_decode_span_shape
 
@@ -1089,6 +1093,27 @@ def minimax_m3_sparse_attn_decode(
             f"MiniMax-M3 sparse decode requires num_heads ({num_heads}) to be a "
             f"multiple of num_kv_heads ({num_kv_heads})."
         )
+    # The TP2 NVFP4 shape on GB300 runs the CuTe kernel for the (decode_query_len, batch) keys its table lists.
+    if (
+        num_topk_chunks is None
+        and kv_scale is None
+        and _csd.try_decode(
+            q,
+            k_paged,
+            v_paged,
+            topk_idx,
+            block_table,
+            seq_lens,
+            sm_scale=sm_scale,
+            output=output,
+            decode_query_len=decode_query_len,
+            k_block_scale=k_block_scale,
+            v_block_scale=v_block_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+        )
+    ):
+        return
     nvfp4_args = (k_block_scale, v_block_scale, k_global_scale, v_global_scale)
     kv_nvfp4 = any(arg is not None for arg in nvfp4_args)
     scale_cols = head_dim // NVFP4_SF_VEC_SIZE
