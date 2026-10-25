@@ -34,11 +34,6 @@ def spin_cycles_for_timeout(seconds: int | None) -> int:
     return seconds * ASSUMED_CLOCK_HZ
 
 
-def _check_spin_cycles(spin_cycles: int) -> None:
-    if type(spin_cycles) is not int or spin_cycles <= 0:
-        raise ValueError("spin_cycles must be a positive exact int")
-
-
 def recommend_cuda_scheduler_ctas(
     ep_size: int,
     max_tokens_per_rank: int,
@@ -193,33 +188,6 @@ class CudaSchedulerOutputs:
         )
 
 
-def enter_cuda_stream(stream: torch.cuda.Stream) -> tuple:
-    """Make ``stream`` and its device current; ``exit_cuda_stream`` restores both.
-
-    Same effect as entering ``torch.cuda.device(stream.device)`` and then
-    ``torch.cuda.stream(stream)``, without their Python overhead on the
-    per-layer submission path. Returns the state to pass to ``exit_cuda_stream``.
-    """
-    index = stream.device_index
-    prev_device = torch._C._cuda_exchangeDevice(index)
-    prev_stream = torch._C._cuda_getCurrentStream(index)
-    torch._C._cuda_setStream(
-        stream_id=stream.stream_id,
-        device_index=index,
-        device_type=stream.device_type,
-    )
-    return prev_device, prev_stream
-
-
-def exit_cuda_stream(state: tuple) -> None:
-    """Restore the stream and device saved by ``enter_cuda_stream``."""
-    prev_device, (stream_id, device_index, device_type) = state
-    torch._C._cuda_setStream(
-        stream_id=stream_id, device_index=device_index, device_type=device_type
-    )
-    torch._C._cuda_maybeExchangeDevice(prev_device)
-
-
 def _stream_handle(stream: object) -> int:
     if isinstance(stream, bool):
         raise TypeError("stream must be a CUDA stream handle")
@@ -236,9 +204,11 @@ def _stream_handle(stream: object) -> int:
 class CudaPhysicalSlotScheduler:
     """Preallocated HALO-Q outputs and workspace for the fused scheduler + copy kernel.
 
-    The GPU-direct copy endpoint binds it once (``bind_gpu_direct``) and
-    launches it with the copy (``moe_rebalance_tma_submit_fused``), taking the
-    scheduler's arguments from ``fused_submit_args``.
+    The GPU-direct copy endpoint binds it once (``bind_gpu_direct``), binds
+    the scheduler's arguments from ``fused_launch_args`` into its native
+    context, and then launches it with the copy
+    (``moe_rebalance_tma_submit_fused``), passing the routes, the route
+    target and the spin bound.
     """
 
     def __init__(self, config: CudaSchedulerConfig, device: str | torch.device = "cuda"):
@@ -257,8 +227,8 @@ class CudaPhysicalSlotScheduler:
         self.outputs = CudaSchedulerOutputs(config, scheduler_device)
         self.out = self.outputs
         self.status = torch.zeros(8, dtype=torch.int32, device=scheduler_device)
-        # Every scheduler argument after `routes` is fixed for the endpoint's
-        # lifetime, so a launch passes these cached tensors and config values.
+        # These tensors and the config values are fixed for the endpoint's
+        # lifetime, so the copy binds them once; see fused_launch_args().
         self.partial = torch.zeros(
             config.ctas * config.logical_expert_count,
             dtype=torch.int32,
@@ -341,35 +311,24 @@ class CudaPhysicalSlotScheduler:
                 raise RuntimeError("EP peer bases are not connected")
             self._bound_stream = _stream_handle(stream)
 
-    def fused_submit_args(
-        self, routes: torch.Tensor, stream_handle: int, *, spin_cycles: int
-    ) -> tuple:
-        """Scheduler arguments of the bound copy's fused launch, ``routes``
-        through ``valid_route_count`` of moe_rebalance_tma_submit_fused.
+    def fused_launch_args(self) -> tuple:
+        """Scheduler arguments that every fused launch of the bound copy
+        shares, ``out_slots`` through ``threads`` of
+        moe_rebalance_tma_bind_fused.
 
-        ``routes`` is a caller-owned CUDA int32[T,K] tensor, read without input
-        staging. T may be zero and may differ across ranks, up to
-        max_tokens_per_rank. The kernel never reads outside those T rows and
-        writes -1 to the unused output tail. All ranks, including empty ranks,
-        must launch each generation in the same collective order.
-
-        The caller must order input production before the bound static stream
-        and keep routes alive and unmodified until the scheduler completes.
-        Metadata checks below do not launch GPU work or synchronize; invalid
-        expert values are reported by the kernel through check_status().
-        ``spin_cycles`` bounds this launch's cross-rank waits.
+        A launch adds its route target, its spin bound and its routes: a
+        caller-owned CUDA int32[T,K] tensor, read without input staging. T may
+        be zero and may differ across ranks, up to max_tokens_per_rank. The
+        kernel never reads outside those T rows and writes -1 to the unused
+        output tail. All ranks, including empty
+        ranks, must launch each generation in the same collective order. The
+        caller keeps the routes alive and unmodified until the scheduler has
+        read them; the kernel reports invalid expert values through
+        check_status().
         """
-        _check_spin_cycles(spin_cycles)
         if self._bound_stream is None:
             raise RuntimeError("a fused launch requires a bound GPU-direct copy")
-        if stream_handle != self._bound_stream:
-            raise RuntimeError(
-                "CUDA scheduler uses one static stream because its workspace "
-                "and reusable barrier epochs are shared"
-            )
-        valid_tokens = self._check_routes(routes)
         return (
-            routes,
             self.outputs.physical_slot_ids,
             self.outputs.hot_expert_ids,
             self.outputs.hot_expert_group_level,
@@ -385,24 +344,11 @@ class CudaPhysicalSlotScheduler:
             self.cfg.logical_expert_count,
             self.cfg.extra_slots_per_rank,
             self.cfg.local_rank,
+            self.cfg.topk,
             self.cfg.route_count,
             self.cfg.ctas,
             self.cfg.threads,
-            spin_cycles,
-            valid_tokens * self.cfg.topk,
         )
-
-    def _check_routes(self, routes: torch.Tensor) -> int:
-        if not isinstance(routes, torch.Tensor):
-            raise TypeError("routes must be a torch.Tensor")
-        if (routes.ndim != 2 or routes.shape[1] != self.cfg.topk
-                or routes.shape[0] > self.cfg.max_tokens_per_rank):
-            raise ValueError("routes must have shape [T,topk] with 0 <= T <= max_tokens_per_rank")
-        if routes.dtype != torch.int32 or not routes.is_contiguous():
-            raise ValueError("routes must be contiguous torch.int32")
-        if not routes.is_cuda or routes.device != self.device:
-            raise ValueError("routes must be on the scheduler CUDA device")
-        return routes.shape[0]
 
     def check_status(self) -> None:
         """Raise if any generation faulted since the last `reset_status()`.

@@ -231,44 +231,53 @@ def test_shared_slot_provider_pool_key_includes_helper_set_mode(per_layer_helper
 
 def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     source = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/sami/hierarchical.py"
-    launches = []
+    native = []
 
-    def submit_fused(ctx, flags_mc, route_epoch, route_target, *scheduler_args):
-        launches.append((ctx, flags_mc, route_epoch, route_target, scheduler_args))
+    def submit_fused(handle, routes, route_target, spin_cycles):
+        native.append(("launch", handle, routes, route_target, spin_cycles))
+
+    def release(handle):
+        native.append(("release", handle))
 
     torch = SimpleNamespace(
-        ops=SimpleNamespace(trtllm=SimpleNamespace(moe_rebalance_tma_submit_fused=submit_fused)),
+        ops=SimpleNamespace(
+            trtllm=SimpleNamespace(
+                moe_rebalance_tma_submit_fused=submit_fused,
+                moe_rebalance_tma_release=release,
+            )
+        ),
     )
-    stream_switches = []
     ticket_cls = _extract_class(
         source,
         "HierarchicalCopyTicket",
         None,
         {"dataclass": dataclasses.dataclass, "field": dataclasses.field},
     )
+    event_handle = _extract_function(source, "_event_handle", {})
     broadcast_cls = _extract_class(
         source,
         "HierarchicalSamiWeightBroadcast",
-        {"submit_fused", "_require_live_bank_reusable", "mark_collective_reuse_safe"},
+        {
+            "submit_fused",
+            "release_generation_after",
+            "_require_live_bank_reusable",
+            "mark_collective_reuse_safe",
+        },
         {
             "torch": torch,
             "HierarchicalCopyTicket": ticket_cls,
-            "enter_cuda_stream": lambda stream: stream_switches.append(("enter", stream)) or stream,
-            "exit_cuda_stream": lambda state: stream_switches.append(("exit", state)),
+            "_event_handle": event_handle,
+            "check_cuda": lambda result, operation: result,
         },
     )
     outputs = object()
-    requests = []
-
-    def fused_submit_args(routes, stream_handle, *, spin_cycles):
-        requests.append((routes, stream_handle, spin_cycles))
-        return ("scheduler", routes)
 
     broadcast = broadcast_cls.__new__(broadcast_cls)
     broadcast._lock = nullcontext()
     broadcast._handoff_aborted = False
     broadcast._outputs = outputs
-    broadcast._scheduler = SimpleNamespace(fused_submit_args=fused_submit_args)
+    # The native context binds every scheduler argument; a launch passes only its routes.
+    broadcast._scheduler = SimpleNamespace()
     authority = object()
     broadcast._reuse_authority = authority
 
@@ -279,40 +288,54 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     broadcast._validate_reuse_authority = revalidate
     broadcast._active_generation = 0
     broadcast._collective_safe_generation = 0
+    broadcast._local_release_generation = 0
     broadcast._generation = 1
     broadcast._stream = 19
-    broadcast._stream_owner = object()
     broadcast.device = 0
     broadcast.ctx = "ctx"
-    broadcast.flags_mc = 4096
+    # The per-layer ops take the context's handle, not the custom-class object.
+    broadcast._handle = 4242
     broadcast.terminal_flags = "terminals"
+    broadcast.cuda = SimpleNamespace(
+        cuStreamWaitEvent=lambda stream, event, flags: native.append(("wait", stream, event))
+    )
 
-    ticket = broadcast.submit_fused(outputs, "routes", "epoch", 8, spin_cycles=12345)
+    ticket = broadcast.submit_fused(outputs, "routes", 8, spin_cycles=12345)
 
-    assert requests == [("routes", 19, 12345)]
-    assert launches == [("ctx", 4096, "epoch", 8, ("scheduler", "routes"))]
-    # The launch runs on the copy stream and restores the caller's stream afterwards.
-    owner = broadcast._stream_owner
-    assert stream_switches == [("enter", owner), ("exit", owner)]
+    # One native call orders the launch after the current stream and enqueues
+    # it on the bound copy stream; Python switches no stream.
+    assert native == [("launch", 4242, "routes", 8, 12345)]
     assert (ticket.generation, ticket.command_count) == (1, 1)
     assert (broadcast._active_generation, broadcast._generation) == (1, 2)
     # The bank stays leased until the consumer of generation 1 is proven done.
     with pytest.raises(RuntimeError, match="still leased"):
-        broadcast.submit_fused(outputs, "routes", "epoch", 16, spin_cycles=12345)
+        broadcast.submit_fused(outputs, "routes", 16, spin_cycles=12345)
     with pytest.raises(RuntimeError, match="bound CUDA scheduler"):
-        broadcast.submit_fused(object(), "routes", "epoch", 16, spin_cycles=12345)
+        broadcast.submit_fused(object(), "routes", 16, spin_cycles=12345)
 
     # Only the bound authority, after the local consumer release, frees the bank.
     with pytest.raises(PermissionError, match="identity mismatch"):
         broadcast.mark_collective_reuse_safe(object(), 1)
-    broadcast._local_release_generation = 0
     with pytest.raises(RuntimeError, match="local consumer release"):
         broadcast.mark_collective_reuse_safe(authority, 1)
-    broadcast._local_release_generation = 1
+    native.clear()
+    # Without an event, the consumer is the work queued on the current stream,
+    # which one native call orders the copy stream after.
+    broadcast.release_generation_after(1)
+    assert native == [("release", 4242)]
+    with pytest.raises(RuntimeError, match="already has a local release"):
+        broadcast.release_generation_after(1)
     broadcast.mark_collective_reuse_safe(authority, 1)
     assert broadcast._collective_safe_generation == 1
-    ticket = broadcast.submit_fused(outputs, "routes", "epoch", 16, spin_cycles=12345)
+    ticket = broadcast.submit_fused(outputs, "routes", 16, spin_cycles=12345)
     assert ticket.generation == 2
+
+    # A caller-recorded consumer event is waited for on the copy stream instead.
+    native.clear()
+    broadcast.release_generation_after(2, SimpleNamespace(cuda_event=23))
+    assert native == [("wait", 19, 23)]
+    with pytest.raises(ValueError, match="positive CUDA event"):
+        broadcast.release_generation_after(3, SimpleNamespace(cuda_event=0))
 
 
 @pytest.mark.parametrize(
@@ -1245,11 +1268,6 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     group.auxiliary_sms = auxiliary_sms
     group.copy_stream = group.scheduler_stream = copy
     group._stream_handle = 19
-    group._input_ready_handle = 1
-    group._consumer_done_handle = 3
-    group._consumer_done = SimpleNamespace(cuda_event=3)
-    route_epoch = object()
-    group._route_epoch = route_epoch
     group._route_epoch_ptr = 77
     # Generation 1 launches during warmup, generation 2 while serving.
     bounds = iter((_WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES))
@@ -1259,11 +1277,11 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         trace.append(entry)
         return (0,)
 
+    # The planner records no event itself: the native launch and release
+    # order the copy stream after MAIN.
     group._driver = SimpleNamespace(
         CUresult=SimpleNamespace(CUDA_SUCCESS=0),
         CUstreamWaitValue_flags=SimpleNamespace(CU_STREAM_WAIT_VALUE_GEQ="geq"),
-        cuEventRecord=lambda event, stream: driver_call("record", event, stream),
-        cuStreamWaitEvent=lambda stream, event, flags: driver_call("wait", stream, event),
         cuStreamWaitValue64=lambda stream, address, value, flags: driver_call(
             "wait_value", stream, address, value, flags
         ),
@@ -1272,8 +1290,8 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
 
     launch_bounds = []
 
-    def submit_fused(result, routes, epoch, target, *, spin_cycles):
-        assert result is outputs and epoch is route_epoch
+    def submit_fused(result, routes, target, *, spin_cycles):
+        assert result is outputs
         generation = group._scheduled_generation
         trace.append(("FUSED", routes.shape[0], target, generation))
         launch_bounds.append(spin_cycles)
@@ -1283,7 +1301,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     group.broadcaster = SimpleNamespace(
         submit_fused=submit_fused,
         release_generation_after=lambda generation, event: trace.append(
-            ("consumer_release", generation, event.cuda_event)
+            ("consumer_release", generation, event)
         ),
         mark_collective_reuse_safe=lambda provider, generation: trace.append(("lease", generation)),
     )
@@ -1308,9 +1326,9 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         group.finish()
         assert trace.count(route_wait) == 1
         assert not any(entry[0] == "lifetime" for entry in trace)
-        assert trace.index(("wait", 19, 1)) < trace.index(("FUSED", rows, target, generation))
         assert trace.index(("FUSED", rows, target, generation)) < trace.index(route_wait)
-        assert trace[-2:] == [("record", 3, 44), ("consumer_release", generation, 3)]
+        # Without an event, the release follows the MAIN work queued so far.
+        assert trace[-1] == ("consumer_release", generation, None)
         if generation > 1:
             # The previous consumer is proven reusable before the next launch.
             assert trace.index(("lease", generation - 1)) < trace.index(
@@ -1333,17 +1351,8 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         group.plan_schedule(_Routes(8, trace, dtype="int64"))
     assert trace == []
 
-    group._driver.cuStreamWaitEvent = lambda *args: (17,)
-    with pytest.raises(RuntimeError, match="cuStreamWaitEvent"):
-        group.plan_schedule(_Routes(8, trace))
-    assert not any(entry[0] == "FUSED" for entry in trace)
-    assert group._plan_part is None
-    # Nothing was launched, so the routes were never handed to HALO-Q.
-    assert group._routes_in_flight is None
-
-    # A submission that fails after the launch keeps its routes alive, and the
-    # group refuses further plans rather than let the allocator reuse them.
-    group._driver.cuStreamWaitEvent = lambda *args: (0,)
+    # A submission that fails may have launched, so it keeps its routes alive,
+    # and the group refuses further plans rather than let the allocator reuse them.
     group._pending_release = None
     group._spin_bound = SimpleNamespace(cycles=lambda: _SERVING_SPIN_CYCLES)
     group.broadcaster.submit_fused = lambda *args, **kwargs: SimpleNamespace(generation=99)
@@ -1435,7 +1444,6 @@ def _module_constants(path: Path, names: set[str]) -> dict:
 def _scheduler_spin_namespace() -> dict:
     namespace = _module_constants(_SCHEDULER_RUNTIME, {"SPIN_CYCLES", "ASSUMED_CLOCK_HZ"})
     _extract_function(_SCHEDULER_RUNTIME, "spin_cycles_for_timeout", namespace)
-    _extract_function(_SCHEDULER_RUNTIME, "_check_spin_cycles", namespace)
     return namespace
 
 
@@ -1470,9 +1478,6 @@ def test_scheduler_spin_cycles_convert_timeouts_at_the_nominal_clock():
     for seconds in (0, -1, 2.5, True):
         with pytest.raises(ValueError, match="positive exact int"):
             to_cycles(seconds)
-    for cycles in (0, -1, 1.0, True):
-        with pytest.raises(ValueError, match="positive exact int"):
-            namespace["_check_spin_cycles"](cycles)
 
 
 @pytest.mark.parametrize(
@@ -1522,22 +1527,35 @@ def test_scheduler_spin_bound_follows_warmup_transitions_and_autotuning(
     assert bound.cycles() == warmup_cycles
 
 
-def test_fused_launch_passes_its_spin_bound_to_the_kernel():
-    # Map the scheduler arguments onto the registered operator schema rather than hard-coding them.
+def _tma_op_parameters(name: str) -> List[str]:
+    """Parameter names of a registered moe_rebalance_tma operator schema."""
     op_source = (_ROOT / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceTmaOp.cpp").read_text()
     schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op_source.split("m.def(")[1:]]
-    schema = next(text for text in schemas if text.startswith("moe_rebalance_tma_submit_fused("))
-    parameters = re.fullmatch(r"moe_rebalance_tma_submit_fused\((.*)\) -> \(\)", schema).group(1)
-    names = [parameter.split()[-1] for parameter in parameters.split(",")]
-    scheduler_names = names[names.index("routes") :]
+    schema = next(text for text in schemas if text.startswith(f"{name}("))
+    parameters = re.fullmatch(rf"{name}\((.*)\) -> \(\)", schema).group(1)
+    return [parameter.split()[-1] for parameter in parameters.split(",")]
 
-    namespace = _scheduler_spin_namespace()
-    namespace["torch"] = SimpleNamespace(Tensor=_Routes, int32="int32")
+
+def test_fused_launch_binds_shared_arguments_and_passes_only_routes():
+    # Map the scheduler arguments onto the registered operator schemas rather than hard-coding them.
+    bind_names = _tma_op_parameters("moe_rebalance_tma_bind_fused")
+    scheduler_names = bind_names[bind_names.index("out_slots") : bind_names.index("copy_stream")]
+    # A launch passes its routes, route target and spin bound; the bind holds the rest.
+    # They take the context's handle, since a custom-class argument costs
+    # microseconds of dispatch per call.
+    assert _tma_op_parameters("moe_rebalance_tma_submit_fused") == [
+        "handle",
+        "routes",
+        "route_target",
+        "spin_cycles",
+    ]
+    assert _tma_op_parameters("moe_rebalance_tma_release") == ["handle"]
+
     scheduler_cls = _extract_class(
         _SCHEDULER_RUNTIME,
         "CudaPhysicalSlotScheduler",
-        {"fused_submit_args", "_check_routes"},
-        namespace,
+        {"fused_launch_args"},
+        {},
     )
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.cfg = SimpleNamespace(
@@ -1567,61 +1585,82 @@ def test_fused_launch_passes_its_spin_bound_to_the_kernel():
         "route_prefix",
     ):
         setattr(scheduler, name, name)
-    scheduler.device = "cuda:0"
+    scheduler._bound_stream = None
+    with pytest.raises(RuntimeError, match="bound GPU-direct copy"):
+        scheduler.fused_launch_args()
     scheduler._bound_stream = 19
 
-    routes = _Routes(16, [])
-    routes.is_cuda = True
-    args = scheduler.fused_submit_args(routes, 19, spin_cycles=_WARMUP_SPIN_CYCLES)
+    args = scheduler.fused_launch_args()
     assert len(args) == len(scheduler_names)
-    assert args[scheduler_names.index("spin_cycles")] == _WARMUP_SPIN_CYCLES
-    assert args[scheduler_names.index("valid_route_count")] == 16 * 6
-    with pytest.raises(ValueError, match="positive exact int"):
-        scheduler.fused_submit_args(routes, 19, spin_cycles=0)
-    # Every fused launch shares the workspace, so it must use the bound stream.
-    with pytest.raises(RuntimeError, match="one static stream"):
-        scheduler.fused_submit_args(routes, 20, spin_cycles=_WARMUP_SPIN_CYCLES)
+    expected = {
+        "out_slots": "slots",
+        "out_ids": "ids",
+        "out_levels": "levels",
+        "out_owners": "owners",
+        "peer_bases": "peer_base",
+        "route_capacity": 8192 * 6,
+        "topk": 6,
+        "ctas": 4,
+        "threads": 512,
+        "ep": 8,
+        "experts": 384,
+        "helpers": 4,
+        "local_rank": 0,
+    }
+    for name, value in expected.items():
+        assert args[scheduler_names.index(name)] == value
 
 
-def test_raw_stream_switch_restores_the_previous_stream_and_device():
-    calls = []
-    current = {"device": 0, "streams": {0: (10, 0, 1), 3: (30, 3, 1)}}
+def _cpp_method_body(source: str, signature: str) -> str:
+    """Body of the C++ function whose definition starts with ``signature``."""
+    open_brace = source.index("{", source.index(signature))
+    depth = 0
+    for index in range(open_brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[open_brace + 1 : index]
+    raise AssertionError(f"unbalanced body of {signature}")
 
-    def exchange_device(index):
-        calls.append(("exchange", index))
-        previous, current["device"] = current["device"], index
-        return previous
 
-    def set_stream(stream_id, device_index, device_type):
-        calls.append(("set", stream_id, device_index))
-        current["streams"][device_index] = (stream_id, device_index, device_type)
+def _assert_in_order(body: str, calls: Tuple[str, ...]) -> None:
+    positions = [body.index(call) for call in calls]
+    assert positions == sorted(positions), calls
 
-    def maybe_exchange_device(index):
-        calls.append(("restore_device", index))
-        current["device"] = index
-        return index
 
-    raw = SimpleNamespace(
-        _cuda_exchangeDevice=exchange_device,
-        _cuda_getCurrentStream=lambda index: current["streams"][index],
-        _cuda_setStream=set_stream,
-        _cuda_maybeExchangeDevice=maybe_exchange_device,
+def test_native_launch_and_release_order_the_copy_stream_after_main():
+    # The cross-stream ordering lives in the native context, so pin its call order:
+    # HALO-Q must not read routes before MAIN wrote them, and the next generation's
+    # copy must not overwrite the live bank before MAIN's consumer of it.
+    source = (_ROOT / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceTmaOp.cpp").read_text()
+    submit = _cpp_method_body(source, "void submitFused(torch::Tensor const& routes")
+    _assert_in_order(
+        submit,
+        (
+            "TORCH_CHECK_VALUE(routes.is_cuda()",
+            "TORCH_CHECK_VALUE(spinCycles > 0",
+            "cudaStream_t const execution = currentExecutionStream();",
+            "cudaEventRecord(mInputReady, execution)",
+            "cudaStreamWaitEvent(mCopyStream, mInputReady, 0)",
+            "megamoe_tma_copy_submit_fused(",
+        ),
     )
-    source = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/cuda_scheduler/runtime.py"
-    namespace = {"torch": SimpleNamespace(_C=raw, cuda=SimpleNamespace(Stream=object))}
-    enter = _extract_function(source, "enter_cuda_stream", namespace)
-    leave = _extract_function(source, "exit_cuda_stream", namespace)
-
-    state = enter(SimpleNamespace(device_index=3, stream_id=77, device_type=1))
-    assert current["device"] == 3 and current["streams"][3] == (77, 3, 1)
-    leave(state)
-    assert current == {"device": 0, "streams": {0: (10, 0, 1), 3: (30, 3, 1)}}
-    assert calls == [
-        ("exchange", 3),
-        ("set", 77, 3),
-        ("set", 30, 3),
-        ("restore_device", 0),
-    ]
+    launch = submit[submit.index("megamoe_tma_copy_submit_fused(") :]
+    assert "reinterpret_cast<void*>(mCopyStream)" in launch
+    release = _cpp_method_body(source, "void releaseAfterCurrentStream()")
+    _assert_in_order(
+        release,
+        (
+            "cudaStream_t const execution = currentExecutionStream();",
+            "cudaEventRecord(mConsumerDone, execution)",
+            "cudaStreamWaitEvent(mCopyStream, mConsumerDone, 0)",
+        ),
+    )
+    # The stream a launch or release follows can never be the copy stream itself.
+    current = _cpp_method_body(source, "cudaStream_t currentExecutionStream() const")
+    assert "TORCH_CHECK(stream != mCopyStream" in current
 
 
 def test_megamoe_cute_weight_cache_keys_every_view_field():

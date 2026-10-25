@@ -27,7 +27,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// Validates the HALO-Q scheduler arguments of moe_rebalance_tma_submit_fused and returns its launch parameters.
+// Validates the HALO-Q scheduler arguments that moe_rebalance_tma_bind_fused binds and returns its launch parameters.
 kernels::MoeRebalanceHaloQParams makeMoeRebalanceHaloQParams(torch::Tensor const& routes, torch::Tensor& outSlots,
     torch::Tensor& outIds, torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases,
     torch::Tensor& status, torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync,

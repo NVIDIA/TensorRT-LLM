@@ -205,15 +205,6 @@ class RebalanceSlotSchedulerGroup:
         self.scheduler_stream = self.copy_stream
         self._stream_handle = int(self.copy_stream.cuda_stream)
         self._driver = driver
-        self._input_ready = torch.cuda.Event()
-        self._consumer_done = torch.cuda.Event()
-        # Materialize each lazily created event once. The steady path uses its
-        # cached driver handle, without per-plan stream guards or allocation.
-        with torch.cuda.device(self.device):
-            for event in (self._input_ready, self._consumer_done):
-                event.record(self.copy_stream)
-        self._input_ready_handle = int(self._input_ready.cuda_event)
-        self._consumer_done_handle = int(self._consumer_done.cuda_event)
         error, cu_device = driver.cuDeviceGet(self.device)
         supported = 0
         if error == driver.CUresult.CUDA_SUCCESS:
@@ -268,7 +259,7 @@ class RebalanceSlotSchedulerGroup:
             tma_route="plan",
             helper_residency=bool(helper_residency),
         )
-        self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream)
+        self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream, self._route_epoch)
 
         # A prior consumer event precedes the next HALO-Q EP rendezvous.
         self.lease = _LiveBankLeaseProvider(self)
@@ -316,16 +307,6 @@ class RebalanceSlotSchedulerGroup:
             raise RuntimeError("MAIN must be distinct from the higher-priority COPY stream")
         self._execution_stream_handle = handle
 
-    def _record_event(self, event_handle: int, stream_handle: int) -> None:
-        (error,) = self._driver.cuEventRecord(event_handle, stream_handle)
-        if error != self._driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"cuEventRecord(rebalance) failed: {error!r}")
-
-    def _wait_event(self, stream_handle: int, event_handle: int) -> None:
-        (error,) = self._driver.cuStreamWaitEvent(stream_handle, event_handle, 0)
-        if error != self._driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"cuStreamWaitEvent(rebalance) failed: {error!r}")
-
     def _wait_route_epoch(self, stream_handle: int) -> None:
         (error,) = self._driver.cuStreamWaitValue64(
             stream_handle,
@@ -367,10 +348,6 @@ class RebalanceSlotSchedulerGroup:
         if num_tokens > self.max_tokens_per_rank:
             raise RuntimeError(f"Route chunk {num_tokens} exceeds {self.max_tokens_per_rank}")
 
-        # Both waits capture their event's current record before a later plan
-        # can re-record it. No host synchronization or temporary event is needed.
-        self._record_event(self._input_ready_handle, self._execution_stream_handle)
-        self._wait_event(self._stream_handle, self._input_ready_handle)
         outputs = self.scheduler.outputs
         self._scheduled_generation = self._generation + 1
         if self._pending_release is not None:
@@ -378,10 +355,11 @@ class RebalanceSlotSchedulerGroup:
             self._pending_release = None
         route_target = self._route_target + self.auxiliary_sms
         self._routes_in_flight = logical_expert_ids
+        # The launch follows the MAIN work queued so far, which wrote the
+        # routes; no host synchronization is needed.
         ticket = self.broadcaster.submit_fused(
             outputs,
             logical_expert_ids,
-            self._route_epoch,
             route_target,
             spin_cycles=self._spin_bound.cycles(),
         )
@@ -437,7 +415,11 @@ class RebalanceSlotSchedulerGroup:
         self.finish()
 
     def finish(self, completion_event: torch.cuda.Event | None = None) -> None:
-        """Queue the previous consumer wait before any next-generation producer."""
+        """Queue the previous consumer wait before any next-generation producer.
+
+        The consumer is ``completion_event``, or without it the MAIN work
+        queued so far: the MegaMoE launch that read this generation, if any.
+        """
         self._check_owner()
         if (
             self._plan_part is not None
@@ -447,9 +429,6 @@ class RebalanceSlotSchedulerGroup:
             or self._generation != self._finished_generation + 1
         ):
             raise RuntimeError("finish must pair exactly once with a completed plan")
-        if completion_event is None:
-            completion_event = self._consumer_done
-            self._record_event(self._consumer_done_handle, self._execution_stream_handle)
         self.broadcaster.release_generation_after(self._generation, completion_event)
         self._pending_release = (self._generation, completion_event)
         self._finished_generation = self._generation
