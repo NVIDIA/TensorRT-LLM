@@ -23,6 +23,7 @@ from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]
+from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
@@ -1518,7 +1519,7 @@ def nvfp4_gemm(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     output_buffer_kind: int = int(BufferKind.DEFAULT),
-    allowed_backends: str = "cutlass,cublaslt,cuda_core",
+    allowed_backends: str = "cutlass,cublaslt,cutedsl,cuda_core",
     group: Optional[List[int]] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1544,8 +1545,8 @@ def nvfp4_gemm(
         output_dtype: Output data type
         output_buffer_kind: Output buffer allocation kind (default/userbuffers/nccl_window)
         allowed_backends: Comma-separated list of backends to consider for auto-selection.
-            Default: "cutlass,cublaslt,cuda_core" (excludes cutedsl for faster build)
-            Add 'cutedsl' for extreme performance at the cost of longer build time.
+            Default: "cutlass,cublaslt,cutedsl,cuda_core".
+            CuTeDSL candidates may increase first-launch compilation time.
             Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
 
     Returns:
@@ -1621,7 +1622,7 @@ def _(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     output_buffer_kind: int = int(BufferKind.DEFAULT),
-    allowed_backends: str = "cutlass,cublaslt,cuda_core",
+    allowed_backends: str = "cutlass,cublaslt,cutedsl,cuda_core",
     group: Optional[List[int]] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -2846,6 +2847,31 @@ def _(
     count: int,
 ) -> None:
     return None
+
+
+@torch.library.register_fake("trtllm::begin_nccl_window_tensor_scope")
+def _(inputs: List[torch.Tensor]) -> None:
+    return None
+
+
+@torch.library.register_fake("trtllm::end_nccl_window_tensor_scope")
+def _(inputs: List[torch.Tensor], outputs: List[torch.Tensor],
+      failed: bool) -> None:
+    return None
+
+
+# These operations modify host-side allocator state. Ordered effects keep the
+# runtime boundaries in AOT graphs without marking model tensors as mutable.
+_NCCL_WINDOW_EFFECT_HANDLES = (
+    _register_effectful_op(
+        torch.ops.trtllm.begin_nccl_window_tensor_scope.default,
+        _EffectType.ORDERED,
+    ),
+    _register_effectful_op(
+        torch.ops.trtllm.end_nccl_window_tensor_scope.default,
+        _EffectType.ORDERED,
+    ),
+)
 
 
 # Host-side predicate for custom-op implementations only. Do not call this

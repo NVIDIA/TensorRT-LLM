@@ -44,8 +44,7 @@ from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
 # isort: on
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
-                       nvtx_range)
+from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
 from .config_utils import uses_vswa_kv_cache_layout
@@ -1405,7 +1404,6 @@ class KVCacheManager(BaseResourceManager):
         # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
-        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         # Override of py_draft_tokens length for KV reserve (e.g. dynamic-tree
         # draft loop). Falls back to max_num_draft_tokens when None.
@@ -1416,6 +1414,25 @@ class KVCacheManager(BaseResourceManager):
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
         capture_sampling_params: Optional[SamplingParams] = None,
     ):
+        """Create dummy requests and eagerly allocate their KV cache resources.
+
+        Register each request in the target cache and, when supplied, the draft
+        cache, including extra KV tokens.
+        ``token_nums`` specifies history plus input length, excluding draft
+        tokens. With ``is_gen=True``, requests enter generation state and reserve
+        draft KV capacity; ``kv_reserve_draft_tokens`` overrides that reserve
+        without changing the ``max_num_draft_tokens`` proposal length.
+
+        Returns:
+            Requests in ``request_ids`` order, or ``None`` if the target cache
+            has no free blocks at entry. Allocation exceptions trigger an
+            attempt to release all sequences registered by this call, then
+            propagate (a cleanup exception takes precedence if cleanup fails).
+
+        The caller must release each returned request with ``free_resources``
+        on this manager and the supplied draft manager when it is no longer
+        needed, including when subsequent warmup or graph capture fails.
+        """
         _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space
@@ -1467,13 +1484,12 @@ class KVCacheManager(BaseResourceManager):
                 encoder_output_len=encoder_output_len)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
-            if prepare_resource:
-                batch_request_infos.append((req_id, token_num, beam_width))
-                batch_llm_requests.append(req)
-                if draft_kv_cache_manager is not None:
-                    draft_batch_request_infos.append(
-                        (req_id, token_num, beam_width))
-                    draft_batch_llm_requests.append(req)
+            batch_request_infos.append((req_id, token_num, beam_width))
+            batch_llm_requests.append(req)
+            if draft_kv_cache_manager is not None:
+                draft_batch_request_infos.append(
+                    (req_id, token_num, beam_width))
+                draft_batch_llm_requests.append(req)
 
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)
@@ -1524,13 +1540,12 @@ class KVCacheManager(BaseResourceManager):
                             req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                             req.py_decoding_iter = 1
                     req.py_draft_tokens = [1] * max_num_draft_tokens
-                    if prepare_resource:
+                    for _ in range(_kv_draft):
+                        self.impl.add_token(req.request_id)
+                    if draft_kv_cache_manager is not None:
                         for _ in range(_kv_draft):
-                            self.impl.add_token(req.request_id)
-                        if draft_kv_cache_manager is not None:
-                            for _ in range(_kv_draft):
-                                draft_kv_cache_manager.impl.add_token(
-                                    req.request_id)
+                            draft_kv_cache_manager.impl.add_token(
+                                req.request_id)
         except Exception:
             # A partial allocation failure (e.g. add_token raising "no free
             # blocks left" after add_sequence_batch succeeded) must not leak
@@ -1622,6 +1637,15 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        # py_kv_reuse_poisoned: failed before completing its first context
+        # chunk, so the blocks were never written. remove_sequence has no
+        # no-store variant, so move the cursor off position 0: usable-token
+        # accounting then yields zero and releaseBlocks' legacy position-0
+        # fallback (which would store the unwritten blocks under the
+        # prompt's keys) no longer applies.
+        if (getattr(request, 'py_kv_reuse_poisoned', False)
+                and request.context_current_position == 0):
+            request.context_current_position = 1
         result = self.impl.remove_sequence(request.py_request_id, request,
                                            pin_on_release)
         self._preprepared_dummy_request_ids.discard(request.py_request_id)
@@ -3230,9 +3254,9 @@ class PeftCacheManager(BaseResourceManager):
                  peft_cache_config: PeftCacheConfig,
                  lora_config: LoraConfig,
                  model_config: ModelConfigCpp,
+                 lora_model_config: LoraModelConfig,
                  world_config: WorldConfig | None = None,
                  execution_stream: Optional[torch.cuda.Stream] = None,
-                 lora_target_modules: Optional[List[str]] = None,
                  initial_data_type: Optional[torch.dtype] = None):
         import tensorrt_llm.bindings as _tb
 
@@ -3272,12 +3296,7 @@ class PeftCacheManager(BaseResourceManager):
             self.impl.configure_data_type(
                 torch_dtype_to_binding(initial_data_type))
         self._lora_config = lora_config
-        self._lora_model_config = LoraModelConfig(
-            lora_target_modules if lora_target_modules is not None else
-            lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
-            binding_to_str_dtype(model_config.data_type),
-            lora_config.swap_gate_up_proj_lora_b_weight)
+        self._lora_model_config = lora_model_config
         mapping = Mapping(
             world_size=world_config.size,
             rank=world_config.rank,
@@ -3309,11 +3328,16 @@ class PeftCacheManager(BaseResourceManager):
                 # cached, we can safely remove both from the request.
                 request.remove_lora_tensors()
             elif request.lora_weights is None and request.py_lora_path:
+                # Load the adapter in the same checkpoint format that the
+                # request was admitted with, so every rank reads the same
+                # files that were validated at enqueue time.
+                ckpt_source = (request.py_lora_ckpt_source
+                               or self._lora_config.lora_ckpt_source)
                 self._lora_manager.load_from_ckpt(
                     [request.py_lora_path],
                     model_config=self._lora_model_config,
                     uids=[request.lora_task_id],
-                    ckpt_source=self._lora_config.lora_ckpt_source)
+                    ckpt_source=ckpt_source)
                 uid = request.lora_task_id
                 request.lora_weights = self._lora_manager.cpp_lora_weights[uid]
                 if request.lora_config is None:

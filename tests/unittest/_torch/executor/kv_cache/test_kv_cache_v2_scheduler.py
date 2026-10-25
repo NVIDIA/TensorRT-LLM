@@ -119,10 +119,11 @@ def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
     manager.kv_connector_manager = Mock()
     manager._connector_reservations_enabled = Mock(return_value=True)
     manager._accept_connector_prefix_reservations = order.accept
+    manager._on_allocation_stream = set()
     order.attach_mock(manager.kv_connector_manager.build_scheduler_output, "report")
     order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
     order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
-    scheduled = Mock()
+    scheduled = Mock(context_requests=[])
     manager.report_batch_to_connector(scheduled)
     assert order.mock_calls == [
         call.accept(scheduled),
@@ -3422,6 +3423,49 @@ class TestChunkedContext:
 
         assert ids(out.context_requests) == [0]
         assert req.context_chunk_size == 128
+
+    @staticmethod
+    def _started_ctx_ending_at_snapshot(request_id: int, position: int, point: int):
+        req = make_ctx_request(
+            request_id,
+            1000,
+            prompt_len=position + 1000,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = position
+        req.expect_snapshot_points = [point]
+        return req
+
+    def test_force_chunk_first_chunk_waits_on_leftover_budget(self):
+        # The started chunk stops at its snapshot point after 130 tokens and
+        # leaves 20 of 150. A first chunk would only prepare and release.
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr, max_num_tokens=150, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 32)
+        )
+        started = self._started_ctx_ending_at_snapshot(0, 1000, 1130)
+        waiting = [make_ctx_request(1, 4000), make_ctx_request(2, 4000)]
+
+        out = sched.schedule_request([started, *waiting], set())
+
+        assert ids(out.context_requests) == [0]
+        assert started.context_chunk_size == 130
+        assert mgr.prepare_context.call_args_list == [call(started)]
+        mgr.free_resources.assert_not_called()
+
+    def test_force_chunk_first_chunk_that_fits_leftover_still_runs(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr, max_num_tokens=150, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 32)
+        )
+        started = self._started_ctx_ending_at_snapshot(0, 1000, 1130)
+        short = make_ctx_request(1, 16)
+
+        out = sched.schedule_request([started, short], set())
+
+        assert ids(out.context_requests) == [0, 1]
+        assert short.context_chunk_size == 16
 
     def test_multiple_ctx_share_budget(self):
         """Two ctx requests share the budget."""
