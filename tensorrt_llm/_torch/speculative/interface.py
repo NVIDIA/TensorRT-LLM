@@ -49,10 +49,8 @@ from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
-# TRTLLM_M3_CHEAP_PAD=1: sample CUDA-graph padding rows from a one-hot logits row
-# instead of a zero one (see SpecWorkerBase._zero_padding_rows). Read once.
-CHEAP_PAD_SAMPLING = os.environ.get("TRTLLM_M3_CHEAP_PAD", "0") == "1"
-# Logit given to token 0 of a padding row under CHEAP_PAD_SAMPLING. Finite in
+# Logit given to token 0 of a CUDA-graph padding row (see
+# SpecWorkerBase._zero_padding_rows). Finite in
 # every logits dtype, and large enough that softmax is exactly one-hot at any
 # temperature a row can carry (<= the 1.0 a non-greedy row resolves to).
 _PADDING_ONEHOT_LOGIT = 1.0e4
@@ -2568,10 +2566,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
         Zeroed logits give a uniform distribution, though, which is the worst
         case of the radix top-p renormalization: every entry falls in one
-        bucket, and the launch lasts as long as its slowest row. With
-        TRTLLM_M3_CHEAP_PAD=1 the rows instead get a one-hot logits row (token
-        0), which the filters pass through cheaply; the caller then restores
-        the uniform probs that zeroed logits give with ``_uniform_padding_probs``.
+        bucket, and the launch lasts as long as its slowest row. The rows
+        therefore get a one-hot logits row (token 0), which the filters pass
+        through cheaply; the caller then restores the uniform probs that zeroed
+        logits give with ``_uniform_padding_probs``.
 
         Args:
             logits: ``[num_generation_tokens, vocab]``.
@@ -2591,8 +2589,7 @@ class SpecWorkerBase(nn.Module, ABC):
         if is_padding is None:
             return logits
         logits = logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
-        if CHEAP_PAD_SAMPLING:
-            logits[:, 0].masked_fill_(is_padding, _PADDING_ONEHOT_LOGIT)
+        logits[:, 0].masked_fill_(is_padding, _PADDING_ONEHOT_LOGIT)
         return logits
 
     @staticmethod
@@ -2605,14 +2602,10 @@ class SpecWorkerBase(nn.Module, ABC):
                                packed_verify: bool = False) -> torch.Tensor:
         """Give padding rows the uniform probs zeroed logits would have produced.
 
-        Pairs with ``_zero_padding_rows`` under TRTLLM_M3_CHEAP_PAD=1, after
-        the filters ran on its one-hot rows: rejection then sees uniform
-        target and draft probs for a padding row and accepts whatever stale
-        draft token it carries, as it does without the switch. In place;
-        a no-op without the switch.
+        Pairs with ``_zero_padding_rows``, after the filters ran on its one-hot
+        rows: rejection then sees uniform target and draft probs for a padding
+        row and accepts whatever stale draft token it carries. In place.
         """
-        if not CHEAP_PAD_SAMPLING:
-            return probs
         is_padding = SpecWorkerBase._padding_row_mask(
             spec_metadata,
             probs.shape[0],
