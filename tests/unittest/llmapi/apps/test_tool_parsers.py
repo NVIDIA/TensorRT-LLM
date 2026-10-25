@@ -1117,6 +1117,7 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         "[" + "9" * 4500 + "]",
         "[Note] The weather in Paris is sunny today.",
         "{greeting} Hello there, how can I help?",
+        "[not JSON </tool_",
     ])
     def test_streaming_plain_answer_opening_with_bracket_is_content(
             self, sample_tools, parser, text):
@@ -1125,6 +1126,14 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
 
         assert calls == []
         assert content == text
+
+    def test_detect_and_parse_wrapped_oversized_integer_has_no_calls(
+            self, sample_tools, parser):
+        """An integer beyond the digit limit inside a wrapped block yields no calls."""
+        result = parser.detect_and_parse(
+            "<tool_call>\n" + "9" * 4500 + "\n</tool_call>", sample_tools)
+
+        assert result.calls == []
 
     def test_streaming_text_that_may_become_json_is_held(
             self, sample_tools, parser):

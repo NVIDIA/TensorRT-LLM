@@ -249,15 +249,20 @@ class Qwen3ToolParser(BaseToolParser):
         return True
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        """Flush text still held while deciding whether it was bare JSON.
+        """Flush model text still held when the stream ends.
 
         A stream that ends inside a `{` or `[` prefix that never became a
         complete JSON value (for example, output cut off by `max_tokens`)
-        leaves that text in the undecided buffer. It is model content, so
-        return it as normal text.
+        leaves that text in the undecided buffer. In wrapped mode, a trailing
+        prefix of `</tool_call>` waits in the normal-text buffer. Both are
+        model content, so return them as normal text.
         """
         if self._stream_mode != self._STREAM_MODE_UNDECIDED:
-            return super().finish(tools)
+            result = super().finish(tools)
+            if self._normal_text_buffer:
+                result.normal_text = self._normal_text_buffer + result.normal_text
+                self._normal_text_buffer = ""
+            return result
         remaining = self._bare_json_buffer
         self._bare_json_buffer = ""
         self._stream_mode = self._STREAM_MODE_WRAPPED
