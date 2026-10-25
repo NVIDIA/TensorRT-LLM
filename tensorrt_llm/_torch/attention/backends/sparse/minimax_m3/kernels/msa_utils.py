@@ -9,6 +9,7 @@ import importlib.util
 import types
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
@@ -233,32 +234,32 @@ def per_token_valid_blocks(
     causal: bool,
     block_size: int,
 ) -> torch.Tensor:
-    """Return the per-query number of valid KV blocks, on CPU.
+    """Return the per-query number of valid KV blocks, on CPU, as int64.
 
     Expands per-request lengths and offsets to a per-token vector so block
-    selection can honour each query token's own causal extent.
+    selection can honour each query token's own causal extent. Computed in
+    NumPy: prepare() runs it every step, and a dozen small torch CPU ops cost
+    several times the arithmetic.
     """
-    qo = qo_lens_cpu.to(torch.long)
-    kv = kv_lens_cpu.to(torch.long)
-    batch = int(qo.shape[0])
-    total = int(qo.sum().item())
+
+    def host(lens: torch.Tensor) -> np.ndarray:
+        return lens.cpu().numpy().astype(np.int64, copy=False)
+
+    qo = host(qo_lens_cpu)
+    kv = host(kv_lens_cpu)
+    total = int(qo.sum())
     if total == 0:
         return torch.zeros(0, dtype=torch.long)
-    batch_row = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), qo)
-    starts = torch.zeros(batch, dtype=torch.long)
-    if batch > 1:
-        starts[1:] = torch.cumsum(qo, 0)[:-1]
-    intra = torch.arange(total, dtype=torch.long) - starts[batch_row]
+    batch_row = np.repeat(np.arange(qo.shape[0], dtype=np.int64), qo)
+    starts = np.cumsum(qo) - qo
+    intra = np.arange(total, dtype=np.int64) - starts[batch_row]
     kv_per = kv[batch_row]
     if causal:
-        if qo_offset_cpu is not None:
-            off = qo_offset_cpu.to(torch.long)[batch_row]
-        else:
-            off = (kv - qo)[batch_row]
-        eff = torch.minimum(off + intra + 1, kv_per)
+        off = host(qo_offset_cpu) if qo_offset_cpu is not None else kv - qo
+        eff = np.minimum(off[batch_row] + intra + 1, kv_per)
     else:
         eff = kv_per
-    return (eff + block_size - 1) // block_size
+    return torch.from_numpy((eff + block_size - 1) // block_size)
 
 
 def select_blocks_from_maxscore(

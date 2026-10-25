@@ -232,6 +232,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # (identity table, (batch, rows), k2q CSR worklist) the NVFP4 prefill built for it: the worklist is
     # layer-invariant for an identity selection, so the later layers of the step reuse it.
     _msa_identity_csr: Optional[tuple] = None
+    # (geometry key, k2q row_ptr, k2q q_indices, schedule) the NVFP4 prefill builds its CSR worklist into. Sized by
+    # the step geometry alone, so every layer, and every later step of the same geometry, reuses it.
+    _msa_csr_workspace: Optional[tuple] = None
     # This step's per-request host lengths, staged by _stage_host_lengths.
     _msa_qo_lens_cpu: Optional[torch.Tensor] = None
     _msa_kv_lens_cpu: Optional[torch.Tensor] = None

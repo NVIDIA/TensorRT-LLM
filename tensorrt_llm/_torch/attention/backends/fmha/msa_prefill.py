@@ -178,6 +178,132 @@ def _msa_sparse_api():
     return sparse
 
 
+@functools.lru_cache(maxsize=1)
+def _k2q_csr_parts():
+    """(run_with_schedule, schedule model, schedule type) behind sparse.build_k2q_csr, or None.
+
+    Internals of the packaged MSA builder, resolved once; a build that moves
+    them leaves every call on build_k2q_csr itself.
+    """
+    _msa_sparse_api()  # puts the CuTe-DSL sources on sys.path
+    try:
+        from sparse_index_utils import _K2Q_CSR_BUILDER
+        from src.sm100.prepare_scheduler import SPARSE_SCHEDULE_MODEL, SparseAttentionSchedule
+
+        _K2Q_CSR_BUILDER._ensure_loaded()
+        run = _K2Q_CSR_BUILDER._run_with_schedule
+    except (ImportError, AttributeError):
+        return None
+    if run is None:
+        return None
+    return run, SPARSE_SCHEDULE_MODEL, SparseAttentionSchedule
+
+
+def _k2q_csr_with_schedule(
+    sparse,
+    q2k: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_kv: torch.Tensor,
+    page_size: int,
+    *,
+    total_k: int,
+    max_seqlen_k: int,
+    max_seqlen_q: int,
+    total_rows: int,
+    qhead_per_kv: int,
+    metadata,
+) -> tuple:
+    """sparse.build_k2q_csr(..., return_schedule=True), into buffers reused across layers.
+
+    The CSR, schedule and split buffers and the schedule sizing depend only on
+    the step's geometry, so they are sized once and kept on the metadata; the
+    builder kernels write them whole on every call, as they do the fresh
+    torch.empty buffers build_k2q_csr allocates. Same kernels, same arguments,
+    so the same bytes. Each layer's attention reads them on the stream before
+    the next layer's build rewrites them.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import (
+        PREFILL_HOST_TRIMS,
+    )
+
+    head_kv, total_q, topk = (int(x) for x in q2k.shape)
+    parts = _k2q_csr_parts() if PREFILL_HOST_TRIMS else None
+    if (
+        parts is None
+        or page_size != 128
+        or topk not in (4, 8, 16, 32)
+        or total_rows <= 0
+        or total_q <= 0
+        or head_kv <= 0
+        or not q2k.is_contiguous()
+    ):
+        return sparse.build_k2q_csr(
+            q2k,
+            cu_q,
+            cu_kv,
+            page_size,
+            total_k=total_k,
+            max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
+            total_rows=total_rows,
+            qhead_per_kv=qhead_per_kv,
+            return_schedule=True,
+        )
+    run, model, schedule_type = parts
+    device = q2k.device
+    key = (device, head_kv, total_q, topk, total_rows, qhead_per_kv)
+    cached = getattr(metadata, "_msa_csr_workspace", None)
+    if cached is None or cached[0] != key:
+        target_q_per_cta = model.balanced_target_q_per_cta(
+            total_q=total_q,
+            topk=topk,
+            blk_kv=page_size,
+            head_kv=head_kv,
+            qhead_per_kv=qhead_per_kv,
+            device=device,
+        )
+        capacity = model.flat_schedule_capacity(
+            total_rows=total_rows,
+            total_q=total_q,
+            topk=topk,
+            head_kv=head_kv,
+            target_q_per_cta=target_q_per_cta,
+        )
+        q_indices = torch.empty((head_kv, total_q * topk), dtype=torch.int32, device=device)
+        schedule = schedule_type(
+            enabled=True,
+            scheduler_metadata=torch.empty((capacity, 6), dtype=torch.int32, device=device),
+            work_count=torch.empty((1,), dtype=torch.int32, device=device),
+            qsplit_indices=torch.empty_like(q_indices),
+            split_counts=torch.empty((total_q, head_kv), dtype=torch.int32, device=device),
+            target_q_per_cta=target_q_per_cta,
+        )
+        row_ptr = torch.empty((head_kv, total_rows + 1), dtype=torch.int32, device=device)
+        cached = (key, row_ptr, q_indices, schedule)
+        metadata._msa_csr_workspace = cached
+    _, row_ptr, q_indices, schedule = cached
+    max_kv_blocks = (max(int(max_seqlen_k), page_size) + page_size - 1) // page_size
+    run(
+        q2k,
+        cu_q,
+        cu_kv,
+        row_ptr,
+        q_indices,
+        schedule.scheduler_metadata,
+        schedule.work_count,
+        schedule.qsplit_indices,
+        schedule.split_counts,
+        topk,
+        page_size,
+        total_rows,
+        max_kv_blocks,
+        schedule.target_q_per_cta,
+        schedule.work_capacity,
+        int(max_seqlen_q),
+    )
+    return row_ptr, q_indices, schedule
+
+
 def run_msa_nvfp4_sparse_gqa(
     q: torch.Tensor,
     k_paged: torch.Tensor,
@@ -244,7 +370,8 @@ def run_msa_nvfp4_sparse_gqa(
     if topk != MSA_REQUIRED_TOPK:
         raise ValueError(f"MiniMax-M3 MSA NVFP4 requires topK={MSA_REQUIRED_TOPK}, got {topk}")
 
-    k2q_row_ptr, k2q_q_indices, schedule = sparse.build_k2q_csr(
+    k2q_row_ptr, k2q_q_indices, schedule = _k2q_csr_with_schedule(
+        sparse,
         q2k,
         cu_q,
         cu_kv,
@@ -254,7 +381,7 @@ def run_msa_nvfp4_sparse_gqa(
         max_seqlen_q=max_q_len,
         total_rows=total_k_rows,
         qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
-        return_schedule=True,
+        metadata=metadata,
     )
     result = sparse.sparse_atten_nvfp4_kv_func(
         q,

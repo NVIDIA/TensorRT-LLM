@@ -14,8 +14,9 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
@@ -304,6 +305,17 @@ def prewarm_split_proxy_variants(dtype: torch.dtype, num_index_heads: int, page_
         )
 
 
+def _empty_topk_table(
+    total_q: int, num_kv_heads: int, topk: int, device: torch.device, *, head_major: bool
+) -> torch.Tensor:
+    """An uninitialized [total_q, num_kv_heads, topk] int32 table, head-major backed if asked."""
+    shape = (num_kv_heads, total_q, topk) if head_major else (total_q, num_kv_heads, topk)
+    # Only a mixed step splits the table and a mixed step is never captured, so
+    # this allocation cannot land in a graph's memory pool.
+    out = torch.empty(shape, dtype=torch.int32, device=device)
+    return out.transpose(0, 1) if head_major else out
+
+
 def _combined_topk_table(
     ctx_table: torch.Tensor,
     gen_table: torch.Tensor,
@@ -372,6 +384,121 @@ def _long_select(
         key="minimax_m3_long_select",
     )
     return out
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    return os.environ.get(name, "1" if default else "0").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
+# Context-row top-16 select through minimax_m31_select_prefill_tile on sm_103: one CTA per (KV head,
+# 8 queries) reads each 32-byte score sector once. Same table as minimax_m3_select_blocks, bit for bit.
+PREFILL_SELECT_TILE = _env_flag("TRTLLM_M3_PREFILL_SELECT_TILE", True)
+# Below this many context tokens the stock select is as fast.
+PREFILL_SELECT_TILE_MIN_ROWS = int(os.environ.get("TRTLLM_M3_PREFILL_SELECT_TILE_MIN_ROWS", "256"))
+# At or below 128 blocks the stock select runs register-resident bitonic sorts and is faster.
+PREFILL_SELECT_TILE_MIN_BLOCKS = 129
+# The op's shared-memory bound (kMinimaxM3SelectPrefillTileMaxBlocks).
+PREFILL_SELECT_TILE_MAX_BLOCKS = 5856
+# Context proxy scores go into an unfilled buffer, since the proxy writes every entry the select reads.
+PREFILL_HOST_TRIMS = _env_flag("TRTLLM_M3_MSA_PREFILL_HOST_TRIMS", True)
+
+
+@functools.lru_cache(maxsize=None)
+def _prefill_tile_op(device_index: int) -> Optional[Callable]:
+    """torch.ops.trtllm.minimax_m31_select_prefill_tile on an sm_103 device, or None."""
+    if torch.cuda.get_device_capability(device_index) != (10, 3):
+        return None
+    op = getattr(torch.ops.trtllm, "minimax_m31_select_prefill_tile", None)
+    logger.info(
+        "MSA prefill select: minimax_m31_select_prefill_tile "
+        f"{'engaged' if op is not None else 'not built in this library'} "
+        f"(rows >= {PREFILL_SELECT_TILE_MIN_ROWS}, blocks <= {PREFILL_SELECT_TILE_MAX_BLOCKS})"
+    )
+    return op
+
+
+def _prefill_tile_select(
+    max_score_kv: torch.Tensor,
+    n_valid_blocks: torch.Tensor,
+    init_blocks: int,
+    local_blocks: int,
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Top-16 table from minimax_m31_select_prefill_tile, or None outside its gate or shapes.
+
+    Returns `out` when given (any [total_q, num_kv_heads, 16] int32 view with unit last-dim stride),
+    else a new head-major backed table, as select_blocks_from_maxscore(..., head_major_output=True).
+    """
+    if (
+        not PREFILL_SELECT_TILE
+        or max_score_kv.dtype != torch.float32
+        or max_score_kv.dim() != 3
+        or not max_score_kv.is_cuda
+        or max_score_kv.stride(2) != 1
+        or init_blocks < 0
+        or local_blocks < 0
+    ):
+        return None
+    num_kv_heads, num_blocks, total_q = (int(x) for x in max_score_kv.shape)
+    if (
+        total_q < max(PREFILL_SELECT_TILE_MIN_ROWS, 1)
+        or not max(PREFILL_SELECT_TILE_MIN_BLOCKS, 1)
+        <= num_blocks
+        <= PREFILL_SELECT_TILE_MAX_BLOCKS
+        or torch.compiler.is_compiling()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    op = _prefill_tile_op(max_score_kv.device.index)
+    if op is None:
+        return None
+    nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
+    if nvb.numel() < total_q:
+        return None
+    if out is None:
+        out = torch.empty(
+            (num_kv_heads, total_q, MSA_REQUIRED_TOPK),
+            dtype=torch.int32,
+            device=max_score_kv.device,
+        ).permute(1, 0, 2)
+    op(max_score_kv, nvb, out, init_blocks, local_blocks)
+    return out
+
+
+def _plan_max_k_tiles(proxy_plan: tuple) -> Optional[Tuple[int, int]]:
+    """(index heads, max_k_tiles) of the max-score block an unsplit fmha_sm100 plan writes, or None."""
+    if not isinstance(proxy_plan, tuple) or len(proxy_plan) != 5 or proxy_plan[0]:
+        return None
+    info = proxy_plan[3]
+    if not isinstance(info, dict):
+        return None
+    heads, k_tiles = info.get("orig_num_qo_heads"), info.get("max_k_tiles")
+    if not isinstance(heads, int) or not isinstance(k_tiles, int) or heads <= 0 or k_tiles <= 0:
+        return None
+    return heads, k_tiles
+
+
+def _unfilled_proxy_max_score(
+    proxy_plan: tuple, num_tokens: int, device: torch.device
+) -> Optional[torch.Tensor]:
+    """An uninitialized [heads, max_k_tiles, tokens] score block for a context proxy pass, or None.
+
+    Left to itself fmha_sm100 allocates this block filled with -inf. The fill is dead: the proxy
+    writes every block of [0, ceil(causal extent / page)) for every query, the exact range the
+    select reads through n_valid_blocks, and the padded tail past it is never read.
+    """
+    if not PREFILL_HOST_TRIMS or num_tokens <= 0:
+        return None
+    geometry = _plan_max_k_tiles(proxy_plan)
+    if geometry is None:
+        return None
+    heads, k_tiles = geometry
+    return torch.empty((heads, k_tiles, num_tokens), dtype=torch.float32, device=device)
 
 
 def _group_max_reduce(
@@ -513,27 +640,41 @@ class MsaIndexer:
                 block_size=page_size,
             )
 
-        gen_table = self._select(max_score, n_valid_blocks[gen_first:])
+        # Rows the proxy scored are context rows: the scorer owns every
+        # generation row of a step that has any.
+        gen_table = self._select(max_score, n_valid_blocks[gen_first:], prefill=not scored)
         if gen_first == 0:
             return gen_table
         # The proxy scores the context prefix into its own buffer, under the
         # plan prepare() built over rows [0, ctx_rows). Context pages are the
         # prefix of the flattened page table, so kv_indices needs no slice.
-        ctx_table = self._select(
-            self._proxy_scores(
-                idx_q[:gen_first],
-                idx_k_paged,
-                proxy_plan=proxy_plan,
-                max_score=None,
-                qo_lens_cpu=None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
-                kv_lens_cpu=None if kv_lens_cpu is None else kv_lens_cpu[:ctx_rows],
-                qo_offset_cpu=None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
-                kv_indices=kv_indices,
-                idx_sm_scale=idx_sm_scale,
-            ),
-            n_valid_blocks[:gen_first],
+        ctx_scores = self._proxy_scores(
+            idx_q[:gen_first],
+            idx_k_paged,
+            proxy_plan=proxy_plan,
+            max_score=None,
+            qo_lens_cpu=None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
+            kv_lens_cpu=None if kv_lens_cpu is None else kv_lens_cpu[:ctx_rows],
+            qo_offset_cpu=None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
+            kv_indices=kv_indices,
+            idx_sm_scale=idx_sm_scale,
         )
-        return _combined_topk_table(ctx_table, gen_table, head_major=True)
+        # The combined table is head-major like an unsplit one (see
+        # _combined_topk_table); the prefill tile select writes the context
+        # rows into it in place, so only the generation rows are copied.
+        combined = _empty_topk_table(
+            int(idx_q.shape[0]),
+            int(gen_table.shape[1]),
+            int(gen_table.shape[2]),
+            gen_table.device,
+            head_major=True,
+        )
+        ctx_out = combined[:gen_first]
+        ctx_table = self._select(ctx_scores, n_valid_blocks[:gen_first], prefill=True, out=ctx_out)
+        if ctx_table is not ctx_out:
+            ctx_out.copy_(ctx_table)
+        combined[gen_first:].copy_(gen_table)
+        return combined
 
     def _proxy_scores(
         self,
@@ -565,6 +706,8 @@ class MsaIndexer:
                 causal=True,
             )
         fmha_sm100 = require_msa_module()
+        if max_score is None:
+            max_score = _unfilled_proxy_max_score(proxy_plan, int(idx_q.shape[0]), idx_q.device)
         _, scores = fmha_sm100.fmha_sm100(
             idx_q,
             idx_k_paged,
@@ -582,12 +725,19 @@ class MsaIndexer:
         self,
         max_score: torch.Tensor,
         n_valid_blocks: torch.Tensor,
+        *,
+        prefill: bool = False,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Reduce scores to KV-head granularity and take the top-k blocks.
 
         Always into a head-major backing, whatever the step: the Triton sparse
         decode kernel reads the table head-major and takes every generation
         row, while fmha_sm100 reads whatever strides it is handed.
+
+        `prefill` marks context rows, which may take the prefill tile select;
+        it writes into `out` when given, and the caller copies any other
+        returned table there.
         """
         max_score_kv = _group_max_reduce(max_score, self.config)
         if self.selector_hook is not None:
@@ -596,6 +746,16 @@ class MsaIndexer:
                 n_valid_blocks,
                 self.config.init_blocks,
                 self.config.local_blocks,
+            )
+            if table is not None:
+                return table
+        if prefill:
+            table = _prefill_tile_select(
+                max_score_kv,
+                n_valid_blocks,
+                self.config.init_blocks,
+                self.config.local_blocks,
+                out=out,
             )
             if table is not None:
                 return table
