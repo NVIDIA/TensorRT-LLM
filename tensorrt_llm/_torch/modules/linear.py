@@ -20,7 +20,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    BufferKind, mxfp8_quantize_gemm_autotuned)
+    BufferKind, mxfp8_gemm_autotuned, mxfp8_quantize_gemm_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3399,6 +3399,46 @@ def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
         _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
 
 
+# One pending MXFP8 activation produced by a fused boundary kernel (the
+# MiniMax-M3 decode multicast layer boundary) for the very next MXFP8 linear
+# that consumes its BF16 output. The slot holds the BF16 tensor itself, so its
+# memory can't be reused for another tensor while the entry is pending; a
+# consumer takes the entry only on the same storage and shape, and any other
+# input drops it and quantizes as usual.
+_PREQUANTIZED_MXFP8: list = [None]
+
+
+def set_prequantized_mxfp8(source: torch.Tensor, act_e4m3: torch.Tensor,
+                           act_sf: torch.Tensor) -> None:
+    """Offer (act_e4m3, act_sf), the swizzled MXFP8 form of ``source``, to the next MXFP8 linear."""
+    _PREQUANTIZED_MXFP8[0] = (source, act_e4m3, act_sf,
+                              torch.cuda.current_stream(act_e4m3.device))
+
+
+def take_prequantized_mxfp8(input: torch.Tensor):
+    """The pre-quantized pair for ``input`` if it is the slot's source, else None.
+
+    Any take clears the slot, so an entry serves only the next MXFP8 linear.
+    Never taken while compiling.
+    """
+    entry = _PREQUANTIZED_MXFP8[0]
+    if entry is None or is_torch_compiling() or torch.compiler.is_compiling():
+        return None
+    _PREQUANTIZED_MXFP8[0] = None
+    source, act_e4m3, act_sf, producer = entry
+    if (input.data_ptr() != source.data_ptr()
+            or input.numel() != source.numel()
+            or input.shape[-1] != source.shape[-1]):
+        return None
+    consumer = torch.cuda.current_stream(act_e4m3.device)
+    if consumer != producer and not torch.cuda.is_current_stream_capturing():
+        # The pair was allocated on the producing stream; keep its memory
+        # alive for the consuming stream's GEMM.
+        act_e4m3.record_stream(consumer)
+        act_sf.record_stream(consumer)
+    return act_e4m3.view(input.shape), act_sf
+
+
 class MXFP8LinearMethod(LinearMethodBase):
     """MXFP8 weights (e4m3 + UE8M0 1x32) x dynamic MXFP8 activations (W8A8).
 
@@ -3582,17 +3622,34 @@ class MXFP8LinearMethod(LinearMethodBase):
             if (self.tune_decode_graph_backends and not is_torch_compiling()
                     and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
-                output = mxfp8_quantize_gemm_autotuned(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    module.dtype,
-                    tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
-                )
+                # An activation a decode boundary kernel already quantized
+                # (MiniMax-M3 multicast boundary) runs only the GEMM half,
+                # with the same op key and tuned tactic per bucket.
+                prequantized = take_prequantized_mxfp8(input)
+                if prequantized is not None:
+                    output = mxfp8_gemm_autotuned(
+                        prequantized[0],
+                        prequantized[1],
+                        module.weight,
+                        module.weight_scale,
+                        module.dtype,
+                        tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+                    )
+                else:
+                    output = mxfp8_quantize_gemm_autotuned(
+                        input,
+                        module.weight,
+                        module.weight_scale,
+                        module.dtype,
+                        tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+                    )
             else:
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
-                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                prequantized = take_prequantized_mxfp8(input)
+                act_e4m3, act_sf = (prequantized if prequantized is not None
+                                    else torch.ops.trtllm.mxfp8_quantize(
+                                        input, True))
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or

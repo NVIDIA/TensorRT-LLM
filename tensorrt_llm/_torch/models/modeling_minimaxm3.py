@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch import minimax_m3_decode_glue as _glue
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -62,19 +63,28 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
+    MXFP8LinearMethod,
     TensorParallelMode,
     WeightMode,
     WeightsLoadingConfig,
     copy_weight,
+    flashinfer_mxfp8_decode_graph_capture_active,
     load_weight_shard,
+    set_prequantized_mxfp8,
 )
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import _record_stream, do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
+from ..utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    get_model_extra_attrs,
+    is_torch_compiling,
+)
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import (
     MINIMAX_M3_PARAMS_MAP,
@@ -823,6 +833,187 @@ class MiniMaxM3MoE(nn.Module):
         # ``maybe_execute_in_parallel`` runs fn0/fn1 sequentially.
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
+        # Decode glue (minimax_m3_decode_glue): the per-layer verdict, decided at the first decode forward, and the
+        # event the main stream waits on for the NVFP4 input quantized on the aux stream.
+        self._decode_glue_layer_ok: Optional[bool] = None
+        self._decode_glue_quant_event = torch.cuda.Event()
+
+    def fp4_input_scale(self, num_rows: int) -> Optional[torch.Tensor]:
+        """The routed experts' NVFP4 fc31 input scale when a pre-quantized input can stand in for quantize_input.
+
+        Only for a single-chunk, non-DP, non-fused-comm forward of the TRT-LLM-op NVFP4 TRTLLM-gen leaf with no AWQ
+        pre-scale and no hidden padding: there quantize_input is exactly fp4_quantize(x, fc31_input_scale, 16, False,
+        False) and passes an unswizzled Fp4QuantizedTensor through unchanged.
+        """
+        from ..moe.fused_moe.trtllm_gen.trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
+
+        experts = self.experts
+        backend = getattr(experts, "backend", None)
+        if (
+            type(backend) is not TrtllmTrtllmGenNvfp4Impl
+            or self.routed_output_is_global
+            or getattr(experts, "use_dp", False)
+            or getattr(experts, "enable_dwdp", False)
+            or getattr(experts, "use_flashinfer", False)
+            or num_rows > getattr(experts, "moe_max_num_tokens", 0)
+            or getattr(backend, "fc31_act_scale", None) is not None
+            or getattr(backend, "scaling_vector_size", None) != 16
+        ):
+            return None
+        w = getattr(backend, "w3_w1_weight", None)
+        if w is None or w.shape[-1] * 2 != self.hidden_dim:
+            return None
+        scale = getattr(backend, "fc31_input_scale", None)
+        if (
+            not isinstance(scale, torch.Tensor)
+            or scale.dtype != torch.float32
+            or scale.numel() != 1
+        ):
+            return None
+        return scale
+
+    def _decode_glue_layer_reason(self) -> Optional[str]:
+        """Why this layer cannot run the decode glue (hoisted NVFP4 quantize / router_tc), or None. Layer-static."""
+        from ..moe.fused_moe import ConfigurableMoE
+        from ..moe.fused_moe.interface import FORCE_SEPARATED_ROUTING
+        from ..moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
+
+        experts = self.experts
+        if self.shared_experts is None or self.aux_stream is None:
+            return "no shared expert or aux stream"
+        if not isinstance(experts, ConfigurableMoE):
+            return f"experts {type(experts).__name__}"
+        if type(getattr(experts, "scheduler", None)) is not ExternalCommMoEScheduler:
+            return f"scheduler {type(getattr(experts, 'scheduler', None)).__name__}"
+        if (
+            getattr(experts, "comm", None) is not None
+            or getattr(experts, "layer_load_balancer", None) is not None
+            or getattr(experts, "apply_router_weight_on_input", False)
+        ):
+            return "communication strategy, EPLB or router weight on input"
+        if (
+            experts.backend._supports_load_balancer()
+            or experts.routing_method.requires_separated_routing
+            or FORCE_SEPARATED_ROUTING
+        ):
+            # The routing step outside the kernel would see the quantized carrier instead of the activation.
+            return "separated routing"
+        if self.fp4_input_scale(0) is None:
+            return "the experts take no pre-quantized NVFP4 input"
+        return None
+
+    def decode_glue_applies(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict],
+        for_boundary: bool = False,
+    ) -> bool:
+        """Whether decode_glue_parts() can run this forward: a multi-stream (decode CUDA-graph) forward on SM100/SM103
+        with one MoE chunk whose experts accept a pre-quantized NVFP4 input. Decided from shapes and configuration
+        only, so every TP rank decides alike. for_boundary: the multicast boundary asks for the parts even when the
+        hoist and router_tc are off."""
+        if not (for_boundary or _glue.NVFP4_HOIST or _glue.ROUTER_TC) or not _glue.arch_ok():
+            return False
+        if is_torch_compiling() or torch.compiler.is_compiling() or not do_multi_stream():
+            return False
+        rows = int(hidden_states.shape[0])
+        if (
+            lora_params
+            or hidden_states.dim() != 2
+            or hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_cuda
+            or not 0 < rows <= _glue.HOIST_MAX_ROWS
+        ):
+            return False
+        if self._decode_glue_layer_ok is None:
+            reason = self._decode_glue_layer_reason()
+            self._decode_glue_layer_ok = reason is None
+            if reason is not None:
+                logger.info_once(
+                    f"MiniMax-M3 decode glue off for this layer: {reason}",
+                    key="m3_decode_glue_layer",
+                )
+        if not self._decode_glue_layer_ok or self.fp4_input_scale(rows) is None:
+            return False
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        return (
+            self.experts.calculate_num_chunks(
+                list(all_rank_num_tokens) if all_rank_num_tokens is not None else [rows]
+            )
+            == 1
+        )
+
+    def _decode_router_tc_applies(self, hidden_states: torch.Tensor) -> bool:
+        weight = self.gate.weight
+        return (
+            _glue.ROUTER_TC
+            and _glue.rows_in(_glue.ROUTER_TC_ROWS, int(hidden_states.shape[0]))
+            and weight.dtype == torch.float32
+            and weight.is_contiguous()
+            and weight.shape[0] == 128
+            and weight.shape[1] % 1024 == 0
+            and hidden_states.is_contiguous()
+            and hidden_states.data_ptr() % 16 == 0
+        )
+
+    def decode_glue_parts(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(shared expert output, routed output) of a decode forward, before their add and all-reduce; only after
+        decode_glue_applies(). The routed experts take their NVFP4 input from router_tc (2..48 rows: one kernel for the
+        router logits and the quantize) or else from the quantize run first on the aux stream, off the router chain."""
+        experts = self.experts
+        use_tc = self._decode_router_tc_applies(hidden_states)
+        hoist = not use_tc and _glue.NVFP4_HOIST
+        main_event = self.event_dict[EventType.Main]
+        shared_event = self.event_dict[EventType.MoeShared]
+        main_event.record()
+        with torch.cuda.stream(self.aux_stream):
+            main_event.wait()
+            if hoist:
+                x_fp4, x_sf = experts.backend.quantize_input(hidden_states, post_quant_comm=False)
+                self._decode_glue_quant_event.record()
+            shared_output = self.shared_experts(hidden_states, lora_params=lora_params)
+            shared_event.record()
+        if use_tc:
+            router_logits, x_fp4, x_sf = torch.ops.trtllm.minimax_m3_router_tc(
+                hidden_states, self.gate.weight, experts.backend.fc31_input_scale, _glue.USE_PDL
+            )
+        else:
+            router_logits = self.gate(hidden_states)
+            if hoist:
+                self._decode_glue_quant_event.wait()
+        routed_input, routed_dtype = hidden_states, None
+        if use_tc or hoist:
+            routed_input = Fp4QuantizedTensor(
+                x_fp4, x_sf, is_sf_swizzled=False, unquantized_hidden_states=hidden_states
+            )
+            routed_dtype = hidden_states.dtype
+        routed_output = experts(
+            routed_input,
+            router_logits,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            use_dp_padding=False,
+            output_dtype=routed_dtype,
+            lora_params=lora_params,
+        )
+        shared_event.wait()
+        if not torch.cuda.is_current_stream_capturing():
+            # As in maybe_execute_in_parallel: tensors made on the aux stream are used on this one.
+            _record_stream(
+                (x_fp4, x_sf, shared_output) if hoist else shared_output,
+                torch.cuda.current_stream(),
+            )
+        logger.info_once(
+            f"MiniMax-M3 decode MoE: {'router_tc' if use_tc else 'hoisted NVFP4 quantize' if hoist else 'stock'} "
+            f"({_glue.describe()})",
+            key=f"m3_decode_glue_moe_{use_tc}_{hoist}",
+        )
+        return shared_output, routed_output
 
     def forward(
         self,
@@ -832,6 +1023,15 @@ class MiniMaxM3MoE(nn.Module):
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+
+        if self.decode_glue_applies(hidden_states, attn_metadata, lora_params):
+            shared_output, routed_output = self.decode_glue_parts(
+                hidden_states, attn_metadata, lora_params
+            )
+            result = shared_output.add_(routed_output)
+            if self.allreduce is not None:
+                result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
+            return result
 
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
@@ -2629,6 +2829,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         # next layer's input_layernorm (or the final model norm for the last
         # layer). None disables POST fusion and boundary-norm folding.
         self.next_layer_layernorm: Optional[RMSNorm] = None
+        # Whether next_layer_layernorm feeds an MXFP8 QKV projection (set with it), which the multicast decode
+        # boundary (minimax_m3_decode_glue) hands its MXFP8 copy.
+        self.next_layer_norm_feeds_mxfp8 = False
 
     def forward(
         self,
@@ -2752,6 +2955,76 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             return AllReduceParams(enable_allreduce=False)
         return None
 
+    def _mc_boundary_workspace(
+        self,
+        hidden_states: torch.Tensor,
+        spec_metadata: Optional[SpecMetadata],
+        lora_params: Optional[dict],
+    ):
+        """The multicast workspace when this post-feed-forward boundary takes minimax_m3_mc_allreduce_norm (see
+        minimax_m3_decode_glue), else None. Shapes and configuration only, so every TP rank decides alike."""
+        if not _glue.MC_BOUNDARY or not _glue.arch_ok():
+            return None
+        if (
+            is_torch_compiling()
+            or torch.compiler.is_compiling()
+            or not flashinfer_mxfp8_decode_graph_capture_active()
+            or is_in_breakable_cuda_graph()
+        ):
+            return None
+        rows, hidden = int(hidden_states.shape[0]), int(hidden_states.shape[-1])
+        norm = self.next_layer_layernorm
+        if (
+            lora_params
+            or not _glue.rows_in(_glue.MC_ROWS, rows)
+            or hidden_states.dim() != 2
+            or hidden_states.dtype != torch.bfloat16
+            or hidden % 128 != 0
+            # A next decoder layer's MXFP8 QKV consumes the MXFP8 copy; the last layer keeps the final norm stock.
+            or norm is None
+            or not self.post_feed_forward_fusion
+            or not self.next_layer_norm_feeds_mxfp8
+            or self.allreduce is None
+            or not 2 <= self.mapping.tp_size <= 8
+            or self.mapping.is_multi_node()
+            or (spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx))
+        ):
+            return None
+        weight = norm.weight
+        if (
+            weight.dtype != torch.bfloat16
+            or weight.dim() != 1
+            or not weight.is_contiguous()
+            or weight.shape[0] != hidden
+            or norm.use_gemma
+        ):
+            return None
+        return _glue.McBoundary.workspace(self.mapping, hidden)
+
+    def _mc_allreduce_norm(
+        self,
+        workspace,
+        x: torch.Tensor,
+        x2: Optional[torch.Tensor],
+        residual: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """(normed, updated) of the multicast boundary for the TP-partial x (+ x2), with the MXFP8 copy of normed left
+        for the next layer's QKV projection; None when the operands are outside the op."""
+        residual = residual if residual.is_contiguous() else residual.contiguous()
+        norm = self.next_layer_layernorm
+        outs = _glue.McBoundary.allreduce_norm(
+            workspace, x, x2, residual, norm.weight, norm.variance_epsilon
+        )
+        if outs is None:
+            return None
+        normed, updated, act_e4m3, act_sf = outs[:4]
+        set_prequantized_mxfp8(normed, act_e4m3, act_sf)
+        logger.info_once(
+            f"MiniMax-M3 multicast boundary all-reduce taken ({_glue.describe()})",
+            key="m3_mc_boundary_taken",
+        )
+        return normed, updated
+
     def forward_MoE(
         self,
         hidden_states: torch.Tensor,
@@ -2761,6 +3034,18 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+
+        workspace = self._mc_boundary_workspace(hidden_states, spec_metadata, lora_params)
+        if workspace is not None and self.block_sparse_moe.decode_glue_applies(
+            hidden_states, attn_metadata, lora_params, for_boundary=True
+        ):
+            shared_output, routed_output = self.block_sparse_moe.decode_glue_parts(
+                hidden_states, attn_metadata, lora_params
+            )
+            fused = self._mc_allreduce_norm(workspace, shared_output, routed_output, residual)
+            if fused is not None:
+                return fused
+            return self._apply_next_layer_layernorm(shared_output.add_(routed_output), residual)
 
         hidden_states = self.block_sparse_moe(
             hidden_states,
@@ -2783,11 +3068,16 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
+        workspace = self._mc_boundary_workspace(hidden_states, spec_metadata, lora_params)
         hidden_states = self.mlp(
             hidden_states,
             final_all_reduce_params=self._feed_forward_all_reduce_params(),
             lora_params=lora_params,
         )
+        if workspace is not None:
+            fused = self._mc_allreduce_norm(workspace, hidden_states, None, residual)
+            if fused is not None:
+                return fused
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
@@ -3074,8 +3364,13 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         for idx, layer in enumerate(layers):
             if idx == num_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
+                layer.next_layer_norm_feeds_mxfp8 = False
             else:
                 layer.next_layer_layernorm = layers[idx + 1].input_layernorm
+                qkv_proj = getattr(layers[idx + 1].self_attn, "qkv_proj", None)
+                layer.next_layer_norm_feeds_mxfp8 = isinstance(
+                    getattr(qkv_proj, "quant_method", None), MXFP8LinearMethod
+                )
 
 
 def _strip_language_model_prefix(
