@@ -2069,6 +2069,9 @@ def test_profiling_failure_releases_resources_and_restores_response_state():
     creator._dummy_reqs = []
     creator._encode_dummy_inputs = Mock(return_value=None)
     executor = Mock()
+    warmup_scope = MagicMock()
+    warmup_scope.__exit__.return_value = False
+    executor.warmup_scope.return_value = warmup_scope
     executor.dist.mapping.rank = 0
     executor.dist.broadcast.side_effect = lambda value, root: value
     executor.enable_iter_perf_stats = True
@@ -2088,6 +2091,8 @@ def test_profiling_failure_releases_resources_and_restores_response_state():
 
     executor.release_resources.assert_called_once_with()
     executor.shutdown.assert_not_called()
-    assert executor.is_warmup is False
+    executor.warmup_scope.assert_called_once_with()
+    warmup_scope.__enter__.assert_called_once()
+    warmup_scope.__exit__.assert_called_once()
     assert executor.enable_iter_perf_stats is True
     assert executor.set_gather_responses.call_args.args == (False,)

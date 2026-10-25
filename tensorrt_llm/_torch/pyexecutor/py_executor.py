@@ -2201,9 +2201,6 @@ class PyExecutor:
         if not self._release_execution_resources():
             raise RuntimeError(
                 "Cannot release resources after an executor hang")
-        for engine in (self.model_engine, self.draft_model_engine):
-            if engine is not None:
-                engine.attn_metadata = None
         self.resource_manager = None
         self.scheduler = None
         self.kv_cache_manager = None

@@ -23,17 +23,23 @@ from tensorrt_llm._torch.pyexecutor.sampler import AsyncWorkerMixin
 pytestmark = pytest.mark.cpu_only
 
 
+class _Engine(SimpleNamespace):
+    @property
+    def attn_metadata(self):
+        return self._attn_metadata
+
+
 @pytest.fixture
 def executor(monkeypatch):
     events = []
-    engine = SimpleNamespace(
-        attn_metadata=object(),
+    engine = _Engine(
+        _attn_metadata=object(),
         _release_cuda_graphs=lambda: events.append("graphs"),
     )
 
     def release_engine_resources(*, release_model_owned_graphs):
         engine._release_cuda_graphs()
-        engine.attn_metadata = None
+        engine._attn_metadata = None
 
     engine.release_executor_resources = Mock(side_effect=release_engine_resources)
     cache = SimpleNamespace(shutdown=lambda: events.append("cache"))
@@ -84,14 +90,14 @@ def executor(monkeypatch):
 
 def test_release_preserves_model_and_orders_gpu_teardown(executor):
     ex, events = executor
-    draft_engine = SimpleNamespace(
-        attn_metadata=object(),
+    draft_engine = _Engine(
+        _attn_metadata=object(),
         _release_cuda_graphs=lambda: events.append("draft_graphs"),
     )
 
     def release_draft_resources(*, release_model_owned_graphs):
         draft_engine._release_cuda_graphs()
-        draft_engine.attn_metadata = None
+        draft_engine._attn_metadata = None
 
     draft_engine.release_executor_resources = Mock(side_effect=release_draft_resources)
     ex.draft_model_engine = draft_engine
