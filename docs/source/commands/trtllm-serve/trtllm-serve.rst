@@ -89,6 +89,7 @@ At high concurrency a single serving process is host-bound: one asyncio event lo
    * Pass ``--num_serve_frontends 1`` (or set ``num_serve_frontends: 1`` in the ``--config`` YAML) to run a single frontend.
    * The default applies to the OpenAI HTTP server on the default executor path on a fixed port. With ``--port 0`` / ``--report_addr``, ``orchestrator_type`` (``rpc`` / ``ray``), ``enable_resource_governor``, ``--enable_sleep_mode``, ``--metadata_server_config_file`` or a disaggregated cluster (``disagg_cluster`` / ``--disagg_cluster_uri``) it falls back to one frontend and logs why; an explicit ``--num_serve_frontends`` greater than 1 fails instead. ``--grpc`` also keeps one frontend unless ``--num_serve_frontends`` is given (only ``--grpc-protocol openengine`` supports more).
    * Each request is handled entirely by the frontend that accepted its connection, and per-process state is not shared: the stateful Responses API store (``store`` / ``previous_response_id``) is disabled, and ``/metrics``, ``/perf_metrics``, ``/prometheus/metrics`` and ``/health`` describe the frontend that happened to answer rather than the whole server.
+   * ``SO_REUSEPORT`` would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.
    * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
 
 Inference Endpoints

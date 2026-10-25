@@ -488,6 +488,35 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+def _reserve_multi_frontend_port(host: str, port: int,
+                                 family: socket.AddressFamily) -> socket.socket:
+    """Refuse a port another server uses; return a lock to hold while serving.
+
+    The frontends bind the port with SO_REUSEPORT, which lets any socket of the
+    same user that also sets it join: a second server on a busy port would share
+    its traffic instead of failing. A plain bind fails on any listener
+    (SO_REUSEADDR keeps TIME_WAIT leftovers out), and an abstract Unix socket
+    named after the port stops a second launcher before this one listens.
+    """
+    lock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        lock.bind(f"\0trtllm-serve-{os.geteuid()}-{port}")
+    except OSError as e:
+        lock.close()
+        raise RuntimeError(f"Port {port} is already reserved by another "
+                           f"multi-frontend trtllm-serve: {e}") from e
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, port))
+    except OSError as e:
+        lock.close()
+        raise RuntimeError(
+            f"Failed to bind socket to {host}:{port}: {e}. "
+            f"Port holder(s): {_diagnose_port_in_use(port)}") from e
+    return lock
+
+
 @contextlib.contextmanager
 def _provision_kv_cache_pool(llm_args: dict,
                              owns_engine: bool = True) -> Iterator[None]:
@@ -674,7 +703,9 @@ def launch_server(
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
-    with socket.socket(address_family, socket.SOCK_STREAM) as s:
+    port_lock = (_reserve_multi_frontend_port(host, port, address_family)
+                 if multi_frontend.is_launcher else contextlib.nullcontext())
+    with port_lock, socket.socket(address_family, socket.SOCK_STREAM) as s:
         # port == 0 lets the kernel pick the port; the caller then needs a way
         # to learn it, either by service discovery or by report_addr.
         assert port > 0 or disagg_cluster_config is not None or report_addr, (

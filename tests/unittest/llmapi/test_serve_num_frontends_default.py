@@ -12,15 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for trtllm-serve's multi-frontend default and its fallback to one."""
+"""CPU tests for trtllm-serve's multi-frontend default, its fallback to one, and its port guard."""
 
+import socket
 from unittest import mock
 
 import pytest
 
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.commands import serve as serve_cmd
 from tensorrt_llm.commands.serve import (
     DEFAULT_NUM_SERVE_FRONTENDS,
+    _reserve_multi_frontend_port,
     _resolve_default_num_serve_frontends,
 )
 
@@ -92,3 +95,25 @@ def test_frontend_count_reaching_launch_server(
         serve_cmd.main(args=[str(tmp_path), *args], standalone_mode=False)
 
     assert launch.call_args.args[2].get("num_serve_frontends", 1) == expected
+
+
+def test_port_used_by_another_server_is_refused() -> None:
+    # Another multi-frontend server listens with SO_REUSEPORT: without the
+    # check, this launcher would join its port and share its traffic.
+    with socket.socket() as other:
+        other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        other.bind(("127.0.0.1", 0))
+        other.listen()
+        port = other.getsockname()[1]
+        with pytest.raises(RuntimeError, match="Failed to bind socket"):
+            _reserve_multi_frontend_port("127.0.0.1", port, socket.AF_INET)
+
+
+def test_port_reserved_by_another_launcher_is_refused() -> None:
+    # A launcher binds its port long before it listens: only its lock shows.
+    port = get_free_port()
+    with _reserve_multi_frontend_port("127.0.0.1", port, socket.AF_INET):
+        with pytest.raises(RuntimeError, match="another multi-frontend trtllm-serve"):
+            _reserve_multi_frontend_port("127.0.0.1", port, socket.AF_INET)
+    # The lock goes with the launcher.
+    _reserve_multi_frontend_port("127.0.0.1", port, socket.AF_INET).close()
