@@ -3091,6 +3091,11 @@ class _LeaseBase:
         return self._failure
 
     @property
+    def writable(self) -> bool:
+        """See ``Lease.writable``."""
+        return self._kind == "write"
+
+    @property
     def return_resumes_at_end(self) -> bool:
         """See ``Lease.return_resumes_at_end``."""
         return self._at_end and self._view_returned

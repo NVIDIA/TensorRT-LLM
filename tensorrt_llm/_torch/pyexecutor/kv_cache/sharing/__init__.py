@@ -21,6 +21,7 @@ import typing as _typing
 
 from ._types import (
     ALL_ARRIVED,
+    Arrived,
     HeldPages,
     HoldReason,
     Lease,
@@ -40,6 +41,7 @@ if _typing.TYPE_CHECKING:
 
 __all__ = [
     "ALL_ARRIVED",
+    "Arrived",
     "HeldPages",
     "HoldReason",
     "LentLayerGroupRows",

@@ -542,6 +542,12 @@ class Lease(Protocol):
         """Why the lease will never be ready, once that is known; for logs only."""
         ...
 
+    @property
+    def writable(self) -> bool:
+        """Whether ``lend_write`` lent the lease, so a backend may write its view; fixed for the
+        lease's life."""
+        ...
+
     def release(self) -> None:
         """Return the lease once all backend access ended; idempotent and legal in every state.
 

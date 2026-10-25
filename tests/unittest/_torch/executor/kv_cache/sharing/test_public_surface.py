@@ -53,8 +53,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
 SH = "tensorrt_llm._torch.pyexecutor.kv_cache.sharing"
 MGR = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
 PUBLIC = sorted(
-    "ALL_ARRIVED HeldPages HoldReason LentLayerGroupRows Lease MemoryKind MemoryRegion RegionHold "
-    "ResumeBounds RowSelection LeaseView Lender StagingOptions attach_lender".split()
+    "ALL_ARRIVED Arrived HeldPages HoldReason LentLayerGroupRows Lease MemoryKind MemoryRegion "
+    "RegionHold ResumeBounds RowSelection LeaseView Lender StagingOptions attach_lender".split()
 )
 MODULES = [
     "__init__.py",
@@ -385,7 +385,7 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
     def members(cls):
         return {n for n in vars(cls) if not n.startswith("_")}
 
-    assert members(Lease) == {"poll", "failure", "release", "return_resumes_at_end"}
+    assert members(Lease) == {"poll", "failure", "writable", "release", "return_resumes_at_end"}
     assert members(Lender) == {
         "regions",
         "page_layout",
@@ -404,6 +404,7 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
         assert not isinstance(object(), protocol), "checkable at run time"
     assert isinstance(Lease.failure, property) and isinstance(Lender.regions, property)
     assert isinstance(Lease.return_resumes_at_end, property)
+    assert isinstance(Lease.writable, property)
     assert isinstance(Lender.page_layout, property)
     # The checks are structural: a lease passes as a hold.
     lease = object.__new__(_lender._StagingLease)
@@ -458,7 +459,7 @@ def public_names(obj) -> Set[str]:
     return {n for n in dir(obj) if not n.startswith("_")}
 
 
-LEASE_MEMBERS = {"poll", "failure", "release", "return_resumes_at_end"}
+LEASE_MEMBERS = {"poll", "failure", "writable", "release", "return_resumes_at_end"}
 LENDER_MEMBERS = {
     "regions",
     "page_layout",
