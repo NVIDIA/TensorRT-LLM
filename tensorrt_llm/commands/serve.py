@@ -72,7 +72,8 @@ from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve._frontend_processes import (
     _init_multi_frontend_mode, _signal_frontend_ready,
-    _spawn_attached_frontends, _terminate_attached_frontends)
+    _spawn_attached_frontends, _terminate_attached_frontends,
+    _watch_attached_frontends)
 from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
                                                LAUNCHER_UDS_NAME,
                                                MultiFrontendServing)
@@ -675,6 +676,7 @@ def launch_server(
             # server construction, middleware registration, and runtime, or a
             # failure in between leaks the child processes.
             frontend_children = []
+            stop_watching_frontends = None
             sockets = [s]
             launcher_uds_sock = None
             launcher_uds_path = None
@@ -689,6 +691,8 @@ def launch_server(
                         multi_frontend.num_frontends,
                         extra_env={LAUNCHER_UDS_ENV: launcher_uds_path},
                         report_failure=_report_observed_child_failure)
+                    stop_watching_frontends = _watch_attached_frontends(
+                        frontend_children)
                     multi_frontend_serving = MultiFrontendServing(
                         launcher_uds=launcher_uds_path, is_launcher=True)
                     sockets.append(launcher_uds_sock)
@@ -719,6 +723,8 @@ def launch_server(
                 _signal_frontend_ready(multi_frontend)
                 uvloop.run(server(host, port, sockets=sockets))
             finally:
+                if stop_watching_frontends is not None:
+                    stop_watching_frontends.set()
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)
                 if launcher_uds_sock is not None:

@@ -17,6 +17,8 @@
 import asyncio
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -32,7 +34,8 @@ from starlette.routing import Match
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
-from tensorrt_llm.serve import openai_server
+from tensorrt_llm.serve import _frontend_processes, openai_server
+from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
 from tensorrt_llm.serve.multi_frontend import (
     FORWARDED_ROUTES,
     AttachedFrontendWatchdog,
@@ -213,6 +216,29 @@ def test_watchdog_notices_a_gone_launcher_process(tmp_path) -> None:
 
     asyncio.run(run())
     assert len(deaths) == 1 and "exited" in str(deaths[0])
+
+
+def test_launcher_logs_an_attached_frontend_that_dies(monkeypatch) -> None:
+    errors = []
+    monkeypatch.setattr(_frontend_processes.logger, "error", errors.append)
+    sleeper = [sys.executable, "-c", "import time; time.sleep(60)"]
+    children = [subprocess.Popen(sleeper) for _ in range(2)]
+    try:
+        stopping = _watch_attached_frontends(children, interval_s=0.01)
+        children[0].kill()
+        deadline = time.monotonic() + 10
+        while not errors and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # Exits once the launcher terminates the group are expected.
+        stopping.set()
+        children[1].kill()
+        time.sleep(0.1)
+    finally:
+        for child in children:
+            child.kill()
+            child.wait()
+    assert len(errors) == 1
+    assert "frontend 1 " in errors[0] and "signal 9" in errors[0] and "2 of 3" in errors[0]
 
 
 @pytest.mark.parametrize("doing_shutdown", [False, True])
