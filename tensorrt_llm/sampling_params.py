@@ -194,7 +194,7 @@ class SamplingParams:
         pad_id (int, optional): The pad token id. Defaults to None.
         max_tokens (int): The maximum number of tokens to generate. Defaults to 32.
         bad (str, List[str], optional): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output. Defaults to None.
-        bad_token_ids (List[Union[int, List[int]]], optional): A list of bad token id sequences that redirect the generation when they are generated, so that the bad ids are excluded from the returned output. Each element is either a single token id or a list of token ids forming a multi-token bad word. Defaults to None.
+        bad_token_ids (List[Union[int, List[int]]], optional): A list of token id sequences that must not appear in the output. Each element is either a single token id or a list of token ids forming a multi-token bad word. Like ``bad``, this works by banning the last id of a sequence once the already generated tokens match the rest of it, so the sequence is never produced rather than removed afterwards. Defaults to None.
         stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
@@ -379,6 +379,21 @@ class SamplingParams:
         For instance, while the greedy decoding with n > 1 is capable in the
         Executor class of C++ runtime, the LLM API disallows such combination.
         """
+        if self.bad_token_ids is not None:
+            for word in self.bad_token_ids:
+                if isinstance(word, int):
+                    continue
+                if (
+                    isinstance(word, (list, tuple))
+                    and len(word) > 0
+                    and all(isinstance(t, int) for t in word)
+                ):
+                    continue
+                raise ValueError(
+                    "bad_token_ids entries must be an int or a non-empty list "
+                    f"of ints, got {word!r}"
+                )
+
         # These bounds are written as negated range checks rather than as
         # `value < low or value > high`, so that NaN is rejected too: every
         # comparison against NaN is False, which lets it slip through the
