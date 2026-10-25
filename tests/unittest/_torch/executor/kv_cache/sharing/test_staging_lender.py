@@ -117,13 +117,11 @@ def check_staged(kit, mgr, lender, request, view):
     dev = kit.DevicePages(mgr)
     rows = 0
     for run in view.groups:
-        region = lender.regions[run.region_index]
-        assert run.layer_group_index in lender.regions[run.region_index].layer_group_indices
+        region, addresses = kit.staged_slots(lender, run)
         assert region.slot_bytes == dev.page_bytes(run.layer_group_index)
         slots = kit.pages(kv, run.layer_group_index)
-        for address, ordinal in zip(run.addresses.tolist(), run.page_ordinals.tolist()):
+        for address, ordinal in zip(addresses, run.page_ordinals.tolist()):
             assert region.address <= address < region.address + region.nbytes
-            assert (address - region.address) % region.slot_bytes == 0
             device = kit.digest(dev.read(run.layer_group_index, slots[ordinal]))
             assert kit.digest(kit.host_bytes(address, region.slot_bytes)) == device
             rows += 1
@@ -865,7 +863,7 @@ def test_a_publish_lends_the_committed_pages_under_their_reuse_keys(kit, real_ma
         view = kit.ready_view(lease, mgr)
         assert isinstance(view, LeaseView) and lease.poll() is view, "one view, every poll"
         (run,) = view.groups
-        assert run.page_ordinals.tolist() == list(range(BLOCKS)) and run.region_index == 0
+        assert run.page_ordinals.tolist() == list(range(BLOCKS)) and run.region_indices == (0,)
         assert check_staged(kit, mgr, lender, source, view) == BLOCKS
         kv = kit.kv(mgr, source)
         assert [bytes(name[16:48]) for name in run.object_keys] == kit.chain_keys(kv, tokens)[
@@ -945,8 +943,8 @@ def test_a_windowed_publish_lends_only_what_the_window_at_its_end_reads(kit, rea
         blocks = range(WINDOWED_END // TPB)
         in_window = [o for o in blocks if not beg <= o < end]
         assert by_group(view) == {full: list(blocks), sliding: in_window}
-        addresses = np.concatenate([run.addresses for run in view.groups])
-        assert len(set(addresses.tolist())) == len(addresses), "every row has its own slot"
+        addresses = [a for run in view.groups for a in kit.staged_slots(lender, run)[1]]
+        assert len(set(addresses)) == len(addresses), "every row has its own slot"
         assert check_staged(kit, mgr, lender, source, view) == len(addresses)
         lease.release()
 
@@ -1106,7 +1104,8 @@ def test_capacity_in_fetches_is_a_budget_and_holes_can_make_a_lease_wait(kit, re
         assert fetch.poll() is None and fetch.failure is None, "no three free slots in a row"
         second.release()  # slots 0 to 2 are free in a row
         (run,) = kit.ready_view(fetch, mgr).groups
-        assert ((run.addresses - region.address) // region.slot_bytes).tolist() == [0, 1, 2]
+        assert run.slots.tolist() == [0, 1, 2]
+        assert kit.staged_slots(lender, run)[0] == region
         for lease in (third, fetch):
             lease.release()
 
@@ -1452,8 +1451,8 @@ def test_a_publish_granted_before_its_request_is_freed_copies_what_it_lent(kit, 
         sentinel = bytes([kit.SENTINEL]) * dev.page_bytes(0)
         assert all(dev.read(0, slot) == sentinel for slot in lent), "the pages were not overwritten"
         (run,) = kit.ready_view(lease, mgr).groups
-        length = lender.regions[run.region_index].slot_bytes
-        got = kit.digest([kit.host_bytes(a, length) for a in run.addresses.tolist()])
+        region, addresses = kit.staged_slots(lender, run)
+        got = kit.digest([kit.host_bytes(a, region.slot_bytes) for a in addresses])
         assert got == kit.digest(original), "the copy read a later owner's writes"
         lease.release()
         others.free()
@@ -1985,8 +1984,8 @@ def test_the_fresh_page_fill_lets_a_freed_publisher_s_copy_run_first(
         assert began and not began[0], "the copy ran before the fill: the check proves nothing"
         assert lent & set(kit.pages(kit.kv(mgr, taken), 0)), "no freed page was taken"
         (run,) = kit.ready_view(read, mgr).groups
-        length = lender.regions[run.region_index].slot_bytes
-        got = kit.digest([kit.host_bytes(a, length) for a in run.addresses.tolist()])
+        region, addresses = kit.staged_slots(lender, run)
+        got = kit.digest([kit.host_bytes(a, region.slot_bytes) for a in addresses])
         assert got == kit.digest(original), "the fill overwrote a page before its copy ran"
         read.release()
         if write is not None:
@@ -3919,8 +3918,8 @@ def test_a_reuse_reset_stops_lending_by_name(kit, real_manager, attach=attach):
             mgr.free_resources(request)
         mgr.reset_reuse_state()  # what reset_prefix_cache does when a weight update ends
         (run,) = kit.ready_view(publish, mgr).groups  # granted before the reset: it finishes
-        length = lender.regions[run.region_index].slot_bytes
-        staged = [kit.host_bytes(a, length) for a in run.addresses.tolist()]
+        region, addresses = kit.staged_slots(lender, run)
+        staged = [kit.host_bytes(a, region.slot_bytes) for a in addresses]
         assert kit.digest(staged) == kit.digest(original), "the granted publish lost its bytes"
         # Its request is gone: nothing is copied, and the request has no bounds.
         assert kit.return_write(lender, fetch, fetch_view.row_masks(True)) is None
@@ -4017,7 +4016,7 @@ def test_an_unreleased_lease_keeps_the_staging_memory_until_exit(
             address, content = None, None
         else:
             lease = lender.lend_read(source, 0, END, **kit.HOST_NAMED)
-            address = int(kit.ready_view(lease, mgr).groups[0].addresses[0])
+            address = kit.staged_slots(lender, kit.ready_view(lease, mgr).groups[0])[1][0]
             content = kit.host_bytes(address, regions[0].slot_bytes)
         warnings = kit.lender_warnings(monkeypatch)
         mgr.shutdown()
@@ -4582,7 +4581,7 @@ def test_an_error_in_the_free_hook_stops_the_lender(kit, real_manager, monkeypat
             kit.return_write(lender, seen, seen_view.row_masks(True))
             mgr._stream.synchronize()
             for run in seen_view.groups:
-                nbytes = lender.regions[run.region_index].slot_bytes
+                nbytes = kit.staged_slots(lender, run)[0].slot_bytes
                 for ordinal in run.page_ordinals.tolist():
                     got = kit.digest(kit.page(mgr, seen_target, run.layer_group_index, ordinal))
                     want = kit.digest(kit.staged_row(0x5A, run.layer_group_index, ordinal, nbytes))
@@ -4624,7 +4623,7 @@ def test_an_error_in_the_free_hook_stops_the_lender(kit, real_manager, monkeypat
             kit.return_write(lender, seen, seen_view.row_masks(True))
         mgr._stream.synchronize()
         for run in seen_view.groups:
-            sentinel = bytes([kit.SENTINEL]) * lender.regions[run.region_index].slot_bytes
+            sentinel = bytes([kit.SENTINEL]) * kit.staged_slots(lender, run)[0].slot_bytes
             for ordinal in run.page_ordinals.tolist():
                 got = kit.digest(kit.page(mgr, seen_target, run.layer_group_index, ordinal))
                 assert got == kit.digest(sentinel), "a return copied rows after the stop"
@@ -5013,7 +5012,8 @@ def check_a_lease_outliving_its_manager(kit):
     view = lease.poll()
     assert view is not None
     (run,) = view.groups
-    address, slot_bytes = int(run.addresses[0]), lender.regions[run.region_index].slot_bytes
+    region, addresses = kit.staged_slots(lender, run)
+    address, slot_bytes = addresses[0], region.slot_bytes
     regions, content = kit.staging_regions(lender), kit.host_bytes(address, slot_bytes)
     row = kit.index_row(mgr, request)
     own = list(kv.get_base_page_indices(0)[:blocks])

@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     ALL_ARRIVED,
     HoldReason,
     MemoryKind,
+    MemoryRegion,
     ResumeBounds,
     RowSelection,
     StagingOptions,
@@ -991,13 +992,22 @@ def layout(windows=(None,) * GROUPS, read_windows=(), sinks=None, named=None):
     )
 
 
-def lender_over(manager, lay, layers=None):
+def lender_over(manager, lay, layers=None, staged=False):
+    """A lender over ``manager`` and ``lay``: the device regions an attach lists, after a staging
+    region of four slots per pool group with ``staged``."""
     count = lay.num_layer_groups
     layers = layers or [(lg,) for lg in range(count)]
     ident = Identity(b"scope", bytes(range(32)), layers, [(1, 0)] * count)
     ref = weakref.ref(manager)
-    regions = tuple(_lender._device_regions(manager, lay, ident))
-    return _lender._ManagerLender(ref, lay, ident, regions, SlotQueue({}), ref)
+    regions = []
+    for g in lay.pool_groups if staged else ():
+        groups = tuple(lg for lg, pg in enumerate(lay.pool_group_of) if pg == g)
+        regions.append(
+            MemoryRegion(f"staging{g}", 4096 * (g + 1), 4096, 1024, 4, groups, MemoryKind.HOST)
+        )
+    regions += _lender._device_regions(manager, lay, ident)
+    slots = SlotQueue({g: 4 for g in lay.pool_groups} if staged else {})
+    return _lender._ManagerLender(ref, lay, ident, tuple(regions), slots, ref)
 
 
 def cache(committed=0, complete=(), endpoint=None, history=LONG_PROMPT, blocks=5):
@@ -1287,8 +1297,7 @@ def test_named_reads_exclude_private_rows_even_after_the_global_commit_advanced(
 def test_named_writes_lend_no_rows_of_a_private_layer_group(kit, monkeypatch, memory):
     """A named fetch lends a PRIVATE layer group nothing in either memory; the others arrive."""
     manager = Manager()
-    lender = lender_over(manager, layout(named=(True, True, False)))
-    lender._slot_queue = SlotQueue({g: 4 for g in range(GROUPS)})
+    lender = lender_over(manager, layout(named=(True, True, False)), staged=True)
     manager.kv_cache_map[RID] = cache(2 * TPB, (False,) * GROUPS, endpoint=0, history=2 * TPB)
     unnamed_keys(lender, monkeypatch)
     monkeypatch.setattr(lender, "_returns_context_outputs", lambda request: False)

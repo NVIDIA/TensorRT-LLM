@@ -47,8 +47,14 @@ def staged(lender, view):
     """Per run, the bytes of every row's staging slot."""
     out = []
     for run in view.groups:
-        length = lender.regions[run.region_index].slot_bytes
-        out.append([ctypes.string_at(a, length) for a in run.addresses.tolist()])
+        (index,) = run.region_indices
+        region = lender.regions[index]
+        out.append(
+            [
+                ctypes.string_at(region.address + slot * region.slot_bytes, region.slot_bytes)
+                for slot in run.slots.tolist()
+            ]
+        )
     return out
 
 
@@ -517,8 +523,9 @@ def staged_right(kit, mgr, lender, view, request):
     """Per row of a read's view, whether its slot holds the block's published bytes."""
     out = {}
     for run in view.groups:
-        nbytes = lender.regions[run.region_index].slot_bytes
-        for ordinal, address in zip(run.page_ordinals.tolist(), run.addresses.tolist()):
+        region, addresses = kit.staged_slots(lender, run)
+        nbytes = region.slot_bytes
+        for ordinal, address in zip(run.page_ordinals.tolist(), addresses):
             want = published_bytes(kit, mgr, request, run.layer_group_index, ordinal, nbytes)
             out[f"{run.layer_group_index}:{ordinal}"] = kit.host_bytes(address, nbytes) == want
     return out

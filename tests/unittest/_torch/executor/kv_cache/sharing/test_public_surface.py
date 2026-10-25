@@ -520,8 +520,7 @@ def test_the_types_keep_their_fields():
         == "layout_label address nbytes slot_bytes slot_count layer_group_indices memory_kind"
     )
     assert fields(LentLayerGroupRows) == (
-        "layer_group_index page_ordinals object_keys=None addresses=None region_index=None "
-        "slots=None region_indices=None"
+        "layer_group_index page_ordinals object_keys=None slots=None region_indices=None"
     )
     assert fields(LeaseView) == "groups start end"
     assert fields(HeldPages) == "deduct unreclaimable by_reason version"
@@ -560,26 +559,24 @@ def test_public_names_are_independent_of_the_lending_mechanism():
 
 
 @pytest.mark.cpu_only
-def test_views_and_regions_match_the_backend_contract_member_names():
-    """Exercise the structural surface without importing the unmerged backend contract."""
+def test_rows_views_and_regions_carry_the_backend_contract_s_members():
+    """Rows, views and regions are what the backend contract describes, and rows carry no member
+    the contract leaves out."""
+    from tensorrt_llm._torch.disaggregation.base import backend as contract
+
     region = MemoryRegion("layout", 4096, 128, 64, 2, (3,), MemoryKind.HOST)
     group = LentLayerGroupRows(
         layer_group_index=3,
         page_ordinals=np.array([0, 7]),
         object_keys=np.zeros((2, 54), dtype=np.uint8),
-        addresses=np.array([4096, 4160]),
-        region_index=0,
+        slots=np.array([0, 1]),
+        region_indices=(0,),
     )
     view = LeaseView((group,), 0, 0)
-    assert all(
-        hasattr(region, name)
-        for name in ("layout_label", "address", "nbytes", "slot_bytes", "slot_count")
-    )
-    assert all(
-        hasattr(group, name)
-        for name in ("layer_group_index", "object_keys", "addresses", "region_index", "__len__")
-    )
-    assert all(hasattr(view, name) for name in ("groups", "row_masks"))
+    assert isinstance(region, contract.SlotRegion) and isinstance(view, contract.View)
+    assert isinstance(group, contract.LayerGroupRows)
+    members = {name for name in vars(contract.LayerGroupRows) if not name.startswith("_")}
+    assert {f.name for f in dataclasses.fields(LentLayerGroupRows)} == members
     assert list(inspect.signature(LeaseView.row_masks).parameters) == ["self", "fill_value"]
     false_masks = view.row_masks()
     true_masks = view.row_masks(fill_value=True)
@@ -588,8 +585,7 @@ def test_views_and_regions_match_the_backend_contract_member_names():
         assert masks[0].shape == (2,) and masks[0].dtype == np.bool_
         assert masks[0].flags.writeable and np.all(masks[0] == fill)
     assert region.nbytes == region.slot_bytes * region.slot_count
-    assert np.all(group.addresses >= region.address)
-    assert np.all(group.addresses + region.slot_bytes <= region.address + region.nbytes)
+    assert np.all(group.slots < region.slot_count)
 
 
 @pytest.mark.cpu_only
@@ -984,13 +980,14 @@ def test_every_new_file_carries_the_license_header():
 # -- the public types' own rules --------------------------------------------------------------
 
 
-def staging_rows(n=3, layer_group_index=0, region_index=0):
+def staged_rows(n=3, layer_group_index=0, region=0):
+    """``n`` named rows in slots ``0 .. n - 1`` of region ``region``."""
     return LentLayerGroupRows(
         layer_group_index,
         np.arange(n),
         np.repeat(np.arange(n, dtype=np.uint8)[:, None], 54, axis=1),
-        np.arange(n, dtype=np.int64) * 4096,
-        region_index,
+        np.arange(n, dtype=np.int64),
+        (region,),
     )
 
 
@@ -1077,26 +1074,20 @@ def test_regions_of_one_memory_kind_that_overlap_by_a_byte_are_refused():
 
 
 @pytest.mark.cpu_only
-def test_layer_group_rows_take_one_whole_placement_or_none_and_names_apart():
+def test_layer_group_rows_take_slots_with_their_regions_or_neither_and_names_apart():
     page_ordinals = np.arange(3)
     object_keys = np.zeros((3, 54), np.uint8)
-    addresses = np.arange(3, dtype=np.int64)
     slots = np.array([5, 0, 2])
     refused = [
-        # A placement half given, or both placements.
-        (ValueError, dict(object_keys=object_keys, addresses=addresses)),
-        (ValueError, dict(region_index=0)),
+        # Slots without their regions, or regions without slots.
         (ValueError, dict(slots=slots)),
         (ValueError, dict(object_keys=object_keys, region_indices=(0,))),
-        (ValueError, dict(addresses=addresses, region_index=0, slots=slots, region_indices=(1,))),
-        # Shapes, dtypes and values, object_keys checked whatever the placement.
+        # Shapes, dtypes and values, object_keys checked with slots or without.
         (ValueError, dict(page_ordinals=np.zeros((3, 1)))),
         (ValueError, dict(object_keys=np.zeros((3, 53), np.uint8))),
         (ValueError, dict(object_keys=np.zeros((3, 54), np.int8))),
         (ValueError, dict(object_keys=object_keys[:2], slots=slots, region_indices=(0,))),
-        (ValueError, dict(object_keys=object_keys, addresses=addresses[:2], region_index=0)),
         (ValueError, dict(layer_group_index=-1)),
-        (ValueError, dict(addresses=addresses, region_index=-1)),
         (ValueError, dict(slots=slots[:2], region_indices=(0,))),
         (ValueError, dict(slots=slots.astype(np.float64), region_indices=(0,))),
         (ValueError, dict(slots=np.array([1, -1, 2]), region_indices=(0,))),
@@ -1104,7 +1095,6 @@ def test_layer_group_rows_take_one_whole_placement_or_none_and_names_apart():
         (ValueError, dict(slots=slots, region_indices=(1, 1))),
         (ValueError, dict(slots=slots, region_indices=(0, -1))),
         (TypeError, dict(layer_group_index=True)),
-        (TypeError, dict(addresses=addresses, region_index=1.0)),
         (TypeError, dict(slots=slots, region_indices=(1.0,))),
         (TypeError, dict(slots=slots, region_indices=(True,))),
         (TypeError, dict(slots=slots, region_indices=1)),
@@ -1114,17 +1104,17 @@ def test_layer_group_rows_take_one_whole_placement_or_none_and_names_apart():
             LentLayerGroupRows(**{"layer_group_index": 0, "page_ordinals": page_ordinals, **fields})
     unplaced = LentLayerGroupRows(1, page_ordinals)
     assert len(unplaced) == 3 and unplaced.page_ordinals.dtype == np.int64
-    placements = ("object_keys", "addresses", "region_index", "slots", "region_indices")
-    assert [getattr(unplaced, name) for name in placements] == [None] * 5
+    placements = ("object_keys", "slots", "region_indices")
+    assert [getattr(unplaced, name) for name in placements] == [None] * 3
     named = LentLayerGroupRows(1, page_ordinals, object_keys)
-    assert named.object_keys.shape == (3, 54) and (named.addresses, named.slots) == (None, None)
-    unnamed = LentLayerGroupRows(1, page_ordinals, addresses=addresses, region_index=np.int64(2))
-    assert unnamed.object_keys is None and unnamed.addresses.tolist() == [0, 1, 2]
-    assert unnamed.region_index == 2 and type(unnamed.region_index) is int
+    assert named.object_keys.shape == (3, 54) and (named.slots, named.region_indices) == (
+        None,
+        None,
+    )
     by_slot = LentLayerGroupRows(
         1, page_ordinals, slots=slots.astype(np.int32), region_indices=[np.int64(4), 1]
     )
-    assert by_slot.object_keys is None and (by_slot.addresses, by_slot.region_index) == (None, None)
+    assert by_slot.object_keys is None
     assert by_slot.slots.dtype == np.int64 and by_slot.slots.tolist() == [5, 0, 2]
     assert by_slot.region_indices == (4, 1)
     assert all(type(index) is int for index in by_slot.region_indices)
@@ -1136,7 +1126,7 @@ def check_immutable(rows, *writable):
     """No array of ``rows`` can be written or made writable, or shares memory with ``writable``."""
     arrays = [
         getattr(rows, name)
-        for name in ("page_ordinals", "object_keys", "addresses", "slots")
+        for name in ("page_ordinals", "object_keys", "slots")
         if getattr(rows, name) is not None
     ]
     for array in arrays:
@@ -1151,13 +1141,13 @@ def check_immutable(rows, *writable):
 def test_layer_group_rows_arrays_are_immutable_copies_of_writable_ones():
     page_ordinals = np.arange(3, dtype=np.int64)
     keys = np.zeros((3, 54), np.uint8)
-    addresses = np.arange(3, dtype=np.int64)
+    staging_slots = np.arange(3, dtype=np.int64)
     slots = np.array([4, 0, 9], dtype=np.int64)
-    by_address = LentLayerGroupRows(0, page_ordinals, keys, addresses, 0)
+    staged = LentLayerGroupRows(0, page_ordinals, keys, staging_slots, (0,))
     by_slot = LentLayerGroupRows(0, page_ordinals, keys, slots=slots, region_indices=(1, 0))
-    check_immutable(by_address, page_ordinals, keys, addresses)
+    check_immutable(staged, page_ordinals, keys, staging_slots)
     check_immutable(by_slot, page_ordinals, keys, slots)
-    assert all(a.flags.writeable for a in (page_ordinals, keys, addresses, slots))
+    assert all(a.flags.writeable for a in (page_ordinals, keys, staging_slots, slots))
     # A caller's read-only view of its writable array is copied too.
     frozen = page_ordinals.view()
     frozen.flags.writeable = False
@@ -1166,24 +1156,21 @@ def test_layer_group_rows_arrays_are_immutable_copies_of_writable_ones():
     kept = LentLayerGroupRows(0, by_slot.page_ordinals, slots=by_slot.slots, region_indices=(0,))
     assert kept.page_ordinals is by_slot.page_ordinals and kept.slots is by_slot.slots
     for picked in (
-        by_address.select(np.array([True, False, True])),
+        staged.select(np.array([True, False, True])),
         by_slot.select(np.array([False, True, True])),
     ):
-        check_immutable(picked, page_ordinals, keys, addresses, slots)
+        check_immutable(picked, page_ordinals, keys, staging_slots, slots)
 
 
 @pytest.mark.cpu_only
 def test_select_keeps_the_marked_rows_in_order():
-    rows = staging_rows(4, layer_group_index=2, region_index=1)
+    rows = staged_rows(4, layer_group_index=2, region=1)
     picked = rows.select(np.array([True, False, True, True]))
     assert picked.page_ordinals.tolist() == [0, 2, 3]
-    assert picked.addresses.tolist() == [0, 8192, 12288]
+    assert picked.slots.tolist() == [0, 2, 3]
     np.testing.assert_array_equal(picked.object_keys, rows.object_keys[[0, 2, 3]])
-    assert picked.object_keys.shape == (3, 54) and (
-        picked.layer_group_index,
-        picked.region_index,
-    ) == (2, 1)
-    assert (picked.slots, picked.region_indices) == (None, None)
+    assert picked.object_keys.shape == (3, 54) and picked.layer_group_index == 2
+    assert picked.region_indices == (1,)
     assert LentLayerGroupRows(0, np.arange(2)).select(np.array([False, True])).object_keys is None
     with pytest.raises(ValueError):
         rows.select(np.array([True, False]))
@@ -1201,7 +1188,6 @@ def test_select_keeps_the_slots_aligned_and_their_regions():
     assert picked.page_ordinals.tolist() == [1, 4] and picked.slots.tolist() == [3, 0]
     np.testing.assert_array_equal(picked.object_keys, keys[[1, 2]])
     assert (picked.layer_group_index, picked.region_indices) == (3, (2, 0))
-    assert (picked.addresses, picked.region_index) == (None, None)
     assert not picked.slots.flags.writeable
     unnamed = LentLayerGroupRows(3, np.arange(2), slots=np.array([1, 0]), region_indices=(0,))
     none = unnamed.select(np.array([False, False]))
@@ -1228,17 +1214,13 @@ def test_rows_and_views_built_without_checks_are_what_the_constructors_make():
             if rng.random() < 0.4
             else on_immutable_bytes(rng.integers(0, 256, (n, 54)), np.uint8)
         )
-        placement = str(rng.choice(["slots", "addresses", "none"]))
-        seen.add(placement)
+        placed = bool(rng.random() < 0.6)
+        seen.add(placed)
         fields = dict(object_keys=keys)
-        if placement == "slots":
+        if placed:
             regions = tuple(int(r) for r in rng.permutation(5)[: int(rng.integers(1, 4))])
             fields.update(
                 slots=on_immutable_bytes(rng.integers(0, 1000, n)), region_indices=regions
-            )
-        elif placement == "addresses":
-            fields.update(
-                addresses=on_immutable_bytes(rng.integers(0, 2**40, n)), region_index=n % 3
             )
         public = LentLayerGroupRows(layer_group_index, ordinals, **fields)
         lent = LentLayerGroupRows._unchecked(layer_group_index, ordinals, **fields)
@@ -1262,7 +1244,7 @@ def test_rows_and_views_built_without_checks_are_what_the_constructors_make():
         assert [m.tolist() for m in built.row_masks(True)] == [
             m.tolist() for m in view.row_masks(True)
         ]
-    assert seen == {"slots", "addresses", "none"}
+    assert seen == {True, False}
 
 
 @pytest.mark.cpu_only
@@ -1343,7 +1325,7 @@ def test_a_lend_checks_memory_and_rows_before_anything_else(name):
 
 @pytest.mark.cpu_only
 def test_a_lease_view_holds_one_row_collection_per_layer_group():
-    view = LeaseView([staging_rows(3, 0), staging_rows(2, 1, region_index=1)], 0, 0)
+    view = LeaseView([staged_rows(3, 0), staged_rows(2, 1, region=1)], 0, 0)
     assert isinstance(view.groups, tuple) and view.num_rows == 5
     masks = view.row_masks()
     assert [m.shape for m in masks] == [(3,), (2,)]
@@ -1351,7 +1333,7 @@ def test_a_lease_view_holds_one_row_collection_per_layer_group():
     assert all(m.all() for m in view.row_masks(True))
     assert LeaseView((), 0, 0).num_rows == 0 and LeaseView((), 0, 0).row_masks() == ()
     with pytest.raises(ValueError):
-        LeaseView((staging_rows(3, 0), staging_rows(1, 0)), 0, 0)
+        LeaseView((staged_rows(3, 0), staged_rows(1, 0)), 0, 0)
     with pytest.raises(TypeError):
         LeaseView((object(),), 0, 0)
 
@@ -1363,8 +1345,8 @@ def test_sparse_rows_keep_group_position_masks_and_placement_alignment():
         layer_group_index=7,
         page_ordinals=np.array([0, 3, 9]),
         object_keys=keys,
-        addresses=np.array([12288, 4096, 8192]),
-        region_index=2,
+        slots=np.array([3, 1, 2]),
+        region_indices=(2,),
     )
     empty = LentLayerGroupRows(layer_group_index=2, page_ordinals=np.array([], dtype=np.int64))
     repeated = LentLayerGroupRows(layer_group_index=4, page_ordinals=np.array([3, 9]))
@@ -1376,9 +1358,9 @@ def test_sparse_rows_keep_group_position_masks_and_placement_alignment():
     masks[0][1] = True
     picked = view.groups[0].select(masks[0])
     assert picked.page_ordinals.tolist() == [3]
-    assert picked.addresses.tolist() == [4096]
+    assert picked.slots.tolist() == [1]
     np.testing.assert_array_equal(picked.object_keys, keys[[1]])
-    assert (picked.layer_group_index, picked.region_index) == (7, 2)
+    assert (picked.layer_group_index, picked.region_indices) == (7, (2,))
     assert not masks[2].any()
 
 
@@ -1440,7 +1422,7 @@ def test_attach_refuses_a_cross_attention_manager_before_allocating():
 @pytest.mark.cpu_only
 def test_a_view_takes_its_lend_s_range_and_refuses_another():
     """A view holds integer bounds ``0 <= start <= end`` and refuses any other."""
-    rows = staging_rows(2, 0)
+    rows = staged_rows(2, 0)
     view = LeaseView((rows,), 32, 64)
     assert (view.start, view.end) == (32, 64)
     assert (LeaseView((rows,), np.int64(0), 0).start, view.num_rows) == (0, 2)

@@ -458,8 +458,6 @@ def _view_key(view):
             g.layer_group_index,
             _bytes_key(g.page_ordinals),
             _bytes_key(g.object_keys),
-            _bytes_key(g.addresses),
-            g.region_index,
             _bytes_key(g.slots),
             g.region_indices,
         )
@@ -469,7 +467,7 @@ def _view_key(view):
 
 def _assert_frozen_view(view):
     for group in view.groups:
-        for array in (group.page_ordinals, group.object_keys, group.addresses, group.slots):
+        for array in (group.page_ordinals, group.object_keys, group.slots):
             if array is not None:
                 assert not array.flags.writeable
                 with pytest.raises(ValueError):
@@ -489,6 +487,7 @@ def _metadata_lender(sources, layout, manager):
         ],
         _region_index_of_pool_group={0: 0, 1: 1},
         _device_regions_of_pool_group={0: (2, 3), 1: (4, 5)},
+        _staging_region_indices={0: (0,), 1: (1,)},
         # A manager without a record of state slots: the cache answers.
         _state_slot=lambda kv, request_id, lg: kv.state_slots[lg],
     )
@@ -542,15 +541,13 @@ def _slow_view(sources, lender, entries, keys, device):
                 )
             )
         else:
-            region_index = lender._region_index_of_pool_group[group]
-            region = lender._regions[region_index]
             groups.append(
                 sources.rows(
                     lg,
                     blocks,
                     object_keys=lender._object_keys(lg, keys[index]),
-                    addresses=region.address + entries.staging_slots[index] * region.slot_bytes,
-                    region_index=region_index,
+                    slots=entries.staging_slots[index],
+                    region_indices=(lender._region_index_of_pool_group[group],),
                 )
             )
     return sources.view(tuple(groups), 0, 0)
@@ -1052,10 +1049,8 @@ def test_named_pipeline_reuses_frozen_metadata_and_preserves_old_views(
                 assert np.shares_memory(rows.slots, entries.device_pages[lg])
                 assert rows.slots.tolist() == kv.pages[lg][start // 4 : end // 4].tolist()
             else:
-                region = lender._regions[lg]
-                assert rows.addresses.tolist() == [
-                    region.address + i * region.slot_bytes for i in range(4)
-                ]
+                assert rows.slots.tolist() == list(range(4))
+                assert rows.region_indices is lender._staging_region_indices[lg]
         _assert_frozen_view(view)
         assert observations and all(shared and not writable for shared, writable in observations), (
             "production metadata must enter DTOs already immutable without another copy"
@@ -2131,7 +2126,7 @@ def view_arrays(view):
     return [
         array
         for rows in view.groups
-        for array in (rows.page_ordinals, rows.slots, rows.addresses, rows.object_keys)
+        for array in (rows.page_ordinals, rows.slots, rows.object_keys)
         if array is not None
     ]
 

@@ -459,8 +459,6 @@ def _lent_rows(
             "layer_group_index": lg,
             "page_ordinals": ordinals,
             "object_keys": None,
-            "addresses": None,
-            "region_index": None,
             "slots": slots,
             "region_indices": regions,
         },
@@ -538,6 +536,7 @@ class _ManagerLender:
         "_recurrent_groups",
         "_region_index_of_pool_group",
         "_device_regions_of_pool_group",
+        "_staging_region_indices",
         "_device_slot_limit",
         "_any_window",
         "_ledger",
@@ -612,6 +611,12 @@ class _ManagerLender:
                 g = int(layout.pool_group_of[region.layer_group_indices[0]])
                 held = self._device_regions_of_pool_group.get(g, ())
                 self._device_regions_of_pool_group[g] = (*held, index)
+        # Per pool group, the one-region tuple its staged rows name, shared by every lend.
+        self._staging_region_indices = {
+            g: (index,)
+            for g, index in self._region_index_of_pool_group.items()
+            if index < len(self._regions) and self._regions[index].memory_kind is MemoryKind.HOST
+        }
         # Per layer group, the least ``slot_count`` of the device regions its rows in place span,
         # which no slot such a row holds may reach.
         self._device_slot_limit: dict[int, int] = {}
@@ -2523,17 +2528,15 @@ class _ManagerLender:
         for lg, block_ordinals, lg_keys, slots in zip(
             entries.layer_group_indices, entries.block_ordinals, reuse_keys, entries.staging_slots
         ):
-            index = self._region_index_of_pool_group[int(self._layout.pool_group_of[lg])]
-            region = self._regions[index]
             groups.append(
                 LentLayerGroupRows._unchecked(
                     int(lg),
                     _unshared(block_ordinals),
                     _immutable(self._object_keys(lg, lg_keys)),
-                    addresses=_frozen_array(
-                        np.asarray(slots, dtype=np.int64) * region.slot_bytes + region.address
-                    ),
-                    region_index=index,
+                    slots=_frozen_array(slots),
+                    region_indices=self._staging_region_indices[
+                        int(self._layout.pool_group_of[lg])
+                    ],
                 )
             )
         return LeaseView._unchecked(tuple(groups), start, end)

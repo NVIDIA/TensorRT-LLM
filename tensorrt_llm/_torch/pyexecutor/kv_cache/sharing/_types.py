@@ -235,11 +235,10 @@ class LentLayerGroupRows:
     """One layer group's rows in aligned immutable arrays, copied only when not already immutable.
 
     Each row describes this rank's logical page across the group's layers. Recurrent state has
-    at most one row, ordinal 0, at the range's end. Ordinals, addresses and slots need not be
-    consecutive. Placement is ``addresses/region_index``, ``slots/region_indices``, or neither;
-    each pair is complete, and object keys are independent of placement. In rows a lender lends,
-    every slot is below the ``slot_count`` of each ``region_indices`` region: the lender fails a
-    lease rather than lend a slot that is not.
+    at most one row, ordinal 0, at the range's end. Ordinals and slots need not be consecutive.
+    ``slots`` and ``region_indices`` are given together or not at all, and object keys are
+    independent of them. In rows a lender lends, every slot is below the ``slot_count`` of each
+    ``region_indices`` region: the lender fails a lease rather than lend a slot that is not.
 
     Under ``attach_lender``'s scope and caller duties, equal keys mean interchangeable bytes.
     Keys are opaque equality-only identities, not checksums: their width (54 bytes) is API, their
@@ -251,30 +250,28 @@ class LentLayerGroupRows:
             ``b`` covers ``[b * t, (b + 1) * t)`` for ``t=PageLayout.tokens_per_page``; under Helix,
             this rank's in-place page of block ``b`` has ordinal ``b * cp_size + cp_rank``.
         object_keys: ``uint8 (n, 54)`` opaque keys, distinct from 32-byte reuse keys, or ``None``.
-        addresses: ``int64 (n,)`` addresses, each covering ``slot_bytes`` in ``region_index``.
-        region_index: Position in ``Lender.regions``, not a pool or layer-group ID.
         slots: ``int64 (n,)`` non-negative slots. Row ``i`` concatenates ``slot_bytes`` bytes
             from ``address + slots[i] * slot_bytes`` in each ``region_indices`` region.
-        region_indices: Nonempty, distinct positions in ``Lender.regions``, in row-byte order.
+        region_indices: Nonempty, distinct positions in ``Lender.regions``, in row-byte order; not
+            pool or layer-group IDs.
 
     Raises:
         TypeError: A noninteger index (including bool), or nonsequence ``region_indices``.
-        ValueError: Wrong array shape, invalid key/placement dtype, negative index/slot, or
-            incomplete/conflicting placement pairs or empty/duplicate regions.
+        ValueError: Wrong array shape, invalid key or slot dtype, negative index or slot,
+            ``slots`` without ``region_indices`` or the reverse, or empty or duplicate regions.
 
     Performance (non-normative):
         Construction fixes each array's dtype and shape, makes it immutable, and checks that
-        ``layer_group_index``, ``region_index``, ``region_indices`` and ``slots`` hold non-negative
-        integers and that ``region_indices`` is non-empty and distinct, so holders need not check
-        these again; ``page_ordinals`` and ``addresses`` get no value check. Read the arrays with
-        whole-array operations and keep references instead of looping over rows or copying
-        defensively; the lender neither changes nor reuses them."""
+        ``layer_group_index``, ``region_indices`` and ``slots`` hold non-negative integers and that
+        ``region_indices`` is non-empty and distinct, so holders need not check these again;
+        ``page_ordinals`` gets no value check. A lender gives all rows of a pool group that lie in
+        the same regions one ``region_indices`` tuple object. Read the arrays with whole-array
+        operations and keep references instead of looping over rows or copying defensively; the
+        lender neither changes nor reuses them."""
 
     layer_group_index: int
     page_ordinals: np.ndarray
     object_keys: Optional[np.ndarray] = None
-    addresses: Optional[np.ndarray] = None
-    region_index: Optional[int] = None
     slots: Optional[np.ndarray] = None
     region_indices: Optional[Tuple[int, ...]] = None
 
@@ -288,12 +285,8 @@ class LentLayerGroupRows:
                 f"page_ordinals must be one-dimensional, got shape {page_ordinals.shape}"
             )
         object.__setattr__(self, "page_ordinals", page_ordinals)
-        if (self.addresses is None) != (self.region_index is None):
-            raise ValueError("addresses and region_index are given together or not at all")
         if (self.slots is None) != (self.region_indices is None):
             raise ValueError("slots and region_indices are given together or not at all")
-        if self.addresses is not None and self.slots is not None:
-            raise ValueError("rows are placed by addresses or by slots, not both")
         if self.object_keys is not None:
             object_keys = np.asarray(self.object_keys)
             if object_keys.dtype != np.uint8 or object_keys.shape != (
@@ -305,10 +298,6 @@ class LentLayerGroupRows:
                     f"got {object_keys.dtype} {object_keys.shape}"
                 )
             object.__setattr__(self, "object_keys", _immutable(np.ascontiguousarray(object_keys)))
-        if self.addresses is not None:
-            addresses = _entry_integers("addresses", self.addresses, page_ordinals.shape)
-            object.__setattr__(self, "addresses", addresses)
-            object.__setattr__(self, "region_index", _integer("region_index", self.region_index, 0))
         if self.slots is not None:
             slots = _entry_integers("slots", self.slots, page_ordinals.shape)
             if np.any(slots < 0):
@@ -333,8 +322,6 @@ class LentLayerGroupRows:
             self.layer_group_index,
             self.page_ordinals[mask],
             None if self.object_keys is None else self.object_keys[mask],
-            None if self.addresses is None else self.addresses[mask],
-            self.region_index,
             None if self.slots is None else self.slots[mask],
             self.region_indices,
         )
@@ -345,15 +332,13 @@ class LentLayerGroupRows:
         layer_group_index: int,
         page_ordinals: np.ndarray,
         object_keys: Optional[np.ndarray] = None,
-        addresses: Optional[np.ndarray] = None,
-        region_index: Optional[int] = None,
         slots: Optional[np.ndarray] = None,
         region_indices: Optional[Tuple[int, ...]] = None,
     ) -> LentLayerGroupRows:
         """The rows the constructor makes of these values, taken as they are, for values that pass
-        its checks unchanged: an ``int`` index, contiguous ``int64 (n,)`` ordinals and placement and
-        ``uint8 (n, 54)`` keys on immutable bytes, at most one complete placement pair, non-negative
-        slots, and a tuple of distinct non-negative ``int`` region indices."""
+        its checks unchanged: an ``int`` index, contiguous ``int64 (n,)`` ordinals and slots and
+        ``uint8 (n, 54)`` keys on immutable bytes, slots and region indices given together or not
+        at all, non-negative slots, and a tuple of distinct non-negative ``int`` region indices."""
         rows = object.__new__(cls)
         object.__setattr__(
             rows,
@@ -362,8 +347,6 @@ class LentLayerGroupRows:
                 "layer_group_index": layer_group_index,
                 "page_ordinals": page_ordinals,
                 "object_keys": object_keys,
-                "addresses": addresses,
-                "region_index": region_index,
                 "slots": slots,
                 "region_indices": region_indices,
             },

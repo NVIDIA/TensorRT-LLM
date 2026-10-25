@@ -630,13 +630,25 @@ def staged_row(byte: int, layer_group: int, ordinal: int, nbytes: int) -> bytes:
     return np.random.default_rng(seed).integers(0, 256, nbytes, dtype=np.uint8).tobytes()
 
 
+def staged_slots(lender, rows) -> Tuple[object, List[int]]:
+    """The staging region holding ``rows`` and the address of each row's slot in it, after checking
+    that the rows are staged pages of their layer group."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
+
+    (index,) = rows.region_indices
+    region = lender.regions[index]
+    assert region.memory_kind is MemoryKind.HOST
+    assert rows.layer_group_index in region.layer_group_indices
+    return region, [region.address + slot * region.slot_bytes for slot in rows.slots.tolist()]
+
+
 def stage(lender, view, byte: int) -> None:
     """Fill every slot of a staging view as a backend's transfer would, each block entry with its
     own bytes (``staged_row``)."""
     for blocks in view.groups:
-        assert blocks.layer_group_index in lender.regions[blocks.region_index].layer_group_indices
-        length = lender.regions[blocks.region_index].slot_bytes
-        for ordinal, address in zip(blocks.page_ordinals.tolist(), blocks.addresses.tolist()):
+        region, addresses = staged_slots(lender, blocks)
+        length = region.slot_bytes
+        for ordinal, address in zip(blocks.page_ordinals.tolist(), addresses):
             ctypes.memmove(
                 address, staged_row(byte, blocks.layer_group_index, ordinal, length), length
             )
@@ -648,25 +660,18 @@ def relay(src_lender, src_view, dst_lender, dst_view, deliver=None) -> Tuple[np.
     entries (default all); returns the masks."""
     by_object_key = {}
     for blocks in src_view.groups:
-        assert (
-            blocks.layer_group_index in src_lender.regions[blocks.region_index].layer_group_indices
-        )
-        length = src_lender.regions[blocks.region_index].slot_bytes
-        for object_key, address in zip(blocks.object_keys, blocks.addresses.tolist()):
-            by_object_key[object_key.tobytes()] = (address, length)
+        region, addresses = staged_slots(src_lender, blocks)
+        for object_key, address in zip(blocks.object_keys, addresses):
+            by_object_key[object_key.tobytes()] = (address, region.slot_bytes)
     masks = []
     for i, blocks in enumerate(dst_view.groups):
-        assert (
-            blocks.layer_group_index in dst_lender.regions[blocks.region_index].layer_group_indices
-        )
+        region, addresses = staged_slots(dst_lender, blocks)
         mask = np.zeros(len(blocks), dtype=bool)
-        for entry_index, (object_key, address) in enumerate(
-            zip(blocks.object_keys, blocks.addresses.tolist())
-        ):
+        for entry_index, (object_key, address) in enumerate(zip(blocks.object_keys, addresses)):
             if deliver is not None and not deliver(i, entry_index):
                 continue
             src, length = by_object_key[object_key.tobytes()]
-            assert length == dst_lender.regions[blocks.region_index].slot_bytes
+            assert length == region.slot_bytes
             ctypes.memmove(address, src, length)
             mask[entry_index] = True
         masks.append(mask)
@@ -1040,6 +1045,7 @@ _KIT = SimpleNamespace(
     settled_bounds=settled_bounds,
     stage=stage,
     staged_row=staged_row,
+    staged_slots=staged_slots,
     stale_blocks=stale_blocks,
     staging_kept=staging_kept,
     staging_memory=staging_memory,

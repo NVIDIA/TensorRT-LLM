@@ -698,10 +698,11 @@ def test_an_in_place_view_places_each_row_by_its_page_in_its_pool_group_regions(
     view = lender._in_place_view(lent, None, 0, 0)
     assert [g.layer_group_index for g in view.groups] == [0, 1, 2]
     assert [g.region_indices for g in view.groups] == [(2, 3), (4,), (2, 3)]
+    assert view.groups[0].region_indices is view.groups[2].region_indices, "one per pool group"
     for group in view.groups:
         assert isinstance(group, LentLayerGroupRows)
         assert group.slots.tolist() == [9, 4] and group.page_ordinals.tolist() == [0, 3]
-        assert (group.addresses, group.region_index, group.object_keys) == (None, None, None)
+        assert group.object_keys is None
     keys = [np.full((2, 32), lg, dtype=np.uint8) for lg in range(3)]
     named = lender._in_place_view(lent, keys, 0, 0)
     for lg, group in enumerate(named.groups):
@@ -712,6 +713,22 @@ def test_an_in_place_view_places_each_row_by_its_page_in_its_pool_group_regions(
         regions[r].address + 9 * regions[r].slot_bytes for r in view.groups[0].region_indices
     ]
     assert addresses == [(1 << 30) + 9 * 256, (2 << 30) + 9 * 128]
+
+
+@pytest.mark.cpu_only
+def test_every_lend_of_a_pool_group_names_its_regions_by_one_tuple():
+    """Rows of one pool group lent in place name one tuple of its device regions, and staged rows
+    one tuple of its staging region, lend after lend."""
+    lender = lender_over(Manager())
+    lent = entries(ordinals=(0, 3), pages=(9, 4))
+    first, second = (lender._in_place_view(lent, None, 0, 0) for _ in range(2))
+    assert all(a.region_indices is b.region_indices for a, b in zip(first.groups, second.groups))
+    lender._assign_staging_slots(lent, None)
+    keys = [np.full((2, 32), lg, dtype=np.uint8) for lg in range(3)]
+    staged = [lender._build_view(lent, keys, 0, 0) for _ in range(2)]
+    assert all(a.region_indices is b.region_indices for a, b in zip(*(v.groups for v in staged)))
+    assert [group.region_indices for group in staged[0].groups] == [(0,), (1,), (0,)]
+    assert {lender.regions[r].memory_kind for r in (0, 1)} == {MemoryKind.HOST}
 
 
 @gpu
@@ -731,7 +748,9 @@ def test_an_in_place_read_lends_the_request_s_own_pages_by_name(kit, real_manage
         for run, staged_run in zip(view.groups, staged_view.groups):
             assert run.page_ordinals.tolist() == [0, 1, 2]
             np.testing.assert_array_equal(run.page_ordinals, staged_run.page_ordinals)
-            assert (run.addresses, run.region_index) == (None, None)
+            kinds = {lender.regions[r].memory_kind for r in run.region_indices}
+            staged_kinds = {lender.regions[r].memory_kind for r in staged_run.region_indices}
+            assert (kinds, staged_kinds) == ({MemoryKind.DEVICE}, {MemoryKind.HOST})
             np.testing.assert_array_equal(run.object_keys, staged_run.object_keys)
             lg = run.layer_group_index
             pages = kit.pages(kv, lg)
@@ -751,9 +770,7 @@ def test_an_in_place_read_lends_the_request_s_own_pages_by_name(kit, real_manage
 def checked_by_the_constructors(view):
     """``view`` rebuilt by the public constructors, which check what the lender's own construction
     of it does not: equal, else ``AssertionError``; values out of the rows' contract raise."""
-    names = (
-        "layer_group_index page_ordinals object_keys addresses region_index slots region_indices"
-    ).split()
+    names = "layer_group_index page_ordinals object_keys slots region_indices".split()
     groups = tuple(LentLayerGroupRows(*(getattr(rows, n) for n in names)) for rows in view.groups)
     rebuilt = LeaseView(groups, view.start, view.end)
     assert repr(rebuilt) == repr(view)
@@ -793,7 +810,7 @@ def view_arrays(view):
     return {
         (group.layer_group_index, name): getattr(group, name)
         for group in view.groups
-        for name in ("page_ordinals", "object_keys", "addresses", "slots")
+        for name in ("page_ordinals", "object_keys", "slots")
         if getattr(group, name) is not None
     }
 
@@ -842,7 +859,10 @@ def test_a_staging_view_is_a_snapshot_of_its_own():
     lender._assign_staging_slots(lent, None)
     keys = [np.full((3, 32), lg, dtype=np.uint8) for lg in range(3)]
     view = lender._build_view(lent, keys, 0, 0)
-    assert {name for _, name in view_arrays(view)} == {"page_ordinals", "object_keys", "addresses"}
+    assert {name for _, name in view_arrays(view)} == {"page_ordinals", "object_keys", "slots"}
+    assert all(
+        lender.regions[g.region_indices[0]].memory_kind is MemoryKind.HOST for g in view.groups
+    )
     before = {key: array.copy() for key, array in view_arrays(view).items()}
     lender._build_view(lent, keys, 0, 0)
     check_snapshot(view, before, [*lent.block_ordinals, *lent.staging_slots])
