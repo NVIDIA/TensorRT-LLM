@@ -91,6 +91,7 @@ from .checkpoints.hf.minimaxm3_weight_mapper import (
     MiniMaxM3HfWeightMapper,
     translate_packed_nvfp4_experts,
 )
+from .minimax_m3_router import router_split_applies, router_split_logits
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
 
@@ -632,13 +633,19 @@ class MiniMaxM3Gate(nn.Module):
 
         BF16 inputs with a split weight run one BF16 tensor-core GEMM over the
         replicated input and the BF16 terms of the weight, with FP32 accumulation
-        and output. Otherwise the router runs in fp32 to match SGLang: cublas_mm
+        and output; on the row counts where that is bitwise equal, minimax_m3_router
+        computes the product without materializing the replicated input. Otherwise
+        the router runs in fp32 to match SGLang: cublas_mm
         always computes with CUBLAS_COMPUTE_32F, whereas F.linear follows torch's
         fp32 matmul precision, which is TF32 under TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
         (set in the NGC PyTorch based containers) and then flips near-tied top-k
         choices.
         """
         if self.split_weight is not None and hidden_states.dtype == torch.bfloat16:
+            if not is_torch_compiling() and router_split_applies(
+                hidden_states, self.split_weight, self.hidden_size
+            ):
+                return router_split_logits(hidden_states, self.split_weight, self.hidden_size)
             terms = self.split_weight.shape[1] // self.hidden_size
             return torch.ops.trtllm.cublas_mm(
                 torch.cat([hidden_states] * terms, dim=-1),
