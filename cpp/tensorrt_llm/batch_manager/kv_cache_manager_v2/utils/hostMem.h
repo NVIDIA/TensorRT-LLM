@@ -170,8 +170,8 @@ private:
 // ---------------------------------------------------------------------------
 // Low-level wrappers used internally (also exposed for storage pool use).
 // ---------------------------------------------------------------------------
-//! Maps `size` bytes of address space, page-aligned, which is all mmap
-//! promises and all any caller needs. Throws HostOOMError.
+//! Maps `size` bytes of address space PROT_NONE, page-aligned, which is all
+//! mmap promises and all any caller needs. Throws HostOOMError.
 MemAddress hostMmap(size_t size);
 void hostMunmap(MemAddress ptr, size_t size) noexcept;
 void resizeFile(int fd, size_t newSize); // throws DiskOOMError
