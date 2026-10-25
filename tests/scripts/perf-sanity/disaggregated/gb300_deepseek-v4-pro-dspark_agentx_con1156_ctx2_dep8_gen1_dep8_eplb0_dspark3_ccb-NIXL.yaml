@@ -114,7 +114,11 @@ worker_config:
       block_reuse_config:
         policy: per_conversation
         max_num_turns: 5
-      pool_ratio: [0.55, 0.22, 0.23]
+      # DeepSeek-V4 KV cache manager v2 life cycles, in order: SWA windows, the compressed
+      # history with the indexer keys, compressor state windows. With per_conversation
+      # reuse only the history grows with the retained conversations, so it takes most of
+      # the GPU and host pools.
+      pool_ratio: [0.18, 0.64, 0.18]
       host_cache_size: 193273528320
     moe_config:
       backend: CUTEDSL
