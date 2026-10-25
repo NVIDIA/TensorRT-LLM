@@ -1063,8 +1063,10 @@ class LmEvalEvaluator(Evaluator):
                 f"lm-eval {self.task_name} {scores_filter} accuracy: {result_acc:.2f}"
             )
         else:
-            result_acc = np.mean(
-                [acc for m, acc in scores.items() if "_stderr" not in m])
+            result_acc = np.mean([
+                acc for m, acc in scores.items()
+                if "_stderr" not in m and isinstance(acc, (float, int))
+            ])
             logger.info(
                 f"lm-eval {self.task_name} average accuracy: {result_acc:.2f}")
         return result_acc
