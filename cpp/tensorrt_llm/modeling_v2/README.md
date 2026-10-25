@@ -103,8 +103,13 @@ target. Kimi K3 (`models/kimi_k3_vl/`) is an example.
 | Option | Values |
 |---|---|
 | `ARCHS` (required) | `NN`, `NNa` or `NNf`, kept only if the build requests a matching architecture. For example, `103a` builds SM103-specific code when the build includes SM103. `100f` builds family-portable code when the build includes any SM 10.x architecture from SM100 up; use it for `sm_10x` targets. |
-| `DEPS` | Any of `cublas`, `cublaslt`, `cuda_driver`, `internal_cutlass`, `nccl`, `trtllm_gen_fmha_interface`. |
+| `DEPS` | Any of `cublas`, `cublaslt`, `cuda_driver`, `flashmla`, `internal_cutlass`, `nccl`, `trtllm_gen_fmha_interface`. |
 | `REQUIRES` | Any of `MULTI_DEVICE`, `NVSHMEM`. |
+
+On aarch64 builds that use Clang, code that declares `flashmla` is compiled
+with GCC as nvcc's host compiler, the way `cpp/tensorrt_llm/flash_mla` is:
+Clang rejects the inline assembly in FlashMLA's headers there. For a target,
+this applies to every target of its family.
 
 A target is not built if none of its `ARCHS` is requested, if a `REQUIRES`
 feature is disabled, or if `TRTLLM_MODELING_V2_TARGETS` excludes it. CMake
