@@ -525,7 +525,7 @@ def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
     """Bind the Unix socket attached frontends forward launcher-owned routes to.
 
     It lives in the multi-frontend ipc dir, which is private to the user and
-    removed by the executor proxy.
+    removed, socket file included, when the executor proxy shuts down.
     """
     # Only the classic IPC proxy has the attribute.
     ipc_dir = getattr(llm._executor, "_multi_frontend_ipc_dir", None)
@@ -679,7 +679,6 @@ def launch_server(
             stop_watching_frontends = None
             sockets = [s]
             launcher_uds_sock = None
-            launcher_uds_path = None
             try:
                 if multi_frontend.is_launcher:
                     launcher_uds_sock, launcher_uds_path = _bind_launcher_uds(
@@ -728,11 +727,8 @@ def launch_server(
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)
                 if launcher_uds_sock is not None:
+                    # Its file goes with the ipc dir (see _bind_launcher_uds).
                     launcher_uds_sock.close()
-                    try:
-                        os.unlink(launcher_uds_path)
-                    except OSError:
-                        pass
 
 
 def launch_mm_encoder_server(
