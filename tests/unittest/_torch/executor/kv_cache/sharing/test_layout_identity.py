@@ -763,6 +763,118 @@ def test_published_shards_are_the_shares_the_topology_gives(
             assert same_share == (first_one == first_other), (one.topology, other.topology)
 
 
+# -- which ranks of an instance hold the same bytes ---------------------------------------------
+
+
+def replica_instance(tp=1, pp=1, cp=1, attention_dp=False, groups_of=None):
+    """Every rank's layout by flat rank, ``pp * (tp * cp) + tp * cp + cp``.
+
+    ``groups_of(pp_rank, tp_rank, cp_rank)`` gives each rank's ``(kind, layers, shard)`` groups.
+    """
+    layouts = []
+    for pp_rank in range(pp):
+        for tp_rank in range(tp):
+            for cp_rank in range(cp):
+                groups = tuple(
+                    LayerGroupDesc(kind, None, 0, g, tuple(layers), shard)
+                    for g, (kind, layers, shard) in enumerate(groups_of(pp_rank, tp_rank, cp_rank))
+                )
+                layouts.append(
+                    PageLayout(
+                        tokens_per_page=4,
+                        pool_slot_bytes={g: (64,) for g in range(len(groups))},
+                        layer_groups=groups,
+                        buffers=(),
+                        topology=RankTopology(
+                            tp_size=tp,
+                            tp_rank=tp_rank,
+                            pp_size=pp,
+                            pp_rank=pp_rank,
+                            cp_size=cp,
+                            cp_rank=cp_rank,
+                            dp_size=tp if attention_dp else 1,
+                            dp_rank=tp_rank if attention_dp else 0,
+                            attention_dp=attention_dp,
+                        ),
+                    )
+                )
+    return layouts
+
+
+def two_heads_over_four_ranks():
+    """Ranks 0 and 1 hold KV head 0, ranks 2 and 3 KV head 1."""
+    return replica_instance(
+        tp=4, groups_of=lambda p, t, c: [("attention", (0, 1), ShardDesc(2, t // 2))]
+    )
+
+
+@pytest.mark.cpu_only
+def test_ranks_of_equal_shards_are_replicas_and_replicated_buffers_are_on_every_rank():
+    ranks = two_heads_over_four_ranks()
+    assert [page_layout.replica_ranks(ranks, r, 0) for r in range(4)] == [
+        (0, 1),
+        (0, 1),
+        (2, 3),
+        (2, 3),
+    ]
+    assert page_layout.replica_ranks(ranks, 3, 0, replicated=True) == (0, 1, 2, 3)
+
+
+@pytest.mark.cpu_only
+def test_replicas_are_listed_by_ascending_flat_rank():
+    """The lowest rank holding a share, which publishes it to a store, comes first."""
+    ranks = two_heads_over_four_ranks()
+    assert [page_layout.replica_ranks(ranks, r, 0)[0] for r in range(4)] == [0, 0, 2, 2]
+    assert page_layout.replica_ranks(ranks, 2, 0, replicated=True)[0] == 0
+    assert page_layout.replica_ranks(ranks, 3, 0) == (2, 3)
+
+
+@pytest.mark.cpu_only
+def test_each_attention_data_parallel_rank_holds_its_own_requests():
+    ranks = replica_instance(
+        tp=4, attention_dp=True, groups_of=lambda p, t, c: [("attention", (0, 1), ShardDesc())]
+    )
+    for r in range(4):
+        assert page_layout.replica_ranks(ranks, r, 0) == (r,)
+        assert page_layout.replica_ranks(ranks, r, 0, replicated=True) == (r,)
+
+
+@pytest.mark.cpu_only
+def test_pipeline_stages_hold_other_layers_and_groups_of_another_kind_other_bytes():
+    def groups_of(pp_rank, tp_rank, cp_rank):
+        if pp_rank == 0:
+            return [("attention", (0, 1), ShardDesc()), ("state", (2,), ShardDesc())]
+        return [("attention", (3, 4), ShardDesc()), ("attention", (2,), ShardDesc())]
+
+    ranks = replica_instance(tp=2, pp=2, groups_of=groups_of)
+    assert page_layout.replica_ranks(ranks, 1, 0) == (0, 1)
+    assert page_layout.replica_ranks(ranks, 3, 0) == (2, 3)
+    # Layer 2 is state on stage 0 and attention on stage 1: no rank of the other stage matches.
+    assert page_layout.replica_ranks(ranks, 0, 1) == (0, 1)
+    assert page_layout.replica_ranks(ranks, 2, 1) == (2, 3)
+
+
+@pytest.mark.cpu_only
+def test_helix_ranks_hold_their_own_attention_pages_and_split_state_by_context_rank():
+    def groups_of(pp_rank, tp_rank, cp_rank):
+        return [("attention", (0,), ShardDesc()), ("state", (1,), ShardDesc(2, cp_rank))]
+
+    ranks = replica_instance(cp=2, groups_of=groups_of)
+    assert [page_layout.replica_ranks(ranks, r, 0) for r in range(2)] == [(0,), (1,)]
+    assert [page_layout.replica_ranks(ranks, r, 1) for r in range(2)] == [(0,), (1,)]
+    # Replicated state is the same on both context ranks.
+    assert page_layout.replica_ranks(ranks, 1, 1, replicated=True) == (0, 1)
+
+
+@pytest.mark.cpu_only
+def test_replicas_are_every_rank_of_the_instance_holding_the_bytes():
+    """Which of them a caller may choose from is the caller's to filter."""
+    parameters = inspect.signature(page_layout.replica_ranks).parameters
+    assert list(parameters) == ["ranks", "rank", "group", "replicated"]
+    assert parameters["replicated"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["replicated"].default is False
+
+
 @pytest.mark.cpu_only
 def test_head_geometry_is_described_per_buffer():
     layout = derive_layout(attention(2, 0, num_kv_heads=8)).page_layout
@@ -1853,7 +1965,9 @@ def test_the_layout_types_keep_their_module_fields_and_members():
     from tensorrt_llm._torch.disaggregation.resource import page as native
 
     assert native.MapperKind is MapperKind and native.RoleLayout is RoleLayout
-    assert sorted(page_layout.__all__) == sorted(t.__name__ for t in (*LAYOUT_TYPES, MapperKind))
+    assert sorted(page_layout.__all__) == sorted(
+        [*(t.__name__ for t in (*LAYOUT_TYPES, MapperKind)), "replica_ranks"]
+    )
     assert not hasattr(sharing, "PageLayout") and "PageLayout" not in sharing.__all__
     for name in ("BufferDesc", "RoleLayout", "MapperKind", "LayerGroupDesc", "ShardDesc"):
         assert getattr(_layout, name) is getattr(page_layout, name), name

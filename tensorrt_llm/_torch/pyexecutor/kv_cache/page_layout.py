@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One rank's page layout and transfer geometry as immutable values; standard library only."""
+"""One rank's page layout and transfer geometry as immutable values, and which ranks of an
+instance hold the same bytes; standard library only."""
 
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import dataclasses
 import enum
 import numbers
 import types
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Mapping
 
@@ -32,6 +34,7 @@ __all__ = [
     "RankTopology",
     "RoleLayout",
     "ShardDesc",
+    "replica_ranks",
 ]
 
 _QUANT_MODES = ("fp8", "nvfp4", "fp8_ds_mla")
@@ -524,3 +527,61 @@ class PageLayout:
                 for value in values
             )
         )
+
+
+def _same_group(layout: PageLayout, desc: LayerGroupDesc) -> LayerGroupDesc | None:
+    """The layer group of ``layout`` holding exactly ``desc``'s layers, of its kind, or None."""
+    layers = frozenset(desc.layers)
+    for other in layout.layer_groups:
+        if other.kind == desc.kind and frozenset(other.layers) == layers:
+            return other
+    return None
+
+
+def replica_ranks(
+    ranks: Sequence[PageLayout],
+    rank: int,
+    group: int,
+    *,
+    replicated: bool = False,
+) -> tuple[int, ...]:
+    """The flat ranks of one instance holding the same bytes as layer group ``group`` of rank
+    ``rank``, read from every rank's published layout.
+
+    Ranks hold the same bytes of a layer group when they serve the same requests (the same
+    attention data-parallel rank); hold the same pages (under Helix an attention group's pages split
+    by context-parallel rank, while a state group's rows do not); hold the same layers, in a layer
+    group of the same kind; and hold the same share of the group's content: a replicated buffer is
+    the same on every such rank, any other buffer on the ranks whose ``LayerGroupDesc.shard`` is
+    equal.
+
+    Args:
+        ranks: Every rank's layout of one instance, by flat rank.
+        rank: The flat rank whose layer group is matched.
+        group: The index of the layer group in that rank's layout.
+        replicated: Match the group's replicated buffers; otherwise its other buffers, which
+            split by the published shard.
+
+    Returns:
+        The matching flat ranks, ascending, ``rank`` among them.
+
+    Raises:
+        IndexError: ``rank`` or ``group`` names no rank or layer group.
+    """
+    layout = ranks[rank]
+    desc = layout.layer_groups[group]
+    topology = layout.topology
+    paged_by_context = desc.kind == "attention"
+    out = []
+    for other_rank in range(len(ranks)):
+        other = ranks[other_rank]
+        other_topology = other.topology
+        if other_topology.dp_rank != topology.dp_rank:
+            continue
+        if paged_by_context and other_topology.cp_rank != topology.cp_rank:
+            continue
+        match = _same_group(other, desc)
+        if match is None or (not replicated and match.shard != desc.shard):
+            continue
+        out.append(other_rank)
+    return tuple(out)
