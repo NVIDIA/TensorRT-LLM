@@ -103,6 +103,7 @@ class ChatPostprocArgs(PostprocArgs):
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_parser: Optional[str] = None
+    tool_parser_grammar_constrained: bool = False
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
@@ -299,7 +300,8 @@ def apply_tool_parser(args: ChatPostprocArgs,
         if output_index not in args.tool_parser_dict:
             args.tool_parser_dict[
                 output_index] = ToolParserFactory.create_tool_parser(
-                    args.tool_parser)
+                    args.tool_parser,
+                    grammar_constrained=args.tool_parser_grammar_constrained)
         tool_parser = args.tool_parser_dict[output_index]
 
     if tool_parser is not None and tools is not None:

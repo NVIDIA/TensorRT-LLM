@@ -200,6 +200,22 @@ from .helpers import (
 from cutlass.experimental import primitives as prims
 
 
+def _compact_q_prefix_min_rows(q: cute.Tensor) -> int | None:
+    """Rows needed for a proven 128 KiB contiguous prefix, or None if unproven."""
+    if len(q.shape) != 3:
+        return None
+    h, d = q.shape[1:]
+    element_bits = q.element_type.width
+    if not all(isinstance(x, int) for x in (h, d, element_bits, *q.stride)):
+        return None
+    if h <= 0 or d <= 0 or element_bits not in (8, 16):
+        return None
+    if tuple(q.stride) != (h * d, d, 1):
+        return None
+    row_bytes = h * d * (element_bits // 8)
+    return (128 * 1024 + row_bytes - 1) // row_bytes
+
+
 def _as_i32(x: int | Int32) -> Int32:
     return Int32(x) if isinstance(x, int) else x
 
@@ -2743,6 +2759,9 @@ class FmhaTs:
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
         extent fits one 128-token tile (default: False).
+    use_blackwell_tma_oob_workaround : bool, optional
+        Use conservative OOB address generation for ragged Q tensor maps.
+        Enable only for a Blackwell execution device (default: False).
     """
 
     def __init__(
@@ -2772,6 +2791,7 @@ class FmhaTs:
         causal_single_kv_tile: bool = False,
         exhaustive_deadlock_race_check: bool = True,
         d_v: int | None = None,
+        use_blackwell_tma_oob_workaround: bool = False,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -2815,6 +2835,7 @@ class FmhaTs:
         self.is_causal = is_causal
         self.is_clc_dynamic = is_clc_dynamic
         self.exhaustive_deadlock_race_check = exhaustive_deadlock_race_check
+        self.use_blackwell_tma_oob_workaround = use_blackwell_tma_oob_workaround
 
         q_dtype = in_qk_dtype or cutlass.Float16
         k_dtype = in_qk_dtype or cutlass.Float16
@@ -3162,6 +3183,24 @@ class FmhaTs:
                 # Zero-fill partial Q rows and head-dimension fragments.
                 oob_fill=cuda.TensorMapFloatOOBFill.none,
             )
+            if cutlass.const_expr(self.use_blackwell_tma_oob_workaround):
+                # Only the real Q layout can establish a mapped prefix;
+                # synthetic ragged dimensions and padded head sizes cannot.
+                minimum_rows = _compact_q_prefix_min_rows(q_cute)
+                correct_oob_addressing = True
+                if cutlass.const_expr(minimum_rows is not None):
+                    correct_oob_addressing = q_cute.shape[0] < minimum_rows
+                if correct_oob_addressing:
+                    # Work around the Blackwell driver TMA descriptor issue documented at
+                    # https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-615-71-09/index.html#known-issues
+                    # Clear Blackwell descriptor bit 85 on the host when a
+                    # contiguous 128 KiB prefix has not been established.
+                    descriptor_word1 = (
+                        cutlass.Pointer(tma_q_desc.get_ptr(), dtype=cutlass.Uint64) + 1
+                    )
+                    descriptor_word1.store(
+                        descriptor_word1.load() & ~cutlass.Uint64(1 << 21)
+                    )
         else:
             tma_q_desc = cuda.create_tensor_map_tiled_from_view(
                 q_cute,

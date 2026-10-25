@@ -9,7 +9,7 @@ byte budget before each decode step. This is a capability facet, orthogonal to
 the runner family axis -- it has no warmup or graph-capture phase.
 """
 
-from collections.abc import Hashable
+from collections.abc import Hashable, Mapping
 from typing import Any
 
 import torch
@@ -21,6 +21,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
@@ -34,7 +35,11 @@ from tensorrt_llm.inputs.registry import (
     InputProcessor,
     get_multimodal_encoder_item_metadata,
 )
-from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    MultimodalEncoderCudaGraphConfig,
+    MultimodalEncoderSchedulingPolicy,
+    TorchLlmArgs,
+)
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, MultimodalEncoderRequestError, _Unset, get_mm_items_for_chunk
@@ -140,9 +145,52 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
     return enabled
 
 
+def use_mrope(model: nn.Module) -> bool:
+    """Whether the model's rope scaling is multimodal RoPE."""
+    use_mrope = False
+    try:
+        use_mrope = model.model_config.pretrained_config.rope_scaling["type"] == "mrope"
+    except Exception:
+        pass
+    logger.debug(f"Detected use_mrope: {use_mrope}")
+    return use_mrope
+
+
 def mm_encoder_cache_enabled(model: nn.Module) -> bool:
     """Whether the multimodal encoder cache is active for this model."""
     return isinstance(model, MultimodalModelMixin) and model.encoder_cache_active
+
+
+def setup_mm_encoder_cuda_graphs(
+    model: nn.Module,
+    graph_configs: Mapping[str, MultimodalEncoderCudaGraphConfig] | None = None,
+    *,
+    max_num_tokens: int | None = None,
+) -> None:
+    """Validate local encoder capabilities, then capture graphs before KV sizing.
+
+    Args:
+        model: Loaded model whose local encoders have already initialized their metadata.
+        graph_configs: Model-wide modality configs. Validate against all local towers together;
+            models without local encoders may delegate encoding to another process.
+        max_num_tokens: Encoder token budget before any scheduling-only increase for large items.
+            Supplies the default capture capacity for automatic configs in each tower.
+    """
+    encoders = [module for module in model.modules() if isinstance(module, MultimodalEncoderMixin)]
+    if graph_configs is not None and encoders:
+        supported_modalities = {
+            module.encoder_cuda_graph_modality
+            for module in encoders
+            if module.encoder_cuda_graph_modality is not None
+        }
+        unsupported = set(graph_configs) - supported_modalities
+        if unsupported:
+            raise ValueError(
+                f"Unsupported multimodal encoder CUDA graph modalities: {sorted(unsupported)}. "
+                f"Supported modalities: {sorted(supported_modalities)}."
+            )
+    for module in encoders:
+        module.enable_blocks_cuda_graph(max_num_tokens=max_num_tokens)
 
 
 def setup_mm_encoder_attn_metadata(
@@ -176,10 +224,20 @@ def setup_mm_encoder_attn_metadata(
 
     for module in encoders:
         setup_kwargs: dict[str, Any] = dict(max_num_tokens=encoder_max_num_tokens)
+        encoder_max_seq_len = max_seq_len
         if attention_metadata_capacity is not None:
             setup_kwargs["attention_metadata_capacity"] = attention_metadata_capacity
+        graph_config = module.encoder_cuda_graph_config
+        if graph_config is not None:
+            graph_tokens = (
+                max(tokens for tokens, _ in graph_config.buckets)
+                if graph_config.buckets is not None
+                else graph_config.max_num_tokens
+            )
+            if graph_tokens is not None:
+                encoder_max_seq_len = max(max_seq_len, graph_tokens)
         module.setup_attn_metadata(**setup_kwargs)
-        module.set_attn_max_seq_len(max_seq_len)
+        module.set_attn_max_seq_len(encoder_max_seq_len)
 
 
 def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
@@ -520,44 +578,59 @@ class MultimodalItemScheduler:
                 target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
             )
 
-        try:
-            outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
-        except MultimodalEncoderContractError as error:
-            raise MultimodalEncoderRequestError(
-                str(error), request_ids=producer_request_ids
-            ) from error
-        if len(outputs) != len(output_targets):
-            raise MultimodalEncoderRequestError(
-                "MM item encoder must return one output per item",
-                request_ids=producer_request_ids,
-            )
-
-        expected_dtype, expected_width = self._embedding_dtype_and_width()
-
-        # Validate the entire batch before publishing any output. Otherwise a
-        # bad later item could leave earlier items READY and later requests
-        # admitted to prefill without committed outputs.
-        for output, (item_idx, cache_key, expected_rows) in zip(
-            outputs, output_targets, strict=True
-        ):
-            if (
-                not isinstance(output, torch.Tensor)
-                or output.shape != (expected_rows, expected_width)
-                or output.dtype != expected_dtype
-            ):
-                actual = (
-                    f"a {output.dtype} tensor with shape {tuple(output.shape)}"
-                    if isinstance(output, torch.Tensor)
-                    else type(output).__name__
+        # The vision tower runs outside ModelCaller, so its TP all-reduces can
+        # return NCCL window tensors here. The cache stores clones, so every
+        # window lease produced by this batch ends with the scope. Request-level
+        # failures are raised only after the forward returned and are identical
+        # on every rank, so they are raised once the scope has closed normally:
+        # a failed scope would quarantine this batch's window buffers for the
+        # communicator's lifetime while the executor keeps serving.
+        pending_error: MultimodalEncoderRequestError | None = None
+        with discard_nccl_window_tensor_outputs(encoder_inputs):
+            try:
+                outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
+            except MultimodalEncoderContractError as error:
+                pending_error = MultimodalEncoderRequestError(
+                    str(error), request_ids=producer_request_ids
                 )
-                raise MultimodalEncoderRequestError(
-                    f"MM item {item_idx} must produce a {expected_dtype} tensor "
-                    f"with shape ({expected_rows}, {expected_width}), got {actual}",
-                    request_ids=requests_using_cache_keys({cache_key}),
+                pending_error.__cause__ = error
+            if pending_error is None and len(outputs) != len(output_targets):
+                pending_error = MultimodalEncoderRequestError(
+                    "MM item encoder must return one output per item",
+                    request_ids=producer_request_ids,
                 )
 
-        for output, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
-            encoder_cache.commit(cache_key, output)
+            if pending_error is None:
+                expected_dtype, expected_width = self._embedding_dtype_and_width()
+
+                # Validate the entire batch before publishing any output. Otherwise a
+                # bad later item could leave earlier items READY and later requests
+                # admitted to prefill without committed outputs.
+                for output, (item_idx, cache_key, expected_rows) in zip(
+                    outputs, output_targets, strict=True
+                ):
+                    if (
+                        not isinstance(output, torch.Tensor)
+                        or output.shape != (expected_rows, expected_width)
+                        or output.dtype != expected_dtype
+                    ):
+                        actual = (
+                            f"a {output.dtype} tensor with shape {tuple(output.shape)}"
+                            if isinstance(output, torch.Tensor)
+                            else type(output).__name__
+                        )
+                        pending_error = MultimodalEncoderRequestError(
+                            f"MM item {item_idx} must produce a {expected_dtype} tensor "
+                            f"with shape ({expected_rows}, {expected_width}), got {actual}",
+                            request_ids=requests_using_cache_keys({cache_key}),
+                        )
+                        break
+
+            if pending_error is None:
+                for output, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
+                    encoder_cache.commit(cache_key, output)
+        if pending_error is not None:
+            raise pending_error
 
         # Every scheduled key is now committed. One pass over the requests
         # also marks the items of requests that only share a committed entry.
