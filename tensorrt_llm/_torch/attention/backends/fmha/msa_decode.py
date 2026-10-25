@@ -22,7 +22,7 @@ module-scope import here would close a cycle.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -52,6 +52,11 @@ class MsaDecodeFmha(PhasedFmha):
         # Where this layer's trtllm-gen scratch sits inside the shared
         # attention workspace, settled by prepare_workspace each step.
         self._dense_layout: Optional[DenseDecodeWorkspaceLayout] = None
+        # An optional stand-in for minimax_m3_sparse_attn_decode on a sparse
+        # layer, set by a model that carries its own build of that kernel. It
+        # takes the same arguments, must write the same output, and returns
+        # nothing.
+        self.sparse_decode_hook: Optional[Callable[..., None]] = None
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -199,9 +204,14 @@ class MsaDecodeFmha(PhasedFmha):
                 k_global_scale=k_scale,
                 v_global_scale=v_scale,
             )
+        decode = (
+            minimax_m3_sparse_attn_decode
+            if self.sparse_decode_hook is None
+            else self.sparse_decode_hook
+        )
         # q may still be FP8 from a fused producer; the kernel widens it
         # in-register, so it is passed through as it arrives.
-        minimax_m3_sparse_attn_decode(
+        decode(
             params.query_input.view(num_tokens, attn.num_heads, head_dim),
             k_paged,
             v_paged,

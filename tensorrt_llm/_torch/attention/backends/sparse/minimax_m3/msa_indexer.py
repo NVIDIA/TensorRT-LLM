@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import functools
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -362,6 +362,15 @@ class MsaIndexer:
 
     def __init__(self, config: "MiniMaxM3SparseConfig"):
         self.config = config
+        # An optional replacement for the top-k select, set by a model that
+        # carries a faster kernel for some shapes. It is called as
+        # hook(max_score_kv, n_valid_blocks, init_blocks, local_blocks) on the
+        # KV-head-reduced scores and returns either the table
+        # select_blocks_from_maxscore would (same values, shape, dtype and
+        # head-major backing) or None to leave the step to that select.
+        self.selector_hook: Optional[
+            Callable[[torch.Tensor, torch.Tensor, int, int], Optional[torch.Tensor]]
+        ] = None
 
     def select_blocks(
         self,
@@ -535,8 +544,18 @@ class MsaIndexer:
         decode kernel reads the table head-major and takes every generation
         row, while fmha_sm100 reads whatever strides it is handed.
         """
+        max_score_kv = _group_max_reduce(max_score, self.config)
+        if self.selector_hook is not None:
+            table = self.selector_hook(
+                max_score_kv,
+                n_valid_blocks,
+                self.config.init_blocks,
+                self.config.local_blocks,
+            )
+            if table is not None:
+                return table
         return select_blocks_from_maxscore(
-            _group_max_reduce(max_score, self.config),
+            max_score_kv,
             topk=MSA_REQUIRED_TOPK,
             n_valid_blocks=n_valid_blocks,
             init_blocks=self.config.init_blocks,
