@@ -1284,6 +1284,14 @@ class KVCacheManagerV2(BaseResourceManager):
     # The lender sharing.attach_lender installs, one per manager for its life; None without one.
     # On the class so it exists without running __init__.
     _sharing = None
+    # Opt-in (RuntimeHooks.skip_unchanged_draft_block_offsets): copy_batch_block_offsets skips a decode-only copy
+    # whose destination, copied rows and the rows' host page indices equal the previous copy's into that
+    # destination (see _block_offsets_unchanged). On the class so it exists without running __init__.
+    skip_unchanged_block_offsets: bool = False
+    _block_offset_guard: Optional[dict] = None
+    _block_offset_host: Optional[np.ndarray] = None
+    block_offset_copies: int = 0
+    block_offset_skips: int = 0
 
     def __init__(
         self,
@@ -6589,6 +6597,13 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         assert copy_idx.shape[0] == num_seqs
 
+        if (
+            self.skip_unchanged_block_offsets
+            and not self._use_per_layer_page_tables
+            and self._block_offsets_unchanged(dst_tensor, copy_idx, num_contexts)
+        ):
+            return
+
         if self._use_per_layer_page_tables:
             self._copy_batch_block_offsets_per_layer(
                 dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
@@ -6603,6 +6618,59 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_offset,
             self._stream.cuda_stream,
         )
+
+    def _block_offsets_unchanged(
+        self, dst_tensor: torch.Tensor, copy_idx: torch.Tensor, num_contexts: int
+    ) -> bool:
+        """Whether the copy into ``dst_tensor`` would write exactly what the previous copy into it wrote.
+
+        copy_batch_block_offsets_to_device writes, for each copied row i, dst[:, i, 0/1, :] from field 0 of host
+        row copy_idx[i] alone (the V entry is derived from the same page index) and the per-pool scales and offsets,
+        which are fixed at construction. So the copy can be skipped when the destination view (storage, offset,
+        shape, strides), the copied rows and those rows' field-0 page indices equal the last copy's into that
+        storage: the device bytes are then already the ones the copy would write. Every write into these
+        destinations goes through this method, and a copy into another view of the same storage replaces the
+        record. A step with context requests always copies (its rows are being filled). The compare is a
+        single-threaded numpy compare of the copied rows only (a torch compare of the whole table costs tens of us
+        on the host per step).
+        """
+        guard = self._block_offset_guard
+        if guard is None:
+            guard = self._block_offset_guard = {}
+        storage = dst_tensor.untyped_storage().data_ptr()
+        if num_contexts != 0:
+            guard.pop(storage, None)
+            return self._count_block_offset_copy(skipped=False)
+        rows = copy_idx.tolist()
+        key = (
+            dst_tensor.data_ptr(),
+            tuple(dst_tensor.shape),
+            tuple(dst_tensor.stride()),
+            tuple(rows),
+        )
+        host = self._block_offset_host
+        if host is None:
+            host = self._block_offset_host = self.host_kv_cache_block_offsets.numpy()
+        current = host[:, rows, 0, :]
+        last = guard.get(storage)
+        if last is not None and last[0] == key and np.array_equal(last[1], current):
+            return self._count_block_offset_copy(skipped=True)
+        guard[storage] = (key, current)
+        return self._count_block_offset_copy(skipped=False)
+
+    def _count_block_offset_copy(self, skipped: bool) -> bool:
+        """Count one guarded copy (``skipped``: not issued) and log the counts whenever the calls reach a power of
+        two; returns ``skipped``."""
+        if skipped:
+            self.block_offset_skips += 1
+        else:
+            self.block_offset_copies += 1
+        calls = self.block_offset_skips + self.block_offset_copies
+        if calls & (calls - 1) == 0:
+            logger.info(
+                f"[M3 host] block-offset copies skipped when unchanged: {self.block_offset_skips} of {calls}"
+            )
+        return skipped
 
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> int | None:

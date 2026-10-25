@@ -509,6 +509,13 @@ class DFlashForCausalLM(nn.Module):
                 f"{self.dflash_attention_backend!r} but loads no op set for it."
             )
         self._dflash_trtllm_gen_workspace = None
+        # Optional target-installed hooks. Unarmed draft models retain the stock path.
+        self._dflash_lean_glue = False
+        self._dflash_cache_rows = None
+        self._dflash_fused_indices = None
+        self._dflash_fused_qk_norm_rope = None
+        self._dflash_fused_qk_norm_rope_append = None
+        self._dflash_attn_pdl = False
         self._dflash_trtllm_gen_counters = None
         self.register_buffer("_dflash_batch_indices", None, persistent=False)
         self.register_buffer("_dflash_block_offsets", None, persistent=False)
@@ -1047,7 +1054,8 @@ class DFlashForCausalLM(nn.Module):
         # after the select() splits — no extra copy required.
         kv = kv_flat.view(N, L, 2, nkv, hd)
         k = kv[:, :, 0].contiguous()
-        v = kv[:, :, 1].contiguous()
+        # V only feeds the paged append and an in-place mask multiply, both stride-aware.
+        v = kv[:, :, 1] if self._dflash_lean_glue else kv[:, :, 1].contiguous()
 
         if self._k_norm_stacked is not None:
             # Fuse L per-layer RMSNorms into one. k is [N, L, nkv, hd];
@@ -1535,10 +1543,26 @@ class DFlashForCausalLM(nn.Module):
             q_rope_cos, q_rope_sin = self._get_rope_cos_sin(query_positions, dtype=rope_dtype)
         _rope = RotaryEmbedding.apply_rotary_pos_emb
 
-        # cache_seqlens BEFORE the block's K/V are stored.
-        cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
-        cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
-        seq_lens_after = cache_seqlens_i32 + block_size
+        # A target's one-launch index prelude for the paged decode: the same int32 tensors as the stock lines, or None.
+        fused_indices = (
+            self._dflash_fused_indices(
+                num_ctx_per_req[:B],
+                ctx_cache_batch_idx,
+                query_positions,
+                block_size,
+                ctx_page_table.size(1),
+                ctx_kv_cache[0].size(-2),
+            )
+            if is_paged and self._dflash_fused_indices is not None
+            else None
+        )
+        if fused_indices is not None:
+            cache_seqlens_i32, cache_batch_idx_i32, seq_lens_after = fused_indices[:3]
+        else:
+            # cache_seqlens BEFORE the block's K/V are stored.
+            cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
+            cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
+            seq_lens_after = cache_seqlens_i32 + block_size
 
         if is_paged:
             max_batch_size = ctx_page_table.size(0)
@@ -1554,28 +1578,38 @@ class DFlashForCausalLM(nn.Module):
                 )
             else:  # FA4 needs no workspace or counter buffers.
                 self._prepare_dflash_index_buffers(hidden_states.device, max_batch_size, block_size)
-            block_tables = ctx_page_table.index_select(0, cache_batch_idx_i32.long())
+            rows = self._dflash_cache_rows if self._dflash_lean_glue else None
+            if rows is not None:
+                block_tables = ctx_page_table[rows[0] : rows[1]]
+            else:
+                block_tables = ctx_page_table.index_select(0, cache_batch_idx_i32.long())
             pages_per_slot = block_tables.size(1)
             # Index the layer first: ctx_kv_cache is an [L, ...] tensor for the
             # private arena but a per-layer list when bound to the draft KV
             # cache manager's pool. page_size sits at -2 either way.
             page_size = ctx_kv_cache[0].size(-2)
             kv_indices = block_tables.flatten()
-            kv_indptr = torch.arange(
-                0,
-                (B + 1) * pages_per_slot,
-                pages_per_slot,
-                dtype=torch.int32,
-                device=hidden_states.device,
-            )
-            kv_last_page_len = ((seq_lens_after - 1) % page_size) + 1
+            if fused_indices is not None:
+                kv_indptr, kv_last_page_len = fused_indices[3:5]
+            else:
+                kv_indptr = torch.arange(
+                    0,
+                    (B + 1) * pages_per_slot,
+                    pages_per_slot,
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+                kv_last_page_len = ((seq_lens_after - 1) % page_size) + 1
             batch_indices = self._dflash_batch_indices
             append_batch_indices = batch_indices[:B].reshape(-1)
-            append_positions = (
-                (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets)
-                .reshape(-1)
-                .contiguous()
-            )
+            if fused_indices is not None:
+                append_positions = fused_indices[5]
+            else:
+                append_positions = (
+                    (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets)
+                    .reshape(-1)
+                    .contiguous()
+                )
         else:  # VANILLA
             # Slot and column that each block K/V row occupies
             self._prepare_dflash_index_buffers(
@@ -1591,8 +1625,11 @@ class DFlashForCausalLM(nn.Module):
                 (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets).reshape(-1).long()
             )
 
-        # Flatten query positions once for the fused QK-norm-RoPE kernel.
-        query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
+        if fused_indices is not None:
+            query_positions_flat_i32 = fused_indices[6]
+        else:
+            # Flatten query positions once for the fused QK-norm-RoPE kernel.
+            query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
 
         residual = None
         has_block_conv = self.has_block_conv
@@ -1622,6 +1659,9 @@ class DFlashForCausalLM(nn.Module):
             # QKV projection on normed query tokens (2D)
             qkv_query = attn_mod.qkv_proj(hs_normed_flat)  # [B*blk, qkv_size]
 
+            kv_appended = (
+                False  # the fused q / k norm + RoPE also wrote this layer's K / V pages (see below)
+            )
             if use_fused_qk_norm_rope:
                 # One kernel does q_norm + k_norm + RoPE in-place on qkv.
                 # Only safe when the drafter's rope params don't use YaRN /
@@ -1635,21 +1675,66 @@ class DFlashForCausalLM(nn.Module):
                 k_noise_bshd = k_noise_2d.reshape(B, block_size, num_kv_heads_per_rank, head_dim)
                 v_noise_bshd = v_noise_2d.reshape(B, block_size, num_kv_heads_per_rank, head_dim)
             elif use_fused_rope:
-                # Per-head RMSNorm on q/k (returns new contiguous tensors),
-                # then flashinfer in-place RoPE sharing the same cos/sin cache
-                # as precompute_context_kv.
-                q = attn_mod.q_norm(qkv_query[:, :q_size].reshape(-1, head_dim)).view(-1, q_size)
-                k = attn_mod.k_norm(
-                    qkv_query[:, q_size : q_size + kv_size].reshape(-1, head_dim)
-                ).view(-1, kv_size)
-                _flashinfer_rope(
-                    query_positions_flat_i32,
-                    q,
-                    k,
-                    head_dim,
-                    self._get_cos_sin_cache(),
-                    self._is_neox,
+                # A target's one-launch q / k norm + RoPE: the same new q / k as the lines below, or None. With the
+                # append form, the same launch also writes the block's K / V into this layer's paged cache.
+                fused_qk = (
+                    self._dflash_fused_qk_norm_rope_append(
+                        qkv_query,
+                        q_size,
+                        kv_size,
+                        head_dim,
+                        attn_mod.q_norm,
+                        attn_mod.k_norm,
+                        query_positions_flat_i32,
+                        self._get_cos_sin_cache(),
+                        self._is_neox,
+                        ctx_kv_cache[layer_idx],
+                        append_batch_indices,
+                        append_positions,
+                        kv_indices,
+                        kv_indptr,
+                    )
+                    if self._dflash_fused_qk_norm_rope_append is not None
+                    and self.dflash_attention_backend == "TRTLLM"
+                    else None
                 )
+                kv_appended = fused_qk is not None
+                if fused_qk is None:
+                    fused_qk = (
+                        self._dflash_fused_qk_norm_rope(
+                            qkv_query,
+                            q_size,
+                            kv_size,
+                            head_dim,
+                            attn_mod.q_norm,
+                            attn_mod.k_norm,
+                            query_positions_flat_i32,
+                            self._get_cos_sin_cache(),
+                            self._is_neox,
+                        )
+                        if self._dflash_fused_qk_norm_rope is not None
+                        else None
+                    )
+                if fused_qk is not None:
+                    q, k = fused_qk
+                else:
+                    # Per-head RMSNorm on q/k (returns new contiguous tensors),
+                    # then flashinfer in-place RoPE sharing the same cos/sin cache
+                    # as precompute_context_kv.
+                    q = attn_mod.q_norm(qkv_query[:, :q_size].reshape(-1, head_dim)).view(
+                        -1, q_size
+                    )
+                    k = attn_mod.k_norm(
+                        qkv_query[:, q_size : q_size + kv_size].reshape(-1, head_dim)
+                    ).view(-1, kv_size)
+                    _flashinfer_rope(
+                        query_positions_flat_i32,
+                        q,
+                        k,
+                        head_dim,
+                        self._get_cos_sin_cache(),
+                        self._is_neox,
+                    )
                 Q_bshd = q.view(B, block_size, num_heads_per_rank, head_dim)
                 k_noise_bshd = k.view(B, block_size, num_kv_heads_per_rank, head_dim)
                 v_noise_bshd = qkv_query[:, q_size + kv_size :].reshape(
@@ -1694,21 +1779,26 @@ class DFlashForCausalLM(nn.Module):
             causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
-                trtllm_gen_ops.append_paged_kv_cache(
-                    append_key=k_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    append_value=v_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    batch_indices=append_batch_indices,
-                    positions=append_positions,
-                    paged_kv_cache=layer_cache,
-                    kv_indices=kv_indices,
-                    kv_indptr=kv_indptr,
-                    kv_last_page_len=kv_last_page_len,
-                    kv_layout="HND",
-                )
+                if not kv_appended:
+                    trtllm_gen_ops.append_paged_kv_cache(
+                        append_key=k_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        append_value=(
+                            v_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim)
+                            if self._dflash_lean_glue
+                            else v_noise_bshd.reshape(
+                                -1, num_kv_heads_per_rank, head_dim
+                            ).contiguous()
+                        ),
+                        batch_indices=append_batch_indices,
+                        positions=append_positions,
+                        paged_kv_cache=layer_cache,
+                        kv_indices=kv_indices,
+                        kv_indptr=kv_indptr,
+                        kv_last_page_len=kv_last_page_len,
+                        kv_layout="HND",
+                    )
                 out = torch.empty_like(Q_bshd)
                 q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
@@ -1726,7 +1816,7 @@ class DFlashForCausalLM(nn.Module):
                         window_left=window_left,
                         out=out_flat,
                         sinks=None,
-                        enable_pdl=False,
+                        enable_pdl=self._dflash_attn_pdl,
                         kv_layout="HND",
                         backend="trtllm-gen",
                         q_len_per_req=block_size,
@@ -1767,7 +1857,7 @@ class DFlashForCausalLM(nn.Module):
                         window_left=window_left,
                         out=out_flat,
                         sinks=None,
-                        enable_pdl=False,
+                        enable_pdl=self._dflash_attn_pdl,
                         kv_layout="HND",
                         kv_cache_sf=None,
                         uses_shared_paged_kv_idx=True,
@@ -1780,9 +1870,11 @@ class DFlashForCausalLM(nn.Module):
                     append_key=k_noise_bshd.reshape(
                         -1, num_kv_heads_per_rank, head_dim
                     ).contiguous(),
-                    append_value=v_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
+                    append_value=(
+                        v_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim)
+                        if self._dflash_lean_glue
+                        else v_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim).contiguous()
+                    ),
                     batch_indices=append_batch_indices,
                     positions=append_positions,
                     paged_kv_cache=layer_cache,

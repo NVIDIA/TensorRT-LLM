@@ -37,7 +37,7 @@ from __future__ import annotations
 import enum
 import os
 from importlib import import_module
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -49,6 +49,7 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 
 # architectures[0] -> routing module, relative to this package.
 MODELING_V2_ROUTERS = {
+    "MiniMaxM3SparseForConditionalGeneration": "models.minimax_m3.routing",
     "GptOssForCausalLM": "models.gpt_oss.routing",
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
 }
@@ -101,6 +102,62 @@ class NoTarget(Exception):
     """
 
 
+_RESOLVED_MODES: Dict[type, ModelingV2Mode] = {}
+
+
+def resolved_mode(target: type) -> ModelingV2Mode:
+    """The mode ``modeling_v2_resolve`` returned ``target`` under; ``auto`` for a class built without it.
+
+    A target reads it at construction: under ``require`` its in-target dispatch
+    raises where it would otherwise fall back to a built-in path inside the
+    shapes it claims.
+    """
+    return _RESOLVED_MODES.get(target, ModelingV2Mode.AUTO)
+
+
+def tp_reaches_across_nodes(mapping) -> bool:
+    """Whether an attention-TP allreduce over ``mapping`` can reach every rank
+    through the workspaces the default targets build.
+
+    Inside one node the IPC workspace (``comm/allreduce``) serves it. Across
+    nodes the targets take the MNNVL workspace (``comm/mnnvl_allreduce``), which
+    needs one NVLink domain over those nodes, as on GB200 and GB300 trays. This
+    is the check the built-in ``AllReduce`` makes before it takes MNNVL. Where it
+    fails, the built-in model falls back to NCCL, which the targets do not
+    implement, so a routing module refuses and ``auto`` keeps the built-in model.
+    Attention DP reduces nothing in its norm slots, and its allgather and
+    reduce-scatter run over NCCL.
+    """
+    if mapping.enable_attention_dp or mapping.tp_size == 1 or not mapping.is_multi_node():
+        return True
+    import torch
+
+    from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+
+    # bf16 is the activation dtype of both default targets.
+    return MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+
+
+def _kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
+    """The KV-cache algorithm the engine will run with, which routing runs too early to read.
+
+    The loader resolves the target before `validate_and_set_kv_cache_quant`
+    applies `kv_cache_config.dtype` to the config, so this applies the same
+    rule here: ``auto`` keeps the checkpoint's algorithm, ``fp8`` and
+    ``nvfp4`` replace it. Any other dtype comes back as the string given, so a
+    route refuses it by name: ``fp8_ds_mla`` is FP8 to the loader but also
+    selects a packed sparse-MLA cache layout, and an unknown dtype is one the
+    loader raises on later.
+    """
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    dtype = llm_args.kv_cache_config.dtype
+    if dtype == "auto":
+        algo = config.quant_config.kv_cache_quant_algo
+        return None if algo is None else QuantAlgo(algo)
+    return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
+
+
 def routing_module(arch: str):
     """Import and return the routing module for ``arch``, or None."""
     name = MODELING_V2_ROUTERS.get(arch)
@@ -143,6 +200,17 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             raise NoTarget(
                 f"no routing module for this architecture; routed architectures: {known}"
             )
+        if arch == "MiniMaxM3SparseForConditionalGeneration":
+            target = routing.route(
+                pretrained_config,
+                config.mapping,
+                _device_compute_capability(),
+                config.spec_config,
+                _kv_cache_quant_algo(config, llm_args),
+            )
+            if target is not None:
+                _RESOLVED_MODES[target] = mode
+            return target
         return routing.route(
             pretrained_config, config.mapping, _device_compute_capability(), config.spec_config
         )
