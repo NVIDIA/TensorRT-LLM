@@ -665,6 +665,104 @@ def test_recurrent_state_is_described_and_sharded_by_rank():
     assert by_role["ssm_state"].geometry == RoleLayout(bytes_per_head=32)
 
 
+def tensor_ranks_per_group(topology):
+    """Tensor ranks in the attention data-parallel group of a rank, by its topology."""
+    return topology.tp_size // topology.dp_size if topology.attention_dp else topology.tp_size
+
+
+def state_grid(topology):
+    """``(ranks, place)`` of the grid recurrent state splits over, by a rank's topology: tensor
+    ranks, none under attention data parallelism, tensor times context ranks (context-minor) under
+    Helix."""
+    if topology.attention_dp:
+        return 1, 0
+    if topology.cp_size > 1:
+        return (
+            topology.tp_size * topology.cp_size,
+            topology.tp_rank * topology.cp_size + topology.cp_rank,
+        )
+    return topology.tp_size, topology.tp_rank
+
+
+def attention_and_state(tp_size, tp_rank, attention_dp, num_kv_heads, cp_size=1, cp_rank=0):
+    """A rank of ``num_kv_heads`` KV heads in layers 0 and 1 and recurrent state in layers 2 and
+    3; under Helix, context rank ``cp_rank`` of ``cp_size``."""
+    heads = -(-num_kv_heads // (1 if attention_dp else tp_size))
+    manager = Manager(
+        [
+            kv_group(lids=(0, 1), heads_per_rank=heads),
+            (SsmLayerConfig, [2, 3], [("conv_state", 96, None), ("ssm_state", 128, None)]),
+        ],
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        attention_dp=attention_dp,
+        num_kv_heads=num_kv_heads,
+        mappers={"conv_state": MapperKind.SECTIONED},
+        layouts={
+            "conv_state": RoleLayout(section_bytes=(32, 32, 32)),
+            "ssm_state": RoleLayout(bytes_per_head=32),
+        },
+    )
+    if cp_size > 1:
+        manager._has_cp_helix = True
+        manager._helix_cp_rank, manager._helix_cp_size = cp_rank, cp_size
+        manager.mapping.cp_size, manager.mapping.cp_rank = cp_size, cp_rank
+    return manager
+
+
+# (TP size, attention DP, Helix context ranks, KV heads) of every instance the sweep builds.
+SHARD_SWEEP = [
+    (tp_size, attention_dp, cp_size, num_kv_heads)
+    for tp_size in (1, 2, 4, 8)
+    for attention_dp in ((False, True) if tp_size > 1 else (False,))
+    for cp_size in ((1,) if attention_dp else (1, 2, 4))
+    for num_kv_heads in (1, 2, 4, 6, 8, 12, 16)
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tp_size, attention_dp, cp_size, num_kv_heads",
+    SHARD_SWEEP,
+    ids=[f"tp{t}{'_adp' if a else ''}_cp{c}_heads{h}" for t, a, c, h in SHARD_SWEEP],
+)
+def test_published_shards_are_the_shares_the_topology_gives(
+    tp_size, attention_dp, cp_size, num_kv_heads
+):
+    """Every rank's published shards name what its topology gives it.
+
+    Attention: a rank at place ``p`` of an attention data-parallel group of ``n`` tensor ranks
+    holds the heads from ``p * T // n``; its share's first head, ``index * T // count``, is that
+    head, and two ranks have equal shares exactly when they hold the same heads. State: the share
+    is the rank's place in the grid recurrent state splits over.
+    """
+    layouts = [
+        derive_layout(
+            attention_and_state(tp_size, tp_rank, attention_dp, num_kv_heads, cp_size, cp_rank)
+        ).page_layout
+        for tp_rank in range(tp_size)
+        for cp_rank in range(cp_size)
+    ]
+    first_heads = []
+    for layout in layouts:
+        attention, state = layout.layer_groups
+        topology = layout.topology
+        ranks = tensor_ranks_per_group(topology)
+        first = (topology.tp_rank % ranks) * num_kv_heads // ranks
+        first_heads.append(first)
+        share = attention.shard
+        assert share.index * num_kv_heads // share.count == first, (topology, share)
+        count, index = state_grid(topology)
+        assert state.shard == (ShardDesc(count, index) if count > 1 else ShardDesc()), (
+            topology,
+            state.shard,
+        )
+    for one, first_one in zip(layouts, first_heads):
+        for other, first_other in zip(layouts, first_heads):
+            same_share = one.layer_groups[0].shard == other.layer_groups[0].shard
+            assert same_share == (first_one == first_other), (one.topology, other.topology)
+
+
 @pytest.mark.cpu_only
 def test_head_geometry_is_described_per_buffer():
     layout = derive_layout(attention(2, 0, num_kv_heads=8)).page_layout

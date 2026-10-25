@@ -279,7 +279,8 @@ def _expansions(
 
 
 class _Heads:
-    """Head counts of attention buffers: per rank from the manager, in total from its inputs."""
+    """Head counts of attention buffers: per rank from the manager, in total from its inputs; and
+    the grid of ranks recurrent state splits over."""
 
     def __init__(self, manager: KVCacheManagerV2) -> None:
         mapping = getattr(manager, "mapping", None)
@@ -288,6 +289,9 @@ class _Heads:
         self.tp_rank = (
             0 if self.tp_size == 1 else int(getattr(mapping, "tp_rank", 0)) % self.tp_size
         )
+        cp_rank, cp_size = (0, 1) if dp else _manager.helix(manager)
+        self.state_size = self.tp_size * cp_size
+        self.state_rank = self.tp_rank * cp_size + cp_rank
         self._per_rank = list(getattr(manager, "num_kv_heads_per_layer", ()) or ())
         self._total = getattr(manager, "num_kv_heads", None)
         self._virtual = _manager.virtual_layers(manager) is not None
@@ -327,7 +331,12 @@ class _Heads:
         return ShardDesc(count, index)
 
     def state_shard(self) -> ShardDesc:
-        return ShardDesc(self.tp_size, self.tp_rank) if self.tp_size > 1 else ShardDesc()
+        """The share of recurrent state this rank holds: over the tensor-parallel ranks, over none
+        under attention data parallelism, and over tensor times context ranks, context-minor, under
+        Helix."""
+        if self.state_size == 1:
+            return ShardDesc()
+        return ShardDesc(self.state_size, self.state_rank)
 
 
 def _buffer_geometry(
