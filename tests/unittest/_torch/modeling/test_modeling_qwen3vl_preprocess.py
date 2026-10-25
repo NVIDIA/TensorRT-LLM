@@ -16,13 +16,13 @@
 
 Covers two pieces of logic that decide what reaches HF's video processor:
 
-  1. ``_decide_do_sample_frames`` — the decision tree that picks the single
-     ``do_sample_frames`` flag for the whole batch.
+  1. ``_decide_do_sample_frames`` — the per-video sampling decision.
   2. ``_preprocess`` — metadata rewriting and kwargs threading around the
      processor call.
 
-The tests bind ``_preprocess`` to a stand-in object so they exercise the
-control flow without constructing a real HF processor.
+The tests use a production adapter instance and a mock HF processor to check
+metadata and kwargs forwarding. Real HF processing is covered by the
+multimodal video sampling tests.
 """
 
 from types import SimpleNamespace
@@ -45,9 +45,18 @@ def _fake_video(metadata, *, n_frames=8):
 
 def _call_preprocess(mm_data, mm_processor_kwargs):
     fake_processor = MagicMock(return_value={})
-    fake_self = SimpleNamespace(processor=fake_processor)
-    Qwen3VLInputProcessorBase._preprocess(
-        fake_self,
+    fake_processor._merge_kwargs.return_value = {
+        "images_kwargs": {},
+        "videos_kwargs": dict(mm_processor_kwargs),
+    }
+    fake_processor.video_processor.do_sample_frames = True
+    fake_processor.video_processor.num_frames = None
+    fake_processor.video_processor.fps = 2
+    fake_processor.video_processor.max_frames = 768
+    fake_processor.video_processor.sample_frames.return_value = [0, 2, 4, 7]
+    instance = object.__new__(Qwen3VLInputProcessorBase)
+    instance._processor = fake_processor
+    instance._preprocess(
         "the prompt",
         mm_data,
         mm_processor_kwargs,
@@ -78,13 +87,41 @@ class TestDecideDoSampleFrames:
         vd = _fake_video({}, n_frames=8)
         assert _decide_do_sample_frames([vd], {"num_frames": 4}) is True
 
+    @pytest.mark.parametrize("target", ["num_frames", "fps"])
+    @pytest.mark.parametrize("value", [0, -1, -2])
+    def test_nonpositive_single_target_disables_limit(self, target, value):
+        vd = _fake_video(
+            {"fps": 24.0, "duration": 10.0, "frames_indices": list(range(40))}, n_frames=40
+        )
+        assert _decide_do_sample_frames([vd], {target: value}) is False
+
+    @pytest.mark.parametrize("num_frames", [None, 0, 40])
+    def test_fps_target_uses_decoded_prefix_duration(self, num_frames):
+        vd = _fake_video(
+            {
+                "fps": 24.0,
+                "total_num_frames": 240,
+                "duration": 10.0,
+                "frames_indices": list(range(40)),
+            },
+            n_frames=40,
+        )
+        kwargs = {"fps": 4}
+        if num_frames is not None:
+            kwargs["num_frames"] = num_frames
+        assert _decide_do_sample_frames([vd], kwargs) is True
+
     def test_fps_target_computed_from_duration(self):
         # Target = floor(duration * fps) = floor(4.0 * 2.0) = 8 → no resample.
         vd_match = _fake_video({"duration": 4.0}, n_frames=8)
         assert _decide_do_sample_frames([vd_match], {"fps": 2.0}) is False
-        # Target = floor(4.0 * 4.0) = 16 ≠ 8 → resample.
+        # FPS sampling still delegates its frame cap to HF.
         vd_diff = _fake_video({"duration": 4.0}, n_frames=8)
         assert _decide_do_sample_frames([vd_diff], {"fps": 4.0}) is True
+
+    @pytest.mark.parametrize("n,target", [(10, 32), (40, 100)])
+    def test_oversized_num_frames_does_not_request_upsampling(self, n, target):
+        assert not _decide_do_sample_frames([_fake_video({}, n_frames=n)], {"num_frames": target})
 
     def test_silent_caller_io_loaded_all_triggers_fallback_sampling(self):
         # No num_frames/fps from caller, IO loaded every source frame
@@ -109,38 +146,40 @@ class TestDecideDoSampleFrames:
 class TestPreprocessMetadataForwarding:
     """`_preprocess` forwards per-video metadata with controlled rewrites."""
 
-    def test_total_num_frames_rewritten_to_decoded_count(self):
+    def test_source_total_num_frames_retained(self):
         # Source clip had 240 frames; IO subsampled to 8.
-        # `total_num_frames` must be rewritten so HF's sample_frames indices
-        # stay in range of the 8-frame tensor we hand it.
+        # The source total is retained; sampling is handled before HF processes
+        # the decoded frames with its own sampling switch disabled.
         vd = _fake_video({"total_num_frames": 240, "fps": 24.0, "duration": 10.0}, n_frames=8)
         processor = _call_preprocess({"video": [vd]}, {"num_frames": 8})
-        m = processor.call_args.kwargs["video_metadata"][0]
-        assert m["total_num_frames"] == 8
+        m = processor.call_args.kwargs["videos_kwargs"]["video_metadata"][0]
+        assert m["total_num_frames"] == 240
         assert m["fps"] == 24.0  # other fields unchanged
 
     def test_metadata_is_none_when_no_videos(self):
         processor = _call_preprocess({}, {"fps": 2.0})
-        assert processor.call_args.kwargs["video_metadata"] is None
+        assert "video_metadata" not in processor.call_args.kwargs["videos_kwargs"]
 
 
 class TestPreprocessKwargsForwarding:
-    """`do_sample_frames` is always passed; sampling kwargs are conditional."""
+    """Videos are sampled per item, then HF's batch sampler is disabled."""
 
     def test_sampling_kwargs_forwarded_when_sampling(self):
-        # num_frames mismatches frames count → sampling fires → num_frames forwarded.
+        # Sampling receives the requested target, then the batch switch is disabled.
         vd = _fake_video({}, n_frames=8)
         processor = _call_preprocess({"video": [vd]}, {"num_frames": 4})
-        kwargs = processor.call_args.kwargs
-        assert kwargs["do_sample_frames"] is True
-        assert kwargs["num_frames"] == 4
+        kwargs = processor.call_args.kwargs["videos_kwargs"]
+        assert kwargs["do_sample_frames"] is False
+        assert "num_frames" not in kwargs
+        assert processor.video_processor.sample_frames.call_args.kwargs["num_frames"] == 4
+        assert kwargs["video_metadata"][0]["frames_indices"] == [0, 2, 4, 7]
 
     def test_sampling_kwargs_dropped_when_not_sampling(self):
         # num_frames matches frames count → no sampling → num_frames NOT forwarded
         # (HF's class-default ``fps=2`` cannot collide because do_sample_frames=False).
         vd = _fake_video({}, n_frames=8)
         processor = _call_preprocess({"video": [vd]}, {"num_frames": 8})
-        kwargs = processor.call_args.kwargs
+        kwargs = processor.call_args.kwargs["videos_kwargs"]
         assert kwargs["do_sample_frames"] is False
         assert "num_frames" not in kwargs
         assert "fps" not in kwargs
@@ -154,4 +193,4 @@ class TestPreprocessKwargsForwarding:
     def test_unrelated_kwargs_pass_through(self):
         # Resize/normalize knobs flow through unchanged.
         processor = _call_preprocess({}, {"max_pixels": 1234})
-        assert processor.call_args.kwargs["max_pixels"] == 1234
+        assert processor.call_args.kwargs["videos_kwargs"]["max_pixels"] == 1234
