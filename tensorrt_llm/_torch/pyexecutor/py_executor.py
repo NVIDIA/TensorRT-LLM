@@ -386,6 +386,15 @@ class PyExecutor:
     # Whether the model opted into running the overlap loop on the execution
     # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
     _execution_stream_loop_armed = False
+    # Step-ahead KV tier staging (_init_kv_tier_staging); off until armed. On
+    # the class so it exists without running __init__.
+    _kv_headroom_managers: tuple = ()
+    _kv_prefetch_managers: tuple = ()
+    _kv_onboard_prefetch_reqs = 0
+    _kv_onboard_early_fetch = False
+    _kv_onboard_defer_tokens = 0
+    _kv_onboard_deferred_ids: frozenset = frozenset()
+    _early_activated_requests: tuple = ()
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -669,6 +678,7 @@ class PyExecutor:
         # context resources before transfer or response handling can terminate
         # a request.
         self._prefetched_request_ids: set[int] = set()
+        self._init_kv_tier_staging()
         self.enable_kv_cache_events = self.kv_cache_manager is not None and (
             self.kv_cache_manager.event_buffer_max_size > 0 or getattr(
                 self.kv_cache_manager, "streaming_kv_events_enabled", False))
@@ -4036,6 +4046,147 @@ class PyExecutor:
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.free_resources(req)
 
+    def _init_kv_tier_staging(self) -> None:
+        """Opt-in step-ahead KV tier copies on KV cache manager v2 pools with a host tier.
+
+        TRTLLM_M3_ASYNC_OFFLOAD=1 keeps GPU slots evicted one step ahead
+        (TRTLLM_M3_ASYNC_OFFLOAD_TOKENS of them per pool, default
+        max_num_tokens), so a forward's new pages do not wait on offloads
+        issued for it. TRTLLM_KV_ONBOARD_PREFETCH=<n> onboards the reused
+        prefix of up to n not-yet-admitted context requests per step;
+        requests arriving during a step are activated right after its launch
+        (TRTLLM_KV_ONBOARD_PREFETCH_EARLY_FETCH=0 turns that off) so their
+        copies overlap the step. With
+        TRTLLM_KV_ONBOARD_PREFETCH_DEFER_TOKENS=<t>, an arrival whose
+        onboarding brings at least t reused tokens to the GPU is staged before
+        its first schedule and held out of it, so the step does not wait on
+        its copies. See kv_cache/kv_tier_staging.py.
+        """
+        self._kv_headroom_managers: list = []
+        self._kv_prefetch_managers: list = []
+        self._kv_onboard_prefetch_reqs = 0
+        self._kv_onboard_early_fetch = False
+        self._kv_onboard_prefetched_ids: set[int] = set()
+        self._kv_onboard_defer_tokens = 0
+        self._kv_onboard_deferred_ids: set[int] = set()
+        self._early_activated_requests: List[LlmRequest] = []
+        if not self._is_kv_manager_v2:
+            return
+        managers = [self.kv_cache_manager]
+        if (isinstance(self.draft_kv_cache_manager, KVCacheManagerV2)
+                and self.draft_kv_cache_manager is not self.kv_cache_manager):
+            managers.append(self.draft_kv_cache_manager)
+
+        if os.environ.get("TRTLLM_M3_ASYNC_OFFLOAD", "0") == "1":
+            tokens = int(
+                os.environ.get("TRTLLM_M3_ASYNC_OFFLOAD_TOKENS", "0")
+                or 0) or int(self.max_num_tokens or 0)
+            self._kv_headroom_managers = [
+                manager for manager in managers
+                if manager.enable_offload_headroom(tokens)
+            ]
+            logger.info(
+                f"KV offload headroom: {tokens} tokens on "
+                f"{len(self._kv_headroom_managers)} of {len(managers)} pool(s)")
+
+        num_reqs = int(os.environ.get("TRTLLM_KV_ONBOARD_PREFETCH", "0") or 0)
+        if num_reqs > 0:
+
+            def can_onboard(manager) -> bool:
+                return (manager.enable_block_reuse
+                        and not manager.is_estimating_kv_cache
+                        and manager.has_lower_cache_tier())
+
+            self._kv_prefetch_managers = list(filter(can_onboard, managers))
+            if self._kv_prefetch_managers:
+                self._kv_onboard_prefetch_reqs = num_reqs
+                # Attention DP routes requests with a rank-state allgather
+                # that runs once per fetch; keep its cadence.
+                early_fetch = os.environ.get(
+                    "TRTLLM_KV_ONBOARD_PREFETCH_EARLY_FETCH", "1") == "1"
+                self._kv_onboard_early_fetch = (early_fetch and
+                                                not self.enable_attention_dp)
+                self._kv_onboard_defer_tokens = int(
+                    os.environ.get("TRTLLM_KV_ONBOARD_PREFETCH_DEFER_TOKENS",
+                                   "0") or 0)
+            logger.info(
+                f"KV onboard prefetch: up to {self._kv_onboard_prefetch_reqs} "
+                f"request(s) per step on {len(self._kv_prefetch_managers)} "
+                f"pool(s), early fetch {self._kv_onboard_early_fetch}, "
+                f"defer from {self._kv_onboard_defer_tokens} tokens")
+
+    def _release_kv_offload_headroom(self) -> None:
+        for manager in self._kv_headroom_managers:
+            manager.release_offload_headroom()
+
+    @nvtx_range("_stage_kv_tiers_after_launch")
+    def _stage_kv_tiers_after_launch(self) -> None:
+        """Issue next-step KV tier copies while the just-launched forward runs.
+
+        Runs on every rank of a model-parallel group at the same point with the
+        same requests, so the pools' states stay identical across ranks.
+        """
+        if self._kv_onboard_prefetch_reqs > 0:
+            if (self._kv_onboard_early_fetch and self.active_requests
+                    and not self.is_shutdown and not self.control_requests):
+                self._early_activated_requests.extend(
+                    self._fetch_and_activate_new_requests())
+            candidates = self._onboard_prefetch_candidates()
+            if candidates:
+                for manager in self._kv_prefetch_managers:
+                    manager.prefetch_context_to_gpu(candidates)
+        # After the prefetch, so the pages it just placed are the most recent
+        # and the headroom's eviction takes older ones.
+        for manager in self._kv_headroom_managers:
+            manager.reserve_offload_headroom()
+
+    @nvtx_range("_stage_kv_for_new_arrivals")
+    def _stage_kv_for_new_arrivals(self,
+                                   new_requests: List[LlmRequest]) -> None:
+        """Onboard arrivals before their first schedule; hold back those with much to copy.
+
+        Only the first pool's onboarded token count decides, so every rank of a
+        model-parallel group defers the same requests.
+        """
+        self._kv_onboard_deferred_ids = set()
+        if self._kv_onboard_defer_tokens <= 0 or not new_requests:
+            return
+        candidates = self._onboard_prefetch_candidates(new_requests)
+        if not candidates:
+            return
+        onboarded = {}
+        for index, manager in enumerate(self._kv_prefetch_managers):
+            staged = manager.prefetch_context_to_gpu(candidates,
+                                                     measure=index == 0)
+            if index == 0:
+                onboarded = staged
+        self._kv_onboard_deferred_ids = {
+            request_id
+            for request_id, num_tokens in onboarded.items()
+            if num_tokens >= self._kv_onboard_defer_tokens
+        }
+
+    def _onboard_prefetch_candidates(
+            self,
+            requests: Optional[List[LlmRequest]] = None) -> List[LlmRequest]:
+        """Not-yet-admitted first-chunk context requests, oldest first, each staged once."""
+        kv_cache_map = self.kv_cache_manager.kv_cache_map
+        pending = [
+            req for req in self.active_requests
+            if req.is_context_init_state and req.is_first_context_chunk
+            and not req.is_dummy and req.py_request_id not in kv_cache_map
+        ]
+        staged = self._kv_onboard_prefetched_ids
+        staged.intersection_update(req.py_request_id for req in pending)
+        if requests is not None:
+            wanted = {req.py_request_id for req in requests}
+            pending = [req for req in pending if req.py_request_id in wanted]
+        candidates = [
+            req for req in pending if req.py_request_id not in staged
+        ][:self._kv_onboard_prefetch_reqs]
+        staged.update(req.py_request_id for req in candidates)
+        return candidates
+
     @nvtx_range("_prefetch_for_context_requests")
     def _prefetch_for_context_requests(self) -> None:
         """Pre-stage disk blocks to host for upcoming context requests with block reuse."""
@@ -4191,6 +4342,11 @@ class PyExecutor:
         self._release_unused_connector_reservations()
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
+        if self._early_activated_requests:
+            # Activated during the previous iteration (see
+            # _stage_kv_tiers_after_launch); they are new to this schedule.
+            new_requests = self._early_activated_requests + new_requests
+            self._early_activated_requests = []
         if self.should_stop_processing:
             return None, None
 
@@ -4206,6 +4362,7 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         self._prefetch_for_context_requests()
+        self._stage_kv_for_new_arrivals(new_requests)
 
         if self.drafter is not None:
             # Honor permanent disable flag based on rolling acceptance first
@@ -4755,6 +4912,10 @@ class PyExecutor:
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
 
+                # Hand the step-ahead headroom back before anything allocates
+                # or adjusts pools (adjustment needs every cache suspended).
+                self._release_kv_offload_headroom()
+
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
@@ -4905,6 +5066,7 @@ class PyExecutor:
 
                         self._maybe_prefetch_next_iter_mm_encoders(
                             scheduled_batch)
+                        self._stage_kv_tiers_after_launch()
 
                         guided_decoder_failed_requests = None
                         if self.guided_decoder is not None:
@@ -5662,6 +5824,10 @@ class PyExecutor:
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
 
+                # Hand the step-ahead headroom back before anything allocates
+                # or adjusts pools (adjustment needs every cache suspended).
+                self._release_kv_offload_headroom()
+
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
@@ -5837,6 +6003,7 @@ class PyExecutor:
                                 scheduled_batch, previous_tensors_device)
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
+                    self._stage_kv_tiers_after_launch()
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -7136,8 +7303,17 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
+        schedulable = self.active_requests
+        if self._kv_onboard_deferred_ids:
+            # Arrivals whose reused prefix is still being onboarded; they are
+            # schedulable from the next iteration on.
+            schedulable = [
+                req for req in schedulable
+                if req.py_request_id not in self._kv_onboard_deferred_ids
+            ]
+            self._kv_onboard_deferred_ids = set()
         scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+            schedulable, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
