@@ -763,6 +763,56 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
     assert plan.use_deep_ep_direct_metadata is expected
 
 
+@pytest.mark.parametrize(
+    "multi_stream,capturing,has_comm,router_weight_on_input,expected",
+    [
+        # Eager forward: host-bound, quantize on the main stream.
+        (False, False, False, False, False),
+        # CUDA graph runner (multi-stream) or any active capture: fork it.
+        (True, False, False, False, True),
+        (False, True, False, False, True),
+        # A comm strategy owns the quantize/dispatch order.
+        (True, False, True, False, False),
+        # x is scaled by the router weight before quantization.
+        (True, False, False, True, False),
+    ],
+)
+def test_scheduler_quantizes_input_async_only_under_multi_stream(
+    monkeypatch,
+    multi_stream: bool,
+    capturing: bool,
+    has_comm: bool,
+    router_weight_on_input: bool,
+    expected: bool,
+) -> None:
+    from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
+
+    monkeypatch.setattr(moe_scheduler, "do_multi_stream", lambda: multi_stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        backend=CuteDslFusedMoE.__new__(CuteDslFusedMoE),
+        comm=object() if has_comm else None,
+        apply_router_weight_on_input=router_weight_on_input,
+    )
+
+    assert scheduler._should_quantize_input_async(torch.empty(2, 4)) is expected
+
+
+def test_scheduler_skips_async_quantization_without_backend_support(monkeypatch) -> None:
+    from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
+
+    monkeypatch.setattr(moe_scheduler, "do_multi_stream", lambda: True)
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        backend=CutlassFusedMoE.__new__(CutlassFusedMoE),
+        comm=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert scheduler._should_quantize_input_async(torch.empty(2, 4)) is False
+
+
 # =====================================================================
 # do_finalize=False: construction-time validation, the model-owned
 # finalize the scheduler runs before the combine, and the one-sided
