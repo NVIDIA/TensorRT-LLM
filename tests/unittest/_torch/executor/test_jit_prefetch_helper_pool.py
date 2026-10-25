@@ -269,6 +269,59 @@ def test_fmha_gen_is_predicted_for_layers_on_trtllm_gen(mla, has_trtllm_gen, exp
 
 
 @pytest.mark.cpu_only
+def test_layer_module_join_outwaits_a_long_build(monkeypatch):
+    """Warmup's join of the layers' FlashInfer modules waits for a long build
+    (an hour by default: stopping it would only restart it in the forward that
+    needs it) unless TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S bounds it."""
+    seen = []
+    monkeypatch.setattr(
+        jp, "wait_flashinfer_build", lambda timeout_s, modules: seen.append(timeout_s)
+    )
+    monkeypatch.delenv("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", raising=False)
+    jp.wait_flashinfer_layer_builds()
+    monkeypatch.setenv("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "120")
+    jp.wait_flashinfer_layer_builds()
+    assert seen == [3600.0, 120.0]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm,expected", [(100, ["fused_moe_trtllm_sm100"]),
+                                         (107, ["fused_moe_trtllm_sm107"])])  # fmt: skip
+def test_flashinfer_moe_layers_name_the_fused_moe_module(monkeypatch, sm, expected):
+    """A MoE layer on FlashInfer's op backend names FlashInfer's TRTLLM-Gen
+    fused MoE module (its Rubin variant on SM 10.7); a model without one
+    names none."""
+    from tensorrt_llm._torch.moe.fused_moe import jit_prefetch_flashinfer as moe_plan
+    from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import FlashinferOpBackend
+
+    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: sm)
+    layer = torch.nn.Module()
+    layer.op_backend = object.__new__(FlashinferOpBackend)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), layer)
+    assert moe_plan.flashinfer_modules(model) == expected
+    other = torch.nn.Module()
+    other.op_backend = object()  # another op backend
+    assert moe_plan.flashinfer_modules(torch.nn.Sequential(other)) == []
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("available", [True, False])
+def test_rotary_embedding_names_the_rope_module(monkeypatch, available):
+    """A model holding a RotaryEmbedding names FlashInfer's RoPE module when
+    FlashInfer is available."""
+    from tensorrt_llm._torch import flashinfer_utils
+    from tensorrt_llm._torch.attention import jit_prefetch_flashinfer_rope as rope_plan
+    from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
+
+    monkeypatch.setattr(flashinfer_utils, "IS_FLASHINFER_AVAILABLE", available)
+    rope = object.__new__(RotaryEmbedding)
+    torch.nn.Module.__init__(rope)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), rope)
+    assert rope_plan.flashinfer_modules(model) == (["rope"] if available else [])
+    assert rope_plan.flashinfer_modules(torch.nn.Sequential(torch.nn.Linear(2, 2))) == []
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("running", [True, False])
 def test_swap_ab_tuning_pass_runs_without_deep_gemm_helpers(monkeypatch, running):
     """With compile ahead on, the swap-AB DeepGEMM ops skip their JIT

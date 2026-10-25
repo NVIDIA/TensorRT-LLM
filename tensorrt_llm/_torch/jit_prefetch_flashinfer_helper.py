@@ -47,16 +47,25 @@ import time
 _stop = False
 
 # FlashInfer JIT modules a helper builds, by JitSpec name (the directory of
-# FlashInfer's JIT cache it is built in): (module, generator of its JitSpec).
-# ``fmha_gen`` is FlashInfer's TRTLLM-GEN attention launcher; its generator
-# also downloads the kernel header the build includes. ``mxfp8_gemm_cutlass``
-# is the SM100-family CUTLASS MXFP8 GEMM behind ``mm_mxfp8``, and
-# ``trtllm_utils`` the delay kernel FlashInfer's autotuner times with.
+# FlashInfer's JIT cache it is built in): (module, generator of its JitSpec[,
+# the generator's keyword arguments]). ``fmha_gen`` is FlashInfer's TRTLLM-GEN
+# attention launcher, and ``fused_moe_trtllm_sm100`` / ``_sm107`` its TRTLLM-Gen
+# fused MoE launcher (Blackwell / Rubin); their generators also download the
+# kernel headers the build includes. ``mxfp8_gemm_cutlass`` is the SM100-family
+# CUTLASS MXFP8 GEMM behind ``mm_mxfp8``, ``trtllm_utils`` the delay kernel
+# FlashInfer's autotuner times with, and ``rope`` its RoPE kernels.
 MODULES = {
     "sampling": ("flashinfer.jit.sampling", "gen_sampling_module"),
     "fmha_gen": ("flashinfer.jit.attention", "gen_trtllm_gen_fmha_module"),
     "mxfp8_gemm_cutlass": ("flashinfer.jit.gemm", "gen_gemm_sm100_module_cutlass_mxfp8"),
     "trtllm_utils": ("flashinfer.jit.tllm_utils", "gen_trtllm_utils_module"),
+    "rope": ("flashinfer.jit.rope", "gen_rope_module"),
+    "fused_moe_trtllm_sm100": ("flashinfer.jit.fused_moe", "gen_trtllm_gen_fused_moe_sm100_module"),
+    "fused_moe_trtllm_sm107": (
+        "flashinfer.jit.fused_moe",
+        "gen_trtllm_gen_fused_moe_sm100_module",
+        {"enable_rubin": True},
+    ),
 }
 
 
@@ -124,8 +133,8 @@ def _gen_spec(name: str):
         if spec.name != name:
             raise ValueError(f"{name} names the module {spec.name}")
         return spec
-    module, generator = MODULES[name]
-    return getattr(importlib.import_module(module), generator)()
+    module, generator, *kwargs = MODULES[name]
+    return getattr(importlib.import_module(module), generator)(**(kwargs[0] if kwargs else {}))
 
 
 def main() -> int:

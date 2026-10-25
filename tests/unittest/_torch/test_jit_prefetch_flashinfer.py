@@ -278,6 +278,41 @@ _MXFP8_CASE = textwrap.dedent(
 )
 
 
+# FlashInfer's RoPE module, which RotaryEmbedding's query/key path builds at
+# its first call: started for the model's layers, the module FlashInfer's own
+# op then loads is the helper's build.
+_ROPE_CASE = textwrap.dedent(
+    """
+    import json, os, time
+    import torch
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from flashinfer.jit import env as jit_env
+
+    so = jit_env.FLASHINFER_JIT_DIR / "rope" / "rope.so"
+    started = jp.start_flashinfer_build(("rope",), nice=0, layer=True)
+    waited = jp.wait_flashinfer_layer_builds()
+    mtime = os.stat(so).st_mtime_ns if so.exists() else None
+    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+
+    dev = torch.device("cuda")
+    head = 64
+    q = torch.randn(4, 2 * head, dtype=torch.bfloat16, device=dev)
+    k = torch.randn(4, head, dtype=torch.bfloat16, device=dev)
+    cos_sin = torch.randn(16, head, dtype=torch.float32, device=dev)
+    t = time.time()
+    apply_rope_with_cos_sin_cache_inplace(torch.arange(4, device=dev), q, k, head, cos_sin, True)
+    torch.cuda.synchronize()
+    load_s = time.time() - t
+    print(json.dumps({"started": started, "waited": waited,
+                      "built_before_load": mtime is not None,
+                      "rebuilt": mtime is not None and os.stat(so).st_mtime_ns != mtime,
+                      "load_s": load_s, "finite": bool(torch.isfinite(q).all()),
+                      "again": [jp.start_flashinfer_build(("rope",), nice=0, layer=True),
+                                jp.flashinfer_builds_pending()]}))
+    """
+)
+
+
 def _env(tmp_path, prefetch: bool):
     env = dict(os.environ, FLASHINFER_WORKSPACE_BASE=str(tmp_path / "fi"), PYTHONNOUSERSITE="1")
     for var in ("TLLM_JIT_AHEAD", "TLLM_JIT_PREFETCH"):
@@ -392,4 +427,14 @@ def test_mxfp8_tune_modules_built_by_helper_are_what_flashinfer_loads(tmp_path):
     assert r["built_before_load"] and r["rebuilt"] == [False, False], r
     assert r["load_s"] < 30 and r["runner"], r
     # Built and joined: nothing is started again, nothing left to join.
+    assert r["again"] == [False, False], r
+
+
+def test_rope_module_built_by_helper_is_what_flashinfer_loads(tmp_path):
+    r = _run_json(tmp_path, prefetch=True, case=_ROPE_CASE)
+    assert r["started"] is True and r["waited"] is not None, r
+    # The helper built the module; FlashInfer's RoPE op loaded it without a
+    # rebuild (the build is about half a minute of nvcc) and ran on it.
+    assert r["built_before_load"] and not r["rebuilt"], r
+    assert r["load_s"] < 10 and r["finite"], r
     assert r["again"] == [False, False], r

@@ -449,11 +449,22 @@ def wait_flashinfer_build(
     return time.perf_counter() - t0
 
 
+def _layer_join_timeout_s() -> float:
+    """Seconds warmup's join of the layers' FlashInfer modules waits:
+    ``TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S`` if set, else an hour. Stopping a layer
+    module's build only restarts it from scratch in the forward that needs
+    it, which cannot finish sooner than the helper's build; the TRTLLM-Gen
+    fused MoE launcher alone is about 15 minutes of nvcc per rank."""
+    if os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S"):
+        return _wait_timeout_s()
+    return 3600.0
+
+
 def wait_flashinfer_layer_builds() -> Optional[float]:
     """Join the helpers building modules of the model's layers (``layer`` in
     ``start_flashinfer_build``), before warmup's first forward; return the
     seconds waited, or None if there is none to join."""
-    return wait_flashinfer_build(modules=_fi_layer_modules)
+    return wait_flashinfer_build(timeout_s=_layer_join_timeout_s(), modules=_fi_layer_modules)
 
 
 def cancel_flashinfer_build() -> None:
@@ -534,7 +545,8 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
       knows of such modules lists them (``fmha_gen``, FlashInfer's TRTLLM-GEN
       attention launcher, for the layers of any model that run on its FMHA
       library, GLM-5.3-Flash's MLA decode and MiniMax-M3; the Mamba2 decode's
-      ``selective_state_update``), which warmup joins
+      ``selective_state_update``; the TRTLLM-Gen fused MoE launcher of MoE
+      layers on FlashInfer's op backend; FlashInfer's RoPE), which warmup joins
       before its first forward (``wait_flashinfer_layer_builds``), and the
       sampling module, if the engine ``llm_args`` describes builds it in
       warmup (``warmup_builds_sampling_module``; warmup starts it otherwise);
@@ -572,6 +584,8 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
         "attention.backends.sparse.glm_kpool.jit_prefetch",
         "attention.backends.sparse.minimax_m3.jit_prefetch_fmha",
         "modules.mamba.jit_prefetch_flashinfer",
+        "moe.fused_moe.jit_prefetch_flashinfer",
+        "attention.jit_prefetch_flashinfer_rope",
     ):
         try:
             planner = importlib.import_module(f".{provider_module}", __package__)
