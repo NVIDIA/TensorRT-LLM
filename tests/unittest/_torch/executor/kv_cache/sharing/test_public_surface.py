@@ -80,6 +80,7 @@ INTERNALS = {
     "pool_group_descs",
     "_has_lossy_cold_page_codec",
     "get_disagg_global_layer_ids",
+    "get_model_layer_ids",
     "get_disagg_role_mapper_kinds",
     "get_disagg_role_layouts",
     "get_disagg_ignored_roles",

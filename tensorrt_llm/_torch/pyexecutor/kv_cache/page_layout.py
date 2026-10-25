@@ -184,11 +184,15 @@ class LayerGroupDesc:
         shard: The share of the group's content held on this rank.
         read_window: Positive number of tokens attention reads, defaulting to kept_window; None
             means full attention. A declared read window must lie within the kept window.
+        model_layers: The model layer each of ``layers`` belongs to, in the same order, normalized
+            to a tuple; None gives ``layers`` themselves. Layer ids numbering several caches of one
+            model layer apart, such as one per attention type, all name that model layer.
 
     Raises:
-        ValueError: If an index or layer id is not a non-negative integer, a window is not a
-            positive integer, any such value is a boolean, or read_window exceeds kept_window or is
-            given when kept_window is None."""
+        ValueError: If an index, layer id or model layer is not a non-negative integer, a window is
+            not a positive integer, any such value is a boolean, read_window exceeds kept_window or
+            is given when kept_window is None, or model_layers does not name one model layer per
+            layer."""
 
     kind: Literal["attention", "state"]
     kept_window: int | None
@@ -197,6 +201,7 @@ class LayerGroupDesc:
     layers: tuple[int, ...]
     shard: ShardDesc = ShardDesc()
     read_window: int | None = None
+    model_layers: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.kept_window is not None:
@@ -217,6 +222,16 @@ class LayerGroupDesc:
                 f"a read window of {self.read_window} tokens is not within the kept window of "
                 f"{self.kept_window} tokens"
             )
+        if self.model_layers is None:
+            object.__setattr__(self, "model_layers", self.layers)
+        else:
+            model_layers = tuple(_integer(n, "model layer") for n in self.model_layers)
+            if len(model_layers) != len(self.layers):
+                raise ValueError(
+                    f"{len(model_layers)} model layers for the {len(self.layers)} layers "
+                    f"{self.layers}"
+                )
+            object.__setattr__(self, "model_layers", model_layers)
 
     @classmethod
     def unchecked(
@@ -228,9 +243,11 @@ class LayerGroupDesc:
         layers: tuple[int, ...],
         shard: ShardDesc = ShardDesc(),
         read_window: int | None = None,
+        model_layers: tuple[int, ...] | None = None,
     ) -> LayerGroupDesc:
         """The constructor's layer group of these values, without its checks and conversions; a
-        read window of None still defaults to the kept window. See ``PageLayout.unchecked``."""
+        read window of None still defaults to the kept window, and model layers of None to the
+        layers. See ``PageLayout.unchecked``."""
         group = object.__new__(cls)
         group.__dict__.update(
             kind=kind,
@@ -240,6 +257,7 @@ class LayerGroupDesc:
             layers=layers,
             shard=shard,
             read_window=kept_window if read_window is None else read_window,
+            model_layers=layers if model_layers is None else model_layers,
         )
         return group
 

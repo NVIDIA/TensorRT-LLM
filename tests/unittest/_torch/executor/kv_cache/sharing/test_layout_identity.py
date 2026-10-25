@@ -62,7 +62,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import (
     canonical_bytes,
     canonical_order,
     derive_layout,
-    global_layer_ids,
     layout_document,
     layout_id,
 )
@@ -151,6 +150,7 @@ def _first_group(layout, **change):
         pytest.param(lambda: make_layout(windows=(None, 128)), id="window"),
         pytest.param(lambda: make_layout(windows=(64, 64)), id="full_to_window"),
         pytest.param(lambda: make_layout(shard=ShardDesc(2, 1)), id="shard"),
+        pytest.param(lambda: _first_group(make_layout(), model_layers=(0, 0)), id="model_layers"),
         pytest.param(
             lambda: dataclasses.replace(make_layout(), buffers=make_layout().buffers[::-1]),
             id="buffer_order",
@@ -159,8 +159,9 @@ def _first_group(layout, **change):
 )
 def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
     """Local numbering and order, sinks and windows (which blocks exist, not how their bytes read),
-    and the shard position, which rides in the name so every rank computes the same ``layout_id``.
-    Buffers are described by global layer, so their listing order does not matter either."""
+    the shard position, which rides in the name so every rank computes the same ``layout_id``, and
+    the model layer each layer belongs to. Buffers are described by global layer, so their listing
+    order does not matter either."""
     assert layout_id(variant()) == layout_id(make_layout())
 
 
@@ -891,7 +892,7 @@ def test_layers_are_global_ids_stable_across_pipeline_stages():
     assert geometry.page_layout.layer_groups[0].layers == (10, 11)
     assert geometry.layers == ((10, 11),)
     assert {b.layer for b in geometry.page_layout.buffers} == {10, 11}
-    assert global_layer_ids(manager, [1, 0]) == [11, 10]
+    assert _manager.global_layer_ids(manager, [1, 0]) == [11, 10]
     # A manager without the map is refused, not named by its stage-local ids, which another
     # stage reuses for other layers.
     del manager.pp_layers
@@ -915,7 +916,7 @@ def test_virtual_layers_are_numbered_by_model_layer_and_attention_type():
         (4, AttentionType.COMPRESSED): 1,
         (5, AttentionType.SLIDING): 2,
     }
-    assert global_layer_ids(manager, [0, 1, 2]) == [12, 13, 15]
+    assert _manager.global_layer_ids(manager, [0, 1, 2]) == [12, 13, 15]
     assert derive_layout(manager).layers == ((12, 13, 15),)
 
 
@@ -935,7 +936,7 @@ def test_an_internal_layer_several_attention_types_share_takes_the_first_s_globa
         (5, AttentionType.SLIDING): 2,
         (5, AttentionType.COMPRESSED): 1,  # shares model layer 4's compressed cache
     }
-    assert global_layer_ids(manager, [0, 1, 2]) == [12, 13, 15]
+    assert _manager.global_layer_ids(manager, [0, 1, 2]) == [12, 13, 15]
     assert derive_layout(manager).layers == ((12, 13, 15),)
 
 
@@ -991,7 +992,8 @@ def test_declared_global_layer_ids_name_extra_internal_layers():
     )
     declared = {0: [2, 0], 1: [1, 3]}
     manager.get_disagg_global_layer_ids = lambda lg: declared[lg]
-    assert global_layer_ids(manager, [0, 1, 2, 3]) == [0, 2, 1, 3]
+    manager.get_model_layer_ids = lambda lg: {0: [1, 0], 1: [0, 1]}[lg]
+    assert _manager.global_layer_ids(manager, [0, 1, 2, 3]) == [0, 2, 1, 3]
     layout = derive_layout(manager).page_layout
     assert [g.layers for g in layout.layer_groups] == [(0, 2), (1, 3)]
     assert {(b.layer, b.role) for b in layout.buffers if b.role == "tail"} == {
@@ -1000,7 +1002,93 @@ def test_declared_global_layer_ids_name_extra_internal_layers():
     }
     manager.get_disagg_global_layer_ids = lambda lg: declared[lg][:1]
     with pytest.raises(ValueError, match="declared global ids"):
-        global_layer_ids(manager, [0])
+        _manager.global_layer_ids(manager, [0])
+
+
+@pytest.mark.cpu_only
+def test_layer_groups_publish_each_layer_s_model_layer():
+    """A manager numbering its layers by model layer publishes them as their own model layers:
+    a pipeline stage's layers, attention and recurrent state alike."""
+    manager = Manager(
+        [
+            kv_group(lids=(1, 0)),
+            (SsmLayerConfig, [2, 3], [("conv_state", 96, None), ("ssm_state", 128, None)]),
+        ],
+        pp_layers=[7, 6, 8, 9],
+        mappers={"conv_state": MapperKind.SECTIONED},
+        layouts={"conv_state": RoleLayout(section_bytes=(32, 32, 32))},
+    )
+    layout = derive_layout(manager).page_layout
+    assert [(g.kind, g.layers, g.model_layers) for g in layout.layer_groups] == [
+        ("attention", (6, 7), (6, 7)),
+        ("state", (8, 9), (8, 9)),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_virtual_layers_publish_the_model_layer_they_belong_to():
+    """Layer ``3 * m + t`` of model layer ``m`` and attention type ``t`` is model layer ``m``,
+    listed beside its layer id; an internal layer two model layers share is its first's."""
+
+    class AttentionType(enum.Enum):
+        SLIDING = 0
+        COMPRESSED = 1
+        INDEXER = 2
+
+    manager = Manager([kv_group(lids=(2, 0)), kv_group(lids=(1, 3))])
+    manager._layer_attn_to_layer_id = {
+        (4, AttentionType.SLIDING): 0,
+        (4, AttentionType.COMPRESSED): 1,
+        (5, AttentionType.SLIDING): 2,
+        (6, AttentionType.COMPRESSED): 3,
+        (6, AttentionType.INDEXER): 1,  # shares model layer 4's compressed cache
+    }
+    layout = derive_layout(manager).page_layout
+    assert [(g.layers, g.model_layers) for g in layout.layer_groups] == [
+        ((12, 15), (4, 5)),
+        ((13, 19), (4, 6)),
+    ]
+    assert _manager.model_layer_ids(manager, [3, 2, 1, 0]) == [6, 5, 4, 4]
+
+
+@pytest.mark.cpu_only
+def test_declared_layer_ids_publish_the_model_layers_declared_beside_them():
+    """A manager declaring its layer ids (FP4 MLA: ``2 * m`` for model layer ``m``'s cache and
+    ``2 * m + 1`` for its tail) declares their model layers too; ids declared without them, or a
+    model layer short, are refused."""
+    manager = Manager(
+        [kv_group(lids=(1, 0)), (AttentionLayerConfig, [2, 3], [("tail", 64, None)])],
+        pp_layers=[0, 1],
+        mappers={"tail": MapperKind.REPLICATED},
+    )
+    declared = {0: [2, 0], 1: [1, 3]}
+    model_layers = {0: [1, 0], 1: [0, 1]}
+    manager.get_disagg_global_layer_ids = lambda lg: declared[lg]
+    manager.get_model_layer_ids = lambda lg: model_layers[lg]
+    layout = derive_layout(manager).page_layout
+    assert [(g.layers, g.model_layers) for g in layout.layer_groups] == [
+        ((0, 2), (0, 1)),
+        ((1, 3), (0, 1)),
+    ]
+    manager.get_model_layer_ids = lambda lg: model_layers[lg][:1]
+    with pytest.raises(ValueError, match="1 declared model layers for 2 layers"):
+        derive_layout(manager)
+    del manager.get_model_layer_ids
+    with pytest.raises(ValueError, match="declares global layer ids without their model layers"):
+        derive_layout(manager)
+
+
+@pytest.mark.cpu_only
+def test_a_layer_group_names_one_model_layer_per_layer():
+    group = LayerGroupDesc("attention", None, 0, 0, [12, 13, 15], model_layers=[4, 4, 5])
+    assert group.model_layers == (4, 4, 5) and type(group.model_layers) is tuple
+    plain = LayerGroupDesc("attention", None, 0, 0, [3, 1])
+    assert plain.model_layers == (3, 1) == plain.layers
+    assert group != LayerGroupDesc("attention", None, 0, 0, (12, 13, 15))
+    assert hash(group) != hash(LayerGroupDesc("attention", None, 0, 0, (12, 13, 15)))
+    for bad in ([4, 4], [4, 4, 5, 6], [4, -1, 5], [4, True, 5], [4, 4.0, 5]):
+        with pytest.raises(ValueError, match="model layer"):
+            LayerGroupDesc("attention", None, 0, 0, (12, 13, 15), model_layers=bad)
 
 
 @pytest.mark.cpu_only
@@ -1172,7 +1260,7 @@ def check_buffers(mgr, layout):
         width = layout.pool_slot_bytes[b.pool_group][b.pool_index]
         assert 0 <= b.slot_offset and b.slot_offset + b.size <= width
     internal = sorted({int(bid.layer_id) for bid in mgr.impl.all_buffer_ids})
-    global_of = dict(zip(internal, global_layer_ids(mgr, internal)))
+    global_of = dict(zip(internal, _manager.global_layer_ids(mgr, internal)))
     native = {(global_of[int(bid.layer_id)], str(bid.role)) for bid in mgr.impl.all_buffer_ids}
     assert set(seen) == native
 
@@ -1328,6 +1416,41 @@ def test_fp4_mla_buffers_carry_the_declared_global_layer_ids(kit, monkeypatch):
         assert {layer for layer, role in buffers if role == "mla_hp_tail"} == {1, 3, 5}
         assert any(window is not None for window in derived.windows), derived.windows
         assert derived.read_windows == derived.windows, (derived.windows, derived.read_windows)
+
+
+@gpu
+@skip_pre_hopper
+def test_fp4_mla_publishes_each_layer_s_model_layer(kit, monkeypatch):
+    """The cache and the tail of model layer ``m``, layers ``2 * m`` and ``2 * m + 1``, are both
+    model layer ``m``."""
+    with fp4_mla(kit, monkeypatch, "triton") as mgr:
+        mgr._model_attention_windows = dict.fromkeys(mgr.pp_layers, 1)
+        groups = derive_layout(mgr).page_layout.layer_groups
+        published = {layer: m for g in groups for layer, m in zip(g.layers, g.model_layers)}
+        assert published == {layer: layer // 2 for layer in range(6)}, published
+
+
+@pytest.mark.cpu_only
+def test_fp4_mla_installs_its_model_layers_beside_its_layer_ids():
+    """A manager the FP4 MLA policy installs its methods on declares each layer's model layer
+    beside its layer id, as an FP4 MLA manager does."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+        Fp4MlaV2CacheLayoutPolicy,
+    )
+
+    # Model layers 4 and 7: their caches are internal layers 0 and 1, their tails 2 and 3.
+    manager = SimpleNamespace(
+        _fp4_mla_hp_pool_size=0,
+        impl=SimpleNamespace(layer_grouping=[[0, 1], [2, 3]]),
+        _cache_manager_layer_ids=[0, 1],
+        _hp_manager_layer_ids=[2, 3],
+        _bf16_mla_manager_layer_ids=[],
+        _fp4_mla_compact_to_local=[0, 1],
+        pp_layers=[4, 7],
+    )
+    Fp4MlaV2CacheLayoutPolicy.install_manager_capabilities(manager)
+    assert _manager.declared_global_layer_ids(manager) == {0: 8, 1: 14, 2: 9, 3: 15}
+    assert _manager.declared_model_layer_ids(manager) == {0: 4, 1: 7, 2: 4, 3: 7}
 
 
 M3_TPB = 128
@@ -1527,7 +1650,7 @@ def test_the_deepseek_v4_layout_covers_every_virtual_layer_and_pool(
         # Buffers and layer groups name layers by global layer id: for virtual layers, model layer
         # times the number of attention types plus a type the internal layer holds.
         internal = sorted(int(i) for group in mgr.impl.layer_grouping for i in group)
-        global_of = dict(zip(internal, global_layer_ids(mgr, internal)))
+        global_of = dict(zip(internal, _manager.global_layer_ids(mgr, internal)))
         assert len(set(global_of.values())) == len(internal)
         virtual = mgr._layer_attn_to_layer_id
         num_types = max(t.value for t in type(next(iter(virtual))[1])) + 1
@@ -1543,6 +1666,78 @@ def test_the_deepseek_v4_layout_covers_every_virtual_layer_and_pool(
         assert layers == sorted(global_of.values())
         # One KV head: every layer group is the same content on every rank.
         assert all(group.shard == ShardDesc() for group in layout.layer_groups)
+
+
+@gpu
+@skip_pre_blackwell
+def test_deepseek_v4_publishes_each_virtual_layer_s_model_layer(deepseek_v4_manager):
+    """Each cache of model layer ``m``, one per attention type, is model layer ``m``; so is the
+    last model layer's, as a draft layer after the target model's would be."""
+    with deepseek_v4_manager(compress_ratios=(1, 4, 128, 4, 4)) as mgr:
+        groups = derive_layout(mgr).page_layout.layer_groups
+        virtual = mgr._layer_attn_to_layer_id
+        num_types = max(t.value for t in type(next(iter(virtual))[1])) + 1
+        published = {layer: m for g in groups for layer, m in zip(g.layers, g.model_layers)}
+        assert published == {layer: layer // num_types for layer in published}, published
+        assert set(published.values()) == set(range(5)) == {m for m, _ in virtual}
+        assert any(layer != m for layer, m in published.items())
+
+
+@gpu
+@skip_pre_blackwell
+def test_csa2_publishes_each_virtual_layer_s_model_layer(kit, monkeypatch):
+    """CSA2 numbers each model layer's SWA, global and compressor caches apart; each is that
+    model layer."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "0")
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "0")
+    config = KvCacheConfig(
+        max_gpu_total_bytes=128 << 20, host_cache_size=0, enable_block_reuse=False, dtype="fp8"
+    )
+    with kit.managed(
+        lambda: CSA2CacheManager(
+            config,
+            CacheType.SELFKONLY,
+            num_layers=4,
+            tokens_per_block=128,
+            max_seq_len=2048,
+            max_batch_size=2,
+            max_num_tokens=2048,
+            mapping=Mapping(),
+            dtype=DataType.BF16,
+            vocab_size=8192,
+            layout=CSA2Layout((0, 2, 2, 1), (1, 3), (1, 3), window_size=256, index_topk=4),
+        )
+    ) as mgr:
+        groups = derive_layout(mgr).page_layout.layer_groups
+        virtual = mgr._layer_attn_to_layer_id
+        num_types = max(t.value for t in type(next(iter(virtual))[1])) + 1
+        published = {layer: m for g in groups for layer, m in zip(g.layers, g.model_layers)}
+        assert published == {layer: layer // num_types for layer in published}, published
+        assert set(published.values()) == {m for m, _ in virtual}
+        assert any(layer != m for layer, m in published.items())
+
+
+@gpu
+def test_a_hybrid_stage_publishes_its_model_layers_for_state_and_attention(gdn_manager):
+    """On pipeline stage 1 of 2, a gated delta-net and attention manager holds model layers 4 to
+    7 as its internal layers 0 to 3; both kinds of group publish the model layers."""
+    from tensorrt_llm.mapping import Mapping
+
+    mapping = Mapping(world_size=2, rank=1, pp_size=2)
+    with gdn_manager(mapping=mapping, pattern="MMM*MMM*") as mgr:
+        assert list(mgr.pp_layers) == [4, 5, 6, 7], mgr.pp_layers
+        groups = derive_layout(mgr).page_layout.layer_groups
+        assert {g.kind for g in groups} == {"state", "attention"}
+        for g in groups:
+            assert g.model_layers == g.layers, g
+        assert sorted(layer for g in groups for layer in g.layers) == [4, 5, 6, 7]
 
 
 @pytest.mark.cpu_only
@@ -1979,7 +2174,7 @@ def test_the_layout_types_keep_their_module_fields_and_members():
     )
     assert pinned_fields(LayerGroupDesc) == (
         "kind kept_window num_sink_blocks pool_group layers shard=ShardDesc(count=1, index=0) "
-        "read_window=None"
+        "read_window=None model_layers=None"
     )
     assert pinned_fields(BufferDesc) == (
         "layer role pool_group pool_index slot_offset size mapper=<MapperKind.INDEXED: 0> "
@@ -2166,6 +2361,8 @@ def test_layout_values_are_refused_rather_than_truncated(bad):
     names = ["size", "expansion"]
     if isinstance(bad, bool) or bad != 0:
         names += ["layer", "pool_group", "pool_index", "slot_offset"]
+        with pytest.raises(ValueError, match="model layer"):
+            LayerGroupDesc("attention", None, 0, 0, (0,), model_layers=(bad,))
     for name in names:
         with pytest.raises(ValueError, match=name):
             BufferDesc(**{**buffer, name: bad})
@@ -2187,7 +2384,9 @@ def every_field_set():
     """A layout with each of its own fields away from the default, and parts of every kind."""
     return make_layout(
         layer_groups=(
-            LayerGroupDesc("attention", 128, 1, 0, (0, 2), ShardDesc(2, 1), read_window=96),
+            LayerGroupDesc(
+                "attention", 128, 1, 0, (0, 2), ShardDesc(2, 1), read_window=96, model_layers=(0, 1)
+            ),
             LayerGroupDesc("state", None, 0, 1, (1,)),
         ),
         buffers=(
@@ -2253,6 +2452,7 @@ def test_an_unchecked_rebuild_equals_the_checked_layout(build):
         unchecked = type(value).unchecked(**fields)
         assert typed(unchecked) == typed(value) == typed(type(value)(**fields)), value
     assert LayerGroupDesc.unchecked("attention", 64, 0, 0, (0,)).read_window == 64
+    assert LayerGroupDesc.unchecked("attention", 64, 0, 0, (0, 2)).model_layers == (0, 2)
 
 
 @pytest.mark.cpu_only
@@ -2263,6 +2463,7 @@ def test_unchecked_constructors_keep_values_the_constructor_refuses_or_converts(
     refused = [
         (BufferDesc, dict(layer=-1, role="kv", pool_group=0, pool_index=0, slot_offset=0, size=8)),
         (LayerGroupDesc, dict(group, read_window=128)),
+        (LayerGroupDesc, dict(group, model_layers=(0, 1))),
         (RankTopology, dict(tp_size=2, tp_rank=2)),
         (ShardDesc, dict(count=1, index=1)),
         (RoleLayout, dict(bytes_per_head=0)),

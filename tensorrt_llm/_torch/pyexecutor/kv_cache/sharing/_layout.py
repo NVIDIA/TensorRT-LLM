@@ -221,20 +221,6 @@ class ManagerLayout:
         return tuple(sorted(self.device_pools))
 
 
-def global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
-    """Each internal layer's global id, the same under any pipeline split: the declared id, else for
-    virtual layers ``model_layer * num_types + attention_type``, else the model layer."""
-    # One declared id per internal layer of each layer group, in order (FP4 MLA's tail layers).
-    declared = _manager.declared_global_layer_ids(manager)
-    if declared is not None:
-        return [declared[int(lid)] for lid in internal_ids]
-    virtual = _manager.virtual_layers(manager)
-    if virtual is None:
-        return [int(manager.pp_layers[int(lid)]) for lid in internal_ids]
-    inverse, num_types = virtual
-    return [inverse[int(lid)][0] * num_types + inverse[int(lid)][1] for lid in internal_ids]
-
-
 def _topology(mapping: object) -> RankTopology:
     """The rank's place as native's ``RankInfo`` reads it from the mapping: under attention data
     parallelism each tensor-parallel rank is a data-parallel rank of its own."""
@@ -376,7 +362,8 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
     if len(pg_of_lg) != len(grouping):
         raise ValueError(f"{len(grouping)} layer groups but {len(pg_of_lg)} pool-group indices")
     internal = sorted({lid for group in grouping for lid in group})
-    global_of = dict(zip(internal, global_layer_ids(manager, internal)))
+    global_of = dict(zip(internal, _manager.global_layer_ids(manager, internal)))
+    model_of = dict(zip(internal, _manager.model_layer_ids(manager, internal)))
 
     state_groups = set()
     for lg, layer_ids in enumerate(grouping):
@@ -471,15 +458,17 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
         g = pg_of_lg[lg]
         if g not in device_pools:
             raise ValueError(f"layer group {lg} maps to pool group {g}, which has no pools")
+        named = sorted((global_of[lid], model_of[lid]) for lid in layer_ids)
         layer_groups.append(
             LayerGroupDesc(
                 kind="state" if is_state else "attention",
                 kept_window=window,
                 num_sink_blocks=-(-sink_tokens // tokens_per_block),
                 pool_group=g,
-                layers=tuple(sorted(global_of[lid] for lid in layer_ids)),
+                layers=tuple(layer for layer, _ in named),
                 shard=_group_shard(shards[lg], ShardDesc(heads.tp_size, heads.tp_rank)),
                 read_window=read,
+                model_layers=tuple(model_layer for _, model_layer in named),
             )
         )
 

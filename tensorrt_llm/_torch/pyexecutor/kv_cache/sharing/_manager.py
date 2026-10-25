@@ -231,7 +231,25 @@ def declared_global_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | Non
     return table
 
 
-def disagg_declaration(manager: KVCacheManagerV2, name: str) -> dict[str, object]:
+def declared_model_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | None:
+    """Internal layer id -> the model layer it belongs to, or ``None`` without the manager's
+    declaration."""
+    getter = getattr(manager, "get_model_layer_ids", None)
+    if getter is None:
+        return None
+    table: dict[int, int] = {}
+    for layer_group, layer_ids in enumerate(manager.impl.layer_grouping):
+        ids = [int(value) for value in getter(layer_group)]
+        if len(ids) != len(layer_ids):
+            raise ValueError(
+                f"layer group {layer_group}: {len(ids)} declared model layers for {len(layer_ids)} "
+                "layers"
+            )
+        table.update(zip((int(layer_id) for layer_id in layer_ids), ids))
+    return table
+
+
+def role_declaration(manager: KVCacheManagerV2, name: str) -> dict[str, object]:
     """Role-keyed layout declarations from the named manager getter."""
     getter = getattr(manager, name, None)
     if getter is None:
@@ -240,17 +258,17 @@ def disagg_declaration(manager: KVCacheManagerV2, name: str) -> dict[str, object
 
 
 def role_mapper_kinds(manager: KVCacheManagerV2) -> dict[str, object]:
-    """The manager's per-role disaggregation mapper declarations."""
-    return disagg_declaration(manager, "get_disagg_role_mapper_kinds")
+    """The manager's per-role mapper declarations."""
+    return role_declaration(manager, "get_disagg_role_mapper_kinds")
 
 
 def role_layouts(manager: KVCacheManagerV2) -> dict[str, object]:
-    """The manager's per-role disaggregation layout declarations."""
-    return disagg_declaration(manager, "get_disagg_role_layouts")
+    """The manager's per-role layout declarations."""
+    return role_declaration(manager, "get_disagg_role_layouts")
 
 
 def ignored_roles(manager: KVCacheManagerV2) -> frozenset[str]:
-    """Roles omitted by the manager's disaggregation declaration."""
+    """Roles the manager declares a transfer leaves out."""
     getter = getattr(manager, "get_disagg_ignored_roles", None)
     return frozenset(str(role) for role in (getter() if getter else ()))
 
@@ -278,6 +296,8 @@ def index_row(manager: KVCacheManagerV2, request_id: int) -> int | None:
 def virtual_layers(manager: KVCacheManagerV2) -> tuple[dict[int, tuple[int, int]], int] | None:
     """(internal id -> (model layer, attention type), type count), or None without virtual layers;
     a shared internal id takes its first declared type, as native's page table does."""
+    # TODO: Layer ids come from the manager's private _layer_attn_to_layer_id; KVCacheManagerV2
+    # does not publish each internal layer's model layer and kind.
     virtual = getattr(manager, "_layer_attn_to_layer_id", None)
     if not virtual:
         return None
@@ -287,6 +307,36 @@ def virtual_layers(manager: KVCacheManagerV2) -> tuple[dict[int, tuple[int, int]
     # Every member of the enum counts, so stages holding different attention types agree.
     attn_type_class = type(next(iter(virtual))[1])
     return inverse, max(int(member.value) for member in attn_type_class) + 1
+
+
+def global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
+    """Each internal layer's global id, the same under any pipeline split: the declared id, else for
+    virtual layers ``model_layer * num_types + attention_type``, else the model layer."""
+    # One declared id per internal layer of each layer group, in order (FP4 MLA's tail layers).
+    declared = declared_global_layer_ids(manager)
+    if declared is not None:
+        return [declared[int(lid)] for lid in internal_ids]
+    virtual = virtual_layers(manager)
+    if virtual is None:
+        return [int(manager.pp_layers[int(lid)]) for lid in internal_ids]
+    inverse, num_types = virtual
+    return [inverse[int(lid)][0] * num_types + inverse[int(lid)][1] for lid in internal_ids]
+
+
+def model_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
+    """The model layer each internal layer belongs to: the declared one, else for virtual layers
+    the model layer they number, else the model layer itself. ``ValueError`` for a manager that
+    declares global layer ids without declaring their model layers."""
+    declared = declared_model_layer_ids(manager)
+    if declared is not None:
+        return [declared[int(lid)] for lid in internal_ids]
+    if declared_global_layer_ids(manager) is not None:
+        raise ValueError("the manager declares global layer ids without their model layers")
+    virtual = virtual_layers(manager)
+    if virtual is None:
+        return [int(manager.pp_layers[int(lid)]) for lid in internal_ids]
+    inverse, _ = virtual
+    return [inverse[int(lid)][0] for lid in internal_ids]
 
 
 def runtime(manager: KVCacheManagerV2) -> object:
