@@ -403,6 +403,21 @@ def test_default_sparse_layers_follow_the_text_config():
     assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), None) == []
 
 
+def test_default_sparse_layers_log_a_fallback_that_ignores_the_config(monkeypatch):
+    import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager as cache_manager
+
+    log = Mock()
+    monkeypatch.setattr(cache_manager, "logger", log)
+    # A config whose split is not the default, on a manager with a different layer count.
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 6) == [3, 4, 5]
+    assert log.info.call_count == 1
+    # The default split, a matching layer count, or no config: nothing to report.
+    default_sparse_layer_ids(_text_config([0, 0, 0, 1, 1]), 6)
+    default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 5)
+    default_sparse_layer_ids(None, 6)
+    assert log.info.call_count == 1
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("implementation", ["msa", "triton"])
 def test_index_k_cache_follows_the_config_sparse_layers(

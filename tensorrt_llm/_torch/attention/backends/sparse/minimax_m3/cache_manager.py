@@ -205,6 +205,20 @@ def default_sparse_layer_ids(
     num_hidden_layers = getattr(pretrained_config, "num_hidden_layers", None)
     if num_hidden_layers is not None and int(num_hidden_layers) == num_target_layers:
         return get_sparse_layer_ids(pretrained_config)[1]
+    if num_hidden_layers is not None:
+        # Expected for a manager that does not hold the target decoder layers
+        # (a separate draft manager). Say so when the config's own split is not
+        # the default, since the cache then follows a different split than the model.
+        try:
+            config_sparse = get_sparse_layer_ids(pretrained_config)[1]
+        except ValueError:
+            config_sparse = None
+        if config_sparse is not None and config_sparse != list(range(3, int(num_hidden_layers))):
+            logger.info(
+                f"MiniMax-M3 KV cache: the model config has {int(num_hidden_layers)} layers but this "
+                f"manager holds {num_target_layers} target layers, so its sparse layers default to "
+                f"layers 3..{num_target_layers - 1} instead of the config's split."
+            )
     return list(range(3, num_target_layers))
 
 
