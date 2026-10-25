@@ -133,6 +133,7 @@ class IterationWriter:
         """
         context = None
         socket = None
+        socket_bound = False
         message = None
 
         try:
@@ -141,6 +142,7 @@ class IterationWriter:
             context = Context(io_threads=1)
             socket = context.socket(PULL)
             socket.bind(address)
+            socket_bound = True
 
             # Open the log file for writing and start listening for messages
             logger.debug(
@@ -161,7 +163,9 @@ class IterationWriter:
             # the "end" sentinel is received. LlmManager sends {"end": True}
             # when it is finished.
             logger.info("Keyboard interrupt, exiting iteration logging...")
-            if socket is not None:
+            # Only drain a socket that finished binding: an interrupt during
+            # bind leaves `socket` set but nothing will ever arrive on it.
+            if socket_bound:
                 while message is None or "end" not in message:
                     message = socket.recv_json()
         finally:
