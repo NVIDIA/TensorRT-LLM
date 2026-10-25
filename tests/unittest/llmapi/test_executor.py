@@ -8,22 +8,26 @@ import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
+from unittest.mock import Mock
 
 import pytest
 import torch
 import zmq
 
-from tensorrt_llm._utils import mpi_world_size
+from tensorrt_llm._utils import mpi_world_size, nvtx_range_debug
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
+from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
+from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -88,8 +92,6 @@ def test_FusedIpcQueue():
 def create_rsp(id, finished: bool = False):
     result = tllm.Result()
     result.output_token_ids = [[id]]
-    result.context_logits = None
-    result.generation_logits = None
     result.log_probs = None
     result.cum_log_probs = None
     if finished:
@@ -110,6 +112,79 @@ def test_GenerationResultBase():
     result._handle_response(create_rsp(4, finished=True))
     print(result.outputs[0])
     assert len(result.outputs[0].token_ids) == 3
+    assert result._done
+
+
+@pytest.mark.parametrize("pytorch", [False, True])
+@pytest.mark.parametrize("beam_search", [False, True])
+def test_result_stream_sequence_alignment(pytorch, beam_search):
+    from tensorrt_llm._torch.pyexecutor.llm_request import (LlmResponse,
+                                                            LlmResult, PyResult)
+    from tensorrt_llm.executor.result import Logprob
+
+    result = GenerationResultBase(id=0,
+                                  sampling_params=SamplingParams(
+                                      max_tokens=2,
+                                      n=2,
+                                      best_of=2,
+                                      use_beam_search=beam_search,
+                                      top_k=10,
+                                      temperature=1.0,
+                                      logprobs=1))
+    for step in (1, 2):
+        for sequence in ([0] if beam_search else [0, 1]):
+            sequences = [0, 1] if beam_search else [sequence]
+            native = tllm.Result()
+            native.output_token_ids = [
+                [100 + seq * 10 + pos for pos in range(1, step + 1)]
+                if beam_search else [100 + seq * 10 + step] for seq in sequences
+            ]
+            probs = [[-0.25] * len(tokens)
+                     for tokens in native.output_token_ids]
+            native.log_probs = probs
+            native.cum_log_probs = [-0.25 * step] * len(sequences)
+            native.sequence_index = sequence
+            native.finish_reasons = [
+                tllm.FinishReason.LENGTH
+                if step == 2 else tllm.FinishReason.NOT_FINISHED
+            ] * len(sequences)
+            native.is_final = step == 2 and (beam_search or sequence == 1)
+            if pytorch:
+                py_result = PyResult(prompt_len=1,
+                                     max_new_tokens=2,
+                                     use_device_memory=False,
+                                     return_log_probs=True)
+                py_result.set_log_probs([[{
+                    token: Logprob(logprob=-0.25, rank=1)
+                } for token in tokens] for tokens in native.output_token_ids],
+                                        native.cum_log_probs)
+                wrapped = LlmResult(native,
+                                    py_result,
+                                    is_final=native.is_final,
+                                    time_breakdown_metrics={"step": step})
+                response = LlmResponse(request_id=0,
+                                       client_id=0,
+                                       result=wrapped)
+            else:
+                response = tllm.Response(request_id=0,
+                                         result=native,
+                                         client_id=0)
+            result._handle_response(response)
+            for seq in sequences:
+                output = result._outputs[seq]
+                assert output.token_ids == [
+                    100 + seq * 10 + pos for pos in range(1, step + 1)
+                ]
+                assert output.token_ids_diff == [100 + seq * 10 + step]
+                expected_logprobs = ([{
+                    token: Logprob(logprob=-0.25, rank=1)
+                } for token in output.token_ids] if pytorch else [-0.25] * step)
+                assert output.logprobs == expected_logprobs
+                assert output.logprobs_diff == expected_logprobs[-1:]
+                assert output.cumulative_logprob == -0.25 * step
+                assert output.finish_reason == ("length" if step == 2 else None)
+            if pytorch:
+                assert result.time_breakdown_metrics == {"step": step}
     assert result._done
 
 
@@ -327,17 +402,23 @@ def test_handle_response_propagates_should_abort():
 
 
 def test_PostprocWorker_Output_tracing_fields():
-    """PostprocWorker.Output carries finish_reason and num_generated_tokens for
-    tracing on the num_postprocess_workers > 0 path. Both fields are optional
-    and default to None when not populated by the worker."""
+    """PostprocWorker.Output carries tracing fields for postprocess workers.
+
+    finish_reason and num_generated_tokens are used for tracing on the
+    num_postprocess_workers > 0 path. Both fields are optional and default to
+    None when not populated by the worker.
+    """
     out = PostprocWorker.Output(client_id=0, res=None, is_final=False)
     assert out.finish_reason is None
     assert out.num_generated_tokens is None
 
 
 def test_handle_response_postproc_nonstreaming_propagates_metadata():
-    """On the non-streaming path (res is not CompletionOutput), finish_reason and
-    token_ids are set on _outputs[0] from the PostprocWorker.Output fields."""
+    """Non-streaming postproc responses propagate finish_reason and token_ids.
+
+    On the non-streaming path (res is not CompletionOutput), finish_reason and
+    token_ids are set on _outputs[0] from the PostprocWorker.Output fields.
+    """
     sampling_params = SamplingParams(max_tokens=10)
     result = GenerationResultBase(id=1, sampling_params=sampling_params)
 
@@ -353,6 +434,37 @@ def test_handle_response_postproc_nonstreaming_propagates_metadata():
     assert result._done
     assert result._outputs[0].finish_reason == "stop"
     assert len(result._outputs[0].token_ids) == 5
+
+
+def test_handle_response_postproc_adds_prompt_tokens():
+    """Main-thread result fills PROMPT_TOKENS for postproc worker responses.
+
+    With num_postprocess_workers > 0 the worker's record has no prompt, so
+    the main-thread result fills PROMPT_TOKENS in alongside the worker's
+    cached-token count. Without it trtllm_prompt_tokens_total stays empty and
+    the Prometheus prefix hit rate has no denominator.
+    """
+    sampling_params = SamplingParams(max_tokens=10)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+    result.prompt_token_ids = list(range(300))
+
+    result._handle_response(
+        PostprocWorker.Output(client_id=1,
+                              res="mock_sse_data",
+                              is_final=False,
+                              metrics={MetricNames.TTFT: 0.5}))
+    assert MetricNames.PROMPT_TOKENS not in result.metrics_dict
+
+    result._handle_response(
+        PostprocWorker.Output(
+            client_id=1,
+            res="mock_sse_data",
+            is_final=True,
+            metrics={MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256},
+            finish_reason="length",
+            num_generated_tokens=1))
+    assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == 300
+    assert result.metrics_dict[MetricNames.PROMPT_CACHE_CACHED_TOKENS] == 256
 
 
 def _ZeroMqQueue_sync_sync_task(addr: str):
@@ -559,8 +671,10 @@ def test_get_params_for_first_rsp_returns_disaggregated_params_once():
 
 
 def test_PostprocWorker_disaggregated_params():
-    """GEN-side: disaggregated_params seeded on the record persists across
-    multiple responses (streaming pattern).
+    """GEN-side: disaggregated_params on the record persists across responses.
+
+    The seeded disaggregated_params must survive multiple responses (streaming
+    pattern).
 
     Regression test for https://nvbugs/5991957: PostprocWorker record was
     created without disaggregated_params, causing /v1/chat/completions to
@@ -616,3 +730,51 @@ def test_PostprocWorker_disaggregated_params():
 
 if __name__ == '__main__':
     test_FusedIpcQueue()
+
+
+def _executor_with_error_queue():
+    # Bare proxy: _handle_background_error is GenerationExecutor's own.
+    executor = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    executor._error_queue = Queue()
+    executor._set_fatal_error = Mock()
+    executor.shutdown = Mock()
+    return executor
+
+
+def test_handle_background_error_without_pending_error_is_noop():
+    executor = _executor_with_error_queue()
+    executor._handle_background_error()
+    executor._set_fatal_error.assert_not_called()
+    executor.shutdown.assert_not_called()
+
+
+def test_handle_background_error_raises_pending_request_error():
+    executor = _executor_with_error_queue()
+    executor._error_queue.put("bad request")
+    with pytest.raises(RequestError, match="bad request"):
+        executor._handle_background_error()
+    executor._set_fatal_error.assert_not_called()
+    executor.shutdown.assert_not_called()
+    assert executor._error_queue.empty()
+
+
+def test_handle_background_error_raises_pending_fatal_error():
+    executor = _executor_with_error_queue()
+    cause = RuntimeError("worker died")
+    executor._error_queue.put(cause)
+    with pytest.raises(RuntimeError, match="worker died"):
+        executor._handle_background_error()
+    executor._set_fatal_error.assert_called_once_with(cause)
+    executor.shutdown.assert_called_once()
+
+
+def test_nvtx_range_debug_disabled_is_noop(monkeypatch):
+    monkeypatch.delenv("TLLM_LLMAPI_ENABLE_NVTX", raising=False)
+    monkeypatch.delenv("TLLM_NVTX_DEBUG", raising=False)
+
+    def func():
+        return 42
+
+    assert nvtx_range_debug("test")(func) is func
+    with nvtx_range_debug("test"):
+        pass

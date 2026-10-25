@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-322 captured fields.
+334 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -137,14 +137,16 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_compression_config.skip_rope_quantization` | `bool` | `value` |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `int` | `value` |  |
 | `kv_cache_config.avg_seq_len` | `int\|none` | `value` |  |
+| `kv_cache_config.block_reuse_config.enable_branch_snapshot` | `bool` | `value` |  |
 | `kv_cache_config.block_reuse_config.max_num_turns` | `int` | `value` |  |
 | `kv_cache_config.block_reuse_config.policy` | `literal` | `categorical` | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` | `int` | `value` |  |
+| `kv_cache_config.cold_tier_offload_min_priority` | `int\|none` | `value` |  |
 | `kv_cache_config.copy_on_partial_reuse` | `bool` | `value` |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `float\|none` | `value` |  |
 | `kv_cache_config.disk_cache_size` | `int\|none` | `value` |  |
 | `kv_cache_config.disk_prefetch_num_reqs` | `int` | `value` |  |
-| `kv_cache_config.dtype` | `allowlist` | `categorical` | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `fp8_ds_mla`, `nvfp4` |
+| `kv_cache_config.dtype` | `allowlist` | `categorical` | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `fp8_ds_mla`, `nvfp4`, `mixed_nvfp4_fp8`, `mixed_nvfp4_float16`, `mixed_nvfp4_bfloat16` |
 | `kv_cache_config.enable_block_reuse` | `bool` | `value` |  |
 | `kv_cache_config.enable_kv_pool_rebalance` | `bool` | `value` |  |
 | `kv_cache_config.enable_partial_reuse` | `bool` | `value` |  |
@@ -160,17 +162,23 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.kv_events_config.hwm` | `int` | `value` |  |
 | `kv_cache_config.kv_events_config.max_queue_size` | `int` | `value` |  |
 | `kv_cache_config.kv_events_config.publisher` | `literal\|none` | `categorical` | `null`, `zmq` |
+| `kv_cache_config.kv_pool_rebalance_config.check_interval` | `int` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.cooldown_secs` | `float` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches` | `int` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.moving_average_decay` | `float` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.ratio_tolerance` | `float` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval` | `int` | `value` |  |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `literal` | `categorical` | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `int` | `value` |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `bool` | `value` |  |
-| `kv_cache_config.mamba_state_config.enable_branch_snapshot` | `bool` | `value` |  |
 | `kv_cache_config.mamba_state_config.periodic_snapshot_interval` | `int` | `value` |  |
 | `kv_cache_config.max_attention_window` | `list[int]\|none` | `value` |  |
 | `kv_cache_config.max_gpu_total_bytes` | `int` | `value` |  |
 | `kv_cache_config.max_tokens` | `int\|none` | `value` |  |
 | `kv_cache_config.max_util_for_resume` | `float` | `value` |  |
+| `kv_cache_config.mixed_precision_first_n` | `int` | `value` |  |
+| `kv_cache_config.mixed_precision_last_n` | `int` | `value` |  |
 | `kv_cache_config.pool_ratio` | `list[float]\|none` | `value` |  |
-| `kv_cache_config.secondary_offload_min_priority` | `int\|none` | `value` |  |
 | `kv_cache_config.sink_token_length` | `int\|none` | `value` |  |
 | `kv_cache_config.tokens_per_block` | `int` | `value` |  |
 | `kv_cache_config.use_kv_cache_manager_v2` | `bool\|literal` | `categorical` | `auto` |
@@ -180,6 +188,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_connector_config.mooncake_store.segment_size` | `int` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_layer_indices` | `list[int]\|none` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_mode` | `literal` | `categorical` | `NONE`, `MARK`, `COLLECT` |
+| `lm_head_output_dtype` | `literal` | `categorical` | `auto`, `float32` |
 | `load_format` | `allowlist\|enum[LoadFormat]` | `categorical` | `auto`, `dummy`, `vision_only`, `gms`, `AUTO`, `DUMMY`, `VISION_ONLY`, `GMS` |
 | `lora_config.cuda_graph_specialize_lora` | `bool` | `value` |  |
 | `lora_config.lora_ckpt_source` | `literal` | `categorical` | `hf`, `nemo` |
@@ -263,6 +272,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.enable_heuristic_topk` | `bool` | `value` |  |
 | `sparse_attention_config.enable_kv_cache_offload` | `bool` | `value` |  |
 | `sparse_attention_config.fuse_qkv_index_projection` | `bool` | `value` |  |
+| `sparse_attention_config.gvr_deterministic_topk` | `bool` | `value` |  |
 | `sparse_attention_config.implementation` | `literal` | `categorical` | `triton`, `msa` |
 | `sparse_attention_config.index_head_dim` | `int\|none` | `value` |  |
 | `sparse_attention_config.index_n_heads` | `int\|none` | `value` |  |
@@ -335,6 +345,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.sa_config.enable_global_pool` | `bool` | `value` |  |
 | `speculative_config.sa_config.threshold` | `int` | `value` |  |
 | `speculative_config.skip_ctx_buffer_budget_check` | `bool` | `value` |  |
+| `speculative_config.spec_dec_variant` | `int\|none` | `value` |  |
 | `speculative_config.target_layer_ids` | `list[int]\|none` | `value` |  |
 | `speculative_config.use_dynamic_tree` | `bool\|none` | `value` |  |
 | `speculative_config.use_mtp_vanilla` | `bool` | `value` |  |
@@ -347,6 +358,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `tensor_parallel_size` | `int` | `value` |  |
 | `tokenizer_mode` | `literal` | `categorical` | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `list[int]\|none` | `value` |  |
+| `torch_compile_config.compile_only_piecewise_graphs` | `bool` | `value` |  |
 | `torch_compile_config.enable_fullgraph` | `bool` | `value` |  |
 | `torch_compile_config.enable_inductor` | `bool` | `value` |  |
 | `torch_compile_config.enable_piecewise_cuda_graph` | `bool` | `value` |  |

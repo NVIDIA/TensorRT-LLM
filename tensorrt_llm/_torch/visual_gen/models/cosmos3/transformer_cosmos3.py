@@ -30,6 +30,7 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     StepPrecisionController,
@@ -37,7 +38,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     parse_diffusion_step_policy,
 )
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -1305,26 +1305,18 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 "Ring parallelism is not supported for Cosmos3 cross-attention."
             )
 
-        if uses_static_fp8(model_config):
-            # Static FP8 puts cross-attention on SEPARATE_QKV, which the parallel
-            # wrappers treat differently from a fused QKV: Attention2D silently
-            # falls back off Ulysses rather than failing. Reject the untested
-            # combinations outright instead of degrading quietly.
-            # cp_size unifies ring and Attention2D; ring is already rejected above.
-            unsupported = {
-                "tp_size": tp_size,
-                "ulysses_size": ulysses_size,
-                "cfg_size": vgm.cfg_size if vgm else 1,
-                "cp_size": vgm.cp_size if vgm else 1,
-                "parallel_vae_size": vgm.parallel_vae_size if vgm else 1,
-            }
-            engaged = {k: v for k, v in unsupported.items() if v > 1}
-            if engaged:
-                raise NotImplementedError(
-                    "Static FP8 Cosmos3 is supported on one GPU only (each of "
-                    f"{sorted(unsupported)} must be 1); got {engaged}. Use the "
-                    "BF16 checkpoint for multi-GPU."
-                )
+        if uses_static_fp8(model_config) and vgm is not None and vgm.cp_size > 1:
+            # Static FP8 puts cross-attention on SEPARATE_QKV. TP, Ulysses,
+            # CFG, and parallel VAE compose with that layout (per-tensor scales
+            # are scalars and replicate across ranks), but the Attention2D
+            # sequence-sharded path has not been validated with separate
+            # projections. cp_size unifies ring and Attention2D; ring is
+            # already rejected above.
+            raise NotImplementedError(
+                "Static FP8 Cosmos3 does not support context parallelism "
+                f"(Attention2D/ring); got cp_size={vgm.cp_size}. Use TP, "
+                "Ulysses, or cfg parallelism, or the BF16 checkpoint."
+            )
 
         self.language_model = Cosmos3LanguageModel(model_config, self.recipe)
 

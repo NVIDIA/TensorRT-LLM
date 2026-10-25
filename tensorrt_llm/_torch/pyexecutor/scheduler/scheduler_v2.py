@@ -577,6 +577,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and not self._has_context_chunk_budget(budget)
             ):
                 continue
+            if scheduled_ctx and self._first_chunk_waits_for_budget(req, budget):
+                continue
             if req.py_request_id in preempted_ids:
                 continue
             remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
@@ -959,6 +961,26 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
         )
 
+    def _first_chunk_waits_for_budget(self, req: LlmRequest, budget: BudgetTracker) -> bool:
+        """Whether a first chunk should wait for the next iteration's budget.
+
+        FORCE_CHUNK admits a leftover below chunk_unit_size, because a started
+        context can end at a snapshot point or at its end inside it. A first
+        chunk learns its reuse only in prepare_context, which matches its prefix
+        and resumes its pages, and a failed first chunk releases both again.
+        Once another context chunk runs this iteration, the first chunk waits
+        for a fresh budget unless its whole remaining prompt fits.
+        """
+        remaining = budget.remaining_tokens
+        return (
+            self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+            and req.state_value == self._context_init_state_value
+            and req.is_first_context_chunk
+            and remaining is not None
+            and remaining < self.chunk_unit_size
+            and req.context_remaining_length > remaining
+        )
+
     def _try_schedule_context_chunked(
         self,
         req: LlmRequest,
@@ -1166,7 +1188,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._free_kv_caches(req)
             return False
 
-        if draft_reuse != common_reuse:
+        # A served prefix is held in both pools even when their reuse policies
+        # commit different depths. Compare the effective prefixes before freeing it.
+        served_prefix = req.py_served_prefix_end
+        if max(draft_reuse, served_prefix) != max(common_reuse, served_prefix):
             # The shorter re-claim can itself fall short, so drop straight to
             # no reuse rather than iterate against an eviction we do not own.
             draft_manager.free_resources(req)
@@ -1431,7 +1456,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 else None
             )
             kv_cache = cross_kv_cache_manager._create_kv_cache(
-                req.py_request_id, req.lora_task_id, input_tokens
+                req.py_request_id, req.lora_task_id, input_tokens, cache_salt=req.cache_salt
             )
             kv_cache.cuda_stream = cross_kv_cache_manager._stream.cuda_stream
 
@@ -1531,9 +1556,9 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _try_allocate_generation(self, req: LlmRequest) -> bool:
         """Atomically admit one generation step in target and draft pools.
 
-        The draft pool mirrors the target pool (same requests, same block
-        boundaries, same ``tokens_per_block``), so a draft-side failure just
-        means this request does not fit. Roll the target growth back and report
+        The draft pool mirrors the target pool's requests and token counts (a
+        standalone drafter's pool may use its own ``tokens_per_block``), so a
+        draft-side failure just means this request does not fit. Roll the target growth back and report
         a plain allocation failure, letting the caller run the same evict /
         recompute-pause / self-suspend ladder it uses for target-pool pressure.
 

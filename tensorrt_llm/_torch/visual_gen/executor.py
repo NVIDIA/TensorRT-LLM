@@ -119,13 +119,16 @@ def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[s
         pipeline_config = pipeline.pipeline_config
         quantized_components = []
         quantization_algos = []
+        dynamic_weight_quant = False
         for component in pipeline.transformer_components:
             if component not in _TELEMETRY_TRANSFORMER_COMPONENTS:
                 continue
-            component_quant = pipeline_config.get_quant_config(component)
+            component_config = pipeline_config.model_configs[component]
+            component_quant = component_config.quant_config
             quantization_algo = _quant_algo_name(component_quant)
             if quantization_algo:
                 quantized_components.append(component)
+                dynamic_weight_quant |= component_config.dynamic_weight_quant
                 if quantization_algo not in quantization_algos:
                     quantization_algos.append(quantization_algo)
 
@@ -142,7 +145,7 @@ def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[s
             resolved_pipeline_class=resolved_pipeline_class,
             modality=entry.modality if entry is not None else "unknown",
             quantization_algo=quantization_algo,
-            dynamic_weight_quant=bool(pipeline_config.dynamic_weight_quant),
+            dynamic_weight_quant=bool(dynamic_weight_quant),
             quantized_components=quantized_components,
             components_present={
                 label: any(

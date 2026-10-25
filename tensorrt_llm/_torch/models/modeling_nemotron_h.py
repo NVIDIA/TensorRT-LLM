@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Literal
 
@@ -40,22 +38,19 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
-                              W4A16NVFP4LinearMethod)
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
-from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
-                                          W4A16NVFP4CutlassFusedMoEMethod)
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model
+from .modeling_utils import (DecoderModel, moe_experts_quant_config,
+                             register_auto_model)
 
 
 class NemotronHPuzzleConfig(PretrainedConfig):
@@ -260,34 +255,10 @@ class NemotronHMOE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
-        # For MIXED_PRECISION models, the global quant_config has quant_algo=MIXED_PRECISION
-        # which maps to QuantMode(0) (no quant). This would cause the MoE backend to select
-        # UnquantizedFusedMoEMethod and allocate BF16 weight buffers, causing a shape mismatch
-        # when loading NVFP4/W4A8_NVFP4_FP8 quantized expert weights.
-        # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
-        override_quant_config = None
-        if model_config.quant_config_dict is not None:
-            experts_prefix = f"{module_prefix}.mixer.experts"
-            for key, cfg in model_config.quant_config_dict.items():
-                if key == experts_prefix or key.startswith(experts_prefix +
-                                                           "."):
-                    override_quant_config = cfg
-                    break
-
-        # Last, so it overrides the per-layer entry above: an override is
-        # authoritative over anything __post_init__ wrote, so this stands in
-        # for both quantization passes and exclusion runs second. Otherwise an
-        # excluded layer keeps the per-layer format and loads quantized weights
-        # the checkpoint left in bf16. No trailing dot -- unlike the weight-form
-        # keys above, exclusion matches module names.
-        from tensorrt_llm.models.modeling_utils import QuantConfig
-
-        global_quant_config = model_config.quant_config
-        if (global_quant_config is not None
-                and global_quant_config.is_module_excluded_from_quantization(
-                    f"{module_prefix}.mixer.experts")):
-            override_quant_config = QuantConfig(
-                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+        # MIXED_PRECISION's global quant_algo reads as unquantized, so the
+        # experts' own format has to be named here.
+        override_quant_config = moe_experts_quant_config(
+            model_config, f"{module_prefix}.mixer.experts")
 
         # Setup MoE experts.
         self.experts = create_moe(
@@ -813,87 +784,6 @@ class NemotronHModel(DecoderModel):
         return hidden_states
 
 
-def _force_moe_backend_for_w4a16_on_hopper(
-        model_config: NemotronHModelConfig) -> None:
-    """SM<100 + NVFP4: force ``moe_backend=CUTLASS`` (only backend with the
-    W4A16 fallback) and disable attention FP4 output fusion.
-    """
-    if get_sm_version() >= 100:
-        return
-
-    # NVFP4 may live in global quant_config OR per-layer quant_config_dict
-    # (MIXED_PRECISION ckpts).
-    qcfg = model_config.quant_config
-    has_nvfp4 = qcfg is not None and qcfg.layer_quant_mode.has_nvfp4()
-    if not has_nvfp4 and model_config.quant_config_dict is not None:
-        has_nvfp4 = any(cfg.quant_mode.has_nvfp4()
-                        for cfg in model_config.quant_config_dict.values())
-    if not has_nvfp4:
-        return
-
-    # o_proj.has_nvfp4 stays True under W4A16 -- the property reads quant_config.
-    # Use the documented env override to keep attention output in bf16.
-    if os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT") != "0":
-        logger.warning(
-            f"Nemotron-H SM{get_sm_version()}: TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0"
-        )
-        os.environ["TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT"] = "0"
-
-    if model_config.moe_backend.upper() in ('CUTLASS', 'AUTO'):
-        return
-
-
-@contextmanager
-def _use_w4a16_for_nvfp4_on_hopper():
-    """SM<100 + NVFP4: swap NVFP4 quant methods -> W4A16 fallback,
-    loosen MoE SM constraint, and disable MLP's fused relu2+FP4 quant.
-    Class-level patches; model construction is single-threaded today.
-    """
-    if get_sm_version() >= 100:
-        yield
-        return
-
-    original_linear = Linear.get_quant_method
-    original_moe = CutlassFusedMoE._get_quant_method
-    original_mlp_create_weights = MLP.create_weights
-    nvfp4_entry = CutlassFusedMoE._QUANT_SUPPORT_TABLE[QuantAlgo.NVFP4]
-    original_sm_constraint = nvfp4_entry["sm_constraint"]
-
-    def _patched_linear(self, quant_config):
-        method = original_linear(self, quant_config)
-        if type(method) is NVFP4LinearMethod:
-            return W4A16NVFP4LinearMethod()
-        return method
-
-    def _patched_moe(self):
-        method = original_moe(self)
-        if type(method) is NVFP4CutlassFusedMoEMethod:
-            return W4A16NVFP4CutlassFusedMoEMethod()
-        return method
-
-    def _patched_mlp_create_weights(self):
-        # Original sets _use_fused_relu2_quant=True for NVFP4 ckpts; off here
-        # so MLP.forward emits bf16 (the SM100+ only fused kernel never runs).
-        original_mlp_create_weights(self)
-        self._use_fused_relu2_quant = False
-
-    # Allow SM 90 through can_implement(); existing entries preserved.
-    constraint_type, constraint_set = original_sm_constraint
-    nvfp4_entry["sm_constraint"] = (constraint_type,
-                                    frozenset(constraint_set) | {90})
-
-    Linear.get_quant_method = _patched_linear
-    CutlassFusedMoE._get_quant_method = _patched_moe
-    MLP.create_weights = _patched_mlp_create_weights
-    try:
-        yield
-    finally:
-        Linear.get_quant_method = original_linear
-        CutlassFusedMoE._get_quant_method = original_moe
-        MLP.create_weights = original_mlp_create_weights
-        nvfp4_entry["sm_constraint"] = original_sm_constraint
-
-
 @register_auto_model("NemotronHPuzzleForCausalLM")
 @register_auto_model("NemotronHForCausalLM")
 class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
@@ -945,12 +835,10 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             }
             model_config._frozen = True
 
-        _force_moe_backend_for_w4a16_on_hopper(model_config)
-        with _use_w4a16_for_nvfp4_on_hopper():
-            super().__init__(
-                model=NemotronHModel(model_config),
-                model_config=model_config,
-            )
+        super().__init__(
+            model=NemotronHModel(model_config),
+            model_config=model_config,
+        )
         self.model_nextn = 0
         if (model_config.spec_config is not None
                 and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
@@ -987,16 +875,6 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             self.model.layers.extend(self.draft_model.mtp_layers)
             self.epilogue.extend(self.draft_model.mtp_layers)
             self.epilogue.append(self.spec_worker)
-
-    def __post_init__(self):
-        # PostInitCaller metaclass invokes __post_init__ AFTER __init__ returns,
-        # so our W4A16 context manager from __init__ has already exited. For
-        # MIXED_PRECISION checkpoints, ``apply_layerwise_quant_config`` rebinds
-        # per-layer ``quant_config`` to NVFP4 and then re-runs ``create_weights``
-        # (see modeling_utils.py:543). Re-enter the context manager so the
-        # patched ``_get_quant_method`` catches that second pass.
-        with _use_w4a16_for_nvfp4_on_hopper():
-            super().__post_init__()
 
     @staticmethod
     def _normalize_puzzle_config(config):

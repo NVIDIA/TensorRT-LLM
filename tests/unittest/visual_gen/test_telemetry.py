@@ -17,6 +17,44 @@ from tensorrt_llm.visual_gen.visual_gen import VisualGen
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize(
+    ("algorithms", "dynamic", "expected_components", "expected_algorithm"),
+    [
+        ((None, None), (False, False), [], ""),
+        (("FP8", None), (False, False), ["transformer"], "FP8"),
+        ((None, "FP8"), (False, True), ["transformer_2"], "FP8"),
+        (("FP8", "FP8"), (False, True), ["transformer", "transformer_2"], "FP8"),
+        (("FP8", "NVFP4"), (False, False), ["transformer", "transformer_2"], "mixed"),
+    ],
+)
+def test_metadata_uses_resolved_transformer_quantization(
+    algorithms, dynamic, expected_components, expected_algorithm
+):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
+    from tensorrt_llm._torch.visual_gen.executor import _visual_gen_telemetry_metadata
+    from tensorrt_llm.llmapi.llm_args import QuantConfig
+
+    components = ("transformer", "transformer_2")
+    configs = {
+        name: DiffusionModelConfig(
+            quant_config=QuantConfig(quant_algo=algorithm), dynamic_weight_quant=is_dynamic
+        )
+        for name, algorithm, is_dynamic in zip(components, algorithms, dynamic)
+    }
+    pipeline = SimpleNamespace(
+        transformer_components=components,
+        pipeline_config=DiffusionPipelineConfig(
+            quant_config=configs["transformer"].quant_config,
+            dynamic_weight_quant=dynamic[0],
+            model_configs=configs,
+        ),
+    )
+    metadata = _visual_gen_telemetry_metadata(pipeline, SimpleNamespace(model="private/model"))
+    assert metadata["quantized_components"] == expected_components
+    assert metadata["quantization_algo"] == expected_algorithm
+    assert metadata["dynamic_weight_quant"] is any(dynamic)
+
+
 def test_completion_and_timeout_metrics_are_counted_once(monkeypatch):
     from tensorrt_llm._torch.visual_gen import executor
     from tensorrt_llm.usage.visual_gen import VisualGenMetrics

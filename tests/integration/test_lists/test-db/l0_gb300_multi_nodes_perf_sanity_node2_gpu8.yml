@@ -13,7 +13,7 @@ l0_gb300_multi_nodes_perf_sanity_node2_gpu8:
       stage: post_merge
       backend: pytorch
   tests:
-  # aggr config
-  # deepseek-r1-fp4
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_grace_blackwell-r1_fp4_v2_dep8_mtp1_8k1k] TIMEOUT (90)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_grace_blackwell-r1_fp4_v2_tep8_mtp3] TIMEOUT (90)
+  # ctx only tests (disagg config)
+  # deepseek-v4-pro-dspark agentx: one 8-GPU DEP8 ctx server
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL] TIMEOUT (115)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (130)

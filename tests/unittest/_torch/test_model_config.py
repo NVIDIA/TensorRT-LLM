@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
 )
+from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -115,8 +116,8 @@ def _make_model_config_with_kv_quant(kv_cache_quant_algo):
 
 
 def _make_kv_cache_config(
-    *, use_kv_cache_manager_v2: bool = False, cross_kv_cache_fraction: float | None = None
-):
+    *, use_kv_cache_manager_v2: bool, cross_kv_cache_fraction: float | None = None
+) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         cross_kv_cache_fraction=cross_kv_cache_fraction,
@@ -130,7 +131,11 @@ def test_validate_and_set_kv_cache_quant_auto_uses_checkpoint():
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
-def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides():
+def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pin a non-SM107 device: on SM107 an explicit NVFP4 request falls back to FP8.
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.model_loader.get_sm_version", lambda: 100)
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     validate_and_set_kv_cache_quant(model_config, "nvfp4")
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
@@ -189,18 +194,32 @@ def test_validate_and_set_kv_cache_quant_auto_keeps_quant_config_dict():
         assert layer_quant_config.kv_cache_quant_algo is None
 
 
+@pytest.mark.parametrize("implementation", [None, "triton", "msa"])
+@pytest.mark.parametrize("requested_dtype", ["nvfp4", "auto"])
 def test_validate_and_set_kv_cache_quant_sm107_downgrade_propagates_to_quant_config_dict(
     monkeypatch: pytest.MonkeyPatch,
+    implementation: str | None,
+    requested_dtype: str,
 ) -> None:
-    """The SM107 NVFP4->FP8 downgrade must update per-layer QuantConfigs too,
-    otherwise a mixed-precision checkpoint keeps NVFP4 in quant_config_dict
-    while the KV pool (sized from the global config) uses FP8."""
+    """The SM107 NVFP4->FP8 decision must reach per-layer QuantConfigs too,
+    otherwise a mixed-precision checkpoint and the KV pool (sized from the
+    global config) disagree. MiniMax-M3 MSA keeps NVFP4, which its hybrid
+    cache serves on SM107; every other configuration falls back to FP8."""
     _mock_sm107(monkeypatch)
     model_config = _make_mixed_precision_model_config()
-    validate_and_set_kv_cache_quant(model_config, "nvfp4")
-    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    if implementation is not None:
+        model_config.sparse_attention_config = MiniMaxM3SparseAttentionConfig(
+            implementation=implementation
+        )
+    if requested_dtype == "auto":
+        model_config.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        for layer_quant_config in model_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+    validate_and_set_kv_cache_quant(model_config, requested_dtype)
+    expected = QuantAlgo.NVFP4 if implementation == "msa" else QuantAlgo.FP8
+    assert model_config.quant_config.kv_cache_quant_algo == expected
     for layer_quant_config in model_config.quant_config_dict.values():
-        assert layer_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+        assert layer_quant_config.kv_cache_quant_algo == expected
 
 
 def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):
@@ -342,10 +361,7 @@ def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
 
 
 def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
-    """V1 KVCacheManager is the default and production target for enc-dec models.
-
-    Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set.
-    """
+    """Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set."""
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
             head_dim=4,
@@ -359,7 +375,10 @@ def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
     )
 
 
-def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction():
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction(
+    use_kv_cache_manager_v2: bool,
+) -> None:
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
             head_dim=4,
@@ -370,11 +389,14 @@ def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction():
     with pytest.raises(ValueError, match="cross_kv_cache_fraction to be set"):
         validate_encoder_decoder_kv_cache_config(
             model_config,
-            _make_kv_cache_config(use_kv_cache_manager_v2=True),
+            _make_kv_cache_config(use_kv_cache_manager_v2=use_kv_cache_manager_v2),
         )
 
 
-def test_validate_encoder_decoder_kv_cache_config_rejects_cross_fraction_for_decoder_only():
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_validate_encoder_decoder_kv_cache_config_rejects_cross_fraction_for_decoder_only(
+    use_kv_cache_manager_v2: bool,
+) -> None:
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
             head_dim=4,
@@ -385,7 +407,9 @@ def test_validate_encoder_decoder_kv_cache_config_rejects_cross_fraction_for_dec
     with pytest.raises(ValueError, match="should only be set for encoder-decoder models"):
         validate_encoder_decoder_kv_cache_config(
             model_config,
-            _make_kv_cache_config(cross_kv_cache_fraction=0.5),
+            _make_kv_cache_config(
+                use_kv_cache_manager_v2=use_kv_cache_manager_v2, cross_kv_cache_fraction=0.5
+            ),
         )
 
 

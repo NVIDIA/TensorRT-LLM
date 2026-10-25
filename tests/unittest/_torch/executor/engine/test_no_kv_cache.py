@@ -9,6 +9,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
+from tensorrt_llm._torch.pyexecutor.engine.runners import common as common_module
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunnerConfig
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
@@ -96,7 +97,6 @@ def _prepare(
                 max_beam_width=1,
                 without_logits=False,
                 attention_backend=_AttentionBackend,
-                attention_runtime_features=AttentionRuntimeFeatures(),
                 enable_attention_dp=enable_attention_dp,
                 prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
                 prefill_cuda_graph_num_tokens=[],
@@ -106,13 +106,14 @@ def _prepare(
             dist=dist,
             moe_load_balancer=None,
             model_caller=Mock(),
+            attention_runtime_features=AttentionRuntimeFeatures(),
         )
     monkeypatch.setattr(
         runner,
-        "setup_attn_metadata",
+        "_setup_attn_metadata",
         Mock(return_value=attn_metadata),
     )
-    prepared = runner.prepare_inputs(
+    prepared = runner._prepare_inputs(
         scheduled_requests,
         resource_manager=SimpleNamespace(name="resources"),
     )
@@ -131,7 +132,7 @@ def test_no_kv_cache_runner_prepare_inputs_packs_context_requests(
 ) -> None:
     set_prefill_flag = Mock()
     monkeypatch.setattr(
-        no_kv_cache_module,
+        common_module,
         "set_per_request_prefill_cuda_graph_flag",
         set_prefill_flag,
     )

@@ -34,12 +34,15 @@ isolation -- it is spread across three points inside
 ``test_py_executor.py`` does for the PP scheduling path.
 """
 
-from unittest.mock import MagicMock
+from types import MethodType
+from unittest.mock import MagicMock, call
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager, OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
 
@@ -56,6 +59,7 @@ def _make_executor(
     tp_size: int = 1,
     cp_size: int = 1,
     enable_attention_dp: bool = False,
+    disable_overlap_scheduler: bool = False,
     kv_cache_transceiver=None,
     kv_connector_manager=None,
     is_warmup: bool = False,
@@ -90,6 +94,8 @@ def _make_executor(
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
     exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
+    exe.disable_overlap_scheduler = disable_overlap_scheduler
+    exe.enable_kv_cache_events = False
     exe.kv_cache_transceiver = kv_cache_transceiver
     exe.kv_connector_manager = kv_connector_manager
     exe.is_warmup = is_warmup
@@ -173,6 +179,39 @@ def _make_request(req_id: int) -> MagicMock:
     req = MagicMock()
     req.py_request_id = req_id
     return req
+
+
+# --------------------------------------------------------------------------- #
+# Constructor validation
+# --------------------------------------------------------------------------- #
+
+
+class TestKvPoolRebalanceCheckIntervalValidation:
+    """``kv_pool_rebalance_check_interval`` must be validated before it can
+
+    reach the ``iter_counter % self._rebalance_check_interval`` modulo in
+    ``_can_pause_for_rebalance``, where a non-positive value would raise
+    ``ZeroDivisionError`` (or silently mis-throttle, for a negative value)
+    deep inside the executor loop instead of failing fast at construction.
+
+    The check is the first statement in ``PyExecutor.__init__`` -- before any
+    CUDA or dependency access -- specifically so it can be exercised here as
+    an unbound call with placeholder positional args that are never touched.
+    """
+
+    @pytest.mark.parametrize("bad_interval", [0, -1])
+    def test_non_positive_interval_raises_before_construction(self, bad_interval):
+        with pytest.raises(ValueError, match="kv_pool_rebalance_check_interval"):
+            PyExecutor.__init__(
+                MagicMock(spec=PyExecutor),
+                resource_manager=None,
+                scheduler=None,
+                model_engine=None,
+                sampler=None,
+                dist=None,
+                max_num_sequences=1,
+                kv_pool_rebalance_check_interval=bad_interval,
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -417,13 +456,25 @@ class TestPaddingDummies:
 class TestConsumePreviousBatch:
     """Overlap-mode drain helper."""
 
-    def test_no_op_when_previous_batch_none(self):
-        exe = _make_executor(previous_batch=None)
+    @pytest.mark.parametrize(
+        "enable_attention_dp,disable_overlap_scheduler",
+        [(False, False), (False, True), (True, True)],
+    )
+    def test_no_op_when_previous_batch_none(
+        self, enable_attention_dp: bool, disable_overlap_scheduler: bool
+    ) -> None:
+        exe = _make_executor(
+            previous_batch=None,
+            enable_attention_dp=enable_attention_dp,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+        )
         PyExecutor._consume_previous_batch_for_rebalance(exe)
         exe._update_requests.assert_not_called()
         exe._send_kv_async.assert_not_called()
         exe._flush_pending_transfer_responses.assert_not_called()
         exe._process_previous_batch.assert_not_called()
+        exe._enqueue_responses.assert_not_called()
+        exe._add_kv_cache_events.assert_not_called()
 
     def test_consumes_and_clears(self):
         prev = MagicMock()
@@ -440,6 +491,209 @@ class TestConsumePreviousBatch:
         exe._flush_pending_transfer_responses.assert_called_once()
         exe._process_previous_batch.assert_called_once()
         exe.perf_manager.compute_batch_gpu_times.assert_called_once()
+        assert exe.previous_batch is None
+
+    @pytest.mark.parametrize(
+        "batch_ranks",
+        [(0,), (1,), (), (0, 1)],
+        ids=["empty-peer", "empty-root", "all-empty", "all-full"],
+    )
+    @pytest.mark.parametrize("enable_events", [False, True], ids=["no-events", "events"])
+    def test_adp_drain_collective_order_and_response_delivery(
+        self, batch_ranks: tuple[int, ...], enable_events: bool
+    ) -> None:
+        responses = [MagicMock(), MagicMock()]
+        batch_responses = [
+            [(rank + 1, responses[rank])] if rank in batch_ranks else [] for rank in range(2)
+        ]
+        transcripts: list[list[str]] = [[], []]
+        batch_order: list[list[str]] = [[], []]
+        expected_batch_order = [
+            ["generation", "response", "resources"] if rank in batch_ranks else ["response"]
+            for rank in range(2)
+        ]
+
+        def make_rank(rank: int) -> MagicMock:
+            request = _make_request(rank + 1)
+            request.is_attention_dp_dummy = False
+            request.py_kv_transfer_timed_out = False
+            request.is_generation_only_request = False
+            request.is_finished = True
+            request.is_disagg_context_complete_state = False
+            request.is_disagg_context_transmission_state = False
+            request.return_perf_metrics = False
+            request.py_decoding_iter = 2
+            request.py_draft_tokens = []
+            request.py_total_draft_tokens = 0
+            request.create_response.return_value = responses[rank]
+            previous_batch = MagicMock() if rank in batch_ranks else None
+            if previous_batch is not None:
+                previous_batch.scheduled_requests.all_requests.return_value = [request]
+            exe = _make_executor(
+                enable_attention_dp=True,
+                tp_size=2,
+                active_requests=[request] if previous_batch is not None else [],
+                previous_batch=previous_batch,
+            )
+            exe.dist.rank = exe.dist.tp_rank = rank
+            exe.dist.world_size = 2
+            exe.dist.mapping.tp_group = [0, 1]
+            exe.gather_all_responses = False
+            exe.responses = {}
+            exe.response_cv = MagicMock()
+            exe.result_wait_queues = {}
+            exe._pending_transfer_responses = []
+            exe._pending_response_terminations = []
+            exe._is_preemption_pending.return_value = False
+            exe.enable_early_first_token_response = False
+            exe.enable_iter_perf_stats = False
+            exe.enable_kv_cache_events = enable_events
+            exe._is_kv_manager_v2 = True
+            exe.force_terminate_ctx_for_partial_reuse = False
+            exe.stream_interval = 1
+            exe.model_engine.route_capture = None
+            exe.perf_manager = MagicMock()
+
+            # Script peer contributions, but check each rank's actual submitted responses.
+            def gather_responses(local_responses: list) -> list | None:
+                phase = len(transcripts[rank])
+                assert phase < 2
+                expected = [[], []] if phase == 0 else batch_responses
+                assert local_responses == expected[rank]
+                if phase == 1:
+                    assert batch_order[rank] == (
+                        ["generation"] if previous_batch is not None else []
+                    )
+                    batch_order[rank].append("response")
+                transcripts[rank].append("transfer" if phase == 0 else "response")
+                return expected if rank == 0 else None
+
+            def gather_events(local_events: list) -> list:
+                assert local_events == []
+                assert transcripts[rank] == ["transfer", "response"]
+                assert batch_order[rank] == expected_batch_order[rank]
+                transcripts[rank].append("events")
+                return [[], []]
+
+            def update_generation_resources(scheduled_requests, *args) -> None:
+                assert previous_batch is not None
+                assert scheduled_requests is previous_batch.scheduled_requests
+                assert batch_order[rank] == []
+                batch_order[rank].append("generation")
+
+            def update_resources(scheduled_requests, *args, skip_kv_cache_manager: bool) -> None:
+                assert previous_batch is not None
+                assert scheduled_requests is previous_batch.scheduled_requests
+                assert skip_kv_cache_manager is True
+                assert batch_order[rank] == ["generation", "response"]
+                batch_order[rank].append("resources")
+
+            exe.dist.tp_gather.side_effect = gather_responses
+            manager = object.__new__(KVCacheManagerV2)
+            manager.event_manager = KVCacheEventManager(
+                max_kv_event_entries=8,
+                attention_dp_rank=rank,
+                attention_dp_gather=gather_events,
+            )
+            manager.update_resources = MagicMock(side_effect=update_generation_resources)
+            exe.kv_cache_manager = manager
+            exe.resource_manager.resource_managers = {ResourceManagerType.KV_CACHE_MANAGER: manager}
+            exe.resource_manager.update_resources.side_effect = update_resources
+            exe._update_v2_generation_resources = MethodType(
+                PyExecutor._update_v2_generation_resources, exe
+            )
+            exe._flush_pending_transfer_responses = MethodType(
+                PyExecutor._flush_pending_transfer_responses, exe
+            )
+            exe._process_previous_batch = MagicMock(
+                wraps=MethodType(PyExecutor._process_previous_batch, exe)
+            )
+            exe._handle_responses = MethodType(PyExecutor._handle_responses, exe)
+            exe._enqueue_responses = MethodType(PyExecutor._enqueue_responses, exe)
+            exe._add_kv_cache_events = MethodType(PyExecutor._add_kv_cache_events, exe)
+            return exe
+
+        executors = [make_rank(rank) for rank in range(2)]
+        for exe in executors:
+            PyExecutor._consume_previous_batch_for_rebalance(exe)
+
+        expected_calls = ["transfer", "response"] + (["events"] if enable_events else [])
+        assert transcripts == [expected_calls, expected_calls]
+        assert batch_order == expected_batch_order
+        assert executors[0].responses == {rank + 1: [responses[rank]] for rank in batch_ranks}
+        assert executors[1].responses == {}
+        for rank, exe in enumerate(executors):
+            assert exe.previous_batch is None
+            assert exe._pending_transfer_responses == []
+            assert exe._pending_response_terminations == []
+            if rank in batch_ranks:
+                exe.kv_cache_manager.update_resources.assert_called_once()
+                exe._update_requests.assert_called_once()
+                exe._send_kv_async.assert_called_once()
+                exe._process_previous_batch.assert_called_once()
+                exe.resource_manager.update_resources.assert_called_once()
+                exe.perf_manager.compute_batch_gpu_times.assert_called_once()
+                exe._terminate_request.assert_called_once()
+                assert exe.active_requests == []
+            else:
+                exe.kv_cache_manager.update_resources.assert_not_called()
+                exe._update_requests.assert_not_called()
+                exe._send_kv_async.assert_not_called()
+                exe._process_previous_batch.assert_not_called()
+                exe.resource_manager.update_resources.assert_not_called()
+                exe.perf_manager.compute_batch_gpu_times.assert_not_called()
+                exe._terminate_request.assert_not_called()
+
+    def test_flushes_pending_buffered_kv_events(self) -> None:
+        calls = []
+
+        def gather(local_events: list) -> list:
+            calls.append("kv_event_allgather")
+            return [local_events, []]
+
+        manager = object.__new__(KVCacheManagerV2)
+        manager.event_manager = KVCacheEventManager(
+            max_kv_event_entries=8, attention_dp_rank=0, attention_dp_gather=gather
+        )
+        manager.event_manager.add_created_event([1])
+        prev = MagicMock()
+        exe = _make_executor(previous_batch=prev, enable_attention_dp=True, tp_size=2)
+        exe.enable_kv_cache_events = True
+        exe._is_kv_manager_v2 = True
+        exe.kv_cache_manager = manager
+        exe.enable_early_first_token_response = False
+        exe.enable_iter_perf_stats = False
+        exe.resource_manager.resource_managers = {ResourceManagerType.KV_CACHE_MANAGER: manager}
+        exe._update_v2_generation_resources = MethodType(
+            PyExecutor._update_v2_generation_resources, exe
+        )
+        exe._process_previous_batch = lambda: PyExecutor._process_previous_batch(exe)
+        exe._add_kv_cache_events = lambda: PyExecutor._add_kv_cache_events(exe)
+
+        def update_generation_resources(*args) -> None:
+            exe._handle_responses.assert_not_called()
+            manager.event_manager.add_created_event([2])
+
+        def update_resources(*args, skip_kv_cache_manager: bool) -> None:
+            assert skip_kv_cache_manager is True
+            manager.update_resources.assert_called_once()
+            exe._handle_responses.assert_called_once()
+            calls.append("update_resources")
+
+        manager.update_resources = MagicMock(side_effect=update_generation_resources)
+        exe.resource_manager.update_resources.side_effect = update_resources
+        exe.perf_manager = MagicMock()
+        exe.perf_manager.compute_batch_gpu_times.side_effect = lambda requests: calls.append(
+            "compute_batch_gpu_times"
+        )
+
+        PyExecutor._consume_previous_batch_for_rebalance(exe)
+
+        assert calls == ["update_resources", "kv_event_allgather", "compute_batch_gpu_times"]
+        events = manager.get_latest_events(timeout_ms=0)
+        assert len(events) == 2
+        assert [event.data.num_blocks_per_cache_level for event in events] == [[1], [2]]
+        assert manager.get_latest_events(timeout_ms=0) == []
         assert exe.previous_batch is None
 
 
@@ -936,6 +1190,9 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # Per-iteration no-ops.
     exe._handle_control_request = MagicMock()
     exe._pad_attention_dp_dummy_request = MagicMock()
+    # No tentative attention-DP dummy is pending, so a skipped microbatch's
+    # rollback (_finalize_adp_dummy_allocation(False)) is a no-op.
+    exe._pending_adp_dummy_request = None
     exe._revert_gen_alloc = MagicMock()
     exe._add_inflight_ids = MagicMock()
     exe._handle_dynamic_draft_len = MagicMock()
@@ -1058,6 +1315,20 @@ class TestPpLoopDrainWiring:
         # And the rebalance ran exactly once, at the end of the drain.
         exe._rebalance_kv_pools_now.assert_called_once()
         assert exe._pp_rebalance_drain_iters is None
+
+    def test_skipped_microbatch_rolls_back_pending_adp_dummy(self, monkeypatch):
+        """Every microbatch the drain skips rolls back its tentative ADP dummy.
+
+        Otherwise a dummy allocated for a skipped microbatch keeps its KV
+        cache allocation.
+        """
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=2, agreement=(True, False))
+        exe._finalize_adp_dummy_allocation = MagicMock()
+
+        with pytest.raises(_ReachedForward):
+            PyExecutor._executor_loop_pp(exe)
+
+        assert exe._finalize_adp_dummy_allocation.call_args_list == [call(False), call(False)]
 
     def test_drain_length_follows_the_ring_depth(self, monkeypatch):
         """A deeper ring drains for longer before rebalancing.

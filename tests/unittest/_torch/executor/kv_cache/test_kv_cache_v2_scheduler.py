@@ -52,6 +52,7 @@ def test_generation_admits_decode_before_capacity_growth(
     manager._ensure_generation_beam_width = Mock(return_value=beam_admitted)
     manager._generation_draft_slots = Mock(return_value=0)
     manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
     manager._has_cp_helix = False
     manager._fill_fresh_kv_pages = Mock()
     manager._log_window_crossing = Mock()
@@ -92,6 +93,7 @@ def test_resume_restores_page_buffers_and_sparse_metadata_row(sparse: bool) -> N
 @pytest.mark.parametrize("is_draft", [False, True])
 def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
     manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock()
     order = Mock()
     manager._disagg_receive_ready = {}
     manager.is_draft = is_draft
@@ -117,10 +119,11 @@ def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
     manager.kv_connector_manager = Mock()
     manager._connector_reservations_enabled = Mock(return_value=True)
     manager._accept_connector_prefix_reservations = order.accept
+    manager._on_allocation_stream = set()
     order.attach_mock(manager.kv_connector_manager.build_scheduler_output, "report")
     order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
     order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
-    scheduled = Mock()
+    scheduled = Mock(context_requests=[])
     manager.report_batch_to_connector(scheduled)
     assert order.mock_calls == [
         call.accept(scheduled),
@@ -373,7 +376,7 @@ def make_ctx_request(
     req.context_remaining_length = context_remaining_length
     req.prompt_len = prompt_len or context_remaining_length
     req.context_current_position = 0
-    req.py_connector_served_position = 0
+    req.py_served_prefix_end = 0
     req.expect_snapshot_points = []
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
@@ -2755,6 +2758,31 @@ class TestEncoder:
         cross_mgr.prepare_context.assert_not_called()
         cross_mgr.resize_context.assert_not_called()
         cross_mgr.try_allocate_generation.assert_not_called()
+        cross_mgr._create_kv_cache.assert_not_called()
+        cross_mgr._resume_and_restore.assert_not_called()
+        assert not cross_mgr.kv_cache_map
+
+    @pytest.mark.parametrize("ctx_chunk_config", [None, (None, 64)], ids=["full", "chunked"])
+    def test_encoder_is_not_an_eviction_or_recompute_victim(
+        self, ctx_chunk_config: tuple | None
+    ) -> None:
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            can_evict=True,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_encoder_scheduler(mgr, max_num_tokens=128, ctx_chunk_config=ctx_chunk_config)
+        context = make_ctx_request(0, context_remaining_length=64, encoder_output_len=80)
+        encoder = make_encoder_request(1, encoder_output_len=80)
+
+        out = sched.schedule_request([context, encoder], set())
+
+        assert ids(out.encoder_requests) == [1]
+        assert not out.context_requests
+        assert not out.paused_requests
+        mgr.preempt_request.assert_not_called()
+        mgr.suspend_request.assert_not_called()
+        assert encoder not in [entry.args[0] for entry in mgr.free_resources.call_args_list]
 
     def test_encoder_without_cross_manager_raises(self):
         """No cross_kv_cache_manager -> encoder request cannot be admitted.
@@ -2814,6 +2842,26 @@ class TestEncoder:
         )
         cross_mgr.kv_cache_map[ctx_req.py_request_id].resize.assert_called_once_with(80)
 
+    def test_cross_pool_reuse_is_scoped_by_cache_salt(self):
+        """Cross-KV blocks share the self pool's per-request salt namespace."""
+        self_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager(enable_block_reuse=True)
+        sched = make_encoder_scheduler(
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
+        )
+        ctx_req = make_ctx_request(0, context_remaining_length=50, encoder_output_len=80)
+        ctx_req.cache_salt = "tenant-a"
+
+        out = sched.schedule_request([ctx_req], set())
+
+        assert ids(out.context_requests) == [0]
+        cross_mgr._create_kv_cache.assert_called_once_with(
+            ctx_req.py_request_id,
+            ctx_req.lora_task_id,
+            ctx_req.get_encoder_unique_tokens.return_value,
+            cache_salt="tenant-a",
+        )
+
     def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
         """Later decoder chunks read existing cross-KV without reallocation."""
         self_mgr = make_kv_cache_manager()
@@ -2836,6 +2884,96 @@ class TestEncoder:
         self_mgr.resize_context.assert_called_once_with(ctx_req, 50)
         cross_mgr.prepare_context.assert_not_called()
         cross_mgr.resize_context.assert_not_called()
+
+
+class TestCrossKVAllocationFailures:
+    @pytest.mark.parametrize("failure", ["resume", "resize"])
+    @pytest.mark.parametrize("ctx_chunk_config", [None, (None, 64)], ids=["full", "chunked"])
+    def test_failed_admission_releases_both_pools_and_retries(
+        self, failure: str, ctx_chunk_config: tuple | None
+    ) -> None:
+        """A failed cross allocation must leave capacity for later requests and retries."""
+        self_mgr = make_kv_cache_manager(can_evict=True)
+        cross_mgr = make_kv_cache_manager()
+        cross_mgr.num_extra_kv_tokens = 2
+        failed_cache = Mock(capacity=0)
+        failed_cache.resize.return_value = failure != "resize"
+        cross_mgr.kv_cache_map[0] = failed_cache
+        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: not (
+            failure == "resume" and cache is failed_cache
+        )
+
+        def prepare_context(req: Mock, reuse_limit: int | None = None) -> bool:
+            self_mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        self_mgr.prepare_context.side_effect = prepare_context
+        for manager in (self_mgr, cross_mgr):
+            manager.free_resources.side_effect = (
+                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            )
+        sched = make_encoder_scheduler(
+            self_mgr,
+            cross_kv_cache_manager=cross_mgr,
+            max_batch_size=1,
+            max_num_tokens=128,
+            ctx_chunk_config=ctx_chunk_config,
+        )
+        prompt_len = 256 if ctx_chunk_config else 128
+        blocked = make_ctx_request(0, context_remaining_length=prompt_len, encoder_output_len=80)
+        following = make_ctx_request(1, context_remaining_length=128, encoder_output_len=80)
+
+        out = sched.schedule_request([blocked, following], set())
+
+        # The failed request consumes neither the token budget nor the single batch slot.
+        assert ids(out.context_requests) == [1]
+        assert out.num_fitting_requests == 1
+        assert not out.paused_requests
+        self_mgr.resize_context.assert_any_call(blocked, 128)
+        self_mgr.suspend_request.assert_called_once_with(blocked)
+        cross_mgr._resume_and_restore.assert_any_call(0, failed_cache)
+        if failure == "resume":
+            failed_cache.resize.assert_not_called()
+            failed_cache.suspend.assert_not_called()
+        else:
+            failed_cache.resize.assert_called_once_with(82)
+            failed_cache.suspend.assert_called_once_with()
+        for manager in (self_mgr, cross_mgr):
+            manager.free_resources.assert_called_once_with(blocked)
+            assert 0 not in manager.kv_cache_map
+            assert 1 in manager.kv_cache_map
+        blocked.set_prepopulated_prompt_len.assert_called_once_with(0, 64)
+        assert blocked.context_current_position == 0
+        assert blocked.context_remaining_length == prompt_len
+        assert blocked.context_chunk_size == prompt_len
+        assert blocked.py_batch_idx is None
+
+        retry = sched.schedule_request([blocked], set())
+
+        assert ids(retry.context_requests) == [0]
+        assert retry.num_fitting_requests == 1
+        assert not retry.paused_requests
+        assert blocked.context_chunk_size == 128
+        assert blocked.context_current_position == 0
+        assert self_mgr.prepare_context.call_args_list == [
+            call(blocked),
+            call(following),
+            call(blocked),
+        ]
+        assert self_mgr.resize_context.call_args_list == [
+            call(blocked, 128),
+            call(following, 128),
+            call(blocked, 128),
+        ]
+        retry_cache = cross_mgr.kv_cache_map[0]
+        assert retry_cache is not failed_cache
+        cross_mgr._create_kv_cache.assert_any_call(
+            0, blocked.lora_task_id, None, cache_salt=blocked.cache_salt
+        )
+        cross_mgr._resume_and_restore.assert_called_with(0, retry_cache)
+        retry_cache.resize.assert_called_once_with(82)
+        for manager in (self_mgr, cross_mgr):
+            manager.free_resources.assert_called_once_with(blocked)
 
 
 # ===========================================================================
@@ -3285,6 +3423,49 @@ class TestChunkedContext:
 
         assert ids(out.context_requests) == [0]
         assert req.context_chunk_size == 128
+
+    @staticmethod
+    def _started_ctx_ending_at_snapshot(request_id: int, position: int, point: int):
+        req = make_ctx_request(
+            request_id,
+            1000,
+            prompt_len=position + 1000,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = position
+        req.expect_snapshot_points = [point]
+        return req
+
+    def test_force_chunk_first_chunk_waits_on_leftover_budget(self):
+        # The started chunk stops at its snapshot point after 130 tokens and
+        # leaves 20 of 150. A first chunk would only prepare and release.
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr, max_num_tokens=150, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 32)
+        )
+        started = self._started_ctx_ending_at_snapshot(0, 1000, 1130)
+        waiting = [make_ctx_request(1, 4000), make_ctx_request(2, 4000)]
+
+        out = sched.schedule_request([started, *waiting], set())
+
+        assert ids(out.context_requests) == [0]
+        assert started.context_chunk_size == 130
+        assert mgr.prepare_context.call_args_list == [call(started)]
+        mgr.free_resources.assert_not_called()
+
+    def test_force_chunk_first_chunk_that_fits_leftover_still_runs(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr, max_num_tokens=150, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 32)
+        )
+        started = self._started_ctx_ending_at_snapshot(0, 1000, 1130)
+        short = make_ctx_request(1, 16)
+
+        out = sched.schedule_request([started, short], set())
+
+        assert ids(out.context_requests) == [0, 1]
+        assert short.context_chunk_size == 16
 
     def test_multiple_ctx_share_budget(self):
         """Two ctx requests share the budget."""
@@ -4868,3 +5049,37 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
     resumed = scheduler.schedule_request([decoding], set())
     assert ids(resumed.generation_requests) == [0]
     manager.try_allocate_generation.assert_called_with(decoding)
+
+
+@pytest.mark.parametrize("prompt_len", [0, 8])
+def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
+    prompt_len: int,
+) -> None:
+    """A Helix CP rank can hold none of the prompt (promptLen 0); the
+    prepopulated-length setter rejects any value there, so rewinding must not
+    call it, while the context cursor is still reset."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import rewind_context_after_cache_drop
+
+    def set_prepopulated_prompt_len(value: int, tokens_per_block: int) -> None:
+        if not value < prompt_len:
+            raise RuntimeError("prepopulatedPromptLen >= promptLen")
+
+    request = Mock(
+        prompt_len=prompt_len,
+        context_current_position=4,
+        context_chunk_size=2,
+        estimated_reusable_tokens=4,
+        py_ctx_pre_resize_cap=16,
+    )
+    request.set_prepopulated_prompt_len = Mock(side_effect=set_prepopulated_prompt_len)
+
+    rewind_context_after_cache_drop(request, 32)
+
+    if prompt_len > 0:
+        request.set_prepopulated_prompt_len.assert_called_once_with(0, 32)
+    else:
+        request.set_prepopulated_prompt_len.assert_not_called()
+    assert request.context_current_position == 0
+    assert request.context_chunk_size == prompt_len
+    assert request.estimated_reusable_tokens == 0
+    assert request.py_ctx_pre_resize_cap is None

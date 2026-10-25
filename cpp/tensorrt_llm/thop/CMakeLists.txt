@@ -30,7 +30,6 @@ endif()
 
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 # Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
 # OptionalArrayRef in the reverse order, relying on C++20's automatic generation
 # of the reversed comparison operator. th_utils/th_common only contain host .cpp
@@ -140,15 +139,20 @@ add_th_common_family(
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  dwdpFabricGatherOp.cpp)
 
 add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
 
 add_th_common_family(
-  th_common_visual_gen fusedAdaptiveLayerNormOp.cpp fusedDiTQKNormRopeOp.cpp
-  fusedDiTSplitQKNormRopeOp.cpp fusedDiTSplitNormOp.cpp
-  fusedDiTGateResidNormShiftScaleOp.cpp)
+  th_common_visual_gen
+  fusedAdaptiveLayerNormOp.cpp
+  fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp
+  fusedDiTSplitNormOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
+  sageQuantizeOp.cpp)
 
 add_th_common_family(
   th_common_decoding
@@ -156,11 +160,16 @@ add_th_common_family(
   parallelDecodeKVCacheUpdateOp.cpp
   specDecOp.cpp
   fusedSamplingOp.cpp
+  chainSpeculativeSamplingOp.cpp
   dynamicTreeOp.cpp
   loraOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
+
+# GLM bindings keep their existing family targets; source lists live with the
+# model.
+add_subdirectory(glmMoeDsa)
 
 add_library(
   th_common SHARED

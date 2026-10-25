@@ -8,14 +8,22 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
 from tensorrt_llm._torch.pyexecutor.engine.runners import encoder_decoder as encoder_decoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import (
+    dummy_requests as dummy_requests_module,
+)
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderPreparedInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     CrossAttentionInputs,
+    EncoderDecoderCudaGraphs,
+    EncoderDecoderDummyRequests,
+    EncoderDecoderInputPreparer,
     EncoderDecoderRunner,
     EncoderStage,
 )
@@ -65,7 +73,7 @@ def test_encoder_decoder_rejects_mixed_token_and_feature_batch() -> None:
     )
 
     with pytest.raises(ValueError, match="cannot share one batch"):
-        runner.prepare_inputs(
+        runner._prepare_inputs(
             scheduled_requests,
             resource_manager=None,
         )
@@ -160,7 +168,7 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
     prepared = EncoderPreparedInputs({}, sequence_lengths=[2, 3])
     hidden_states = torch.arange(10).reshape(5, 2)
     runner = object.__new__(EncoderStage)
-    runner.prepare_inputs = Mock(return_value=prepared)
+    runner._prepare_inputs = Mock(return_value=prepared)
     runner._execute_prepared = Mock(return_value=hidden_states)
     scheduled_requests = ScheduledRequests()
     resource_manager = object()
@@ -174,7 +182,7 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
         "encoder_hidden_states": hidden_states,
         "encoder_seq_lens": [2, 3],
     }
-    runner.prepare_inputs.assert_called_once_with(
+    runner._prepare_inputs.assert_called_once_with(
         scheduled_requests,
         resource_manager=resource_manager,
     )
@@ -188,15 +196,19 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
     mapping = object()
     dist = object()
     input_processor = object()
+    features = object()
     shapes = frozenset({(1, 16)})
 
     order = Mock()
+
+    def decoder_init(self, *args, **kwargs) -> None:
+        order.decoder(self._encoder_graph_shapes, *args, **kwargs)
+
     with (
         patch.object(encoder_decoder_module, "EncoderStage") as stage_type,
-        patch.object(DecoderRunner, "__init__", return_value=None) as decoder_init,
+        patch.object(DecoderRunner, "__init__", decoder_init),
     ):
         order.attach_mock(stage_type, "stage")
-        order.attach_mock(decoder_init, "decoder")
         stage_type.return_value._encoder_graph_shapes = shapes
         runner = EncoderDecoderRunner(
             model,
@@ -206,34 +218,82 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
             dist=dist,
             moe_load_balancer=None,
             input_processor=input_processor,
+            attention_runtime_features=features,
         )
 
     assert runner._encoder_stage is stage_type.return_value
-    assert runner._encoder_graph_shapes is shapes
+    assert runner._input_processor is input_processor
     assert order.mock_calls == [
-        call.stage(model, encoder_config, mapping=mapping, dist=dist, moe_load_balancer=None),
+        call.stage(
+            model,
+            encoder_config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=None,
+            attention_runtime_features=features,
+        ),
         call.decoder(
+            shapes,
             model,
             config,
             mapping=mapping,
             dist=dist,
             moe_load_balancer=None,
-            input_processor=input_processor,
+            attention_runtime_features=features,
         ),
     ]
+
+
+def test_encoder_decoder_runner_builds_encoder_decoder_components() -> None:
+    runner = object.__new__(EncoderDecoderRunner)
+    runner._sparse_attention_config = object()
+    runner._input_processor = object()
+    runner._attention_runtime_features = object()
+    runner._encoder_graph_shapes = frozenset({(1, 16)})
+    runner._inputs = object()
+    mm_item_scheduler = object()
+
+    with (
+        patch.object(DecoderRunner, "_dummy_requests_kwargs", return_value={"dummy": 1}),
+        patch.object(DecoderRunner, "_input_preparer_kwargs", return_value={"inputs": 2}) as kw,
+        patch.object(DecoderRunner, "_cuda_graphs_kwargs", return_value={"graphs": 3}),
+        patch.object(encoder_decoder_module, "EncoderDecoderDummyRequests") as dummy_type,
+        patch.object(encoder_decoder_module, "EncoderDecoderInputPreparer") as preparer_type,
+        patch.object(encoder_decoder_module, "EncoderDecoderCudaGraphs") as graphs_type,
+    ):
+        assert runner._make_dummy_requests() is dummy_type.return_value
+        assert runner._make_input_preparer(mm_item_scheduler) is preparer_type.return_value
+        assert runner._make_cuda_graphs() is graphs_type.return_value
+
+    kw.assert_called_once_with(mm_item_scheduler)
+    dummy_type.assert_called_once_with(dummy=1)
+    preparer_type.assert_called_once_with(
+        inputs=2,
+        sparse_attention_config=runner._sparse_attention_config,
+        attention_runtime_features=runner._attention_runtime_features,
+    )
+    graphs_type.assert_called_once_with(
+        graphs=3,
+        input_processor=runner._input_processor,
+        encoder_graph_shapes=runner._encoder_graph_shapes,
+        inputs=runner._inputs,
+    )
+    assert issubclass(EncoderDecoderDummyRequests, DummyRequestFactory)
+    assert issubclass(EncoderDecoderInputPreparer, encoder_decoder_module.DecoderInputPreparer)
+    assert issubclass(EncoderDecoderCudaGraphs, encoder_decoder_module.DecoderCudaGraphs)
 
 
 def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
     runner = object.__new__(EncoderDecoderRunner)
     calls = Mock()
     runner._encoder_stage = calls.stage
-    runner._release_decoder_graphs = calls.decoder
 
-    runner.release_graphs()
+    with patch.object(DecoderRunner, "release_graphs", calls.decoder):
+        runner.release_graphs(release_nccl_window_owners=False)
 
     assert calls.mock_calls == [
-        call.stage.release_graphs(),
-        call.decoder(),
+        call.stage.release_graphs(release_nccl_window_owners=False),
+        call.decoder(release_nccl_window_owners=False),
     ]
 
 
@@ -276,55 +336,54 @@ def test_encoder_decoder_graph_runner_config_gates_mixed_graphs(
 
 @pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
 def test_encoder_decoder_release_context_frees_cross_kv(fails: bool) -> None:
-    runner = object.__new__(EncoderDecoderRunner)
     requests = [object(), object()]
     batch = ScheduledRequests()
     batch.generation_requests = requests
-    cross_kv_cache_manager = Mock()
+    managers = Mock()
     resource_manager = Mock()
-    resource_manager.get_resource_manager.side_effect = lambda key: (
-        cross_kv_cache_manager if key == ResourceManagerType.CROSS_KV_CACHE_MANAGER else None
-    )
+    resource_manager.get_resource_manager.side_effect = {
+        ResourceManagerType.CROSS_KV_CACHE_MANAGER: managers.cross,
+        ResourceManagerType.KV_CACHE_MANAGER: managers.kv,
+    }.get
 
     with (
-        patch.object(
-            DecoderRunner, "_release_batch_context", return_value=nullcontext(batch)
-        ) as release_decoder,
         pytest.raises(RuntimeError) if fails else nullcontext(),
-        runner._release_batch_context(batch, resource_manager) as released,
+        _dummy_requests(EncoderDecoderDummyRequests).release_batch_context(
+            batch, resource_manager
+        ) as released,
     ):
         assert released is batch
-        cross_kv_cache_manager.free_resources.assert_not_called()
+        assert managers.mock_calls == []
         if fails:
             raise RuntimeError("capture failure")
 
-    release_decoder.assert_called_once_with(batch, resource_manager)
-    assert cross_kv_cache_manager.free_resources.call_args_list == [
-        call(request) for request in requests
+    assert managers.mock_calls == [
+        *(call.cross.free_resources(request) for request in requests),
+        *(call.kv.free_resources(request) for request in requests),
     ]
 
 
-def _dummy_request_runner(
-    runner_type: type[DecoderRunner], pretrained_config: SimpleNamespace
-) -> DecoderRunner:
-    runner = object.__new__(runner_type)
-    runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-    runner._config = SimpleNamespace(
-        max_seq_len=64,
-        max_draft_loop_tokens=0,
-        spec_config=None,
-        use_mrope=False,
-        max_beam_width=1,
+def _dummy_requests(
+    factory_type: type[DummyRequestFactory], pretrained_config: SimpleNamespace | None = None
+) -> DummyRequestFactory:
+    return factory_type(
+        config=SimpleNamespace(
+            max_seq_len=64,
+            max_draft_loop_tokens=0,
+            spec_config=None,
+            use_mrope=False,
+            max_beam_width=1,
+        ),
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(pretrained_config=pretrained_config or SimpleNamespace())
+        ),
+        get_runtime_tokens_per_gen_step=lambda draft_len: draft_len + 1,
+        release_request_state=None,
     )
-    runner.model = SimpleNamespace(
-        model_config=SimpleNamespace(pretrained_config=pretrained_config)
-    )
-    runner._get_draft_kv_cache_manager = Mock(return_value=None)
-    return runner
 
 
 def _dummy_request_resources() -> tuple[Mock, Mock]:
-    kv_cache_manager = Mock(max_seq_len=64)
+    kv_cache_manager = Mock(max_seq_len=64, context_swa_layer_limit=None)
     kv_cache_manager.get_num_available_tokens.return_value = 40
     managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
@@ -336,23 +395,23 @@ def _dummy_request_resources() -> tuple[Mock, Mock]:
 
 
 @pytest.mark.parametrize(
-    ("runner_type", "expected_tokens", "expected_kwargs"),
+    ("factory_type", "expected_tokens", "expected_kwargs"),
     [
-        (DecoderRunner, 32, {}),
-        (EncoderDecoderRunner, 16, {"encoder_output_lens": [24]}),
+        (DummyRequestFactory, 32, {}),
+        (EncoderDecoderDummyRequests, 16, {"encoder_output_lens": [24]}),
     ],
 )
-def test_longest_dummy_request_applies_runner_limits(
-    runner_type: type[DecoderRunner], expected_tokens: int, expected_kwargs: dict
+def test_longest_dummy_request_applies_model_limits(
+    factory_type: type[DummyRequestFactory], expected_tokens: int, expected_kwargs: dict
 ) -> None:
-    runner = _dummy_request_runner(
-        runner_type, SimpleNamespace(max_position_embeddings=32, max_target_positions=16)
+    requests = _dummy_requests(
+        factory_type, SimpleNamespace(max_position_embeddings=32, max_target_positions=16)
     )
     resource_manager, kv_cache_manager = _dummy_request_resources()
     longest = object()
     kv_cache_manager.add_dummy_requests.return_value = [longest]
 
-    actual = runner._add_longest_dummy_request(resource_manager, [], 3, None, 0, None)
+    actual = requests.add_longest_dummy_request(resource_manager, [], 3, None, 0, None)
 
     assert actual is longest
     kv_cache_manager.add_dummy_requests.assert_called_once_with(
@@ -370,22 +429,41 @@ def test_longest_dummy_request_applies_runner_limits(
 
 
 def test_longest_dummy_request_failure_frees_filler_requests() -> None:
-    runner = _dummy_request_runner(DecoderRunner, SimpleNamespace())
     draft_kv_cache_manager = Mock()
     draft_kv_cache_manager.get_num_available_tokens.return_value = 40
-    runner._get_draft_kv_cache_manager = Mock(return_value=draft_kv_cache_manager)
     resource_manager, kv_cache_manager = _dummy_request_resources()
     kv_cache_manager.add_dummy_requests.return_value = None
     fillers = [object(), object()]
 
-    assert runner._add_longest_dummy_request(resource_manager, fillers, 3, None, 0, None) is None
+    requests = _dummy_requests(DummyRequestFactory)
+    with patch.object(
+        dummy_requests_module, "get_draft_kv_cache_manager", return_value=draft_kv_cache_manager
+    ):
+        actual = requests.add_longest_dummy_request(resource_manager, fillers, 3, None, 0, None)
+    assert actual is None
     assert kv_cache_manager.free_resources.call_args_list == [call(r) for r in fillers]
     assert draft_kv_cache_manager.free_resources.call_args_list == [call(r) for r in fillers]
 
 
+def test_cuda_graph_warmup_request_frees_rows_without_cross_kv_space() -> None:
+    resource_manager, kv_cache_manager = _dummy_request_resources()
+    cross_kv_cache_manager = resource_manager.get_resource_manager(
+        ResourceManagerType.CROSS_KV_CACHE_MANAGER
+    )
+    cross_kv_cache_manager.add_dummy_requests.return_value = None
+    rows = [SimpleNamespace(py_request_id=0), SimpleNamespace(py_request_id=1)]
+    batch = ScheduledRequests()
+    batch.generation_requests = rows
+
+    requests = _dummy_requests(EncoderDecoderDummyRequests)
+    assert requests.finish_cuda_graph_warmup_request(batch, resource_manager, 2, 0) is None
+
+    assert cross_kv_cache_manager.add_dummy_requests.call_args.kwargs["request_ids"] == [0, 1]
+    assert kv_cache_manager.free_resources.call_args_list == [call(row) for row in rows]
+    cross_kv_cache_manager.free_resources.assert_not_called()
+
+
 def test_mixed_warmup_request_orders_context_generation_and_longest_rows() -> None:
-    runner = _dummy_request_runner(EncoderDecoderRunner, SimpleNamespace())
-    runner.get_runtime_tokens_per_gen_step = lambda draft_len: draft_len + 1
     resource_manager, kv_cache_manager = _dummy_request_resources()
     kv_cache_manager.get_num_free_blocks.return_value = 8
     contexts = [SimpleNamespace(), SimpleNamespace()]
@@ -398,13 +476,17 @@ def test_mixed_warmup_request_orders_context_generation_and_longest_rows() -> No
         longest_inputs.append(list(requests))
         return longest
 
-    with (
-        patch.object(runner, "_add_longest_dummy_request", side_effect=add_longest),
-        patch.object(
-            runner, "_finish_cuda_graph_warmup_request", side_effect=lambda result, *_: result
-        ) as finish,
-    ):
-        batch = runner._create_mixed_cuda_graph_warmup_request(resource_manager, 4, 0, [5, 7], 3)
+    finish = Mock(side_effect=lambda result, *_: result)
+    requests = _dummy_requests(EncoderDecoderDummyRequests)
+    requests.add_longest_dummy_request = Mock(side_effect=add_longest)
+    requests.finish_cuda_graph_warmup_request = finish
+    batch = requests.create_cuda_graph_warmup_request(
+        resource_manager,
+        4,
+        0,
+        context_token_nums=[3, 3],
+        context_request_kwargs={"encoder_output_lens": [5, 7]},
+    )
 
     assert longest_inputs == [contexts + generations]
     assert batch.context_requests_last_chunk == contexts
@@ -428,8 +510,8 @@ def test_mixed_warmup_request_orders_context_generation_and_longest_rows() -> No
 
 
 def test_cross_attention_inputs_project_context_and_repeat_generation_rows() -> None:
-    runner = Mock()
-    inputs = CrossAttentionInputs(runner)
+    preparer = Mock()
+    inputs = CrossAttentionInputs(preparer)
     encoder_output = torch.zeros(3, 2)
     inputs.add_context_request(
         SimpleNamespace(
@@ -456,12 +538,12 @@ def test_cross_attention_inputs_project_context_and_repeat_generation_rows() -> 
 
     built = inputs.build(attn_metadata, resource_manager)
 
-    assert built is runner._prepare_enc_dec_cross_attn_inputs.return_value
-    runner._prepare_enc_dec_cross_attn_inputs.assert_called_once_with(
+    assert built is preparer.prepare_cross_attention.return_value
+    preparer.prepare_cross_attention.assert_called_once_with(
         [encoder_output], [3, 0, 0, 0, 0], [0, 4, 6, 5, 5], attn_metadata, resource_manager
     )
     with pytest.raises(RuntimeError, match="has no encoder output"):
-        CrossAttentionInputs(runner).add_context_request(
+        CrossAttentionInputs(preparer).add_context_request(
             SimpleNamespace(
                 py_request_id=5, encoder_output_len=3, py_skip_cross_kv_projection=False
             )
@@ -480,13 +562,13 @@ def test_cross_attention_inputs_project_context_and_repeat_generation_rows() -> 
 def test_input_fast_path_clears_staged_request_ids_when_not_taken(
     promoted_context_request_ids: frozenset[int], eligible: bool, taken: bool
 ) -> None:
-    runner = object.__new__(EncoderDecoderRunner)
+    preparer = object.__new__(EncoderDecoderInputPreparer)
     staged_request_ids = object()
-    runner._encoder_decoder_staged_request_ids = staged_request_ids
-    runner._can_use_encoder_decoder_input_fast_path = Mock(return_value=eligible)
-    runner._prepare_encoder_decoder_inputs_fast = Mock()
+    preparer._staged_request_ids = staged_request_ids
+    preparer._can_use_fast_path = Mock(return_value=eligible)
+    preparer._prepare_fast = Mock()
 
-    result = runner._prepare_inputs_fast_path(
+    result = preparer._prepare_inputs_fast_path(
         ScheduledRequests(),
         Mock(),
         object.__new__(TrtllmAttentionMetadata),
@@ -498,9 +580,78 @@ def test_input_fast_path_clears_staged_request_ids_when_not_taken(
     )
 
     if taken:
-        assert result is runner._prepare_encoder_decoder_inputs_fast.return_value
-        assert runner._encoder_decoder_staged_request_ids is staged_request_ids
+        assert result is preparer._prepare_fast.return_value
+        assert preparer._staged_request_ids is staged_request_ids
     else:
         assert result is None
-        assert runner._encoder_decoder_staged_request_ids is None
-        runner._prepare_encoder_decoder_inputs_fast.assert_not_called()
+        assert preparer._staged_request_ids is None
+        preparer._prepare_fast.assert_not_called()
+
+
+@pytest.mark.parametrize("feature_mode", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_encoder_lifetime_scope_covers_embedding_and_preserves_output(
+    monkeypatch: pytest.MonkeyPatch, feature_mode: bool, fail: bool
+) -> None:
+    events = []
+    active = False
+
+    def begin(inputs: list[torch.Tensor]) -> int:
+        nonlocal active
+        assert not active
+        active = True
+        events.append("begin")
+        return 0
+
+    def end(
+        inputs: list[torch.Tensor],
+        outputs: list[torch.Tensor],
+        failed: bool,
+        entry_depth: int,
+    ) -> None:
+        nonlocal active
+        assert active
+        assert failed is fail
+        assert entry_depth == 0
+        assert len(outputs) == (0 if fail else 1)
+        if not fail:
+            assert outputs[0] is output
+        active = False
+        events.append("end")
+
+    def embedding(input_ids: torch.Tensor) -> torch.Tensor:
+        assert active
+        events.append("embedding")
+        return input_ids.to(torch.float32).unsqueeze(1)
+
+    def encoder(**kwargs: object) -> torch.Tensor:
+        assert active
+        events.append("encoder")
+        if fail:
+            raise RuntimeError("encoder failed")
+        return output
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    runner = object.__new__(EncoderStage)
+    runner._model = SimpleNamespace(
+        encoder=encoder,
+        model=SimpleNamespace(shared_embedding=embedding, embed_scale=2.0),
+    )
+    with FakeTensorMode():
+        output = torch.empty(3, 2, device="cuda")
+        inputs = {"encoder_attn_metadata": object()}
+        if feature_mode:
+            inputs["input_features"] = torch.empty(3, 4, device="cuda")
+        else:
+            inputs["encoder_input_ids"] = torch.tensor([1, 2, 3], device="cuda")
+        if fail:
+            with pytest.raises(RuntimeError, match="encoder failed"):
+                runner._forward_encoder_stack(inputs)
+        else:
+            assert runner._forward_encoder_stack(inputs) is output
+
+    assert not active
+    assert events == (
+        ["begin", "encoder", "end"] if feature_mode else ["begin", "embedding", "encoder", "end"]
+    )
