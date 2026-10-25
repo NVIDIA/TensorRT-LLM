@@ -526,8 +526,8 @@ def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
     It lives in the multi-frontend ipc dir, which is private to the user and
     removed by the executor proxy.
     """
-    ipc_dir = getattr(getattr(llm, "_executor", None),
-                      "_multi_frontend_ipc_dir", None)
+    # Only the classic IPC proxy has the attribute.
+    ipc_dir = getattr(llm._executor, "_multi_frontend_ipc_dir", None)
     if not ipc_dir:
         raise ValueError(
             "num_serve_frontends > 1 requires the classic IPC executor "
@@ -548,11 +548,9 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
     Not via set_prometheus_multiproc_dir(): it keeps only its latest
     TemporaryDirectory alive, so OpenAIServer's later call would delete this one.
     """
-    args = getattr(llm, "args", None)
-    if args is None or os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
         return
-    if (getattr(args, "return_perf_metrics", False)
-            or getattr(args, "perf_metrics_output_dir", None)):
+    if llm.args.return_perf_metrics or llm.args.perf_metrics_output_dir:
         path = tempfile.mkdtemp(prefix="prometheus_", dir=ipc_dir)
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = path
         logger.info(

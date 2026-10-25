@@ -1805,12 +1805,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
         Mirrors the fatal-error branch of ``health``.
         """
-        executor = getattr(self.generator, '_executor', None)
-        if executor is None:
+        executor = self.generator._executor
+        if executor is None:  # the LLM already shut down
             return
-        if getattr(executor, '_fatal_error', None) is None:
-            executor._set_fatal_error(error)
-        if not getattr(executor, 'doing_shutdown', True):
+        executor._set_fatal_error(error)  # keeps only the first error
+        if not executor.doing_shutdown:
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 
@@ -1989,10 +1988,9 @@ class OpenAIServer(_VideoRoutesMixin):
             f"The steady clock offset between local and disagg server: {offset} second"
         )
         # Multi-frontend launcher: every frontend stamps perf metrics with it.
-        shared = getattr(self, "_shared_clock_offset", None)
-        if shared is not None:
+        if self._shared_clock_offset is not None:
             try:
-                shared.publish(offset)
+                self._shared_clock_offset.publish(offset)
             except OSError as e:
                 logger.error(
                     f"Failed to share the steady clock offset with the "
@@ -2045,8 +2043,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     res.metrics_dict)
             # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
             # Wake up the stats collector to drain iteration stats
-            if self._iteration_stats_collector_task is not None and getattr(
-                    self.generator.args, "enable_iter_perf_stats", True):
+            # The collector only runs with enable_iter_perf_stats.
+            if self._iteration_stats_collector_task is not None:
                 self._iteration_stats_wakeup_event.set()
 
     async def _create_chat_response(
@@ -2103,8 +2101,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 try:
                     await asyncio.wait_for(
                         self._iteration_stats_wakeup_event.wait(),
-                        timeout=getattr(self, "_iteration_stats_poll_interval",
-                                        None))
+                        timeout=self._iteration_stats_poll_interval)
                 except asyncio.TimeoutError:
                     woken_by_timer = True
 

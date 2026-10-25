@@ -218,9 +218,7 @@ def test_watchdog_notices_a_gone_launcher_process(tmp_path) -> None:
 @pytest.mark.parametrize("doing_shutdown", [False, True])
 def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, doing_shutdown: bool) -> None:
     fatal_errors = []
-    executor = SimpleNamespace(
-        doing_shutdown=doing_shutdown, _fatal_error=None, _set_fatal_error=fatal_errors.append
-    )
+    executor = SimpleNamespace(doing_shutdown=doing_shutdown, _set_fatal_error=fatal_errors.append)
     server = object.__new__(OpenAIServer)
     server.generator = SimpleNamespace(_executor=executor)
     signals, terminations = [], []
