@@ -52,6 +52,7 @@ from .common import (
     build_paged_kv_slot_mapping,
     write_kv_slots,
 )
+from .kernels import msa_v1_indexer
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
@@ -1343,6 +1344,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """Return the paged index-K cache in the HND layout MSA consumes."""
         return self.kv_cache_manager.get_index_k_buffer(layer_idx)
 
+    def msa_idx_k_nvfp4(self, layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return the NVFP4 index-K mirror (data, scales) when TRTLLM_M3_MSA_V1_INDEXER is on."""
+        getter = getattr(self.kv_cache_manager, "get_index_k_nvfp4_buffers", None)
+        return None if getter is None else getter(layer_idx)
+
     def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
         """Write the new-token index-K into the side cache at out_cache_loc."""
         cache = self.msa_idx_k_cache(layer_idx)
@@ -1617,6 +1623,17 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             if not idx_k_prewritten:
                 idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
                 metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
+        nvfp4_index_k = (
+            metadata.msa_idx_k_nvfp4(self.layer_idx)
+            if configured_for_fp8 and msa_v1_indexer.env_enabled()
+            else None
+        )
+        if nvfp4_index_k is not None:
+            # Every writer stores E4M3 index-K; refresh this step's slots of the NVFP4
+            # mirror the MSA-v1 decode indexer reads before any selection.
+            msa_v1_indexer.quantize_index_k_nvfp4(
+                idx_k_cache, *nvfp4_index_k, metadata.msa_out_cache_loc[:num_tokens]
+            )
         # The FP8 indexer mirrors vLLM's unscaled E4M3 contract: normalized
         # index Q/K are cast directly and the proxy accumulates their QK scores
         # in FP32. Block ordering is invariant to the omitted positive scale.
@@ -1656,6 +1673,30 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         # present (a standalone test that skips prepare) select_blocks plans
         # inline and computes the valid-block count itself.
         proxy_plan = metadata.msa_prefill_proxy_plan
+        if (
+            nvfp4_index_k is not None
+            and proxy_plan is None
+            and span is not None
+            and span.row_first == 0
+            and gen_first == 0
+        ):
+            indexer_config = self.indexer.config
+            table = msa_v1_indexer.try_select(
+                idx_q_view,
+                *nvfp4_index_k,
+                block_table=block_table,
+                seq_lens=seq_lens_cuda,
+                decode_query_len=decode_query_len,
+                num_kv_heads=int(indexer_config.num_kv_heads),
+                init_blocks=int(indexer_config.init_blocks),
+                local_blocks=int(indexer_config.local_blocks),
+                layer_idx=self.layer_idx,
+                plan_cache=metadata.fmha_plan_caches.setdefault(
+                    msa_v1_indexer.PLAN_CACHE_KEY, {}
+                ),
+            )
+            if table is not None:
+                return table
         if proxy_plan is None and span is not None and span.row_first == 0:
             # No proxy plan to read max_k_tiles from for the contiguous score
             # view, so it is shaped to the worst case, which the scorer
