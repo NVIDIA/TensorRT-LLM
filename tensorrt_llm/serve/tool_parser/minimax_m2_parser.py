@@ -93,10 +93,10 @@ class MiniMaxM2ToolParser(BaseToolParser):
             r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
         )
         self.invoke_regex = re.compile(
-            r'<invoke\s+name=["\']?(.*?)["\']?\s*>(.*?)</invoke>', re.DOTALL
+            r'<invoke\s+name=["\']?([^>]*?)["\']?\s*>(.*?)</invoke>', re.DOTALL
         )
         self.param_regex = re.compile(
-            r'<parameter\s+name=["\']?(.*?)["\']?\s*>(.*?)</parameter>', re.DOTALL
+            r'<parameter\s+name=["\']?([^>]*?)["\']?\s*>(.*?)</parameter>', re.DOTALL
         )
 
         # Streaming state
@@ -191,7 +191,7 @@ class MiniMaxM2ToolParser(BaseToolParser):
             complete_invocations = list(self.invoke_regex.finditer(inner_text))
             # Check for partial invoke (started but not closed)
             partial_invoke = re.search(
-                r'<invoke\s+name=["\']?(.*?)["\']?\s*>((?:(?!</invoke>).)*?)$',
+                r'<invoke\s+name=["\']?([^>]*?)["\']?\s*>((?:(?!</invoke>).)*?)$',
                 inner_text,
                 re.DOTALL,
             )
