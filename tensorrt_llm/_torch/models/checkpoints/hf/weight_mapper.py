@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.logger import logger
 
 from ..base_weight_loader import ConsumableWeightsDict
 from ..base_weight_mapper import BaseWeightMapper
@@ -41,6 +42,38 @@ def _invert_compressed_tensors_global_scale(value) -> torch.Tensor:
                       1.0 / torch.clamp(t, min=torch.finfo(torch.float32).tiny),
                       torch.zeros_like(t))
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+
+
+def _read_compressed_tensors_global_scale(name: str, value, zero_scales: list,
+                                          invalid_scales: list) -> torch.Tensor:
+    """Read a global scale and record whether it has entries that cannot be inverted."""
+    t = value if isinstance(value, torch.Tensor) else value[...]
+    t32 = t.to(torch.float32)
+    if bool((~torch.isfinite(t32) | (t32 < 0)).any()):
+        invalid_scales.append(name)
+    elif bool((t32 == 0).any()):
+        zero_scales.append(name)
+    return t
+
+
+def _warn_uninvertible_global_scales(zero_scales: list,
+                                     invalid_scales: list) -> None:
+    """Log one summary line for the global scales that were set to 0."""
+    if not zero_scales and not invalid_scales:
+        return
+    parts = []
+    if invalid_scales:
+        parts.append(
+            f"{len(invalid_scales)} with negative or non-finite values, which "
+            f"means a broken checkpoint (e.g. {', '.join(invalid_scales[:3])})")
+    if zero_scales:
+        parts.append(
+            f"{len(zero_scales)} with 0, as stored for experts without "
+            f"calibration data (e.g. {', '.join(zero_scales[:3])})")
+    logger.warning(
+        "compressed-tensors NVFP4 global scales that cannot be inverted: " +
+        "; ".join(parts) + ". They are set to 0; a weight global scale of 0 "
+        "zeroes that expert's output.")
 
 
 def convert_compressed_tensors_nvfp4_weights(
@@ -75,16 +108,20 @@ def convert_compressed_tensors_nvfp4_weights(
         return weights
 
     converted = {}
+    zero_scales, invalid_scales = [], []
     for name, value in weights.items():
         if name.endswith(".weight_packed"):
             name = name[:-len(".weight_packed")] + ".weight"
-        elif name.endswith(".weight_global_scale"):
-            name = name[:-len(".weight_global_scale")] + ".weight_scale_2"
-            value = _invert_compressed_tensors_global_scale(value)
-        elif name.endswith(".input_global_scale"):
-            name = name[:-len(".input_global_scale")] + ".input_scale"
+        elif name.endswith((".weight_global_scale", ".input_global_scale")):
+            value = _read_compressed_tensors_global_scale(
+                name, value, zero_scales, invalid_scales)
+            if name.endswith(".weight_global_scale"):
+                name = name[:-len(".weight_global_scale")] + ".weight_scale_2"
+            else:
+                name = name[:-len(".input_global_scale")] + ".input_scale"
             value = _invert_compressed_tensors_global_scale(value)
         converted[name] = value
+    _warn_uninvertible_global_scales(zero_scales, invalid_scales)
     return ConsumableWeightsDict.take_ownership(weights, converted)
 
 

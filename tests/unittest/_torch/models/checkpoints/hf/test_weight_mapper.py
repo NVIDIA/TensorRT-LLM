@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -76,6 +78,44 @@ def test_compressed_tensors_nvfp4_names_and_global_scales_are_converted() -> Non
     assert converted["model.norm.weight"] is norm
     torch.testing.assert_close(converted[f"{prefix}.weight_scale_2"], torch.tensor([0.25, 0.0]))
     torch.testing.assert_close(converted[f"{prefix}.input_scale"], torch.tensor([0.125]))
+
+
+def test_compressed_tensors_nvfp4_uninvertible_global_scales_log_one_warning(monkeypatch) -> None:
+    import tensorrt_llm._torch.models.checkpoints.hf.weight_mapper as weight_mapper
+
+    log = Mock()
+    monkeypatch.setattr(weight_mapper, "logger", log)
+    weights = {
+        "model.layers.0.mlp.experts.0.w1.weight_global_scale": torch.tensor([4.0]),
+        "model.layers.0.mlp.experts.1.w1.weight_global_scale": torch.tensor([0.0]),
+        "model.layers.0.mlp.experts.2.w1.weight_global_scale": torch.tensor([-1.0]),
+        "model.layers.0.mlp.experts.3.w1.input_global_scale": _LazySlice(
+            torch.tensor([float("nan")])
+        ),
+    }
+
+    converted = convert_compressed_tensors_nvfp4_weights(weights)
+
+    for i in (1, 2):
+        torch.testing.assert_close(
+            converted[f"model.layers.0.mlp.experts.{i}.w1.weight_scale_2"], torch.tensor([0.0])
+        )
+    torch.testing.assert_close(
+        converted["model.layers.0.mlp.experts.3.w1.input_scale"], torch.tensor([0.0])
+    )
+    assert log.warning.call_count == 1
+    message = log.warning.call_args[0][0]
+    assert "2 with negative or non-finite values" in message
+    assert "experts.2.w1.weight_global_scale" in message
+    assert "experts.3.w1.input_global_scale" in message
+    assert "1 with 0" in message
+    assert "experts.1.w1.weight_global_scale" in message
+
+    log.reset_mock()
+    convert_compressed_tensors_nvfp4_weights(
+        {"model.layers.0.mlp.experts.0.w1.weight_global_scale": torch.tensor([4.0])}
+    )
+    log.warning.assert_not_called()
 
 
 def test_compressed_tensors_nvfp4_conversion_returns_other_checkpoints_unchanged() -> None:
