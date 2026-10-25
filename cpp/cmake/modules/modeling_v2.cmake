@@ -55,8 +55,12 @@ SOURCES   Paths or globs relative to the unit's csrc/ directory: the
           Source properties the family's CMakeLists.txt sets with
           set_source_files_properties (e.g. COMPILE_OPTIONS) apply to shared
           and target sources alike.
-DEPS      From a closed list: cublas, cublaslt, cuda_driver, internal_cutlass,
-          nccl, trtllm_gen_fmha_interface.
+DEPS      From a closed list: cublas, cublaslt, cuda_driver, flashmla,
+          internal_cutlass, nccl, trtllm_gen_fmha_interface. On aarch64
+          builds with Clang, flashmla makes nvcc use GCC as the host compiler:
+          for the family's targets when a target declares it, for every
+          family's shared code when shared code does (see
+          _modeling_v2_host_compiler).
 REQUIRES  Build features: MULTI_DEVICE, NVSHMEM. Unmet requirements skip the
           target.
 
@@ -68,8 +72,14 @@ not empty.
 
 include_guard(GLOBAL)
 
-set(_MODELING_V2_KNOWN_DEPS cublas cublaslt cuda_driver internal_cutlass nccl
-                            trtllm_gen_fmha_interface)
+set(_MODELING_V2_KNOWN_DEPS
+    cublas
+    cublaslt
+    cuda_driver
+    flashmla
+    internal_cutlass
+    nccl
+    trtllm_gen_fmha_interface)
 set(_MODELING_V2_KNOWN_REQUIRES MULTI_DEVICE NVSHMEM)
 
 # --- Naming ------------------------------------------------------------------
@@ -311,12 +321,47 @@ function(_modeling_v2_apply_compile_deps object_lib)
         PRIVATE
           $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
       )
+    elseif(dep STREQUAL "flashmla")
+      # The headers of the FlashMLA 3rdparty/fetch_content.json pins, for code
+      # that instantiates its kernels.
+      target_include_directories(
+        ${object_lib} PRIVATE "${flashmla_SOURCE_DIR}/csrc"
+                              "${flashmla_SOURCE_DIR}/csrc/kerutils/include")
     elseif(dep STREQUAL "trtllm_gen_fmha_interface")
       target_link_libraries(${object_lib} PRIVATE trtllm_gen_fmha_interface)
     elseif(dep STREQUAL "nccl" AND ENABLE_MULTI_DEVICE)
       target_include_directories(${object_lib} PRIVATE ${MPI_C_INCLUDE_DIRS})
     endif()
   endforeach()
+endfunction()
+
+#[[
+The CUDA host compiler and flags for code that uses DEPS, or "" when the build's
+own apply. FlashMLA's headers keep PTX inline assembly in __host__ __device__
+functions, which nvcc hands to the host compiler as well; Clang checks their
+operand constraints against the host architecture and on aarch64 rejects "l".
+Such code compiles with GCC as the host compiler there, as
+cpp/tensorrt_llm/flash_mla does. CMake reads both variables per directory, so
+the caller sets them for the directory that creates the code's OBJECT library.
+#]]
+function(_modeling_v2_host_compiler out_compiler out_cuda_flags)
+  set(compiler "")
+  set(cuda_flags "${CMAKE_CUDA_FLAGS}")
+  if("flashmla" IN_LIST ARGN
+     AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64"
+     AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    find_program(GCC_EXECUTABLE NAMES g++ REQUIRED)
+    set(compiler "${GCC_EXECUTABLE}")
+    # PyTorch adds this Clang-only flag for Clang hosts; g++ rejects it.
+    string(REGEX REPLACE "-Xcompiler=-fclang-abi-compat=[0-9]+" "" cuda_flags
+                         "${cuda_flags}")
+  endif()
+  set(${out_compiler}
+      "${compiler}"
+      PARENT_SCOPE)
+  set(${out_cuda_flags}
+      "${cuda_flags}"
+      PARENT_SCOPE)
 endfunction()
 
 # Link-time libraries of DEPS, for the family library.
@@ -540,6 +585,17 @@ function(add_modeling_v2_target family target)
       "${archs}"
       "${sources}"
       "${arg_DEPS}")
+    # The target's objects are created in its family's directory, so this covers
+    # the family's other targets too.
+    _modeling_v2_host_compiler(host_compiler cuda_flags ${arg_DEPS})
+    if(host_compiler)
+      set(CMAKE_CUDA_HOST_COMPILER
+          "${host_compiler}"
+          PARENT_SCOPE)
+      set(CMAKE_CUDA_FLAGS
+          "${cuda_flags}"
+          PARENT_SCOPE)
+    endif()
   else()
     message(
       STATUS
@@ -682,7 +738,20 @@ endfunction()
 # cpp/tensorrt_llm/modeling_v2/CMakeLists.txt after it added the families.
 function(add_modeling_v2_family_libraries)
   get_property(families GLOBAL PROPERTY MODELING_V2_FAMILIES)
+  set(shared_deps "")
   foreach(family IN LISTS families)
     _modeling_v2_add_family_library("${family}")
+    get_property(deps GLOBAL PROPERTY MODELING_V2_${family}_SHARED_DEPS)
+    list(APPEND shared_deps ${deps})
   endforeach()
+  # Every family's shared objects are created in the caller's directory.
+  _modeling_v2_host_compiler(host_compiler cuda_flags ${shared_deps})
+  if(host_compiler)
+    set(CMAKE_CUDA_HOST_COMPILER
+        "${host_compiler}"
+        PARENT_SCOPE)
+    set(CMAKE_CUDA_FLAGS
+        "${cuda_flags}"
+        PARENT_SCOPE)
+  endif()
 endfunction()

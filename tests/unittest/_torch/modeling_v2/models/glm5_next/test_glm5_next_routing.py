@@ -10,6 +10,7 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi.llm_args import (
     Eagle3DecodingConfig,
+    KvCacheConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
     SADecodingConfig,
@@ -31,7 +32,11 @@ _FUSED = (
     "models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default_mtp_fused.modeling."
     "ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused"
 )
+_TP4_TARGET = (
+    "models.glm5_next.glm_5_3_flash_nvfp4__sm_10x__tp4.modeling.ModelingV2Glm53FlashNvfp4Sm10xTp4"
+)
 _TEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1)
+_TP4 = dict(world_size=4, tp_size=4, moe_ep_size=1, moe_tp_size=4)
 
 
 def _qualified(target) -> str:
@@ -48,6 +53,15 @@ def _on_sm100(monkeypatch):
 
 def _llm_args(mode: str, **kwargs) -> TorchLlmArgs:
     return TorchLlmArgs(model=_DUMMY_MODEL, modeling_v2=mode, **kwargs)
+
+
+def _tp4_engine(**kwargs) -> dict:
+    """The engine the tp4 target is served with: 128-token KV cache pages, up to 256 sequences per step."""
+    return {
+        "max_batch_size": 32,
+        "kv_cache_config": KvCacheConfig(tokens_per_block=128),
+        **kwargs,
+    }
 
 
 def _flash_config(**text_overrides) -> PretrainedConfig:
@@ -171,9 +185,112 @@ def test_flash_near_misses_do_not_match(
 
 
 def test_flash_on_sm103_does_not_match(monkeypatch):
-    """The targets have been run on B200 only; a GB300 falls back."""
+    """The default targets have been run on B200 only; a GB300 the tp4 target declines falls back."""
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
     config = _model_config(_flash_config())
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+# --- The tp4 target: sm_100 and sm_103, with the engine it is written for ---------
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("sm", [(10, 0), (10, 3)], ids=["sm100", "sm103"])
+@pytest.mark.parametrize(
+    "spec_config",
+    [
+        None,
+        MTPDecodingConfig(max_draft_len=3),
+        # the served deployment: temperature-only sampling, which the step's own head samples
+        MTPDecodingConfig(max_draft_len=3, advanced_sampling_mode="no_topk_no_topp"),
+    ],
+    ids=["no-spec", "mtp3", "mtp3-temperature-only"],
+)
+@pytest.mark.parametrize("layout", [_TP4, _TEP4], ids=["tp4", "tp4-ep4"])
+def test_tp4_engine_routes_to_the_tp4_target(mode, sm, spec_config, layout, monkeypatch):
+    """The tp4 target takes every deployment it supports, ahead of the default targets."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: sm)
+    config = _model_config(_flash_config(), spec_config=spec_config, **layout)
+    target = modeling_v2_resolve(config, _llm_args(mode, **_tp4_engine()))
+    assert _qualified(target) == _TP4_TARGET
+
+
+@pytest.mark.parametrize(
+    "spec_config, mapping_kwargs, engine, on_sm100, missed",
+    [
+        # attention DP splits the attention weights differently: another layout, not a knob
+        (None, _DEP4, {}, _SPLIT, "attention_dp=True"),
+        # a measured layout splits the experts by expert or by intermediate, not both
+        (
+            None,
+            dict(world_size=4, tp_size=4, moe_ep_size=2, moe_tp_size=2),
+            {},
+            _SPLIT,
+            "moe_tp=2 moe_ep=2",
+        ),
+        # the KDA replay records hold exactly three drafts
+        (MTPDecodingConfig(max_draft_len=2), _TP4, {}, _FUSED, "max_draft_len=2"),
+        # vanilla MTP is the multi-model loop; the target carries the one-model drafter
+        (
+            MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
+            _TP4,
+            {},
+            _SPLIT,
+            "speculative decoding",
+        ),
+        # the kernels read and write a BF16 latent cache
+        (
+            None,
+            _TP4,
+            dict(kv_cache_config=KvCacheConfig(dtype="fp8", tokens_per_block=128)),
+            _SPLIT,
+            "KV cache dtype fp8",
+        ),
+        # the kernels address 128-token pages (the LLM API's default is 32)
+        (
+            MTPDecodingConfig(max_draft_len=3),
+            _TEP4,
+            dict(kv_cache_config=KvCacheConfig()),
+            _FUSED,
+            "tokens_per_block 32",
+        ),
+        # the step program's head takes up to 256 sequences per step (the LLM API's default
+        # max_batch_size is 2048)
+        (None, _TP4, dict(max_batch_size=512), _SPLIT, "max_batch_size 512"),
+        # a step's rows are split over the 4 ranks
+        (None, _TP4, dict(max_num_tokens=8190), _SPLIT, "max_num_tokens 8190"),
+    ],
+    ids=[
+        "attention-dp",
+        "moe-tp2-ep2",
+        "mtp2",
+        "vanilla-mtp",
+        "fp8-kv",
+        "pages-32",
+        "batch-512",
+        "max-num-tokens-8190",
+    ],
+)
+def test_what_the_tp4_target_declines_goes_to_the_default_targets(
+    spec_config, mapping_kwargs, engine, on_sm100, missed, monkeypatch
+):
+    """A deployment the tp4 target declines lands on a default target on sm_100, and on none on sm_103."""
+    config = _model_config(_flash_config(), spec_config=spec_config, **mapping_kwargs)
+    engine = _tp4_engine(**engine)
+    for mode in ("auto", "require"):
+        assert _qualified(modeling_v2_resolve(config, _llm_args(mode, **engine))) == on_sm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
+    assert modeling_v2_resolve(config, _llm_args("auto", **engine)) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require", **engine))
+
+
+@pytest.mark.parametrize("sm", [(9, 0), (12, 0)], ids=["sm90", "sm120"])
+def test_flash_on_other_sms_does_not_match(sm, monkeypatch):
+    """Every target's kernels are sm_10x code."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: sm)
+    config = _model_config(_flash_config(), **_TP4)
+    assert modeling_v2_resolve(config, _llm_args("auto", **_tp4_engine())) is None
