@@ -142,7 +142,6 @@ class DecoderMetadata:
             )
         self.attn_metadata.msa_policy = msa
         kv_cache_manager.configure_decode_shortcuts(
-            skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
             reuse_pool_views=msa.reuse_pool_views,
         )
 
@@ -155,9 +154,6 @@ class DecoderMetadata:
             self._config, self.model.config, spec_resource_manager, self.mapping
         )
         self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
-        self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
-        if self.runtime_hooks.pack_spec_rng_uploads:
-            logger.info("[M3 host] sampled-step Philox uploads staged into the step-input pack")
         if self.runtime_hooks.spec_small_h2d:
             logger.info(
                 "[M3 host] spec step small uploads off the boundary (accepted counts packed, static slot ids)"

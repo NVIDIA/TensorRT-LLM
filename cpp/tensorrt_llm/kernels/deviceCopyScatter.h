@@ -33,7 +33,7 @@ namespace kernels
 //! `(dst, src, bytes)` int64 triple per copy. A host copy's `src` is a byte offset into the staging buffer (its
 //! bytes were uploaded with the header); a device copy's `src` is a device address. Every host copy is written
 //! before any device copy, so a device copy may read a destination a host copy of the same batch filled.
-void invokeStepInputsScatter(uint8_t const* stage, cudaStream_t stream);
+void invokeDeviceCopyScatter(uint8_t const* stage, cudaStream_t stream);
 
 } // namespace kernels
 

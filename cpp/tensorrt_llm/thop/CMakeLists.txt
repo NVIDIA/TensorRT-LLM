@@ -174,6 +174,7 @@ add_th_common_family(
   dynamicTreeOp.cpp
   loraOp.cpp
   inplaceSliceCopyOp.cpp
+  deviceCopyScatterOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
 

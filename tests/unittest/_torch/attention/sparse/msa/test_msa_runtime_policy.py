@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-M3 MSA decode-step preparation a model opts into (RuntimeHooks.msa).
 
-Covers the short-sequence identity table the metadata stages, and the KV cache
-manager's block-table and pool-view shortcuts. With the default policy every
+Covers the short-sequence identity table the metadata stages, the KV cache
+manager's pool-view shortcut, and the MSA copy sites a copy plan skips. With the default policy every
 path runs as before; the existing test_msa_backend.py tests cover that.
 """
 
@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseMetadataParams,
+    MsaCopySite,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -30,8 +31,8 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     MiniMaxM3MsaSparseAttentionMetadata,
     _fill_unused_slots,
 )
-from tensorrt_llm._torch.pyexecutor import h2d_cache
-from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
+from tensorrt_llm._torch.pyexecutor import device_copy
+from tensorrt_llm._torch.pyexecutor.device_copy import CopyPlan, DeviceCopier
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm._utils import prefer_pinned
@@ -41,6 +42,12 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _skipping(*sites):
+    """A copier that skips ``sites`` when unchanged (it defers nothing, so it needs no device)."""
+    return DeviceCopier(CopyPlan(skip_unchanged=set(sites)), torch.device("cuda"))
+
 
 NUM_KV_HEADS = 2
 PARAMS = MiniMaxM3SparseMetadataParams(
@@ -152,10 +159,10 @@ def test_ineligible_steps_do_not_use_the_identity_table(manager, n_valid, num_co
 @requires_cuda
 @pytest.mark.parametrize("skip_cache", [False, True], ids=["plain", "skip_cache"])
 def test_the_identity_table_follows_each_step(manager, skip_cache):
-    """Also with the engine's skip cache active, which skips the repeated [2, 4] upload."""
+    """Also with a plan that skips the table, which skips the repeated [2, 4] upload."""
     metadata = _short_table_metadata(MsaRuntimePolicy(short_sequence_identity=True), manager)
 
-    with h2d_cache.active(H2DSkipCache() if skip_cache else None):
+    with device_copy.active(_skipping(MsaCopySite.SHORT_TABLE) if skip_cache else None):
         for n_valid in ([2, 3], [2, 4], [2, 4], [16], [2, 3]):
             metadata._stage_msa_short_table(torch.tensor(n_valid, dtype=torch.int32), PARAMS)
             assert torch.equal(_staged(metadata, len(n_valid)), _identity(n_valid))
@@ -176,8 +183,14 @@ def test_the_identity_table_grows_past_its_first_bound(manager):
 
 
 # ---------------------------------------------------------------------------
-# Block-table copy shortcut
+# Block-offset copies skipped by a plan (MsaCopySite.BLOCK_OFFSETS)
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def skipping_block_offsets():
+    with device_copy.active(_skipping(MsaCopySite.BLOCK_OFFSETS)):
+        yield
 
 
 @pytest.fixture
@@ -201,20 +214,19 @@ def _decode_copy(manager, dst, request_ids=(0, 1), num_contexts=0, max_blocks=8)
     )
 
 
-def test_block_offsets_shortcut_is_off_by_default(manager, base_copy):
+def test_block_offsets_are_copied_without_a_plan(manager, base_copy):
     _block_table_host(manager)
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
     _decode_copy(manager, dst)
 
-    assert not manager.skip_unchanged_block_offsets
+    assert device_copy.current() is None
     assert base_copy.call_count == 2
 
 
-def test_an_unchanged_decode_copy_is_skipped(manager, base_copy):
+def test_an_unchanged_decode_copy_is_skipped(manager, base_copy, skipping_block_offsets):
     _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
@@ -223,9 +235,8 @@ def test_an_unchanged_decode_copy_is_skipped(manager, base_copy):
     assert base_copy.call_count == 1
 
 
-def test_a_changed_host_table_is_copied(manager, base_copy):
+def test_a_changed_host_table_is_copied(manager, base_copy, skipping_block_offsets):
     host = _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
@@ -245,9 +256,8 @@ def test_a_changed_host_table_is_copied(manager, base_copy):
     ],
     ids=["batch_order", "request_set", "max_blocks"],
 )
-def test_a_changed_batch_is_copied(manager, base_copy, change):
+def test_a_changed_batch_is_copied(manager, base_copy, skipping_block_offsets, change):
     _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
@@ -256,9 +266,8 @@ def test_a_changed_batch_is_copied(manager, base_copy, change):
     assert base_copy.call_count == 2
 
 
-def test_each_destination_keeps_its_own_record(manager, base_copy):
+def test_each_destination_keeps_its_own_record(manager, base_copy, skipping_block_offsets):
     _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
     first = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
     second = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
@@ -270,9 +279,10 @@ def test_each_destination_keeps_its_own_record(manager, base_copy):
     assert base_copy.call_count == 2
 
 
-def test_a_step_with_contexts_always_copies_and_resets_the_record(manager, base_copy):
+def test_a_step_with_contexts_always_copies_and_resets_the_record(
+    manager, base_copy, skipping_block_offsets
+):
     _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
     dst = torch.zeros(2, 4, 2, 8, dtype=torch.int32)
 
     _decode_copy(manager, dst)
@@ -284,9 +294,10 @@ def test_a_step_with_contexts_always_copies_and_resets_the_record(manager, base_
     assert base_copy.call_count == 4
 
 
-def test_a_failed_block_copy_does_not_leave_a_valid_record(manager, base_copy):
+def test_a_failed_block_copy_does_not_leave_a_valid_record(
+    manager, base_copy, skipping_block_offsets
+):
     host = _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
     dst = torch.zeros_like(host)
     _decode_copy(manager, dst)
     base_copy.side_effect = RuntimeError("copy failed")
@@ -297,9 +308,10 @@ def test_a_failed_block_copy_does_not_leave_a_valid_record(manager, base_copy):
     assert base_copy.call_count == 3
 
 
-def test_a_different_destination_view_requires_a_new_copy(manager, base_copy):
+def test_a_different_destination_view_requires_a_new_copy(
+    manager, base_copy, skipping_block_offsets
+):
     host = _block_table_host(manager)
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
     storage = torch.zeros(2 * host.numel(), dtype=host.dtype)
     first = storage[: host.numel()].view_as(host)
     second = storage[host.numel() :].view_as(host)
@@ -366,7 +378,7 @@ def test_pool_views_are_rebuilt_on_every_call_by_default(manager, pools):
 @requires_cuda
 def test_reused_pool_views_are_built_once_per_geometry(manager, pools):
     kv_pool, scale_pool = pools
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=False, reuse_pool_views=True)
+    manager.configure_decode_shortcuts(reuse_pool_views=True)
 
     view = manager.get_buffers(3)
     scale_view = manager.get_block_scale_buffers(3)
@@ -382,7 +394,7 @@ def test_reused_pool_views_are_built_once_per_geometry(manager, pools):
 @requires_cuda
 def test_reused_pool_views_are_kept_per_inference_mode(manager, pools):
     kv_pool, _ = pools
-    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=False, reuse_pool_views=True)
+    manager.configure_decode_shortcuts(reuse_pool_views=True)
 
     view = manager.get_buffers(3)
     with torch.inference_mode():
@@ -398,7 +410,7 @@ def test_reused_pool_views_are_kept_per_inference_mode(manager, pools):
 @requires_cuda
 def test_unused_slots_are_filled_after_a_full_buffer_step():
     buf = torch.full((8,), 7, dtype=torch.int32, device="cuda")
-    with h2d_cache.active(H2DSkipCache()):
+    with device_copy.active(_skipping(MsaCopySite.OUT_CACHE_LOC_TAIL)):
         _fill_unused_slots(buf, 3)
         # A step whose live rows cover the whole buffer overwrites the filled tail.
         buf.copy_(torch.arange(8, dtype=torch.int32, device="cuda"))

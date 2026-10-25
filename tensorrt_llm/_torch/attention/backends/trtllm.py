@@ -47,9 +47,9 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
-from ...pyexecutor import step_inputs
+from ...pyexecutor import device_copy
 from ...pyexecutor.config_utils import is_mla
-from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
+from ...pyexecutor.device_copy import CopySite
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -1101,9 +1101,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
-                             self.prompt_lens_cpu[:self.num_seqs],
-                             pack=True)
+        device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                         self.prompt_lens_cuda[:self.num_seqs],
+                         self.prompt_lens_cpu[:self.num_seqs])
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1158,8 +1158,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
-                          maybe_pin_memory(kv_lens[:self.num_seqs]))
+        device_copy.copy(CopySite.ATTN_KV_LENS,
+                         self.kv_lens_cuda[:self.num_seqs],
+                         maybe_pin_memory(kv_lens[:self.num_seqs]))
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1310,7 +1311,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                         self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens

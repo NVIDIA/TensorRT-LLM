@@ -140,8 +140,10 @@ class MsaRuntimePolicy:
     short_sequence_identity: bool = False
     # The model's one-launch replacement for the update after the KV lengths move.
     kv_update: Optional[MsaKvUpdate] = None
-    # Skip a block-table copy whose inputs equal the previous step's.
-    skip_unchanged_block_offsets: bool = False
+    # Build the decode step's slot table, page table and query/KV prefix sums on the host and stage them as copies,
+    # instead of filling them with device gathers, zero fills and scans between the decode graphs. The copies are
+    # MSA copy sites (MsaCopySite), deferred or skipped as the model's CopyPlan says.
+    stage_tables_on_host: bool = False
     # Build each KV pool view once per pool geometry instead of on every attention call.
     reuse_pool_views: bool = False
 
@@ -176,35 +178,14 @@ class ExecutorEvents(Protocol):
 
 @dataclass(frozen=True)
 class RuntimeHooks:
-    """The step-loop hooks a model opts into. All off by default."""
+    """The step-loop hooks a model opts into. All off by default.
 
-    # Pack a decode step's small host-to-device input copies into one upload and
-    # one scatter launch, issued just before the CUDA graph replay.
-    pack_step_inputs: bool = False
-    # Issue the step-input pack's host copies with one parallel scatter (a program per copy) instead of the
-    # serial one-CTA scatter, when their destinations do not overlap (pack_step_inputs).
-    pack_parallel_scatter: bool = False
-    # Issue the step-input pack inside the replayed graph (a prologue copies a pinned window and scatters it), so no
-    # operation is left between the decode graphs (needs pack_parallel_scatter).
-    pack_in_graph: bool = False
-    # With pack_in_graph: a side copy stream uploads the pinned window into the prologue's own device buffer while the
-    # previous graph still runs, so the prologue only waits on that copy and scatters device to device (no host copy
-    # at the head of the replay).
-    pack_early_copy: bool = False
-    # With pack_in_graph: the pack keeps a step epoch, one int64 device counter the graph's prologue increments once per
-    # replay and never resets, so in-graph per-step flags can be tagged with it instead of cleared between steps.
-    pack_step_epoch: bool = False
-    # With pack_early_copy: the model's one-launch prologue, called inside the capture as
-    # ``op(window, epoch_or_None, max_desc)``. It writes the window's host copies, then its device copies, zeroes the
-    # window's header and increments the epoch, which the default prologue does with two scatter launches and a fill.
-    pack_prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None
+    Which per-step copies are deferred to the graph replay or skipped is the model's ``CopyPlan``
+    (``device_copy``), not a hook.
+    """
+
     decode_prologue: Optional[DecodePrologue] = None
     executor_events: Optional[ExecutorEvents] = None
-    # Skip host-to-device metadata copies whose values the destination already holds.
-    skip_unchanged_h2d: bool = False
-    # With skip_unchanged_h2d: a changed packed 2-D upload stages only each row's changed column span (a page table that
-    # gained a page re-sends a few bytes, not every padded row), so the pack keeps fitting the in-graph window.
-    h2d_changed_span: bool = False
     # A speculative step under the overlap scheduler re-derives its KV-length metadata (on_update_kv_lens) once,
     # after the forward's KV-length correction, instead of also before it: the first pass's device writes are all
     # rewritten by the second.
@@ -236,10 +217,6 @@ class RuntimeHooks:
     # Skip the per-step Philox seed and offset uploads on all-greedy
     # one-model speculative batches (the argmax path never reads them).
     skip_greedy_rng_upload: bool = False
-    # Stage the one-model speculative sampler's per-step Philox seed and offset
-    # uploads into the step-input pack (pack_step_inputs), so they ride its one
-    # upload instead of each being a copy the next graph waits for.
-    pack_spec_rng_uploads: bool = False
     # The one-model speculative step's small per-step uploads: the accepted-draft
     # counts join the step-input pack, and the spec sampler keeps its slot ids in
     # a device buffer it re-uploads only when they change.
@@ -255,15 +232,6 @@ class RuntimeHooks:
     iteration_timing_one_event: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
-
-    @property
-    def skips_unchanged_metadata_uploads(self) -> bool:
-        """Whether a hook skips uploads into graph metadata buffers that already hold the values.
-
-        Such a skip is sound only while no other engine writes those buffers, so the engine
-        then gives its CUDA graph metadata a buffer pool of its own.
-        """
-        return self.skip_unchanged_h2d or self.msa.skip_unchanged_block_offsets
 
 
 DEFAULT_RUNTIME_HOOKS = RuntimeHooks()
