@@ -174,14 +174,22 @@ class CrossAttention(nn.Module):
         )
 
         # Cross-attention backend selection honors ``ModelConfig.attn_backend``
-        # directly, mirroring the behavior of self-attention.
+        # directly, mirroring the behavior of self-attention. The backend also
+        # needs the quantization config: it carries the KV cache dtype, and the
+        # attention op sizes every cache token from it. The cross pool is
+        # allocated from the same config, so a backend that does not see it
+        # addresses an FP8 pool at 16 bits per element and runs past the pool
+        # once a request's blocks are more than half of it.
+        self.quant_config = config.get_quant_config()
         self.attn: AttentionBackend = create_attention(
             config.attn_backend,
             layer_idx,
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
+            quant_config=self.quant_config,
             q_scaling=self.q_scaling,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
 
         if not config.skip_create_weights_in_init:
@@ -192,6 +200,7 @@ class CrossAttention(nn.Module):
         self.k_proj.create_weights()
         self.v_proj.create_weights()
         self.o_proj.create_weights()
+        self.attn.update_quant_config(self.quant_config)
 
     def forward(
         self,
