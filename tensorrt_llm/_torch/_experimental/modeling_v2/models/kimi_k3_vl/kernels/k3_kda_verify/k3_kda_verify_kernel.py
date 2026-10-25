@@ -29,15 +29,15 @@ After the wait (this step's fused projection rows [q | k | v | onorm gate | f_a 
 f_b:          g[t, c] = bf16(sum_i f_a[t, i] W_fb[128 h + c, i]), rounded as the unfused bf16 GEMV output is.
 Pre-compute:  warp t = verify token t: q, k = l2norm(silu(conv4(u))) (q also scaled), the lower-bound gate, beta and
               this CTA's 16 v channels.
-Recurrence:   the arithmetic of ``kda_mtp_decode``'s V-split path over the verify tokens, unrolled; the state after
+Recurrence:   sequential FP32 packed-FMA delta-rule updates over the verify tokens, unrolled; the state after
               token 0 (the golden token) is committed to the pool; token t >= 1 leaves its draft's records (vn,
               beta * k, decay) in ``state_tok[slot]``.
 Epilogue:     the gated RMSNorm of the outputs over V (per-token sums of squares stored into every peer's shared
               memory, one cluster barrier), bf16 output rows; CTA 0 rewrites the q/k conv cache (the window at the
               golden token and the raw inputs of the drafts), every CTA the same for its v channels.
 
-With FOLD_FB False the gate comes from ``g_ext`` (the unfused f_b output); the kernel is then bit-exact against
-``kda_mtp_decode`` fed the same gate and replaying the same accepted drafts.
+With FOLD_FB False the gate comes from ``g_ext`` (the unfused f_b output). The state agrees numerically with
+``kda_mtp_decode``'s chunked 3xTF32 recurrence, whose tensor-core products and accumulation order differ.
 """
 
 from __future__ import annotations

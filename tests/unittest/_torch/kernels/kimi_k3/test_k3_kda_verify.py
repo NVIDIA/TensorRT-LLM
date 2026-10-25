@@ -27,11 +27,11 @@ Two references, run over the same schedule of rounds from the same initial pools
   S <- S d + beta (v - (S d) k) k^T, o = S q, the gated RMSNorm.
 
 Checks per round: the outputs of every request against both references (fp32 tolerance), the committed pool state
-(after each golden token) against the history, the conv caches against main's (raw inputs: bit-exact); with the gate
-taken from the unfused f_b output (``g_ext``) the pool state against main's bit for bit. The drafts' records in
-``state_tok`` are checked through the next round, which starts from the accepted ones. Also: requests isolated, the
-schedule twice bit-identical, CUDA-graph replays with rewritten inputs, the slots and the pending counts given as
-slices of longer index tensors at any element offset.
+(after each golden token) against the history and main's chunked 3xTF32 recurrence; the conv caches against main's
+(raw inputs: bit-exact). The sequential FP32 and chunked tensor-core state updates have different rounding order.
+The drafts' records in ``state_tok`` are checked through the next round, which starts from the accepted ones.
+Also: requests isolated, each schedule twice bit-identical, CUDA-graph replays with rewritten inputs, the slots
+and the pending counts given as slices of longer index tensors at any element offset.
 
   pytest test_k3_kda_verify.py
   python3 test_k3_kda_verify.py report | time
@@ -59,6 +59,7 @@ TOL_OUT = 2e-2  # bf16 outputs; main rounds the core to bf16 before its norm
 # fp32 states against the fp32 history: approximate exp / rcp in the kernels, and the bf16 f_b gate (one bf16 ulp
 # moves a decay by up to ~1 %; main's kda_mtp_decode measures 2.05e-4 at 6x8)
 TOL_STATE = 1e-3
+TOL_STATE_MAIN = 1e-5
 
 SPLITS = [(r, t) for t in (8, 4, 2) for r in range(1, 9)]
 
@@ -275,7 +276,9 @@ def rel(a: torch.Tensor, b: torch.Tensor) -> float:
     return ((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-6)).item()
 
 
-def run_schedule(num_requests, steps, fold=True, layout="dense", seed=0, rounds=ROUNDS):
+def run_schedule(
+    num_requests, steps, fold=True, layout="dense", seed=0, rounds=ROUNDS, states=None
+):
     """Main's path, k3_kda_verify and the fp32 history over ``rounds`` rounds; per-round metrics."""
     _ops()
     num_spec = steps - 1
@@ -300,20 +303,22 @@ def run_schedule(num_requests, steps, fold=True, layout="dense", seed=0, rounds=
         r["main_vs_fp32"] = rel(out_main, out_ref)
         # The pool state after the golden token (state_tok holds the drafts' compact records, which the next round's
         # outputs check against the history).
-        st_err, main_st_err, st_bits = 0.0, 0.0, True
+        st_err, main_st_err, st_main_err = 0.0, 0.0, 0.0
         for n, s in enumerate(slots.tolist()):
             states, _ = ref.last[n]
             st_err = max(st_err, rel(k3.p["state"][s], states[0]))
             main_st_err = max(main_st_err, rel(main.p["state"][s], states[0]))
-            st_bits &= torch.equal(k3.p["state"][s], main.p["state"][s])
+            st_main_err = max(st_main_err, rel(k3.p["state"][s], main.p["state"][s]))
         r["state_vs_fp32"] = st_err
         r["main_state_vs_fp32"] = main_st_err
-        r["state_bits_vs_main"] = st_bits
+        r["state_vs_main"] = st_main_err
         r["conv_bits_vs_main"] = all(
             torch.equal(k3.p[c], main.p[c]) for c in ("cs_q", "cs_k", "cs_v")
         )
         rows.append(r)
         outs.append(out_k3.clone())
+        if states is not None:
+            states.append(k3.p["state"].clone())
         nxt = pending_schedule(num_requests, num_spec, rnd)
         pending_req.copy_(torch.tensor(nxt, dtype=torch.int32))
         k3.p["pending"][slots.long()] = pending_req
@@ -324,8 +329,8 @@ def run_schedule(num_requests, steps, fold=True, layout="dense", seed=0, rounds=
 def round_ok(r, fold: bool) -> bool:
     ok = (r["out_vs_main"] <= TOL_OUT and r["out_vs_fp32"] <= TOL_OUT and r["state_vs_fp32"] <= TOL_STATE
           and r["conv_bits_vs_main"])  # fmt: skip
-    if not fold:  # the same gate as main's: the recurrence's arithmetic is kda_mtp_decode's
-        ok &= r["state_bits_vs_main"]
+    if not fold:
+        ok &= r["state_vs_main"] <= TOL_STATE_MAIN and r["main_state_vs_fp32"] <= TOL_STATE
     return ok
 
 
@@ -342,11 +347,22 @@ def test_split(num_requests, steps):
 @pytest.mark.parametrize("num_requests,steps", [(1, 8), (3, 4), (8, 8), (8, 2)])
 @pytest.mark.parametrize("layout", ["dense", "strided"])
 def test_g_ext(num_requests, steps, layout):
-    """The gate from the unfused f_b output (main's bf16 F.linear): the pool state bit-exact against main's."""
+    """An unfused gate matches main numerically and repeats bit-identically on the same implementation."""
+    states, states2 = [], []
     with torch.inference_mode():
-        rows, _ = run_schedule(num_requests, steps, fold=False, layout=layout, seed=1)
+        rows, outs = run_schedule(
+            num_requests, steps, fold=False, layout=layout, seed=1, states=states
+        )
+        again, outs2 = run_schedule(
+            num_requests, steps, fold=False, layout=layout, seed=1, states=states2
+        )
     for r in rows:
         assert round_ok(r, False), r
+    assert rows == again, "the repeated g_ext state and cache metrics differ"
+    assert all(torch.equal(a, b) for a, b in zip(outs, outs2)), "the repeated g_ext outputs differ"
+    assert all(torch.equal(a, b) for a, b in zip(states, states2)), (
+        "the repeated g_ext states differ"
+    )
 
 
 @pytest.mark.parametrize("num_requests,steps", [(4, 8), (8, 4)])
@@ -490,8 +506,8 @@ def report() -> int:
     with torch.inference_mode():
         print(f"{torch.cuda.get_device_name()}; kda_mtp_decode: {main_kda_variant()}")
         print("| split | mode | layout | rounds | k3 vs main | k3 vs fp32 | main vs fp32 | state vs fp32 "
-              "| main state vs fp32 | state bits = main | conv bits = main | deterministic | result |")  # fmt: skip
-        print("| :-- | :-- | :-- | --: | --: | --: | --: | --: | --: | :-- | :-- | :-- | :-- |")
+              "| main state vs fp32 | state vs main | conv bits = main | deterministic | result |")  # fmt: skip
+        print("| :-- | :-- | :-- | --: | --: | --: | --: | --: | --: | --: | :-- | :-- | :-- |")
         ok_all = True
         cases = [(r, t, True, "dense") for r, t in SPLITS]
         cases += [
@@ -514,7 +530,7 @@ def report() -> int:
                   f"{max(x['out_vs_main'] for x in rows):.2e} | {max(x['out_vs_fp32'] for x in rows):.2e} | "
                   f"{max(x['main_vs_fp32'] for x in rows):.2e} | {max(x['state_vs_fp32'] for x in rows):.2e} | "
                   f"{max(x['main_state_vs_fp32'] for x in rows):.2e} | "
-                  f"{all(x['state_bits_vs_main'] for x in rows)} | {all(x['conv_bits_vs_main'] for x in rows)} | "
+                  f"{max(x['state_vs_main'] for x in rows):.2e} | {all(x['conv_bits_vs_main'] for x in rows)} | "
                   f"{det} | {'PASS' if ok else 'FAIL'} |", flush=True)  # fmt: skip
     print("ALL PASS" if ok_all else "FAIL")
     return 0 if ok_all else 1

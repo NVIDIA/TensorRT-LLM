@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Chunked KDA (Kimi Delta Attention) prefill, reading and writing each sequence's recurrent state in place."""
+"""Packed raw-input KDA prefill with indexed resident recurrent state."""
 
 from typing import Optional
 
@@ -13,59 +13,56 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 class KdaPrefill(OpWrapper):
     """Run the gated delta rule over each sequence from `state_pool[state_indices[b]]`; return `o`.
 
-    The final state of sequence b is written back to `state_pool[state_indices[b]]` (fp32, V-first
-    `[slots, H, V, K]`). Returns a new `o` shaped like `v`.
+    The final state of sequence b is written back to `state_pool[state_indices[b]]` (BF16 or FP32,
+    V-first `[slots, H, V, K]`). Q/K normalization and gate/beta activation are fused. Returns new `o`.
     """
 
     ARCHS = frozenset({Arch.SM_100})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(
-                why=f"TP{96 // heads} ragged varlen with {cu_dtype}, scattered padded pool slots",
+                why=f"TP{96 // heads} ragged packed prefill with {state_dtype} padded state rows",
                 spec=dict(
                     heads=heads,
                     seq_lens=(100, 64, 300, 37),
                     slots=(7, 2, 10, 4),
                     fresh=(True, False, True, False),
-                    cu_dtype=cu_dtype,
-                    batch_rows=1,
+                    state_dtype=state_dtype,
                 ),
             )
-            for heads, cu_dtype in ((6, torch.int64), (24, torch.int64), (6, torch.int32))
+            for heads, state_dtype in ((6, torch.float32), (24, torch.float32), (6, torch.bfloat16))
         ),
         Cell(
-            why="two equal-length 256-token sequences without cumulative sequence metadata",
+            why="equal-length packed sequences, including an empty continuation",
             spec=dict(
                 heads=6,
-                seq_lens=(256, 256),
-                slots=(1, 9),
-                fresh=(True, True),
-                cu_dtype=torch.int64,
-                batch_rows=2,
+                seq_lens=(256, 0, 256),
+                slots=(1, 7, 9),
+                fresh=(True, False, True),
+                state_dtype=torch.float32,
             ),
         ),
     )
     note = """
-    Caller-owned fp32 V-first recurrent pool, possibly padded between slots.
-    Only state_indices rows are written; fresh rows must be zeroed by the
-    caller. Continuation chunks must run in order on the same slot. The tests
-    compare 256 + 256 against 512 tokens and a swapped-order negative control.
-    Returned outputs are newly allocated and later calls leave them untouched.
-    The runner caches compiled kernels and intermediate scratch process-wide,
-    not in a caller-owned object.
+    Raw contiguous BF16 q/k/v/g use packed [1,T,H,128] storage; beta contains
+    BF16 logits. Mandatory int64 cu_seqlens partitions the packed tokens and
+    int32 state_indices names unique resident BF16/FP32 V-first pool rows.
+    The caller zeroes fresh rows; continuation calls reuse the same slot in
+    order. A_log and dt_bias are contiguous FP32. Kimi K3 uses scale=128**-0.5
+    and lower_bound=-5. Q/K normalization and gate/beta activation run inside
+    the prefill kernel; projections, convolution and output norm do not.
 
-    cu_seqlens, chunk_indices and state_indices plus varlen_is_aligned and
-    single_sequence_length are caller-built batch metadata. A single varlen
-    sequence is caller-padded to a 64-token multiple while cu_seqlens retains
-    its real length. q/k are L2-normalized bf16; v/g are bf16, beta/A_log/dt_bias
-    fp32, K=V=128. Kimi K3 uses scale=128**-0.5, safe_gate=True, lower_bound=-5,
-    gate and beta activation enabled and int64 cumulative metadata.
-    Projections, convolution, q/k normalization and gated output norm are not
-    fused. The layer sends four or more chunks here and smaller batches to
-    chunk_kda; bf16 pools are staged through dense fp32 rows here.
-    CuTe DSL and FlashInfer are required for registration, and SM 10.x for
-    execution. The bf16 chunked evaluation carries fp32 state; tests use bands
-    of 2e-2 for outputs and 1e-2 for states against the recurrence.
+    mode selects auto, bt16, small-bh, engine or decomp. max_seqlen is zero
+    or an upper bound on each sequence length. Optional seq_order and cu_chunks
+    are a stable descending length permutation and prefix sums of ceil(L/16)
+    in request order; both must be refreshed when lengths change. These
+    scheduling arguments do not change the reference recurrence.
+
+    Only selected state rows are written; slot padding and unselected rows
+    remain unchanged. Every output is newly allocated. The tests compare
+    packed ragged and empty sequences, both resident state dtypes, ordered
+    continuation and preplanned metadata against the FP32 recurrence, with
+    output/state bands of 2e-2/1e-2. CuTe DSL and SM100 are required.
     """
 
     def __call__(
@@ -77,18 +74,15 @@ class KdaPrefill(OpWrapper):
         beta: torch.Tensor,
         state_pool: torch.Tensor,
         state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         scale: float,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        chunk_indices: Optional[torch.Tensor] = None,
-        chunk_size: int = 64,
-        safe_gate: bool = False,
-        lower_bound: Optional[float] = None,
-        use_gate_in_kernel: bool = False,
-        use_beta_sigmoid_in_kernel: bool = True,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-        varlen_is_aligned: Optional[bool] = None,
-        single_sequence_length: Optional[int] = None,
+        lower_bound: float,
+        mode: str = "auto",
+        max_seqlen: int = 0,
+        seq_order: Optional[torch.Tensor] = None,
+        cu_chunks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return torch.ops.trtllm.kda_prefill(
             q,
@@ -98,18 +92,15 @@ class KdaPrefill(OpWrapper):
             beta,
             state_pool,
             state_indices,
-            scale,
             cu_seqlens,
-            chunk_indices,
-            chunk_size,
-            safe_gate,
-            lower_bound,
-            use_gate_in_kernel,
-            use_beta_sigmoid_in_kernel,
             A_log,
             dt_bias,
-            varlen_is_aligned,
-            single_sequence_length,
+            scale,
+            lower_bound,
+            mode,
+            max_seqlen,
+            seq_order,
+            cu_chunks,
         )
 
     def reference(
@@ -121,36 +112,25 @@ class KdaPrefill(OpWrapper):
         beta: torch.Tensor,
         state_pool: torch.Tensor,
         state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         scale: float,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        chunk_indices: Optional[torch.Tensor] = None,
-        chunk_size: int = 64,
-        safe_gate: bool = False,
-        lower_bound: Optional[float] = None,
-        use_gate_in_kernel: bool = False,
-        use_beta_sigmoid_in_kernel: bool = True,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-        varlen_is_aligned: Optional[bool] = None,
-        single_sequence_length: Optional[int] = None,
+        lower_bound: float,
+        mode: str = "auto",
+        max_seqlen: int = 0,
+        seq_order: Optional[torch.Tensor] = None,
+        cu_chunks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qf, kf, vf = q.float() * scale, k.float(), v.float()
-        gate = g.float()
-        if dt_bias is not None:
-            gate = gate + dt_bias.float().reshape(q.shape[-2:])
+        qf = torch.nn.functional.normalize(q.float(), dim=-1, eps=1e-12) * scale
+        kf = torch.nn.functional.normalize(k.float(), dim=-1, eps=1e-12)
+        vf = v.float()
+        gate = g.float() + dt_bias.float().reshape(q.shape[-2:])
         rate = A_log.float().exp().reshape(-1, 1)
-        gate = (
-            (-5.0 if lower_bound is None else lower_bound) * torch.sigmoid(rate * gate)
-            if safe_gate
-            else -rate * torch.nn.functional.softplus(gate)
-        )
-        decay = gate.exp()
-        bf = beta.float().sigmoid() if use_beta_sigmoid_in_kernel else beta.float()
-        if cu_seqlens is None:
-            spans = [(row, 0, q.shape[1]) for row in range(q.shape[0])]
-        else:
-            starts = cu_seqlens.tolist()
-            spans = [(0, lo, hi) for lo, hi in zip(starts, starts[1:])]
+        decay = (lower_bound * torch.sigmoid(rate * gate)).exp()
+        bf = beta.float().sigmoid()
+        starts = cu_seqlens.tolist()
+        spans = [(0, lo, hi) for lo, hi in zip(starts, starts[1:])]
         out = torch.zeros_like(v, dtype=torch.float32)
         for slot, (row, lo, hi) in zip(state_indices.tolist(), spans):
             state = state_pool[slot].float()
@@ -174,32 +154,37 @@ class KdaPrefill(OpWrapper):
         beta: torch.Tensor,
         state_pool: torch.Tensor,
         state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         scale: float,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        chunk_indices: Optional[torch.Tensor] = None,
-        chunk_size: int = 64,
-        safe_gate: bool = False,
-        lower_bound: Optional[float] = None,
-        use_gate_in_kernel: bool = False,
-        use_beta_sigmoid_in_kernel: bool = True,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-        varlen_is_aligned: Optional[bool] = None,
-        single_sequence_length: Optional[int] = None,
+        lower_bound: float,
+        mode: str = "auto",
+        max_seqlen: int = 0,
+        seq_order: Optional[torch.Tensor] = None,
+        cu_chunks: Optional[torch.Tensor] = None,
     ) -> None:
-        assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, (
-            "KDA prefill kernels require K == V == 128"
+        starts = cu_seqlens.tolist()
+        lengths = [hi - lo for lo, hi in zip(starts, starts[1:])]
+        assert starts[0] == 0 and starts[-1] == q.shape[1] and min(lengths) >= 0, (
+            "cu_seqlens must monotonically partition the packed tokens"
         )
-        assert all(
-            tensor is None or tensor.device == q.device
-            for tensor in (k, g, beta, A_log, dt_bias, cu_seqlens, chunk_indices)
-        ), "all prefill inputs must share q's device"
-        if cu_seqlens is not None and cu_seqlens.numel() == 2:
-            length = int(cu_seqlens[-1])
-            if q.shape[1] > length:
-                assert all(
-                    not bool(tensor[:, length:].count_nonzero()) for tensor in (q, k, v, beta)
-                ), "single-sequence padding of q/k/v/beta must be zero"
+        slots = state_indices.tolist()
+        assert len(slots) == len(lengths) and len(set(slots)) == len(slots), (
+            "state_indices must name one unique slot per sequence"
+        )
+        assert all(0 <= slot < state_pool.shape[0] for slot in slots), "state slot out of range"
+        assert max_seqlen == 0 or max(lengths) <= max_seqlen, (
+            "max_seqlen is below a sequence length"
+        )
+        if seq_order is not None:
+            assert seq_order.tolist() == sorted(range(len(lengths)), key=lambda i: -lengths[i]), (
+                "seq_order must be the stable descending sequence-length permutation"
+            )
+            chunks = [0]
+            for length in lengths:
+                chunks.append(chunks[-1] + (length + 15) // 16)
+            assert cu_chunks.tolist() == chunks, "cu_chunks must prefix-sum ceil(length / 16)"
 
 
 kda_prefill = KdaPrefill()

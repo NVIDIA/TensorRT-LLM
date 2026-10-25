@@ -188,6 +188,20 @@ manager's bf16 convolution pools and independent per-slot strides directly;
 standalone fp32 convolution pools remain supported. Pool views are never
 copied or cast on the call path.
 
+KDA prefill takes raw packed BF16 Q/K/V, gate and beta logits with mandatory
+int64 sequence offsets, FP32 gate parameters and indexed BF16/FP32 state rows.
+Normalization and gate/beta activation run inside the shared prefill op; the
+model-owned wrapper uses its current 16-argument contract, including optional
+sequence-order and chunk-prefix metadata.
+
+KDA verify's sequential FP32 FMA recurrence and main's chunked 3xTF32
+tensor-core recurrence agree numerically, not bit-for-bit. With the same
+external gate, 48 SM100 rounds across dense and strided pools measured maximum
+state divergence of 6.31e-6 relative to the largest reference-state entry.
+The cross-implementation gate is 1e-5; the existing 2e-2 output and 1e-3
+FP64-reference state bands remain unchanged. Repeated same-implementation
+states and outputs, convolution caches and graph replay remain bit-exact.
+
 MLA launch admission queries the launch stream's owning context resources,
 including converted green contexts, without querying stream execution during
 graph capture. Invalid resources still reject the launch. Wide MoE states use

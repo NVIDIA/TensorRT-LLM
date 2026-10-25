@@ -52,9 +52,9 @@ class ChunkKda(OpWrapper):
     avoid retaining backward activations. Training/context-parallel arguments,
     intermediate states, allow_neg_eigval and chunk_size are not exposed.
     Kernels autotune once per process: repeated calls are bit-identical within
-    one process, but choices can differ between processes. Kimi K3 therefore
-    stages bf16 pools through fp32 rows in kda_prefill rather than falling back
-    here. Chunked bf16 arithmetic carries fp32 state; the test's comparison
+    one process, but choices can differ between processes. The indexed
+    kda_prefill path accepts resident BF16/FP32 pools directly and normalizes
+    its raw Q/K inputs internally. This path carries FP32 state; comparison
     bands are 2e-2 for outputs and 1e-2 for final states.
     """
 

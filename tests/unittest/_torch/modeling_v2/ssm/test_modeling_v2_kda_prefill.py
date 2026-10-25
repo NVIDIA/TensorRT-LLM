@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the kda_prefill catalog entry."""
 
+import math
 import zlib
 from typing import List
 
@@ -12,7 +13,6 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_prefill import (
     kda_prefill,
 )
-from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
 
 __extra_import_path__ = [".."]
 from _validating import validating
@@ -35,30 +35,35 @@ class _Inputs:
         heads: int,
         seq_lens: List[int],
         seed: int,
-        batch_rows: int = 1,
-        cu_dtype: torch.dtype = torch.int64,
+        state_dtype: torch.dtype = torch.float32,
     ) -> None:
         gen = torch.Generator(device="cuda").manual_seed(seed)
         self.heads = heads
         self.seq_lens = seq_lens
-        tokens = sum(seq_lens) if batch_rows == 1 else seq_lens[0]
-        for name, t in kr.kimi_k3_inputs(heads, tokens, gen, batch_rows).items():
-            setattr(self, name, t)
-        # V-first fp32 state rows in a pool with a padded slot stride.
+        tokens = sum(seq_lens)
+        shape = (1, tokens, heads, HEAD_DIM)
+        for name in ("q", "k", "v", "g"):
+            setattr(self, name, torch.randn(*shape, generator=gen, device="cuda").bfloat16())
+        self.beta = torch.randn(1, tokens, heads, generator=gen, device="cuda").bfloat16()
+        self.A_log = torch.log(torch.empty(heads, device="cuda").uniform_(1, 16, generator=gen))
+        self.dt_bias = torch.empty(heads * HEAD_DIM, device="cuda").uniform_(
+            math.log(1e-3), math.log(1e-1), generator=gen
+        )
         slot = heads * HEAD_DIM * HEAD_DIM
-        storage = torch.randn(NUM_SLOTS, slot + SLOT_PAD, generator=gen, device="cuda") * 0.1
+        storage = (torch.randn(NUM_SLOTS, slot + SLOT_PAD, generator=gen, device="cuda") * 0.1).to(
+            state_dtype
+        )
         self.storage = storage
         self.pool = storage[:, :slot].view(NUM_SLOTS, heads, HEAD_DIM, HEAD_DIM)
-        self.cu_seqlens = kr.cu_seqlens_of(seq_lens, cu_dtype) if batch_rows == 1 else None
+        self.cu_seqlens = kr.cu_seqlens_of(seq_lens)
 
-    def call(self, slots: List[int], fresh: List[bool], reference=False, pool=None):
+    def call(self, slots: List[int], fresh: List[bool], reference=False, pool=None, **options):
         """Zero the fresh sequences' rows (the layer's job) and run the op as Kimi K3's layer does; return o."""
         state_pool = self.pool if pool is None else pool
         for s, is_fresh in zip(slots, fresh):
             if is_fresh:
                 state_pool[s].zero_()
         state_indices = torch.tensor(slots, dtype=torch.int32, device="cuda")
-        varlen = self.cu_seqlens is not None
         call = kda_prefill.reference if reference else kda_prefill
         return call(
             self.q,
@@ -68,19 +73,12 @@ class _Inputs:
             self.beta,
             state_pool,
             state_indices,
+            self.cu_seqlens,
+            self.A_log,
+            self.dt_bias,
             SCALE,
-            cu_seqlens=self.cu_seqlens,
-            chunk_indices=prepare_chunk_indices(self.cu_seqlens, CHUNK) if varlen else None,
-            chunk_size=CHUNK,
-            safe_gate=True,
-            lower_bound=LOWER_BOUND,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            # The host metadata Kimi K3's layer prepares once per batch.
-            varlen_is_aligned=all(n % CHUNK == 0 for n in self.seq_lens) if varlen else None,
-            single_sequence_length=self.seq_lens[0] if varlen and len(self.seq_lens) == 1 else None,
+            LOWER_BOUND,
+            **options,
         )
 
 
@@ -91,17 +89,14 @@ def _assert_state_close(got: torch.Tensor, ref: torch.Tensor) -> None:
 
 @pytest.mark.parametrize("cell", kda_prefill.CELLS, ids=[c.why[:40] for c in kda_prefill.CELLS])
 def test_kimi_k3_varlen_prefill(cell) -> None:
-    # Kimi K3's prefill call at its TP16 rank slice (6 heads) and TP4 (24): a varlen batch of fresh
-    # sequences and continuations (chunked prefill / a reused prefix, which start from the slot's
-    # state), sequence lengths not chunk multiples, scattered slots of a padded pool. The layer's
-    # cu_seqlens are int64; the op takes int32 as well.
+    # Kimi K3's TP16 and TP4 packed raw inputs, fresh and continuing resident state,
+    # ragged and empty sequences, scattered slots and both supported state dtypes.
     spec = cell.spec
     inp = _Inputs(
         spec["heads"],
         spec["seq_lens"],
         zlib.crc32(cell.why.encode()) % 2**31,
-        batch_rows=spec["batch_rows"],
-        cu_dtype=spec["cu_dtype"],
+        state_dtype=spec["state_dtype"],
     )
     slots, fresh = spec["slots"], spec["fresh"]
     before = inp.storage.clone()
@@ -112,8 +107,9 @@ def test_kimi_k3_varlen_prefill(cell) -> None:
     assert o.shape == inp.v.shape and o.dtype == inp.v.dtype
     start = 0
     for seq, (length, slot) in enumerate(zip(inp.seq_lens, slots)):
-        where = (0, slice(start, start + length)) if spec["batch_rows"] == 1 else (seq,)
-        kr.assert_scaled_close(o[where], ref_o[where], atol=2e-2)
+        if length:
+            where = (0, slice(start, start + length))
+            kr.assert_scaled_close(o[where], ref_o[where], atol=2e-2)
         _assert_state_close(inp.pool[slot], ref_pool[slot])
         start += length
     untouched = [s for s in range(NUM_SLOTS) if s not in slots]
@@ -164,9 +160,9 @@ def test_continuation_equals_one_call() -> None:
 
 
 def test_equal_length_batch() -> None:
-    # Two equal-length sequences without cu_seqlens: q / k / v are [2, T, H, K].
+    # Two equal-length sequences share one packed token dimension and explicit offsets.
     heads = 6
-    inp = _Inputs(heads, [256], seed=3, batch_rows=2)
+    inp = _Inputs(heads, [256, 256], seed=3)
     slots = [1, 9]
     ref_pool = inp.pool.clone()
     ref_o = inp.call(slots, [True, True], reference=True, pool=ref_pool)
@@ -174,7 +170,8 @@ def test_equal_length_batch() -> None:
         o = inp.call(slots, [True, True])
     assert o.shape == inp.v.shape
     for row, slot in enumerate(slots):
-        kr.assert_scaled_close(o[row], ref_o[row], atol=2e-2)
+        sl = slice(row * 256, (row + 1) * 256)
+        kr.assert_scaled_close(o[0, sl], ref_o[0, sl], atol=2e-2)
         _assert_state_close(inp.pool[slot], ref_pool[slot])
 
 
@@ -194,56 +191,81 @@ def test_output_is_a_new_tensor() -> None:
 def test_rejects_out_of_contract() -> None:
     inp = _Inputs(6, [256], seed=4)
     good_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
-    bf16_pool = inp.pool.to(torch.bfloat16)
     narrow = torch.zeros(4, 6 * HEAD_DIM * HEAD_DIM + 1, device="cuda")[:, 1:].view(
         4, 6, HEAD_DIM, HEAD_DIM
     )
-    bad = {
-        "bf16 pool": (bf16_pool, good_indices),
-        "wrong head count": (inp.pool[:, :5], good_indices),
-        "misaligned pool": (narrow, good_indices),
-        "two indices for one sequence": (
-            inp.pool,
-            torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
-        ),
-        "float indices": (inp.pool, good_indices.float()),
-    }
-    for name, (pool, indices) in bad.items():
-        try:
-            kda_prefill(
-                inp.q,
-                inp.k,
-                inp.v,
-                inp.g,
-                inp.beta,
-                pool,
-                indices,
-                SCALE,
-                cu_seqlens=inp.cu_seqlens,
-                chunk_indices=prepare_chunk_indices(inp.cu_seqlens, CHUNK),
-                safe_gate=True,
-                lower_bound=LOWER_BOUND,
-                use_gate_in_kernel=True,
-                A_log=inp.A_log,
-                dt_bias=inp.dt_bias,
-            )
-        except ValueError:
-            continue
-        raise AssertionError(f"{name}: the op accepted an out-of-contract call")
+    args = dict(
+        q=inp.q,
+        k=inp.k,
+        v=inp.v,
+        g=inp.g,
+        beta=inp.beta,
+        state_pool=inp.pool,
+        state_indices=good_indices,
+        cu_seqlens=inp.cu_seqlens,
+        A_log=inp.A_log,
+        dt_bias=inp.dt_bias,
+        scale=SCALE,
+        lower_bound=LOWER_BOUND,
+    )
+    bad = (
+        dict(state_pool=inp.pool[:, :5]),
+        dict(state_pool=narrow),
+        dict(state_indices=torch.tensor([0, 1], dtype=torch.int32, device="cuda")),
+        dict(state_indices=good_indices.float()),
+        dict(cu_seqlens=inp.cu_seqlens.int()),
+        dict(beta=inp.beta.float()),
+        dict(q=inp.q.view(2, 128, 6, HEAD_DIM)),
+        dict(seq_order=good_indices),
+    )
+    for overrides in bad:
+        with pytest.raises(ValueError):
+            kda_prefill(**(args | overrides))
 
 
-@pytest.mark.parametrize("bad", ("head_dim", "device", "padding"))
+@pytest.mark.parametrize("bad", ("offsets", "slots", "slot_range", "max_seqlen", "order", "chunks"))
 def test_guard_refuses_silent_wrong_inputs(bad) -> None:
-    inp = _Inputs(6, [256], seed=9)
-    if bad == "head_dim":
-        inp.q = inp.q[..., :64].contiguous()
-        match = "K == V == 128"
-    elif bad == "device":
-        inp.g = inp.g.cpu()
-        match = "share q's device"
+    inp = _Inputs(6, [37, 100], seed=9)
+    slots = [0, 1]
+    options = {}
+    if bad == "offsets":
+        inp.cu_seqlens = kr.cu_seqlens_of([37, 99])
+        match = "partition the packed tokens"
+    elif bad == "slots":
+        slots = [0, 0]
+        match = "unique slot"
+    elif bad == "slot_range":
+        slots = [0, NUM_SLOTS]
+        match = "out of range"
+    elif bad == "max_seqlen":
+        options["max_seqlen"] = 99
+        match = "below a sequence length"
     else:
-        inp.cu_seqlens = kr.cu_seqlens_of([255])
-        inp.seq_lens = [255]
-        match = "padding of q/k/v/beta must be zero"
+        options["seq_order"] = torch.tensor(
+            [0, 1] if bad == "order" else [1, 0], dtype=torch.int32, device="cuda"
+        )
+        options["cu_chunks"] = torch.tensor(
+            [0, 3, 9 if bad == "chunks" else 10], dtype=torch.int32, device="cuda"
+        )
+        match = "descending" if bad == "order" else "prefix-sum"
     with pytest.raises(AssertionError, match=match), validating(kda_prefill):
-        inp.call([0], [True])
+        inp.call(slots, [False, False], **options)
+
+
+def test_preplanned_metadata_matches_automatic() -> None:
+    inp = _Inputs(6, [37, 100, 64], seed=10)
+    slots = [7, 2, 9]
+    planned_pool = inp.pool.clone()
+    automatic = inp.call(slots, [False] * 3, mode="bt16")
+    with validating(kda_prefill):
+        planned = inp.call(
+            slots,
+            [False] * 3,
+            pool=planned_pool,
+            mode="bt16",
+            max_seqlen=100,
+            seq_order=torch.tensor([1, 2, 0], dtype=torch.int32, device="cuda"),
+            cu_chunks=torch.tensor([0, 3, 10, 14], dtype=torch.int32, device="cuda"),
+        )
+    kr.assert_scaled_close(planned, automatic, atol=2e-2)
+    _assert_state_close(planned_pool, inp.pool)
