@@ -266,7 +266,6 @@ def test_compact_stop_words_storage_and_finish_precedence() -> None:
         tokens[0, 2, 0] = token
         handler.write_finish_reasons(
             seq_slots_host=slots.cpu(),
-            is_draft_batch=False,
             seq_slots_cuda=slots,
             seq_lens_cuda=torch.tensor([seq_len], device="cuda"),
             new_tokens_cuda=tokens,
