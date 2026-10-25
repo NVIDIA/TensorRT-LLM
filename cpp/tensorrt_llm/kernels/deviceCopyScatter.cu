@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/minimaxM3/stepInputsScatter.h"
+#include "tensorrt_llm/kernels/deviceCopyScatter.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -37,7 +37,7 @@ __device__ __forceinline__ void copyBytes(uint8_t* dst, uint8_t const* src, int6
 
 // One CTA: the batches this serves are a step's few hundred bytes of metadata, where a single launch is the point and
 // the copy itself is negligible.
-__global__ void __launch_bounds__(kThreads) stepInputsScatterKernel(uint8_t const* __restrict__ stage)
+__global__ void __launch_bounds__(kThreads) deviceCopyScatterKernel(uint8_t const* __restrict__ stage)
 {
     auto const* header = reinterpret_cast<int64_t const*>(stage);
     int64_t const numHostCopies = header[0];
@@ -59,9 +59,9 @@ __global__ void __launch_bounds__(kThreads) stepInputsScatterKernel(uint8_t cons
 
 } // namespace
 
-void invokeStepInputsScatter(uint8_t const* stage, cudaStream_t stream)
+void invokeDeviceCopyScatter(uint8_t const* stage, cudaStream_t stream)
 {
-    stepInputsScatterKernel<<<1, kThreads, 0, stream>>>(stage);
+    deviceCopyScatterKernel<<<1, kThreads, 0, stream>>>(stage);
 }
 
 } // namespace kernels

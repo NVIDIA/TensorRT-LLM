@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/minimaxM3/stepInputsScatter.h"
+#include "tensorrt_llm/kernels/deviceCopyScatter.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -28,17 +28,17 @@ namespace torch_ext
 
 //! Issue a batch of packed host-to-device and device-to-device copies in one launch.
 //!
-//! @param stage Contiguous uint8 CUDA tensor laid out as described in kernels/minimaxM3/stepInputsScatter.h. Its
+//! @param stage Contiguous uint8 CUDA tensor laid out as described in kernels/deviceCopyScatter.h. Its
 //! destinations are raw device addresses: the caller guarantees each one is live and that no other work on the stream
 //! writes it between staging and this call.
-void stepInputsScatter(torch::Tensor const& stage)
+void deviceCopyScatter(torch::Tensor const& stage)
 {
-    TORCH_CHECK(stage.is_cuda(), "step_inputs_scatter expects a CUDA staging buffer");
-    TORCH_CHECK(stage.scalar_type() == torch::kUInt8, "step_inputs_scatter expects a uint8 staging buffer");
-    TORCH_CHECK(stage.is_contiguous(), "step_inputs_scatter expects a contiguous staging buffer");
-    TORCH_CHECK(stage.numel() >= 16, "step_inputs_scatter staging buffer is shorter than its header");
+    TORCH_CHECK(stage.is_cuda(), "device_copy_scatter expects a CUDA staging buffer");
+    TORCH_CHECK(stage.scalar_type() == torch::kUInt8, "device_copy_scatter expects a uint8 staging buffer");
+    TORCH_CHECK(stage.is_contiguous(), "device_copy_scatter expects a contiguous staging buffer");
+    TORCH_CHECK(stage.numel() >= 16, "device_copy_scatter staging buffer is shorter than its header");
     c10::cuda::CUDAGuard const deviceGuard{stage.device()};
-    tensorrt_llm::kernels::invokeStepInputsScatter(
+    tensorrt_llm::kernels::invokeDeviceCopyScatter(
         stage.data_ptr<uint8_t>(), at::cuda::getCurrentCUDAStream(stage.get_device()));
 }
 
@@ -48,10 +48,10 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("step_inputs_scatter(Tensor stage) -> ()");
+    m.def("device_copy_scatter(Tensor stage) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("step_inputs_scatter", &tensorrt_llm::torch_ext::stepInputsScatter);
+    m.impl("device_copy_scatter", &tensorrt_llm::torch_ext::deviceCopyScatter);
 }
