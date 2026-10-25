@@ -109,5 +109,12 @@ class Backend(ABC):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        required_tools: tuple[str, ...] = (),
     ) -> AsyncIterator[BackendClient]:
+        """Open a session.
+
+        ``required_tools`` are the role's deliverable tools
+        (``AgentLayerConfig.required_tools``); a backend may use them to tell
+        a finished role from one still waiting on background work.
+        """
         yield
