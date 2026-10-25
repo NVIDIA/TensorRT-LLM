@@ -39,7 +39,19 @@ def __getattr__(name):
         # ``from tensorrt_llm.serve import <submodule>`` falls back to the
         # import system.
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(importlib.import_module(module_name), name)
+    try:
+        module = importlib.import_module(module_name)
+    except AttributeError as e:
+        # An AttributeError escaping the module is a bug inside it, not a
+        # missing name here. Raised as is, hasattr() and getattr() with a
+        # default would hide it, and ``from ... import`` would run the
+        # module twice and lose the cause.
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing "
+            f"{module_name} raised {e!r}",
+            name=__name__,
+        ) from e
+    value = getattr(module, name)
     globals()[name] = value  # cache: subsequent access skips __getattr__
     return value
 
