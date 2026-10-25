@@ -117,6 +117,18 @@ def supports_indexer() -> bool:
     return supported() and hasattr(deep_gemm, "compile_only_paged_mqa_logits")
 
 
+def dsa_indexer_built_ahead() -> bool:
+    """Whether DeepGEMM helpers build the DSA indexer's kernels
+    (``DsaIndexerProvider``), so warmup can skip its paged-MQA-logits
+    metadata sweep: compile ahead is on, this DeepGEMM has the indexer's
+    compile-only entries, and the helpers are running. Without them (they did
+    not start, or all exited during warmup) the sweep compiles those kernels
+    as without compile ahead."""
+    from .jit_prefetch import warmup_jit_coverage_enabled
+
+    return not warmup_jit_coverage_enabled() and supports_indexer() and helpers_running
+
+
 def target() -> Tuple[int, int, int, int, int]:
     """(arch_major, arch_minor, num_sms, smem_optin_bytes, l2_bytes) the
     helper must compile for (``DJ_COMPILE_TARGET``).

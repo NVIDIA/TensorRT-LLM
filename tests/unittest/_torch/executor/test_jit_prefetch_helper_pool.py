@@ -291,6 +291,42 @@ def test_swap_ab_tuning_pass_runs_without_deep_gemm_helpers(monkeypatch, running
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("running", [True, False])
+def test_dsa_metadata_sweep_runs_without_deep_gemm_helpers(monkeypatch, running):
+    """With compile ahead on, warmup skips the DSA indexer's paged-MQA-logits
+    metadata sweep only while DeepGEMM helpers build those kernels; without
+    them the sweep compiles them as without compile ahead, and
+    TLLM_WARMUP_JIT_COVERAGE=1 keeps it either way."""
+    from tensorrt_llm._torch import jit_prefetch_deep_gemm as jdg
+
+    for var in _SWITCHES:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
+    monkeypatch.setattr(jdg, "supports_indexer", lambda: True)
+    monkeypatch.setattr(jdg, "helpers_running", running)
+    assert jdg.dsa_indexer_built_ahead() is running
+    monkeypatch.setenv("TLLM_WARMUP_JIT_COVERAGE", "1")
+    assert jdg.dsa_indexer_built_ahead() is False
+
+
+@pytest.mark.cpu_only
+def test_prefetch_helpers_running_follows_the_live_helpers(prefetcher, monkeypatch):
+    """A warmup pass skipped for a kind of helper sees whether one of that
+    kind is still alive in this process's prefetcher."""
+    assert not jp.prefetch_helpers_running("triton")  # no prefetcher yet
+    monkeypatch.setattr(jp.JitPrefetcher, "_instance", prefetcher)
+    monkeypatch.setattr(
+        prefetcher, "_procs_by_kind", {"triton": [SimpleNamespace(pid=11), SimpleNamespace(pid=12)]}
+    )
+    assert jp.prefetch_helpers_running("triton")
+    assert not jp.prefetch_helpers_running("deep_gemm")
+    prefetcher._exited.add(11)
+    assert jp.prefetch_helpers_running("triton")
+    prefetcher._exited.add(12)
+    assert not jp.prefetch_helpers_running("triton")
+
+
+@pytest.mark.cpu_only
 def test_process_compiles_are_reported_at_most_once_a_second(prefetcher, monkeypatch):
     """Serving forwards report the DeepGEMM kernels compiled in this process
     since the last report, at most once a second."""

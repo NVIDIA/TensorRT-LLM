@@ -746,9 +746,8 @@ class DecoderWarmup:
         if not isinstance(attn_meta, DSAtrtllmAttentionMetadata):
             return
         from tensorrt_llm._torch import jit_prefetch_deep_gemm as jdg
-        from tensorrt_llm._torch.jit_prefetch import warmup_jit_coverage_enabled
 
-        if not warmup_jit_coverage_enabled() and jdg.supports_indexer():
+        if jdg.dsa_indexer_built_ahead():
             # JIT compile ahead builds this kernel's variants (one per next_n
             # on SM100, where it has no batch-size template parameter) in
             # CPU-only helpers; see jit_prefetch_deep_gemm.DsaIndexerProvider.
@@ -1430,8 +1429,9 @@ class DecoderWarmup:
 
         With JIT tune ahead on (``TLLM_JIT_TUNE_AHEAD``), the autotune
         benchmark of (2)'s keys runs at the end of warmup instead, so (2) is
-        skipped and (1) runs. Otherwise, with JIT compile ahead on, its helpers
-        compile (1)'s variants, so only (2) runs, to autotune on the GPU.
+        skipped and (1) runs. Otherwise, with JIT compile ahead on and its
+        Triton helpers running on every rank, they compile (1)'s variants, so
+        only (2) runs, to autotune on the GPU.
 
         Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
         the autotuner is enabled so op-level (M,N,K) caches also get primed
@@ -1442,7 +1442,11 @@ class DecoderWarmup:
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if kv_cache_manager is None or not isinstance(kv_cache_manager, MambaHybridCacheManager):
             return
-        from tensorrt_llm._torch.jit_prefetch import tune_ahead_enabled, warmup_jit_coverage_enabled
+        from tensorrt_llm._torch.jit_prefetch import (
+            prefetch_helpers_running,
+            tune_ahead_enabled,
+            warmup_jit_coverage_enabled,
+        )
 
         jit_coverage = warmup_jit_coverage_enabled()
         # With tune ahead on, the autotune benchmark of the HAS_INITSTATES
@@ -1467,6 +1471,13 @@ class DecoderWarmup:
         # would unbalance the per-shape agreement inside it.
         if not self._agreement.agree_flag(curr_max_num_tokens >= 4):
             return
+        # JIT compile ahead's Triton helpers build the variants of the
+        # multi-sequence pass and of the chunk alignment below. A rank whose
+        # helpers are not running would compile them while serving, so then
+        # the whole group primes them here, as without compile ahead.
+        compiled_ahead = not jit_coverage and self._agreement.agree_flag(
+            prefetch_helpers_running("triton")
+        )
 
         # Cap the multi-seq warmup token count so we don't fill the KV cache
         # to the brim. The autotuner warmup that ran just before this uses
@@ -1496,7 +1507,7 @@ class DecoderWarmup:
         # Resolved the same way the runtime does, so warmup can't prime the
         # alignment variant of a class the runtime never instantiates.
         metadata_cls = resolve_mamba_metadata_cls(self.model)
-        chunk_alignment = metadata_cls.prefill_chunk_alignment if jit_coverage else None
+        chunk_alignment = None if compiled_ahead else metadata_cls.prefill_chunk_alignment
 
         # (num_tokens, num_gen_requests, least_requests, force_initstates,
         #  chunk_aligned)
@@ -1513,7 +1524,7 @@ class DecoderWarmup:
             # cached prefixes, tuned by the autotuner pass's forward, else
             # here, as without tune ahead.
             mamba_warmup_shapes = mamba_warmup_shapes[:1]
-        elif not jit_coverage:
+        elif compiled_ahead:
             # JIT compile ahead compiles the multi-sequence variants the first
             # pass exists for. The HAS_INITSTATES pass stays: its kernels are
             # autotuned on new keys (initial states, chunk indices), and that

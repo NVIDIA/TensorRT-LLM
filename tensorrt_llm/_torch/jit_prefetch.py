@@ -235,6 +235,14 @@ def warmup_jit_coverage_enabled() -> bool:
     return not prefetch_enabled()
 
 
+def prefetch_helpers_running(kind: str) -> bool:
+    """Whether this process's JIT prefetcher has a live helper of ``kind``
+    ("triton", "deep_gemm", "cute_dsl"). A warmup pass that is skipped because
+    those helpers build its kernels runs as without compile ahead otherwise."""
+    prefetcher = JitPrefetcher.get()
+    return prefetcher is not None and prefetcher._helpers_alive(kind)
+
+
 def disagg_context_only() -> bool:
     """Whether this process is a disaggregated context (prefill) worker, set
     by the disaggregated server for its executor ranks (``TRTLLM_DISAGG_ROLE``).

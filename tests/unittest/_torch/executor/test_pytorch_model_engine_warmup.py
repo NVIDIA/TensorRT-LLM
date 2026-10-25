@@ -995,6 +995,51 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     )
 
 
+@pytest.mark.parametrize("helpers_running", [True, False])
+def test_mamba_warmup_primes_the_multi_seq_pass_without_compile_ahead_helpers(
+    helpers_running: bool, monkeypatch
+) -> None:
+    """With JIT compile ahead on (tune ahead off), the Mamba hybrid warmup
+    drops its multi-sequence pass only while Triton helpers build its
+    variants; without them it runs both passes, as without compile ahead."""
+    import tensorrt_llm._torch.jit_prefetch as jit_prefetch
+
+    engine, resource_manager = _build_engine_and_resource_manager()
+    runner = engine._runner
+    kv_cache_manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+    for var in ("TLLM_JIT_PREFETCH", "TLLM_WARMUP_JIT_COVERAGE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
+    monkeypatch.setenv("TLLM_JIT_TUNE_AHEAD", "0")
+    monkeypatch.setattr(jit_prefetch, "prefetch_helpers_running", lambda kind: helpers_running)
+    create = Mock(return_value=ScheduledRequests())
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(runner._dummy_requests, "create_warmup_request", create))
+        stack.enter_context(
+            patch.object(
+                runner._dummy_requests,
+                "release_batch_context",
+                side_effect=lambda request, resources: contextlib.nullcontext(request),
+            )
+        )
+        stack.enter_context(patch.object(runner._warmup, "_forward_warmup", Mock()))
+        stack.enter_context(
+            patch.object(decoder_warmup_module, "MambaHybridCacheManager", type(kv_cache_manager))
+        )
+        stack.enter_context(
+            patch.object(kv_cache_manager, "get_num_available_tokens", return_value=8)
+        )
+        stack.enter_context(
+            patch.object(
+                runner._warmup, "_config", replace(runner._warmup._config, enable_autotuner=False)
+            )
+        )
+        runner._warmup._run_mamba_hybrid_warmup(resource_manager)
+    # The multi-sequence pass is the one without chunk alignment.
+    passes = [c.kwargs["chunk_aligned"] for c in create.call_args_list]
+    assert passes == ([True] if helpers_running else [False, True])
+
+
 class _Tracker:
     """Records method-call order (and each call's arguments) via mock side_effects."""
 
