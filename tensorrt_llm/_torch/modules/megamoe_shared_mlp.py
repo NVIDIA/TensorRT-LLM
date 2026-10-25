@@ -136,6 +136,7 @@ class MegaMoESharedMLP(GatedMLP):
         if self._fc12_max_tokens <= 0:
             raise ValueError("Shared FC12 max_num_tokens must be positive")
         self._fc12_source_state: tuple[tuple[int, int, int | None], ...] | None = None
+        self._fc12_sm_count: int | None = None
         for name in ("fc1_weight", "fc1_weight_sf", "fc2_weight", "fc2_weight_sf"):
             self.register_buffer(f"_fc12_{name}", None, persistent=False)
 
@@ -220,6 +221,7 @@ class MegaMoESharedMLP(GatedMLP):
         self._fc12_fc1_weight_sf = packed_fc1_sf
         self._fc12_fc2_weight = fc2.unsqueeze(0)
         self._fc12_fc2_weight_sf = fc2_sf.unsqueeze(0)
+        self._fc12_sm_count = self.sm_count
         self._fc12_source_state = source_state
 
     def forward(
@@ -252,6 +254,6 @@ class MegaMoESharedMLP(GatedMLP):
             self._fc12_fc2_weight,
             self._fc12_fc2_weight_sf,
             swiglu_limit=self.swiglu_limit,
-            sm_count=self.sm_count,
+            sm_count=self._fc12_sm_count,
             max_tokens=self._fc12_max_tokens,
         )

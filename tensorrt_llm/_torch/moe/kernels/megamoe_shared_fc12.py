@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Single-expert use of MegaMoE's complete fused FC1/activation/FC2 kernel."""
 
+import weakref
 from itertools import product
 from threading import Condition, RLock
 
@@ -164,6 +165,7 @@ class _SharedFc12Runner:
         self._cuda_stream = cuda.CUstream(stream_handle)
         # A slice supplies the current E=1 token count without a per-call GPU write.
         self.token_counts = torch.arange(max_tokens + 1, dtype=torch.int32, device=device)
+        self._token_count_views: dict[int, torch.Tensor] = {}
 
         token_rows = cute.sym_int64(divisibility=1)
         scale_rows = cute.sym_int64(divisibility=128)
@@ -230,6 +232,11 @@ class _SharedFc12Runner:
         fc2_weight_sf: torch.Tensor,
     ) -> torch.Tensor:
         token_rows = activation.shape[0]
+        token_count = self._token_count_views.get(token_rows)
+        if token_count is None:
+            token_count = self._token_count_views[token_rows] = self.token_counts[
+                token_rows : token_rows + 1
+            ]
         quantized, scales = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0.sm_budget(
             activation, reserved_sms=self.reserved_sms
         )
@@ -252,14 +259,14 @@ class _SharedFc12Runner:
             fc2_output=output,
             local_workspace=self.workspace_pointer,
             stream=self.stream_handle,
-            expert_token_sizes=self.token_counts[token_rows : token_rows + 1],
+            expert_token_sizes=token_count,
             expert_token_prefix_sum=None,
             topk_scores=None,
             fc1_alpha=None,
             fc2_alpha=None,
             fc1_norm_const=None,
         )
-        return output[:, 0, :]
+        return output.view(token_rows, self.hidden_size)
 
 
 _SHARED_FC12_CACHE_LOCK = RLock()
@@ -409,19 +416,23 @@ class SharedFc12TunableRunner(TunableRunner):
             swiglu_limit,
             stream_handle,
         )
-        self._unique_id = (
-            _CATALOG_VERSION,
-            device_index,
-            properties.major,
-            properties.minor,
-            properties.multi_processor_count,
-            sm_count,
-            hidden_size,
-            intermediate_size,
-            max_tokens,
-            swiglu_limit,
-            "K128_input_K32_intermediate_R128c4_gateup16",
-            input_signature,
+        # The AutoTuner keys its cache by str(unique_id()) on every dispatch,
+        # so build that string once.
+        self._unique_id = str(
+            (
+                _CATALOG_VERSION,
+                device_index,
+                properties.major,
+                properties.minor,
+                properties.multi_processor_count,
+                sm_count,
+                hidden_size,
+                intermediate_size,
+                max_tokens,
+                swiglu_limit,
+                "K128_input_K32_intermediate_R128c4_gateup16",
+                input_signature,
+            )
         )
         self.buckets = _token_buckets(max_tokens)
         self.tuning_config = TuningConfig(
@@ -571,6 +582,64 @@ def release_shared_fc12_cache(device_index: int, stream_handle: int | None = Non
         _end_shared_fc12_release(device_index, stream_key)
 
 
+# Validated weight layouts by the identity of the four weight tensors. A
+# layer's weights stay fixed between loads, so each set is checked once.
+_WEIGHT_LAYOUTS: dict[tuple[int, int, int, int], tuple] = {}
+
+
+def _weight_layout(weights: tuple, hidden_size: int) -> tuple[int, torch.device, tuple]:
+    """Validate FC12 weights once per weight set.
+
+    Returns the intermediate size, the weights' device, and the input
+    signature of a contiguous BF16 ``[T, hidden_size]`` activation with them.
+    """
+    key = (id(weights[0]), id(weights[1]), id(weights[2]), id(weights[3]))
+    entry = _WEIGHT_LAYOUTS.get(key)
+    if entry is not None:
+        refs, layout_hidden_size, intermediate_size, device, signature = entry
+        if (
+            layout_hidden_size == hidden_size
+            and refs[0]() is weights[0]
+            and refs[1]() is weights[1]
+            and refs[2]() is weights[2]
+            and refs[3]() is weights[3]
+        ):
+            return intermediate_size, device, signature
+    fc1_weight, fc1_weight_sf, fc2_weight, fc2_weight_sf = weights
+    if fc2_weight.ndim != 3 or fc2_weight.shape[:2] != (1, hidden_size):
+        raise ValueError("shared FC12 weight must have shape [1, H, I]")
+    intermediate_size = fc2_weight.shape[2]
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError("shared FC12 hidden and intermediate dimensions must be multiples of 128")
+    if fc1_weight.shape != (1, 2 * intermediate_size, hidden_size):
+        raise ValueError("shared FC1 weight must have shape [1, 2*I, H]")
+    for weight in (fc1_weight, fc2_weight):
+        if weight.dtype != torch.float8_e4m3fn or not weight.is_contiguous():
+            raise ValueError("shared FC12 weights must be contiguous E4M3 tensors")
+    for scale in (fc1_weight_sf, fc2_weight_sf):
+        if scale.dtype != torch.uint8 or not scale.is_contiguous():
+            raise ValueError("shared FC12 scales must be contiguous uint8 tensors")
+    device = fc1_weight.device
+    if any(t.device != device for t in weights):
+        raise ValueError("shared FC12 inputs and weights must be on the same CUDA device")
+    signature = (
+        (str(torch.bfloat16), (None, hidden_size), (hidden_size, 1)),
+        *((str(t.dtype), tuple(t.shape), tuple(t.stride())) for t in weights),
+    )
+    with _SHARED_FC12_CACHE_LOCK:
+        stale = [k for k, e in _WEIGHT_LAYOUTS.items() if any(ref() is None for ref in e[0])]
+        for k in stale:
+            del _WEIGHT_LAYOUTS[k]
+        _WEIGHT_LAYOUTS[key] = (
+            tuple(weakref.ref(t) for t in weights),
+            hidden_size,
+            intermediate_size,
+            device,
+            signature,
+        )
+    return intermediate_size, device, signature
+
+
 def run_shared_fc12(
     activation: torch.Tensor,
     fc1_weight: torch.Tensor,
@@ -594,51 +663,36 @@ def run_shared_fc12(
         raise ValueError("shared FC12 requires CUDA BF16 activations")
     if activation.ndim != 2 or not activation.is_contiguous():
         raise ValueError("shared FC12 requires contiguous [T, H] activations")
-    if max_tokens <= 0 or activation.shape[0] > max_tokens:
+    tokens, hidden_size = activation.shape
+    if max_tokens <= 0 or tokens > max_tokens:
         raise ValueError("shared FC12 token count exceeds its configured capacity")
-    hidden_size = activation.shape[1]
-    if fc2_weight.ndim != 3 or fc2_weight.shape[:2] != (1, hidden_size):
-        raise ValueError("shared FC12 weight must have shape [1, H, I]")
-    intermediate_size = fc2_weight.shape[2]
-    if hidden_size % 128 or intermediate_size % 128:
-        raise ValueError("shared FC12 hidden and intermediate dimensions must be multiples of 128")
-    if fc1_weight.shape != (1, 2 * intermediate_size, hidden_size):
-        raise ValueError("shared FC1 weight must have shape [1, 2*I, H]")
-    for weight in (fc1_weight, fc2_weight):
-        if weight.dtype != torch.float8_e4m3fn or not weight.is_contiguous():
-            raise ValueError("shared FC12 weights must be contiguous E4M3 tensors")
-    for scale in (fc1_weight_sf, fc2_weight_sf):
-        if scale.dtype != torch.uint8 or not scale.is_contiguous():
-            raise ValueError("shared FC12 scales must be contiguous uint8 tensors")
-    if any(
-        t.device != activation.device
-        for t in (fc1_weight, fc1_weight_sf, fc2_weight, fc2_weight_sf)
-    ):
+    weights = (fc1_weight, fc1_weight_sf, fc2_weight, fc2_weight_sf)
+    intermediate_size, device, input_signature = _weight_layout(weights, hidden_size)
+    if activation.device != device:
         raise ValueError("shared FC12 inputs and weights must be on the same CUDA device")
-    if activation.shape[0] == 0:
+    if tokens == 0:
         return torch.empty_like(activation)
-    stream = torch.cuda.current_stream(activation.device)
-    inputs = [activation, fc1_weight, fc1_weight_sf, fc2_weight, fc2_weight_sf]
-    input_signature = tuple(
-        (str(t.dtype), (None, hidden_size) if index == 0 else tuple(t.shape), tuple(t.stride()))
-        for index, t in enumerate(inputs)
-    )
+    device_index = device.index
+    stream_handle = torch._C._cuda_getCurrentRawStream(device_index)
+    inputs = [activation, *weights]
     runner_key = (
-        activation.device.index,
+        device_index,
         hidden_size,
         intermediate_size,
         max_tokens,
         sm_count,
         swiglu_limit,
-        stream.cuda_stream,
+        stream_handle,
         input_signature,
     )
-    active_key = _begin_shared_fc12_call(activation.device.index, stream.cuda_stream)
+    active_key = _begin_shared_fc12_call(device_index, stream_handle)
     try:
-        with _SHARED_FC12_CACHE_LOCK, torch.cuda.device(activation.device):
-            runner = _tunable_runners.get(runner_key)
-            if runner is None:
-                runner = _tunable_runners[runner_key] = SharedFc12TunableRunner(*runner_key)
+        runner = _tunable_runners.get(runner_key)
+        if runner is None:
+            with _SHARED_FC12_CACHE_LOCK, torch.cuda.device(device_index):
+                runner = _tunable_runners.get(runner_key)
+                if runner is None:
+                    runner = _tunable_runners[runner_key] = SharedFc12TunableRunner(*runner_key)
         tuner = AutoTuner.get()
         selected_runner, tactic = tuner.choose_one(
             _SHARED_FC12_OP, [runner], runner.tuning_config, inputs
