@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -398,9 +399,13 @@ class KDAReplayState:
         *,
         stochastic_rounding: bool = False,
         draft_records: bool = False,
+        commit_pending_drafts: Callable[..., None] | None = None,
     ) -> None:
         self._stochastic_rounding = stochastic_rounding
         self.draft_records = draft_records
+        # A model whose verify keeps the drafts' records in its own layout commits them itself
+        # (commit_kda_pending_drafts' signature).
+        self._commit_pending_drafts = commit_pending_drafts
         self.pool_layers: list[dict[str, torch.Tensor]] | None = None
         self.num_speculative_tokens = num_speculative_tokens
         self.suspended_requests: set[int] = set()
@@ -783,6 +788,7 @@ class KDAReplayState:
         """Fold accepted drafts and the replay conv window into the persistent states."""
         from ._kda_kernels import commit_kda_pending_drafts
 
+        commit = self._commit_pending_drafts or commit_kda_pending_drafts
         assert self.prev_num_accepted_tokens is not None
         slots = torch.full(
             (1,), slot, dtype=torch.int32, device=self.prev_num_accepted_tokens.device
@@ -790,7 +796,7 @@ class KDAReplayState:
         num_accepted = self.prev_num_accepted_tokens.index_select(0, slots)
         for layer, (ssm_states, conv_states) in enumerate(zip(self._ssm_states, self._conv_states)):
             replay = self._layer_cache_fields(layer)
-            commit_kda_pending_drafts(
+            commit(
                 ssm_states,
                 conv_states,
                 replay["kda_conv_q"],
