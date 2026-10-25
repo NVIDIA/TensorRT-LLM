@@ -166,6 +166,10 @@ class BaseToolParser(ABC):
 
         results = []
         for act in action:
+            # A JSON array whose elements are not objects (e.g. a plain
+            # answer such as `["a", "b"]`) holds no tool call.
+            if not isinstance(act, dict):
+                continue
             name = act.get("name")
             if name:
                 if name not in tool_indices:

@@ -1,7 +1,11 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/qwen25_detector.py
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import json
 import re
 from typing import List
+
+from partial_json_parser.core.options import Allow
 
 from tensorrt_llm.logger import logger
 
@@ -9,6 +13,7 @@ from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .base_tool_parser import BaseToolParser
 from .core_types import (StreamingParseResult, StructureInfo, ToolCallItem,
                          _GetInfoFunc)
+from .utils import partial_json_loads
 
 
 class Qwen3ToolParser(BaseToolParser):
@@ -85,9 +90,11 @@ class Qwen3ToolParser(BaseToolParser):
             # tool call — `json.loads` would raise `Extra data` and drop the
             # entire text into normal_text (see NVBug 6240584 review).
             stripped = text.strip()
+            # `ValueError` also covers integers longer than Python's
+            # int-to-str digit limit, which `JSONDecodeError` does not.
             try:
                 parsed, _end = json.JSONDecoder().raw_decode(stripped)
-            except json.JSONDecodeError:
+            except ValueError:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
             if isinstance(parsed, (dict, list)):
                 calls = self.parse_base_json(parsed, tools)
@@ -105,7 +112,7 @@ class Qwen3ToolParser(BaseToolParser):
             try:
                 parsed_call = json.loads(match_result.strip())
                 calls.extend(self.parse_base_json(parsed_call, tools))
-            except json.JSONDecodeError as e:
+            except ValueError as e:
                 logger.warning(
                     f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}"
                 )
@@ -175,9 +182,16 @@ class Qwen3ToolParser(BaseToolParser):
         # follow-up review).
         try:
             parsed, _end = json.JSONDecoder().raw_decode(stripped)
-        except json.JSONDecodeError:
-            # Not yet complete — buffer more.
-            return StreamingParseResult()
+        except ValueError:
+            if self._may_become_json(stripped):
+                # Not yet complete — buffer more.
+                return StreamingParseResult()
+            # No continuation can make this valid JSON (e.g. "[Note] ..."),
+            # so it is plain text: flush it through the wrapped path.
+            self._stream_mode = self._STREAM_MODE_WRAPPED
+            replay = accumulated
+            self._bare_json_buffer = ""
+            return self._wrapped_streaming(replay, tools)
 
         if isinstance(parsed, (dict, list)):
             calls = self.parse_base_json(parsed, tools)
@@ -224,6 +238,32 @@ class Qwen3ToolParser(BaseToolParser):
         replay = accumulated
         self._bare_json_buffer = ""
         return self._wrapped_streaming(replay, tools)
+
+    @staticmethod
+    def _may_become_json(text: str) -> bool:
+        """Return whether `text` is a prefix of some valid JSON value."""
+        try:
+            partial_json_loads(text, Allow.ALL)
+        except (ValueError, IndexError):
+            return False
+        return True
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush text still held while deciding whether it was bare JSON.
+
+        A stream that ends inside a `{` or `[` prefix that never became a
+        complete JSON value (for example, output cut off by `max_tokens`)
+        leaves that text in the undecided buffer. It is model content, so
+        return it as normal text.
+        """
+        if self._stream_mode != self._STREAM_MODE_UNDECIDED:
+            return super().finish(tools)
+        remaining = self._bare_json_buffer
+        self._bare_json_buffer = ""
+        self._stream_mode = self._STREAM_MODE_WRAPPED
+        if not remaining:
+            return StreamingParseResult()
+        return StreamingParseResult(normal_text=remaining)
 
     def _wrapped_streaming(self, new_text: str,
                            tools: List[Tool]) -> StreamingParseResult:
