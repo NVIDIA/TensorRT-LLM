@@ -462,8 +462,9 @@ class HeldPages:
     share counts once per cache, so the counts are upper bounds.
 
     Attributes:
-        deduct: Pages admission subtracts from capacity: those ``DEFERRED_CLOSE`` holds, including
-            pages the manager may also count against live requests.
+        deduct: Pages ``DEFERRED_CLOSE`` holds, including pages the manager may also count against
+            live requests. They stay with the cache they belong to, already outside its free pages,
+            so admission does not subtract them again.
         unreclaimable: Pages no reclaim frees, ``LOCKED`` and ``DEFERRED_CLOSE`` together: keep
             them, the largest generation resume window and its next step within
             ``max_util_for_resume``.
@@ -631,9 +632,10 @@ class Lender(Protocol):
         ...
 
     def held_page_counts(self) -> HeldPages:
-        """Pages lending holds, per local pool group (``HeldPages``); use them separately on each
-        rank and pipeline stage. The value stays the same, ``version`` included, while no count
-        changes, also after the manager's shutdown."""
+        """Pages lending holds on this rank and pipeline stage, per local pool group (``HeldPages``).
+        Compare them across ranks and stages to find holds that differ; admission takes only
+        ``unreclaimable`` into account, as room recovery needs. The value stays the same,
+        ``version`` included, while no count changes, also after the manager's shutdown."""
         ...
 
     def hold_regions(self) -> RegionHold:

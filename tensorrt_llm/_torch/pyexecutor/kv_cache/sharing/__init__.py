@@ -123,11 +123,14 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
           or an unlisted exception, stop lending, progress, lease polling and bounds queries; return
           leases and release holds after access ends, treat parked fetch intervals as empty, drop
           their caches and compute from zero.
-        - Subtract ``held_page_counts().deduct`` from admission capacity, separately per rank and
-          stage. Fetches can hold device pages while waiting for host slots; keep
-          ``held_page_counts().unreclaimable`` pages, the largest generation resume window and its
-          next step within each pool group's ``max_util_for_resume``. A parked-fetch quota alone
-          is insufficient.
+        - Do not subtract ``held_page_counts().deduct`` from a V2 manager's admission capacity: a
+          ``DEFERRED_CLOSE`` page stays with the cache it belongs to and is already outside the
+          free pages, so subtracting it counts it twice. Fetches can hold device pages while
+          waiting for host slots; keep ``held_page_counts().unreclaimable`` pages, the largest
+          generation resume window and its next step within each pool group's
+          ``max_util_for_resume``. A parked-fetch quota alone is insufficient. Use
+          ``held_page_counts`` per pool group only to check that ranks and pipeline stages hold
+          alike, and warn where they do not.
         - Use per-item ``multi_modal_uuids`` to distinguish processor-dependent inputs. Digests trust
           input-pipeline bytes, like prefix reuse, and omit differences such as NumPy/Tensor rescaling
           or ``mm_processor_kwargs``. ``cache_salt`` separates names but not encoder embeddings:
