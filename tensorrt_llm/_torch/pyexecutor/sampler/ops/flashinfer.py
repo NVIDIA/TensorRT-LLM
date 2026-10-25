@@ -312,7 +312,11 @@ def top_p_renorm_probs_op(
         overridden = _TOP_P_RENORM_OVERRIDE(probs, top_p)
         if overridden is not None:
             return overridden
-    renormed: torch.Tensor = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    # Deterministic: every TP rank runs this sampler on its own and must get bit-identical probs (the default
+    # mode aggregates with order-dependent float atomics, so near-threshold accept/sample decisions can differ).
+    renormed: torch.Tensor = flashinfer.sampling.top_p_renorm_probs(
+        probs, top_p, is_deterministic=True
+    )
     return renormed
 
 
@@ -344,7 +348,7 @@ def compute_probs_from_logits_op(
         probs = (
             overridden
             if overridden is not None
-            else flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+            else flashinfer.sampling.top_p_renorm_probs(probs, top_p, is_deterministic=True)
         )
     return probs
 
