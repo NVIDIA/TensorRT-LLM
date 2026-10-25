@@ -724,7 +724,6 @@ class CompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             if backend == "pytorch" or gather_generation_logits:
                 sampling_logprobs = self.logprobs
@@ -732,8 +731,6 @@ class CompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             best_of=self.best_of,
@@ -777,8 +774,6 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -1257,7 +1252,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
             if backend == "pytorch" or gather_generation_logits:
@@ -1266,8 +1260,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`gather_generation_logits` must be `True` to use `top_logprobs`"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -1311,8 +1303,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 

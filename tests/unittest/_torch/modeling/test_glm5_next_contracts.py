@@ -337,6 +337,26 @@ def test_mtp_rejects_unsupported_attention_dp_lm_head_sharding():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("model_config", "separate"),
+    [
+        (_config(), False),
+        (_config().text_config, False),
+        (PretrainedConfig(model_type="deepseek_v3", num_nextn_predict_layers=1), True),
+    ],
+    ids=["glm5_next", "glm5_next_text", "deepseek_v3"],
+)
+def test_mtp_draft_layers_share_the_target_kv_cache(model_config, separate):
+    from tensorrt_llm._torch.speculative import update_spec_config_from_model_config
+    from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+    update_spec_config_from_model_config(spec_config, model_config)
+    assert should_use_separate_draft_kv_cache(spec_config) is separate
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("model_type", ["glm5_next", "glm5_next_text"])
 def test_model_type_recognition_does_not_hide_missing_schedule(model_type):
     config = SimpleNamespace(model_type=model_type, num_hidden_layers=1)
@@ -523,7 +543,7 @@ def test_checkpoint_lazy_scalar_materialization(tmp_path) -> None:
 
 
 @pytest.mark.cpu_only
-def test_nvfp4_moe_loader_collects_local_expert_tensors() -> None:
+def test_nvfp4_moe_loader_collects_expert_tensors() -> None:
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -531,6 +551,7 @@ def test_nvfp4_moe_loader_collects_local_expert_tensors() -> None:
     owner.mlp = torch.nn.Module()
     owner.mlp.experts = experts = torch.nn.Module()
     # This EP rank owns experts 0 and 2 of 4.
+    experts.num_experts = 4
     experts.initial_local_expert_ids = [0, 2]
     experts.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     experts.load_weights = Mock()
@@ -546,20 +567,23 @@ def test_nvfp4_moe_loader_collects_local_expert_tensors() -> None:
     Glm5NextForCausalLM._fill_module(None, owner, 3, prefix, entries, weights, torch.device("cpu"))
     (loaded,), _ = experts.load_weights.call_args
     proj_to_w = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+    # Weights come from local experts only; input_scale comes from every
+    # expert so each rank reduces the same layer-wide activation scale.
     expected = {
         f"{expert}.{proj_to_w[proj]}.{label}": weights[
             f"{prefix}mlp.experts.{expert}.{proj}.{label}"
         ]
-        for expert in (0, 2)
+        for expert in range(4)
         for proj in proj_to_w
         for label in labels
+        if expert in (0, 2) or label == "input_scale"
     }
     assert loaded == [expected]
 
     # A missing expert tensor fails with the collected and expected counts.
-    del weights[f"{prefix}mlp.experts.2.down_proj.input_scale"]
+    del weights[f"{prefix}mlp.experts.1.down_proj.input_scale"]
     entries = [(key, key) for key in weights]
-    with pytest.raises(ValueError, match="collected 23 expert tensors, expected 24"):
+    with pytest.raises(ValueError, match="collected 29 expert tensors, expected 30"):
         Glm5NextForCausalLM._fill_module(
             None, owner, 3, prefix, entries, weights, torch.device("cpu")
         )

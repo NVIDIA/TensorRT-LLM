@@ -1276,6 +1276,7 @@ def _resolve_decode_launch_spec(
 
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
+        arch_config_args,
         get_max_active_clusters_for_cluster_size,
         make_decode_config,
         make_q_tile_geometry,
@@ -1287,6 +1288,7 @@ def _resolve_decode_launch_spec(
     k_dtype = _cutlass_dtype(k_dtype_key)
     v_dtype = _cutlass_dtype(v_dtype_key)
     output_dtype = _cutlass_dtype(output_dtype_key)
+    arch_args = arch_config_args(torch.cuda.get_device_capability(device_index))
 
     def make_config(
         args: object | None = None,
@@ -1298,7 +1300,7 @@ def _resolve_decode_launch_spec(
     ) -> "FmhaDecodeConfig":
         return make_decode_config(
             headdim=head_dim,
-            args=args,
+            args=(arch_args, args),
             seq_len_q=seq_len_q,
             seq_len_kv=max_kv_len,
             batch_size=batch_size,

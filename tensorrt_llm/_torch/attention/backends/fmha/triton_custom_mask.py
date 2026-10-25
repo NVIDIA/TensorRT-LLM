@@ -128,12 +128,13 @@ class TritonCustomMaskFmha(PhasedFmha):
         if q.dtype not in self.SUPPORTED_DTYPES:
             return False, f"Input dtype {q.dtype} is not supported."
         output = forward_args.output
-        if output is None or output.dtype != q.dtype:
-            return False, "Custom-mask Triton attention requires output to match the input dtype."
+        if output is None or output.dtype not in (q.dtype, torch.float8_e4m3fn):
+            return False, "Custom-mask Triton attention requires matching or FP8 output dtype."
         if forward_args.output_sf is not None:
             return False, "Custom-mask Triton attention does not support NVFP4 output."
-        if QuantMode(self.attn.quant_mode).has_kv_cache_quant():
-            return False, "Custom-mask TRT-LLM attention does not support quantized KV cache."
+        quant_mode = QuantMode(self.attn.quant_mode)
+        if quant_mode.has_kv_cache_quant() and not quant_mode.has_fp8_kv_cache():
+            return False, "Custom-mask TRT-LLM attention only supports FP8 quantized KV cache."
         if forward_args.attention_sinks is not None:
             return False, "Custom-mask Triton attention does not support attention sinks."
         if (
@@ -330,4 +331,8 @@ class TritonCustomMaskFmha(PhasedFmha):
             custom_mask=fwd.attention_mask_data.flatten().contiguous(),
             sm_scale=bmm1_scale,
             window_left=window_left,
+            kv_scale_quant_orig=(
+                fwd.kv_scale_quant_orig if QuantMode(attn.quant_mode).has_fp8_kv_cache() else None
+            ),
+            out_scale=fwd.out_scale if params.output.dtype == torch.float8_e4m3fn else None,
         )
