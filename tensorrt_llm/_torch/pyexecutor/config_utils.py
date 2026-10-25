@@ -1121,6 +1121,13 @@ def load_pretrained_config(model_name_or_path: str,
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
+    elif model_type == "beam":
+        # Beam is not a transformers model type; its config class lives with
+        # the native model. The checkpoint directory is kept as name_or_path,
+        # as from_pretrained does, for targets that read the stored config.
+        from tensorrt_llm._torch.models.modeling_beam import BeamConfig
+        model_config = BeamConfig.from_dict(config_dict, **kwargs)
+        model_config.name_or_path = model_name_or_path
     elif model_type == "minicpmv4_6" or (
             architectures
             and architectures[0] == "MiniCPMV4_6ForConditionalGeneration"):
