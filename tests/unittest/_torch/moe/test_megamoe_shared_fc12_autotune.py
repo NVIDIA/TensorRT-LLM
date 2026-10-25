@@ -8,6 +8,7 @@ import ast
 import inspect
 import os
 import unittest
+import weakref
 from contextlib import nullcontext
 from copy import deepcopy
 from itertools import product
@@ -107,12 +108,12 @@ class CpuContractTests(unittest.TestCase):
             cuda=SimpleNamespace(
                 get_device_properties=lambda device: properties,
                 device=lambda device: nullcontext(),
-                current_stream=lambda device: SimpleNamespace(cuda_stream=17),
                 ExternalStream=external_stream,
                 synchronize=lambda device: self.device_syncs.append(device),
                 empty_cache=lambda: setattr(self, "empty_cache_calls", self.empty_cache_calls + 1),
             ),
             empty_like=lambda x: Tensor(x.shape, x.dtype),
+            _C=SimpleNamespace(_cuda_getCurrentRawStream=lambda device_index: 17),
         )
         self.ns = dict(
             torch=torch,
@@ -124,6 +125,7 @@ class CpuContractTests(unittest.TestCase):
             RLock=RLock,
             deepcopy=deepcopy,
             product=product,
+            weakref=weakref,
         )
         module = ast.parse(_SOURCE.read_text())
         module.body = [
@@ -335,6 +337,62 @@ class CpuContractTests(unittest.TestCase):
         self.assertEqual(len(self.creations), 1)
         self.assertEqual([output.shape[0] for output in outputs], [129, 200])
         self.assertEqual([tokens for _, tokens in self.launches], [129, 200])
+
+    def test_weight_layout_is_validated_once_per_weight_set(self):
+        checks = []
+
+        class CountedWeight(Tensor):
+            @property
+            def ndim(self):
+                checks.append(id(self))
+                return len(self.shape)
+
+            @ndim.setter
+            def ndim(self, value):
+                pass
+
+        self.tuner.choose_one = lambda op, runners, config, tensors: (runners[0], -1)
+        activation, fc1, fc1_sf, fc2, _ = inputs(129)
+        fc2 = CountedWeight(fc2.shape, fc2.dtype)
+        fc2_sf = Tensor((1, 688128), "uint8")
+        run = self.ns["run_shared_fc12"]
+        for tokens in (129, 200):
+            run(Tensor((tokens, 7168)), fc1, fc1_sf, fc2, fc2_sf, swiglu_limit=10.0, sm_count=72)
+        # The second call of the same weight set skips the weight checks.
+        self.assertEqual(len(checks), 1)
+        layouts = self.ns["_WEIGHT_LAYOUTS"]
+        self.assertEqual(len(layouts), 1)
+
+        # New weight tensors are validated again; entries of freed weights are pruned.
+        fc2_new = CountedWeight(fc2.shape, fc2.dtype)
+        del fc2
+        run(activation, fc1, fc1_sf, fc2_new, fc2_sf, swiglu_limit=10.0, sm_count=72)
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(len(layouts), 1)
+
+    def test_tuning_key_text_is_unchanged(self):
+        # Persisted AutoTuner caches key the runner by str(unique_id()); the prebuilt
+        # string must stay the text of the identity tuple.
+        r = self.runner()
+        self.assertEqual(
+            r.unique_id(),
+            str(
+                (
+                    self.ns["_CATALOG_VERSION"],
+                    0,
+                    10,
+                    7,
+                    80,
+                    72,
+                    7168,
+                    3072,
+                    8192,
+                    10.0,
+                    "K128_input_K32_intermediate_R128c4_gateup16",
+                    ("fixed_weight_layout",),
+                )
+            ),
+        )
 
     def test_terminal_release_drops_all_device_runner_references(self):
         first = self.runner(stream=17)
