@@ -149,6 +149,7 @@ worker_config:
     enable_chunked_prefill: true
     attention_dp_config:
       kv_cache_routing_conversation_affinity: true
+      kv_cache_routing_strict_conversation_affinity: true
     scheduler_config:
       capacity_scheduler_policy: MAX_UTILIZATION
     num_serve_frontends: 8
