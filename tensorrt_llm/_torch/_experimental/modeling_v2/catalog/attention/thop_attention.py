@@ -113,21 +113,11 @@ _FP8_24_4_256 = dict(
 class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
 
-<<<<<<< HEAD
     The shipped targets use the native phased ``AttentionOp`` through
     ``FallbackFmha.attention``: gpt-oss uses attention sinks and an alternating
     sliding window, deepseek uses MLA's two phases, and qwen4_exp uses packed
-    GQA for its full-attention and MTP layers and uncached MHA for vision.
-=======
-    The most load-bearing entry in the catalog and the only one wrapping a
-    pybind binding rather than a registered torch op. Three targets go through
-    it, by different paths: gpt-oss on the standard path with attention sinks
-    and an alternating sliding window, deepseek on MLA's two phases, and
-    qwen4_exp on the standard path twice over -- its full-attention layers and
-    MTP module (GQA 24/2/256 over a bf16 or an fp8-e4m3 pool, a P-token draft
-    block per generation sequence, a two-pool hybrid mapping), and its vision
-    tower with no KV cache at all.
->>>>>>> origin/main
+    GQA over a bf16 or an fp8-e4m3 pool for its full-attention and MTP layers
+    and uncached MHA for vision.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
