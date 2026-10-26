@@ -28,7 +28,7 @@ _QUEUE = "CUDA_SCALE_LAUNCH_QUEUES"
 _SCHEDULER_RUNTIME = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/cuda_scheduler/runtime.py"
 # The scheduler's native bound and the bound of the default 1800 s MoE
 # communication warmup timeout at the nominal 2 GHz clock.
-_SERVING_SPIN_CYCLES = 8_000_000_000
+_SERVING_SPIN_CYCLES = 300 * 2_000_000_000
 _WARMUP_SPIN_CYCLES = 1800 * 2_000_000_000
 
 
