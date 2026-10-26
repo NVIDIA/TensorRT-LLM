@@ -16,6 +16,12 @@ between calls (a CUDA graph capture stream, for example) but not within one.
 Each call therefore forks COPY from MAIN and joins it back, so the whole
 call can be captured into a CUDA graph and replayed.
 
+A native context binds the layer's buffers, COPY and the four events once,
+so each step of the sequence is one native call: ``moe_rebalance_halo_r_submit``
+(the first two lines), ``moe_rebalance_halo_r_wait_routes`` and
+``moe_rebalance_halo_r_release`` (the last two). They take an int handle of
+the context, which costs less dispatch time than the custom-class object.
+
 READY generations live on the device. The relay copy publishes the
 scheduler's epoch into this rank's READY cell on every rank, and the next
 scheduler launch of the same layer drains and zeroes the local READY row
@@ -81,17 +87,6 @@ _READY_CELL_BYTES = 8
 _READY_GENERATION = 1
 
 
-def _check_driver(result: Any, what: str) -> Any:
-    from cuda.bindings import driver
-
-    error = result[0] if isinstance(result, tuple) else result
-    if error != driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"{what} failed: {error!r}")
-    if isinstance(result, tuple) and len(result) > 1:
-        return result[1]
-    return None
-
-
 def validate_halo_r_geometry(*, ep_size: int, home_experts: int, helper_slots: int) -> None:
     """Reject geometries the HALO-R kernels cannot plan."""
     if not 2 <= ep_size <= HALO_R_MAX_EP:
@@ -139,8 +134,6 @@ class HaloRSlotSchedulerGroup:
         auxiliary_sms: int,
         layer_idx: Optional[int],
     ) -> None:
-        from cuda.bindings import driver
-
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.multirank_dist import (
             FabricSymmetricBuffer,
         )
@@ -181,6 +174,8 @@ class HaloRSlotSchedulerGroup:
         self.arena = arena
         self.plan_calls = 0
         self.symmetric = None
+        self._ctx = None
+        self._handle = 0
         self._closed = False
         self._validated_streams: set = set()
         self._call_stream_handle: Optional[int] = None
@@ -198,20 +193,10 @@ class HaloRSlotSchedulerGroup:
             raise RuntimeError("rebalance arena and scheduler must use the same EP ProcessGroup")
         arena.provider.register_producer(self)
 
-        self._driver = driver
         self._copy_handle = int(copy_stream.cuda_stream)
 
         with torch.cuda.device(self.device):
             self._allocate_buffers()
-            self._events = {
-                name: torch.cuda.Event()
-                for name in ("input_ready", "plan_ready", "consumer_done", "copy_idle")
-            }
-            # Materialize every lazily created event once; the layer path uses
-            # its cached driver handle.
-            for event in self._events.values():
-                event.record(copy_stream)
-            self._event_handles = {name: int(e.cuda_event) for name, e in self._events.items()}
 
             self.symmetric = FabricSymmetricBuffer(
                 4 * (_SYMMETRIC_HEADER_INTS + 2 * ep_size * self.experts), self.device
@@ -234,6 +219,7 @@ class HaloRSlotSchedulerGroup:
                 )
             )
             self._bind_relay_tables(arena, pool)
+            self._bind_native_context()
 
             # Zero this layer's READY row before any peer can publish into it,
             # then run epoch 1 on every rank so later epochs find a full row.
@@ -244,8 +230,10 @@ class HaloRSlotSchedulerGroup:
             stream = torch.cuda.current_stream(self.device)
             if int(stream.cuda_stream) == self._copy_handle:
                 raise RuntimeError("HALO-R warmup must not run on the COPY stream")
-            self._submit(warmup_routes, 0, int(stream.cuda_stream))
-            self._join(int(stream.cuda_stream), None)
+            torch.ops.trtllm.moe_rebalance_halo_r_submit(
+                self._handle, warmup_routes, HALO_R_SPIN_BUDGET_NS
+            )
+            torch.ops.trtllm.moe_rebalance_halo_r_release(self._handle, 0)
             torch.cuda.synchronize(self.device)
             ep_comm.barrier()
 
@@ -317,11 +305,57 @@ class HaloRSlotSchedulerGroup:
         self._ready_flags_ptr = int(bound.terminal_local_ptr)
         self._ready_flag_mc_ptr = int(bound.terminal_mc_ptr) + _READY_CELL_BYTES * self.ep_rank
 
+    def _bind_native_context(self) -> None:
+        """Bind every argument the per-layer launches share, and COPY, natively once."""
+        ctx = torch.ops.trtllm.moe_rebalance_halo_r_create(
+            self.physical_slot_ids,
+            self.hot_expert_ids,
+            self.hot_expert_source_ranks,
+            self.peer_bases,
+            self.status,
+            self.partial,
+            self.route_aux,
+            self.grid_sync,
+            self.plan_words,
+            self.route_prefix,
+            self._ready_flags_ptr,
+            self.relay_sources,
+            self.relay_destinations,
+            self.relay_plane_bytes,
+            self.relay_completed_ctas,
+            self.relay_launch_count,
+            self._ready_flag_mc_ptr,
+            self.ep_size,
+            self.experts,
+            self.helper_slots,
+            HALO_R_SEND_COUNT,
+            HALO_R_SEND_WEIGHT,
+            self.ep_rank,
+            self.topk,
+            self.route_capacity,
+            self.auxiliary_sms,
+            HALO_R_RELAY_CTAS,
+            self._copy_handle,
+        )
+        try:
+            # The per-layer ops take this handle of ctx; passing the
+            # custom-class object costs microseconds per call.
+            handle = int(torch.ops.trtllm.moe_rebalance_halo_r_handle(ctx))
+        except BaseException:
+            torch.ops.trtllm.moe_rebalance_halo_r_destroy(ctx)
+            raise
+        self._ctx = ctx
+        self._handle = handle
+
     def close(self) -> None:
         """Release this layer after the owning pool has drained device work."""
         if self._closed:
             return
         with torch.cuda.device(self.device):
+            if self._ctx is not None:
+                self._handle = 0
+                torch.ops.trtllm.moe_rebalance_halo_r_destroy(self._ctx)
+                self._ctx = None
             if self.symmetric is not None:
                 self.symmetric.close()
         self._closed = True
@@ -349,82 +383,6 @@ class HaloRSlotSchedulerGroup:
             raise RuntimeError("one HALO-R layer call must stay on one stream")
         return handle
 
-    def _record(self, event: str, stream_handle: int) -> None:
-        _check_driver(
-            self._driver.cuEventRecord(self._event_handles[event], stream_handle),
-            "cuEventRecord(HALO-R)",
-        )
-
-    def _wait(self, stream_handle: int, event: str) -> None:
-        _check_driver(
-            self._driver.cuStreamWaitEvent(stream_handle, self._event_handles[event], 0),
-            "cuStreamWaitEvent(HALO-R)",
-        )
-
-    def _submit(self, routes: torch.Tensor, num_tokens: int, main_handle: int) -> None:
-        """Fork COPY from MAIN and enqueue the scheduler and the relay copy."""
-        if not torch.cuda.is_current_stream_capturing():
-            # A captured route tensor lives in the graph's pool for the graph's lifetime.
-            routes.record_stream(self.copy_stream)
-        self._record("input_ready", main_handle)
-        self._wait(self._copy_handle, "input_ready")
-        with torch.cuda.stream(self.copy_stream):
-            torch.ops.trtllm.moe_rebalance_halo_r(
-                routes,
-                self.physical_slot_ids,
-                self.hot_expert_ids,
-                self.hot_expert_source_ranks,
-                self.peer_bases,
-                self.status,
-                self.partial,
-                self.route_aux,
-                self.grid_sync,
-                self.plan_words,
-                self.route_prefix,
-                self._ready_flags_ptr,
-                self.ep_size,
-                self.experts,
-                self.helper_slots,
-                HALO_R_SEND_COUNT,
-                HALO_R_SEND_WEIGHT,
-                self.ep_rank,
-                self.route_capacity,
-                self.auxiliary_sms,
-                HALO_R_SPIN_BUDGET_NS,
-                num_tokens * self.topk,
-            )
-            self._record("plan_ready", self._copy_handle)
-            torch.ops.trtllm.moe_rebalance_relay(
-                self.plan_words,
-                self.relay_sources,
-                self.relay_destinations,
-                self.relay_plane_bytes,
-                self.status,
-                self.relay_completed_ctas,
-                self.relay_launch_count,
-                self._ready_flag_mc_ptr,
-                self.ep_size,
-                self.experts,
-                self.ep_rank,
-                HALO_R_RELAY_CTAS,
-            )
-
-    def _join(self, main_handle: int, completion_event: Optional[torch.cuda.Event]) -> None:
-        """Order COPY after the consumer, then join COPY back into MAIN."""
-        if completion_event is None:
-            self._record("consumer_done", main_handle)
-            self._wait(self._copy_handle, "consumer_done")
-        else:
-            handle = int(completion_event.cuda_event)
-            if handle <= 0:
-                raise ValueError("completion_event must expose a CUDA event")
-            _check_driver(
-                self._driver.cuStreamWaitEvent(self._copy_handle, handle, 0),
-                "cuStreamWaitEvent(HALO-R consumer)",
-            )
-        self._record("copy_idle", self._copy_handle)
-        self._wait(main_handle, "copy_idle")
-
     def plan_schedule(self, logical_expert_ids: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """Submit contiguous CUDA int32 routes [tokens, topk] without staging.
 
@@ -447,7 +405,11 @@ class HaloRSlotSchedulerGroup:
         if num_tokens > self.max_tokens_per_rank:
             raise RuntimeError(f"Route chunk {num_tokens} exceeds {self.max_tokens_per_rank}")
         self._call_stream_handle = handle
-        self._submit(logical_expert_ids, num_tokens, handle)
+        # Forks COPY from MAIN, which wrote the routes, and enqueues the
+        # scheduler and the relay copy; no host synchronization is needed.
+        torch.ops.trtllm.moe_rebalance_halo_r_submit(
+            self._handle, logical_expert_ids, HALO_R_SPIN_BUDGET_NS
+        )
         self._pending_tokens = num_tokens
         self._routes_waited = False
         part = (self.physical_slot_ids, num_tokens)
@@ -471,9 +433,9 @@ class HaloRSlotSchedulerGroup:
 
     def wait_for_routes(self) -> None:
         """Order the first MAIN route read after the scheduler, without a host wait."""
-        handle = self._call_stream()
+        self._call_stream()
         if not self._routes_waited:
-            self._wait(handle, "plan_ready")
+            torch.ops.trtllm.moe_rebalance_halo_r_wait_routes(self._handle)
             self._routes_waited = True
 
     def plan(
@@ -487,11 +449,20 @@ class HaloRSlotSchedulerGroup:
         self.finish()
 
     def finish(self, completion_event: Optional[torch.cuda.Event] = None) -> None:
-        """Queue the consumer wait before the next layer call and join COPY."""
-        handle = self._call_stream()
+        """Queue the consumer wait before the next layer call and join COPY.
+
+        The consumer is ``completion_event``, or without it the MAIN work
+        queued so far: the MegaMoE launch that read this layer's routes.
+        """
+        self._call_stream()
         if not self._planned or not self._routes_waited:
             raise RuntimeError("finish must pair exactly once with a completed plan")
-        self._join(handle, completion_event)
+        event_handle = 0
+        if completion_event is not None:
+            event_handle = int(completion_event.cuda_event)
+            if event_handle <= 0:
+                raise ValueError("completion_event must expose a CUDA event")
+        torch.ops.trtllm.moe_rebalance_halo_r_release(self._handle, event_handle)
         self._planned = False
         self._call_stream_handle = None
         self._part = None

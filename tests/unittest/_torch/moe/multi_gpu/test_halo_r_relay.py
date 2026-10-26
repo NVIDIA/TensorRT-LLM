@@ -118,8 +118,8 @@ def _halo_r_ops_available() -> bool:
     # by value into the MPI workers, and a direct `torch.ops` reference makes
     # cloudpickle try to serialize torch's op-namespace object.
     trtllm_ops = getattr(getattr(torch, "ops"), "trtllm")
-    return hasattr(trtllm_ops, "moe_rebalance_halo_r") and hasattr(
-        trtllm_ops, "moe_rebalance_relay"
+    return hasattr(trtllm_ops, "moe_rebalance_halo_r_create") and hasattr(
+        trtllm_ops, "moe_rebalance_halo_r_submit"
     )
 
 
