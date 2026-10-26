@@ -40,6 +40,7 @@ from strenum import StrEnum
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
+from tensorrt_llm._torch.pyexecutor.kv_cache.memory_utils import get_integrated_gpu_free_memory
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -639,6 +640,21 @@ def _skips_auto_host_tier(has_cp_helix: bool, is_disagg: bool, spec_config) -> b
     return (
         has_cp_helix and not is_disagg and getattr(spec_config, "decoding_type", None) == "DSpark"
     )
+
+
+def _get_available_memory_for_auto_host_tier(
+    shares_device_memory: bool, mem_available: float
+) -> float:
+    """Read available memory before allocating either cache tier.
+
+    Args:
+        shares_device_memory: Whether host and device allocations share RAM.
+        mem_available: Available host memory from ``get_host_memory_limits``.
+    """
+    if shares_device_memory:
+        cuda_free, cuda_total = torch.cuda.mem_get_info()
+        return get_integrated_gpu_free_memory(cuda_free, cuda_total)
+    return mem_available
 
 
 def _compute_auto_host_tier_quota(
@@ -2816,6 +2832,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # OOM the host (observed on GB300 NVL72 with 4 ranks/node and
             # ~170GiB device quota each on a 975GiB node).
             local_ranks, mem_available, memlock_limit = get_host_memory_limits(mapping)
+            shares_device_memory = is_device_integrated()
+            mem_available = _get_available_memory_for_auto_host_tier(
+                shares_device_memory, mem_available
+            )
             # Every rank on the node also pins its host-backed sparse pools and
             # its sparse Batch's staging copy.
             offload_pinned_bytes = self._host_history_budget + self._sparse_batch_staging_bytes
@@ -2826,7 +2846,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 local_ranks,
                 mem_available,
                 memlock_limit,
-                shares_device_memory=is_device_integrated(),
+                shares_device_memory=shares_device_memory,
                 pins_offloaded_history=self._sparse_kv_offload is not None,
             )
             history_sized_automatically = (
