@@ -17,7 +17,6 @@ include(FetchContent)
 set(SRCS
     bufferManagerNvls.cpp
     mcastGroupComm.cpp
-    utils/numpyUtils.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
     locality_domain/locality_domain_utils.cpp
@@ -92,6 +91,13 @@ target_link_libraries(
   tllm_runtime_worker_pool
   PUBLIC tllm::common_headers Threads::Threads
   PRIVATE tllm::common_logging CUDA::cudart)
+
+add_library(tllm_runtime_numpy STATIC utils/numpyUtils.cpp)
+add_library(tllm::runtime_numpy ALIAS tllm_runtime_numpy)
+target_link_libraries(tllm_runtime_numpy PUBLIC tllm::runtime_buffers)
+target_compile_features(tllm_runtime_numpy PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_numpy PROPERTIES POSITION_INDEPENDENT_CODE
+                                                    ON)
 
 foreach(component
         tllm_runtime_memory tllm_runtime_buffers tllm_runtime_distributed
