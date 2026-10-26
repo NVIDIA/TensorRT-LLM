@@ -14,12 +14,14 @@
 # limitations under the License.
 """The entry `plugin.py` calls: one run's request, and its outcome per test.
 
-    SelectionRequest.of(machine, ladder, out_dir)  -> SelectionRequest; None without a machine
-    Selection.of(request, tests)                   -> one Outcome per test, in order
-    selection.partition(items)                     -> (selected, deselected)
-    selection.report(rootdir)                      -> SelectionOutput
+    SelectionRequest.of(machine, ladder, out_dir)            -> a catalogue machine's request
+    SelectionRequest.for_profile(profile, ladder, out_dir)   -> a generated profile's request
+    Selection.of(request, tests)                             -> one Outcome per test, in order
+    selection.partition(items)                               -> (selected, deselected)
+    selection.report(rootdir)                                -> SelectionOutput
 
-Raises `SelectionError`, whose message names the option to fix.
+A request is recorded under its profile's name. Raises `SelectionError`, whose
+message names the option to fix.
 """
 
 from __future__ import annotations
@@ -92,20 +94,27 @@ class SelectionRequest:
     @classmethod
     def of(
         cls,
-        machine: Optional[str],
+        machine: str,
         ladder: Optional[str] = None,
         out_dir: Optional[str] = None,
-    ) -> Optional[SelectionRequest]:
-        """The request, or None when no machine is named; no other option is read then."""
-        if not machine:
-            return None
-        profile = cls.profile_for(machine)
+    ) -> SelectionRequest:
+        """The request for the catalogue machine `machine`."""
+        return cls.for_profile(cls.profile_for(machine), ladder, out_dir)
+
+    @classmethod
+    def for_profile(
+        cls,
+        profile: MachineProfile,
+        ladder: Optional[str] = None,
+        out_dir: Optional[str] = None,
+    ) -> SelectionRequest:
+        """The request for `profile`, catalogued or generated; the ladder is checked before `out_dir`."""
         parsed_ladder = cls.ladder_for(ladder, profile)
         return cls(
-            machine=machine,
+            machine=profile.name,
             profile=profile,
             ladder=parsed_ladder,
-            out_dir=cls.out_dir_for(out_dir, machine, parsed_ladder),
+            out_dir=cls.out_dir_for(out_dir, profile.name, parsed_ladder),
         )
 
     @classmethod
