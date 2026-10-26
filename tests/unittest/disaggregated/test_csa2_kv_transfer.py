@@ -247,7 +247,7 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(monkeypatch, ctx_tp, gen
         transfer_id = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
         ctx_req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=transfer_id)
         gen_req.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=0,
+            ctx_request_id=transfer_id,
             ctx_dp_rank=0,
             ctx_info_endpoint=get_ctx_info_endpoint(ctx_tcs[0]),
             disagg_request_id=transfer_id,

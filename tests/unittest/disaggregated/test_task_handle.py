@@ -764,6 +764,7 @@ def test_queued_sender_abort_preserves_the_committed_cancellation(
         dst_ptrs=empty,
         sizes=empty,
         unique_rid=30,
+        result_rid=30,
         slice_id=0,
         receiver_slice_id=0,
         peer_rank=0,
