@@ -479,6 +479,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     def rerunInfraFailure = null
     def unrerunInfraFailure = null
     def hasUnrerunFailure = false
+    def hasUnfinishedTests = false
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
@@ -509,9 +510,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
             def rerunResult = rerunFailedTests(
                 pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag, retryContext)
             if (rerunResult.failed) {
-                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                    error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
-                }
+                echo "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
                 rerunInfraFailure = rerunResult.infraFailure ?: rerunInfraFailure
@@ -529,9 +528,8 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     // path does. hasUnrerunFailure stays untouched here: it drives
                     // the duration/no-signature message below, which doesn't apply.
                     generateTimeoutTestResultXml(pipeline, stageName)
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
-                    }
+                    hasUnfinishedTests = true
+                    echo "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
                 } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
                     String scope = retryContext?.scope ?: InfraFailure.K8S
                     def classified = classifyFailure(pipeline, e, scope, retryContext)
@@ -542,9 +540,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     // finished but failed, and was never actually rerun, so
                     // results_isolated_${i}.xml still carries the original
                     // <failure> with nothing here to flag it.
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
-                    }
+                    echo "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
                     hasUnrerunFailure = true
                 }
             }
@@ -554,16 +550,12 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         }
     }
 
-    // After processing all isolated tests, set stage failure if any test failed
+    // The caller checks the latest waives before leaving the isolated stage.
     if (rerunFailed) {
-        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            error "One or more isolated tests failed after rerun attempts"
-        }
+        echo "One or more isolated tests failed after rerun attempts"
     }
     if (hasUnrerunFailure) {
-        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            error "One or more isolated tests failed and were not eligible for rerun, please check the test report."
-        }
+        echo "One or more isolated tests failed and were not eligible for rerun, please check the test report."
     }
 
     return [
@@ -571,7 +563,51 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         rerunInfraFailure: rerunInfraFailure,
         unrerunInfraFailure: unrerunInfraFailure,
         hasUnrerunFailure: hasUnrerunFailure,
+        hasUnfinishedTests: hasUnfinishedTests,
     ]
+}
+
+def finishIsolatedTestStage(pipeline, preprocessedLists, isolatedResult, llmSrc, stageName) {
+    if (!isolatedResult.rerunFailed && !isolatedResult.hasUnrerunFailure &&
+            !isolatedResult.hasUnfinishedTests) {
+        return [refreshAttempted: false]
+    }
+
+    timeout(time: 15, unit: 'MINUTES') {
+        generateRerunReport(stageName, llmSrc)
+    }
+    def unfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
+    def reportPath = "${WORKSPACE}/${stageName}/waive_refresh/report.json"
+    def reportExisted = fileExists(reportPath)
+    def allFailuresWaived = refreshFailedTestWaives(llmSrc, stageName)
+    def isolatedFailuresWaived = allFailuresWaived
+    if (allFailuresWaived) {
+        unfinishedTests = false
+    } else if (!reportExisted && fileExists(reportPath)) {
+        def report = readJSON(text: readFile(reportPath), returnPojo: true)
+        if (report.stage_name == stageName && report.all_failures_waived == false &&
+                report.remaining_failures instanceof List && report.waived instanceof List) {
+            def isolatedTests = readFile(preprocessedLists.isolate).readLines().collect {
+                it.replaceAll(/(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$/, '').trim()
+            }.findAll { it }.toSet()
+            def remaining = report.remaining_failures
+            def hasWaivedIsolatedTests = report.waived.any { isolatedTests.contains(it.test) }
+            isolatedFailuresWaived = hasWaivedIsolatedTests && !remaining.any {
+                isolatedTests.contains(it.test) || !it.test?.contains('::') || it.file == 'results-stage.xml'
+            }
+            unfinishedTests = remaining.any {
+                it.file in ['results-timeout.xml', 'unfinished_test.txt']
+            }
+        }
+    }
+
+    if (!isolatedFailuresWaived) {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+            error "Some isolated tests still failed or terminated unexpectedly after the TOT waive check, please check the test report."
+        }
+    }
+    return [refreshAttempted: true, allFailuresWaived: allFailuresWaived,
+            unfinishedTests: unfinishedTests]
 }
 
 def getInfraDryRunPytestTargets(testListPath) {
@@ -2768,10 +2804,32 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         echo "[INFRA-RETRY] ${stageName}: SLURM ${classificationSource} matched " +
                             "${classified.detectedPattern}: " +
                             classified.message
-                        throw classified
+                        if (retryContextAllowsRetry(pipeline, retryContext, classified)) {
+                            throw classified
+                        }
+                    }
+                    if (slurmState == "FAILED" && jobExit == "1" && !infraDryRun) {
+                        def exitCodesPath = "${WORKSPACE}/${stageName}/pytest_exit_codes.txt"
+                        int copied = Utils.exec(pipeline,
+                            script: scpFromRemoteCmd(remote, "${jobWorkspace}/pytest_exit_codes.txt", exitCodesPath),
+                            returnStatus: true, retryOnFail: false)
+                        if (copied == 0) {
+                            def exitCodeLines = readFile(exitCodesPath).readLines()
+                            // Only pytest's identified test failures may be waived. A
+                            // separate perf check or worker failure remains a failure.
+                            if (exitCodeLines && exitCodeLines[0].trim() == "1 0") {
+                                def smVersion = (exitCodeLines.size() > 1 &&
+                                    (exitCodeLines[1].trim() ==~ /\d+\.\d+/)) ?
+                                    exitCodeLines[1].trim().replace(".", "") : ""
+                                generateTimeoutTestResultXml(pipeline, stageName)
+                                if (refreshFailedTestWaives(llmSrcLocal, stageName, smVersion)) {
+                                    return
+                                }
+                            }
+                        }
                     }
                     echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} state=${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}; deferring to classifier."
-                    throw jobFailure
+                    throw (classified instanceof InfraFailure ? classified : jobFailure)
                 }
             }
             echo "Finished test stage execution."
@@ -4894,6 +4952,52 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
     }
 }
 
+boolean refreshFailedTestWaives(String llmSrc, String stageName, String smVersion="") {
+    if (isInfraDryRun()) {
+        return false
+    }
+    try {
+        def targetBranch = env.gitlabTargetBranch
+        if (!targetBranch && env.globalVars) {
+            def parentVars = readJSON(text: env.globalVars, returnPojo: true)
+            targetBranch = parentVars['target_branch']
+        }
+        if (!targetBranch || !env.gitlabCommit) {
+            echo "TOT waive refresh unavailable for ${stageName}: missing target branch or PR commit"
+            return false
+        }
+        def initialWaivesUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives_TOT_initial_${env.gitlabCommit}.txt"
+        int status
+        withEnv([
+            "WAIVE_REFRESH_SCRIPT=${llmSrc}/jenkins/scripts/refresh_test_waives.py",
+            "WAIVE_REFRESH_RESULTS=${WORKSPACE}/${stageName}",
+            "WAIVE_REFRESH_STAGE=${stageName}",
+            "WAIVE_REFRESH_INITIAL_URL=${initialWaivesUrl}",
+            "WAIVE_REFRESH_BRANCH=${targetBranch}",
+            "WAIVE_REFRESH_COMMIT=${env.gitlabCommit ?: ''}",
+            "WAIVE_REFRESH_SM=${smVersion}",
+        ]) {
+            status = sh(returnStatus: true, script: '''
+                python3 "$WAIVE_REFRESH_SCRIPT" \
+                    --result-dir "$WAIVE_REFRESH_RESULTS" \
+                    --stage-name "$WAIVE_REFRESH_STAGE" \
+                    --initial-waives-url "$WAIVE_REFRESH_INITIAL_URL" \
+                    --target-branch "$WAIVE_REFRESH_BRANCH" \
+                    --pr-commit "$WAIVE_REFRESH_COMMIT" \
+                    ${WAIVE_REFRESH_SM:+--sm-version "$WAIVE_REFRESH_SM"}
+            ''')
+        }
+        echo "TOT waive refresh for ${stageName}: ${status == 0 ? 'all failures waived' : 'failure retained'}. " +
+             "Audit: ${stageName}/waive_refresh/report.json in the test-results artifact."
+        return status == 0
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "TOT waive refresh unavailable for ${stageName}; keeping the original failure: ${e.message}"
+        return false
+    }
+}
+
 /**
  * Append passes that previously succeeded for this commit + stage to the
  * stage's waives.txt as SKIPs, so the upcoming pytest run skips them.
@@ -5310,6 +5414,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def rerunInfraFailure = null
         def unrerunInfraFailure = null
         def hasUnrerunFailure = false
+        def isolatedWaiveResult = [refreshAttempted: false]
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
             testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -5506,18 +5611,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         // results-timeout.xml directly, so this is what surfaces it.
                         def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
                         if (rerunResult.failed) {
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Regular tests failed after rerun attempt"
-                            }
+                            echo "Regular tests failed after rerun attempt"
                             rerunFailed = true
                             rerunInfraFailure = rerunResult.infraFailure ?: rerunInfraFailure
                         } else if (hadUnfinishedTests) {
-                            // Rerun passed but the first run had a timeout: mark this
-                            // stage FAILURE so "[${stageName}] Run Pytest" turns red,
-                            // not just the enclosing parent stage.
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Some tests terminated unexpectedly, please check the test report."
-                            }
+                            echo "Some tests terminated unexpectedly, please check the test report."
                         } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
                             String scope = retryContext?.scope ?: InfraFailure.K8S
                             def classified = classifyFailure(pipeline, e, scope, retryContext)
@@ -5529,9 +5627,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             // signature matched: results.xml still carries their
                             // original <failure>, but neither branch above fires for
                             // them, so without this the stage silently reports green.
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
-                            }
+                            echo "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
                             hasUnrerunFailure = true
                         }
                     }
@@ -5546,6 +5642,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             rerunInfraFailure = isolatedResult.rerunInfraFailure ?: rerunInfraFailure
                             unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure
                             hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
+                            if (!retryContextAllowsRetry(pipeline, retryContext,
+                                    rerunInfraFailure ?: unrerunInfraFailure)) {
+                                isolatedWaiveResult = finishIsolatedTestStage(
+                                    pipeline, preprocessedLists, isolatedResult, llmSrc, stageName)
+                            }
                         }
                     } else {
                         echo "No isolated tests to run for stage ${stageName}"
@@ -5577,9 +5678,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Generate comprehensive rerun report if any reruns occurred
-        stage ("Generate Report") {
-            timeout(time: 15, unit: 'MINUTES'){
-                generateRerunReport(stageName, llmSrc)
+        if (!isolatedWaiveResult.refreshAttempted) {
+            stage ("Generate Report") {
+                timeout(time: 15, unit: 'MINUTES'){
+                    generateRerunReport(stageName, llmSrc)
+                }
             }
         }
 
@@ -5620,24 +5723,47 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
+        def infraFailure = rerunInfraFailure ?: unrerunInfraFailure
+        if (retryContextAllowsRetry(pipeline, retryContext, infraFailure)) {
+            throw infraFailure
+        }
+
+        def unfinishedTests = isolatedWaiveResult.refreshAttempted ?
+            isolatedWaiveResult.unfinishedTests : generateTimeoutTestResultXml(pipeline, stageName)
+        if (isolatedWaiveResult.allFailuresWaived) {
+            rerunFailed = false
+            hasUnrerunFailure = false
+        }
+        if (!isolatedWaiveResult.refreshAttempted &&
+                (rerunFailed || hasUnrerunFailure || unfinishedTests) && perfRegressionExitCode == null) {
+            if (refreshFailedTestWaives(llmSrc, stageName)) {
+                rerunFailed = false
+                hasUnrerunFailure = false
+                unfinishedTests = false
+            }
+        }
+
+        if (rerunFailed || hasUnrerunFailure || unfinishedTests) {
+            if (rerunInfraFailure != null) {
+                throw rerunInfraFailure
+            }
+            if (unrerunInfraFailure != null) {
+                throw unrerunInfraFailure
+            }
+        }
+
         // Checked after perfMode so perf artifacts are generated first.
         // Unguarded error() on purpose -- catchError here would swallow the
         // throw that cacheErrorAndUploadResult relies on to fail the build.
         if (rerunFailed) {
-            if (rerunInfraFailure != null) {
-                throw rerunInfraFailure
-            }
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
+        if (unfinishedTests) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
         if (hasUnrerunFailure) {
-            if (unrerunInfraFailure != null) {
-                throw unrerunInfraFailure
-            }
             error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
         }
 

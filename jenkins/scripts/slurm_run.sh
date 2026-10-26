@@ -213,6 +213,14 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
     echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
 fi
 
+if [ "${SLURM_PROCID:-0}" -eq 0 ] && [ "$pytest_exit_code" -eq 1 ]; then
+    printf '%s %s\n' "$pytest_exit_code" "$perf_check_exit_code" > "$jobWorkspace/pytest_exit_codes.txt"
+    if command -v nvidia-smi > /dev/null; then
+        timeout 10s nvidia-smi --query-gpu=compute_cap --format=csv,noheader \
+            >> "$jobWorkspace/pytest_exit_codes.txt" || true
+    fi
+fi
+
 if [ "$pytest_exit_code" -ne 0 ]; then
     final_exit_code=$pytest_exit_code
 elif [ "$perf_check_exit_code" -ne 0 ]; then

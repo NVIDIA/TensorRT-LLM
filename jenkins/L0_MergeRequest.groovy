@@ -636,6 +636,7 @@ def mergeWaiveList(pipeline, globalVars)
             --latest-waive-list=${waiveTot} \
             --diff-file=diff_content.txt \
             --output-file=waives.txt
+            cp ${waiveTot} waives_TOT_initial_${env.gitlabCommit}.txt
         """
         trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
         echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
