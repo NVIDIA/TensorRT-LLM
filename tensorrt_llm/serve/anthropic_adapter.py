@@ -1050,24 +1050,30 @@ async def _iter_openai_sse_lines(
     buffer = ""
     input_type: Optional[type] = None
 
-    async for payload in openai_sse:
-        if not isinstance(payload, (str, bytes)):
-            raise TypeError(f"OpenAI SSE payload must be str or bytes, got {type(payload)!r}")
+    try:
+        async for payload in openai_sse:
+            if not isinstance(payload, (str, bytes)):
+                raise TypeError(f"OpenAI SSE payload must be str or bytes, got {type(payload)!r}")
 
-        current_type = type(payload)
-        if input_type is None:
-            input_type = current_type
-        elif current_type is not input_type:
-            raise TypeError("OpenAI SSE stream cannot mix str and bytes payloads")
+            current_type = type(payload)
+            if input_type is None:
+                input_type = current_type
+            elif current_type is not input_type:
+                raise TypeError("OpenAI SSE stream cannot mix str and bytes payloads")
 
-        if isinstance(payload, bytes):
-            buffer += decoder.decode(payload)
-        else:
-            buffer += payload
+            if isinstance(payload, bytes):
+                buffer += decoder.decode(payload)
+            else:
+                buffer += payload
 
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            yield line.rstrip("\r")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                yield line.rstrip("\r")
+    finally:
+        # Leaving these lines early leaves the upstream too.
+        aclose = getattr(openai_sse, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     if input_type is bytes:
         buffer += decoder.decode(b"", final=True)
@@ -1103,6 +1109,11 @@ async def _with_ticks(
                 await items.put(item)
         except asyncio.CancelledError:
             # The consumer has stopped; nobody is left to take the end marker.
+            # Stopped while handing over an item, the reader leaves the source
+            # suspended at its yield, so it closes the source itself.
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                await aclose()
             raise
         except Exception:
             await items.put(end)
@@ -1124,6 +1135,8 @@ async def _with_ticks(
             yield item
     finally:
         reader.cancel()
+        # Return only once the reader has stopped and closed the source.
+        await asyncio.gather(reader, return_exceptions=True)
 
 
 async def reframe_openai_stream(

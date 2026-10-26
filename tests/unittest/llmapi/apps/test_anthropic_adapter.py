@@ -1865,6 +1865,31 @@ def test_a_slow_client_holds_back_the_upstream(monkeypatch, fails):
     assert events[-1][0] == ("error" if fails else "message_stop")
 
 
+def test_a_client_that_leaves_while_a_frame_waits_closes_the_upstream(monkeypatch):
+    """The upstream is closed by the time the stream is, also while its next frame waits for the client."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 10)
+    closed = []
+
+    async def source():
+        try:
+            for i in range(20):
+                yield _line(chunk({"content": f"w{i} "}))
+        finally:
+            closed.append(True)
+
+    async def leave_after_one_frame():
+        stream = reframe_openai_stream(source(), MODEL)
+        async for _ in stream:
+            break
+        # The reader fills the queue and then waits to hand over the next frame.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await stream.aclose()
+        return list(closed)
+
+    assert asyncio.run(leave_after_one_frame()) == [True]
+
+
 def test_stopping_the_stream_cancels_its_pending_read(monkeypatch):
     """A client that goes away mid-silence stops the upstream read at once."""
     monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.05)
