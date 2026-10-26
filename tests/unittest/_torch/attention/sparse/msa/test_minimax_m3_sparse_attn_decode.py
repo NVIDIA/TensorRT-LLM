@@ -1377,7 +1377,7 @@ def test_msa_jit_cache_tracks_sources_and_build_modes(
     require_msa_module()
     # MSA is optional outside supported GPU test environments; import after its
     # required-package check rather than during collection on other platforms.
-    from fmha_sm100 import jit
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100 import jit
 
     package = tmp_path / "package"
     csrc = package / "csrc"

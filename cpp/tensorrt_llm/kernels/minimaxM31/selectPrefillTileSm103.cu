@@ -60,6 +60,8 @@ constexpr int kWideUnroll = 4;
 constexpr uint32_t kFull = 0xFFFFFFFFu;
 constexpr float kInitScore = 1.0e30f;
 constexpr float kLocalScore = 1.0e29f;
+// Keys >= kNegInfKey (-inf and every negative NaN, which orders below -inf) are invalid picks -> -1, as in
+// minimax_m3_select_blocks.
 constexpr uint32_t kNegInfKey = 0xFF800000u;
 // Per-warp scratch: the radix histogram (256 bins) or the candidate list (keys then blocks).
 constexpr int kMaxCand = 256;
@@ -351,9 +353,9 @@ __global__ void __launch_bounds__(kNt) selectPrefillTileKernel(float const* __re
                     }
                     sel = rank < kTopK;
                 }
-                uint32_t const m = __ballot_sync(kFull, sel && k != kNegInfKey);
+                uint32_t const m = __ballot_sync(kFull, sel && k < kNegInfKey);
                 int const slot = written + __popc(m & ((1u << lane) - 1u));
-                if (sel && k != kNegInfKey)
+                if (sel && k < kNegInfKey)
                 {
                     dst[slot] = static_cast<int32_t>(blk);
                 }
@@ -470,7 +472,7 @@ __global__ void __launch_bounds__(kNt) selectPrefillTileKernel(float const* __re
         int const slot = count + __popc(takeMask & ((1u << lane) - 1u));
         if (take && slot < kTopK)
         {
-            dst[slot] = (k == kNegInfKey) ? -1 : b;
+            dst[slot] = (k >= kNegInfKey) ? -1 : b;
         }
         count += __popc(takeMask);
         ties += __popc(tieMask);

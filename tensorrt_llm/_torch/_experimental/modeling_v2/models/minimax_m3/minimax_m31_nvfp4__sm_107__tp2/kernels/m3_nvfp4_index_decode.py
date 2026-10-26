@@ -20,7 +20,9 @@ PAGE = 128
 
 
 def _interface():
-    from fmha_sm100_q8kv8 import q8_indexer_interface as qi
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100_q8kv8 import (
+        q8_indexer_interface as qi,
+    )
 
     return qi
 

@@ -1,0 +1,83 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+// SPDX-License-Identifier: MIT
+
+// Auto-generated FMHA variant: {{ variant_name }}
+// DTypeIn={{ dtype_in }}, Tile={{ tile_q }}x{{ tile_kv }}, Sparse={{ sparse_mode }}, Page={{ page_size }}, SplitKV={{ is_split_kv }}
+#include "fmha_cutlass_sm100.cuh"
+#include "mask.cuh"
+#include "cutlass_utils.cuh"
+#include "fmha_sm100_params.h"
+
+using namespace flashinfer;
+using namespace cute;
+
+cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
+  using cutlass_type_in = cutlass_dtype_t<{{ dtype_in }}>;
+  using cutlass_type_out = {{ cutlass_dtype_out }};
+  using TileShapeQK = Shape<{{ tile_q }}, {{ tile_kv }}, cute::Int<128>>;
+  using TileShapePV = Shape<{{ tile_q }}, cute::Int<128>, {{ tile_kv }}>;
+  using FmhaThreadShape = Shape<{{ thread_shape }}>;
+
+{% if is_split_kv == "true" %}
+  auto* out_ptr = static_cast<cutlass_type_out*>(p.workspace_o_ptr);
+  int effective_max_qo_len = p.max_qo_len < 128 ? 128 : p.max_qo_len;
+{% else %}
+  auto* out_ptr = static_cast<cutlass_type_out*>(p.o_ptr);
+  int effective_max_qo_len = p.max_qo_len;
+{% endif %}
+
+  using ActiveMaskType = {% if pack_factor is defined and pack_factor > 1 %}PackedCausalMask<{{ pack_factor }}>{% else %}CausalMask{% endif %};
+
+  auto run = [&](auto unit_selector_column) {
+    return run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t,
+                      TileShapeQK, TileShapePV, ActiveMaskType, FmhaThreadShape,
+                      /*IsSplitKV=*/{{ is_split_kv }},
+                      /*SingleSoftmaxWarpGroup=*/{{ single_wg }},
+                      {{ page_size }},
+                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }},
+                      decltype(unit_selector_column)::value>(
+      p.workspace_buffer_ptr,
+      static_cast<cutlass_type_in*>(p.q_ptr),
+      static_cast<cutlass_type_in*>(p.k_ptr),
+      static_cast<cutlass_type_in*>(p.v_ptr),
+      p.qo_segment_lens_ptr, p.kv_segment_lens_ptr,
+      p.qo_segment_offsets_ptr, p.kv_segment_offsets_ptr,
+      p.packed_work_range_ptr, p.packed_work_info_ptr,
+      out_ptr,
+      p.mask_mode_code,
+      p.sm_scale, p.scale_q, p.scale_k, p.scale_v, p.o_scale,
+      p.num_qo_heads, p.num_kv_heads,
+      p.head_dim_qk, p.head_dim_vo,
+      p.q_stride_n, p.q_stride_h,
+      p.k_stride_n, p.k_stride_h,
+      p.v_stride_n, p.v_stride_h,
+      p.batch_size, p.total_qo_len, p.total_kv_len,
+      effective_max_qo_len,
+      p.qo_offsets_ptr, p.stream,
+      p.num_kv_splits,
+      p.kv_tile_begin_ptr, p.kv_tile_end_ptr, p.kv_split_ptr,
+      p.workspace_lse_ptr,
+      p.kv_indices_ptr, p.kv_page_indptr_ptr, p.total_page_num,
+      p.max_score_ptr, p.max_k_tiles,
+      p.kv_block_indexes_ptr, p.kv_block_num,
+      p.kv_block_stride_n, p.kv_block_stride_h, p.kv_block_stride_b,
+      p.pack_factor, p.q_stride_n_original, p.q_stride_h_original, p.h_r_original,
+      flashinfer::PackGQAUnpackParams{p.max_score_direct_ptr, p.total_qo_len_orig,
+                                      p.o_direct_ptr, p.num_qo_heads_orig,
+                                      p.tma_direct_o_enabled
+#ifdef FMHA_GMEM_BOUNDS_CHECK
+                                      , p.gmem_bounds
+#endif
+                                      },
+      p.num_ctas);
+  };
+{% if dtype_in == "nv_bfloat16" and page_size > 0 and sparse_mode == "Sparse" %}
+  // The selector layout is host metadata; capture the matching existing kernel
+  // specialization without copying the selector or reading device values.
+  if (p.kv_block_stride_b == 1) {
+    return run(cute::true_type{});
+  }
+{% endif %}
+  return run(cute::false_type{});
+}

@@ -1,0 +1,2796 @@
+diff --git a/LICENSE b/LICENSE
+new file mode 100644
+index 0000000000000000000000000000000000000000..132dd20ee3294d09a1c613a6bd4c8094c496fbf9
+--- /dev/null
++++ b/LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 MiniMax
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/NOTICE b/NOTICE
+new file mode 100644
+index 0000000000000000000000000000000000000000..39212e2332b2c89dd175abaef1d9df407eb2ba16
+--- /dev/null
++++ b/NOTICE
+@@ -0,0 +1,203 @@
++fmha_sm100
++Copyright (c) 2026 MiniMax
++
++This product includes software developed by third parties. See the
++"Third-party licenses" section of README.md for the full list of bundled
++and runtime-dependency components and license summaries. The
++authoritative license text for each third-party component is shipped
++with that component itself (vendored source headers, the LICENSE file
++distributed with the pip-installed package, or the upstream project
++repository).
++
++================================================================================
++Bundled / derived source (shipped in this repository)
++================================================================================
++
++This project bundles or derives from the following third-party components.
++Each retains its original license and copyright. In compliance with the
++BSD-3-Clause §2 and Apache-2.0 §4 redistribution clauses, the original
++copyright notices and license terms are reproduced below (and are also
++preserved at the top of every vendored source file via the
++SPDX-License-Identifier header).
++
++--------------------------------------------------------------------------------
++NVIDIA CUTLASS — BSD-3-Clause
++--------------------------------------------------------------------------------
++
++Copyright (c) 2017-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++  1. Redistributions of source code must retain the above copyright notice,
++     this list of conditions and the following disclaimer.
++  2. Redistributions in binary form must reproduce the above copyright notice,
++     this list of conditions and the following disclaimer in the documentation
++     and/or other materials provided with the distribution.
++  3. Neither the name of the copyright holder nor the names of its
++     contributors may be used to endorse or promote products derived from
++     this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
++
++Project:    https://github.com/NVIDIA/cutlass
++Where:      python/fmha_sm100/cutlass/ (git submodule: include/ and
++            tools/util/include/)
++            plus BSD-3-tagged headers under python/fmha_sm100/csrc/include/.
++            The SM100 MMA descriptor encodings in
++            python/fmha_sm100/cute/src/common/mma_sm100_desc.py
++            mirror NVIDIA CUTLASS hardware descriptors.
++Full text:  python/fmha_sm100/cutlass/LICENSE.txt (submodule), or
++            https://github.com/NVIDIA/cutlass/blob/main/LICENSE
++
++--------------------------------------------------------------------------------
++FlashInfer — Apache License 2.0
++--------------------------------------------------------------------------------
++
++Copyright (c) 2023-2025 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Project:    https://github.com/flashinfer-ai/flashinfer
++Where:      Apache-2.0-tagged sources under python/fmha_sm100/csrc/
++            and python/fmha_sm100/csrc/include/ (e.g. allocator.h,
++            exception.h, utils.cuh, cutlass_utils.cuh,
++            fmha_cutlass_sm100.cuh, sparse_topk_select.cuh, plan.cuh,
++            sm100_fmha_reduction.hpp, tvm_ffi_utils.h).
++Full text:  https://www.apache.org/licenses/LICENSE-2.0
++
++--------------------------------------------------------------------------------
++Fireworks AI (minimax-kernels KV-outer) — Apache License 2.0
++--------------------------------------------------------------------------------
++
++Copyright (c) 2026 Fireworks AI
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    https://www.apache.org/licenses/LICENSE-2.0
++
++Project:    https://github.com/fw-ai/minimax-kernels
++Where:      python/fmha_sm100/kvouter/ and python/fmha_sm100/csrc/kvouter/
++            (KV-outer sparse attention backend used by sparse_fmha_adapter.py).
++Full text:  https://www.apache.org/licenses/LICENSE-2.0
++
++--------------------------------------------------------------------------------
++NVIDIA TensorRT-LLM — Apache License 2.0
++--------------------------------------------------------------------------------
++
++Copyright (c) 2019-2026 NVIDIA CORPORATION. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Project:    https://github.com/NVIDIA/TensorRT-LLM
++Where:      python/fmha_sm100/csrc/include/sparse_topk_select.cuh
++            portions of the indexerTopK histogram-step + insertion-sort
++            algorithm, derived from
++            tensorrt_llm/cpp/tensorrt_llm/kernels/indexerTopK.cu.
++Full text:  https://www.apache.org/licenses/LICENSE-2.0
++
++--------------------------------------------------------------------------------
++NVIDIA indexer TopK — Apache License 2.0
++--------------------------------------------------------------------------------
++
++Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Where:      python/fmha_sm100/csrc/include/indexer_topk/ (forced-tail
++            top-16 selection used by the Q8KV4/Q8KV8 paged indexers).
++Full text:  https://www.apache.org/licenses/LICENSE-2.0
++
++--------------------------------------------------------------------------------
++NAVER Corp. (CLOVA) — Apache License 2.0
++--------------------------------------------------------------------------------
++
++Copyright (c) 2021 NAVER Corp.
++Licensed under the Apache License, Version 2.0; you may not use this file
++except in compliance with the License. You may obtain a copy of the
++License at https://www.apache.org/licenses/LICENSE-2.0
++
++Project:    https://github.com/NAVER-CLOVA
++Where:      Co-authored portions of
++            python/fmha_sm100/csrc/include/sparse_topk_select.cuh
++            (indexerTopK algorithm, alongside the NVIDIA copyright above).
++Full text:  https://www.apache.org/licenses/LICENSE-2.0
++
++--------------------------------------------------------------------------------
++Changes to bundled / derived source
++--------------------------------------------------------------------------------
++
++This project does not modify the text of vendored third-party source files
++beyond what is required to integrate them (path adjustments in
++`#include` directives and minor macro renames to avoid collision with
++project-local symbols; no semantic changes). All such integration
++modifications are confined to `csrc/` and to the import shim under
++`python/fmha_sm100/sparse.py`. The SM100 MMA descriptor encodings in
++`python/fmha_sm100/cute/src/common/mma_sm100_desc.py` are
++re-typed from the CUTLASS hardware descriptors — they are numerical
++constants, not CUTLASS source code, but the original copyright is
++attributed here for completeness.
++
++================================================================================
++Runtime dependencies (installed via pip, not vendored)
++================================================================================
++
++For runtime dependencies, the authoritative license text is distributed
++with each installed package; consult `pip show <pkg>` for the license
++metadata. The full list and license summaries are in the
++"Third-party licenses" section of README.md.
++
++================================================================================
++Trademarks
++================================================================================
++
++NVIDIA, the NVIDIA logo, Blackwell, SM100, B200, B300, GB200, GB300,
++TensorRT, TensorRT-LLM, cuDNN, cuBLAS, and CUDA are trademarks and/or
++registered trademarks of NVIDIA Corporation. Apache, Apache TVM, and
++Apache TVM FFI are trademarks of The Apache Software Foundation. All
++other trademarks referenced in this project are the property of their
++respective owners. The use of any trademark in this NOTICE or in
++README.md is for identification purposes only and does not imply
++endorsement.
+diff --git a/README.md b/README.md
+index 63b1593519f0c32cbbc4dbd57b57441b1944de26..9f3e24145993cfb6fef56ced13a9992f768da221 100644
+--- a/README.md
++++ b/README.md
+@@ -18,15 +18,15 @@ sparse prefill.
+   QMUL4 instruction where the toolchain accepts it for the target (SM100 and SM103; the JIT
+   probes `nvcc` once per toolchain and architecture) and an exact packed-FP16 path otherwise
+   (SM107, which has no QMUL4). Both paths produce the same E4M3 values.
+-  `FMHA_SM100_PREFILL_Q8KV4_DISABLE_QMUL4=1` compiles the FP16 path on any GPU.
++  `FMHA_SM100_PREFILL_BF16X_DISABLE_QMUL4=1` compiles the FP16 path on any GPU.
+ - CUTLASS headers: the repository submodule (4.8) or any newer release through `CUTLASS_ROOT`;
+   SM107 needs 4.8 or newer.
+ - The CuTe-DSL sparse stack (`nvidia-cutlass-dsl`, `quack-kernels`) for the CSR builder and the
+   combine.
+ - The kernel is JIT-compiled on first use into `MINFER_FMHA_CACHE_DIR` (or
+   `TORCH_EXTENSIONS_DIR`, or `~/.cache/minfer/fmha_sm100`), one extension per block-scale shift.
+-  `FMHA_SM100_PREFILL_Q8KV4_ARCH` selects the target for offline builds without a device
+-  (`python -m fmha_sm100.prefill_q8kv4.build --arch 103a`).
++  `FMHA_SM100_PREFILL_BF16X_ARCH` selects the target for offline builds without a device
++  (`python -m tensorrt_llm._torch.attention.backends.fmha.msa_kernels.prefill_bf16x.build --arch 103a`).
+ 
+ ## Through `fmha_sm100`
+ 
+@@ -57,7 +57,7 @@ prefill part here and their decode part to the Q8KV4 decode kernel.
+ ## Direct API
+ 
+ ```python
+-from fmha_sm100.prefill_q8kv4 import BatchPrefillWithPagedKVCacheWrapper, interleave_v_scales
++from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.prefill_bf16x import BatchPrefillWithPagedKVCacheWrapper, interleave_v_scales
+ 
+ wrapper = BatchPrefillWithPagedKVCacheWrapper()
+ wrapper.plan(topk_indices, cu_seqlens_q, cu_seqlens_k, kv_indices, kv_indptr=kv_indptr,
+@@ -74,7 +74,7 @@ return_schedule=True)` (that is what `fmha_sm100` does per layer), so a caller t
+ builds them for the CuTe-DSL kernel swaps only the attention call:
+ 
+ ```python
+-from fmha_sm100.prefill_q8kv4 import run_prefill
++from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.prefill_bf16x import run_prefill
+ 
+ run_prefill(q_e4m3, (k_data, v_data), (k_sf, v_sf), kv_indices=block_table, kv_indptr=None,
+             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, k2q_row_ptr=k2q_row_ptr,
+@@ -90,7 +90,7 @@ in order on one stream may share one, and `run_prefill` takes one through `works
+ it the partials are fresh allocations per call).
+ 
+ ```python
+-from fmha_sm100.prefill_q8kv4 import PrefillWorkspace
++from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.prefill_bf16x import PrefillWorkspace
+ 
+ workspace = PrefillWorkspace(device)
+ workspace = PrefillWorkspace(device, partial_bytes=workspace.required_bytes(topk, max_total_q, Hq))
+@@ -102,7 +102,7 @@ partial buffer over the domains and the combine reads every tile from the domain
+ which raises its bandwidth where the inter-domain fabric is the limit; the kernels and results
+ are the same as with interleaved memory. Reserve the largest batch up front with
+ `partial_bytes`: a batch that outgrows a striped buffer synchronizes the device before replacing
+-it. `FMHA_SM100_PREFILL_Q8KV4_LOCALITY_DOMAINS=0` keeps the buffer interleaved (for
++it. `FMHA_SM100_PREFILL_BF16X_LOCALITY_DOMAINS=0` keeps the buffer interleaved (for
+ comparisons). One workspace must not be used from two streams at once.
+ 
+ ## Data contract
+diff --git a/build.py b/build.py
+index 280ee6b8dd486a946e827771c324d4aeeb8efbbe..3122a7c3847c699760fb81c331238b832b73b32c 100644
+--- a/build.py
++++ b/build.py
+@@ -1,4 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """Offline cache builder for Q8KV4 sparse prefill attention."""
+@@ -8,47 +9,95 @@ from __future__ import annotations
+ import argparse
+ import os
+ 
+-from .jit import FMHA_SM100_PREFILL_Q8KV4_ARCH
++from .jit import FMHA_SM100_PREFILL_BF16X_ARCH
+ 
+ 
+-def precompile(arch: str | None = None, block_scale_shifts=(0, 3)) -> list[str]:
+-    """Build the cache entries used by the lazy runtime JIT (one per block-scale shift)."""
++def precompile(
++    arch: str | None = None, block_scale_shifts=(0, 3), data_paths=("e4m3",)
++) -> list[str]:
++    """Build the cache entries used by the lazy runtime JIT: one per block-scale shift for the
++    E4M3 data path, one (shift 0) for the BF16 data path."""
+ 
+-    previous_arch = os.environ.get(FMHA_SM100_PREFILL_Q8KV4_ARCH)
++    previous_arch = os.environ.get(FMHA_SM100_PREFILL_BF16X_ARCH)
+     if arch is not None:
+-        os.environ[FMHA_SM100_PREFILL_Q8KV4_ARCH] = arch
++        os.environ[FMHA_SM100_PREFILL_BF16X_ARCH] = arch
+     try:
+         from . import jit
+ 
+         jit._target_arch.cache_clear()
+         jit._load_extension_for_arch.cache_clear()
+         uris = []
+-        for shift in block_scale_shifts:
+-            spec = jit.gen_jit_spec(block_scale_shift=shift)
+-            spec.build_and_load()
+-            uris.append(spec.uri)
++        for data_path in data_paths:
++            shifts = block_scale_shifts if data_path == jit.E4M3_DATA_PATH else (0,)
++            for shift in shifts:
++                spec = jit.gen_jit_spec(block_scale_shift=shift, data_path=data_path)
++                spec.build_and_load()
++                uris.append(spec.uri)
+         return uris
+     finally:
+         if previous_arch is None:
+-            os.environ.pop(FMHA_SM100_PREFILL_Q8KV4_ARCH, None)
++            os.environ.pop(FMHA_SM100_PREFILL_BF16X_ARCH, None)
+         else:
+-            os.environ[FMHA_SM100_PREFILL_Q8KV4_ARCH] = previous_arch
++            os.environ[FMHA_SM100_PREFILL_BF16X_ARCH] = previous_arch
+         if "jit" in locals():
+             jit._target_arch.cache_clear()
+ 
+ 
++def build_aot(aot_dir: str, arch: str | None = None, block_scale_shifts=(0,), data_paths=("e4m3",)) -> list[str]:
++    """Build the extensions offline and copy each library into ``aot_dir`` (the CPP-E4M3X prebuilt set that
++    ``jit.load_extension`` takes before the JIT)."""
++    import shutil
++    from pathlib import Path
++
++    from . import jit
++
++    precompile(arch, block_scale_shifts, data_paths)
++    previous_arch = os.environ.get(FMHA_SM100_PREFILL_BF16X_ARCH)
++    if arch is not None:
++        os.environ[FMHA_SM100_PREFILL_BF16X_ARCH] = arch
++    try:
++        jit._target_arch.cache_clear()
++        out = Path(aot_dir)
++        out.mkdir(parents=True, exist_ok=True)
++        names = []
++        for data_path in data_paths:
++            shifts = block_scale_shifts if data_path == jit.E4M3_DATA_PATH else (0,)
++            for shift in shifts:
++                spec = jit.gen_jit_spec(block_scale_shift=shift, data_path=data_path)
++                library = spec.recipe().lookup()
++                if library is None:
++                    raise RuntimeError(f"no built library for {spec.uri}")
++                shutil.copyfile(library, out / f"{spec.module_name}.so")
++                names.append(f"{spec.module_name}.so")
++        return names
++    finally:
++        if previous_arch is None:
++            os.environ.pop(FMHA_SM100_PREFILL_BF16X_ARCH, None)
++        else:
++            os.environ[FMHA_SM100_PREFILL_BF16X_ARCH] = previous_arch
++        jit._target_arch.cache_clear()
++
++
+ def _main() -> None:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--arch", default=None, help="Target SM, for example 103a")
+     parser.add_argument("--block-scale-shifts", default="0,3",
+-                        help="Comma-separated block-scale shifts to build")
++                        help="Comma-separated block-scale shifts to build (E4M3 data path)")
++    parser.add_argument("--data-paths", default="e4m3",
++                        help="Comma-separated data paths to build: e4m3, bf16")
++    parser.add_argument("--aot-dir", default=None,
++                        help="Also copy the built libraries here (the prebuilt set jit.load_extension takes first)")
+     args = parser.parse_args()
+     shifts = tuple(int(value) for value in args.block_scale_shifts.split(","))
+-    print("\n".join(precompile(args.arch, shifts)))
++    data_paths = tuple(value.strip() for value in args.data_paths.split(","))
++    if args.aot_dir:
++        print("\n".join(build_aot(args.aot_dir, args.arch, shifts, data_paths)))
++    else:
++        print("\n".join(precompile(args.arch, shifts, data_paths)))
+ 
+ 
+ if __name__ == "__main__":
+     _main()
+ 
+ 
+-__all__ = ["precompile"]
++__all__ = ["build_aot", "precompile"]
+diff --git a/csrc/api/locality_domains.cu b/csrc/api/locality_domains.cu
+index 583c4ad51aa52aa7dabd6199ad160cc164267bf6..09dbefe9ab6f44b36573c884bf3effaa837f5697 100644
+--- a/csrc/api/locality_domains.cu
++++ b/csrc/api/locality_domains.cu
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ // Memory locality domains (Rubin uGPU, Blackwell's dies): the domain of every SM, and
+@@ -18,12 +19,12 @@
+ 
+ // The locality-domain driver API ships with CUDA 13.4.
+ #if CUDA_VERSION >= 13040
+-#define FMHA_SM100_PREFILL_Q8KV4_HAS_LOCALITY_DOMAINS 1
++#define FMHA_SM100_PREFILL_BF16X_HAS_LOCALITY_DOMAINS 1
+ #else
+-#define FMHA_SM100_PREFILL_Q8KV4_HAS_LOCALITY_DOMAINS 0
++#define FMHA_SM100_PREFILL_BF16X_HAS_LOCALITY_DOMAINS 0
+ #endif
+ 
+-namespace fmha_sm100::prefill_q8kv4 {
++namespace fmha_sm100::prefill_bf16x {
+ namespace {
+ 
+ int checked_device(int64_t device) {
+@@ -33,7 +34,7 @@ int checked_device(int64_t device) {
+   return static_cast<int>(device);
+ }
+ 
+-#if FMHA_SM100_PREFILL_Q8KV4_HAS_LOCALITY_DOMAINS
++#if FMHA_SM100_PREFILL_BF16X_HAS_LOCALITY_DOMAINS
+ 
+ void check_driver(CUresult result, char const *what) {
+   if (result != CUDA_SUCCESS) {
+@@ -158,13 +159,13 @@ std::vector<CUdevResource> split_sms_by_domain(CUdevice cu_device, int num_domai
+   return groups;
+ }
+ 
+-#endif // FMHA_SM100_PREFILL_Q8KV4_HAS_LOCALITY_DOMAINS
++#endif // FMHA_SM100_PREFILL_BF16X_HAS_LOCALITY_DOMAINS
+ 
+ } // namespace
+ 
+ int64_t locality_domain_count(int64_t device) {
+   int const index = checked_device(device);
+-#if FMHA_SM100_PREFILL_Q8KV4_HAS_LOCALITY_DOMAINS
++#if FMHA_SM100_PREFILL_BF16X_HAS_LOCALITY_DOMAINS
+   return domain_count(index);
+ #else
+   (void)index;
+@@ -174,7 +175,7 @@ int64_t locality_domain_count(int64_t device) {
+ 
+ int64_t locality_page_bytes(int64_t device) {
+   int const index = checked_device(device);
+-#if FMHA_SM100_PREFILL_Q8KV4_HAS_LOCALITY_DOMAINS
++#if FMHA_SM100_PREFILL_BF16X_HAS_LOCALITY_DOMAINS
+   return static_cast<int64_t>(page_bytes(index));
+ #else
+   (void)index;
+@@ -184,7 +185,7 @@ int64_t locality_page_bytes(int64_t device) {
+ 
+ torch::Tensor sm_locality_domains(int64_t device) {
+   int const index = checked_device(device);
+-#if FMHA_SM100_PREFILL_Q8KV4_HAS_LOCALITY_DOMAINS
++#if FMHA_SM100_PREFILL_BF16X_HAS_LOCALITY_DOMAINS
+   c10::cuda::CUDAGuard const device_guard(index);
+   CUdevice const cu_device = driver_device(index);
+   int const num_domains = domain_count(index);
+@@ -239,7 +240,7 @@ torch::Tensor sm_locality_domains(int64_t device) {
+ 
+ torch::Tensor alloc_locality_striped(int64_t bytes, int64_t device) {
+   int const index = checked_device(device);
+-#if FMHA_SM100_PREFILL_Q8KV4_HAS_LOCALITY_DOMAINS
++#if FMHA_SM100_PREFILL_BF16X_HAS_LOCALITY_DOMAINS
+   c10::cuda::CUDAGuard const device_guard(index);
+   int const num_domains = domain_count(index);
+   size_t const page = page_bytes(index);
+@@ -300,4 +301,4 @@ torch::Tensor alloc_locality_striped(int64_t bytes, int64_t device) {
+ #endif
+ }
+ 
+-} // namespace fmha_sm100::prefill_q8kv4
++} // namespace fmha_sm100::prefill_bf16x
+diff --git a/csrc/api/prefill_attention_api.cpp b/csrc/api/prefill_attention_api.cpp
+index e1f0a9fe05828351c0339ef93a4016233b81df98..4f7d6079217b1fcfd61432834a881e1973fd5239 100644
+--- a/csrc/api/prefill_attention_api.cpp
++++ b/csrc/api/prefill_attention_api.cpp
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #include "prefill_attention_api.hpp"
+@@ -16,9 +17,16 @@
+ 
+ #include "sm100/device/prefill_attention.hpp"
+ 
+-namespace fmha_sm100::prefill_q8kv4 {
++namespace fmha_sm100::prefill_bf16x {
+ namespace {
+ 
++// FMHA_SM100_PREFILL_BF16X_DTYPE (defaulted in prefill_attention.hpp): 1 builds the BF16 data
++// path, whose forward folds the K global scale into the K dequant and applies neither the V
++// global scale nor an output scale (the combine applies them).
++constexpr bool kBf16DataPath = FMHA_SM100_PREFILL_BF16X_DTYPE == 1;
++static_assert(!kBf16DataPath || FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT == 0,
++              "the BF16 data path has no block-scale staging");
++
+ constexpr int kQHeadsPerKv = 16;
+ constexpr int kHeadDim = 128;
+ constexpr int kPageSize = 128;
+@@ -111,7 +119,18 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
+     check_same_device(q, tensor, name);
+   }
+ 
+-  TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "q must have dtype torch.float8_e4m3fn");
++  if constexpr (kBf16DataPath) {
++    TORCH_CHECK(q.scalar_type() == at::kBFloat16,
++                "q must have dtype torch.bfloat16 (BF16 data-path extension)");
++    TORCH_CHECK(!v_global_scale.has_value(),
++                "the BF16 data path does not apply v_global_scale in the forward; the combine "
++                "applies it");
++    TORCH_CHECK(output_scale == 1.0, "the BF16 data path takes no forward output_scale");
++    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(q.data_ptr()) % kCacheAlignment == 0,
++                "q must be 16-byte aligned (TMA)");
++  } else {
++    TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "q must have dtype torch.float8_e4m3fn");
++  }
+   TORCH_CHECK(packed_k.scalar_type() == at::kByte && packed_v.scalar_type() == at::kByte,
+               "packed K/V must have dtype torch.uint8");
+   for (auto const &scale : {k_scale, v_scale}) {
+@@ -135,7 +154,7 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
+               "packed_k must have shape [pages, num_kv_heads, 128, 64]");
+   int const num_kv_heads = checked_int_dimension(packed_k.size(1), "num_kv_heads");
+   TORCH_CHECK(num_q_heads == static_cast<int64_t>(num_kv_heads) * kQHeadsPerKv,
+-              "Q8KV4 prefill requires exactly 16 Q heads per KV head");
++              "BF16X prefill requires exactly 16 Q heads per KV head");
+   int64_t const pages = packed_k.size(0);
+   PrefillArguments arguments{};
+   arguments.packed_k = make_cache_view(packed_k, "packed_k", pages, num_kv_heads, kHeadDim / 2);
+@@ -249,9 +268,18 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
+         checked_int_dimension(combine_tile_counters->numel(), "combine_tile_counters");
+   }
+   // The dequant stages every block scale by 2^-shift; scores and outputs get 2^shift back.
+-  double const stage_gain = static_cast<double>(1 << FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT);
++  double const stage_gain = static_cast<double>(1 << FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT);
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1 || FMHA_SM100_PREFILL_BF16X_E4M3X == 1
++  // BF16X M3 / E4M3X: the reference forms Float32(softmax_scale) * Float32(log2 e) (an fp32 product; shift is 0 on this path).
++  {
++    volatile float const scale32 = static_cast<float>(softmax_scale);
++    volatile float const log2e32 = static_cast<float>(1.4426950408889634074);
++    arguments.softmax_scale_log2 = scale32 * log2e32;
++  }
++#else
+   arguments.softmax_scale_log2 =
+       static_cast<float>(softmax_scale * stage_gain * 1.4426950408889634074);
++#endif
+   arguments.output_scale = static_cast<float>(output_scale * stage_gain);
+ 
+   cudaStream_t const stream = c10::cuda::getCurrentCUDAStream().stream();
+@@ -260,6 +288,8 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
+               "Q8KV4 sparse prefill launch failed: ", cudaGetErrorString(status));
+ }
+ 
+-int64_t block_scale_shift() { return FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT; }
++int64_t block_scale_shift() { return FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT; }
++
++int64_t data_path() { return FMHA_SM100_PREFILL_BF16X_DTYPE; }
+ 
+-} // namespace fmha_sm100::prefill_q8kv4
++} // namespace fmha_sm100::prefill_bf16x
+diff --git a/csrc/api/prefill_attention_api.hpp b/csrc/api/prefill_attention_api.hpp
+index b03cc68bdfa69cddd05949854f5dc78e9cd5029a..6a8c27fb171903de86de18a7b9d00ee0cc24baf1 100644
+--- a/csrc/api/prefill_attention_api.hpp
++++ b/csrc/api/prefill_attention_api.hpp
+@@ -1,11 +1,12 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+ 
+ #include <torch/extension.h>
+ 
+-namespace fmha_sm100::prefill_q8kv4 {
++namespace fmha_sm100::prefill_bf16x {
+ 
+ void prefill_run(torch::Tensor q,
+                  torch::Tensor packed_k,
+@@ -31,6 +32,8 @@ void prefill_run(torch::Tensor q,
+ 
+ // The block-scale shift this extension was built with.
+ int64_t block_scale_shift();
++// The data path this extension was built with: 0 = E4M3, 1 = BF16.
++int64_t data_path();
+ 
+ // Memory locality domains of a device (Rubin uGPU; one on other GPUs).
+ int64_t locality_domain_count(int64_t device);
+@@ -44,4 +47,4 @@ torch::Tensor sm_locality_domains(int64_t device);
+ // the page size times the domain count.
+ torch::Tensor alloc_locality_striped(int64_t bytes, int64_t device);
+ 
+-}  // namespace fmha_sm100::prefill_q8kv4
++}  // namespace fmha_sm100::prefill_bf16x
+diff --git a/csrc/api/prefill_attention_binding.cpp b/csrc/api/prefill_attention_binding.cpp
+index 2057ad9bc3a70f23cd0d178f0df8da83e0c5eab0..7e3b8e83984af787001cd4bdcab3cf5016eef3a4 100644
+--- a/csrc/api/prefill_attention_binding.cpp
++++ b/csrc/api/prefill_attention_binding.cpp
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #include <torch/extension.h>
+@@ -6,7 +7,7 @@
+ #include "prefill_attention_api.hpp"
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+-  module.def("run", &fmha_sm100::prefill_q8kv4::prefill_run, "SM100 Q8KV4 paged sparse-prefill K1",
++  module.def("run", &fmha_sm100::prefill_bf16x::prefill_run, "SM100 Q8KV4 paged sparse-prefill K1",
+              py::arg("q"), py::arg("packed_k"), py::arg("packed_v"), py::arg("k_scale"),
+              py::arg("v_scale"), py::arg("kv_indices"), py::arg("kv_indptr"), py::arg("cu_seqlens_q"),
+              py::arg("cu_seqlens_k"), py::arg("seqused_k"), py::arg("k2q_row_ptr"),
+@@ -14,15 +15,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+              py::arg("o_partial"), py::arg("lse_partial"), py::arg("k_global_scale"),
+              py::arg("v_global_scale"), py::arg("softmax_scale"), py::arg("output_scale"),
+              py::arg("combine_tile_counters") = py::none());
+-  module.def("block_scale_shift", &fmha_sm100::prefill_q8kv4::block_scale_shift,
++  module.def("block_scale_shift", &fmha_sm100::prefill_bf16x::block_scale_shift,
+              "Block-scale shift this extension was built with");
+-  module.def("locality_domain_count", &fmha_sm100::prefill_q8kv4::locality_domain_count,
++  module.def("data_path", &fmha_sm100::prefill_bf16x::data_path,
++             "Data path this extension was built with: 0 = E4M3, 1 = BF16");
++  module.def("locality_domain_count", &fmha_sm100::prefill_bf16x::locality_domain_count,
+              "Memory locality domains of a device", py::arg("device"));
+-  module.def("locality_page_bytes", &fmha_sm100::prefill_q8kv4::locality_page_bytes,
++  module.def("locality_page_bytes", &fmha_sm100::prefill_bf16x::locality_page_bytes,
+              "Allocation granularity of domain-localized memory", py::arg("device"));
+-  module.def("sm_locality_domains", &fmha_sm100::prefill_q8kv4::sm_locality_domains,
++  module.def("sm_locality_domains", &fmha_sm100::prefill_bf16x::sm_locality_domains,
+              "Locality domain of every SM id, -1 where unknown", py::arg("device"));
+-  module.def("alloc_locality_striped", &fmha_sm100::prefill_q8kv4::alloc_locality_striped,
++  module.def("alloc_locality_striped", &fmha_sm100::prefill_bf16x::alloc_locality_striped,
+              "Device buffer whose pages alternate between the locality domains",
+              py::arg("bytes"), py::arg("device"));
+ }
+diff --git a/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh b/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
+index 37c003047aae67f2b73f940e6dd04ac287dbd2a1..3a1a343bccc8f398326b38654a54c0ea98bf2a98 100644
+--- a/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
++++ b/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -9,8 +10,12 @@
+ #include "cutlass/arch/barrier.h"
+ #include "cutlass/cutlass.h"
+ #include "sm100/common/nvfp4_to_e4m3.cuh"
++#include "sm100/common/prefill_attention_config.cuh"
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++#include "sm100/common/nvfp4_to_bf16.cuh"
++#endif
+ 
+-namespace fmha_sm100::prefill_q8kv4::detail {
++namespace fmha_sm100::prefill_bf16x::detail {
+ 
+ struct Fp4DequantInput {
+   uint32_t packed_fp4;
+@@ -19,18 +24,27 @@ struct Fp4DequantInput {
+ 
+ CUTLASS_DEVICE Fp4DequantInput load_fp4_dequant_input(
+     uint8_t const* packed_fp4, uint8_t scale_e4m3) {
++  if constexpr (kE4M3X) {
++    return {*reinterpret_cast<uint32_t const*>(packed_fp4),
++            ::fmha_sm100::prefill_bf16x::sm100::common::e4m3x_scale_f16x2(scale_e4m3)};
++  }
+   return {
+       *reinterpret_cast<uint32_t const*>(packed_fp4),
+-      ::fmha_sm100::prefill_q8kv4::sm100::common::make_dequant_scale_word(scale_e4m3),
++      ::fmha_sm100::prefill_bf16x::sm100::common::make_dequant_scale_word(scale_e4m3),
+   };
+ }
+ 
+ CUTLASS_DEVICE void dequant_store_fp8_smem(
+-    Fp4DequantInput const& input, uint32_t output_address) {
++    Fp4DequantInput const& input, uint32_t output_address, float global_scale = 1.0f) {
+   uint32_t output_lo;
+   uint32_t output_hi;
+-  ::fmha_sm100::prefill_q8kv4::sm100::common::dequant_e2m1x8_uniform_scale(
+-      output_lo, output_hi, input.packed_fp4, input.scale_word);
++  if constexpr (kE4M3X) {
++    ::fmha_sm100::prefill_bf16x::sm100::common::dequant_e2m1x8_scale_global_e4m3x(
++        output_lo, output_hi, input.packed_fp4, input.scale_word, global_scale);
++  } else {
++    ::fmha_sm100::prefill_bf16x::sm100::common::dequant_e2m1x8_uniform_scale(
++        output_lo, output_hi, input.packed_fp4, input.scale_word);
++  }
+   asm volatile("st.shared.v2.b32 [%0], {%1, %2};"
+                :
+                : "r"(output_address), "r"(output_lo), "r"(output_hi));
+@@ -47,7 +61,7 @@ CUTLASS_DEVICE void dequant_store_fp8_smem(
+ template <int NumRows, int HeadDim, int ScaleGroupSize, bool TokenQuadScales>
+ CUTLASS_DEVICE void dequant_fp4_tile_to_fp8_smem(
+     uint8_t const* packed_fp4, uint8_t const* scale,
+-    uint8_t* output_smem, int thread_idx, int valid_rows = NumRows) {
++    uint8_t* output_smem, int thread_idx, int valid_rows = NumRows, float global_scale = 1.0f) {
+   static_assert(NumRows == 128);
+   static_assert(HeadDim == 128);
+   static_assert(ScaleGroupSize == 16);
+@@ -112,7 +126,7 @@ CUTLASS_DEVICE void dequant_fp4_tile_to_fp8_smem(
+   for (int iteration = 0; iteration < kRowIterations - 3; ++iteration) {
+     Fp4DequantInput input_d = load_fp4_dequant_input(
+         current_data + 3 * kDataIterationStride, row_scale(3));
+-    dequant_store_fp8_smem(input_a, output_address);
++    dequant_store_fp8_smem(input_a, output_address, global_scale);
+     output_address += kLinearRowStep;
+     current_data += kDataIterationStride;
+     current_scale += kScaleIterationStride;
+@@ -122,11 +136,11 @@ CUTLASS_DEVICE void dequant_fp4_tile_to_fp8_smem(
+     input_c = input_d;
+   }
+ 
+-  dequant_store_fp8_smem(input_a, output_address);
++  dequant_store_fp8_smem(input_a, output_address, global_scale);
+   dequant_store_fp8_smem(
+-      input_b, output_address + kLinearRowStep);
++      input_b, output_address + kLinearRowStep, global_scale);
+   dequant_store_fp8_smem(
+-      input_c, output_address + 2 * kLinearRowStep);
++      input_c, output_address + 2 * kLinearRowStep, global_scale);
+ }
+ 
+ template <int NumRows, int HeadDim>
+@@ -163,4 +177,131 @@ CUTLASS_DEVICE void clear_fp8_tile_smem(
+   cutlass::arch::fence_view_async_shared();
+ }
+ 
+-}  // namespace fmha_sm100::prefill_q8kv4::detail
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++
++// BF16 data path: SMEM byte offset (before the SW128 XOR) of element (row, d) of a 128 x 128 BF16
++// tile, row = token. Both tiles are built from 1 KB SW128 atoms of 8 rows x 128 bytes:
++//  * K (QK B operand, K-major, Layout_K_SW128_Atom<bf16> = 8 tokens x 64 dims): atoms run over
++//    the 16 token groups first, then over the two 64-dim halves, so dims [64, 128) start 16 KB in.
++//  * V (PV B operand, MN-major, Layout_MN_SW128_Atom<bf16> = 64 dims x 8 tokens): atoms run over
++//    the two 64-dim halves first, then over the 16 token groups (2 KB per group of 8 tokens).
++// This is tile_to_mma_shape's order (M/N mode first, then K); the launch static_asserts these
++// formulas against the cute layouts. The SW128 XOR (Swizzle<3,4,3> on byte addresses) swaps the
++// 16-byte chunks of a 128-byte row by the row's index within its atom, bits [7, 10).
++template <bool MnMajor>
++CUTLASS_HOST_DEVICE constexpr int bf16_tile_linear_byte_offset(int row, int d) {
++  return MnMajor ? (d / 64) * 1024 + (row / 8) * 2048 + (row % 8) * 128 + (d % 64) * 2
++                 : (d / 64) * (128 * 128) + (row / 8) * 1024 + (row % 8) * 128 + (d % 64) * 2;
++}
++
++CUTLASS_HOST_DEVICE constexpr int sw128_swizzle_byte_offset(int linear) {
++  return linear ^ ((linear & 0x380) >> 3);
++}
++
++// NVFP4 -> BF16 tile dequant for the BF16 data path. Same thread mapping as the E4M3 path: 16
++// threads per row, 8 consecutive dims (one 32-bit packed word, one block scale) per thread, 8
++// rows per iteration; each thread writes one 16-byte chunk per row with st.shared.v4.
++//  * MnMajor = false: K tile (K-major); MnMajor = true: V tile (MN-major).
++//  * TokenQuadScales: V scale order, as in dequant_fp4_tile_to_fp8_smem.
++//  * global_scale_bf16x2: folded into every block scale with mul.rn.bf16x2 when
++//    FoldGlobalScale (K); unused otherwise (the V global scale is applied by the combine).
++//  * Rows [valid_rows, NumRows) get a zero scale before the multiply, so they come out as exact
++//    zeros (see dequant_fp4_tile_to_fp8_smem for why V needs this).
++template <int NumRows, int HeadDim, int ScaleGroupSize, bool TokenQuadScales, bool MnMajor,
++          bool FoldGlobalScale>
++CUTLASS_DEVICE void dequant_fp4_tile_to_bf16_smem(uint8_t const* packed_fp4, uint8_t const* scale,
++                                                  uint8_t* output_smem, int thread_idx,
++                                                  uint32_t global_scale_bf16x2,
++                                                  int valid_rows = NumRows) {
++  namespace common = ::fmha_sm100::prefill_bf16x::sm100::common;
++  static_assert(NumRows == 128);
++  static_assert(HeadDim == 128);
++  static_assert(ScaleGroupSize == 16);
++
++  constexpr int kNumThreads = 128;
++  constexpr int kElementsPerThread = 8;
++  constexpr int kThreadsPerRow = HeadDim / kElementsPerThread;
++  constexpr int kRowsPerIteration = kNumThreads / kThreadsPerRow;
++  constexpr int kRowIterations = NumRows / kRowsPerIteration;
++  constexpr int kDataRowStride = HeadDim / 2;
++  constexpr int kScaleRowStride = HeadDim / ScaleGroupSize;
++  constexpr int kDataIterationStride = kDataRowStride * kRowsPerIteration;
++  constexpr int kScaleIterationStride = kScaleRowStride * kRowsPerIteration;
++  // One iteration advances 8 rows = one atom row group.
++  constexpr int kOutputIterationStride = bf16_tile_linear_byte_offset<MnMajor>(kRowsPerIteration, 0);
++
++  static_assert(kThreadsPerRow == 16);
++  static_assert(kRowsPerIteration == 8);
++  static_assert(kRowIterations == 16);
++  static_assert(kScaleIterationStride == (kRowsPerIteration / 4) * 32);
++  // The XOR only reads bits [7, 10) (the row within the atom), which the per-iteration stride
++  // (a multiple of 1 KB) does not touch, so the swizzled start address can be advanced linearly.
++  static_assert(kOutputIterationStride % 1024 == 0);
++
++  int const row_in_iteration = thread_idx / kThreadsPerRow;
++  int const lane_in_row = thread_idx % kThreadsPerRow;
++  int const d_base = lane_in_row * kElementsPerThread;
++  int const fp4_byte_base = d_base / 2;
++  int const scale_group = d_base / ScaleGroupSize;
++
++  uint32_t output_address =
++      static_cast<uint32_t>(__cvta_generic_to_shared(output_smem)) +
++      static_cast<uint32_t>(
++          sw128_swizzle_byte_offset(bf16_tile_linear_byte_offset<MnMajor>(row_in_iteration, d_base)));
++
++  uint8_t const* current_data = packed_fp4 + row_in_iteration * kDataRowStride + fp4_byte_base;
++  int const scale_offset =
++      TokenQuadScales ? (row_in_iteration / 4) * 32 + scale_group * 4 + row_in_iteration % 4
++                      : row_in_iteration * kScaleRowStride + scale_group;
++  uint8_t const* current_scale = scale + scale_offset;
++
++  CUTLASS_PRAGMA_UNROLL
++  for (int iteration = 0; iteration < kRowIterations; ++iteration) {
++    int const row = row_in_iteration + iteration * kRowsPerIteration;
++    uint32_t const packed = *reinterpret_cast<uint32_t const*>(current_data);
++    // Zero the scale of rows past the KV length before the multiply (exact zeros out).
++    uint8_t const scale_byte = row < valid_rows ? *current_scale : uint8_t{0};
++    uint32_t scale_bf16x2 = common::e4m3_to_bf16x2_broadcast(scale_byte);
++    if constexpr (FoldGlobalScale) {
++      // combined = bf16(block scale) x bf16(global scale), one RNE rounding in BF16.
++      scale_bf16x2 = common::mul_bf16x2_rn(scale_bf16x2, global_scale_bf16x2);
++    }
++    uint32_t out[4];
++    common::dequant_e2m1x8_to_bf16x8(out, packed, scale_bf16x2);
++    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
++                 :
++                 : "r"(output_address), "r"(out[0]), "r"(out[1]), "r"(out[2]), "r"(out[3])
++                 : "memory");
++    output_address += kOutputIterationStride;
++    current_data += kDataIterationStride;
++    current_scale += kScaleIterationStride;
++  }
++  // The tile is read by tcgen05.mma (async proxy).
++  cutlass::arch::fence_view_async_shared();
++}
++
++// Zero fill of a 128 x 128 BF16 tile (32 KB): a linear clear, the layout is irrelevant.
++template <int NumRows, int HeadDim>
++CUTLASS_DEVICE void clear_bf16_tile_smem(uint8_t* output_smem, int thread_idx) {
++  constexpr int kNumThreads = 128;
++  constexpr int kTileBytes = NumRows * HeadDim * 2;
++  constexpr int kChunkBytes = 16;
++  constexpr int kIterations = kTileBytes / (kNumThreads * kChunkBytes);
++  static_assert(kTileBytes % (kNumThreads * kChunkBytes) == 0);
++  uint32_t output_address = static_cast<uint32_t>(__cvta_generic_to_shared(output_smem)) +
++                            static_cast<uint32_t>(thread_idx * kChunkBytes);
++  uint32_t constexpr kZero = 0;
++  CUTLASS_PRAGMA_UNROLL
++  for (int iteration = 0; iteration < kIterations; ++iteration) {
++    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
++                 :
++                 : "r"(output_address), "r"(kZero), "r"(kZero), "r"(kZero), "r"(kZero)
++                 : "memory");
++    output_address += kNumThreads * kChunkBytes;
++  }
++  cutlass::arch::fence_view_async_shared();
++}
++
++#endif  // FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++
++}  // namespace fmha_sm100::prefill_bf16x::detail
+diff --git a/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh b/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
+index a68d061e7633e05a6aed40c5e2c9886755a7cc24..3ca9ae07400edf28f4027cb320c105995fea37a4 100644
+--- a/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
++++ b/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -22,7 +23,7 @@
+ #include "cutlass/arch/reg_reconfig.h"
+ #include "cutlass/cutlass.h"
+ 
+-namespace fmha_sm100::prefill_q8kv4 {
++namespace fmha_sm100::prefill_bf16x {
+ namespace detail {
+ 
+ using namespace cute;
+@@ -70,12 +71,20 @@ CUTLASS_DEVICE void initialize_work_tile(Storage &storage, PrefillArguments cons
+   storage.work_tile.valid_cols =
+       physical_page >= 0 && physical_page < arguments.physical_pages ? valid_cols : 0;
+   storage.work_tile.physical_page = physical_page;
+-  float const k_global_scale =
+-      arguments.k_global_scale_ptr != nullptr ? arguments.k_global_scale_ptr[0] : 1.0f;
+-  float const v_global_scale =
+-      arguments.v_global_scale_ptr != nullptr ? arguments.v_global_scale_ptr[0] : 1.0f;
+-  storage.work_tile.softmax_scale_log2 = arguments.softmax_scale_log2 * k_global_scale;
+-  storage.work_tile.output_scale = arguments.output_scale * v_global_scale;
++  if constexpr (kExactPath) {
++    // BF16: the K global scale is folded into the K dequant (not the softmax scale), the V global
++    // scale is applied by the combine, and the forward has no output scale. E4M3X: both global scales are inside
++    // the K / V dequant (the CuTe-DSL fp8 forward), no output scale.
++    storage.work_tile.softmax_scale_log2 = arguments.softmax_scale_log2;
++    storage.work_tile.output_scale = 1.0f;
++  } else {
++    float const k_global_scale =
++        arguments.k_global_scale_ptr != nullptr ? arguments.k_global_scale_ptr[0] : 1.0f;
++    float const v_global_scale =
++        arguments.v_global_scale_ptr != nullptr ? arguments.v_global_scale_ptr[0] : 1.0f;
++    storage.work_tile.softmax_scale_log2 = arguments.softmax_scale_log2 * k_global_scale;
++    storage.work_tile.output_scale = arguments.output_scale * v_global_scale;
++  }
+ }
+ 
+ template <class Storage> CUTLASS_DEVICE void initialize_pipeline_barriers(Storage &storage) {
+@@ -234,8 +243,9 @@ CUTLASS_DEVICE void run_load_warps(Storage &storage, Params const &params, int w
+         __syncwarp();
+       }
+       if (lane == 0) {
+-        cute::set_barrier_transaction_bytes(storage.q_full[q_stage],
+-                                            kQueriesPerGroup * kQHeadsPerKv * kHeadDim);
++        cute::set_barrier_transaction_bytes(
++            storage.q_full[q_stage],
++            kQueriesPerGroup * kQHeadsPerKv * kHeadDim * static_cast<int>(sizeof(Element)));
+       }
+       if (lane < kQueriesPerGroup) {
+         cutlass::arch::ClusterBarrier::arrive(&storage.q_full[q_stage]);
+@@ -258,13 +268,30 @@ CUTLASS_DEVICE void run_load_warps(Storage &storage, Params const &params, int w
+             int const q_abs = q_batch_offset + decode_q_idx(packed_qsplit);
+             q_tile = q_abs * arguments.num_kv_heads + head_kv;
+           }
+-          auto gQTile = local_tile(gQ, make_shape(Int<kQHeadsPerKv>{}, Int<kHeadDim>{}),
+-                                   make_coord(q_tile, _0{}));
+-          auto sQTile = make_tensor(make_smem_ptr(storage.q.begin() + q_stage * 128 * kHeadDim +
+-                                                  token * cosize_v<QTokenSmemLayout>),
+-                                    QTokenSmemLayout{});
+-          cute::copy(tma_q.with(reinterpret_cast<uint64_t &>(storage.q_full[q_stage])),
+-                     thr_tma_q.partition_S(gQTile), thr_tma_q.partition_D(sQTile));
++          if constexpr (kQTmaKBlocks == 1) {
++            auto gQTile = local_tile(gQ, make_shape(Int<kQHeadsPerKv>{}, Int<kHeadDim>{}),
++                                     make_coord(q_tile, _0{}));
++            auto sQTile = make_tensor(make_smem_ptr(storage.q.begin() + q_stage * 128 * kHeadDim +
++                                                    token * cosize_v<QTokenSmemLayout>),
++                                      QTokenSmemLayout{});
++            cute::copy(tma_q.with(reinterpret_cast<uint64_t &>(storage.q_full[q_stage])),
++                       thr_tma_q.partition_S(gQTile), thr_tma_q.partition_D(sQTile));
++          } else {
++            // BF16: one box per 64-dim SW128 k-atom; in the stage layout k-atom kb of all 128
++            // rows starts at kb * 128 * kQTmaCols elements and a token's 16 rows are contiguous
++            // within it.
++            CUTLASS_PRAGMA_UNROLL
++            for (int k_block = 0; k_block < kQTmaKBlocks; ++k_block) {
++              auto gQTile = local_tile(gQ, make_shape(Int<kQHeadsPerKv>{}, Int<kQTmaCols>{}),
++                                       make_coord(q_tile, k_block));
++              auto sQTile = make_tensor(
++                  make_smem_ptr(storage.q.begin() + q_stage * 128 * kHeadDim +
++                                k_block * 128 * kQTmaCols + token * cosize_v<QTokenSmemLayout>),
++                  QTokenSmemLayout{});
++              cute::copy(tma_q.with(reinterpret_cast<uint64_t &>(storage.q_full[q_stage])),
++                         thr_tma_q.partition_S(gQTile), thr_tma_q.partition_D(sQTile));
++            }
++          }
+         }
+       }
+     }
+@@ -384,15 +411,35 @@ CUTLASS_DEVICE void run_softmax_warpgroup(Storage &storage, PrefillArguments con
+   // The two softmax warpgroups perform KV dequant before consuming their
+   // respective score stages: stage 0 owns K and stage 1 owns V.
+   if (score_stage == 0) {
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++    if (valid_page) {
++      // K global scale folded into every K block scale: bf16(scale) x cvt.rn.bf16(k_global).
++      float const k_global_scale =
++          arguments.k_global_scale_ptr != nullptr ? arguments.k_global_scale_ptr[0] : 1.0f;
++      uint32_t const k_global_bf16x2 =
++          ::fmha_sm100::prefill_bf16x::sm100::common::f32_to_bf16x2_broadcast(k_global_scale);
++      cute::wait_barrier(storage.k_tma_full, 0);
++      dequant_fp4_tile_to_bf16_smem<kPageSize, kHeadDim, 16, /*TokenQuadScales=*/false,
++                                    /*MnMajor=*/false, /*FoldGlobalScale=*/true>(
++          &storage.k_raw[0][0], &storage.k_scale[0][0],
++          reinterpret_cast<uint8_t *>(storage.k.begin()), group_thread, k_global_bf16x2);
++    } else {
++      clear_bf16_tile_smem<kPageSize, kHeadDim>(reinterpret_cast<uint8_t *>(storage.k.begin()),
++                                                group_thread);
++    }
++#else
+     if (valid_page) {
+       cute::wait_barrier(storage.k_tma_full, 0);
++      float const e4m3x_k_global =
++          kE4M3X && arguments.k_global_scale_ptr != nullptr ? arguments.k_global_scale_ptr[0] : 1.0f;
+       dequant_fp4_tile_to_fp8_smem<kPageSize, kHeadDim, 16, /*TokenQuadScales=*/false>(
+           &storage.k_raw[0][0], &storage.k_scale[0][0],
+-          reinterpret_cast<uint8_t *>(storage.k.begin()), group_thread);
++          reinterpret_cast<uint8_t *>(storage.k.begin()), group_thread, kPageSize, e4m3x_k_global);
+     } else {
+       clear_fp8_tile_smem<kPageSize, kHeadDim>(reinterpret_cast<uint8_t *>(storage.k.begin()),
+                                                group_thread);
+     }
++#endif
+     cutlass::arch::NamedBarrier dequant_barrier(WarpSpecialization::kSoftmaxWarps * 32,
+                                                 kKvDequantKBarrierId);
+     dequant_barrier.arrive_and_wait();
+@@ -400,17 +447,35 @@ CUTLASS_DEVICE void run_softmax_warpgroup(Storage &storage, PrefillArguments con
+       cutlass::arch::ClusterBarrier::arrive(&storage.k_dequant_full);
+     }
+   } else {
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++    if (valid_page) {
++      cute::wait_barrier(storage.v_tma_full, 0);
++      // V rows past the KV length are zeroed (zero scale before the multiply). The V global
++      // scale is not applied here: the combine applies it.
++      dequant_fp4_tile_to_bf16_smem<kPageSize, kHeadDim, 16, /*TokenQuadScales=*/true,
++                                    /*MnMajor=*/true, /*FoldGlobalScale=*/false>(
++          &storage.v_raw[0][0], &storage.v_scale[0][0],
++          reinterpret_cast<uint8_t *>(storage.v.begin()), group_thread,
++          /*global_scale_bf16x2=*/0u, storage.work_tile.valid_cols);
++    } else {
++      clear_bf16_tile_smem<kPageSize, kHeadDim>(reinterpret_cast<uint8_t *>(storage.v.begin()),
++                                                group_thread);
++    }
++#else
+     if (valid_page) {
+       cute::wait_barrier(storage.v_tma_full, 0);
+       // V rows past the KV length are zeroed: see dequant_fp4_tile_to_fp8_smem.
++      float const e4m3x_v_global =
++          kE4M3X && arguments.v_global_scale_ptr != nullptr ? arguments.v_global_scale_ptr[0] : 1.0f;
+       dequant_fp4_tile_to_fp8_smem<kPageSize, kHeadDim, 16, /*TokenQuadScales=*/true>(
+           &storage.v_raw[0][0], &storage.v_scale[0][0],
+           reinterpret_cast<uint8_t *>(storage.v.begin()), group_thread,
+-          storage.work_tile.valid_cols);
++          storage.work_tile.valid_cols, e4m3x_v_global);
+     } else {
+       clear_fp8_tile_smem<kPageSize, kHeadDim>(reinterpret_cast<uint8_t *>(storage.v.begin()),
+                                                group_thread);
+     }
++#endif
+     cutlass::arch::NamedBarrier dequant_barrier(WarpSpecialization::kSoftmaxWarps * 32,
+                                                 kKvDequantVBarrierId);
+     dequant_barrier.arrive_and_wait();
+@@ -508,4 +573,4 @@ CUTLASS_DEVICE void run_epilogue_warpgroup(Storage &storage, PrefillArguments co
+ }
+ 
+ } // namespace detail
+-} // namespace fmha_sm100::prefill_q8kv4
++} // namespace fmha_sm100::prefill_bf16x
+diff --git a/csrc/include/sm100/common/nvfp4_to_bf16.cuh b/csrc/include/sm100/common/nvfp4_to_bf16.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4ed8a986c9da54769fb832eb9020d88042c0fbc
+--- /dev/null
++++ b/csrc/include/sm100/common/nvfp4_to_bf16.cuh
+@@ -0,0 +1,118 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++// SPDX-License-Identifier: MIT
++
++#pragma once
++
++// NVFP4 (E2M1 code x E4M3 block scale) -> BF16 dequant helpers for the BF16 data path
++// (FMHA_SM100_PREFILL_BF16X_DTYPE == 1).
++//
++// Exactness:
++//  * E2M1 -> BF16 is exact: the E2M1 values (+-{0, 0.5, 1, 1.5, 2, 3, 4, 6}) have at most two
++//    significant bits. The path is cvt.rn.f16x2.e2m1x2 (exact, F16 holds them), cvt.f32.f16
++//    (exact, widening) and cvt.rn.bf16x2.f32 (exact: 2 significant bits fit BF16's 8, and the
++//    exponent range is inside BF16's). A direct cvt.rn.bf16x2.e2m1x2 is not used: CUTLASS 4.8 has
++//    no use of it and it could not be verified against the toolchain without compiling.
++//  * E4M3 -> BF16 is exact: E4M3 values have at most 4 significant bits and magnitudes in
++//    [2^-9, 448], so F16 (cvt.rn.f16x2.e4m3x2) holds them exactly, and so does BF16. A NaN scale
++//    (0x7F / 0xFF) stays NaN.
++//  * code x scale in mul.rn.bf16x2 is exact: at most 2 + 4 = 6 significant bits <= 8, magnitude
++//    in [2^-10, 2688]; no rounding happens.
++//  * For K the block scale is first multiplied by the K global scale (cvt.rn.bf16 of the fp32
++//    global), mul.rn.bf16x2(scale_bf16, kglobal_bf16): that product and the following
++//    code x combined product each round once to nearest-even in BF16. This is the defined
++//    reference semantics of the BF16X K dequant.
++
++#include <cstdint>
++
++#include "cutlass/cutlass.h"
++
++namespace fmha_sm100::prefill_bf16x::sm100::common {
++
++// fp32 -> BF16 (round to nearest even), duplicated into both halves of a bf16x2.
++CUTLASS_DEVICE uint32_t f32_to_bf16x2_broadcast(float value) {
++  uint32_t packed;
++  asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(packed) : "f"(value));
++  return packed;
++}
++
++// Two fp32 -> one bf16x2 with `lo` in bits [15:0] and `hi` in bits [31:16] (cvt.rn.bf16x2.f32
++// puts its first source in the upper half).
++CUTLASS_DEVICE uint32_t pack_bf16x2_rn(float lo, float hi) {
++  uint32_t packed;
++  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(packed) : "f"(hi), "f"(lo));
++  return packed;
++}
++
++CUTLASS_DEVICE uint32_t mul_bf16x2_rn(uint32_t lhs, uint32_t rhs) {
++  uint32_t product;
++  asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(product) : "r"(lhs), "r"(rhs));
++  return product;
++}
++
++// One E4M3 block-scale byte -> BF16, duplicated into both halves (exact, see above).
++// BF16X-M3: the reference's bit decode (utils cvt_fp8x4_e4m3_bf16x4 on the byte replicated x4):
++// sign | (exp, mant) >> 4 as a BF16 pattern, then fma.rn.bf16x2 by 2^120. Equal to the hardware
++// cvt on every finite code; the NaN codes 0x7f / 0xff decode to +-480 as in the reference.
++CUTLASS_DEVICE uint32_t e4m3_to_bf16x2_broadcast(uint8_t scale_e4m3) {
++  uint32_t const replicated = static_cast<uint32_t>(scale_e4m3) * 0x01010101u;
++  uint32_t packed;
++  asm("{\n"
++      ".reg .b32 q, mant, out, bias, zero;\n"
++      "prmt.b32 q, %1, %1, 0x1302;\n"
++      "and.b32 out, q, 0x80008000;\n"
++      "and.b32 mant, q, 0x7f007f00;\n"
++      "shr.u32 mant, mant, 4;\n"
++      "or.b32 out, out, mant;\n"
++      "mov.b32 bias, 0x7b807b80;\n"
++      "mov.b32 zero, 0;\n"
++      "fma.rn.bf16x2 %0, out, bias, zero;\n"
++      "}\n"
++      : "=r"(packed)
++      : "r"(replicated));
++  return packed;
++}
++
++// Dequantizes eight consecutive E2M1 values (one 32-bit word, element i in nibble i, so the low
++// nibble of each byte is the even element) that share one scale into eight BF16 values:
++// out[j] holds elements 2j (bits [15:0]) and 2j + 1 (bits [31:16]), the little-endian SMEM order.
++// `scale_bf16x2` is the (combined) scale in both halves.
++CUTLASS_DEVICE void dequant_e2m1x8_to_bf16x8(uint32_t (&out)[4], uint32_t packed_fp4,
++                                             uint32_t scale_bf16x2) {
++  asm("{\n"
++      ".reg .b8 e0, e1, e2, e3;\n"
++      ".reg .b32 h0, h1, h2, h3;\n"
++      ".reg .b16 l0, u0, l1, u1, l2, u2, l3, u3;\n"
++      ".reg .f32 fl0, fu0, fl1, fu1, fl2, fu2, fl3, fu3;\n"
++      ".reg .b32 b0, b1, b2, b3;\n"
++      "mov.b32 {e0, e1, e2, e3}, %4;\n"
++      "cvt.rn.f16x2.e2m1x2 h0, e0;\n"
++      "cvt.rn.f16x2.e2m1x2 h1, e1;\n"
++      "cvt.rn.f16x2.e2m1x2 h2, e2;\n"
++      "cvt.rn.f16x2.e2m1x2 h3, e3;\n"
++      "mov.b32 {l0, u0}, h0;\n"
++      "mov.b32 {l1, u1}, h1;\n"
++      "mov.b32 {l2, u2}, h2;\n"
++      "mov.b32 {l3, u3}, h3;\n"
++      "cvt.f32.f16 fl0, l0;\n"
++      "cvt.f32.f16 fu0, u0;\n"
++      "cvt.f32.f16 fl1, l1;\n"
++      "cvt.f32.f16 fu1, u1;\n"
++      "cvt.f32.f16 fl2, l2;\n"
++      "cvt.f32.f16 fu2, u2;\n"
++      "cvt.f32.f16 fl3, l3;\n"
++      "cvt.f32.f16 fu3, u3;\n"
++      "cvt.rn.bf16x2.f32 b0, fu0, fl0;\n"
++      "cvt.rn.bf16x2.f32 b1, fu1, fl1;\n"
++      "cvt.rn.bf16x2.f32 b2, fu2, fl2;\n"
++      "cvt.rn.bf16x2.f32 b3, fu3, fl3;\n"
++      "mul.rn.bf16x2 %0, b0, %5;\n"
++      "mul.rn.bf16x2 %1, b1, %5;\n"
++      "mul.rn.bf16x2 %2, b2, %5;\n"
++      "mul.rn.bf16x2 %3, b3, %5;\n"
++      "}\n"
++      : "=&r"(out[0]), "=&r"(out[1]), "=&r"(out[2]), "=&r"(out[3])
++      : "r"(packed_fp4), "r"(scale_bf16x2));
++}
++
++}  // namespace fmha_sm100::prefill_bf16x::sm100::common
+diff --git a/csrc/include/sm100/common/nvfp4_to_e4m3.cuh b/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
+index 68da91a0074e8ca514647dea3d2b4280740c4c6c..e67261156edc64b42dfba85b6c772824ecbbceac 100644
+--- a/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
++++ b/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -7,33 +8,33 @@
+ 
+ #include "cutlass/cutlass.h"
+ 
+-#if !defined(FMHA_SM100_PREFILL_Q8KV4_HAS_QMUL4)
+-#error "The Q8KV4 prefill JIT must define FMHA_SM100_PREFILL_Q8KV4_HAS_QMUL4"
++#if !defined(FMHA_SM100_PREFILL_BF16X_HAS_QMUL4)
++#error "The BF16X prefill JIT must define FMHA_SM100_PREFILL_BF16X_HAS_QMUL4"
+ #endif
+-#if !defined(FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT)
+-#error "The Q8KV4 prefill JIT must define FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT"
++#if !defined(FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT)
++#error "The BF16X prefill JIT must define FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT"
+ #endif
+ 
+-#if FMHA_SM100_PREFILL_Q8KV4_HAS_QMUL4 &&                                                    \
++#if FMHA_SM100_PREFILL_BF16X_HAS_QMUL4 &&                                                    \
+     (!defined(__CUDACC_VER_MAJOR__) || (__CUDACC_VER_MAJOR__ < 13) ||                        \
+      (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ < 4))
+-#error "Q8KV4 prefill attention QMUL4 requires CUDA Toolkit 13.4 or newer"
++#error "BF16X prefill attention QMUL4 requires CUDA Toolkit 13.4 or newer"
+ #endif
+ 
+-namespace fmha_sm100::prefill_q8kv4::sm100::common {
++namespace fmha_sm100::prefill_bf16x::sm100::common {
+ 
+ // One E4M3 block scale duplicated into a 16-bit pair. With block-scale staging the scale is
+ // divided by 2^shift first: exact through f16, rounded back to E4M3 (scales below 2^(shift - 6)
+ // become subnormal, below 2^(shift - 10) zero), the decode kernel's rounding. Both dequant paths
+ // start from this pair, so they produce the same E4M3 values.
+-#if FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT == 0
++#if FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT == 0
+ CUTLASS_DEVICE uint16_t stage_block_scale_pair(uint8_t scale_e4m3) {
+   return static_cast<uint16_t>(scale_e4m3 * 0x0101u);
+ }
+ #else
+ CUTLASS_DEVICE uint16_t stage_block_scale_pair(uint8_t scale_e4m3) {
+   constexpr uint32_t kStageF16x2 =
+-      ((15u - FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT) << 10) * 0x00010001u;
++      ((15u - FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT) << 10) * 0x00010001u;
+   uint16_t const pair = static_cast<uint16_t>(scale_e4m3 * 0x0101u);
+   uint16_t staged;
+   asm("{\n"
+@@ -53,7 +54,7 @@ CUTLASS_DEVICE uint16_t stage_block_scale_pair(uint8_t scale_e4m3) {
+ // 4-7, each byte i being element i. `scale_word` comes from `make_dequant_scale_word`, so the
+ // per-element scale broadcast happens once per group of eight.
+ 
+-#if FMHA_SM100_PREFILL_Q8KV4_HAS_QMUL4
++#if FMHA_SM100_PREFILL_BF16X_HAS_QMUL4
+ 
+ // QMUL4 operand: the staged scale in all four lanes.
+ CUTLASS_DEVICE uint32_t make_dequant_scale_word(uint8_t scale_e4m3) {
+@@ -123,4 +124,47 @@ CUTLASS_DEVICE void dequant_e2m1x8_uniform_scale(
+ 
+ #endif
+ 
+-}  // namespace fmha_sm100::prefill_q8kv4::sm100::common
++// E4M3X (the CuTe-DSL fp8 forward's K / V dequant with a global scale, utils cvt_fp4x8_e2m1_scaled_e4m3x8 fallback):
++// the block scale as an exact f16 pair; per E2M1 pair: cvt.rn.f16x2.e2m1x2, mul.rn.f16x2 by the scale (exact),
++// cvt.f32.f16 (exact), mul.rn.f32 by the fp32 global scale (rounding 1), cvt.rn.satfinite.e4m3x2.f32 (rounding 2).
++// Byte i = element i (low nibble = even element). A 0 scale gives exact +-0; a NaN scale byte gives NaN.
++CUTLASS_DEVICE uint32_t e4m3x_scale_f16x2(uint8_t scale_e4m3) {
++  uint32_t scale_f16x2;
++  uint16_t const pair = static_cast<uint16_t>(scale_e4m3 * 0x0101u);
++  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(scale_f16x2) : "h"(pair));
++  return scale_f16x2;
++}
++
++CUTLASS_DEVICE uint16_t e4m3x_dequant_pair(uint32_t e2m1_byte, uint32_t scale_f16x2, float global_scale) {
++  uint16_t out;
++  asm("{\n"
++      ".reg .b8 e;\n"
++      ".reg .b32 f;\n"
++      ".reg .b16 h0, h1;\n"
++      ".reg .f32 x0, x1;\n"
++      "cvt.u8.u32 e, %1;\n"
++      "cvt.rn.f16x2.e2m1x2 f, e;\n"
++      "mul.rn.f16x2 f, f, %2;\n"
++      "mov.b32 {h0, h1}, f;\n"
++      "cvt.f32.f16 x0, h0;\n"
++      "cvt.f32.f16 x1, h1;\n"
++      "mul.rn.f32 x0, x0, %3;\n"
++      "mul.rn.f32 x1, x1, %3;\n"
++      "cvt.rn.satfinite.e4m3x2.f32 %0, x1, x0;\n"
++      "}\n"
++      : "=h"(out)
++      : "r"(e2m1_byte), "r"(scale_f16x2), "f"(global_scale));
++  return out;
++}
++
++CUTLASS_DEVICE void dequant_e2m1x8_scale_global_e4m3x(uint32_t& output_lo, uint32_t& output_hi, uint32_t packed_fp4,
++                                                      uint32_t scale_f16x2, float global_scale) {
++  uint32_t const q0 = e4m3x_dequant_pair(packed_fp4 & 0xffu, scale_f16x2, global_scale);
++  uint32_t const q1 = e4m3x_dequant_pair((packed_fp4 >> 8) & 0xffu, scale_f16x2, global_scale);
++  uint32_t const q2 = e4m3x_dequant_pair((packed_fp4 >> 16) & 0xffu, scale_f16x2, global_scale);
++  uint32_t const q3 = e4m3x_dequant_pair(packed_fp4 >> 24, scale_f16x2, global_scale);
++  output_lo = q0 | (q1 << 16);
++  output_hi = q2 | (q3 << 16);
++}
++
++}  // namespace fmha_sm100::prefill_bf16x::sm100::common
+diff --git a/csrc/include/sm100/common/prefill_attention_config.cuh b/csrc/include/sm100/common/prefill_attention_config.cuh
+index 5d55a306d3852d002eeb47d390675a59bf787dc1..93f96f221fc528076df255921ace0db9f9fc3084 100644
+--- a/csrc/include/sm100/common/prefill_attention_config.cuh
++++ b/csrc/include/sm100/common/prefill_attention_config.cuh
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -6,39 +7,81 @@
+ #include "cute/tensor.hpp"
+ 
+ #include "cute/arch/mma_sm100_umma.hpp"
++#include "cutlass/bfloat16.h"
+ #include "cutlass/cutlass.h"
+ #include "cutlass/float8.h"
+ 
+-#if !defined(FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT)
+-#error "The Q8KV4 prefill JIT must define FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT"
++#if !defined(FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT)
++#error "The BF16X prefill JIT must define FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT"
+ #endif
+-#if !defined(FMHA_SM100_PREFILL_Q8KV4_SM107)
+-#error "The Q8KV4 prefill JIT must define FMHA_SM100_PREFILL_Q8KV4_SM107"
++#if !defined(FMHA_SM100_PREFILL_BF16X_SM107)
++#error "The BF16X prefill JIT must define FMHA_SM100_PREFILL_BF16X_SM107"
++#endif
++// Data-path selector: 0 = E4M3 Q / E4M3 dequantized K,V / E4M3 P (kind::f8f6f4, the upstream
++// Q8KV4 path), 1 = BF16 Q / BF16 dequantized K,V / BF16 P (kind::f16). The JIT passes it only for
++// the BF16 extension, so an E4M3 build sees exactly the upstream configuration.
++#if !defined(FMHA_SM100_PREFILL_BF16X_DTYPE)
++#define FMHA_SM100_PREFILL_BF16X_DTYPE 0
++#endif
++#if FMHA_SM100_PREFILL_BF16X_DTYPE != 0 && FMHA_SM100_PREFILL_BF16X_DTYPE != 1
++#error "FMHA_SM100_PREFILL_BF16X_DTYPE must be 0 (E4M3) or 1 (BF16)"
+ #endif
+ 
+-namespace fmha_sm100::prefill_q8kv4::detail {
++namespace fmha_sm100::prefill_bf16x::detail {
+ 
++inline constexpr bool kBf16DataPath = FMHA_SM100_PREFILL_BF16X_DTYPE == 1;
++#if !defined(FMHA_SM100_PREFILL_BF16X_E4M3X)
++#define FMHA_SM100_PREFILL_BF16X_E4M3X 0
++#endif
++// E4M3X: the E4M3 data path transcribed op for op to the CuTe-DSL fp8 forward (the in-model VR path), the bitwise
++// target: K / V dequant with the fp32 global scale before the E4M3 conversion, no P range scaling, the DSL softmax /
++// epilogue / LSE roundings (the BF16X M3 set). Off (0) = the upstream Q8KV4 E4M3 kernel, unchanged.
++inline constexpr bool kE4M3X = !kBf16DataPath && FMHA_SM100_PREFILL_BF16X_E4M3X == 1;
++inline constexpr bool kExactPath = kBf16DataPath || kE4M3X;
++
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++using Element = cutlass::bfloat16_t;
++#else
+ using Element = cutlass::float_e4m3_t;
++#endif
+ using Accumulator = float;
+ 
+ inline constexpr int kQHeadsPerKv = 16;
+ inline constexpr int kHeadDim = 128;
+ inline constexpr int kPageSize = 128;
+ inline constexpr int kQueriesPerGroup = 128 / kQHeadsPerKv;
+-inline constexpr int kQStages = 8;
++// SMEM budget (227 KB = 232448 B of dynamic SMEM per CTA). One Q stage is a group of
++// kQueriesPerGroup = 8 tokens x 16 heads x 128 dims:
++//   E4M3: 8 x 16 x 128 x 1 B = 16 KB per stage, 8 stages = 128 KB; K + V tiles 2 x 16 KB.
++//   BF16: 8 x 16 x 128 x 2 B = 32 KB per stage, 4 stages = 128 KB; K + V tiles 2 x 32 KB.
++// Common: packed K/V 2 x 8 KB, K/V block scales 2 x 1 KB, qsplit ring 1 KB, row_sum/row_max
++// 2 KB, barriers + tmem_base + work tile ~0.4 KB; sizeof(SharedStorage) rounds up to 1 KB.
++//   E4M3: 131072 + 32768 + 16384 + 2048 + ~3.4 K = 185748 B -> sizeof 186368 B (182 KB).
++//   BF16: 131072 + 65536 + 16384 + 2048 + ~3.4 K = 218452 B -> sizeof 219136 B (214 KB).
++// A fifth BF16 stage would need 251904 B > 232448 B, so BF16 runs 4 stages (13 KB headroom).
++// The launch static_asserts sizeof(SharedStorage) <= 232448.
++inline constexpr int kQStages = kBf16DataPath ? 4 : 8;
+ inline constexpr int kScoreStages = 2;
+ inline constexpr int kQMetadataStages = 32;
+ // Block-scale staging: the dequant divides each E4M3 block scale by 2^kBlockScaleShift so that
+ // code x scale fits E4M3 for full-range (TransformerEngine-style) scales; the host folds 2^shift
+ // back into the softmax and output scales. Each shift is its own extension.
+-inline constexpr int kBlockScaleShift = FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT;
++inline constexpr int kBlockScaleShift = FMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT;
+ static_assert(kBlockScaleShift >= 0 && kBlockScaleShift <= 7, "block-scale shift out of range");
++// The BF16 dequant is exact (no requantization), so it has no block-scale staging.
++static_assert(!kBf16DataPath || kBlockScaleShift == 0, "the BF16 data path requires shift 0");
++static_assert(!kE4M3X || kBlockScaleShift == 0, "the E4M3X data path requires shift 0");
+ 
+ inline constexpr int kTmemScoreOffset = 0;
+ inline constexpr int kTmemScoreStride = 128;
+ inline constexpr int kTmemOutputOffset = 256;
+ inline constexpr int kTmemOutputStride = 128;
+-inline constexpr int kTmemProbabilityOffset = 96;
++// P aliases the upper columns of its S stage: E4M3 P (4 per 32-bit column) takes 32 columns at
++// +96, BF16 P (2 per column) takes 64 columns at +64. The softmax reads all 128 S columns into
++// registers before it writes P.
++inline constexpr int kTmemProbabilityOffset = kBf16DataPath ? 64 : 96;
++inline constexpr int kTmemProbabilityColumns = kPageSize * cute::sizeof_bits_v<Element> / 32;
++static_assert(kTmemProbabilityOffset + kTmemProbabilityColumns == kTmemScoreStride);
+ inline constexpr int kTmemColumns = 512;
+ 
+ inline constexpr int kPackedKvBytes = kPageSize * kHeadDim / 2;
+@@ -123,10 +166,16 @@ inline constexpr int kKvDequantVBarrierId = 7;
+ inline constexpr int kTmemBarrierId = 0;
+ inline constexpr int kQLoadBarrierId = 1;
+ 
++// One Q TMA box: a token's 16 heads x kQTmaCols dims. An SW128 K-major atom row is 128 bytes,
++// i.e. all 128 E4M3 dims but only 64 BF16 dims; the MMA's stage layout puts the two 64-dim BF16
++// k-atoms of all 128 rows 16 KB apart, so a BF16 token is loaded as two boxes (one per k-atom).
++inline constexpr int kQTmaCols = kBf16DataPath ? kHeadDim / 2 : kHeadDim;
++inline constexpr int kQTmaKBlocks = kHeadDim / kQTmaCols;
++
+ using QTokenSmemLayout = decltype(cute::coalesce(
+     cute::tile_to_shape(cute::UMMA::Layout_K_SW128_Atom<Element>{},
+-                        cute::Shape<cute::Int<kQHeadsPerKv>, cute::Int<kHeadDim>>{},
++                        cute::Shape<cute::Int<kQHeadsPerKv>, cute::Int<kQTmaCols>>{},
+                         cute::Step<cute::_1, cute::_2>{}),
+     cute::Shape<cute::_1, cute::_1>{}));
+ 
+-} // namespace fmha_sm100::prefill_q8kv4::detail
++} // namespace fmha_sm100::prefill_bf16x::detail
+diff --git a/csrc/include/sm100/common/prefill_attention_math.cuh b/csrc/include/sm100/common/prefill_attention_math.cuh
+index a8785da9d22c6304e5ec9f0b1857d82eab5319ed..7dcbd2cd82df815f17a6a89e60d104acd364363f 100644
+--- a/csrc/include/sm100/common/prefill_attention_math.cuh
++++ b/csrc/include/sm100/common/prefill_attention_math.cuh
+@@ -1,9 +1,13 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+ 
+ #include "sm100/common/prefill_attention_config.cuh"
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++#include "sm100/common/nvfp4_to_bf16.cuh"
++#endif
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -19,12 +23,16 @@
+ #include "cutlass/cutlass.h"
+ #include "cutlass/numeric_conversion.h"
+ 
+-namespace fmha_sm100::prefill_q8kv4 {
++namespace fmha_sm100::prefill_bf16x {
+ namespace detail {
+ 
+ using namespace cute;
+ 
+ constexpr float kLog2Fp8ProbabilityScale = 8.807354922057604f;
++// The E4M3 path scales P by 2^kLog2Fp8ProbabilityScale (448) so it uses the E4M3 range, and takes
++// it back out of the LSE. BF16 P needs no range scaling: the BF16 path uses 0 (and skips the LSE
++// subtraction altogether).
++constexpr float kLog2ProbabilityScale = kExactPath ? 0.0f : kLog2Fp8ProbabilityScale;
+ 
+ CUTLASS_DEVICE int decode_q_idx(int packed_qsplit) { return packed_qsplit & 0x00ffffff; }
+ 
+@@ -80,6 +88,73 @@ CUTLASS_DEVICE float2 fma_packed_f32x2(float2 lhs, float2 rhs, float2 addend) {
+   return result;
+ }
+ 
++// BF16X M3: the reference softmax's exact ops (BF16X_M0_DSL_MATH_TRACE_v1 + SASS confirm): packed f32x2 ops are .rn WITHOUT
++// ftz; the poly exp2 is utils.ex2_emulation_2(poly_degree=3) op for op.
++CUTLASS_DEVICE float2 add_packed_f32x2_rn(float2 lhs, float2 rhs) {
++  float2 result;
++  asm("add.rn.f32x2 %0, %1, %2;"
++      : "=l"(reinterpret_cast<uint64_t &>(result))
++      : "l"(reinterpret_cast<uint64_t const &>(lhs)), "l"(reinterpret_cast<uint64_t const &>(rhs)));
++  return result;
++}
++
++CUTLASS_DEVICE float2 fma_packed_f32x2_rn(float2 lhs, float2 rhs, float2 addend) {
++  float2 result;
++  asm("fma.rn.f32x2 %0, %1, %2, %3;"
++      : "=l"(reinterpret_cast<uint64_t &>(result))
++      : "l"(reinterpret_cast<uint64_t const &>(lhs)), "l"(reinterpret_cast<uint64_t const &>(rhs)),
++        "l"(reinterpret_cast<uint64_t const &>(addend)));
++  return result;
++}
++
++CUTLASS_DEVICE float2 sub_packed_f32x2_rn(float2 lhs, float2 rhs) {
++  float2 result;
++  asm("sub.rn.f32x2 %0, %1, %2;"
++      : "=l"(reinterpret_cast<uint64_t &>(result))
++      : "l"(reinterpret_cast<uint64_t const &>(lhs)), "l"(reinterpret_cast<uint64_t const &>(rhs)));
++  return result;
++}
++
++CUTLASS_DEVICE float2 add_packed_f32x2_rm(float2 lhs, float2 rhs) {
++  float2 result;
++  asm("add.rm.f32x2 %0, %1, %2;"
++      : "=l"(reinterpret_cast<uint64_t &>(result))
++      : "l"(reinterpret_cast<uint64_t const &>(lhs)), "l"(reinterpret_cast<uint64_t const &>(rhs)));
++  return result;
++}
++
++CUTLASS_DEVICE float max_f32(float a, float b) {
++  float r;
++  asm("max.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
++  return r;
++}
++
++CUTLASS_DEVICE float combine_int_frac_ex2(float x_rounded, float frac_ex2) {
++  float out;
++  asm("{\n\t.reg .s32 xi, fi, xe, oi;\n\tmov.b32 xi, %1;\n\tmov.b32 fi, %2;\n\tshl.b32 xe, xi, 23;\n\t"
++      "add.s32 oi, xe, fi;\n\tmov.b32 %0, oi;\n\t}"
++      : "=f"(out) : "f"(x_rounded), "f"(frac_ex2));
++  return out;
++}
++
++// utils.ex2_emulation_2(x, y, poly_degree=3): clamp -127, floor via add.rm(2^23+2^22), frac via two sub.rn, Horner
++// fma.rn.f32x2 with POLY_EX2[3] = (1.0, 0.695146143436431884765625, 0.227564394474029541015625,
++// 0.077119089663028717041015625) from the highest degree down, then exponent bits.
++CUTLASS_DEVICE float2 ex2_emulation_2(float2 xy) {
++  float const kRound = 12582912.0f;  // 2^23 + 2^22 (0f4B400000)
++  float2 const clamped = make_float2(max_f32(xy.x, -127.0f), max_f32(xy.y, -127.0f));
++  float2 const rounded = add_packed_f32x2_rm(clamped, make_float2(kRound, kRound));
++  float2 const rounded_back = sub_packed_f32x2_rn(rounded, make_float2(kRound, kRound));
++  float2 const frac = sub_packed_f32x2_rn(clamped, rounded_back);
++  float const c3 = 0.077119089663028717041015625f, c2 = 0.227564394474029541015625f;
++  float const c1 = 0.695146143436431884765625f, c0 = 1.0f;
++  float2 acc = make_float2(c3, c3);
++  acc = fma_packed_f32x2_rn(acc, frac, make_float2(c2, c2));
++  acc = fma_packed_f32x2_rn(acc, frac, make_float2(c1, c1));
++  acc = fma_packed_f32x2_rn(acc, frac, make_float2(c0, c0));
++  return make_float2(combine_int_frac_ex2(rounded.x, acc.x), combine_int_frac_ex2(rounded.y, acc.y));
++}
++
+ template <class Tensor> CUTLASS_DEVICE auto make_16x256b_tensor_mn_view(Tensor tensor) {
+   auto acc_layout = layout(tensor);
+   auto acc_layout_col_major = make_layout(shape(acc_layout));
+@@ -128,6 +203,18 @@ CUTLASS_DEVICE void issue_qk(TiledMma tiled_mma, ScoreTensor tS, auto const &tQ,
+   cutlass::arch::umma_arrive(done_barrier);
+ }
+ 
++template <int Offset, class Tensor, size_t... Indices>
++CUTLASS_DEVICE void tmem_store_32_impl(Tensor const &source, uint32_t destination,
++                                       cute::index_sequence<Indices...>) {
++  SM100_TMEM_STORE_32dp32b32x::copy(source(Offset + Indices)..., destination);
++}
++
++// 32 consecutive 32-bit TMEM columns of this thread's lane (BF16 P: one 64-key half).
++template <int Offset, class Tensor>
++CUTLASS_DEVICE void tmem_store_32(Tensor const &source, uint32_t destination) {
++  tmem_store_32_impl<Offset>(source, destination, cute::make_index_sequence<32>{});
++}
++
+ template <class TiledMmaQK>
+ CUTLASS_DEVICE void softmax_to_tmem(TiledMmaQK tiled_mma_qk, uint32_t score_address,
+                                     uint32_t probability_address, float softmax_scale_log2,
+@@ -179,9 +266,150 @@ CUTLASS_DEVICE void softmax_to_tmem(TiledMmaQK tiled_mma_qk, uint32_t score_addr
+ 
+   float const maximum_safe = maximum == -INFINITY ? 0.0f : maximum;
+   float2 const packed_scale = make_float2(softmax_scale_log2, softmax_scale_log2);
++  // BF16X-M3: packed-op ftz flags. fma/add.rn.ftz.f32x2 flush subnormal inputs and results; the
++  // exact reference softmax may need the non-ftz forms (or a different op order) here and below.
+   float2 const packed_bias =
+       fma_packed_f32x2(make_float2(-maximum_safe, -maximum_safe), packed_scale,
+-                       make_float2(kLog2Fp8ProbabilityScale, kLog2Fp8ProbabilityScale));
++                       make_float2(kLog2ProbabilityScale, kLog2ProbabilityScale));
++  if constexpr (kBf16DataPath) {
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++    // BF16X M3: the reference forms ms = max_safe * scale_log2 (fp32 mul) and x * scale_log2 - ms as one packed fma.
++    float const ms = __fmul_rn(maximum_safe, softmax_scale_log2);
++    float2 const bias_rn = make_float2(-ms, -ms);
++    // BF16 P: 2 keys per 32-bit TMEM column, so each 64-key half is 32 columns. The first half
++    // (keys 0-63, PV k-blocks 0-3) is published on p_early_full as soon as it is stored, the
++    // second (keys 64-127) on p_full; the PV MMA waits on them in that order.
++    namespace common = ::fmha_sm100::prefill_bf16x::sm100::common;
++    // BF16X-M3: row_sum association. Four packed partial sums (keys 8c + {0,1}, {2,3}, {4,5},
++    // {6,7}), reduced as (sum0 + sum1) + (sum2 + sum3), then .x + .y.
++    float2 sum0 = make_float2(0.0f, 0.0f);
++    float2 sum1 = make_float2(0.0f, 0.0f);
++    float2 sum2 = make_float2(0.0f, 0.0f);
++    float2 sum3 = make_float2(0.0f, 0.0f);
++    Tensor rP = make_tensor<uint32_t>(make_shape(Int<32>{}));
++    CUTLASS_PRAGMA_UNROLL
++    for (int half = 0; half < 2; ++half) {
++      CUTLASS_PRAGMA_UNROLL
++      for (int chunk = 0; chunk < 8; ++chunk) {
++        int const col = half * 64 + chunk * 8;
++        // BF16X M3: elements 44-47, 60-63, 76-79, 92-95 (fragments 1-2, k % 16 >= 12 of the reference's
++        // ex2_emu_freq 16 / res 4 / start_frg 1, causal) use the poly exp2; all others MUFU ex2.approx.ftz.
++        bool const poly_chunk = (col == 40) || (col == 56) || (col == 72) || (col == 88);
++        float2 p0 = fma_packed_f32x2_rn(make_float2(rS(col), rS(col + 1)), packed_scale, bias_rn);
++        p0.x = exp2_approx_ftz(p0.x);
++        p0.y = exp2_approx_ftz(p0.y);
++        sum0 = add_packed_f32x2_rn(sum0, p0);
++
++        float2 p1 = fma_packed_f32x2_rn(make_float2(rS(col + 2), rS(col + 3)), packed_scale, bias_rn);
++        p1.x = exp2_approx_ftz(p1.x);
++        p1.y = exp2_approx_ftz(p1.y);
++        sum1 = add_packed_f32x2_rn(sum1, p1);
++
++        float2 p2 = fma_packed_f32x2_rn(make_float2(rS(col + 4), rS(col + 5)), packed_scale, bias_rn);
++        if (poly_chunk) {
++          p2 = ex2_emulation_2(p2);
++        } else {
++          p2.x = exp2_approx_ftz(p2.x);
++          p2.y = exp2_approx_ftz(p2.y);
++        }
++        sum2 = add_packed_f32x2_rn(sum2, p2);
++
++        float2 p3 = fma_packed_f32x2_rn(make_float2(rS(col + 6), rS(col + 7)), packed_scale, bias_rn);
++        if (poly_chunk) {
++          p3 = ex2_emulation_2(p3);
++        } else {
++          p3.x = exp2_approx_ftz(p3.x);
++          p3.y = exp2_approx_ftz(p3.y);
++        }
++        sum3 = add_packed_f32x2_rn(sum3, p3);
++
++        // cvt.rn.bf16x2.f32, even key in the low half (TMEM A operand order).
++        rP(chunk * 4) = common::pack_bf16x2_rn(p0.x, p0.y);
++        rP(chunk * 4 + 1) = common::pack_bf16x2_rn(p1.x, p1.y);
++        rP(chunk * 4 + 2) = common::pack_bf16x2_rn(p2.x, p2.y);
++        rP(chunk * 4 + 3) = common::pack_bf16x2_rn(p3.x, p3.y);
++      }
++      tmem_store_32<0>(rP, probability_address + half * 32);
++      cutlass::arch::fence_view_async_tmem_store();
++      cutlass::arch::ClusterBarrier::arrive(half == 0 ? p_early_full : p_full);
++    }
++
++    sum0 = add_packed_f32x2_rn(sum0, sum1);
++    sum2 = add_packed_f32x2_rn(sum2, sum3);
++    sum0 = add_packed_f32x2_rn(sum0, sum2);
++    row_sum = __fadd_rn(sum0.x, sum0.y);
++    row_max = maximum;
++#endif
++    return;
++  }
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 0 && FMHA_SM100_PREFILL_BF16X_E4M3X == 1
++  // E4M3X: the CuTe-DSL fp8 softmax. Same ops as the BF16X M3 path (ms = max_safe x scale_log2 in fp32, then the
++  // packed non-ftz fma; the causal poly exp2 on elements 44-47 / 60-63 / 76-79 / 92-95; MUFU elsewhere; the row
++  // sum over the fp32 exps in the 4-accumulator order with non-ftz adds), then P = cvt.rn.satfinite.e4m3 of the
++  // UNSCALED exp (no 448 range factor), byte i = key i.
++  {
++    float const ms = __fmul_rn(maximum_safe, softmax_scale_log2);
++    float2 const bias_rn = make_float2(-ms, -ms);
++    float2 sum0 = make_float2(0.0f, 0.0f);
++    float2 sum1 = make_float2(0.0f, 0.0f);
++    float2 sum2 = make_float2(0.0f, 0.0f);
++    float2 sum3 = make_float2(0.0f, 0.0f);
++    Tensor rP = make_tensor<uint32_t>(make_shape(Int<32>{}));
++    auto pack_e4m3x4 = [](float2 lo, float2 hi) -> uint32_t {
++      uint16_t a;
++      uint16_t b;
++      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(a) : "f"(lo.y), "f"(lo.x));
++      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(b) : "f"(hi.y), "f"(hi.x));
++      return static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 16);
++    };
++    CUTLASS_PRAGMA_UNROLL
++    for (int chunk = 0; chunk < 16; ++chunk) {
++      int const col = chunk * 8;
++      bool const poly_chunk = (col == 40) || (col == 56) || (col == 72) || (col == 88);
++      float2 p0 = fma_packed_f32x2_rn(make_float2(rS(col), rS(col + 1)), packed_scale, bias_rn);
++      p0.x = exp2_approx_ftz(p0.x);
++      p0.y = exp2_approx_ftz(p0.y);
++      sum0 = add_packed_f32x2_rn(sum0, p0);
++      float2 p1 = fma_packed_f32x2_rn(make_float2(rS(col + 2), rS(col + 3)), packed_scale, bias_rn);
++      p1.x = exp2_approx_ftz(p1.x);
++      p1.y = exp2_approx_ftz(p1.y);
++      sum1 = add_packed_f32x2_rn(sum1, p1);
++      float2 p2 = fma_packed_f32x2_rn(make_float2(rS(col + 4), rS(col + 5)), packed_scale, bias_rn);
++      if (poly_chunk) {
++        p2 = ex2_emulation_2(p2);
++      } else {
++        p2.x = exp2_approx_ftz(p2.x);
++        p2.y = exp2_approx_ftz(p2.y);
++      }
++      sum2 = add_packed_f32x2_rn(sum2, p2);
++      float2 p3 = fma_packed_f32x2_rn(make_float2(rS(col + 6), rS(col + 7)), packed_scale, bias_rn);
++      if (poly_chunk) {
++        p3 = ex2_emulation_2(p3);
++      } else {
++        p3.x = exp2_approx_ftz(p3.x);
++        p3.y = exp2_approx_ftz(p3.y);
++      }
++      sum3 = add_packed_f32x2_rn(sum3, p3);
++      rP(chunk * 2) = pack_e4m3x4(p0, p1);
++      rP(chunk * 2 + 1) = pack_e4m3x4(p2, p3);
++    }
++    sum0 = add_packed_f32x2_rn(sum0, sum1);
++    sum2 = add_packed_f32x2_rn(sum2, sum3);
++    sum0 = add_packed_f32x2_rn(sum0, sum2);
++    float const sum = __fadd_rn(sum0.x, sum0.y);
++
++    tmem_store_16<0>(rP, probability_address);
++    cutlass::arch::fence_view_async_tmem_store();
++    cutlass::arch::ClusterBarrier::arrive(p_early_full);
++
++    tmem_store_16<16>(rP, probability_address + 16);
++    cutlass::arch::fence_view_async_tmem_store();
++    cutlass::arch::ClusterBarrier::arrive(p_full);
++
++    row_sum = sum;
++    row_max = maximum;
++  }
++#elif FMHA_SM100_PREFILL_BF16X_DTYPE == 0
+   float2 sum0 = make_float2(0.0f, 0.0f);
+   float2 sum1 = make_float2(0.0f, 0.0f);
+   float2 sum2 = make_float2(0.0f, 0.0f);
+@@ -254,6 +482,7 @@ CUTLASS_DEVICE void softmax_to_tmem(TiledMmaQK tiled_mma_qk, uint32_t score_addr
+ 
+   row_sum = sum;
+   row_max = maximum;
++#endif
+ }
+ 
+ // Thread-level views of one 64-column half of the O accumulator: the tiled TMEM copy, its source
+@@ -317,9 +546,12 @@ CUTLASS_DEVICE void store_partial_output_pass(RegTensor const &rOPass,
+       uint32_t packed[4];
+       CUTLASS_PRAGMA_UNROLL
+       for (int pair = 0; pair < 4; ++pair) {
+-        float2 const value =
+-            make_float2(rOMn(row_index, column_base + 2 * pair) * state.scale,
+-                        rOMn(row_index, column_base + 2 * pair + 1) * state.scale);
++        // BF16X M3: the reference's o x rcp is mul.rn.f32x2 (no ftz): explicit __fmul_rn on the BF16 path.
++        float2 const value = kExactPath
++            ? make_float2(__fmul_rn(rOMn(row_index, column_base + 2 * pair), state.scale),
++                          __fmul_rn(rOMn(row_index, column_base + 2 * pair + 1), state.scale))
++            : make_float2(rOMn(row_index, column_base + 2 * pair) * state.scale,
++                          rOMn(row_index, column_base + 2 * pair + 1) * state.scale);
+         __nv_bfloat162 const bf16_pair = __float22bfloat162_rn(value);
+         packed[pair] = *reinterpret_cast<uint32_t const *>(&bf16_pair);
+       }
+@@ -378,7 +610,15 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor
+           (static_cast<int64_t>(q_abs) * num_q_heads + head) * kHeadDim;
+       float const sum = row_sum[row];
+       rows[row_index][half].ptr = o_partial_ptr + row_offset;
+-      rows[row_index][half].scale = sum > 0.0f ? rcp_approx_ftz(sum) * output_scale : 0.0f;
++      if constexpr (kExactPath) {
++        // No output scale in the BF16 forward: O = acc x rcp.approx.ftz(row_sum), with
++        // rcp(1) for an empty (0) or NaN sum.
++        // BF16X-M3: epilogue rounding (rcp.approx, the fp32 multiply and the RN bf16 store).
++        float const divisor = (sum == 0.0f || sum != sum) ? 1.0f : sum;
++        rows[row_index][half].scale = rcp_approx_ftz(divisor);
++      } else {
++        rows[row_index][half].scale = sum > 0.0f ? rcp_approx_ftz(sum) * output_scale : 0.0f;
++      }
+       rows[row_index][half].valid = qi < q_count;
+     }
+   }
+@@ -414,8 +654,16 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor
+     float lse = -INFINITY;
+     if (lse_sum > 0.0f && isfinite(lse_max)) {
+       constexpr float kLn2 = 0.6931471805599453f;
+-      lse = (lse_max * softmax_scale_log2 + log2_approx_ftz(lse_sum) - kLog2Fp8ProbabilityScale) *
+-            kLn2;
++      if constexpr (kExactPath) {
++        // BF16X-M3: LSE fma. Left to the compiler (contracted to fma(max, scale, lg2(sum)) or
++        // not); the exact reference fixes the op order and rounding.
++        // BF16X M3: the reference's contracted fma(row_max_raw, scale_log2, lg2(sum)) then x ln2 (PTX fma.rn.f32 + mul).
++        lse = __fmul_rn(__fmaf_rn(lse_max, softmax_scale_log2, log2_approx_ftz(lse_sum)), kLn2);
++      } else {
++        lse = (lse_max * softmax_scale_log2 + log2_approx_ftz(lse_sum) -
++               kLog2Fp8ProbabilityScale) *
++              kLn2;
++      }
+     }
+     int64_t const lse_offset =
+         (static_cast<int64_t>(split) * total_q + q_abs) * num_q_heads + lse_head;
+@@ -424,4 +672,4 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor
+ }
+ 
+ } // namespace detail
+-} // namespace fmha_sm100::prefill_q8kv4
++} // namespace fmha_sm100::prefill_bf16x
+diff --git a/csrc/include/sm100/common/sm107_mma_ts.cuh b/csrc/include/sm100/common/sm107_mma_ts.cuh
+index fa5a400f26f315db6670cf685df5932d9bb5557a..ef53314e288f6b30b1121fc929d264b18c3a80fd 100644
+--- a/csrc/include/sm100/common/sm107_mma_ts.cuh
++++ b/csrc/include/sm100/common/sm107_mma_ts.cuh
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -7,12 +8,19 @@
+ // (SM107_MMA_F8F6F4_SS) but no TS form; the instruction is the same as SM100's TS form, only the
+ // instruction descriptor selects the 64-deep K (make_sm107_instr_desc), which runs at twice the
+ // SM100 FP8 rate on SM107.
++//
++// BF16 data path (FMHA_SM100_PREFILL_BF16X_DTYPE == 1): Sm107MmaF16Bf16Ts is the kind::f16 TS
++// form (A = P in TMEM, B = V in SMEM, BF16 x BF16 -> FP32) for SM107. CUTLASS 4.8 has no SM107_*
++// f16 atom; its SM100_MMA_F16BF16_TS is compiled for SM107A too (CUTE_ARCH_TCGEN05_F16F32_MMA_
++// ENABLED), and the f16 instruction descriptor has no SM107 K extension (k_size_ is f8f6f4-only),
++// so this atom is the same PTX and the standard descriptor with K = 16 (256 bits). It is kept
++// local, like the f8f6f4 atom, so the SM107 PV path does not depend on that CUTLASS gating.
+ 
+ #include "cute/tensor.hpp"
+ 
+ #include "sm100/common/prefill_attention_config.cuh"
+ 
+-#if FMHA_SM100_PREFILL_Q8KV4_SM107
++#if FMHA_SM100_PREFILL_BF16X_SM107
+ 
+ #include "cute/arch/config.hpp"
+ #include "cute/arch/mma_sm100_desc.hpp"
+@@ -20,7 +28,7 @@
+ #include "cute/atom/mma_traits.hpp"
+ #include "cute/atom/mma_traits_sm100.hpp"
+ 
+-namespace fmha_sm100::prefill_q8kv4::detail {
++namespace fmha_sm100::prefill_bf16x::detail {
+ 
+ template <class a_type, class b_type, class c_type, int M, int N, cute::UMMA::Major a_major,
+           cute::UMMA::Major b_major, cute::UMMA::ScaleIn a_neg = cute::UMMA::ScaleIn::One,
+@@ -59,13 +67,53 @@ struct Sm107MmaF8F6F4Ts {
+   }
+ };
+ 
+-} // namespace fmha_sm100::prefill_q8kv4::detail
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++template <class a_type, class b_type, class c_type, int M, int N, cute::UMMA::Major a_major,
++          cute::UMMA::Major b_major, cute::UMMA::ScaleIn a_neg = cute::UMMA::ScaleIn::One,
++          cute::UMMA::ScaleIn b_neg = cute::UMMA::ScaleIn::One,
++          cute::UMMA::Saturate c_sat = cute::UMMA::Saturate::False>
++struct Sm107MmaF16Bf16Ts {
++  static_assert(M == 128, "Sm107MmaF16Bf16Ts: M must be 128");
++  static_assert(N % 16 == 0 && N >= 16 && N <= 256,
++                "Sm107MmaF16Bf16Ts: N must be a multiple of 16");
++  static_assert(a_major == cute::UMMA::Major::K, "Sm107MmaF16Bf16Ts: A from TMEM is K-major");
++
++  using DRegisters = void;
++  using ARegisters = uint32_t[1];
++  using BRegisters = uint64_t[1];
++  using CRegisters = uint32_t[1];
++
++  CUTE_HOST_DEVICE static void fma(uint32_t const &tmem_a, uint64_t const &desc_b,
++                                   uint32_t const &tmem_c, uint32_t const &scaleC,
++                                   uint64_t const &idescE) {
++#if defined(CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED)
++    if (cute::elect_one_sync()) {
++      uint32_t mask[4] = {0, 0, 0, 0};
++      asm volatile("{\n\t"
++                   ".reg .pred p;\n\t"
++                   "setp.ne.b32 p, %4, 0;\n\t"
++                   "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, "
++                   "{%5, %6, %7, %8}, p; \n\t"
++                   "}\n"
++                   :
++                   : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE >> 32)),
++                     "r"(scaleC), "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
++    }
++#else
++    CUTE_INVALID_CONTROL_PATH(
++        "Sm107MmaF16Bf16Ts requires CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED");
++#endif
++  }
++};
++#endif // FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++
++} // namespace fmha_sm100::prefill_bf16x::detail
+ 
+ namespace cute {
+ 
+ template <class a_type, class b_type, class c_type, int M, int N, UMMA::Major a_major,
+           UMMA::Major b_major, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, UMMA::Saturate c_sat>
+-struct MMA_Traits<fmha_sm100::prefill_q8kv4::detail::Sm107MmaF8F6F4Ts<
++struct MMA_Traits<fmha_sm100::prefill_bf16x::detail::Sm107MmaF8F6F4Ts<
+     a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg, c_sat>> {
+   using ValTypeD = c_type;
+   using ValTypeA = a_type;
+@@ -105,12 +153,63 @@ struct MMA_Traits<fmha_sm100::prefill_q8kv4::detail::Sm107MmaF8F6F4Ts<
+     uint64_t desc_b = B[0];
+     uint32_t tmem_c = raw_pointer_cast(D.data());
+     uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+-    fmha_sm100::prefill_q8kv4::detail::Sm107MmaF8F6F4Ts<a_type, b_type, c_type, M, N, a_major,
++    fmha_sm100::prefill_bf16x::detail::Sm107MmaF8F6F4Ts<a_type, b_type, c_type, M, N, a_major,
+                                                         b_major, a_neg, b_neg, c_sat>::
+         fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+   }
+ };
+ 
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++template <class a_type, class b_type, class c_type, int M, int N, UMMA::Major a_major,
++          UMMA::Major b_major, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, UMMA::Saturate c_sat>
++struct MMA_Traits<fmha_sm100::prefill_bf16x::detail::Sm107MmaF16Bf16Ts<
++    a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg, c_sat>> {
++  using ValTypeD = c_type;
++  using ValTypeA = a_type;
++  using ValTypeB = b_type;
++  using ValTypeC = c_type;
++  static_assert(cute::sizeof_bits_v<a_type> == 16 && cute::sizeof_bits_v<b_type> == 16,
++                "Sm107MmaF16Bf16Ts takes 16-bit A and B");
++
++  using FrgTypeA = UMMA::tmem_frg_1sm<a_type, a_type, UMMA::TmemAllocMode::NonInterleaved>;
++  using FrgTypeB = UMMA::smem_desc<b_major>;
++  using FrgTypeC = UMMA::tmem_frg_1sm<c_type, int32_t, UMMA::TmemAllocMode::NonInterleaved>;
++
++  // 256-bit logical K per instruction: 16 BF16 elements (no SM107 K extension for kind::f16).
++  static constexpr int K = 256 / cute::sizeof_bits<ValTypeA>::value;
++
++  using Shape_MNK = Shape<Int<M>, Int<N>, Int<K>>;
++  using ThrID = Layout<_1>;
++  using ALayout = Layout<Shape<_1, Shape<Int<M>, Int<K>>>, Stride<_0, Stride<_1, Int<M>>>>;
++  using BLayout = Layout<Shape<_1, Shape<Int<N>, Int<K>>>, Stride<_0, Stride<_1, Int<N>>>>;
++  using CLayout = Layout<Shape<_1, Shape<Int<M>, Int<N>>>, Stride<_0, Stride<_1, Int<M>>>>;
++
++  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
++
++  UMMA::InstrDescriptor idesc_ =
++      UMMA::make_instr_desc<a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg,
++                            c_sat>();
++
++  template <class TD, class DLayout, class TA, class ALayout, class TB, class BLayout, class TC,
++            class CLayout>
++  CUTE_HOST_DEVICE constexpr friend void
++  mma_unpack(MMA_Traits const &traits, Tensor<TD, DLayout> &D, Tensor<TA, ALayout> const &A,
++             Tensor<TB, BLayout> const &B, Tensor<TC, CLayout> const &C) {
++    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
++    static_assert(is_tmem<TA>::value, "Expected tmem in MMA_Atom::call");
++    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
++    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
++    uint32_t tmem_a = raw_pointer_cast(A.data());
++    uint64_t desc_b = B[0];
++    uint32_t tmem_c = raw_pointer_cast(D.data());
++    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
++    fmha_sm100::prefill_bf16x::detail::Sm107MmaF16Bf16Ts<a_type, b_type, c_type, M, N, a_major,
++                                                         b_major, a_neg, b_neg, c_sat>::
++        fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
++  }
++};
++#endif // FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++
+ } // namespace cute
+ 
+-#endif // FMHA_SM100_PREFILL_Q8KV4_SM107
++#endif // FMHA_SM100_PREFILL_BF16X_SM107
+diff --git a/csrc/include/sm100/device/prefill_attention.hpp b/csrc/include/sm100/device/prefill_attention.hpp
+index 25da849e9589e7fe1e64fb4d3cf8105bb5e4c95e..03b2b6a43699bd850667642e08c1bad289f78463 100644
+--- a/csrc/include/sm100/device/prefill_attention.hpp
++++ b/csrc/include/sm100/device/prefill_attention.hpp
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -9,7 +10,13 @@
+ 
+ #include "cutlass/bfloat16.h"
+ 
+-namespace fmha_sm100::prefill_q8kv4 {
++// Data-path selector (see prefill_attention_config.cuh): 0 = E4M3, 1 = BF16. Passed by the JIT
++// for the BF16 extension only.
++#if !defined(FMHA_SM100_PREFILL_BF16X_DTYPE)
++#define FMHA_SM100_PREFILL_BF16X_DTYPE 0
++#endif
++
++namespace fmha_sm100::prefill_bf16x {
+ 
+ // One side (K or V) of the NVFP4 cache, data or block scales: a [pages, heads, 128, row_bytes]
+ // view whose token rows are contiguous within a head; the head and page strides are free
+@@ -46,7 +53,9 @@ struct PrefillArguments {
+   int64_t o_partial_split_stride = 0;
+   float *lse_partial_ptr = nullptr;
+   // Optional one-element fp32 per-tensor scales (value = code x block_scale x global_scale),
+-  // read on the device so captured graphs follow updates.
++  // read on the device so captured graphs follow updates. BF16 data path: the K global scale is
++  // folded into the K dequant (bf16 x bf16 block scale) and v_global_scale must be null (the
++  // combine applies it).
+   float const *k_global_scale_ptr = nullptr;
+   float const *v_global_scale_ptr = nullptr;
+   // Optional int32 counters the combine claims its tiles from; this kernel zeroes them for the
+@@ -61,11 +70,12 @@ struct PrefillArguments {
+   int total_rows = 0;
+   int qsplit_stride = 0;
+   int work_capacity = 0;
+-  // Host factors; the kernel multiplies in the K and V global scales respectively.
++  // Host factors; the kernel multiplies in the K and V global scales respectively (E4M3). The
++  // BF16 data path ignores output_scale (its forward applies none).
+   float softmax_scale_log2 = 0.0f;
+   float output_scale = 1.0f;
+ };
+ 
+ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStream_t stream);
+ 
+-} // namespace fmha_sm100::prefill_q8kv4
++} // namespace fmha_sm100::prefill_bf16x
+diff --git a/csrc/include/sm100/device/prefill_attention_launch.cuh b/csrc/include/sm100/device/prefill_attention_launch.cuh
+index 3876fd82749ff756e04c417bb16e66cd4b5ceafc..2f51db68e60285677febeabad0b7edf27d9d1939 100644
+--- a/csrc/include/sm100/device/prefill_attention_launch.cuh
++++ b/csrc/include/sm100/device/prefill_attention_launch.cuh
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -12,14 +13,14 @@
+ #include <cuda_runtime.h>
+ 
+ #include "cute/tensor.hpp"
+-#if FMHA_SM100_PREFILL_Q8KV4_SM107
++#if FMHA_SM100_PREFILL_BF16X_SM107
+ #include "cute/arch/mma_sm107_umma.hpp"
+ #include "cute/atom/mma_traits_sm107.hpp"
+ #endif
+ #include "cutlass/gemm/collective/builders/sm100_common.inl"
+ #include "cutlass/version.h"
+ 
+-namespace fmha_sm100::prefill_q8kv4 {
++namespace fmha_sm100::prefill_bf16x {
+ namespace {
+ 
+ // One (page, head) block of `tile_rows` x 128 contiguous bytes per box; the head and page
+@@ -53,8 +54,18 @@ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStre
+   using namespace cute;
+   using namespace detail;
+ 
+-#if FMHA_SM100_PREFILL_Q8KV4_SM107
+-  // SM107: K = 64 per instruction, twice the SM100 FP8 rate.
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++  // BF16: tcgen05 kind::f16, BF16 x BF16 -> FP32, 128 x 128 tile, K = 16 per instruction (8
++  // k-blocks over the 128 dims). CUTLASS's SM100 SS atom is compiled for SM100A, SM103A and
++  // SM107A alike (CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED); kind::f16 has no SM107 K extension.
++  using QkMmaAtom =
++      SM100_MMA_F16BF16_SS<Element, Element, Accumulator, 128, 128, UMMA::Major::K, UMMA::Major::K>;
++#elif FMHA_SM100_PREFILL_BF16X_SM107 && !defined(FMHA_SM100_PREFILL_BF16X_E4M3_K32) && \
++    !(defined(FMHA_SM100_PREFILL_BF16X_E4M3X) && FMHA_SM100_PREFILL_BF16X_E4M3X)
++  // E4M3X always takes the K = 32 atoms: the S accumulation order must be the CuTe-DSL fp8 forward's (VR oracle v2
++  // 837815: bitwise on wide-range scales only at K = 32; same speed, 837675).
++  // SM107: K = 64 per instruction, twice the SM100 FP8 rate. (E4M3_K32: the SM100 K = 32 atoms below, as the
++  // CuTe-DSL fp8 forward issues them, for the E4M3X exact path.)
+   using QkMmaAtom =
+       SM107_MMA_F8F6F4_SS<Element, Element, Accumulator, 128, 128, UMMA::Major::K, UMMA::Major::K>;
+ #elif CUTLASS_MAJOR > 4 || (CUTLASS_MAJOR == 4 && CUTLASS_MINOR >= 8)
+@@ -69,7 +80,15 @@ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStre
+       integral_constant<UMMA::ScaleIn, UMMA::ScaleIn::One>>>;
+ #endif
+   using TiledMmaQK = decltype(make_tiled_mma(QkMmaAtom{}));
+-#if FMHA_SM100_PREFILL_Q8KV4_SM107
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1 && FMHA_SM100_PREFILL_BF16X_SM107
++  // BF16 PV: A = P (BF16) from TMEM, B = V (BF16, MN-major) from SMEM, kind::f16.
++  using PvMmaAtom = detail::Sm107MmaF16Bf16Ts<Element, Element, Accumulator, 128, 128,
++                                              UMMA::Major::K, UMMA::Major::MN>;
++#elif FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++  using PvMmaAtom = SM100_MMA_F16BF16_TS<Element, Element, Accumulator, 128, 128, UMMA::Major::K,
++                                         UMMA::Major::MN>;
++#elif FMHA_SM100_PREFILL_BF16X_SM107 && !defined(FMHA_SM100_PREFILL_BF16X_E4M3_K32) && \
++    !(defined(FMHA_SM100_PREFILL_BF16X_E4M3X) && FMHA_SM100_PREFILL_BF16X_E4M3X)
+   using PvMmaAtom = detail::Sm107MmaF8F6F4Ts<Element, Element, Accumulator, 128, 128,
+                                              UMMA::Major::K, UMMA::Major::MN>;
+ #else
+@@ -102,6 +121,47 @@ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStre
+   static_assert(cosize_v<QSmemLayout> == cosize_v<QLogicalLayout>);
+   static_assert(cosize_v<KSmemLayout> == cosize_v<KLogicalLayout>);
+   static_assert(cosize_v<VSmemLayout> == cosize_v<VLogicalLayout>);
++#if FMHA_SM100_PREFILL_BF16X_DTYPE == 1
++  // The BF16 dequant writes K and V with hand-computed SW128 addresses
++  // (bf16_tile_linear_byte_offset, then sw128_swizzle_byte_offset); check them against the
++  // layouts the MMA descriptors are built from. The atoms are ComposedLayout<Swizzle<3,4,3>,
++  // smem_ptr_flag_bits<16>, L>, whose swizzle acts on byte addresses (cute applies it to the smem
++  // pointer), so the unswizzled offsets of L (in elements) are compared with the linear formula
++  // and the swizzle functor is checked to be the byte-level SW128 one.
++  static_assert(cute::is_same_v<cute::remove_cvref_t<decltype(KLogicalLayout{}.layout_a())>,
++                                cute::Swizzle<3, 4, 3>>);
++  static_assert(cute::is_same_v<cute::remove_cvref_t<decltype(VLogicalLayout{}.layout_a())>,
++                                cute::Swizzle<3, 4, 3>>);
++  // K is (token, dim); V is (dim, token): the PV B operand is N = dim by K = token. The
++  // coordinates cover every address component (row in atom, row group, dim chunk, dim half).
++  static_assert(KLogicalLayout{}.layout_b()(0, 0, 0) * 2 == bf16_tile_linear_byte_offset<false>(0, 0));
++  static_assert(KLogicalLayout{}.layout_b()(1, 8, 0) * 2 == bf16_tile_linear_byte_offset<false>(1, 8));
++  static_assert(KLogicalLayout{}.layout_b()(7, 56, 0) * 2 ==
++                bf16_tile_linear_byte_offset<false>(7, 56));
++  static_assert(KLogicalLayout{}.layout_b()(13, 72, 0) * 2 ==
++                bf16_tile_linear_byte_offset<false>(13, 72));
++  static_assert(KLogicalLayout{}.layout_b()(66, 64, 0) * 2 ==
++                bf16_tile_linear_byte_offset<false>(66, 64));
++  static_assert(KLogicalLayout{}.layout_b()(127, 127, 0) * 2 ==
++                bf16_tile_linear_byte_offset<false>(127, 127));
++  static_assert(VLogicalLayout{}.layout_b()(0, 0, 0) * 2 == bf16_tile_linear_byte_offset<true>(0, 0));
++  static_assert(VLogicalLayout{}.layout_b()(8, 1, 0) * 2 == bf16_tile_linear_byte_offset<true>(1, 8));
++  static_assert(VLogicalLayout{}.layout_b()(56, 7, 0) * 2 ==
++                bf16_tile_linear_byte_offset<true>(7, 56));
++  static_assert(VLogicalLayout{}.layout_b()(72, 13, 0) * 2 ==
++                bf16_tile_linear_byte_offset<true>(13, 72));
++  static_assert(VLogicalLayout{}.layout_b()(64, 66, 0) * 2 ==
++                bf16_tile_linear_byte_offset<true>(66, 64));
++  static_assert(VLogicalLayout{}.layout_b()(127, 127, 0) * 2 ==
++                bf16_tile_linear_byte_offset<true>(127, 127));
++  // Q: the box of token t, k-atom kb starts at kb * 128 * kQTmaCols + t * cosize(token box), and
++  // a stage is 128 * kHeadDim elements.
++  static_assert(QLogicalLayout{}.layout_b()(16 * 3, 0, 0) == 3 * cosize_v<QTokenSmemLayout>);
++  static_assert(QLogicalLayout{}.layout_b()(16 * 5, kQTmaCols, 0) ==
++                128 * kQTmaCols + 5 * cosize_v<QTokenSmemLayout>);
++  static_assert(QLogicalLayout{}.layout_b()(0, 0, 1) == 128 * kHeadDim);
++  static_assert(cosize_v<QTokenSmemLayout> == kQHeadsPerKv * kQTmaCols);
++#endif
+ 
+   auto q_gmem_shape = make_shape(arguments.total_q * arguments.num_q_heads, Int<kHeadDim>{});
+   auto q_gmem_stride = make_stride(Int<kHeadDim>{}, _1{});
+@@ -137,6 +197,8 @@ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStre
+   }
+ 
+   using Storage = SharedStorage<QSmemLayout, KSmemLayout, VSmemLayout>;
++  // 227 KB of dynamic SMEM per CTA (see the budget in prefill_attention_config.cuh).
++  static_assert(sizeof(Storage) <= 232448, "SharedStorage exceeds the 227 KB SMEM limit");
+   using Params = KernelParams<decltype(tma_q), decltype(q_gmem_shape)>;
+   Params kernel_params{arguments,    tma_q,       q_gmem_shape, tma_packed_k,
+                        tma_packed_v, tma_k_scale, tma_v_scale};
+@@ -162,4 +224,4 @@ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStre
+   return cudaLaunchKernelEx(&config, kernel, kernel_params);
+ }
+ 
+-} // namespace fmha_sm100::prefill_q8kv4
++} // namespace fmha_sm100::prefill_bf16x
+diff --git a/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh b/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
+index b3aaafa7c79cce1fe89ad6f2edbc44ef96222a73..0b30f6594217b47cf6a57c1e9446cd6153496d07 100644
+--- a/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
++++ b/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
+@@ -1,11 +1,12 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+ 
+ #include "sm100/collective/sm100_prefill_attention_mainloop.cuh"
+ 
+-namespace fmha_sm100::prefill_q8kv4::detail {
++namespace fmha_sm100::prefill_bf16x::detail {
+ 
+ // Warp roles:
+ //   0-3: softmax stage 0 and K dequant
+@@ -90,4 +91,4 @@ void prefill_attention_kernel(
+   }
+ }
+ 
+-}  // namespace fmha_sm100::prefill_q8kv4::detail
++}  // namespace fmha_sm100::prefill_bf16x::detail
+diff --git a/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh b/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
+index a466ab511134477fec7153e57f5b70dff13173b0..3abd742f74d9b59b295d46a03db3c964c505a772 100644
+--- a/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
++++ b/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -11,7 +12,7 @@
+ #include "cute/arch/copy_sm100.hpp"
+ #include "cute/tensor.hpp"
+ 
+-namespace fmha_sm100::prefill_q8kv4::detail {
++namespace fmha_sm100::prefill_bf16x::detail {
+ 
+ struct WorkTileInfo {
+   int head_kv;
+@@ -47,7 +48,7 @@ struct SharedStorage {
+   alignas(16) uint64_t q_empty[kQStages];
+ 
+   // KV: TMA load completes raw tiles, then one softmax warpgroup dequantizes
+-  // K or V and publishes the corresponding FP8 tile to the MMA warp.
++  // K or V and publishes the corresponding FP8 (or BF16) tile to the MMA warp.
+   alignas(16) uint64_t k_tma_full;
+   alignas(16) uint64_t v_tma_full;
+   alignas(16) uint64_t k_dequant_full;
+@@ -83,4 +84,4 @@ struct KernelParams {
+   cute::TmaDescriptor tma_v_scale;
+ };
+ 
+-}  // namespace fmha_sm100::prefill_q8kv4::detail
++}  // namespace fmha_sm100::prefill_bf16x::detail
+diff --git a/csrc/templates/prefill_attention_inst.cu.jinja b/csrc/templates/prefill_attention_inst.cu.jinja
+index cbfe28ac5fd1036ea07cbc042356f65c902f7c87..ec2e46f8256aa72e76e5e7b3fcd81832eb8e6335 100644
+--- a/csrc/templates/prefill_attention_inst.cu.jinja
++++ b/csrc/templates/prefill_attention_inst.cu.jinja
+@@ -1,9 +1,10 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #include "sm100/device/prefill_attention_launch.cuh"
+ 
+-namespace fmha_sm100::prefill_q8kv4 {
++namespace fmha_sm100::prefill_bf16x {
+ 
+ static_assert(detail::kQHeadsPerKv == {{ q_heads_per_kv }});
+ static_assert(detail::kHeadDim == {{ head_dim }});
+@@ -11,4 +12,4 @@ static_assert(detail::kPageSize == {{ page_size }});
+ static_assert(detail::kQStages == {{ q_stages }});
+ static_assert(detail::kScoreStages == {{ score_stages }});
+ 
+-}  // namespace fmha_sm100::prefill_q8kv4
++}  // namespace fmha_sm100::prefill_bf16x
+diff --git a/interface.py b/interface.py
+index bb5fa95636be775e0b86730335d37db5c58b0aea..3b2da90112533a2d5352b1fb6fb6cd70d546d443 100644
+--- a/interface.py
++++ b/interface.py
+@@ -1,10 +1,14 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+-"""FlashInfer-style wrapper for Q8KV4 paged sparse prefill."""
++"""FlashInfer-style wrapper for Q8KV4 paged sparse prefill (E4M3 or BF16 q)."""
+ 
+ from __future__ import annotations
+ 
++import functools
++import inspect
++
+ import logging
+ import math
+ import os
+@@ -12,14 +16,30 @@ from dataclasses import dataclass
+ 
+ import torch
+ 
+-from ..decode_q8kv4.interface import interleave_v_scales
+-from .jit import MAX_BLOCK_SCALE_SHIFT, load_extension
++
++_SCALE_GROUPS = 8
++
++
++def interleave_v_scales(v_scale: torch.Tensor) -> torch.Tensor:
++    """Return linear ``[pages, Hkv, page_size, 8]`` V scales in the kernel's token-quad order.
++
++    TensorRT-LLM: decode_q8kv4.interface.interleave_v_scales of the same upstream commit, inlined (decode_q8kv4 is not
++    vendored). Same shape and dtype; byte ``token * 8 + group`` moves to ``(token // 4) * 32 + group * 4 + token % 4``.
++    """
++    if v_scale.ndim != 4 or v_scale.shape[-1] != _SCALE_GROUPS:
++        raise ValueError(f"v_scale must have shape [pages, Hkv, page_size, {_SCALE_GROUPS}]")
++    pages, heads, page_size, groups = v_scale.shape
++    if page_size % 4:
++        raise ValueError("page_size must be a multiple of 4")
++    quads = v_scale.reshape(pages, heads, page_size // 4, 4, groups)
++    return quads.transpose(-1, -2).contiguous().view(v_scale.shape)
++from .jit import BF16_DATA_PATH, E4M3_DATA_PATH, MAX_BLOCK_SCALE_SHIFT, load_extension
+ 
+ logger = logging.getLogger(__name__)
+ 
+ # Set to 0 to keep the split workspace in interleaved device memory on a GPU with several memory
+ # locality domains, the layout single-domain GPUs use (for A/B measurements).
+-LOCALITY_DOMAINS_ENV = "FMHA_SM100_PREFILL_Q8KV4_LOCALITY_DOMAINS"
++LOCALITY_DOMAINS_ENV = "FMHA_SM100_PREFILL_BF16X_LOCALITY_DOMAINS"
+ 
+ _HEAD_DIM = 128
+ _Q_HEADS_PER_KV = 16
+@@ -32,14 +52,20 @@ _KV_SCALE_ROW_BYTES = _HEAD_DIM // 16
+ 
+ def _sparse_stack():
+     """Return fmha_sm100's k2q CSR builder and split combine (the CuTe-DSL sparse stack)."""
+-    from .. import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
++    from ..fmha_sm100 import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
+     from src.sm100.fwd.combine import combine
+ 
+     return sparse.build_k2q_csr, combine
+ 
+ 
++@functools.lru_cache(maxsize=None)
++def _combine_accepts(fn, name: str) -> bool:
++    """Whether the installed combine takes keyword `name` (the shipped and upstream combines differ)."""
++    return name in inspect.signature(fn).parameters
++
++
+ def _locality_hints_type():
+-    from .. import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
++    from ..fmha_sm100 import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
+     from src.sm100.fwd.combine import LocalityHints
+ 
+     return LocalityHints
+@@ -84,13 +110,13 @@ def _device_locality_domains(device: torch.device, block_scale_shift: int) -> _D
+                 # The probe needs green contexts, which some profilers' driver shims refuse;
+                 # interleaved memory serves every domain then.
+                 logger.warning(
+-                    "Q8KV4 prefill: locality-domain probe failed, the split workspace stays "
++                    "BF16X prefill: locality-domain probe failed, the split workspace stays "
+                     "interleaved: %s",
+                     error,
+                 )
+         if locality is not None:
+             logger.info(
+-                "Q8KV4 prefill: device %d has %d memory locality domains, the split workspace "
++                "BF16X prefill: device %d has %d memory locality domains, the split workspace "
+                 "is striped over them",
+                 index,
+                 locality.num_domains,
+@@ -100,7 +126,7 @@ def _device_locality_domains(device: torch.device, block_scale_shift: int) -> _D
+ 
+ 
+ class PrefillWorkspace:
+-    """Split workspace of the Q8KV4 prefill: the partial outputs and partial log-sum-exps the
++    """Split workspace of the BF16X prefill: the partial outputs and partial log-sum-exps the
+     forward kernel writes and the combine reads.
+ 
+     One workspace serves any number of layers and batches that run in order on one stream; two
+@@ -168,7 +194,7 @@ class PrefillWorkspace:
+             # A driver that counts domains but cannot place memory in them: interleaved memory
+             # serves every domain, without the steering.
+             logger.warning(
+-                "Q8KV4 prefill: localized allocation failed, the split workspace stays "
++                "BF16X prefill: localized allocation failed, the split workspace stays "
+                 "interleaved: %s",
+                 error,
+             )
+@@ -242,6 +268,15 @@ def _check_global_scale(scale, *, name: str, device: torch.device) -> None:
+         raise ValueError(f"{name} must be on {device}")
+ 
+ 
++def _q_data_path(q: torch.Tensor) -> str:
++    """The kernel data path selected by the dtype of q."""
++    if q.dtype == torch.float8_e4m3fn:
++        return E4M3_DATA_PATH
++    if q.dtype == torch.bfloat16:
++        return BF16_DATA_PATH
++    raise TypeError("q must be torch.float8_e4m3fn or torch.bfloat16")
++
++
+ def _check_block_scale_shift(block_scale_shift: int) -> int:
+     block_scale_shift = int(block_scale_shift)
+     if not 0 <= block_scale_shift <= MAX_BLOCK_SCALE_SHIFT:
+@@ -300,6 +335,9 @@ def run_prefill(
+     o_partial: torch.Tensor | None = None,
+     lse_partial: torch.Tensor | None = None,
+     workspace: PrefillWorkspace | None = None,
++    o_fp8: torch.Tensor | None = None,
++    sf_out: torch.Tensor | None = None,
++    write_bf16: bool = True,
+ ) -> tuple[torch.Tensor, torch.Tensor | None]:
+     """Run the Q8KV4 forward over a prepared k2q CSR and schedule, then combine the splits.
+ 
+@@ -308,6 +346,9 @@ def run_prefill(
+     scales in token-quad order, see :func:`interleave_v_scales`); all four may be strided views
+     into vLLM's page layout. Returns ``(out, lse)`` with ``lse`` None unless ``lse`` is given.
+ 
++    ``q`` is ``torch.float8_e4m3fn`` (E4M3 data path: E4M3 dequantized K/V, E4M3 P) or
++    ``torch.bfloat16`` (BF16 data path: BF16 dequantized K/V, BF16 P, a separate extension).
++
+     ``kv_indices`` maps each request's logical pages to physical pages: a ``[batch, max_pages]``
+     int32 table (rows contiguous, any row stride, e.g. vLLM's block table) with ``kv_indptr``
+     None, or a flat ``[total_pages]`` list with ``kv_indptr`` (``[batch + 1]``) giving each
+@@ -319,6 +360,12 @@ def run_prefill(
+     ``2**-shift`` before ``code x scale`` is requantized to E4M3 (3 for TransformerEngine-style
+     full-range scales, 0 when the products already fit). ``output_scale`` multiplies the output.
+ 
++    BF16 data path (bfloat16 ``q``): the forward (K1) folds ``k_global_scale`` into the K dequant
++    (``bf16(block_scale) x bf16(k_global_scale)``, not the softmax scale) and applies neither
++    ``v_global_scale`` nor ``output_scale``; the combine applies them (its ``output_scale`` tensor
++    is ``v_global_scale``, times ``output_scale`` when that is not 1). ``block_scale_shift`` must
++    be 0 (the BF16 dequant is exact, there is no staging).
++
+     ``topk`` is the width of the TopK lists the schedule was built from (one split per slot).
+     ``seqused_k`` (``[batch]`` int32) replaces each request's KV length for masking and for the
+     bottom-right causal alignment, as ``fmha_sm100``'s ``qo_offset`` does.
+@@ -339,13 +386,14 @@ def run_prefill(
+         or schedule.split_counts is None
+     ):
+         raise ValueError("run_prefill needs a forward schedule with split metadata")
+-    if q.dtype != torch.float8_e4m3fn:
+-        raise TypeError("q must be torch.float8_e4m3fn")
++    data_path = _q_data_path(q)
+     _check_cuda_contiguous(q, name="q")
+     _check_page_table(kv_indices, kv_indptr, batch=cu_seqlens_q.numel() - 1)
+     _check_global_scale(k_global_scale, name="k_global_scale", device=q.device)
+     _check_global_scale(v_global_scale, name="v_global_scale", device=q.device)
+     block_scale_shift = _check_block_scale_shift(block_scale_shift)
++    if data_path == BF16_DATA_PATH and block_scale_shift != 0:
++        raise ValueError("bfloat16 q (BF16 data path) requires block_scale_shift 0")
+     if topk not in SUPPORTED_TOPK:
+         raise ValueError(f"topk must be one of {SUPPORTED_TOPK}, got {topk}")
+     total_q, num_q_heads, _ = q.shape
+@@ -384,7 +432,28 @@ def run_prefill(
+         out = torch.empty((total_q, num_q_heads, _HEAD_DIM), dtype=torch.bfloat16, **options)
+ 
+     _, combine = _sparse_stack()
+-    load_extension(q.device, block_scale_shift).run(
++    # BF16 data path: K1 gets k_global_scale (folded into the K dequant) but not v_global_scale or
++    # output_scale; the combine below applies those as its output_scale.
++    combine_output_scale = None
++    if data_path == BF16_DATA_PATH:
++        combine_output_scale = v_global_scale
++        if float(output_scale) != 1.0:
++            combine_output_scale = (
++                v_global_scale * float(output_scale)
++                if v_global_scale is not None
++                else torch.full((1,), float(output_scale), dtype=torch.float32, device=q.device)
++            )
++        if combine_output_scale is not None and not _combine_accepts(combine, "output_scale"):
++            raise RuntimeError(
++                "the BF16 data path needs a combine that takes output_scale to apply "
++                "v_global_scale / output_scale"
++            )
++        forward_v_global_scale = None
++        forward_output_scale = 1.0
++    else:
++        forward_v_global_scale = v_global_scale
++        forward_output_scale = float(output_scale)
++    load_extension(q.device, block_scale_shift, data_path).run(
+         q,
+         k_cache,
+         v_cache,
+@@ -402,20 +471,34 @@ def run_prefill(
+         o_partial,
+         lse_partial,
+         k_global_scale,
+-        v_global_scale,
++        forward_v_global_scale,
+         float(sm_scale),
+-        float(output_scale),
++        forward_output_scale,
+         None if locality is None else locality.tile_counters,
+     )
+-    combine(
+-        o_partial,
+-        lse_partial,
+-        out,
+-        lse,
+-        split_counts=schedule.split_counts,
+-        use_pdl=True,
+-        locality=locality,
+-    )
++    # M3.1 overlay v2 (TP2CTX_Q8KV4): the shipped fmha_sm100 combine predates the locality hints and needs cu_seqlens for
++    # a varlen output with split_counts. E4M3: the V global scale is already applied in this forward, so no
++    # output_scale. BF16: the combine applies v_global_scale (x output_scale) as its output_scale.
++    combine_kwargs = dict(split_counts=schedule.split_counts, use_pdl=True)
++    if _combine_accepts(combine, "cu_seqlens"):
++        combine_kwargs["cu_seqlens"] = cu_seqlens_q
++    if locality is not None:
++        combine_kwargs["locality"] = locality
++    if combine_output_scale is not None:
++        combine_kwargs["output_scale"] = combine_output_scale
++    # o_proj MXFP8 sink (LongAttn, TP2CTX_COMBINE_MXFP8 on the E4M3X fork): the combine also writes the MXFP8 copy of
++    # the final O (o_fp8 [total_q, heads x dim] + swizzled UE8M0 sf_out; bitwise mxfp8_quantize(O, True)), and with
++    # write_bf16=False skips the bf16 O store. No silent fallback: a combine without these arguments raises.
++    if o_fp8 is not None or sf_out is not None or not write_bf16:
++        if o_fp8 is None or sf_out is None:
++            raise ValueError("run_prefill: o_fp8 and sf_out go together")
++        if not _combine_accepts(combine, "o_fp8"):
++            raise RuntimeError("run_prefill: the installed fmha combine has no o_fp8 / sf_out (MXFP8 sink) arguments")
++        combine_kwargs["o_fp8"] = o_fp8
++        combine_kwargs["sf_out"] = sf_out
++        if not write_bf16:
++            combine_kwargs["write_bf16"] = False
++    combine(o_partial, lse_partial, out, lse, **combine_kwargs)
+     return out, lse
+ 
+ 
+@@ -476,7 +559,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
+         if torch.cuda.is_current_stream_capturing():
+             raise RuntimeError("plan() must be called outside CUDA Graph capture")
+         if not causal:
+-            raise NotImplementedError("Q8KV4 prefill v1 supports only causal attention")
++            raise NotImplementedError("BF16X prefill v1 supports only causal attention")
+         _check_same_device(topk_indices, page_table, name="page_table")
+         batch = cu_seqlens_q.numel() - 1
+         _check_page_table(page_table, kv_indptr, batch=batch)
+diff --git a/jit.py b/jit.py
+index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..680e8e0dd9e417d329383224c692beb052e9d6b8 100644
+--- a/jit.py
++++ b/jit.py
+@@ -1,7 +1,8 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+-"""Op-local JIT for the SM100 Q8KV4 sparse prefill attention kernel."""
++"""Op-local JIT for the SM100 Q8KV4 sparse prefill attention kernel (E4M3 or BF16 data path)."""
+ 
+ from __future__ import annotations
+ 
+@@ -18,24 +19,55 @@ from pathlib import Path
+ import jinja2
+ from torch.utils import cpp_extension
+ 
+-from .. import _jit_cache
+-from ..decode_q8kv4._build_utils import cuda_home as _cuda_home
+-from ..decode_q8kv4._build_utils import cutlass_root as _cutlass_root
+-from ..decode_q8kv4._build_utils import cutlass_version as _cutlass_version
+-from ..decode_q8kv4._build_utils import require_cuda_version
+-from ..decode_q8kv4._build_utils import supports_qmul4
+-from ..decode_q8kv4._build_utils import target_arch as _resolve_target_arch
++# TensorRT-LLM: the module is built ahead of time (cpp/tensorrt_llm/kernels/minimaxM3Msa) and loads through the AOT path
++# below; the run-time JIT helpers of the upstream package are not vendored, so a spec outside the prebuilt set logs
++# "msa fmha JIT fallback variant=prefill_bf16x" and raises.
++try:
++    from .. import _jit_cache
++    from ..decode_q8kv4._build_utils import cuda_home as _cuda_home
++    from ..decode_q8kv4._build_utils import cutlass_root as _cutlass_root
++    from ..decode_q8kv4._build_utils import cutlass_version as _cutlass_version
++    from ..decode_q8kv4._build_utils import require_cuda_version
++    from ..decode_q8kv4._build_utils import supports_qmul4
++    from ..decode_q8kv4._build_utils import target_arch as _resolve_target_arch
++except ImportError:
++    _jit_cache = None
++
++    def _no_jit(*args, **kwargs):
++        logging.getLogger(__name__).warning("msa fmha JIT fallback variant=prefill_bf16x")
++        raise RuntimeError(
++            "prefill_bf16x: no prebuilt module for this spec, and TensorRT-LLM ships no run-time compile for it")
++
++    _cuda_home = _cutlass_root = _cutlass_version = require_cuda_version = _no_jit
++    supports_qmul4 = _resolve_target_arch = _no_jit
+ 
+ logger = logging.getLogger(__name__)
+ 
+ # Offline builds (build.py) select the target architecture with this variable.
+-FMHA_SM100_PREFILL_Q8KV4_ARCH = "FMHA_SM100_PREFILL_Q8KV4_ARCH"
++FMHA_SM100_PREFILL_BF16X_ARCH = "FMHA_SM100_PREFILL_BF16X_ARCH"
+ # Set to 1 to compile the packed-FP16 dequant path even when the toolchain accepts QMUL4: the path
+ # SM107 takes, so the two can be compared on one GPU.
+-DISABLE_QMUL4_ENV = "FMHA_SM100_PREFILL_Q8KV4_DISABLE_QMUL4"
++DISABLE_QMUL4_ENV = "FMHA_SM100_PREFILL_BF16X_DISABLE_QMUL4"
++# E4M3X study: set to 1 to build the E4M3 data path with the SM100 K = 32 f8f6f4 MMA atoms on SM107 (the K the
++# CuTe-DSL fp8 forward uses) instead of the SM107 K = 64 ones. Own uri suffix "_k32", so the two never share a cache.
++E4M3_K32_ENV = "FMHA_SM100_PREFILL_BF16X_E4M3_K32"
++_E4M3_K32 = os.environ.get(E4M3_K32_ENV, "0") == "1"
++# E4M3X (default ON, m4f): the E4M3 data path built as the CuTe-DSL fp8 forward's exact transcription (uri suffix
++# "_e4m3x"; bitwise vs the DSL fp8 forward, VR oracles 837726 / 837778). Set to 0 for the upstream Q8KV4 E4M3 kernel.
++E4M3X_ENV = "FMHA_SM100_PREFILL_BF16X_E4M3X"
++_E4M3X = os.environ.get(E4M3X_ENV, "1") == "1"
+ _SUPPORTED_ARCHES = ("100a", "103a", "107a")
+ _QMUL4_DEQUANT = "qmul4"
+ _FP16_DEQUANT = "fp16"
++# Data paths (compile-time FMHA_SM100_PREFILL_BF16X_DTYPE): E4M3 Q / KV / P (the upstream Q8KV4
++# kernel, define 0) or BF16 Q / KV / P (define 1). Each is its own extension.
++E4M3_DATA_PATH = "e4m3"
++BF16_DATA_PATH = "bf16"
++DATA_PATHS = (E4M3_DATA_PATH, BF16_DATA_PATH)
++_DTYPE_DEFINE = {E4M3_DATA_PATH: 0, BF16_DATA_PATH: 1}
++# Q ring depth per data path: 16 KB vs 32 KB per stage inside the 227 KB SMEM budget (see
++# csrc/include/sm100/common/prefill_attention_config.cuh).
++_Q_STAGES = {E4M3_DATA_PATH: 8, BF16_DATA_PATH: 4}
+ 
+ _ROOT = Path(__file__).resolve().parent
+ _CSRC = _ROOT / "csrc"
+@@ -51,7 +83,7 @@ MAX_BLOCK_SCALE_SHIFT = 7
+ def _cuda_version() -> tuple[int, int]:
+     return require_cuda_version(
+         (13, 4),
+-        component="Q8KV4 prefill attention",
++        component="BF16X prefill attention",
+     )
+ 
+ 
+@@ -59,13 +91,13 @@ def _cuda_version() -> tuple[int, int]:
+ def _target_arch(device=None) -> str:
+     arch = _resolve_target_arch(
+         device,
+-        component="Q8KV4 prefill attention",
++        component="BF16X prefill attention",
+         supported_arches=_SUPPORTED_ARCHES,
+-        env_var=FMHA_SM100_PREFILL_Q8KV4_ARCH,
++        env_var=FMHA_SM100_PREFILL_BF16X_ARCH,
+     )
+     if arch == "107a" and _cutlass_version() < (4, 8):
+         raise RuntimeError(
+-            "Q8KV4 prefill attention on SM107 requires CUTLASS 4.8 or newer; set "
++            "BF16X prefill attention on SM107 requires CUTLASS 4.8 or newer; set "
+             f"CUTLASS_ROOT (found {_cutlass_version()} at {_cutlass_root()})"
+         )
+     return arch
+@@ -98,7 +130,7 @@ def _cache_root() -> Path:
+         if explicit
+         else Path.home() / ".cache/minfer/fmha_sm100"
+     )
+-    return root / "prefill_q8kv4"
++    return root / "prefill_bf16x"
+ 
+ 
+ def _write_text_if_changed(path: Path, content: str) -> None:
+@@ -123,22 +155,29 @@ def _import_extension(module_name: str, library: Path):
+ 
+ @dataclass(frozen=True)
+ class JitSpec:
+-    """One compile-time configuration: target architecture, block-scale shift, dequant path."""
++    """One compile-time configuration: target architecture, block-scale shift, dequant path,
++    data path. Build specs through :func:`gen_jit_spec`, which sets ``q_stages`` for the data
++    path."""
+ 
+     target_arch: str
+     block_scale_shift: int = 0
+     dequant_mode: str = _QMUL4_DEQUANT
+-    variant_name: str = "prefill_attention_q8kv4"
++    variant_name: str = "prefill_attention_bf16x"
+     q_heads_per_kv: int = 16
+     head_dim: int = 128
+     page_size: int = 128
+     q_stages: int = 8
+     score_stages: int = 2
++    data_path: str = E4M3_DATA_PATH
+ 
+     @property
+     def uri(self) -> str:
++        # The E4M3 uri is the upstream one; the BF16 data path gets its own uri and module.
++        data_path = "" if self.data_path == E4M3_DATA_PATH else f"_{self.data_path}"
++        k32 = "_k32" if (_E4M3_K32 and self.data_path == E4M3_DATA_PATH) else ""
++        k32 += "_e4m3x" if (_E4M3X and self.data_path == E4M3_DATA_PATH) else ""
+         return (
+-            f"{self.variant_name}_shift{self.block_scale_shift}_{self.dequant_mode}_"
++            f"{self.variant_name}{data_path}{k32}_shift{self.block_scale_shift}_{self.dequant_mode}_"
+             f"{self.target_arch}"
+         )
+ 
+@@ -156,8 +195,15 @@ class JitSpec:
+         }
+ 
+     def _load_arguments(self, cache_dir: Path) -> dict:
+-        shift_define = f"-DFMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT={self.block_scale_shift}"
++        shift_define = f"-DFMHA_SM100_PREFILL_BF16X_BLOCK_SCALE_SHIFT={self.block_scale_shift}"
+         has_qmul4 = int(self.dequant_mode == _QMUL4_DEQUANT)
++        # The data-path define is passed only for BF16 (the headers default it to 0), so the E4M3
++        # build command, and with it its cache recipe, is the upstream one.
++        dtype_defines = (
++            []
++            if self.data_path == E4M3_DATA_PATH
++            else [f"-DFMHA_SM100_PREFILL_BF16X_DTYPE={_DTYPE_DEFINE[self.data_path]}"]
++        )
+         return {
+             "sources": [
+                 str(_API / "prefill_attention_api.cpp"),
+@@ -174,7 +220,8 @@ class JitSpec:
+                     _cutlass_root() / "tools/util/include",
+                 )
+             ],
+-            "extra_cflags": ["-O3", "-DNDEBUG", "-std=c++20", shift_define],
++            "extra_cflags": ["-O3", "-DNDEBUG", "-std=c++20", shift_define, *dtype_defines,
++                             *(["-DFMHA_SM100_PREFILL_BF16X_E4M3X=1"] if (_E4M3X and self.data_path == E4M3_DATA_PATH) else [])],
+             "extra_cuda_cflags": [
+                 "-O3",
+                 "-DNDEBUG",
+@@ -188,13 +235,16 @@ class JitSpec:
+                 # know SM107.
+                 f"-gencode=arch=compute_{self.target_arch},code=sm_{self.target_arch}",
+                 shift_define,
+-                f"-DFMHA_SM100_PREFILL_Q8KV4_HAS_QMUL4={has_qmul4}",
++                f"-DFMHA_SM100_PREFILL_BF16X_HAS_QMUL4={has_qmul4}",
+                 # Seen by the host and device passes alike (the cute arch macros are device-only),
+                 # so the kernel instantiation the host registers is the one the cubin holds.
+-                f"-DFMHA_SM100_PREFILL_Q8KV4_SM107={int(self.target_arch == '107a')}",
++                f"-DFMHA_SM100_PREFILL_BF16X_SM107={int(self.target_arch == '107a')}",
+                 # The kernel is launched with programmatic stream serialization (PDL); without
+                 # this define CUTLASS compiles griddepcontrol.wait / launch_dependents out.
+                 "-DCUTLASS_ENABLE_GDC_FOR_SM100",
++                *dtype_defines,
++                *(["-DFMHA_SM100_PREFILL_BF16X_E4M3_K32=1"] if (_E4M3_K32 and self.data_path == E4M3_DATA_PATH) else []),
++                *(["-DFMHA_SM100_PREFILL_BF16X_E4M3X=1"] if (_E4M3X and self.data_path == E4M3_DATA_PATH) else []),
+             ],
+             "extra_ldflags": ["-lcuda", f"-Wl,-rpath,{_cuda_home() / 'lib64'}"],
+         }
+@@ -226,6 +276,11 @@ class JitSpec:
+     def build_and_load(self):
+         if not 0 <= self.block_scale_shift <= MAX_BLOCK_SCALE_SHIFT:
+             raise ValueError(f"block_scale_shift must be in [0, {MAX_BLOCK_SCALE_SHIFT}]")
++        _check_data_path(self.data_path, self.block_scale_shift)
++        if self.q_stages != _Q_STAGES[self.data_path]:
++            raise ValueError(
++                f"q_stages must be {_Q_STAGES[self.data_path]} for the {self.data_path} data path"
++            )
+         recipe = self.recipe()
+         library = recipe.lookup()
+         if library is not None:
+@@ -262,41 +317,131 @@ class JitSpec:
+         finally:
+             cpp_extension.CUDA_HOME = previous_cuda_home
+         logger.info(
+-            "Compiled fmha_sm100.prefill_q8kv4 in %.1fs",
++            "Compiled fmha_sm100.prefill_bf16x in %.1fs",
+             time.time() - started_at,
+         )
+         return extension
+ 
+ 
+-def gen_jit_spec(device=None, block_scale_shift: int = 0) -> JitSpec:
+-    """Return the compile-time configuration for a device and block-scale shift."""
++def _check_data_path(data_path: str, block_scale_shift: int) -> None:
++    if data_path not in DATA_PATHS:
++        raise ValueError(f"data_path must be one of {DATA_PATHS}, got {data_path!r}")
++    if data_path == BF16_DATA_PATH and block_scale_shift != 0:
++        raise ValueError("the bf16 data path has no block-scale staging (block_scale_shift 0)")
+ 
+-    arch = _target_arch(device)
++
++def _make_spec(arch: str, block_scale_shift: int, data_path: str) -> JitSpec:
++    _check_data_path(data_path, block_scale_shift)
+     return JitSpec(
+         target_arch=arch,
+-        block_scale_shift=int(block_scale_shift),
++        block_scale_shift=block_scale_shift,
+         dequant_mode=_dequant_mode(arch),
++        q_stages=_Q_STAGES[data_path],
++        data_path=data_path,
+     )
+ 
+ 
++def gen_jit_spec(
++    device=None, block_scale_shift: int = 0, data_path: str = E4M3_DATA_PATH
++) -> JitSpec:
++    """Return the compile-time configuration for a device, block-scale shift and data path."""
++
++    return _make_spec(_target_arch(device), int(block_scale_shift), data_path)
++
++
+ @lru_cache(maxsize=None)
+-def _load_extension_for_arch(arch: str, block_scale_shift: int = 0):
+-    return JitSpec(
+-        target_arch=arch,
+-        block_scale_shift=block_scale_shift,
+-        dequant_mode=_dequant_mode(arch),
+-    ).build_and_load()
++def _load_extension_for_arch(
++    arch: str, block_scale_shift: int = 0, data_path: str = E4M3_DATA_PATH
++):
++    return _make_spec(arch, block_scale_shift, data_path).build_and_load()
++
++
++# MiniMax-M3.1 CPP-E4M3X (MSA, PREREG_M31_MSA_CPP_E4M3X_v1): extensions prebuilt offline (build_aot) load from
++# TRTLLM_M31_E4M3X_AOT_DIR (default: the package's aot/ dir) before the JIT's toolchain checks, so serving needs
++# neither nvcc nor CUTLASS_ROOT. A spec without a prebuilt library takes the JIT. Set TRTLLM_M31_DISABLE_E4M3X_AOT=1
++# for the JIT path everywhere.
++E4M3X_AOT_DIR_ENV = "TRTLLM_M31_E4M3X_AOT_DIR"
++DISABLE_E4M3X_AOT_ENV = "TRTLLM_M31_DISABLE_E4M3X_AOT"
++
++
++def _aot_dir() -> Path:
++    # TensorRT-LLM: tensorrt_llm/libs/msa_fmha_sm100/prefill_bf16x (this file is tensorrt_llm/_torch/attention/backends/
++    # fmha/msa_kernels/prefill_bf16x/jit.py).
++    default = Path(os.path.abspath(__file__)).parents[6] / "libs" / "msa_fmha_sm100" / "prefill_bf16x"
++    return Path(os.environ.get(E4M3X_AOT_DIR_ENV) or default)
++
++
++def prebuilt_available(device=None, block_scale_shift: int = 0, data_path: str = E4M3_DATA_PATH) -> bool:
++    """Whether the prebuilt module for this device / shift / data path is installed (TensorRT-LLM)."""
++    prefix, suffix = aot_library_name(_device_arch(device), int(block_scale_shift), data_path)
++    root = _aot_dir()
++    return root.is_dir() and len(sorted(root.glob(f"{prefix}*{suffix}"))) == 1
++
++
++def _device_arch(device) -> str:
++    """The arch suffix of the device (``107a``) without the toolchain checks of ``_target_arch``."""
++    explicit = os.environ.get(FMHA_SM100_PREFILL_BF16X_ARCH)
++    if explicit:
++        return explicit
++    import torch
++
++    major, minor = torch.cuda.get_device_capability(device)
++    return f"{major}{minor}a"
++
++
++def aot_library_name(arch: str, block_scale_shift: int, data_path: str) -> tuple[str, str]:
++    """The (module-name prefix, suffix) of a prebuilt library; the dequant mode in between is the build's."""
++    marker = "@"
++    spec = JitSpec(target_arch=arch, block_scale_shift=block_scale_shift, dequant_mode=marker,
++                   q_stages=_Q_STAGES[data_path], data_path=data_path)
++    prefix, suffix = spec.module_name.split(marker)
++    return prefix, f"{suffix}.so"
++
++
++@lru_cache(maxsize=None)
++def _load_aot_extension(arch: str, block_scale_shift: int, data_path: str):
++    prefix, suffix = aot_library_name(arch, block_scale_shift, data_path)
++    root = _aot_dir()
++    found = sorted(root.glob(f"{prefix}*{suffix}")) if root.is_dir() else []
++    if len(found) != 1:
++        return None
++    import hashlib
++
++    library = found[0]
++    digest = hashlib.md5(library.read_bytes()).hexdigest()[:8]
++    module = _import_extension(library.name[: -len(".so")], library)
++    print(f"E4M3X_AOT loaded {library.name[len('_fmha_sm100_'):-len('.so')]} {digest}", file=sys.stderr, flush=True)
++    return module
++
++
++@cache
++def _aot_disabled() -> bool:
++    disabled = os.environ.get(DISABLE_E4M3X_AOT_ENV, "0") == "1"
++    if disabled:
++        print("E4M3X_AOT disabled", file=sys.stderr, flush=True)
++    return disabled
+ 
+ 
+-def load_extension(device=None, block_scale_shift: int = 0):
+-    """Build and load the extension for the tensor architecture and block-scale shift."""
++def load_extension(device=None, block_scale_shift: int = 0, data_path: str = E4M3_DATA_PATH):
++    """Build and load the extension for the tensor architecture, block-scale shift and data path
++    (``"e4m3"``: float8_e4m3fn q; ``"bf16"``: bfloat16 q). A prebuilt library is taken first."""
+ 
+-    return _load_extension_for_arch(_target_arch(device), int(block_scale_shift))
++    block_scale_shift = int(block_scale_shift)
++    if not _aot_disabled():
++        module = _load_aot_extension(_device_arch(device), block_scale_shift, data_path)
++        if module is not None:
++            return module
++    return _load_extension_for_arch(_target_arch(device), block_scale_shift, data_path)
+ 
+ 
+ __all__ = [
++    "BF16_DATA_PATH",
++    "DATA_PATHS",
+     "DISABLE_QMUL4_ENV",
+-    "FMHA_SM100_PREFILL_Q8KV4_ARCH",
++    "E4M3_DATA_PATH",
++    "DISABLE_E4M3X_AOT_ENV",
++    "E4M3X_AOT_DIR_ENV",
++    "FMHA_SM100_PREFILL_BF16X_ARCH",
+     "MAX_BLOCK_SCALE_SHIFT",
+     "JitSpec",
+     "gen_jit_spec",

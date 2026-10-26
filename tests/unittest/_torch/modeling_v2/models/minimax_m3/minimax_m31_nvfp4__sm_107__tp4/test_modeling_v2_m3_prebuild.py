@@ -66,7 +66,7 @@ _CORE_METHODS = (
 def _proxy_builds(monkeypatch):
     """The MSA indexer proxy's fmha_sm100 variants are recorded rather than compiled (an nvcc build each)."""
     require_msa_module()  # its cutlass compatibility shim must precede the fmha_sm100 import, as in the target
-    from fmha_sm100 import jit as fmha_jit
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100 import jit as fmha_jit
 
     built = []
 

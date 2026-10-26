@@ -1,0 +1,343 @@
+diff --git a/q8_indexer_interface.py b/q8_indexer_interface.py
+index ae4208104c016ca7685700241094966c6f2fe2e8..ea99438339b623b851a441ef2bbe3772743a5828 100644
+--- a/q8_indexer_interface.py
++++ b/q8_indexer_interface.py
+@@ -1,4 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """Q8KV4/Q8KV8 paged sparse-attention indexers over the vLLM cache layout.
+@@ -39,11 +40,12 @@ import torch
+ from cutlass import Int32
+ from cutlass.cute.runtime import from_dlpack
+ 
+-from src.common.aot_cache import save_aot, try_load_aot
+-from src.sm100.q8kv4_indexer_decode import Q8KV4DecodeIndexerSm100
+-from src.sm100.q8kv8_indexer_decode import Q8KV8DecodeIndexerSm100
+-from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
+-from src.sm100.q8kv8_indexer_prefill_plan import (
++from .src.common.aot_cache import save_aot, try_load_aot
++from .src.sm100.q8kv4_indexer_decode import Q8KV4DecodeIndexerSm100
++from .src.sm100.q8kv8_indexer_decode import Q8KV8DecodeIndexerSm100
++from .src.sm100.q8kv8_indexer_prefill import MMA_K as _PREFILL_MMA_K
++from .src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
++from .src.sm100.q8kv8_indexer_prefill_plan import (
+     Q8KV8PrefillIndexerPlanBuild,
+     Q8KV8PrefillIndexerPlanReset,
+ )
+@@ -161,12 +163,15 @@ def _compile_or_load(key: tuple[object, ...], compile_fn):
+ 
+ 
+ def _cute_kernel_key(name: str, capability: tuple[int, int], *static) -> tuple[object, ...]:
++    # MiniMax-M3.1 vendoring: the MMA K (the exact K32 vs the SM107 K64 instruction) is part of every key, in-process and
++    # AOT, so a K32 run never loads a K64 binary (the 840442 trap: the key ignored it).
+     return (
+         name,
+         cutlass.__version__,
+         str(cutlass.CUDA_VERSION),
+         _kernel_source_digest(),
+         capability,
++        ("mma_k", _PREFILL_MMA_K),
+         *static,
+     )
+ 
+@@ -248,7 +253,7 @@ def _check_topk_output(
+ 
+ 
+ def _load_indexer_module_from_source_tree(name: str):
+-    from fmha_sm100.jit import get_indexer_module
++    from ..fmha_sm100.jit import get_indexer_module
+ 
+     return get_indexer_module(name)
+ 
+@@ -639,6 +644,30 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
+     def _check_k_cache(self, k_cache: torch.Tensor, device: torch.device) -> None:
+         _check_paged_cache(k_cache, dtype=torch.uint8, page_width=_NVFP4_PAGE_WIDTH, device=device)
+ 
++    def run_scores_hpr(self, q: torch.Tensor, k_cache: torch.Tensor, kernel_out: torch.Tensor) -> None:
++        """MiniMax-M3.1 (MSA #7): the scores of the planned step written straight into the select layout
++        (``q8kv4_hpr_buffer``'s ``kernel_out``; read them through its ``view``). Two or four heads (the CuTe DSL kernel)."""
++        if self._num_heads == 1 or self._scores is None:
++            raise RuntimeError("run_scores_hpr needs plan() and two or four heads")
++        device = q.device
++        _check_query(q, self._scores.shape[0] * self._query_len, self._num_heads, device)
++        self._check_k_cache(k_cache, device)
++        sm_count = _sm_count(device)
++        key = _cute_kernel_key(
++            self._kernel_name, _require_supported_device(device), sm_count, self._num_heads, ("hpr", self._query_len)
++        )
++        metadata = (self._block_table, self._seq_lens, kernel_out, self._workspace)
++        compiled = _compile_or_load(
++            key,
++            lambda: cute.compile(
++                self._kernel_class(sm_count=sm_count, num_heads=self._num_heads, out_query_len=self._query_len),
++                *_cute_arguments((q, k_cache), metadata),
++                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
++                options="--enable-tvm-ffi --opt-level 2",
++            ),
++        )
++        compiled(q, k_cache, *metadata)
++
+     def _launch_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> None:
+         if self._num_heads != 1:
+             super()._launch_scores(q, k_cache)
+@@ -656,6 +685,17 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
+         )
+ 
+ 
++def q8kv4_hpr_buffer(batch_size: int, max_pages: int, num_heads: int, query_len: int, device) -> tuple:
++    """MiniMax-M3.1 (MSA #7): the score buffer of ``BatchDecodeIndexerQ8KV4Wrapper.run_scores_hpr`` and its select view
++    [num_heads, max_pages, batch_size * query_len] (contiguous, at offset 8 - query_len of the buffer)."""
++    rows = batch_size * query_len
++    pad = _DECODE_QUERY_LENGTH - query_len
++    buf = torch.empty(num_heads * max_pages * rows + pad, dtype=torch.float32, device=device)
++    view = buf.as_strided((num_heads, max_pages, rows), (max_pages * rows, rows, 1), pad)
++    kernel_out = buf.as_strided((num_heads, max_pages, rows), (max_pages * rows, rows, 1), 0)
++    return buf, view, kernel_out
++
++
+ @dataclass(frozen=True, slots=True)
+ class _PrefillPlanState:
+     cu_seqlens_q: torch.Tensor
+@@ -938,6 +978,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
+ 
+ 
+ __all__ = [
++    "q8kv4_hpr_buffer",
+     "BatchDecodeIndexerQ8KV4Wrapper",
+     "BatchDecodeIndexerQ8KV8Wrapper",
+     "BatchPrefillIndexerQ8KV8Wrapper",
+diff --git a/src/__init__.py b/src/__init__.py
+index 15dfab1c4fc45dcec26ba7489b35624f5c46a698..2f188f6ff1247edc431cca8eb19a71b312124f3a 100644
+--- a/src/__init__.py
++++ b/src/__init__.py
+@@ -1,3 +1,4 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+-
++# MiniMax-M3.1 vendoring (fmha_sm100_q8kv8): package marker.
+diff --git a/src/common/aot_cache.py b/src/common/aot_cache.py
+index 722a553c19035be4d43e1b8839f9aae3cb07f756..877d4b9887be5d000aee4dcda53ebb79ed84c25c 100644
+--- a/src/common/aot_cache.py
++++ b/src/common/aot_cache.py
+@@ -1,4 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """Persistent AOT cache for CuTe DSL compiled kernels.
+@@ -58,14 +59,33 @@ def _toolchain_manifest():
+ 
+ 
+ _MANIFEST = _toolchain_manifest()
++_TOOLCHAIN = hashlib.sha256(json.dumps(_MANIFEST, sort_keys=True).encode()).hexdigest()[:16]
++
++
++def _vendored_layout():
++    """TensorRT-LLM: (the vendored tree's name, the tensorrt_llm package dir) of this copy. The trees are
++    tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/<tree>."""
++    here = os.path.abspath(__file__)
++    tree = here
++    while os.path.basename(os.path.dirname(tree)) != "msa_kernels":
++        tree = os.path.dirname(tree)
++    return os.path.basename(tree), os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
++        os.path.dirname(os.path.dirname(tree))))))
++
++
++_TREE, _TRTLLM_ROOT = _vendored_layout()
++# Each vendored tree keeps its own cache: their source paths, relative to their roots, would collide in one.
+ _AOT_CACHE_DIR = os.path.join(
+     os.environ.get(
+         "MM_SPARSE_ATTN_AOT_CACHE",
+         os.path.expanduser("~/.cache/minfer/mm_sparse_attn"),
+     ),
++    _TREE,
+     f"v{_SCHEMA}",
+-    hashlib.sha256(json.dumps(_MANIFEST, sort_keys=True).encode()).hexdigest()[:16],
++    _TOOLCHAIN,
+ )
++# TensorRT-LLM: objects harvested from a reference run ship as wheel data and are read before the user cache.
++_WHEEL_AOT_DIR = os.path.join(_TRTLLM_ROOT, "libs", "msa_cute_aot", _TREE, f"v{_SCHEMA}", _TOOLCHAIN)
+ 
+ _loaded_modules: dict[str, object] = {}
+ _file_hashes: dict[Path, str | None] = {}
+@@ -80,10 +100,10 @@ def _file_hash(path: Path):
+     return _file_hashes[path]
+ 
+ 
+-def _key_to_path(key: tuple) -> str:
++def _key_to_path(key: tuple, root: str = _AOT_CACHE_DIR) -> str:
+     h = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+     name = str(key[0]).replace("/", "_")
+-    return os.path.join(_AOT_CACHE_DIR, f"{name}_{h}")
++    return os.path.join(root, f"{name}_{h}")
+ 
+ 
+ def _source_files(sources) -> list[Path]:
+@@ -165,8 +185,16 @@ def _loaded_cute_modules() -> list[Path]:
+ 
+ 
+ def _valid_object(key: tuple):
+-    """The cached object of ``key`` if its entry vouches for the current sources, else None."""
+-    base = _key_to_path(key)
++    """The shipped (wheel data), else the cached, object of ``key`` whose entry vouches for the current sources."""
++    for root in (_WHEEL_AOT_DIR, _AOT_CACHE_DIR):
++        found = _valid_object_in(key, root)
++        if found is not None:
++            return found
++    return None
++
++
++def _valid_object_in(key: tuple, root: str):
++    base = _key_to_path(key, root)
+     try:
+         with open(base + ".json", encoding="utf-8") as f:
+             entry = json.load(f)
+diff --git a/src/sm100/__init__.py b/src/sm100/__init__.py
+index f23267fe73800d35db382a1919bc28196da5aa8c..aecd1d11d3266ca79556ad0e13fbd228a3d058cf 100644
+--- a/src/sm100/__init__.py
++++ b/src/sm100/__init__.py
+@@ -1,4 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """SM100 sparse attention kernels."""
++# MiniMax-M3.1 vendoring (fmha_sm100_q8kv8): package marker.
+diff --git a/src/sm100/q8kv4_indexer_decode.py b/src/sm100/q8kv4_indexer_decode.py
+index 409b457f23ddd84a3da9b8b8067e11b50e706c5c..778ebb3b162d45dc31044666cab61d75e5c83171 100644
+--- a/src/sm100/q8kv4_indexer_decode.py
++++ b/src/sm100/q8kv4_indexer_decode.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ 
+ """CuTe DSL Q8KV4 paged decode indexer proxy scores for two or four index heads.
+ 
+@@ -26,7 +27,7 @@ from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
+ 
+ import cuda.bindings.driver as cuda
+ 
+-from src.common import utils as common_utils
++from ..common import utils as common_utils
+ 
+ # QMUL4 is public PTX from CUDA 13.4; older DSL backends and SM107, whose ptxas
+ # rejects it, take the exact FP16 path.
+@@ -257,7 +258,13 @@ class Q8KV4DecodeIndexerSm100:
+     k_per_tmem_col = e4m3_per_tmem_col
+     dequant_store_halves = 1
+ 
+-    def __init__(self, *, sm_count: int, num_heads: int) -> None:
++    def __init__(self, *, sm_count: int, num_heads: int, out_query_len: int = 0) -> None:
++        # MiniMax-M3.1 (MSA #7, PREREG_M31_MSA_NVFP4_INDEXK_HPR_v1): out_query_len > 0 writes the scores straight into the
++        # select's [heads, pages, rows] layout (rows = batch * out_query_len, the request's last out_query_len of the eight
++        # query slots), skipping the padded slots; 0 keeps the upstream [batch, 8 * heads, pages] layout. Same scores.
++        if not 0 <= out_query_len <= self.query_length:
++            raise ValueError(f"out_query_len must be in [0, {self.query_length}]")
++        self.out_query_len = out_query_len
+         if sm_count <= 0:
+             raise ValueError("sm_count must be positive")
+         if num_heads not in self.supported_num_heads:
+@@ -374,10 +381,21 @@ class Q8KV4DecodeIndexerSm100:
+             mPageTable.iterator,
+             cute.select(mPageTable.layout, mode=[1, 0]),
+         )
+-        mOut_pqb = cute.make_tensor(
+-            mOut.iterator,
+-            cute.select(mOut.layout, mode=[2, 1, 0]),
+-        )
++        if cutlass.const_expr(self.out_query_len == 0):
++            mOut_pqb = cute.make_tensor(
++                mOut.iterator,
++                cute.select(mOut.layout, mode=[2, 1, 0]),
++            )
++        else:
++            # mOut = [heads, pages, rows] over a buffer whose select view starts (8 - out_query_len) elements later:
++            # query slot s of request b lands on row b * out_query_len + s - (8 - out_query_len) of that view.
++            mOut_pqb = cute.make_tensor(
++                mOut.iterator,
++                cute.make_layout(
++                    (mOut.shape[1], (self.num_heads, self.query_length), batch_size),
++                    stride=(mOut.stride[1], (mOut.stride[0], 1), self.out_query_len),
++                ),
++            )
+         mScheduler = cute.make_tensor(
+             cute.recast_ptr(mSchedulerStorage.iterator, dtype=Int32),
+             cute.make_layout(batch_size + 1),
+@@ -1034,7 +1052,12 @@ class Q8KV4DecodeIndexerSm100:
+                                 # waits for this grid, so it may start launching.
+                                 cute.arch.griddepcontrol_launch_dependents()
+                             if logical_page < local_block:
+-                                mOut_pqb[logical_page, query_idx, current_batch] = row_max
++                                if cutlass.const_expr(self.out_query_len == 0):
++                                    mOut_pqb[logical_page, query_idx, current_batch] = row_max
++                                elif query_idx >= Int32(
++                                    (self.query_length - self.out_query_len) * self.num_heads
++                                ):
++                                    mOut_pqb[logical_page, query_idx, current_batch] = row_max
+                         global_page += Int32(1)
+                         logical_page += Int32(1)
+                     pages_remaining -= segment_pages
+diff --git a/src/sm100/q8kv8_indexer_prefill.py b/src/sm100/q8kv8_indexer_prefill.py
+index c0c3ff018624c826f242bd4676c3a7b66514972d..b3fefd5b5c26e45d5eb7c4f5aee0991eb2bdeb39 100644
+--- a/src/sm100/q8kv8_indexer_prefill.py
++++ b/src/sm100/q8kv8_indexer_prefill.py
+@@ -1,9 +1,11 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """CuTe DSL Q8KV8 paged prefill indexer proxy scores for SM100/SM103."""
+ 
+ import enum
++import os
+ 
+ import cutlass
+ import cutlass.cute as cute
+@@ -16,6 +18,13 @@ import cuda.bindings.driver as cuda
+ from quack import copy_utils
+ 
+ 
++
++# MiniMax-M3.1 vendoring (fmha_sm100_q8kv8, MSA; CTX handoff HANDOFF_CTX_IDX_SCORER_M2_v1 6a964784): the MMA instruction K of
++# the SM107 FP8 path. 32 = EXACT mode (default): the generic F8F6F4 MMA, bitwise to the served fmha proxy scores. 64 = the
++# upstream SM107 FP8 instruction (competitor numerics: a different accumulation order), only with
++# TRTLLM_M31_IDX_SCORER_MMA_K=64 and behind MSA's parity gates. Read once, at import; part of every compile key.
++MMA_K = 64 if os.environ.get("TRTLLM_M31_IDX_SCORER_MMA_K", "32") == "64" else 32
++
+ class NamedBarrierIndexerSm100(enum.IntEnum):
+     """Kernel-local named barriers."""
+ 
+@@ -60,7 +69,9 @@ class Q8KV8PrefillIndexerSm100:
+         compute_capability: tuple[int, int],
+         io_dtype=cutlass.Float8E4M3FN,
+     ) -> bool:
+-        return compute_capability == (10, 7) and io_dtype in cls.sm107_fp8_dtypes
++        # MiniMax-M3.1 vendoring (fmha_sm100_q8kv8): the exact mode (MMA_K == 32, the default) always takes the generic
++        # F8F6F4 instruction at K = 32, whose accumulation order is the served fmha proxy's (bitwise, CTX 840485).
++        return MMA_K == 64 and compute_capability == (10, 7) and io_dtype in cls.sm107_fp8_dtypes
+ 
+     @classmethod
+     def uses_two_ctas_per_sm(cls, compute_capability: tuple[int, int]) -> bool:
+diff --git a/src/sm100/q8kv8_indexer_prefill_plan.py b/src/sm100/q8kv8_indexer_prefill_plan.py
+index 100ffc0d2e0c0d3654a8c9500322976689d1b0a5..d60e87cfadf65da739286df7d8e4434238630544 100644
+--- a/src/sm100/q8kv8_indexer_prefill_plan.py
++++ b/src/sm100/q8kv8_indexer_prefill_plan.py
+@@ -1,4 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """Device-side varlen task planning for the Q8KV8 prefill indexer."""
+@@ -7,7 +8,7 @@ import cutlass
+ import cutlass.cute as cute
+ import cuda.bindings.driver as cuda
+ 
+-from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
++from .q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
+ 
+ 
+ class Q8KV8PrefillIndexerPlanReset:

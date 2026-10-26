@@ -1476,34 +1476,32 @@ def main(*,
             build_dir / "tensorrt_llm" / "flash_mla" / "python" / "flash_mla",
             pkg_dir / "flash_mla")
 
-    # Stage the FetchContent-patched MSA package for setup.py packaging.
-    msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
-    cutlass_src = build_dir / "_deps" / "cutlass-src"
-    msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
-    if not (msa_src / "cute" / "interface.py").is_file():
-        raise FileNotFoundError(
-            f"MSA package missing at {msa_src}; CMake FetchContent for msa "
-            "did not populate the expected sources.")
-    if msa_dst.is_symlink():
-        msa_dst.unlink()
-    elif msa_dst.exists():
-        rmtree(msa_dst)
-    msa_dst.mkdir(parents=True)
-    for python_source in msa_src.glob("*.py"):
-        install_file(python_source, msa_dst)
-    for source_dir, relative_dir in (
-        (msa_src / "csrc", Path("csrc")),
-        (msa_src / "cute", Path("cute")),
-        (cutlass_src / "include", Path("cutlass/include")),
-        (cutlass_src / "tools/util/include",
-         Path("cutlass/tools/util/include")),
-    ):
-        (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
-        install_tree(
-            source_dir,
-            msa_dst / relative_dir,
-        )
-    install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
+    # The MSA fmha_sm100 modules built ahead of time (kernels/minimaxM3Msa); the vendored
+    # package loads them from tensorrt_llm/libs/msa_fmha_sm100.
+    msa_aot = build_dir / "tensorrt_llm/kernels/minimaxM3Msa/msa_fmha_sm100"
+    if msa_aot.is_dir():
+        install_tree(msa_aot, lib_dir / "msa_fmha_sm100")
+        # Variants outside the prebuilt set compile at run time against these
+        # CUTLASS headers (the vendored jit.py looks in its package's cutlass/).
+        cutlass_src = build_dir / "_deps" / "cutlass-src"
+        msa_cutlass = (pkg_dir / "_torch" / "attention" / "backends" / "fmha" /
+                       "msa_kernels" / "fmha_sm100" / "cutlass")
+        for relative_dir in ("include", "tools/util/include"):
+            (msa_cutlass / relative_dir).parent.mkdir(parents=True,
+                                                      exist_ok=True)
+            install_tree(cutlass_src / relative_dir, msa_cutlass / relative_dir)
+        install_file(cutlass_src / "LICENSE.txt", msa_cutlass)
+
+    # The MSA CuTe DSL objects harvested from a reference run (minimaxM3Msa/pack_cute_aot.py), read before any compile.
+    msa_cute_aot = get_source_dir(
+    ) / "tensorrt_llm/kernels/minimaxM3Msa/cute_aot/msa_cute_aot.txz"
+    if msa_cute_aot.is_file():
+        import tarfile
+
+        if (lib_dir / "msa_cute_aot").exists():
+            rmtree(lib_dir / "msa_cute_aot")
+        with tarfile.open(msa_cute_aot) as tar:
+            tar.extractall(lib_dir / "msa_cute_aot", filter="data")
 
     if not skip_stubs:
         with working_directory(pkg_dir):

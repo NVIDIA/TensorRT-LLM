@@ -28,7 +28,7 @@ WANT = {"1_0_0_2_1_0_1", "1_0_0_2_1_0_0", "1_0_1_2_1_0_0", "1_1_1_2_1_0_0"}
 @pytest.fixture
 def proxy_builds(monkeypatch):
     require_msa_module()  # its cutlass compatibility shim must precede the fmha_sm100 import, as in the target
-    from fmha_sm100 import jit as fmha_jit
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100 import jit as fmha_jit
 
     built = []
 

@@ -16,6 +16,13 @@
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
     },
     {
+      "name": "cutlass_msa",
+      "git_repository": "https://github.com/NVIDIA/cutlass",
+      "git_tag": "v4.8.0",
+      "git_shallow": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
       "name": "cxxopts",
       "git_repository": "https://github.com/jarro2783/cxxopts",
       "git_tag": "v3.1.1",
@@ -85,14 +92,6 @@
       "git_tag": "v3.12.0",
       "git_shallow": true,
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
-    },
-    {
-      "name": "msa",
-      "git_repository": "https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa.git",
-      "git_tag": "e2ebe7656649f619af0ad1d457b534283034655e",
-      "git_submodules": "",
-      "source_subdir": "dont-add-this-project-with-add-subdirectory",
-      "patch_file": "patches/msa_strided_paged_kv.patch"
     },
     {
       "name": "nanobind",

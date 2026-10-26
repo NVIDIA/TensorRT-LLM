@@ -35,6 +35,7 @@ add_subdirectory(kimiK3AttnRes)
 add_subdirectory(mhcKernels)
 add_subdirectory(compressorKernels)
 add_subdirectory(fusedSampling)
+add_subdirectory(minimaxM3Msa)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -74,6 +75,9 @@ list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "fusedSampling/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "fusedSampling/.*")
+# The MSA fmha_sm100 modules are built ahead of time by
+# minimaxM3Msa/CMakeLists.txt.
+list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Msa/.*")
 # Marlin is built as its own architecture-scoped OBJECT library below.
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")

@@ -3168,8 +3168,12 @@ class MiniMaxM3Tp8ModelingV2(DecoderModel):
         Compile and load only, nothing runs: no numerics change. fmha_sm100 keys its cache by its installed sources, so
         a source overlay builds its own variants. Returns the variant names."""
         require_msa_module()
-        from fmha_sm100 import api as fmha_api
-        from fmha_sm100 import jit as fmha_jit
+        from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100 import (
+            api as fmha_api,
+        )
+        from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100 import (
+            jit as fmha_jit,
+        )
 
         only_score, page = 2, 128
         names = []

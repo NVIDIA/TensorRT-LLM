@@ -40,8 +40,9 @@ constexpr int32_t kMinimaxM3SelectPrefillTileMaxBlocks = 5856;
 //! Same contract as minimax_m3_select_blocks: per (query, head) row the clamp(nValidBlocks[query], 0, numBlocks)
 //! leading blocks; the last localBlocks of them (counted from the unclamped count) forced to 1e29 and the first
 //! initBlocks to 1e30, local winning; ranked by the descending ordered key of the float bits (NaN above +inf, +0 above
-//! -0, negative NaN below -inf), ties to the smaller block; picks whose forced score is -inf emitted as -1; ascending
-//! ids with -1 tail padding. Writes out[query * outQueryStride + head * outHeadStride + 0..15].
+//! -0, negative NaN below -inf), ties to the smaller block; picks whose forced score is -inf or a negative NaN
+//! emitted as -1; ascending ids with -1 tail padding.
+//! Writes out[query * outQueryStride + head * outHeadStride + 0..15].
 cudaError_t invokeMinimaxM3SelectPrefillTile(float const* scores, int64_t headStride, int64_t blockStride,
     int32_t const* nValidBlocks, int32_t* out, int64_t outQueryStride, int64_t outHeadStride, int32_t numKvHeads,
     int32_t numBlocks, int32_t totalQ, int32_t initBlocks, int32_t localBlocks, cudaStream_t stream);

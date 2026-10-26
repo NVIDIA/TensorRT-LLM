@@ -880,12 +880,15 @@ def _archive_tree(repo: Path, commit: str, source: str, patterns: Sequence[str])
         if relative in ("", "."):
             continue
         _validate_tree_relative_path(relative)
+        # Entries the include patterns skip are never materialized, so a link or a
+        # submodule there (for example an upstream's own CUTLASS submodule) does not
+        # block selecting the files beside it.
+        if not _matches(relative, patterns):
+            continue
         if object_type != b"blob" or mode not in ("100644", "100755"):
             raise VendorError(
                 f"Selected upstream trees cannot contain links or special files: {relative}."
             )
-        if not _matches(relative, patterns):
-            continue
         if relative in seen_paths:
             raise VendorError(
                 f"Git produced a duplicate tree entry for source {source!r}: {relative}."

@@ -104,10 +104,12 @@ __device__ __forceinline__ int4 rmsNorm(float denom, PackedBf16& vec, PackedBf16
 //! one 8-element chunk per thread) whose per-row output also goes through quantize_mxfp8_rows' per-element math
 //! (cvt_warp_fp16_to_mxfp8<bf16, 32>, swizzled K32 scales) while it is still in registers. The scale rows that pad
 //! the row count to a multiple of 128 are zero-filled, as quantize_mxfp8_rows does.
-template <bool kWriteNorm, bool kFp4>
+//! kF32 (TP2CTX_NORMQ_F32): also writes the normed rows widened to FP32 (exact: bf16 -> fp32), the router GEMM's input,
+//! so the separate cast kernel (normOut.float()) is not needed.
+template <bool kWriteNorm, bool kFp4, bool kF32>
 __global__ void ctxResidualRmsNormMxfp8Kernel(__nv_bfloat16* inter, __nv_bfloat16 const* residual,
     __nv_bfloat16 const* weight, __nv_bfloat16* normOut, uint64_t* qOut, uint32_t* sfOut, uint32_t* fp4Out,
-    uint32_t* fp4SfOut, float const* fp4GlobalScale, int rows, int hidden, float eps)
+    uint32_t* fp4SfOut, float const* fp4GlobalScale, float* f32Out, int rows, int hidden, float eps)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     static constexpr int kThreadsPerSf = 32 / CVT_ELTS_PER_THREAD;
@@ -152,6 +154,15 @@ __global__ void ctxResidualRmsNormMxfp8Kernel(__nv_bfloat16* inter, __nv_bfloat1
         {
             *reinterpret_cast<int4*>(normOut + rowOffset) = outVec.packed;
         }
+        if constexpr (kF32)
+        {
+            float2 const f0 = __bfloat1622float2(outVec.unpacked[0]);
+            float2 const f1 = __bfloat1622float2(outVec.unpacked[1]);
+            float2 const f2 = __bfloat1622float2(outVec.unpacked[2]);
+            float2 const f3 = __bfloat1622float2(outVec.unpacked[3]);
+            reinterpret_cast<float4*>(f32Out + rowOffset)[0] = make_float4(f0.x, f0.y, f1.x, f1.y);
+            reinterpret_cast<float4*>(f32Out + rowOffset)[1] = make_float4(f2.x, f2.y, f3.x, f3.y);
+        }
         PackedVec<__nv_bfloat16> quantIn;
         *reinterpret_cast<int4*>(&quantIn) = outVec.packed;
         auto sf = cvt_quant_get_sf_out_offset<uint32_t, kThreadsPerSf>(
@@ -191,7 +202,7 @@ __global__ void ctxResidualRmsNormMxfp8Kernel(__nv_bfloat16* inter, __nv_bfloat1
 
 void invokeCtxResidualRmsNormMxfp8(__nv_bfloat16* inter, __nv_bfloat16 const* residual, __nv_bfloat16 const* weight,
     __nv_bfloat16* normOut, uint64_t* qOut, uint32_t* sfOut, uint32_t* fp4Out, uint32_t* fp4SfOut,
-    float const* fp4GlobalScale, int rows, int hidden, float eps, bool enablePdl, cudaStream_t stream)
+    float const* fp4GlobalScale, float* f32Out, int rows, int hidden, float eps, bool enablePdl, cudaStream_t stream)
 {
     static int const multiProcessorCount = []
     {
@@ -214,16 +225,26 @@ void invokeCtxResidualRmsNormMxfp8(__nv_bfloat16* inter, __nv_bfloat16 const* re
     auto launch = [&](auto kernel)
     {
         cudaLaunchKernelEx(&config, kernel, inter, residual, weight, normOut, qOut, sfOut, fp4Out, fp4SfOut,
-            fp4GlobalScale, rows, hidden, eps);
+            fp4GlobalScale, f32Out, rows, hidden, eps);
     };
     bool const fp4 = fp4Out != nullptr;
-    if (normOut != nullptr)
+    if (f32Out != nullptr)
     {
-        fp4 ? launch(ctxResidualRmsNormMxfp8Kernel<true, true>) : launch(ctxResidualRmsNormMxfp8Kernel<true, false>);
+        // The FP32 router copy is requested at the pre-MoE boundary, which also writes the BF16 norm and (N1b) the
+        // experts' NVFP4 input.
+        TLLM_CHECK_WITH_INFO(normOut != nullptr, "the FP32 side output needs the BF16 norm output");
+        fp4 ? launch(ctxResidualRmsNormMxfp8Kernel<true, true, true>)
+            : launch(ctxResidualRmsNormMxfp8Kernel<true, false, true>);
+    }
+    else if (normOut != nullptr)
+    {
+        fp4 ? launch(ctxResidualRmsNormMxfp8Kernel<true, true, false>)
+            : launch(ctxResidualRmsNormMxfp8Kernel<true, false, false>);
     }
     else
     {
-        fp4 ? launch(ctxResidualRmsNormMxfp8Kernel<false, true>) : launch(ctxResidualRmsNormMxfp8Kernel<false, false>);
+        fp4 ? launch(ctxResidualRmsNormMxfp8Kernel<false, true, false>)
+            : launch(ctxResidualRmsNormMxfp8Kernel<false, false, false>);
     }
 }
 
