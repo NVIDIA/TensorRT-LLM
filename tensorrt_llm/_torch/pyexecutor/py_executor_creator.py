@@ -1232,8 +1232,8 @@ def _create_py_executor(
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
-    # Whether standalone dense DWDP was set up before the KV caches (below).
-    dense_dwdp_set_up = False
+    # Whether DWDP was set up before the KV caches (below).
+    dwdp_set_up = False
 
     # Create the execution stream for model forward operations
     # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
@@ -1291,13 +1291,16 @@ def _create_py_executor(
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
         # Without the estimation, build_managers sizes the final KV cache from
-        # the device memory free now, so standalone dense DWDP is set up first:
-        # the replicated dense weights it frees then go to the KV cache. With
-        # the estimation, it is set up below, before the estimation run
-        # measures the memory.
-        if dense_dwdp_manager is not None and not estimating_kv_cache:
-            dense_dwdp_manager.setup(model_engine.model)
-            dense_dwdp_set_up = True
+        # the device memory free now, so dense DWDP is set up first, standalone
+        # or attached with the expert setup: the replicated dense weights it
+        # frees then go to the KV cache. With the estimation, it is set up
+        # below, before the estimation run measures the memory. Expert DWDP
+        # without a dense request keeps its place after the KV cache.
+        if dense_mode is not None and not estimating_kv_cache:
+            manager = (dwdp_manager
+                       if dwdp_manager is not None else dense_dwdp_manager)
+            manager.setup(model_engine.model)
+            dwdp_set_up = True
 
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE
@@ -1306,12 +1309,13 @@ def _create_py_executor(
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
     # weight manager + MoE backend fixup (single entry point). Dense DWDP is set
-    # up there with expert DWDP, else here when it runs standalone (unless it
-    # was set up before the KV caches above).
-    if dwdp_manager is not None:
-        dwdp_manager.setup(model_engine.model)
-    elif dense_dwdp_manager is not None and not dense_dwdp_set_up:
-        dense_dwdp_manager.setup(model_engine.model)
+    # up there with expert DWDP, else here when it runs standalone. A launch
+    # with dense DWDP and without the estimation was set up above instead.
+    if not dwdp_set_up:
+        if dwdp_manager is not None:
+            dwdp_manager.setup(model_engine.model)
+        elif dense_dwdp_manager is not None:
+            dense_dwdp_manager.setup(model_engine.model)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config

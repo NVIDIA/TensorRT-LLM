@@ -22,7 +22,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._torch.cute_dsl_utils import sm_reserve
+from tensorrt_llm._torch.modules.dwdp import fabric_gather
+from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
 from tensorrt_llm._torch.modules.dwdp.dense.manager import (
+    DenseDwdpManager,
     get_global_dense_dwdp_manager,
     set_global_dense_dwdp_manager,
 )
@@ -167,13 +171,33 @@ _NOOPS = ("instantiate_sampler", "get_spec_resource_manager", "get_spec_drafter"
 _NOOPS += ("_adjust_torch_mem_fraction", "log_memory_usage")
 
 
-def _create(monkeypatch: pytest.MonkeyPatch, mode: str, kv_cache: str) -> tuple[list, object]:
+def _standalone_dense_manager(
+    mode: DenseMode, *, mapping: Mapping, config: DenseConfig
+) -> DenseDwdpManager:
+    """A real standalone manager, of an attention-DP instance whatever the creator's stand-in
+    mapping."""
+    assert mode is DenseMode.STANDALONE
+    instance = Mapping(world_size=2, rank=0, tp_size=2, enable_attention_dp=True)
+    return DenseDwdpManager(mode, mapping=instance, config=config)
+
+
+def _create(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    kv_cache: str,
+    *,
+    real_dense_manager: bool = False,
+    copy_mode: str | None = None,
+) -> tuple[list, object]:
     """Run ``create_py_executor`` with DWDP in ``mode``, start a forward of the executor it returns.
 
     Args:
         mode: ``"expert"`` (expert DWDP alone), ``"attached"`` (dense DWDP attached to it) or
             ``"standalone"`` (dense DWDP alone).
         kv_cache: ``"estimated"``, ``"not_estimated"`` or ``"none"`` (a model without one).
+        real_dense_manager: Standalone, the creator builds a real ``DenseDwdpManager``, whose
+            setup only logs; the model engine logs the SM reserve it is built with.
+        copy_mode: Standalone, ``dwdp_config.copy_mode``.
 
     Returns:
         The call log and the one DWDP manager created.
@@ -233,6 +257,8 @@ def _create(monkeypatch: pytest.MonkeyPatch, mode: str, kv_cache: str) -> tuple[
         return SimpleNamespace(dwdp_manager=given[0], dense_dwdp_manager=given[1])
 
     def model_engine(attn_runtime_features: object, **_kwargs: object) -> _DummyModelEngine:
+        if real_dense_manager:
+            log.append(("model built with an SM reserve of", sm_reserve()))
         engine = _DummyModelEngine(
             attn_runtime_features=attn_runtime_features, kv_cache_quant_algo=QuantAlgo.NO_QUANT
         )
@@ -244,7 +270,7 @@ def _create(monkeypatch: pytest.MonkeyPatch, mode: str, kv_cache: str) -> tuple[
     fakes.update(
         validate_dense_gate=lambda *_args: log.append("gate") or dense_mode,
         DwdpManager=manager,
-        DenseDwdpManager=manager,
+        DenseDwdpManager=_standalone_dense_manager if real_dense_manager else manager,
         KvCacheCreator=kv_cache_creator,
         create_py_executor_instance=create_py_executor_instance,
         create_py_executor_resources=create_py_executor_resources,
@@ -272,7 +298,9 @@ def _create(monkeypatch: pytest.MonkeyPatch, mode: str, kv_cache: str) -> tuple[
 
     llm_args = _make_llm_args()
     if mode == "standalone":
-        llm_args.dwdp_config = DwdpConfig(enable_experts=False, enable_dense=True)
+        llm_args.dwdp_config = DwdpConfig(
+            enable_experts=False, enable_dense=True, copy_mode=copy_mode
+        )
     else:
         llm_args.dwdp_config = DwdpConfig(
             enable_dense=mode == "attached",
@@ -280,14 +308,16 @@ def _create(monkeypatch: pytest.MonkeyPatch, mode: str, kv_cache: str) -> tuple[
             num_experts_per_worker=4,
             num_prefetch_experts=4,
         )
+    if real_dense_manager:
+        monkeypatch.setattr(DenseDwdpManager, "setup", lambda _self, _model: log.append("setup"))
     executor = py_executor_creator.create_py_executor(llm_args=llm_args, checkpoint_dir=None)
     executor._prime_dwdp()
-    (manager,) = managers
+    (manager,) = [executor.dense_dwdp_manager] if real_dense_manager else managers
     return log, manager
 
 
 @pytest.mark.parametrize("kv_cache", ["estimated", "not_estimated", "none"])
-@pytest.mark.parametrize("mode", ["expert", "attached"])
+@pytest.mark.parametrize("mode", ["expert", "attached", "standalone"])
 def test_only_the_serving_phase_gets_the_manager(
     monkeypatch: pytest.MonkeyPatch, mode: str, kv_cache: str
 ) -> None:
@@ -295,11 +325,15 @@ def test_only_the_serving_phase_gets_the_manager(
 
     With the KV-cache estimation, the executor is built for profiling without the manager, so
     ``release_resources`` exits none, and ``rebind_resources`` hands it to the serving phase.
-    Without the estimation the executor serves from its construction and gets it then.
+    Without the estimation the executor serves from its construction and gets it then, and dense
+    DWDP is set up before ``build_managers`` sizes the final KV cache, which then gets the memory
+    dense DWDP frees; expert DWDP alone is set up after it.
     """
     log, manager = _create(monkeypatch, mode, kv_cache)
 
+    given = (None, manager) if mode == "standalone" else (manager, None)
     final_kv_cache = ("build_managers", False)
+    setup_first = mode != "expert"
     expected = {
         "estimated": [
             ("build_managers", True),
@@ -307,10 +341,35 @@ def test_only_the_serving_phase_gets_the_manager(
             ("executor", None, None),
             ("release", None, None),
             final_kv_cache,
-            ("serving resources", manager, None),
+            ("serving resources", *given),
             "rebind",
         ],
-        "not_estimated": [final_kv_cache, "setup", ("executor", manager, None)],
-        "none": ["setup", ("executor", manager, None)],
+        "not_estimated": ["setup", final_kv_cache] if setup_first else [final_kv_cache, "setup"],
+        "none": ["setup"],
     }[kv_cache]
-    assert log == ["gate"] * (mode != "expert") + expected + ["start_forward"]
+    if kv_cache != "estimated":
+        expected.append(("executor", *given))
+    start = "prefetch_first_layers" if mode == "standalone" else "start_forward"
+    assert log == ["gate"] * (mode != "expert") + expected + [start]
+
+
+def test_a_standalone_gather_reserves_its_sms_before_the_model_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kernels that size their persistent grids when the model is built (the KDA prefill) leave
+    the SM gather's resident SMs out; exiting the manager drops the reserve.  The gather comes
+    from dwdp_config.copy_mode."""
+    monkeypatch.delenv("TRTLLM_CUTEDSL_SM_RESERVE", raising=False)
+    monkeypatch.setenv("TRTLLM_DWDP_GATHER_BLOCKS", "30")
+    monkeypatch.setattr(fabric_gather, "THREADS", 1024)
+    with _restore_global_dense_dwdp_manager():
+        log, manager = _create(
+            monkeypatch, "standalone", "not_estimated", real_dense_manager=True, copy_mode="gather"
+        )
+        try:
+            assert ("model built with an SM reserve of", 30) in log
+            assert log.index("setup") > log.index(("model built with an SM reserve of", 30))
+            assert get_global_dense_dwdp_manager() is manager and sm_reserve() == 30
+        finally:
+            manager.__exit__(None, None, None)
+    assert sm_reserve() == 0
