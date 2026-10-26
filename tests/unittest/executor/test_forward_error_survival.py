@@ -54,7 +54,6 @@ def _request(mm_data=None):
         py_disaggregated_params=None,
         sampling_config=None,
         py_multimodal_data=mm_data,
-        kv_cache_retention_config=None,
     )
 
 
