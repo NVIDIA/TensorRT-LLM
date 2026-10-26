@@ -140,6 +140,14 @@ _V2_RETENTION_IGNORED_LOG_KEY = "kv_cache_manager_v2_retention_config_ignored"
 _KV_GPU_PREFETCH_KILLED = os.environ.get("TRTLLM_M31_DISABLE_KV_GPU_PREFETCH",
                                          "0") == "1"
 _KV_GPU_PREFETCH = False
+
+
+def arm_kv_gpu_prefetch() -> None:
+    """Take the host-tier KV prefix prefetch in this process (RuntimeHooks.kv_gpu_prefetch), unless killed."""
+    global _KV_GPU_PREFETCH
+    _KV_GPU_PREFETCH = not _KV_GPU_PREFETCH_KILLED
+
+
 _KV_GPU_PREFETCH_MAX = int(os.environ.get("TRTLLM_M31_KV_GPU_PREFETCH_MAX",
                                           "2"))
 _KV_GPU_PREFETCH_BYTES_PER_STEP = int(1.5e9)
@@ -403,7 +411,6 @@ def _arm_runtime_opt_ins(hooks: RuntimeHooks) -> bool:
     index_fill, the DFlash host-side context allocation and the late-compile
     detector. Each keeps its TRTLLM_M31_DISABLE_* kill switch.
     """
-    global _KV_GPU_PREFETCH
     if hooks.mxfp8_pinned_tactics:
         # Imported on use: only an opted-in model needs the table.
         from tensorrt_llm._torch.custom_ops import mxfp8_cute_pinned_tactics
@@ -413,7 +420,7 @@ def _arm_runtime_opt_ins(hooks: RuntimeHooks) -> bool:
             paged_cache
         paged_cache.arm_fp8_saturation()
     if hooks.kv_gpu_prefetch:
-        _KV_GPU_PREFETCH = not _KV_GPU_PREFETCH_KILLED
+        arm_kv_gpu_prefetch()
     if hooks.context_token_array:
         from . import llm_request
         llm_request.arm_context_token_array()
