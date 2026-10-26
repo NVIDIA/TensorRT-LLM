@@ -17,10 +17,17 @@ bit in that rank's READY cell on every rank. The residency cases put a
 full-device kernel that spins on the READY row, like MegaMoE's gate, on MAIN
 right after the route wait, while the relay is starved of SMs, and expect it
 to pass its gate in eager mode and under graph replay.
+
+``test_halo_r_relay_pdl_timing`` is a benchmark, skipped unless
+HALO_R_PDL_TIMING=1: it stamps the scheduler and relay of every layer call
+with the timing probe, with the relay's programmatic launch on and off, and
+asserts only correctness.
 """
 
 import ctypes
 import faulthandler
+import json
+import os
 import pickle
 import random
 import sys
@@ -94,7 +101,9 @@ def _pattern(expert: int, plane: int, layer: int, nbytes: int, device: int) -> t
     return ((index * 131 + expert * 7919 + plane * 104729 + layer * 15485863) % 251).to(torch.uint8)
 
 
-def _routes(step: int, rank: int, num_tokens: int, experts: int, device: int) -> torch.Tensor:
+def _routes(
+    step: int, rank: int, num_tokens: int, experts: int, device: int, topk: int = _TOPK
+) -> torch.Tensor:
     """Skewed routes: most tokens pick one hot expert per step, distinct experts per token."""
     rng = random.Random(1000 * step + rank)
     hot = [(5 * step) % experts, (5 * step + 9) % experts]
@@ -103,12 +112,12 @@ def _routes(step: int, rank: int, num_tokens: int, experts: int, device: int) ->
         choice = [hot[0]] if rng.random() < 0.6 else []
         if rng.random() < 0.3 and hot[1] not in choice:
             choice.append(hot[1])
-        while len(choice) < _TOPK:
+        while len(choice) < topk:
             expert = rng.randrange(experts)
             if expert not in choice:
                 choice.append(expert)
         rows.append(choice)
-    return torch.tensor(rows, dtype=torch.int32, device=f"cuda:{device}").reshape(-1, _TOPK)
+    return torch.tensor(rows, dtype=torch.int32, device=f"cuda:{device}").reshape(-1, topk)
 
 
 def _init_process_group(rank: int) -> None:
@@ -356,7 +365,9 @@ _PLACEHOLDER_MESSAGE = "HALO-R requires CUDA 13.1+"
 class _Layers:
     """HALO-R groups of consecutive MoE layers on one model-level manager."""
 
-    def __init__(self, rank: int, count: int) -> None:
+    def __init__(
+        self, rank: int, count: int, hidden: int = _HIDDEN, intermediate: int = _INTERMEDIATE
+    ) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
             PerLayerDynamicMoeLoadBalancer,
         )
@@ -376,7 +387,7 @@ class _Layers:
         self.manager = PerLayerDynamicMoeLoadBalancer(ep_rank=rank, ep_size=_EP_SIZE, config=config)
         self.mapping = SimpleNamespace(moe_ep_size=_EP_SIZE, moe_ep_rank=rank, local_rank=rank)
         self.process_group = dist.group.WORLD
-        bundle = BundleLayout.create(hidden=_HIDDEN, intermediate=_INTERMEDIATE)
+        bundle = BundleLayout.create(hidden=hidden, intermediate=intermediate)
         self.arenas = []
         for layer in range(count):
             arena = allocate_rebalance_arena(
@@ -402,7 +413,7 @@ class _Layers:
         self.groups = []
         self.epochs = []
 
-    def build_groups(self) -> None:
+    def build_groups(self, max_tokens: int = _MAX_TOKENS, topk: int = _TOPK) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
             build_halo_r_slot_scheduler_group,
         )
@@ -416,8 +427,8 @@ class _Layers:
                     ep_process_group=self.process_group,
                     home_experts=_HOME_EXPERTS,
                     helper_slots=_HELPER_SLOTS,
-                    topk=_TOPK,
-                    max_tokens_per_rank=_MAX_TOKENS,
+                    topk=topk,
+                    max_tokens_per_rank=max_tokens,
                     layer_idx=layer,
                 )
             )
@@ -635,3 +646,229 @@ def test_halo_r_relay_matches_reference(halo_r_mpi_pool, case):
         pytest.skip("; ".join(sorted(skips)))
     failures = [failure for _, rank_failures in results for failure in rank_failures]
     assert not failures, "\n".join(failures[:20])
+
+
+# Timing benchmark of the relay's programmatic dependent launch (PDL). Production
+# shape where the harness allows it: 2048 tokens per rank, top-8, the default
+# NVFP4 bundle; routes are the skewed synthetic `_routes`, not replayed slabs.
+_TIMING_TOKENS = 2048
+_TIMING_TOPK = 8
+_TIMING_LAYERS = int(os.environ.get("HALO_R_PDL_TIMING_LAYERS", "4"))
+_TIMING_ITERATIONS = int(os.environ.get("HALO_R_PDL_TIMING_ITERATIONS", "20"))
+# MoeRebalanceHaloRProbeWord.
+_PROBE_WORDS = 8
+_PROBE_SCHEDULER_START = 0
+_PROBE_PLAN_PUBLISHED = 1
+_PROBE_SCHEDULER_END = 2
+_PROBE_RELAY_START = 3
+_PROBE_RELAY_END = 4
+_PROBE_RELAY_FALLBACKS = 5
+_UNSET = (1 << 64) - 1
+
+
+def _quantiles(values: list) -> dict:
+    """Median and nearest-rank p90 in microseconds."""
+    ordered = sorted(values)
+    count = len(ordered)
+    middle = count // 2
+    median = ordered[middle] if count % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+    p90 = ordered[max(0, -(-9 * count // 10) - 1)]
+    return {"median_us": round(median / 1000, 3), "p90_us": round(p90 / 1000, 3)}
+
+
+def _timing_summary(records: list) -> dict:
+    """Probe records (stamps in ns) to the four intervals of PDL_NOTES.md."""
+    plan, tail, start, total = [], [], [], []
+    for r in records:
+        plan.append(r[_PROBE_PLAN_PUBLISHED] - r[_PROBE_SCHEDULER_START])
+        tail.append(r[_PROBE_SCHEDULER_END] - r[_PROBE_PLAN_PUBLISHED])
+        start.append(r[_PROBE_RELAY_START] - r[_PROBE_SCHEDULER_END])
+        total.append(r[_PROBE_RELAY_END] - r[_PROBE_SCHEDULER_START])
+    return {
+        "calls": len(records),
+        "plan_b_minus_a": _quantiles(plan),
+        "route_tail_c_minus_b": _quantiles(tail),
+        "relay_start_vs_scheduler_end_d_minus_c": _quantiles(start),
+        "end_to_end_e_minus_a": _quantiles(total),
+        "relay_plan_fallback_ctas": sum(r[_PROBE_RELAY_FALLBACKS] for r in records),
+    }
+
+
+def _probe_records(probe: torch.Tensor, indices: list, rank: int, layer: int, failures: list):
+    rows = probe.cpu().tolist()
+    records = []
+    for index in indices:
+        record = [value & _UNSET for value in rows[index]]
+        if _UNSET in (record[_PROBE_SCHEDULER_START], record[_PROBE_RELAY_START]) or not all(
+            record[_PROBE_PLAN_PUBLISHED : _PROBE_RELAY_END + 1]
+        ):
+            failures.append(f"rank {rank}: layer {layer} launch {index}: probe record incomplete")
+            continue
+        records.append(record)
+    return records
+
+
+def _run_timing_worker(pdl: bool):
+    faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S, exit=True)
+    rank = tllm.mpi_rank()
+    layers = None
+    try:
+        assert tllm.mpi_world_size() == _EP_SIZE
+        torch.cuda.set_device(rank)
+        reason = _skip_reason()
+        if reason is None and not hasattr(
+            getattr(getattr(torch, "ops"), "trtllm"), "moe_rebalance_halo_r_set_probe"
+        ):
+            reason = "HALO-R timing probe is not built"
+        reasons = MPI.COMM_WORLD.allgather(reason)
+        if any(reasons):
+            return "; ".join(sorted({r for r in reasons if r})), [], {}
+        ops = getattr(getattr(torch, "ops"), "trtllm")
+        # The native context reads the switch when it is bound.
+        os.environ["TRTLLM_HALO_R_RELAY_PDL"] = "1" if pdl else "0"
+        _init_process_group(rank)
+        hidden = int(os.environ.get("HALO_R_PDL_TIMING_HIDDEN", "7168"))
+        intermediate = int(os.environ.get("HALO_R_PDL_TIMING_INTERMEDIATE", "3072"))
+        layers = _Layers(rank, _TIMING_LAYERS, hidden=hidden, intermediate=intermediate)
+        try:
+            layers.build_groups(max_tokens=_TIMING_TOKENS, topk=_TIMING_TOPK)
+        except RuntimeError as error:
+            if _PLACEHOLDER_MESSAGE in str(error):
+                return f"placeholder build: {error}", [], {}
+            raise
+        experts = layers.experts
+        records = 2 * _TIMING_ITERATIONS + 8
+        probes = []
+        for group in layers.groups:
+            probe = torch.zeros((records, _PROBE_WORDS), dtype=torch.int64, device=f"cuda:{rank}")
+            probe[:, _PROBE_SCHEDULER_START] = -1
+            probe[:, _PROBE_RELAY_START] = -1
+            ops.moe_rebalance_halo_r_set_probe(group._handle, probe)
+            probes.append(probe)
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+
+        failures = []
+        launches = {"eager": [[] for _ in layers.groups], "cuda_graph": [[] for _ in layers.groups]}
+        main = torch.cuda.Stream()
+
+        def check(routes: list) -> None:
+            for layer, (group, arena) in enumerate(zip(layers.groups, layers.arenas)):
+                failures.extend(
+                    _check_call(group, arena, routes[layer], layers.epochs[layer], rank, layer)
+                )
+
+        # Eager: the layers back to back on MAIN, one host sync per iteration.
+        for iteration in range(_TIMING_ITERATIONS):
+            routes = [
+                _routes(100 * iteration + layer, rank, _TIMING_TOKENS, experts, rank, _TIMING_TOPK)
+                for layer in range(len(layers.groups))
+            ]
+            torch.cuda.synchronize()
+            MPI.COMM_WORLD.Barrier()
+            with torch.cuda.stream(main):
+                for layer, group in enumerate(layers.groups):
+                    launches["eager"][layer].append(layers.epochs[layer])
+                    group.plan(routes[layer], defer_wait=False)
+                    group.finish()
+                    layers.epochs[layer] += 1
+            torch.cuda.synchronize()
+            MPI.COMM_WORLD.Barrier()
+            check(routes)
+
+        # CUDA graph: every layer in one captured graph, replayed.
+        static_routes = [
+            _routes(layer, rank, _TIMING_TOKENS, experts, rank, _TIMING_TOPK)
+            for layer in range(len(layers.groups))
+        ]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for layer, group in enumerate(layers.groups):
+                group.plan(static_routes[layer], defer_wait=False)
+                group.finish()
+        for iteration in range(_TIMING_ITERATIONS):
+            for layer, routes in enumerate(static_routes):
+                routes.copy_(
+                    _routes(
+                        100 * (iteration + _TIMING_ITERATIONS) + layer,
+                        rank,
+                        _TIMING_TOKENS,
+                        experts,
+                        rank,
+                        _TIMING_TOPK,
+                    )
+                )
+                launches["cuda_graph"][layer].append(layers.epochs[layer])
+            torch.cuda.synchronize()
+            MPI.COMM_WORLD.Barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            MPI.COMM_WORLD.Barrier()
+            for layer in range(len(layers.groups)):
+                layers.epochs[layer] += 1
+            check(static_routes)
+        graph.reset()
+
+        records = {}
+        for mode, per_layer in launches.items():
+            records[mode] = []
+            for layer, indices in enumerate(per_layer):
+                records[mode] += _probe_records(probes[layer], indices, rank, layer, failures)
+        for group in layers.groups:
+            ops.moe_rebalance_halo_r_set_probe(group._handle, None)
+        return None, failures, records
+    except Exception:
+        traceback.print_exc()
+        MPI.COMM_WORLD.Abort(1)
+        raise
+    finally:
+        if layers is not None:
+            layers.shutdown()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        faulthandler.cancel_dump_traceback_later()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < _EP_SIZE, reason="Requires 4 GPUs")
+@pytest.mark.skipif(
+    os.environ.get("HALO_R_PDL_TIMING") != "1", reason="benchmark; set HALO_R_PDL_TIMING=1"
+)
+@pytest.mark.parametrize("pdl", [True, False], ids=["pdl_on", "pdl_off"])
+def test_halo_r_relay_pdl_timing(halo_r_mpi_pool, pdl):
+    """Stamps every layer call; asserts READY, the bitwise relay and completion, never timing.
+
+    Prints one summary line per (pdl, mode) and merges the summary into the
+    JSON file named by HALO_R_PDL_TIMING_JSON, if set.
+    """
+    results = list(halo_r_mpi_pool.map(_run_timing_worker, [pdl] * _EP_SIZE))
+    skips = {skip for skip, _, _ in results if skip}
+    if skips:
+        pytest.skip("; ".join(sorted(skips)))
+    failures = [failure for _, rank_failures, _ in results for failure in rank_failures]
+    assert not failures, "\n".join(failures[:20])
+
+    key = "pdl_on" if pdl else "pdl_off"
+    summary = {}
+    for mode in ("eager", "cuda_graph"):
+        records = [record for _, _, per_mode in results for record in per_mode[mode]]
+        summary[mode] = _timing_summary(records)
+        print(f"HALO-R relay timing {key} {mode}: {json.dumps(summary[mode], sort_keys=True)}")
+    path = os.environ.get("HALO_R_PDL_TIMING_JSON")
+    if path:
+        merged = {}
+        if os.path.exists(path):
+            with open(path) as handle:
+                merged = json.load(handle)
+        merged[key] = {
+            "routing": "skewed synthetic (_routes), not replayed slabs",
+            "ep": _EP_SIZE,
+            "tokens_per_rank": _TIMING_TOKENS,
+            "topk": _TIMING_TOPK,
+            "layers": _TIMING_LAYERS,
+            "iterations": _TIMING_ITERATIONS,
+            "hidden": int(os.environ.get("HALO_R_PDL_TIMING_HIDDEN", "7168")),
+            "intermediate": int(os.environ.get("HALO_R_PDL_TIMING_INTERMEDIATE", "3072")),
+            **summary,
+        }
+        with open(path, "w") as handle:
+            json.dump(merged, handle, indent=2, sort_keys=True)
