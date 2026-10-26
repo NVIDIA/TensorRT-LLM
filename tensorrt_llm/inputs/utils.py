@@ -659,6 +659,38 @@ def resolve_hf_chat_template(
     return None
 
 
+def rendered_hf_chat_template_source(
+    *,
+    tokenizer: Union[TransformersTokenizer, TokenizerBase],
+    processor: ProcessorMixin,
+    chat_template: Optional[str] = None,
+    tools: Optional[list[dict[str, Any]]] = None,
+) -> Optional[str]:
+    """The Jinja source ``apply_chat_template`` will render for these inputs.
+
+    Returns ``None`` when ``apply_chat_template`` dispatches to a renderer
+    with no Jinja source to analyze (the DeepSeek custom tokenizers, a
+    tokenizer-native python template) or when no template resolves. Callers
+    that construct chat_template_kwargs use this to run the same
+    referenced-kwargs analysis the render-site guard applies, so they can
+    avoid injecting a kwarg the active template never reads.
+    """
+    if isinstance(
+            tokenizer,
+        (DeepseekV32Tokenizer, DeepseekV4Tokenizer, DeepseekV41Tokenizer)):
+        return None
+    if isinstance(tokenizer, TransformersTokenizer):
+        tokenizer = tokenizer.tokenizer
+    if (chat_template is None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is None
+            and _has_python_chat_template(tokenizer)):
+        return None
+    template = resolve_hf_chat_template(tokenizer, processor, chat_template,
+                                        tools)
+    return template if isinstance(template, str) else None
+
+
 def _resolve_content_format(model_type: str,
                             chat_template: Optional[str]) -> ContentFormat:
     """Determine the content format for the given model and template.

@@ -243,6 +243,10 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
+  # Reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.
+  - unittest/llmapi/apps/test_musespark_chat_template.py
+  - unittest/llmapi/apps/test_musespark_serve_extensions.py
+  - unittest/llmapi/apps/test_musespark_tool_parser.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
   - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
@@ -283,6 +287,7 @@ l0_cpu:
   - unittest/llmapi/test_custom_tokenizer_aliases.py
   # Reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.
   - unittest/llmapi/test_musespark_open_tokenizer.py
+  - unittest/llmapi/test_musespark_reasoning_parser.py
   - unittest/llmapi/test_llm_quant.py
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py

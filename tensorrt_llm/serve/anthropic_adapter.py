@@ -501,6 +501,9 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
             chat_request["thinking_token_budget"] = request.thinking.budget_tokens
 
     if request.output_config:
+        # Forwarded as-is here (this adapter is model-agnostic); the model's
+        # serving extension normalizes it later because it is listed in
+        # injected_chat_template_kwargs below (e.g. MuseSpark maps `max`).
         reasoning_effort = request.output_config.get("effort")
         if isinstance(reasoning_effort, str) and reasoning_effort:
             chat_template_kwargs["reasoning_effort"] = reasoning_effort

@@ -1980,7 +1980,8 @@ def _create_usage_info(num_prompt_tokens,
 
 def maybe_transform_reasoning_effort(
     reasoning_effort: ReasoningEffort
-    | Literal["low", "medium", "high", "max", "none"] | None
+    | Literal["minimal", "low", "medium", "high", "xhigh", "max", "none"]
+    | None
 ) -> ReasoningEffort | None:
     str_to_effort = {
         "low": ReasoningEffort.LOW,
@@ -1990,6 +1991,11 @@ def maybe_transform_reasoning_effort(
         # the nearest harmony level ("none" means no explicit effort).
         "max": ReasoningEffort.HIGH,
         "none": None,
+        # Extended-scale efforts accepted by the shared request schema
+        # (consumed natively by chat templates that support them); map to
+        # the nearest harmony level so harmony deployments keep working.
+        "minimal": ReasoningEffort.LOW,
+        "xhigh": ReasoningEffort.HIGH,
     }
     if reasoning_effort and not isinstance(reasoning_effort, ReasoningEffort):
         return str_to_effort[reasoning_effort]

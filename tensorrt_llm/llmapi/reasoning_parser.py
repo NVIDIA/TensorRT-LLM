@@ -723,6 +723,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "kimi_k3": "kimi_k3",
     "minimax_m3": "minimax_m3",
     "minimax_m3_vl": "minimax_m3",
+    "muse_spark": "musespark",
 }
 
 _QWEN3_MODEL_TYPES = frozenset({
@@ -1390,3 +1391,10 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                 return ReasoningParserResult(content=remaining)
         # Header fragments and structural-gap text are dropped.
         return ReasoningParserResult()
+
+
+# Model-specific parsers live in tensorrt_llm.llmapi.reasoning; importing the
+# module runs its register_reasoning_parser decorators, and the name is
+# re-exported here so callers can import every parser from this module.
+from tensorrt_llm.llmapi.reasoning.musespark import (  # noqa: E402,F401  isort: skip
+    MuseSparkReasoningParser)
