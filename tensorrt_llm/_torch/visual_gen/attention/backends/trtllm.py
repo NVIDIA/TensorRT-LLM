@@ -244,6 +244,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
                 "platform."
             )
+        # Compiled callers guard on this flag; testing layer_idx per call would specialize, and
+        # recompile, the attention frames for every layer.
+        self.is_dense_layer = self.layer_idx in self.dense_layers
 
     @property
     def timestep_cutoff(self) -> Optional[float]:
@@ -283,7 +286,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         dense; a call without a phase (no cutoff or no timestep) is sparse.
         """
 
-        if self.layer_idx in self.dense_layers:
+        if self.is_dense_layer:
             return False
         return sparse_attn_phase != 0
 
@@ -392,10 +395,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
         if use_separate_qkv and (k is None or v is None):
             raise ValueError("This TRTLLM attention call requires separate q, k, and v tensors.")
-        if block_sparse_inputs is not None and self.quant_attention_config is not None:
-            raise ValueError(
-                "Generic block-sparse attention does not support quant_attention_config."
-            )
 
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
@@ -410,6 +409,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                     "sage_attn_num_elts_per_blk_v": quant_cfg.v_block_size,
                     "sage_attn_qk_int8": quant_cfg.qk_dtype == "int8",
                     "sage_attn_smooth_k": quant_cfg.smooth_k,
+                    "sage_attn_smooth_v": quant_cfg.smooth_v,
                     "qk_fp8_per_tensor": quant_cfg.q_block_size == 0
                     and quant_cfg.qk_dtype == "fp8",
                     "v_fp8_per_tensor": quant_cfg.v_block_size == 0 and quant_cfg.v_dtype == "fp8",

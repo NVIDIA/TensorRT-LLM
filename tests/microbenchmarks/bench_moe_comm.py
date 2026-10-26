@@ -68,8 +68,9 @@ from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE, MoE
+from tensorrt_llm._torch.moe.fused_moe import MoE
 from tensorrt_llm._torch.moe.fused_moe.communication import Communication, CommunicationFactory
+from tensorrt_llm._torch.moe.fused_moe.cutlass import cutlass_leaves_in_resolution_order
 from tensorrt_llm._torch.moe.fused_moe.routing import DefaultMoeRoutingMethod
 from tensorrt_llm._utils import local_mpi_rank, mpi_allgather, mpi_barrier, mpi_rank, mpi_world_size
 from tensorrt_llm.mapping import Mapping
@@ -1011,7 +1012,14 @@ def _run_benchmark_worker_under_current_mpi(
         moe = None
         if quant_algo != QuantAlgo.NO_QUANT and backend.supports_post_quant_dispatch():
             routing_method = DefaultMoeRoutingMethod(top_k=top_k)
-            moe = CutlassFusedMoE(
+            # Only quantize_input runs here, and every leaf of one format shares it.
+            leaves = cutlass_leaves_in_resolution_order(quant_algo)
+            if not leaves:
+                raise ValueError(
+                    f"No Cutlass leaf publishes {quant_algo.name}, so there is no "
+                    f"quantize_input to build the post-quant dispatch payload."
+                )
+            moe = leaves[0](
                 routing_method=routing_method,
                 num_experts=num_experts_total,
                 hidden_size=hidden_size,
