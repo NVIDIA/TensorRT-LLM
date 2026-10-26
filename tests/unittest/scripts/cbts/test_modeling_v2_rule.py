@@ -88,8 +88,8 @@ def _selected(result) -> set[str]:
 
 
 def test_claims_python_and_native_sources_but_not_docs_or_stock():
-    assert _is_mv2_claim(f"{_PY}/models/fixture/scale_add__sm_80__default/__init__.py")
-    assert _is_mv2_claim(f"{_CPP}/fixture/scaleAddSm80Default/kernels/scaleAdd.cu")
+    assert _is_mv2_claim(f"{_PY}/models/fixture/scale_add__sm_10x__default/__init__.py")
+    assert _is_mv2_claim(f"{_CPP}/fixture/scaleAddSm10xDefault/kernels/scaleAdd.cu")
     assert _is_mv2_claim(f"{_CPP}/contractSurface.txt")
     assert _is_mv2_claim("cpp/cmake/modules/modeling_v2.cmake")
     assert not _is_mv2_claim(f"{_CPP}/README.md")
@@ -115,8 +115,8 @@ def test_snake_inverts_camel_without_a_repo_root():
 @pytest.mark.parametrize(
     "changed",
     [
-        f"{_PY}/models/fixture/scale_add__sm_80__default/ops/elementwise/scale_add.py",
-        f"{_CPP}/fixture/scaleAddSm80Default/kernels/scaleAdd.cu",
+        f"{_PY}/models/fixture/scale_add__sm_10x__default/ops/elementwise/scale_add.py",
+        f"{_CPP}/fixture/scaleAddSm10xDefault/kernels/scaleAdd.cu",
         f"{_CPP}/fixture/CMakeLists.txt",
     ],
 )
@@ -130,7 +130,7 @@ def test_a_family_change_selects_that_family_and_the_checks(rule, changed):
 def test_two_families_union(rule):
     result = _apply(
         rule,
-        f"{_PY}/models/fixture/scale_add__sm_80__default/__init__.py",
+        f"{_PY}/models/fixture/scale_add__sm_10x__default/__init__.py",
         f"{_PY}/models/gpt_oss/routing.py",
     )
     assert _selected(result) == {_FIXTURE_UNIT, _GPT_OSS_UNIT, _GPT_OSS_ACCURACY, _CLAIMS}

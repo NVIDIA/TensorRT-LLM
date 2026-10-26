@@ -142,6 +142,7 @@ l0_b300:
   # cpu_only files run on the CPU stage instead), so 30 per entry is at least 2.2x headroom.
   - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/deepseek_v3 TIMEOUT (30)
+  # Temporary native-code infrastructure fixture (no model); built for 100f only.
   - unittest/_torch/modeling_v2/models/fixture TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/glm_moe_dsa TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp TIMEOUT (30)

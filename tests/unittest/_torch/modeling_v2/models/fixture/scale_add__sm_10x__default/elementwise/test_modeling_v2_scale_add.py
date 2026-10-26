@@ -13,10 +13,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.fixture.scale_add__sm_80__default import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.fixture.scale_add__sm_10x__default import (  # noqa: E501
     native_ops,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.fixture.scale_add__sm_80__default.ops.elementwise.scale_add import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.fixture.scale_add__sm_10x__default.ops.elementwise.scale_add import (  # noqa: E501
     scale_add as op,
 )
 

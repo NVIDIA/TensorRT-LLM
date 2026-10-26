@@ -395,7 +395,7 @@ def test_accuracy_entries_name_a_family():
 def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
     """The loader and CBTS compute directory, namespace and architecture
     coverage in Python; the build computes them in modeling_v2.cmake."""
-    names = ["fixture", "minimax_m3", "scale_add__sm_80__default", "r1_0528_nvfp4__sm_10x__default"]
+    names = ["fixture", "minimax_m3", "scale_add__sm_10x__default", "r1_0528_nvfp4__sm_10x__default"]
     script = tmp_path / "probe.cmake"
     lines = [f'include("{_CMAKE_MODULE}")']
     for name in names:
@@ -416,6 +416,6 @@ def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
         assert f"name {name} {camel(name)} {identifier(name)}" in output, output
     assert "archs 90a-real;100f-real;103a-real" in output, output
     # The family namespace the build registers is the loader's.
-    assert torch_namespace("fixture", "scale_add__sm_80__default") == (
-        "mv2_fixture_scale_add_sm_80_default"
+    assert torch_namespace("fixture", "scale_add__sm_10x__default") == (
+        "mv2_fixture_scale_add_sm_10x_default"
     )

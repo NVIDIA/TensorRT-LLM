@@ -134,7 +134,8 @@ native modules, a library this installation does not carry is a `NoTarget`, so
 `auto` keeps the built-in model; one that is installed but broken is a
 `NativeLoadError`, never a fallback.
 `cpp/tensorrt_llm/modeling_v2/README.md` is the guide, and
-`models/fixture/` is the smallest complete example.
+`models/fixture/`, a temporary infrastructure fixture rather than a model, is
+the smallest complete example.
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain

@@ -40,7 +40,7 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 
 pytestmark = pytest.mark.cpu_only
 
-_FIXTURE = "tensorrt_llm._torch._experimental.modeling_v2.models.fixture.scale_add__sm_80__default"
+_FIXTURE = "tensorrt_llm._torch._experimental.modeling_v2.models.fixture.scale_add__sm_10x__default"
 
 
 @pytest.fixture
@@ -76,10 +76,10 @@ def test_camel_is_the_native_directory(name, expected):
 
 def test_names_of_libraries_and_namespaces():
     assert library_name("minimax_m3") == "libth_modeling_v2_minimax_m3.so"
-    assert identifier("scale_add__sm_80__default") == "scale_add_sm_80_default"
+    assert identifier("scale_add__sm_10x__default") == "scale_add_sm_10x_default"
     assert torch_namespace("fixture") == "mv2_fixture"
-    assert namespace_of(_FIXTURE) == "mv2_fixture_scale_add_sm_80_default"
-    assert split_target_package(_FIXTURE) == ("fixture", "scale_add__sm_80__default")
+    assert namespace_of(_FIXTURE) == "mv2_fixture_scale_add_sm_10x_default"
+    assert split_target_package(_FIXTURE) == ("fixture", "scale_add__sm_10x__default")
     with pytest.raises(ValueError):
         split_target_package("tensorrt_llm._torch.models")
 
@@ -103,7 +103,7 @@ def test_a_library_that_fails_to_open_is_a_broken_installation(libs, monkeypatch
 
 def test_a_target_the_library_does_not_carry_is_no_target(libs, monkeypatch):
     _install(libs, monkeypatch, lambda: frozenset({"other__sm_90__default"}))
-    with pytest.raises(NoTarget, match="does not carry scale_add__sm_80__default"):
+    with pytest.raises(NoTarget, match="does not carry scale_add__sm_10x__default"):
         load_target_ops(_FIXTURE)
 
 
@@ -112,11 +112,11 @@ def test_a_library_opens_once(libs, monkeypatch):
 
     def opens():
         opened.append(1)
-        return frozenset({"scale_add__sm_80__default"})
+        return frozenset({"scale_add__sm_10x__default"})
 
     _install(libs, monkeypatch, opens)
-    assert load_family_library("fixture") == {"scale_add__sm_80__default"}
-    assert load_family_library("fixture") == {"scale_add__sm_80__default"}
+    assert load_family_library("fixture") == {"scale_add__sm_10x__default"}
+    assert load_family_library("fixture") == {"scale_add__sm_10x__default"}
     assert len(opened) == 1
 
 

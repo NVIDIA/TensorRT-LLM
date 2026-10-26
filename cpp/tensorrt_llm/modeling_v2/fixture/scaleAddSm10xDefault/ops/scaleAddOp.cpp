@@ -18,7 +18,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
-#include "tensorrt_llm/modeling_v2/fixture/scaleAddSm80Default/kernels/scaleAdd.h"
+#include "tensorrt_llm/modeling_v2/fixture/scaleAddSm10xDefault/kernels/scaleAdd.h"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>

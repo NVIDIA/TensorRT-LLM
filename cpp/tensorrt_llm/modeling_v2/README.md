@@ -17,6 +17,8 @@ torch-op library, `libth_modeling_v2_<family>.so`, installed next to
 
 This document is the guide for adding native code to a target. The family
 `fixture/` is the smallest complete example: one target with one op. Copy it.
+It is a temporary infrastructure fixture, not a model, and is removed once a
+family with native code has GPU unit tests that run in CI.
 
 ## Layout
 

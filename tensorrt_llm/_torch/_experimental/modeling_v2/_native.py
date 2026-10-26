@@ -61,8 +61,8 @@ class NativeLoadError(RuntimeError):
 
 
 def camel(name: str) -> str:
-    """The C++ directory of a family or target: ``scale_add__sm_80__default`` ->
-    ``scaleAddSm80Default``."""
+    """The C++ directory of a family or target: ``scale_add__sm_10x__default`` ->
+    ``scaleAddSm10xDefault``."""
     parts = [p for p in name.split("_") if p]
     return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
 

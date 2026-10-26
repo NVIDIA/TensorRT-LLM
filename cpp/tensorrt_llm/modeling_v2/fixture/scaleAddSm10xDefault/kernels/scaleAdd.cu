@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/modeling_v2/fixture/scaleAddSm80Default/kernels/scaleAdd.h"
+#include "tensorrt_llm/modeling_v2/fixture/scaleAddSm10xDefault/kernels/scaleAdd.h"
 
 #include <algorithm>
 #include <cuda_bf16.h>

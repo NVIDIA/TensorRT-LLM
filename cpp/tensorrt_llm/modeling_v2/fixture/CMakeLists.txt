@@ -15,14 +15,15 @@
 # the License.
 #
 
-# The infrastructure fixture: one target with one op, so that CI drives the
-# whole native path -- build, packaging, load, built_targets(), fake op,
-# GPU op -- on every GPU it has. It is also the smallest complete family to copy
-# (see ../README.md). Its architectures cover every GPU CI runs on; a real
-# target declares the architectures it was written and gated for.
+# Temporary infrastructure fixture, not a model: one target with one op, so
+# that CI drives the whole native path -- build, packaging, load,
+# built_targets(), fake op, GPU op. Remove this family (with its Python package
+# and tests) once a family with native code has GPU unit tests that run in CI.
+# It is built for 100f only, the B300 its GPU test runs on, to keep the
+# library it adds to every wheel small.
 add_modeling_v2_family(fixture)
 
 add_modeling_v2_target(
-  fixture scale_add__sm_80__default
-  ARCHS 80 90 100f 120f
+  fixture scale_add__sm_10x__default
+  ARCHS 100f
   SOURCES kernels/scaleAdd.cu ops/scaleAddOp.cpp)

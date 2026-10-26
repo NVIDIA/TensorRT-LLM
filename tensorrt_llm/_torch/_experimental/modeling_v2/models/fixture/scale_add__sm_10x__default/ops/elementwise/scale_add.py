@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """`x * alpha + beta`: the native-code fixture's op, an entry like any other.
 
-The kernel is ``cpp/tensorrt_llm/modeling_v2/fixture/scaleAddSm80Default/``; the
+The kernel is ``cpp/tensorrt_llm/modeling_v2/fixture/scaleAddSm10xDefault/``; the
 op is reached through the target's ``native_ops`` namespace, which loading the
 target package filled. Nothing here is specific to native code beyond that one name.
 """
