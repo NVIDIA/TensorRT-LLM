@@ -132,11 +132,9 @@ def _retained_kv_cache(metadata, owner) -> Optional[torch.Tensor]:
     if _retained_block_table(metadata, owner) is None:
         return None
     manager = metadata.kv_cache_manager
-    high_layers = getattr(manager, "high_layers", None)
-    if not high_layers:
-        return None
-    local = manager.layer_offsets.get(owner.layer_idx)
-    if local not in high_layers:
+    local = manager.layer_offsets[owner.layer_idx]
+    if local not in manager.high_layers:
+        # Draft layers appended to the target manager keep a plain cache.
         return None
     # [blocks, kv_factor, tokens, heads, width] with one head and no value half.
     pool = manager._get_mixed_precision_buffers(local, "NHD", "high")
