@@ -4,10 +4,10 @@ Runtime
 .. Here are files in the cpp/include/runtime
 .. We manually add subsection to enable detailed description in the future
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
-loraCachePageManagerConfig.h
-____________________________
+loraCache.h
+___________
 
-.. doxygenfile:: loraCachePageManagerConfig.h
+.. doxygenfile:: loraCache.h
    :project: TensorRT-LLM
 
 bufferManager.h
@@ -16,16 +16,10 @@ _______________
 .. doxygenfile:: bufferManager.h
    :project: TensorRT-LLM
 
-iBuffer.h
-_________
-
-.. doxygenfile:: iBuffer.h
-   :project: TensorRT-LLM
-
-mcastGroupComm.h
+memoryCounters.h
 ________________
 
-.. doxygenfile:: mcastGroupComm.h
+.. doxygenfile:: memoryCounters.h
    :project: TensorRT-LLM
 
 runtimeDefaults.h
@@ -40,10 +34,28 @@ __________
 .. doxygenfile:: ipcUtils.h
    :project: TensorRT-LLM
 
+cudaEvent.h
+___________
+
+.. doxygenfile:: cudaEvent.h
+   :project: TensorRT-LLM
+
 modelConfig.h
 _____________
 
 .. doxygenfile:: modelConfig.h
+   :project: TensorRT-LLM
+
+loraCachePageManagerConfig.h
+____________________________
+
+.. doxygenfile:: loraCachePageManagerConfig.h
+   :project: TensorRT-LLM
+
+mcastGroupComm.h
+________________
+
+.. doxygenfile:: mcastGroupComm.h
    :project: TensorRT-LLM
 
 worldConfig.h
@@ -52,22 +64,10 @@ _____________
 .. doxygenfile:: worldConfig.h
    :project: TensorRT-LLM
 
-cudaEvent.h
-___________
+ipcNvlsMemory.h
+_______________
 
-.. doxygenfile:: cudaEvent.h
-   :project: TensorRT-LLM
-
-speculativeDecodingModule.h
-___________________________
-
-.. doxygenfile:: speculativeDecodingModule.h
-   :project: TensorRT-LLM
-
-cudaStream.h
-____________
-
-.. doxygenfile:: cudaStream.h
+.. doxygenfile:: ipcNvlsMemory.h
    :project: TensorRT-LLM
 
 loraModule.h
@@ -76,28 +76,10 @@ ____________
 .. doxygenfile:: loraModule.h
    :project: TensorRT-LLM
 
-ipcNvlsMemory.h
-_______________
+speculativeDecodingMode.h
+_________________________
 
-.. doxygenfile:: ipcNvlsMemory.h
-   :project: TensorRT-LLM
-
-memoryCounters.h
-________________
-
-.. doxygenfile:: memoryCounters.h
-   :project: TensorRT-LLM
-
-virtualMemory.h
-_______________
-
-.. doxygenfile:: virtualMemory.h
-   :project: TensorRT-LLM
-
-iTensor.h
-_________
-
-.. doxygenfile:: iTensor.h
+.. doxygenfile:: speculativeDecodingMode.h
    :project: TensorRT-LLM
 
 common.h
@@ -106,15 +88,33 @@ ________
 .. doxygenfile:: common.h
    :project: TensorRT-LLM
 
-speculativeDecodingMode.h
-_________________________
+cudaStream.h
+____________
 
-.. doxygenfile:: speculativeDecodingMode.h
+.. doxygenfile:: cudaStream.h
    :project: TensorRT-LLM
 
-loraCache.h
-___________
+virtualMemory.h
+_______________
 
-.. doxygenfile:: loraCache.h
+.. doxygenfile:: virtualMemory.h
+   :project: TensorRT-LLM
+
+speculativeDecodingModule.h
+___________________________
+
+.. doxygenfile:: speculativeDecodingModule.h
+   :project: TensorRT-LLM
+
+iTensor.h
+_________
+
+.. doxygenfile:: iTensor.h
+   :project: TensorRT-LLM
+
+iBuffer.h
+_________
+
+.. doxygenfile:: iBuffer.h
    :project: TensorRT-LLM
 

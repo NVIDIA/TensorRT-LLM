@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -710,7 +711,7 @@
 <span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
-<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/llm-api/README.md">README</a>.</p>
+<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/llm-api/README.md">README</a>.</p>
 </section>
 <section id="model-input">
 <h2>Model Input<a class="headerlink" href="#model-input" title="Link to this heading">#</a></h2>
@@ -821,40 +822,37 @@ if the prefill CUDA graphs are not enabled, its related metrics “…ctx_cuda_g
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_engine_creation_seconds</span></code></p></td>
 <td><p>Construct the main model engine, which includes loading model weights.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_model_engine_creation_seconds</span></code></p></td>
-<td><p>Construct the separate draft model engine in the deprecated two-model MTP setting.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">guided_decoder_creation_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">guided_decoder_creation_seconds</span></code></p></td>
 <td><p>Construct guided-decoding resources.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sampler_creation_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sampler_creation_seconds</span></code></p></td>
 <td><p>Construct the sampler.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">initial_kv_cache_creation_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">initial_kv_cache_creation_seconds</span></code></p></td>
 <td><p>Construct the temporary KV cache used to estimate final capacity.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_decoding_resource_manager_creation_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_decoding_resource_manager_creation_seconds</span></code></p></td>
 <td><p>Construct the speculative-decoding resource manager.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_drafter_creation_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_drafter_creation_seconds</span></code></p></td>
 <td><p>Construct the speculative drafter.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">initial_py_executor_creation_seconds_for_kv_cache_estimation</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">initial_py_executor_creation_seconds_for_kv_cache_estimation</span></code></p></td>
 <td><p>Construct the temporary PyExecutor for KV cache capacity estimation, which includes the initial model engine warmup.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_capacity_configuration_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_capacity_configuration_seconds</span></code></p></td>
 <td><p>Determine final KV cache capacity from the temporary executor and available memory.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">final_kv_cache_creation_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">final_kv_cache_creation_seconds</span></code></p></td>
 <td><p>Construct the final KV cache retained for serving.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">final_py_executor_creation_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">final_py_executor_creation_seconds</span></code></p></td>
 <td><p>Using the final KV cache, construct the final PyExecutor retained for serving, which includes the final model engine warmup.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">worker_start_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">worker_start_seconds</span></code></p></td>
 <td><p>Start the final PyExecutor worker.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">total_py_executor_creation_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">total_py_executor_creation_seconds</span></code></p></td>
 <td><p>Total time for the <code class="docutils literal notranslate"><span class="pre">create_py_executor()</span></code> call, including all applicable scopes above.</p></td>
 </tr>
 </tbody>
@@ -864,9 +862,7 @@ if the prefill CUDA graphs are not enabled, its related metrics “…ctx_cuda_g
 <code class="docutils literal notranslate"><span class="pre">initial_model_engine</span></code> measures the timings for the initial model engine creation as part of the
 <code class="docutils literal notranslate"><span class="pre">py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation</span></code> timing.
 Likewise, <code class="docutils literal notranslate"><span class="pre">final_model_engine</span></code> measures the timings for the final model engine creation as part of
-the <code class="docutils literal notranslate"><span class="pre">py_executor.final_py_executor_creation_seconds</span></code> timing.
-The deprecated two-model speculative decoding setting may produce the additional properties
-<code class="docutils literal notranslate"><span class="pre">initial_draft_model_engine</span></code> and <code class="docutils literal notranslate"><span class="pre">final_draft_model_engine</span></code>.</p>
+the <code class="docutils literal notranslate"><span class="pre">py_executor.final_py_executor_creation_seconds</span></code> timing.</p>
 <p>Each model-engine property contains the warmup scopes below. Which scopes appear depends on the model
 and configuration; for example, encoder-decoder and context-parallel configurations can skip some
 stages.</p>
@@ -929,7 +925,7 @@ stages.</p>
 <code class="docutils literal notranslate"><span class="pre">checkpoint_finalization_seconds</span></code> for checkpoint-session synchronization and cleanup after weight population.
 If a draft model is used, additional fields <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code>,
 <code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code>, and <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_finalization_seconds</span></code> will appear.
-A <code class="docutils literal notranslate"><span class="pre">draft_model_loader</span></code> property can also appear in the deprecated two-model MTP setting.
+A <code class="docutils literal notranslate"><span class="pre">draft_model_loader</span></code> property appears when a user-provided drafter exposes a <code class="docutils literal notranslate"><span class="pre">draft_model_engine</span></code>.
 The <code class="docutils literal notranslate"><span class="pre">py_executor.model_engine_creation_seconds</span></code> timing includes the total <code class="docutils literal notranslate"><span class="pre">model_loader</span></code> timing.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -981,26 +977,8 @@ The <code class="docutils literal notranslate"><span class="pre">py_executor.mod
 </pre></div>
 </div>
 </section>
-<section id="tips-and-troubleshooting">
-<h2>Tips and Troubleshooting<a class="headerlink" href="#tips-and-troubleshooting" title="Link to this heading">#</a></h2>
-<p>The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:</p>
-<section id="runtimeerror-only-rank-0-can-start-multi-node-session-got-1">
-<h3>RuntimeError: only rank 0 can start multi-node session, got 1<a class="headerlink" href="#runtimeerror-only-rank-0-can-start-multi-node-session-got-1" title="Link to this heading">#</a></h3>
-<p>There is no need to add an <code class="docutils literal notranslate"><span class="pre">mpirun</span></code> prefix for launching single node multi-GPU inference with the LLM API.</p>
-<p>For example, you can run <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">llm_inference_distributed.py</span></code> to perform multi-GPU on a single node.</p>
-</section>
-<section id="hang-issue-on-slurm-node">
-<h3>Hang issue on Slurm Node<a class="headerlink" href="#hang-issue-on-slurm-node" title="Link to this heading">#</a></h3>
-<p>If you experience a hang or other issue on a node managed with Slurm, add prefix <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span> <span class="pre">--oversubscribe</span> <span class="pre">--allow-run-as-root</span></code> to your launch script.</p>
-<p>For example, try <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span> <span class="pre">--oversubscribe</span> <span class="pre">--allow-run-as-root</span> <span class="pre">python</span> <span class="pre">llm_inference_distributed.py</span></code>.</p>
-</section>
-<section id="mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1">
-<h3>MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.<a class="headerlink" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1" title="Link to this heading">#</a></h3>
-<p>Because the LLM API relies on the <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code> library, put the LLM class in a function and protect the main entrypoint to the program under the <code class="docutils literal notranslate"><span class="pre">__main__</span></code> namespace to avoid a <a class="reference external" href="https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor">recursive spawn</a> process in <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>.</p>
-<p>This limitation is applicable for multi-GPU inference only.</p>
-</section>
-<section id="unified-compiled-artifact-cache">
-<h3>Unified compiled-artifact cache<a class="headerlink" href="#unified-compiled-artifact-cache" title="Link to this heading">#</a></h3>
+<section id="unified-cache-for-compiled-artifacts">
+<h2>Unified Cache for Compiled Artifacts<a class="headerlink" href="#unified-cache-for-compiled-artifacts" title="Link to this heading">#</a></h2>
 <p>Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> before importing TensorRT-LLM to place its compiled
 artifact caches under a single root. TensorRT-LLM supplies the following
 defaults. Except for the isolation behavior described below, an individually
@@ -1008,49 +986,67 @@ configured environment variable takes precedence.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Environment variable</p></th>
+<th class="head"><p>Default cache path</p></th>
 <th class="head"><p>Default under <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code></p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_AUTOTUNER_CACHE_PATH</span></code></p></td>
+<td><p>Disabled</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">autotuner/cache.json</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/torchinductor_$USER</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">inductor</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">$HOME/.triton/cache</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">triton</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TORCH_EXTENSIONS_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">$HOME/.cache/torch_extensions</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch_extensions</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">$HOME/.cache/flashinfer</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">flashinfer</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUTE_DSL_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/$USER/cutlass_python_cache</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">cute_dsl</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DG_JIT_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">$HOME/.deep_gemm</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deep_gemm</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_CACHE_DIR</span></code></p></td>
+<td><p>Disabled</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">trtllm_deep_gemm</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUDA_CACHE_PATH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">$HOME/.nv/ComputeCache</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">cuda</span></code></p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<p><strong>Important note</strong>: while some of the caches controlled by <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code>
+are enabled and persisted by default (e.g., <code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code>),
+others are disabled or with a path defaulting to <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> (e.g., <code class="docutils literal notranslate"><span class="pre">CUTE_DSL_CACHE_DIR</span></code>
+or <code class="docutils literal notranslate"><span class="pre">TLLM_AUTOTUNER_CACHE_PATH</span></code>). These caches are not validated for sharing
+across model instances or long-term persistence, which may lead to errors
+and other unintended behavior. As such, we recommend using distinct
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> caches for different models, and invalidating them anytime
+a component in the software stack changes.</p>
 <p>The directories are created by their respective consumers when needed.
-TensorRT-LLM does not add cache locking, cleanup, or per-rank isolation for
-these unified defaults (with the exceptions described below). The
+TensorRT-LLM does not add cache locking or cleanup; per-rank isolation is
+enabled only for the exceptions described below. The
 configured values are forwarded to dynamically spawned MPI workers.</p>
 <p>Configuring <code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_CACHE_DIR</span></code>, either directly or through
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code>, also defaults <code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_JIT_DUMP_CUBIN</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code> so its
 NVRTC-generated cubins are persisted. An explicitly configured dump setting
 still takes precedence. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/models/core/deepseek_v3/README.md">DeepGEMM environment variables</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/models/core/deepseek_v3/README.md">DeepGEMM environment variables</a>
 for details.</p>
 <p>Note that, when <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> is set, the FlashInfer workspace isolation
 mechanism described below still applies. This will prevent race conditions
@@ -1063,6 +1059,94 @@ under <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_
 and GPU, even when that value was set explicitly. Other explicit values are
 preserved. Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0</span></code> to preserve and share the
 unified path.</p>
+<section id="launcher-process-ownership">
+<h3>Launcher process ownership<a class="headerlink" href="#launcher-process-ownership" title="Link to this heading">#</a></h3>
+<p>The rank-0 <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> shell starts a small Python guard for the MPI
+communication server, task, and shutdown helper. Each guard owns a separate
+process group and monitors the shell, so killing only the shell with <code class="docutils literal notranslate"><span class="pre">SIGKILL</span></code>
+under plain <code class="docutils literal notranslate"><span class="pre">mpirun</span></code> still triggers cleanup of those groups. Startup registration
+finishes before a command can run. Guards also clean remaining group members
+when the command exits, then return its original exit status.</p>
+<p>Cleanup sends <code class="docutils literal notranslate"><span class="pre">SIGTERM</span></code>, followed by <code class="docutils literal notranslate"><span class="pre">SIGKILL</span></code> after
+<code class="docutils literal notranslate"><span class="pre">TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS</span></code> (default 5 seconds). This covers descendants
+that remain in their inherited process group. A command that deliberately
+creates a separate session or process group must manage those processes itself;
+killing a guard independently also requires the job’s scheduler/container to
+reclaim its workload.</p>
+</section>
+<section id="remote-mpi-shutdown-timeouts">
+<h3>Remote MPI shutdown timeouts<a class="headerlink" href="#remote-mpi-shutdown-timeouts" title="Link to this heading">#</a></h3>
+<p>Configure these settings together when using <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code>:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Setting</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Scope</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_MGMN_SHUTDOWN_GRACE_SECONDS</span></code></p></td>
+<td><p>60 seconds</p></td>
+<td><p>Server budget for draining a failed batch or stopping the MPI world. Final session and shared-executor teardown use the remaining budget.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT</span></code></p></td>
+<td><p>120 seconds</p></td>
+<td><p>Launcher wait for the stop helper and server after the task exits. Also used separately for guard registration and for the task to exit naturally after a server failure.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS</span></code></p></td>
+<td><p>5 seconds</p></td>
+<td><p>Additional cleanup grace between TERM and KILL for owned process groups.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The server shutdown grace starts when it receives the stop request; an earlier
+worker-failure deadline can shorten the remaining grace. The launcher also waits
+for the stop helper’s Python startup and <code class="docutils literal notranslate"><span class="pre">tensorrt_llm</span></code> imports before that request
+can be sent. Set the launcher stop timeout above the server grace by enough to
+cover measured cold startup/import time, connection/send and queue cleanup, and
+scheduling margin. The defaults leave 60 seconds of allowance; raising only the
+server grace does not raise the launcher timeout.</p>
+<p>For example, a 120-second server grace with a 180-second launcher timeout leaves
+60 seconds for this overhead. This is an illustrative allowance: increase it if
+cold or loaded nodes need more time.</p>
+<p>If task-first shutdown exhausts the launcher budget, the launcher terminates
+owned groups and returns 124 when the task succeeded; an existing nonzero task
+status takes precedence. After a server-first failure, the launcher instead
+preserves a naturally completed task’s nonzero status, otherwise the server’s
+failure status. TERM-to-KILL cleanup is a separate phase. Launcher waits count
+100 ms sleeps, so polling and scheduling overhead add time; these settings are
+not a strict end-to-end wall-clock limit.</p>
+<p>The launcher returns exit code 2 for invalid
+<code class="docutils literal notranslate"><span class="pre">TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT</span></code> or
+<code class="docutils literal notranslate"><span class="pre">TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS</span></code> values; both require a positive integer
+of at most six digits. A process-guard registration timeout also returns 124.
+If registration of the stop helper fails after the task has exited, an existing
+nonzero task status still takes precedence.</p>
+</section>
+<section id="remote-mpi-batch-ordering">
+<h3>Remote MPI batch ordering<a class="headerlink" href="#remote-mpi-batch-ordering" title="Link to this heading">#</a></h3>
+<p>The remote MPI server dispatches the next batch only after every future in the
+previous batch has completed. The task wrapper retains its entry barrier to
+place one task on each rank, but has no trailing barrier: an individual rank can
+finish or report an error while its peers are still running. Cross-batch ordering
+is enforced by the server; directly invoking the wrapper does not provide a
+collective completion barrier.</p>
+</section>
+<section id="disaggregated-mpi-leader-failures">
+<h3>Disaggregated MPI leader failures<a class="headerlink" href="#disaggregated-mpi-leader-failures" title="Link to this heading">#</a></h3>
+<p>The disaggregated MPI leader uses the same remote MPI server. An asynchronous
+worker failure is fatal to that server: it reports the worker error, stops
+accepting new work, and keeps the error channel available until a stop request
+or the original failure deadline. Final teardown can abort the MPI communicator
+if its remaining grace expires. This does not restart the failed service.</p>
+<p>The leader launches its proxy through an autonomous process guard. Normal leader
+cleanup signals the guard; if the leader exits through <code class="docutils literal notranslate"><span class="pre">MPI_Abort</span></code> or is killed,
+the guard detects parent death and cleans the proxy’s inherited process group.
+It allows 5 seconds between <code class="docutils literal notranslate"><span class="pre">SIGTERM</span></code> and <code class="docutils literal notranslate"><span class="pre">SIGKILL</span></code>. Descendants that create their
+own session or process group still require separate ownership, as described
+above. The Bash launcher’s <code class="docutils literal notranslate"><span class="pre">TLLM_LLMAPI_LAUNCH_*</span></code> settings do not configure this
+Python launcher.</p>
 </section>
 <section id="flashinfer-jit-workspaces-for-mpi-workers">
 <h3>FlashInfer JIT workspaces for MPI workers<a class="headerlink" href="#flashinfer-jit-workspaces-for-mpi-workers" title="Link to this heading">#</a></h3>
@@ -1088,6 +1172,25 @@ ranks; populate it before the multi-rank launch, either by installing the
 <code class="docutils literal notranslate"><span class="pre">flashinfer-cubin</span></code> package matching <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code> or with a single-rank
 warm-up run, and set <code class="docutils literal notranslate"><span class="pre">FLASHINFER_NO_DOWNLOAD=1</span></code> so a missing artifact fails
 instead of being downloaded concurrently into the shared directory.</p>
+</section>
+</section>
+<section id="tips-and-troubleshooting">
+<h2>Tips and Troubleshooting<a class="headerlink" href="#tips-and-troubleshooting" title="Link to this heading">#</a></h2>
+<p>The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:</p>
+<section id="runtimeerror-only-rank-0-can-start-multi-node-session-got-1">
+<h3>RuntimeError: only rank 0 can start multi-node session, got 1<a class="headerlink" href="#runtimeerror-only-rank-0-can-start-multi-node-session-got-1" title="Link to this heading">#</a></h3>
+<p>There is no need to add an <code class="docutils literal notranslate"><span class="pre">mpirun</span></code> prefix for launching single node multi-GPU inference with the LLM API.</p>
+<p>For example, you can run <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">llm_inference_distributed.py</span></code> to perform multi-GPU on a single node.</p>
+</section>
+<section id="hang-issue-on-slurm-node">
+<h3>Hang issue on Slurm Node<a class="headerlink" href="#hang-issue-on-slurm-node" title="Link to this heading">#</a></h3>
+<p>If you experience a hang or other issue on a node managed with Slurm, add prefix <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span> <span class="pre">--oversubscribe</span> <span class="pre">--allow-run-as-root</span></code> to your launch script.</p>
+<p>For example, try <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span> <span class="pre">--oversubscribe</span> <span class="pre">--allow-run-as-root</span> <span class="pre">python</span> <span class="pre">llm_inference_distributed.py</span></code>.</p>
+</section>
+<section id="mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1">
+<h3>MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.<a class="headerlink" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1" title="Link to this heading">#</a></h3>
+<p>Because the LLM API relies on the <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code> library, put the LLM class in a function and protect the main entrypoint to the program under the <code class="docutils literal notranslate"><span class="pre">__main__</span></code> namespace to avoid a <a class="reference external" href="https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor">recursive spawn</a> process in <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>.</p>
+<p>This limitation is applicable for multi-GPU inference only.</p>
 </section>
 <section id="cannot-quit-after-generation">
 <h3>Cannot quit after generation<a class="headerlink" href="#cannot-quit-after-generation" title="Link to this heading">#</a></h3>
@@ -1169,12 +1272,18 @@ instead of being downloaded concurrently into the shared directory.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#startup-metrics">Startup Metrics</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#unified-cache-for-compiled-artifacts">Unified Cache for Compiled Artifacts</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launcher-process-ownership">Launcher process ownership</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#remote-mpi-shutdown-timeouts">Remote MPI shutdown timeouts</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#remote-mpi-batch-ordering">Remote MPI batch ordering</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#disaggregated-mpi-leader-failures">Disaggregated MPI leader failures</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#flashinfer-jit-workspaces-for-mpi-workers">FlashInfer JIT workspaces for MPI workers</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tips-and-troubleshooting">Tips and Troubleshooting</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtimeerror-only-rank-0-can-start-multi-node-session-got-1">RuntimeError: only rank 0 can start multi-node session, got 1</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hang-issue-on-slurm-node">Hang issue on Slurm Node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1">MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#unified-compiled-artifact-cache">Unified compiled-artifact cache</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#flashinfer-jit-workspaces-for-mpi-workers">FlashInfer JIT workspaces for MPI workers</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cannot-quit-after-generation">Cannot quit after generation</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#single-node-hanging-when-using-docker-run-net-host">Single node hanging when using <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span> <span class="pre">--net=host</span></code></a></li>
 </ul>
@@ -1270,9 +1379,9 @@ instead of being downloaded concurrently into the shared directory.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

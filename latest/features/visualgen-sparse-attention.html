@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -777,7 +778,7 @@
 <li><p>Set <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to disable Skip Softmax Attention at the beginning of denoising. The cutoff is expressed in normalized scheduler time; the number of dense steps it produces depends on the scheduler and the number of inference steps.</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> and <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> are alternatives: if both are present, <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> takes precedence and the calibration formula is not used. User-provided <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> and <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> override checkpoint defaults. Checkpoint <code class="docutils literal notranslate"><span class="pre">ignore</span></code> patterns always disable Skip Softmax Attention for matching layers.</p>
-<p>Skip Softmax Attention works with both the <strong>TRTLLM</strong> and <strong>CUTEDSL</strong> attention backends in VisualGen. Set <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>’s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and SOL cannot be combined with quantized attention on any backend.</p>
+<p>Skip Softmax Attention works with both the <strong>TRTLLM</strong> and <strong>CUTEDSL</strong> attention backends in VisualGen. Set <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>’s block-scaled Q/K recipes (MXFP8, NVFP4). VSA and SOL can be combined with quantized attention only on TRTLLM, through its SageAttention recipes.</p>
 <section id="mapping-disabled-until-timestep-to-actual-denoising-steps">
 <h4>Mapping <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to Actual Denoising Steps<a class="headerlink" href="#mapping-disabled-until-timestep-to-actual-denoising-steps" title="Link to this heading">#</a></h4>
 <p>VisualGen passes each transformer a normalized scheduler timestep <code class="docutils literal notranslate"><span class="pre">t</span></code> in <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1]</span></code>. Denoising proceeds from high to low <code class="docutils literal notranslate"><span class="pre">t</span></code>. Skip Softmax Attention is disabled while <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">&gt;=</span> <span class="pre">disabled_until_timestep</span></code> and enabled once <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">&lt;</span> <span class="pre">disabled_until_timestep</span></code>. Equality therefore belongs to the dense phase.</p>
@@ -931,9 +932,11 @@ inside the core forward from the flattened Q/K/V, the batch layout in the
 attention metadata and the <code class="docutils literal notranslate"><span class="pre">timestep</span></code> in the forward arguments; dense layers
 and dense timestep phases return no routes. The VisualGen wrapper compacts
 fused projection split views once and shares those tensors between
-prediction and the block-sparse FMHA. Cross-attention, context parallelism,
-attention quantization and unsupported tensor envelopes raise an error
-instead of silently falling back to dense attention.</p></li>
+prediction and the block-sparse FMHA. With a SageAttention recipe, the
+attention core quantizes Q/K/V and the proxy means for the FMHA after
+prediction; the dense timestep phases use the dense SageAttention kernel.
+Cross-attention, context parallelism and unsupported tensor envelopes raise
+an error instead of silently falling back to dense attention.</p></li>
 <li><p><strong>CUTEDSL</strong> runs the fused kernel vendored from the reference implementation
 (<code class="docutils literal notranslate"><span class="pre">SOLCuTeDSLAttention</span></code>), which folds routing, sparse computation and the
 approximation correction into one online-softmax pass. It runs on datacenter
@@ -1010,7 +1013,7 @@ be reused for the sparse phase.</p>
 <li><p>A VSA-fine-tuned checkpoint such as <a class="reference external" href="https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers"><code class="docutils literal notranslate"><span class="pre">FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers</span></code></a>. Standard Wan checkpoints do not carry the learned VSA gates.</p></li>
 <li><p>The <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> or <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> attention backend. <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> uses the CuTe DSL fine-stage kernel; <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> lowers the selected cubes through the generic PrimTS block-sparse FMHA contract.</p></li>
 <li><p>A supported CUDA device and tensor shape for the selected block-sparse kernel. When that kernel is unavailable or the input is outside its envelope, the fine branch runs the compact Q/K/V through that backend’s dense path (SDPA for <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, TRTLLM attention for <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>) and the VSA post-processing still applies.</p></li>
-<li><p>VSA cannot be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>.</p></li>
+<li><p>On <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, VSA can be combined with a SageAttention <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>; the block-sparse fine stage then runs with quantized Q/K/V. <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> rejects <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code> with VSA.</p></li>
 <li><p>VSA is not compatible with Ring attention or Attention2D (it does not produce per-split LSE). Ulysses is supported.</p></li>
 </ul>
 <p>Configure VSA with <code class="docutils literal notranslate"><span class="pre">VideoSparseAttentionConfig</span></code> and either backend:</p>
@@ -1206,9 +1209,9 @@ implementation rather than a VSA-specific lifecycle.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

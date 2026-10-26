@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -694,9 +695,9 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
 <h2>Features<a class="headerlink" href="#features" title="Link to this heading">#</a></h2>
 <p>Currently available:</p>
 <ul class="simple">
-<li><p>Generate text asynchronously (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/ray_orchestrator/llm_inference_async_ray.py">llm_inference_async_ray.py</a>)</p></li>
-<li><p>Multi-node inference (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/ray_orchestrator/multi_nodes/README.md">multi-node README</a>)</p></li>
-<li><p>Disaggregated serving (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/ray_orchestrator/disaggregated/README.md">disagg README</a>)</p></li>
+<li><p>Generate text asynchronously (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/ray_orchestrator/llm_inference_async_ray.py">llm_inference_async_ray.py</a>)</p></li>
+<li><p>Multi-node inference (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/ray_orchestrator/multi_nodes/README.md">multi-node README</a>)</p></li>
+<li><p>Disaggregated serving (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/ray_orchestrator/disaggregated/README.md">disagg README</a>)</p></li>
 </ul>
 <p><em>Initial testing has been focused on LLaMA and DeepSeek variants. Please open an Issue if you encounter problems with other models so we can prioritize support.</em></p>
 </section>
@@ -709,8 +710,50 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
 </section>
 <section id="architecture">
 <h2>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h2>
-<p>This feature introduces new classes such as <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/tensorrt_llm/executor/ray/executor.py">RayExecutor</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/tensorrt_llm/executor/ray/gpu_worker.py">RayGPUWorker</a> for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on <a class="reference external" href="https://docs.pytorch.org/tutorials/beginner/dist_overview.html">torch.distributed</a> without MPI. We welcome contributions to improve and extend this support.</p>
+<p>This feature introduces new classes such as <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/tensorrt_llm/executor/ray/executor.py">RayExecutor</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/tensorrt_llm/executor/ray/gpu_worker.py">RayGPUWorker</a> for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on <a class="reference external" href="https://docs.pytorch.org/tutorials/beginner/dist_overview.html">torch.distributed</a> without MPI. We welcome contributions to improve and extend this support.</p>
 <p><img alt="Ray orchestrator architecture" src="docs/source/media/ray_orchestrator_architecture.jpg" /></p>
+</section>
+<section id="environment-variables">
+<h2>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_DISABLE_MPI</span></code></p></td>
+<td><p>unset</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> runs without MPI. The Ray orchestrator sets it on its workers.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_RAY_FORCE_LOCAL_CLUSTER</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> always starts a new local Ray cluster instead of attaching to an existing one.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_RAY_PER_WORKER_GPUS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
+<td><p>GPUs reserved for each worker actor. A fraction lets several actors share one GPU (colocated use). <code class="docutils literal notranslate"><span class="pre">ray_placement_config.per_worker_gpu_share</span></code> takes precedence.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_RAY_BUNDLE_INDICES</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Comma-separated placement-group bundle indices, one per rank (unique, in range). Must be set from inside a Ray placement group. <code class="docutils literal notranslate"><span class="pre">ray_placement_config</span></code> takes precedence.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES</span></code>, <code class="docutils literal notranslate"><span class="pre">RAY_DEDUP_LOGS</span></code></p></td>
+<td><p>set by the orchestrator (<code class="docutils literal notranslate"><span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">0</span></code>)</p></td>
+<td><p>Keep Ray from restricting <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES</span></code> per worker and from collapsing duplicate log lines across ranks. Export them yourself before <code class="docutils literal notranslate"><span class="pre">ray</span> <span class="pre">start</span></code> on a manually launched cluster, as the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/ray_orchestrator/multi_nodes/run_cluster.sh">multi-node example</a> does.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_CUDA_OBJECT_COLLECTIVES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Without MPI, small Python-object collectives (attention-DP votes, response gathers) are staged through CUDA tensors on dedicated NCCL communicators. <code class="docutils literal notranslate"><span class="pre">0</span></code> falls back to the gloo CPU backend. Must be identical on every rank.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_REFIT_DEDUP_MODULES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>During RL weight refit, each module’s refit hook runs once even if a <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> wrapper exposes it twice. <code class="docutils literal notranslate"><span class="pre">0</span></code> disables this, for bisecting.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 </section>
 </section>
 
@@ -768,6 +811,7 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#features">Features</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#roadmap">Roadmap</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture">Architecture</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#environment-variables">Environment Variables</a></li>
 </ul>
   </nav></div>
 
@@ -859,9 +903,9 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -707,7 +708,7 @@
 <p>The following examples demonstrate how to use TensorRT LLM’s multimodal support in various scenarios, including quick run examples, serving endpoints, and performance benchmarking.</p>
 <section id="quick-start">
 <h3>Quick start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h3>
-<p>Quickly try out TensorRT LLM’s multimodal support using our <code class="docutils literal notranslate"><span class="pre">LLM-API</span></code> and a ready-to-run <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/llm-api/quickstart_multimodal.py">example</a>. The script imports helpers from its sibling file <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/llm-api/quickstart_advanced.py"><code class="docutils literal notranslate"><span class="pre">quickstart_advanced.py</span></code></a>, so run it from a checkout of the <code class="docutils literal notranslate"><span class="pre">examples/llm-api/</span></code> directory rather than as a single downloaded file:</p>
+<p>Quickly try out TensorRT LLM’s multimodal support using our <code class="docutils literal notranslate"><span class="pre">LLM-API</span></code> and a ready-to-run <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/llm-api/quickstart_multimodal.py">example</a>. The script imports helpers from its sibling file <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/llm-api/quickstart_advanced.py"><code class="docutils literal notranslate"><span class="pre">quickstart_advanced.py</span></code></a>, so run it from a checkout of the <code class="docutils literal notranslate"><span class="pre">examples/llm-api/</span></code> directory rather than as a single downloaded file:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Get the examples directory first; quickstart_multimodal.py imports from</span>
 <span class="c1"># quickstart_advanced.py next to it.</span>
 git<span class="w"> </span>clone<span class="w"> </span>--depth<span class="w"> </span><span class="m">1</span><span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
@@ -722,7 +723,8 @@ python3<span class="w"> </span>quickstart_multimodal.py<span class="w"> </span>-
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>Qwen/Qwen2-VL-7B-Instruct<span class="w">  </span>--backend<span class="w"> </span>pytorch
 </pre></div>
 </div>
-<p>You can then send OpenAI-compatible requests, such as via curl or API clients, to the server endpoint. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/serve/curl_chat_client_for_multimodal.sh">curl chat client for multimodal script</a> as an example.</p>
+<p>You can then send OpenAI-compatible requests, such as via curl or API clients, to the server endpoint. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/serve/curl_chat_client_for_multimodal.sh">curl chat client for multimodal script</a> as an example.</p>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> renders the chat template itself and marks the resulting <code class="docutils literal notranslate"><span class="pre">TextPrompt</span></code> with <code class="docutils literal notranslate"><span class="pre">chat_template_applied</span></code>, as do the multimodal prompt builders in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.inputs.utils</span></code>. An input processor that would otherwise apply the chat template to a raw <code class="docutils literal notranslate"><span class="pre">prompt</span></code> should use such a prompt verbatim; see <code class="docutils literal notranslate"><span class="pre">TextPrompt</span></code> in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/inputs/data.py</span></code>.</p>
 </section>
 <section id="run-with-trtllm-bench">
 <h3>Run with <a class="reference internal" href="../commands/trtllm-bench.html"><span class="std std-doc"><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code></span></a><a class="headerlink" href="#run-with-trtllm-bench" title="Link to this heading">#</a></h3>
@@ -881,9 +883,9 @@ python3<span class="w"> </span>quickstart_multimodal.py<span class="w"> </span>-
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

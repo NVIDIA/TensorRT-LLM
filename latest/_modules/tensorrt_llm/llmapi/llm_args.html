@@ -419,7 +419,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -434,7 +434,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -785,6 +785,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -1049,8 +1050,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span><span class="p">,</span> <span class="n">EnumMeta</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Annotated</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span>
-                    <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Set</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Type</span><span class="p">,</span> <span class="n">TypeAlias</span><span class="p">,</span>
-                    <span class="n">TypeVar</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span><span class="p">)</span>
+                    <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Set</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Type</span><span class="p">,</span>
+                    <span class="n">TypeAlias</span><span class="p">,</span> <span class="n">TypeVar</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span><span class="p">)</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">yaml</span>
@@ -1725,14 +1726,36 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">MultimodalEncoderCudaGraphConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""CUDA graph capture for multimodal vision / audio encoders.</span>
 
-<span class="sd">    One graph is captured per `buckets` entry; replay falls back to eager when the live workload's</span>
-<span class="sd">    padded shape does not match any bucket.</span>
+<span class="sd">    Set `max_batch_size` to generate capture shapes automatically. Advanced users can instead</span>
+<span class="sd">    specify `buckets`. Replay falls back to eager when no captured shape fits the live workload.</span>
 
 <span class="sd">    NOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for</span>
 <span class="sd">    `buckets` corresponding to lesser compute.</span>
 <span class="sd">    """</span>
 
-    <span class="n">buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">,</span> <span class="n">PositiveInt</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="p">(</span><span class="s2">"Maximum number of encoder contexts per CUDA graph. Automatically captures every "</span>
+         <span class="s2">"context count from 1 to this limit, with token capacities derived from the encoder "</span>
+         <span class="s2">"token budget. Contexts are encoder sequences, such as image or video frame groups "</span>
+         <span class="s2">"and audio chunks; they are not concurrent requests. Mutually exclusive with buckets."</span>
+         <span class="p">),</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">max_num_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="p">(</span><span class="s2">"Optional total token capacity for automatically generated graphs. Defaults to "</span>
+         <span class="s2">"encoder_max_num_tokens, or max_num_tokens when the encoder limit is unset. The "</span>
+         <span class="s2">"encoder adapter defines token units and layout. Larger workloads run eagerly. "</span>
+         <span class="s2">"Mutually exclusive with buckets."</span><span class="p">),</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">buckets</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">,</span> <span class="n">PositiveInt</span><span class="p">]]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">min_length</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="p">(</span><span class="s2">"Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair "</span>
@@ -1768,6 +1791,13 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">'after'</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_normalize</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">'MultimodalEncoderCudaGraphConfig'</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">buckets</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Set max_batch_size or explicit buckets."</span><span class="p">)</span>
+            <span class="k">return</span> <span class="bp">self</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Explicit buckets cannot be combined with "</span>
+                             <span class="s2">"max_batch_size or max_num_tokens."</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">total_tokens</span><span class="p">,</span> <span class="n">num_contexts</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">buckets</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">total_tokens</span> <span class="o">&lt;</span> <span class="n">num_contexts</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"`buckets` entries must have total_tokens &gt;= "</span>
@@ -2412,10 +2442,11 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."</span>
     <span class="p">)</span>
     <span class="n">use_cute_dsl_paged_mqa_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">"Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM."</span>
-    <span class="p">)</span>
+        <span class="s2">"Whether to use the CuTe DSL paged MQA logits kernel on SM100-family "</span>
+        <span class="s2">"GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 "</span>
+        <span class="s2">"family or when the cutlass-dsl package is missing."</span><span class="p">)</span>
     <span class="n">q_split_threshold</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">8192</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -3127,12 +3158,9 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">Nvfp4GemmConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Configuration for NVFP4 GEMM backend selection."""</span>
     <span class="n">allowed_backends</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Nvfp4Backend</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s1">'cutlass'</span><span class="p">,</span> <span class="s1">'cublaslt'</span><span class="p">,</span> <span class="s1">'cuda_core'</span><span class="p">],</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s1">'cutlass'</span><span class="p">,</span> <span class="s1">'cublaslt'</span><span class="p">,</span> <span class="s1">'cutedsl'</span><span class="p">,</span> <span class="s1">'cuda_core'</span><span class="p">],</span>
         <span class="n">min_length</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">"List of backends to consider for auto-selection. "</span>
-        <span class="s2">"Default excludes 'cutedsl' for faster build time. "</span>
-        <span class="s2">"Add 'cutedsl' for extreme performance at the cost of longer server launch time."</span>
-    <span class="p">)</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">"List of backends to consider for auto-selection."</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="AttentionDpConfig">
@@ -3762,8 +3790,8 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"both"</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">"What this server does with the pool. 'both' reads and "</span>
         <span class="s2">"writes, 'producer' only writes, 'consumer' only reads, and "</span>
-        <span class="s2">"'capacity' does neither: its ranks lend memory without moving any "</span>
-        <span class="s2">"KV, so they pin no staging buffers and pay no per-request cost."</span><span class="p">)</span>
+        <span class="s2">"'capacity' does neither: its ranks lend memory without registering "</span>
+        <span class="s2">"any KV cache, so it needs no GPUDirect RDMA."</span><span class="p">)</span>
     <span class="n">segment_size</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="s2">"16GiB"</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">"Host memory each of this server's ranks contributes to "</span>
@@ -3787,12 +3815,12 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"disagree read each other's pages as their own, so it has no default "</span>
         <span class="s2">"and must be unique per checkpoint."</span><span class="p">)</span>
     <span class="n">stage_through_host</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="kc">True</span><span class="p">,</span>
+        <span class="kc">False</span><span class="p">,</span>
         <span class="n">telemetry</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">"Copy pages through a pinned host buffer instead of "</span>
-        <span class="s2">"registering the KV pools with Mooncake. The only transfer path "</span>
-        <span class="s2">"supported today, so 'false' is ignored with a warning. Costs a copy "</span>
-        <span class="s2">"each way and needs no GPUDirect RDMA."</span><span class="p">)</span>
+        <span class="s2">"registering the KV pools with Mooncake. For a host whose HCA cannot "</span>
+        <span class="s2">"pin GPU pages; costs a copy each way. Ignored when role is "</span>
+        <span class="s2">"'capacity'."</span><span class="p">)</span>
     <span class="n">local_hostname</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="kc">None</span><span class="p">,</span>
         <span class="n">telemetry</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -3815,17 +3843,6 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"master to accept connections. Raise it when the wait spans a "</span>
         <span class="s2">"container start on another node. Expiring fails the server at "</span>
         <span class="s2">"startup."</span><span class="p">)</span>
-
-    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">"stage_through_host"</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"after"</span><span class="p">)</span>
-    <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_force_host_staging</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">"""Say here what the workers would otherwise each say after bringup."""</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">value</span><span class="p">:</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                <span class="s2">"Ignoring mooncake_store.stage_through_host=False: pages pass "</span>
-                <span class="s2">"through pinned host memory, which is the only transfer path "</span>
-                <span class="s2">"this connector supports today."</span><span class="p">)</span>
-        <span class="k">return</span> <span class="kc">True</span>
 
     <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">"segment_size"</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"after"</span><span class="p">)</span>
     <span class="nd">@classmethod</span>
@@ -4485,14 +4502,11 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_capture_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="c1"># MTP_EAGLE (two-model) feeds captured target hidden states into the</span>
-        <span class="c1"># separate draft engine, so the shared Eagle3ResourceManager must</span>
-        <span class="c1"># allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes</span>
-        <span class="c1"># the target model's hidden_states straight to the MTP layer</span>
-        <span class="c1"># (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,</span>
-        <span class="c1"># both gated on self.is_mtp_eagle), so no capture buffer is needed</span>
-        <span class="c1"># and we should skip allocation to avoid disabling post-MLP/MoE</span>
-        <span class="c1"># fusion via the layer-capture hook.</span>
+        <span class="c1"># MTP_EAGLE_ONE_MODEL passes the target model's hidden_states straight</span>
+        <span class="c1"># to the MTP layer (see Eagle3OneModelWorker.prepare_1st_drafter_inputs</span>
+        <span class="c1"># / _run_draft_forward, both gated on self.is_mtp_eagle), so no capture</span>
+        <span class="c1"># buffer is needed and we skip allocation to avoid disabling</span>
+        <span class="c1"># post-MLP/MoE fusion via the layer-capture hook.</span>
         <span class="k">return</span> <span class="mi">0</span>
 
     <span class="nd">@property</span>
@@ -4645,14 +4659,17 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"speculators DSpark drafters are supported with a qwen3 backbone; "</span>
             <span class="sa">f</span><span class="s2">"this one has model_type </span><span class="si">{</span><span class="n">layer</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'model_type'</span><span class="p">)</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
     <span class="n">aux_layer_ids</span> <span class="o">=</span> <span class="n">config_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"aux_hidden_state_layer_ids"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">aux_layer_ids</span> <span class="ow">or</span> <span class="nb">min</span><span class="p">(</span><span class="n">aux_layer_ids</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+    <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">aux_layer_ids</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">aux_layer_ids</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span>
+            <span class="nb">type</span><span class="p">(</span><span class="n">layer_id</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="nb">int</span> <span class="ow">or</span> <span class="n">layer_id</span> <span class="o">&lt;</span> <span class="mi">1</span>
+            <span class="k">for</span> <span class="n">layer_id</span> <span class="ow">in</span> <span class="n">aux_layer_ids</span><span class="p">)):</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="s2">"a speculators DSpark drafter needs aux_hidden_state_layer_ids &gt;= 1 "</span>
+            <span class="s2">"a speculators DSpark drafter needs aux_hidden_state_layer_ids to be "</span>
+            <span class="s2">"a non-empty list of positive integers (&gt;= 1, excluding bool) "</span>
             <span class="s2">"(layer 0's input is the embedding output, which is not captured); "</span>
             <span class="sa">f</span><span class="s2">"got </span><span class="si">{</span><span class="n">aux_layer_ids</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="n">num_layers</span> <span class="o">=</span> <span class="n">layer</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span>
     <span class="n">dflash_config</span> <span class="o">=</span> <span class="p">{</span>
-        <span class="s2">"target_layer_ids"</span><span class="p">:</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">layer_id</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">layer_id</span> <span class="ow">in</span> <span class="n">aux_layer_ids</span><span class="p">]</span>
+        <span class="s2">"target_layer_ids"</span><span class="p">:</span> <span class="p">[</span><span class="n">layer_id</span> <span class="o">-</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">layer_id</span> <span class="ow">in</span> <span class="n">aux_layer_ids</span><span class="p">]</span>
     <span class="p">}</span>
     <span class="k">if</span> <span class="n">config_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"mask_token_id"</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">dflash_config</span><span class="p">[</span><span class="s2">"mask_token_id"</span><span class="p">]</span> <span class="o">=</span> <span class="n">config_dict</span><span class="p">[</span><span class="s2">"mask_token_id"</span><span class="p">]</span>
@@ -5970,15 +5987,12 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">enable_branch_snapshot</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
-        <span class="n">telemetry</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span>
-        <span class="s2">"Snapshot the Mamba recurrent state where a request's content "</span>
-        <span class="s2">"diverges from the prefix cache, so that later requests sharing the "</span>
-        <span class="s2">"same prefix can reuse up to the fork instead of being truncated to "</span>
-        <span class="s2">"an earlier snapshot. If no periodic or additional snapshot point "</span>
-        <span class="s2">"applies to the prompt, the prompt end is snapshotted as a fallback. "</span>
-        <span class="s2">"Requires KV cache manager V2."</span><span class="p">)</span></div>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"deprecated"</span><span class="p">,</span>
+        <span class="n">telemetry</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">exclude</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">"Deprecated alias for "</span>
+        <span class="s2">"kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes "</span>
+        <span class="s2">"effect only when block reuse is enabled."</span><span class="p">)</span></div>
 
 
 
@@ -6086,6 +6100,22 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"This preference does not guarantee residency or change attention windows "</span>
         <span class="s2">"or prefix matching. Dummy and draft requests are excluded."</span><span class="p">)</span>
 
+    <span class="n">enable_branch_snapshot</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">"Keep reusable state where a request's prompt diverges from the prefix "</span>
+        <span class="s2">"cache, so later requests sharing that prefix can reuse up to the fork. "</span>
+        <span class="s2">"For sliding-window attention (SWA), the SWA window at the fork is "</span>
+        <span class="s2">"committed. This helps when only the SWA window at a chunk end is kept: "</span>
+        <span class="s2">"policy 'per_request' or 'per_conversation', or SWA scratch reuse. The "</span>
+        <span class="s2">"fork is aligned down to a block boundary and becomes a forced context "</span>
+        <span class="s2">"chunk boundary. SWA layers skip this with joint target/draft KV cache "</span>
+        <span class="s2">"reuse. For hybrid Mamba models, the recurrent state is snapshotted at "</span>
+        <span class="s2">"the fork. If no periodic or additional snapshot point applies to the "</span>
+        <span class="s2">"prompt, the prompt end is snapshotted as a fallback. Requires KV cache "</span>
+        <span class="s2">"manager v2 and block reuse."</span><span class="p">)</span>
+
 <div class="viewcode-block" id="BlockReuseConfig.validate_swa_endpoint_policy">
 <a class="viewcode-back" href="../../../llm-api/reference/BlockReuseConfig.html#tensorrt_llm.llmapi.BlockReuseConfig.validate_swa_endpoint_policy">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">"after"</span><span class="p">)</span>
@@ -6160,6 +6190,23 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"should be attempted."</span><span class="p">)</span>
 
 
+<span class="c1"># Mixed-precision KV dtype: "mixed_&lt;history dtype&gt;_&lt;retained dtype&gt;". The</span>
+<span class="c1"># first/last retained tokens and the attention inputs use the second dtype;</span>
+<span class="c1"># the full history is stored in the first. Requires KV cache manager V2.</span>
+<span class="n">_MIXED_PRECISION_KV_DTYPE</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
+    <span class="sa">r</span><span class="s2">"^mixed_(?P&lt;low&gt;nvfp4)_(?P&lt;high&gt;fp8|float16|bfloat16)$"</span><span class="p">)</span>
+<span class="n">_MIXED_PRECISION_KV_DTYPES</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="sa">f</span><span class="s2">"mixed_nvfp4_</span><span class="si">{</span><span class="n">high</span><span class="si">}</span><span class="s2">"</span>
+                                   <span class="k">for</span> <span class="n">high</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"fp8"</span><span class="p">,</span> <span class="s2">"float16"</span><span class="p">,</span> <span class="s2">"bfloat16"</span><span class="p">))</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MixedPrecisionKV</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Layout of a mixed-precision KV cache, parsed from KvCacheConfig."""</span>
+    <span class="n">low</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">high</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">first_n</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">last_n</span><span class="p">:</span> <span class="nb">int</span>
+
+
 <div class="viewcode-block" id="KvCacheConfig">
 <a class="viewcode-back" href="../../../llm-api/reference/KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig">[docs]</a>
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_KvCacheConfig</span><span class="p">)</span>
@@ -6214,11 +6261,19 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">"The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Defaults to None (unset); must be set when using an encoder-decoder model and must not be set otherwise."</span>
     <span class="p">)</span>
-    <span class="n">secondary_offload_min_priority</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">cold_tier_offload_min_priority</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">"Only blocks with priority &gt; secondary_offload_min_priority can be offloaded to secondary memory."</span>
+        <span class="s2">"Minimum priority for offloading unreferenced blocks from the hot tier to cold tiers. "</span>
+        <span class="s2">"Blocks with priority at or above this value can be offloaded. Defaults to 30 when unset."</span>
     <span class="p">)</span>
+    <span class="n">secondary_offload_min_priority</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"deprecated"</span><span class="p">,</span>
+        <span class="n">deprecated</span><span class="o">=</span><span class="s2">"Use cold_tier_offload_min_priority instead."</span><span class="p">,</span>
+        <span class="n">telemetry</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">exclude</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">"Deprecated alias for cold_tier_offload_min_priority."</span><span class="p">)</span>
     <span class="n">event_buffer_max_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -6271,12 +6326,31 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "</span>
         <span class="s2">"is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "</span>
         <span class="s2">"'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "</span>
+        <span class="s2">"'mixed_nvfp4_&lt;dtype&gt;' (prototype) stores the full KV history in NVFP4 and "</span>
+        <span class="s2">"keeps the first and last N tokens of every sequence in &lt;dtype&gt; "</span>
+        <span class="s2">"('fp8', 'float16' or 'bfloat16'), N from mixed_precision_first_n and "</span>
+        <span class="s2">"mixed_precision_last_n; requires KV cache manager V2. "</span>
         <span class="s2">"Resolved at "</span>
         <span class="s2">"LLM-construction time, including when set via trtllm-serve "</span>
         <span class="s2">"--extra_llm_api_options."</span><span class="p">,</span>
         <span class="n">telemetry</span><span class="o">=</span><span class="n">TelemetryField</span><span class="o">.</span><span class="n">categorical</span><span class="p">(</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"float16"</span><span class="p">,</span> <span class="s2">"bfloat16"</span><span class="p">,</span>
                                              <span class="s2">"float32"</span><span class="p">,</span> <span class="s2">"fp8"</span><span class="p">,</span> <span class="s2">"fp8_ds_mla"</span><span class="p">,</span>
-                                             <span class="s2">"nvfp4"</span><span class="p">))</span>
+                                             <span class="s2">"nvfp4"</span><span class="p">,</span>
+                                             <span class="o">*</span><span class="n">_MIXED_PRECISION_KV_DTYPES</span><span class="p">))</span>
+
+    <span class="n">mixed_precision_first_n</span><span class="p">:</span> <span class="n">NonNegativeInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">"Mixed-precision KV only: number of leading tokens per sequence kept at the "</span>
+        <span class="s2">"retained dtype. Retention follows the cache page granularity."</span><span class="p">)</span>
+
+    <span class="n">mixed_precision_last_n</span><span class="p">:</span> <span class="n">NonNegativeInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">"Mixed-precision KV only: number of most recent tokens per sequence kept at "</span>
+        <span class="s2">"the retained dtype. Retention follows the cache page granularity."</span><span class="p">)</span>
 
     <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
     <span class="n">mamba_ssm_cache_dtype</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span>
@@ -6433,7 +6507,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">free_gpu_memory_fraction</span><span class="p">,</span>
             <span class="n">host_cache_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">host_cache_size</span><span class="p">,</span>
             <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_fraction</span><span class="p">,</span>
-            <span class="n">secondary_offload_min_priority</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">secondary_offload_min_priority</span><span class="p">,</span>
+            <span class="n">secondary_offload_min_priority</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cold_tier_offload_min_priority</span><span class="p">,</span>
             <span class="n">event_buffer_max_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">event_buffer_max_size</span><span class="p">,</span>
             <span class="n">enable_partial_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_partial_reuse</span><span class="p">,</span>
             <span class="n">copy_on_partial_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">copy_on_partial_reuse</span><span class="p">,</span>
@@ -6442,6 +6516,33 @@ window.runMermaid = runMermaid;</script>
             <span class="n">attention_dp_events_gather_period_ms</span><span class="p">,</span>
             <span class="n">max_gpu_total_bytes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_gpu_total_bytes</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">config</span>
+
+<div class="viewcode-block" id="KvCacheConfig.migrate_legacy_offload_min_priority">
+<a class="viewcode-back" href="../../../llm-api/reference/KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig.migrate_legacy_offload_min_priority">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">'after'</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">migrate_legacy_offload_min_priority</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">'KvCacheConfig'</span><span class="p">:</span>
+        <span class="n">legacy</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'secondary_offload_min_priority'</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">legacy</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cold_tier_offload_min_priority</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">cold_tier_offload_min_priority</span> <span class="o">!=</span> <span class="n">legacy</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"cold_tier_offload_min_priority and secondary_offload_min_priority "</span>
+                <span class="s2">"must match when both are set."</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+            <span class="s2">"'kv_cache_config.secondary_offload_min_priority' is deprecated; "</span>
+            <span class="s2">"use 'kv_cache_config.cold_tier_offload_min_priority' instead."</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cold_tier_offload_min_priority</span> <span class="o">=</span> <span class="n">legacy</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="s1">'secondary_offload_min_priority'</span><span class="p">:</span>
+            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="s1">'cold_tier_offload_min_priority'</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="p">(</span><span class="n">name</span> <span class="o">==</span> <span class="s1">'cold_tier_offload_min_priority'</span>
+              <span class="ow">and</span> <span class="s1">'secondary_offload_min_priority'</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_fields_set</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">[</span><span class="s1">'secondary_offload_min_priority'</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
 
 <div class="viewcode-block" id="KvCacheConfig.validate_free_gpu_memory_fraction">
 <a class="viewcode-back" href="../../../llm-api/reference/KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig.validate_free_gpu_memory_fraction">[docs]</a>
@@ -6479,11 +6580,24 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">v</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"fp8"</span><span class="p">,</span> <span class="s2">"fp8_ds_mla"</span><span class="p">,</span>
                  <span class="s2">"nvfp4"</span><span class="p">)</span> <span class="ow">or</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">_str_to_torch_dtype_dict</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
             <span class="k">return</span> <span class="n">v</span>
+        <span class="k">if</span> <span class="n">_MIXED_PRECISION_KV_DTYPE</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">v</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">v</span>
 
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
             <span class="s1">'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '</span>
-            <span class="s1">'"nvfp4", or valid torch.dtype string'</span><span class="p">)</span></div>
+            <span class="s1">'"nvfp4", "mixed_nvfp4_&lt;fp8|float16|bfloat16&gt;", or valid '</span>
+            <span class="s1">'torch.dtype string'</span><span class="p">)</span></div>
 
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">mixed_precision_kv</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">MixedPrecisionKV</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Layout of a mixed-precision KV cache, else None."""</span>
+        <span class="n">match</span> <span class="o">=</span> <span class="n">_MIXED_PRECISION_KV_DTYPE</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">match</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="n">MixedPrecisionKV</span><span class="p">(</span><span class="n">match</span><span class="p">[</span><span class="s2">"low"</span><span class="p">],</span> <span class="n">match</span><span class="p">[</span><span class="s2">"high"</span><span class="p">],</span>
+                                <span class="bp">self</span><span class="o">.</span><span class="n">mixed_precision_first_n</span><span class="p">,</span>
+                                <span class="bp">self</span><span class="o">.</span><span class="n">mixed_precision_last_n</span><span class="p">)</span>
 
 <div class="viewcode-block" id="KvCacheConfig.reject_fp8_ds_mla_pool_rebalance">
 <a class="viewcode-back" href="../../../llm-api/reference/KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig.reject_fp8_ds_mla_pool_rebalance">[docs]</a>
@@ -6546,6 +6660,49 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache_manager_v2</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">"block_reuse_config.swa_endpoint_rewind_tokens requires "</span>
+                    <span class="s2">"kv_cache_config.use_kv_cache_manager_v2=True."</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.migrate_mamba_branch_snapshot">
+<a class="viewcode-back" href="../../../llm-api/reference/KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig.migrate_mamba_branch_snapshot">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">'after'</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">migrate_mamba_branch_snapshot</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">'KvCacheConfig'</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Copy the deprecated Mamba branch snapshot flag into block_reuse_config.</span>
+
+<span class="sd">        Runs before validate_branch_snapshot. The old flag had no effect</span>
+<span class="sd">        without block reuse, so it is not copied then rather than rejected.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mamba_state_config</span><span class="o">.</span><span class="n">enable_branch_snapshot</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+        <span class="k">if</span> <span class="p">(</span><span class="s2">"enable_branch_snapshot"</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_reuse_config</span><span class="o">.</span><span class="n">model_fields_set</span>
+                <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_reuse_config</span><span class="o">.</span><span class="n">enable_branch_snapshot</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"Cannot set both 'kv_cache_config.mamba_state_config."</span>
+                <span class="s2">"enable_branch_snapshot=True' and 'kv_cache_config."</span>
+                <span class="s2">"block_reuse_config.enable_branch_snapshot=False'."</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+            <span class="s2">"'kv_cache_config.mamba_state_config.enable_branch_snapshot' is "</span>
+            <span class="s2">"deprecated; use 'kv_cache_config.block_reuse_config."</span>
+            <span class="s2">"enable_branch_snapshot' instead."</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">block_reuse_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_reuse_config</span><span class="o">.</span><span class="n">model_copy</span><span class="p">(</span>
+                <span class="n">update</span><span class="o">=</span><span class="p">{</span><span class="s2">"enable_branch_snapshot"</span><span class="p">:</span> <span class="kc">True</span><span class="p">})</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_branch_snapshot">
+<a class="viewcode-back" href="../../../llm-api/reference/KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig.validate_branch_snapshot">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">'after'</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_branch_snapshot</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">'KvCacheConfig'</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_reuse_config</span><span class="o">.</span><span class="n">enable_branch_snapshot</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">"block_reuse_config.enable_branch_snapshot requires "</span>
+                    <span class="s2">"kv_cache_config.enable_block_reuse=True."</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache_manager_v2</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">"block_reuse_config.enable_branch_snapshot requires "</span>
                     <span class="s2">"kv_cache_config.use_kv_cache_manager_v2=True."</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -6627,6 +6784,19 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"</span>
                 <span class="p">)</span>
         <span class="k">return</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_mixed_precision_retention">
+<a class="viewcode-back" href="../../../llm-api/reference/KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig.validate_mixed_precision_retention">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">'after'</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_mixed_precision_retention</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">'KvCacheConfig'</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A mixed-precision cache must retain at least one token per sequence."""</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mixed_precision_kv</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mixed_precision_first_n</span>
+                <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">mixed_precision_last_n</span> <span class="o">==</span> <span class="mi">0</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"Mixed-precision KV requires mixed_precision_first_n or "</span>
+                <span class="s2">"mixed_precision_last_n to be greater than zero."</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
 
 
 <div class="viewcode-block" id="KvCacheConfig.validate_pool_ratio">
@@ -7818,6 +7988,18 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"Separated-routing MoE backends only."</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">"beta"</span><span class="p">)</span>
 
+    <span class="n">lm_head_output_dtype</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"float32"</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">"auto"</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">"Output dtype written by the LM head GEMM. 'auto' uses the model "</span>
+        <span class="s2">"dtype before logits are upcast to float32. 'float32' writes the "</span>
+        <span class="s2">"float32 accumulator directly, avoiding intermediate bf16/fp16 "</span>
+        <span class="s2">"rounding of logits before logprob computation. Weights and inputs "</span>
+        <span class="s2">"remain in the model dtype. Only supported for unquantized LM heads "</span>
+        <span class="s2">"of decoder-only models."</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
+        <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"Literal['auto', 'float32']"</span><span class="p">})</span>
+
     <span class="n">moe_config</span><span class="p">:</span> <span class="n">MoeConfig</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">MoeConfig</span><span class="p">,</span>
                                   <span class="n">description</span><span class="o">=</span><span class="s2">"MoE config."</span><span class="p">,</span>
                                   <span class="n">status</span><span class="o">=</span><span class="s2">"beta"</span><span class="p">)</span>
@@ -8412,6 +8594,41 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
+<div class="viewcode-block" id="TorchLlmArgs.validate_mixed_precision_kv">
+<a class="viewcode-back" href="../../../llm-api/reference/TorchLlmArgs.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_mixed_precision_kv">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">"after"</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_mixed_precision_kv</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">'TorchLlmArgs'</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Reject runtime features the mixed-precision KV cache does not support."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">mixed_precision_kv</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">use_kv_cache_manager_v2</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">True</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."</span>
+            <span class="p">)</span>
+        <span class="c1"># get_attention_backend matches the name case-insensitively.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_backend</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"TRTLLM"</span><span class="p">,</span> <span class="s2">"FLASHINFER"</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"Mixed-precision KV supports the TRTLLM and FLASHINFER attention "</span>
+                <span class="sa">f</span><span class="s2">"backends; got attn_backend=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_backend</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sparse_attention_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"Mixed-precision KV is not supported together with sparse attention."</span>
+            <span class="p">)</span>
+        <span class="c1"># The connector layout maps every cache layer to one model layer; the</span>
+        <span class="c1"># retained-token layers break that mapping.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_connector_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"Mixed-precision KV is not supported together with a KV connector."</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_compression_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"Mixed-precision KV currently requires single-beam execution "</span>
+                <span class="s2">"without speculative decoding or cold-page compression."</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
 <div class="viewcode-block" id="TorchLlmArgs.normalize_disabled_mm_encoder_cache">
 <a class="viewcode-back" href="../../../llm-api/reference/TorchLlmArgs.html#tensorrt_llm.llmapi.TorchLlmArgs.normalize_disabled_mm_encoder_cache">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">"after"</span><span class="p">)</span>
@@ -8643,6 +8860,21 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">"Speculation type </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">decoding_type</span><span class="si">}</span><span class="s2"> does not "</span>
                     <span class="sa">f</span><span class="s2">"support backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">backend</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">NGramDecodingConfig</span><span class="p">):</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning_once</span><span class="p">(</span>
+                    <span class="s2">"NGramDecodingConfig (decoding_type 'NGram') is deprecated "</span>
+                    <span class="s2">"and will be removed in January 2027. Use SADecodingConfig "</span>
+                    <span class="s2">"(decoding_type 'SA', suffix automaton speculative "</span>
+                    <span class="s2">"decoding) instead."</span><span class="p">,</span>
+                    <span class="n">key</span><span class="o">=</span><span class="s2">"deprecated_ngram_decoding_config"</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+                            <span class="n">UserProvidedDecodingConfig</span><span class="p">):</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning_once</span><span class="p">(</span>
+                    <span class="s2">"UserProvidedDecodingConfig (decoding_type "</span>
+                    <span class="s2">"'User_Provided') is deprecated and will be removed in "</span>
+                    <span class="s2">"January 2027."</span><span class="p">,</span>
+                    <span class="n">key</span><span class="o">=</span><span class="s2">"deprecated_user_provided_decoding_config"</span><span class="p">)</span>
 
             <span class="c1"># If user passed decoding_type: Eagle on pytorch, convert to Eagle3 with warning</span>
             <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">)</span> <span class="ow">is</span> <span class="n">EagleDecodingConfig</span><span class="p">:</span>
@@ -9163,10 +9395,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s2">"auto"</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">'fp8'</span><span class="p">,</span> <span class="s1">'fp8_ds_mla'</span><span class="p">):</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">'fp8'</span><span class="p">,</span> <span class="s1">'fp8_ds_mla'</span><span class="p">,</span>
+                                            <span class="s1">'mixed_nvfp4_fp8'</span><span class="p">):</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s1">'nvfp4'</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">'mixed_nvfp4_float16'</span><span class="p">,</span>
+                                            <span class="s1">'mixed_nvfp4_bfloat16'</span><span class="p">):</span>
+            <span class="c1"># Retained tokens stay in the model dtype: no KV quantization.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2">, "</span>
@@ -9549,9 +9786,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

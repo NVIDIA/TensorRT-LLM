@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -770,6 +771,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_dp_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.AttentionDpConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disable_overlap_scheduler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_return_routed_experts:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">lm_head_output_dtype:</span> <span class="pre">~typing.Literal['auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'float32']</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MoeConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">nvfp4_gemm_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dwdp_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.DwdpConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -1243,6 +1246,12 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.layer_wise_benchmarks_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">layer_wise_benchmarks_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">LayerwiseBenchmarksConfig</span></em><em class="property"> <span class="pre">[Optional]</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.layer_wise_benchmarks_config" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Configuration for layer-wise benchmarks calibration.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.lm_head_output_dtype">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">lm_head_output_dtype</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'float32'</span></span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.lm_head_output_dtype" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Output dtype written by the LM head GEMM. ‘auto’ uses the model dtype before logits are upcast to float32. ‘float32’ writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -1780,7 +1789,7 @@ At the same time, we still need to accept None as a valid value to avoid a break
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_encoder_runtime_sizes">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_encoder_runtime_sizes</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">encoder_max_batch_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">encoder_max_num_tokens</span></em><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_encoder_runtime_sizes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_encoder_runtime_sizes" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_encoder_runtime_sizes</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">encoder_max_num_tokens</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">encoder_max_batch_size</span></em><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_encoder_runtime_sizes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_encoder_runtime_sizes" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
@@ -1861,6 +1870,12 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_lora_config_consistency">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_lora_config_consistency</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_lora_config_consistency" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_mixed_precision_kv">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_mixed_precision_kv</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_mixed_precision_kv"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_mixed_precision_kv" title="Link to this definition">#</a></dt>
+<dd><p>Reject runtime features the mixed-precision KV cache does not support.</p>
+</dd></dl>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_mla_skip_correction_config">
@@ -2076,6 +2091,7 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_config"><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.kv_connector_config"><code class="docutils literal notranslate"><span class="pre">kv_connector_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.layer_wise_benchmarks_config"><code class="docutils literal notranslate"><span class="pre">layer_wise_benchmarks_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.lm_head_output_dtype"><code class="docutils literal notranslate"><span class="pre">lm_head_output_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.load_format"><code class="docutils literal notranslate"><span class="pre">load_format</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.lora_config"><code class="docutils literal notranslate"><span class="pre">lora_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_batch_size"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></a></li>
@@ -2167,6 +2183,7 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_helix_tokens_per_block"><code class="docutils literal notranslate"><span class="pre">validate_helix_tokens_per_block</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_load_balancer"><code class="docutils literal notranslate"><span class="pre">validate_load_balancer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_lora_config_consistency"><code class="docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_mixed_precision_kv"><code class="docutils literal notranslate"><span class="pre">validate_mixed_precision_kv</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_mla_skip_correction_config"><code class="docutils literal notranslate"><span class="pre">validate_mla_skip_correction_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_mx_config"><code class="docutils literal notranslate"><span class="pre">validate_mx_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_parallel_config"><code class="docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></a></li>
@@ -2281,9 +2298,9 @@ the (MoE, GMS) follow-up; see <code class="docutils literal notranslate"><span c
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       
