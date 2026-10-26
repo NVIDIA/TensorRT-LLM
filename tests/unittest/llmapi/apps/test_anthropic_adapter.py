@@ -1132,6 +1132,122 @@ def test_stream_reframer_reassembles_sse_frames_split_across_chunks():
     assert "".join(text_deltas) == "hello"
 
 
+def test_stream_reframer_reads_the_upstream_to_its_end_after_done():
+    """The upstream runs past [DONE], so the work it does there runs.
+
+    The chat stream records the request's metrics after its last frame. A
+    reframer that stopped reading at [DONE] left it suspended there, to be
+    closed with GeneratorExit: every streamed /v1/messages request lost its
+    metrics, and the server logged a traceback for it.
+    """
+    after_done = []
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert after_done == ["ran"]
+
+
+def test_stream_reframer_reads_the_upstream_to_its_end_before_message_stop():
+    """A consumer that stops reading at message_stop still lets the upstream end.
+
+    A client may disconnect as soon as it has message_stop. Had message_stop
+    gone out before the upstream was drained, the chat stream would be left
+    suspended at [DONE] and its metrics never recorded.
+    """
+    after_done = []
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def read_until_message_stop():
+        stream = reframe_openai_stream(source(), MODEL)
+        frames = []
+        async for frame in stream:
+            frames.append(frame)
+            if frame.startswith("event: message_stop"):
+                break
+        await stream.aclose()
+        return frames
+
+    events = parse_frames(asyncio.run(read_until_message_stop()))
+    assert_event_invariants(events)
+    assert after_done == ["ran"]
+
+
+def test_stream_reframer_drops_anything_after_done():
+    """Lines after [DONE] are read to reach the end, never reframed."""
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        yield f"data: {chunk({'content': 'late'}).model_dump_json()}\n\n"
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    text_deltas = [
+        payload["delta"]["text"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(text_deltas) == "hello"
+
+
+def test_stream_reframer_adds_no_event_when_the_upstream_fails_after_done():
+    """message_stop stays the last event when reading past [DONE] fails."""
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        raise RuntimeError("failed after the last frame")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert "error" not in [name for name, _ in events]
+
+
+def test_stream_reframer_reads_a_byte_stream_to_its_end_when_done_is_split():
+    """A relayed byte stream is read to its EOF however [DONE] is chunked."""
+    body = (
+        f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        "data: [DONE]\n\n"
+    ).encode()
+    split = body.index(b"[DONE]") + len(b"[DO")
+    after_last_chunk = []
+
+    async def source():
+        yield body[:split]
+        yield body[split:]
+        after_last_chunk.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert after_last_chunk == ["ran"]
+
+
 def test_stream_reframer_splits_multibyte_characters():
     """A chunk boundary landing inside a UTF-8 sequence must not corrupt output.
 
