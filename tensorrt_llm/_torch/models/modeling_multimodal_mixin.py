@@ -19,6 +19,8 @@ import copy
 import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -63,6 +65,23 @@ class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
 
 
+def _batch_encoder_input(
+    values: Sequence[torch.Tensor], *, dim: int, pad_dims: tuple[int, ...], pad_value: float
+) -> torch.Tensor:
+    if pad_dims and len(values) > 1:
+        maxima = {axis: max(value.shape[axis] for value in values) for axis in pad_dims}
+        padded = []
+        for value in values:
+            padding = [0] * (2 * value.ndim)
+            for axis, maximum in maxima.items():
+                padding[2 * (value.ndim - axis) - 1] = maximum - value.shape[axis]
+            padded.append(
+                torch.nn.functional.pad(value, padding, value=pad_value) if any(padding) else value
+            )
+        values = padded
+    return torch.cat(values, dim=dim)
+
+
 @dataclass(frozen=True)
 class EncoderInputField:
     """How one encoder argument combines already ordered input payloads.
@@ -72,18 +91,34 @@ class EncoderInputField:
     Padding extends the right side with ``pad_value``. Callers supply compatible
     tensor ranks, dtypes, devices and remaining dimensions, and retain ownership
     of modality order, optional-field policy and attention-mask semantics.
+    ``batch`` applies the same padding and owned concatenation to a gathered column.
     """
 
     source_names: tuple[str, ...]
     dim: int = 0
     pad_dims: tuple[int, ...] = ()
     pad_value: float = 0.0
+    batch: Callable[[Sequence[torch.Tensor]], torch.Tensor] = dataclass_field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if not self.source_names:
             raise ValueError("Encoder input fields require at least one source name")
         if self.dim < 0 or any(axis < 0 or axis == self.dim for axis in self.pad_dims):
             raise ValueError("Encoder padding axes must be nonnegative and exclude the concat axis")
+        object.__setattr__(
+            self,
+            "batch",
+            partial(
+                _batch_encoder_input,
+                dim=self.dim,
+                pad_dims=self.pad_dims,
+                pad_value=self.pad_value,
+            )
+            if self.pad_dims or self.dim
+            else torch.cat,
+        )
 
 
 def batch_encoder_inputs(
@@ -139,20 +174,7 @@ def batch_encoder_inputs(
                             f"Missing encoder input {name!r}: expected {field.source_names}"
                         )
                 values.append(value)
-        if field.pad_dims and only is None:
-            maxima = {axis: max(value.shape[axis] for value in values) for axis in field.pad_dims}
-            padded = []
-            for value in values:
-                padding = [0] * (2 * value.ndim)
-                for axis, maximum in maxima.items():
-                    padding[2 * (value.ndim - axis) - 1] = maximum - value.shape[axis]
-                padded.append(
-                    torch.nn.functional.pad(value, padding, value=field.pad_value)
-                    if any(padding)
-                    else value
-                )
-            values = padded
-        result[name] = torch.cat(values, dim=field.dim)
+        result[name] = field.batch(values)
     return result
 
 

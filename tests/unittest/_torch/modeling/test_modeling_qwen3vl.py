@@ -497,6 +497,48 @@ def test_qwen3vl_common_batching_preserves_packing_and_deepstack_order(selection
             assert torch.equal(model._multimodal_encoder_cache.get(key), item_output)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("preferred_pixels", "preferred_grid", "expected_pixels", "expected_grid"),
+    [
+        (
+            torch.tensor([[5.0]]),
+            torch.tensor([[7, 8, 9]]),
+            [[1.0], [5.0]],
+            [[1, 2, 3], [7, 8, 9]],
+        ),
+        (None, None, [[1.0], [3.0]], [[1, 2, 3], [4, 5, 6]]),
+    ],
+    ids=["tensor", "none"],
+)
+def test_qwen3vl_common_batching_preserves_video_alias_priority(
+    preferred_pixels: Optional[torch.Tensor],
+    preferred_grid: Optional[torch.Tensor],
+    expected_pixels: list[list[float]],
+    expected_grid: list[list[int]],
+) -> None:
+    image = {
+        "pixel_values": torch.tensor([[1.0]]),
+        "image_grid_thw": torch.tensor([[1, 2, 3]]),
+    }
+    video = {
+        "pixel_values_videos": torch.tensor([[3.0]]),
+        "video_grid_thw": torch.tensor([[4, 5, 6]]),
+        "pixel_values": preferred_pixels,
+        "image_grid_thw": preferred_grid,
+    }
+    params = [MultimodalParams(multimodal_data={"video": video, "image": image})]
+
+    packed = modeling_qwen3vl._qwen3vl_build_batched_input(params)
+
+    assert torch.equal(packed["pixel_values"], torch.tensor(expected_pixels))
+    assert torch.equal(packed["grid_thw"], torch.tensor(expected_grid))
+    for result in packed.values():
+        for source in (*image.values(), *video.values()):
+            if source is not None:
+                assert result.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen3vl_deepstack_fusion_reuses_registered_buffer():
     hidden_size = 4

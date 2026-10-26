@@ -1317,6 +1317,36 @@ def _qwen3vl_build_batched_input(
 ) -> dict[str, Any]:
     """Cat image items then video items across requests (matching the
     ``EncoderGroup.modalities`` order) into one ViT input."""
+    pixels, grids = [], []
+    try:
+        for param in multimodal_params:
+            bucket = param.multimodal_data.get("image")
+            if bucket is not None:
+                pixels.append(bucket["pixel_values"])
+                grids.append(bucket["image_grid_thw"])
+        has_images = bool(pixels)
+        for param in multimodal_params:
+            bucket = param.multimodal_data.get("video")
+            if bucket is not None:
+                # Two canonical fields leave no room for a preferred image alias.
+                if (
+                    len(bucket) > 2
+                    and has_images
+                    and ("pixel_values" in bucket or "image_grid_thw" in bucket)
+                ):
+                    break
+                pixels.append(bucket["pixel_values_videos"])
+                grids.append(bucket["video_grid_thw"])
+        else:
+            if pixels:
+                return {
+                    "pixel_values": _QWEN3VL_ENCODER_INPUT_FIELDS["pixel_values"].batch(pixels),
+                    "grid_thw": _QWEN3VL_ENCODER_INPUT_FIELDS["grid_thw"].batch(grids),
+                }
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    # Preserve field-major alias lookup and error priority for noncanonical inputs.
     inputs_by_modality = [
         [
             bucket
