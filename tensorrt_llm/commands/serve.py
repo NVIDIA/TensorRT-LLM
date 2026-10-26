@@ -276,6 +276,7 @@ def get_llm_args(
         enable_chunked_prefill: bool = False,
         enable_attention_dp: bool = False,
         video_pruning_rate: Optional[float] = None,
+        num_input_processor_workers: Optional[int] = None,
         telemetry: bool = True,
         agent_percentage: float = 0.0,
         agent_types: Optional[str] = None,
@@ -363,6 +364,8 @@ def get_llm_args(
         build_cli_config("multimodal_config",
                          video_pruning_rate=video_pruning_rate)
         if video_pruning_rate is not None else None,
+        "num_input_processor_workers":
+        num_input_processor_workers,
         "telemetry_config":
         _telemetry_config.TelemetryConfig(
             disabled=not telemetry,
@@ -530,7 +533,7 @@ def launch_server(
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         served_model_name: Optional[str] = None,
         allow_request_chat_template: bool = False,
-        num_input_processor_workers: int = 8,
+        num_input_processor_workers: Optional[int] = None,
         num_media_load_workers: int = 8,
         multi_frontend_enabled: bool = True,
         internal_disagg_auth_key: Optional[str] = None,
@@ -544,6 +547,10 @@ def launch_server(
         os.environ[
             DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = server_role.name.lower()
 
+    if num_input_processor_workers is not None:
+        llm_args = update_llm_args_with_extra_dict(
+            llm_args,
+            {"num_input_processor_workers": num_input_processor_workers})
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
 
@@ -642,7 +649,6 @@ def launch_server(
                     multimodal_server_config=multimodal_server_config,
                     chat_template=chat_template,
                     allow_request_chat_template=allow_request_chat_template,
-                    input_processor_workers=num_input_processor_workers,
                     media_load_workers=num_media_load_workers,
                     internal_disagg_auth_key=internal_disagg_auth_key,
                     enable_runtime_control_endpoints=
@@ -1047,11 +1053,11 @@ def launch_visual_gen_server(
     "SO_REUSEPORT (classic IPC executor path only).",
     status="prototype")
 @stability_option("--num_input_processor_workers",
-                  type=click.IntRange(min=1),
-                  default=8,
-                  help="Size of the dedicated thread pool that runs the HF "
-                  "input processor (multimodal preprocess) on the chat "
-                  "and completion endpoints.",
+                  type=click.IntRange(min=0),
+                  default=None,
+                  help="Input-processing threads per frontend for chat and "
+                  "completion requests (default: 8). 0 runs inline. Sets "
+                  "num_input_processor_workers.",
                   status="prototype")
 @stability_option("--num_media_load_workers",
                   type=click.IntRange(min=1),
@@ -1284,7 +1290,7 @@ def serve(
     kv_cache_dtype: str,
     num_postprocess_workers: int,
     num_serve_frontends: int,
-    num_input_processor_workers: int,
+    num_input_processor_workers: Optional[int],
     num_media_load_workers: int,
     trust_remote_code: bool,
     revision: Optional[str],
@@ -1456,6 +1462,7 @@ def serve(
             enable_attention_dp=enable_attention_dp,
             enable_locality_domains=enable_locality_domains,
             video_pruning_rate=video_pruning_rate,
+            num_input_processor_workers=num_input_processor_workers,
             telemetry=telemetry,
             agent_percentage=agent_percentage,
             agent_types=agent_types,
@@ -1617,7 +1624,6 @@ def serve(
                 multimodal_server_config,
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
-                num_input_processor_workers=num_input_processor_workers,
                 num_media_load_workers=num_media_load_workers,
                 internal_disagg_auth_key=internal_disagg_auth_key,
                 report_addr=report_addr,

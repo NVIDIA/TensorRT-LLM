@@ -39,6 +39,24 @@ The following abbreviated command syntax shows the commonly used arguments to st
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
 
+Preprocessing Workers
+~~~~~~~~~~~~~~~~~~~~~
+
+Set ``--num_input_processor_workers N`` or use the same setting in ``--config``:
+
+.. code-block:: yaml
+
+   num_input_processor_workers: 8
+
+The default remains eight input-processing threads per frontend for chat and
+completion requests, including text-only models. Zero runs inline on the request
+event loop. Qwen3-VL uses a separate HF processor and tokenizer per thread.
+Additional workers increase host memory use. Offline ``LLM`` calls remain synchronous.
+
+An explicit flag overrides the YAML value, and ``--set
+num_input_processor_workers=N`` has final precedence. Media loading
+uses its separate ``--num_media_load_workers`` pool.
+
 .. _tool-parser-selection:
 
 Tool-call Parser Selection

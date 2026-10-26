@@ -6473,6 +6473,16 @@ TORCH_LLMARGS_REMOVED_ARGS = frozenset(_TORCH_LLMARGS_REMOVED_ARG_CHECKS)
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
+    num_input_processor_workers: NonNegativeInt = Field(
+        default=8,
+        description=(
+            "Number of input-processing threads per serving frontend for "
+            "chat and completion requests, including text-only models. "
+            "0 runs inline on the request event loop. Offline LLM calls "
+            "remain synchronous."),
+        status="prototype",
+    )
+
     generation_config: Literal["auto", "trtllm"] = Field(
         default="trtllm",
         description=

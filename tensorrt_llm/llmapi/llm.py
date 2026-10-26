@@ -2120,6 +2120,9 @@ class _TorchLLM(BaseLLM):
             trust_remote_code=self.args.trust_remote_code,
             enable_tokenization_cache=self.args.enable_tokenization_cache,
             **input_processor_kwargs)
+        if isinstance(self.input_processor, BaseMultimodalInputProcessor):
+            self.input_processor.configure_preprocessing(
+                self.args.num_input_processor_workers)
         self._tokenizer = self.input_processor.tokenizer
 
         # Resolve encode_only mode (opt-in only)

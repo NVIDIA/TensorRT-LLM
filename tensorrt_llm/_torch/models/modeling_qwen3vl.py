@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import math
 import re
+import threading
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 from typing import Mapping as TypingMapping
@@ -258,6 +259,35 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # Qwen3-VL keeps ``torch_dtype`` only on ``text_config`` under transformers 5.x.
         self._dtype = self.config.text_config.dtype
 
+    def configure_preprocessing(self, num_workers: int) -> None:
+        if num_workers > 1:
+            if getattr(self, "_preprocess_thread_state", None) is None:
+                self._preprocess_thread_state = threading.local()
+                self._preprocess_copy_lock = threading.Lock()
+                self._get_preprocessing_state()
+        else:
+            self._preprocess_thread_state = None
+
+    def _get_preprocessing_state(self) -> Optional[threading.local]:
+        state = getattr(self, "_preprocess_thread_state", None)
+        if state is not None and not hasattr(state, "processor"):
+            # HF processors and fast tokenizers can change padding/truncation
+            # state during a call. Each preprocessing thread owns its copies.
+            with self._preprocess_copy_lock:
+                state.processor = copy.deepcopy(self._processor)
+                state.tokenizer = copy.deepcopy(self._tokenizer)
+        return state
+
+    @property
+    def processor(self):
+        state = self._get_preprocessing_state()
+        return self._processor if state is None else state.processor
+
+    @property
+    def tokenizer(self):
+        state = self._get_preprocessing_state()
+        return self._tokenizer if state is None else state.tokenizer
+
     @classmethod
     def _build_temporal_block(
         cls,
@@ -457,7 +487,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # wrong-formula fallback that would break chunked prefill, so we must
         # run the full processor here.
         do_rescale = not (video and isinstance(video[0], torch.Tensor))
-        processed = self._processor(
+        processed = self.processor(
             text=["<|vision_start|><|video_pad|><|vision_end|>"],
             videos=[video],
             padding=True,

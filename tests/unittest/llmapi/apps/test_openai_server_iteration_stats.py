@@ -366,3 +366,56 @@ async def test_metrics_endpoint_reads_visual_gen_stats():
     assert _response_content(response) == stats
     assert server.generator.stats_timeouts == [None]
     assert server.metrics_collector.logged_stats == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workers", [0, 1, 4])
+async def test_preprocessing_pool_and_inline_thread_ownership(workers):
+    server = object.__new__(OpenAIServer)
+    server._input_proc_executor = ThreadPoolExecutor(max_workers=workers) if workers else None
+    try:
+        thread = await server._run_input_processor(threading.get_ident)
+        assert (thread == threading.get_ident()) == (workers == 0)
+
+        def fail():
+            raise ValueError("invalid input")
+
+        with pytest.raises(ValueError, match="invalid input"):
+            await server._run_input_processor(fail)
+    finally:
+        if server._input_proc_executor is not None:
+            server._input_proc_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("workers", [None, 0, 1, 4, 8])
+@pytest.mark.parametrize("override", [None, 0, 2])
+def test_preprocessing_constructor_uses_typed_config(monkeypatch, workers, override):
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.serve import openai_server
+
+    for name in ("_init_llm", "register_routes"):
+        monkeypatch.setattr(OpenAIServer, name, lambda *args: None)
+    monkeypatch.setattr(openai_server, "load_builtin_extensions", lambda: None)
+    monkeypatch.setattr(openai_server, "create_metadata_server", lambda _: None)
+    monkeypatch.setattr(openai_server.BaseMediaIO, "set_executor", lambda _: None)
+    config = (
+        TorchLlmArgs(model="dummy/model")
+        if workers is None
+        else TorchLlmArgs(model="dummy/model", num_input_processor_workers=workers)
+    )
+    generator = SimpleNamespace(args=config)
+    server = OpenAIServer(
+        generator, "dummy/model", None, None, None, input_processor_workers=override
+    )
+    expected = override if override is not None else config.num_input_processor_workers
+    try:
+        assert generator.args.num_input_processor_workers == expected
+        if expected:
+            assert server._input_proc_executor._max_workers == expected
+        else:
+            assert server._input_proc_executor is None
+    finally:
+        if server._input_proc_executor is not None:
+            server._input_proc_executor.shutdown(wait=True)
+        server._media_load_executor.shutdown(wait=True)
+        server._metrics_stats_executor.shutdown(wait=True)

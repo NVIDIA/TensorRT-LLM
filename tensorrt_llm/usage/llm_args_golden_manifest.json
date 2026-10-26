@@ -1112,6 +1112,11 @@
     {
       "capture_policy": "int",
       "kind": "value",
+      "path": "num_input_processor_workers"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
       "path": "num_postprocess_workers"
     },
     {
