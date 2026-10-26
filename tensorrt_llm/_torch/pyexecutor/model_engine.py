@@ -21,7 +21,7 @@ from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._utils import mpi_disabled, release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
-from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
+from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           PrefillCudaGraphBackend,
                                           TorchCompileConfig, TorchLlmArgs)
@@ -50,7 +50,7 @@ from ..tensor_lru_cache import TensorLRUCache
 from ..utils import set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
-from .engine.cuda_graph import filter_cuda_graph_batch_sizes
+from .engine.cuda_graph import plan_cuda_graphs
 from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
@@ -122,54 +122,6 @@ class ModelEngine(ABC):
 # refit moves no tensor, so the captures stay valid and PWCG stays hot across a
 # refit (976 graphs measured still live) instead of going cold.
 
-
-def _filter_piecewise_capture_num_tokens(
-    candidate_num_tokens: list[int],
-    max_num_tokens: int,
-    max_batch_size: int,
-    max_seq_len: int,
-) -> Tuple[list[int], list[int]]:
-    """Cap piecewise CUDA graph capture candidates at the engine's reachable
-    `num_tokens` ceiling `max_batch_size * (max_seq_len - 1)`
-    clamping user-requested sizes above it down to the ceiling.
-
-    Each in-flight request must leave room for at least one decode token,
-    so the ceiling is the largest forward-pass `num_tokens` the warmup
-    builder can construct. Candidates above the ceiling cannot be
-    recorded; clamping them down to the ceiling preserves the user's
-    intent (a requested 128 becomes 127 when only 127 is recordable)
-    without inventing capture sizes the user never asked
-    for. Appending sizes beyond the user's list is harmful: runtime
-    padding rounds iterations up to the nearest captured size, so a far
-    appended ceiling (e.g. 65536 over a list topping at 13914) would
-    make every iteration in the gap execute the full ceiling shape.
-
-    Returns `(kept, unrecordable)` where `kept` is sorted ascending and
-    deduped, with above-ceiling candidates clamped to the ceiling.
-    `unrecordable` is the sorted unique set of input entries above the
-    ceiling but within `max_num_tokens` (the clamped ones, reported so
-    the caller's warning fires).
-    """
-    max_capturable_num_tokens = max(0, max_batch_size * (max_seq_len - 1))
-    piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
-    if piecewise_capacity_limit > 0:
-        kept = sorted({
-            min(i, piecewise_capacity_limit)
-            for i in candidate_num_tokens if 0 < i <= max_num_tokens
-        })
-    else:
-        kept = []
-    unrecordable = sorted({
-        i
-        for i in candidate_num_tokens
-        if max_capturable_num_tokens < i <= max_num_tokens
-    })
-    return kept, unrecordable
-
-
-# BCG uses the same capture-bucket filtering semantics as PCG.
-_filter_prefill_capture_num_tokens = _filter_piecewise_capture_num_tokens
-
 _DEEP_GEMM_PDL_CONFIGURED = False
 
 
@@ -218,6 +170,7 @@ class PyTorchModelEngine(ModelEngine):
             model_weights_restore_mode=model_weights_restore_mode,
         )
         self._init_from_model(llm_args=llm_args, mapping=mapping)
+        self._size_cuda_graphs()
         backend_num_streams = self._compile_model(
             configured_encoder_max_num_tokens)
         self._init_execution_services(spec_config=spec_config,
@@ -466,12 +419,8 @@ class PyTorchModelEngine(ModelEngine):
         self._torch_compile_backend = None
         self._init_model_capacity()
 
-    def _compile_model(
-        self, configured_encoder_max_num_tokens: Optional[int]
-    ) -> Optional[Backend.Streams]:
-        """Size the CUDA graphs from the clamped capacity, compile the model and
-        capture the local multimodal encoders' CUDA graphs; returns the compile
-        backend's auxiliary streams."""
+    def _size_cuda_graphs(self) -> None:
+        """Size the decode and prefill CUDA graphs from the clamped capacity."""
         self.cuda_graph_config = self.llm_args.cuda_graph_config
 
         if (isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
@@ -484,22 +433,25 @@ class PyTorchModelEngine(ModelEngine):
                 "disabled.")
             self.cuda_graph_config = None
 
-        cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
-            'batch_sizes'].default
-        cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
-            'enable_padding'].default
+        plan = plan_cuda_graphs(
+            self.cuda_graph_config,
+            self.llm_args.prefill_capture_num_tokens,
+            max_batch_size=self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_seq_len=self.max_seq_len,
+            decode_tokens_per_request=1 + self.original_max_total_draft_tokens,
+        )
+        self._cuda_graph_padding_enabled = plan.padding_enabled
+        self._cuda_graph_batch_sizes = plan.batch_sizes
+        self.max_cuda_graph_batch_size = plan.max_batch_size
+        self._prefill_cuda_graph_num_tokens = plan.prefill_num_tokens
 
-        self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
-
-        decode_tokens_per_request = 1 + self.original_max_total_draft_tokens
-        self._cuda_graph_batch_sizes = filter_cuda_graph_batch_sizes(
-            cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
-            decode_tokens_per_request,
-            self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
-
-        self.max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
-                                          self._cuda_graph_batch_sizes else 0)
-
+    def _compile_model(
+        self, configured_encoder_max_num_tokens: Optional[int]
+    ) -> Optional[Backend.Streams]:
+        """Compile the model, or install the eager NCCL window tensor scopes, and
+        capture the local multimodal encoders' CUDA graphs; returns the compile
+        backend's auxiliary streams."""
         torch_compile_config = self.llm_args.torch_compile_config
         prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
         torch_compile_enabled = bool(torch_compile_config is not None)
@@ -519,26 +471,6 @@ class PyTorchModelEngine(ModelEngine):
             'max_num_streams'].default
 
         self._torch_compile_prefill_only = False
-
-        prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
-        if prefill_cuda_graph_num_tokens is None:
-            prefill_cuda_graph_num_tokens = cuda_graph_batch_sizes or []
-
-        self._prefill_cuda_graph_num_tokens, unrecordable = (
-            _filter_prefill_capture_num_tokens(
-                prefill_cuda_graph_num_tokens,
-                max_num_tokens=self.max_num_tokens,
-                max_batch_size=self.batch_size,
-                max_seq_len=self.max_seq_len,
-            ))
-        if unrecordable:
-            logger.warning(
-                f"Skipping prefill CUDA graph capture for num_tokens="
-                f"{unrecordable}: exceeds reachable ceiling "
-                f"max_batch_size*(max_seq_len-1)="
-                f"{max(0, self.batch_size * (self.max_seq_len - 1))}. "
-                f"Clamping them to the ceiling; raise max_seq_len for larger graphs."
-            )
 
         backend_num_streams = None
         try:
