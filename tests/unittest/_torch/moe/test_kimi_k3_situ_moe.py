@@ -638,8 +638,9 @@ def test_kimi_k3_allow_list_matches_what_the_backends_declare():
 
     ``any`` rather than ``all`` over a family: resolution walks family members
     in ``IMPL_PRIORITY`` order, so a family serves SiTU when one member does.
-    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` does not
-    declare it, ``CuteDslFusedMoE`` does.
+    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` and the BF16
+    grouped-GEMM leaf do not declare it, ``TrtllmCutedslGroupedGemmNvfp4Impl``
+    does.
     """
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import BACKEND_FAMILY
     from tensorrt_llm._torch.utils import ActivationType
