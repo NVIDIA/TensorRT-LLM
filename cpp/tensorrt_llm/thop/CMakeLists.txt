@@ -91,7 +91,6 @@ target_sources(
           chainSpeculativeSamplingOp.cpp
           minimaxM3/minimaxM3AttnC1Op.cpp
           minimaxM3/minimaxM3AttnMegaOp.cpp
-          minimaxM3/minimaxM3CuteSparseDecodeOp.cpp
           minimaxM3/minimaxM3DraftStepOp.cpp
           minimaxM3/minimaxM3FusedDecodeAttnOp.cpp
           minimaxM3/minimaxM3McAllreduceNormOp.cpp
