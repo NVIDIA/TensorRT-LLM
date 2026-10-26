@@ -437,6 +437,63 @@ def get_model_yaml_config(model_label: str,
                 'num_postprocess_workers': 4,
             }
         },
+        # GLM-5.3 B200 TP8/EP8 deployment recipe, without MTP.
+        {
+            'patterns': ['glm_5.3_fp8-serve-pytorch'],
+            'config': {
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 16384,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 128,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.75,
+                },
+                'moe_config': {
+                    'backend': 'DEEPGEMM',
+                },
+                'stream_interval': 10,
+            }
+        },
+        # GLM-5.3-Flash B200 TP4/EP4: FP8 weights and BF16 KV cache.
+        {
+            'patterns': [
+                'glm_5.3_flash_fp8-serve-pytorch',
+                'glm_5.3_flash_fp8_mtp-serve-pytorch',
+            ],
+            'config': {
+                # Text-only perf does not need the image/video processor.
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 16384,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'auto',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
+        {
+            'patterns': ['glm_5.3_flash_fp8_mtp-serve-pytorch'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
         # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).

@@ -126,6 +126,7 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    "glm_5.3_flash_fp8_mtp",
     "deepseek_v4_pro_base_fp8",
     *QWEN38_MTP_MODELS,
     "qwen3_4b_eagle3",
