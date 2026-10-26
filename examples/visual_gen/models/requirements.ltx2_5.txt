@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+# Install after TensorRT-LLM in a dedicated LTX-2.5 environment.
+transformers==5.14.1
+opencv-python-headless

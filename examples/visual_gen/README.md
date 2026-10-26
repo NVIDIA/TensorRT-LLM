@@ -70,3 +70,8 @@ The Python API uses existing `MediaRef` slots with role `reference`,
 The BF16 Ref2VA example uses eager execution and TRTLLM normalization and SwiGLU kernels.
 Ref2VA references condition content rather than anchoring the first/last frame;
 the default output canvas is 768×1344 regardless of reference dimensions.
+
+### LTX-2.5 IC-LoRA
+
+See the [BF16 two-stage editing guide](models/README.ltx2_5.md) for the split
+checkpoint recipe, public API example, supported subset and validation gates.
