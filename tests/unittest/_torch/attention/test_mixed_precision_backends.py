@@ -753,7 +753,10 @@ def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 
     target = KvCacheConfig(
-        dtype=f"mixed_nvfp4_{high}", mixed_precision_first_n=16, mixed_precision_last_n=64, pool_ratio=[0.9, 0.1]
+        dtype=f"mixed_nvfp4_{high}",
+        mixed_precision_first_n=16,
+        mixed_precision_last_n=64,
+        pool_ratio=[0.9, 0.1],
     )
     draft = KvCacheCreator._get_one_model_draft_kv_cache_config(
         SimpleNamespace(), target, 1024, estimating_kv_cache=True
