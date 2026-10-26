@@ -131,12 +131,6 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
-from .kv_tier_staging import (
-    OffloadHeadroom,
-    gpu_backed_reuse_tokens,
-    has_lower_tier,
-    prefetch_reuse_to_gpu,
-)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1298,9 +1292,6 @@ class KVCacheManagerV2(BaseResourceManager):
     _block_offset_host: Optional[np.ndarray] = None
     block_offset_copies: int = 0
     block_offset_skips: int = 0
-    # Opt-in (enable_offload_headroom): GPU slots evicted one step ahead of use. On the class so it exists without
-    # running __init__.
-    _offload_headroom: Optional[OffloadHeadroom] = None
 
     def __init__(
         self,
@@ -6061,7 +6052,6 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
-        self.release_offload_headroom()
         if self._sharing is not None:
             self._sharing._on_shutdown()
         if self.sparse_metadata_batch is not None:
@@ -6852,80 +6842,6 @@ class KVCacheManagerV2(BaseResourceManager):
             finally:
                 kv_cache.close()
         return success
-
-    def has_lower_cache_tier(self) -> bool:
-        """Whether GPU eviction moves pages to a lower tier (and a reused prefix can need onboarding)."""
-        return has_lower_tier(self.impl)
-
-    def enable_offload_headroom(self, num_tokens: int) -> bool:
-        """Keep ``num_tokens`` worth of GPU slots evicted one step ahead (see ``OffloadHeadroom``).
-
-        Only meaningful with a lower tier: without one, eviction drops reusable blocks and costs no copy.
-        Returns whether the headroom is armed.
-        """
-        if num_tokens <= 0 or self.is_estimating_kv_cache or not self.has_lower_cache_tier():
-            return False
-        if self._offload_headroom is None:
-            self._offload_headroom = OffloadHeadroom(
-                self.impl, num_tokens, device=self._stream.device
-            )
-        return True
-
-    def reserve_offload_headroom(self) -> bool:
-        """Evict for the headroom now; call after a forward is launched. False when disarmed or unbackable."""
-        headroom = self._offload_headroom
-        return headroom is not None and headroom.reserve()
-
-    def release_offload_headroom(self) -> None:
-        """Hand the headroom's slots to the free list; call before scheduling and before pool adjustment."""
-        if self._offload_headroom is not None:
-            self._offload_headroom.release()
-
-    def prefetch_context_to_gpu(
-        self, requests: Iterable[LlmRequest], measure: bool = False
-    ) -> Dict[int, int]:
-        """Onboard the reusable prefix of context requests that are not admitted yet.
-
-        For each first-chunk request without a cache in this pool, the blocks its
-        admission will match are copied up to the GPU now, on the core's streams,
-        instead of when the scheduler resumes its cache. Best effort: a request
-        whose pages do not fit is skipped and onboards at admission as before.
-
-        Returns, per staged request id, how many reused tokens the GPU newly backs
-        (counted with a second radix-tree probe when ``measure``; else 0).
-        """
-        if not self.enable_block_reuse or self.is_estimating_kv_cache:
-            return {}
-        if not self.has_lower_cache_tier():
-            return {}
-        staged = {}
-        for req in requests:
-            if req.py_request_id in self.kv_cache_map or req.is_dummy:
-                continue
-            # The claim cap prepare_context applies: it decides which window
-            # pages of sliding-window groups the admission locks.
-            limit = None
-            if self._spec_recompute_tail:
-                limit = _spec_recompute_claim_limit(
-                    req,
-                    tail=self._spec_recompute_tail,
-                    tokens_per_block=self.tokens_per_block,
-                    is_draft=self.is_draft,
-                )
-            tokens = self._context_reuse_tokens(req, limit)
-            # Length test: on the C++ backend this is an int32 array view.
-            if len(tokens) < self.tokens_per_block:
-                continue
-            scope = ReuseScope(
-                lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)
-            )
-            backed = prefetch_reuse_to_gpu(self.impl, scope, tokens)
-            if backed is None:
-                continue
-            staged[req.py_request_id] = (
-                gpu_backed_reuse_tokens(self.impl, scope, tokens) - backed if measure else 0
-            )
-        return staged
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
