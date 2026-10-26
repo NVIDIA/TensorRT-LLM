@@ -14,7 +14,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.llmapi import KvCacheConfig, RequestOutput
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
-from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
+from tensorrt_llm.sampling_params import BatchedLogitsProcessor, LogitsProcessor, SamplingParams
 
 from .model_paths import default_model_name, get_model_path, llama_model_path
 
@@ -143,6 +143,51 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
         backend=backend,
         **llm_kwargs,
     )
+
+
+class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
+    def __init__(self, biased_word_id):
+        self.biased_word_id = biased_word_id
+
+    def __call__(
+        self,
+        req_ids: List[int],
+        logits: List[torch.Tensor],
+        ids: List[List[List[int]]],
+        stream_ptr: int,
+        client_ids: List[Optional[int]],
+    ):
+        assert len(req_ids) == len(logits) == len(ids) == len(client_ids)
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            for rows in logits:
+                rows[:] = float("-inf")
+                rows[..., self.biased_word_id] = 0
+
+
+def tinyllama_batched_logits_processor_test_harness(backend=None, **llm_kwargs):
+    tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    max_tokens = 6
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
+    with assert_resource_freed(
+        LLM,
+        llama_model_path,
+        batched_logits_processor=MyBatchedLogitsProcessor(biased_word_id),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        backend=backend,
+        **llm_kwargs,
+    ) as llm:
+        # Only the request that opts in is handed to the batched processor.
+        outputs = llm.generate(
+            ["A B C", "A B C"],
+            [
+                SamplingParams(max_tokens=max_tokens, apply_batched_logits_processor=True),
+                SamplingParams(max_tokens=max_tokens),
+            ],
+        )
+        assert outputs[0].outputs[0].text == expected_output
+        assert outputs[1].outputs[0].text != expected_output
 
 
 def _test_llm_generate_async(model_name=default_model_name, tp_size: int = 1, tokenizer=None):

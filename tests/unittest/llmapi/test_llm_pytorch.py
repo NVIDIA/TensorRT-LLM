@@ -32,6 +32,7 @@ from tensorrt_llm.sampling_params import EmbeddingBias, SamplingParams
 from .llm_test_utils import (global_kvcache_config, llm_test_harness, prompts,
                              run_llm_abort_request,
                              sampling_params_for_aborting_request,
+                             tinyllama_batched_logits_processor_test_harness,
                              tinyllama_logits_processor_test_harness)
 from .model_paths import llama_model_path
 
@@ -41,6 +42,11 @@ from .model_paths import llama_model_path
 def test_tinyllama_logits_processor(enable_chunked_prefill):
     tinyllama_logits_processor_test_harness(
         backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
+
+
+@force_ampere
+def test_tinyllama_batched_logits_processor():
+    tinyllama_batched_logits_processor_test_harness(backend="pytorch")
 
 
 @force_ampere
