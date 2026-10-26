@@ -1084,6 +1084,16 @@ def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch, device_pa
         manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
         assert manager._use_per_layer_page_tables is False
         assert manager.uses_device_page_table is (device_page_table == "1")
+        if device_page_table == "0":
+            assert all(
+                tensor.is_pinned()
+                for tensor in (
+                    manager.host_kv_cache_block_offsets,
+                    manager.index_scales,
+                    manager.kv_offset,
+                    manager.index_mapper.get_copy_index([0, 1], 0, 1),
+                )
+            )
         page_spec = manager.get_fp4_mla_page_table_spec(0)
         assert page_spec.cache_page_index_scale == 1
         dst = torch.full(

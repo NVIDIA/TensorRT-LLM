@@ -802,7 +802,6 @@ def test_manager_keeps_the_native_path_on_gpu_addressable_hosts(monkeypatch):
             manager.add_dummy_requests(
                 request_ids=request_ids,
                 token_nums=[_TOKENS_PER_REQUEST],
-                prepare_resource=True,
             )
             is not None
         )
@@ -856,7 +855,6 @@ def test_forced_device_page_table_matches_the_native_kernel(monkeypatch):
             manager.add_dummy_requests(
                 request_ids=request_ids,
                 token_nums=[_TOKENS_PER_REQUEST] * _MANAGER_BATCH,
-                prepare_resource=True,
             )
             is not None
         )
@@ -957,7 +955,6 @@ def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heteroge
                 manager.add_dummy_requests(
                     request_ids=request_ids,
                     token_nums=[_TOKENS_PER_REQUEST] * num_seqs,
-                    prepare_resource=True,
                 )
                 is not None
             )
