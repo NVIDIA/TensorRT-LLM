@@ -1695,6 +1695,7 @@ class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
             },
             # Acceptance length is read back off this worker's /metrics.
             "enable_iter_perf_stats": True,
+            "max_stats_len": -1,
             "iter_stats_max_iterations": -1,
         }
         disaggregated_server_config = {
