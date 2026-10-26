@@ -66,44 +66,6 @@ def _write_rows_kernel(
 
 
 @triton.jit
-def _write_compressed_rows_kernel(
-    rows_ptr,
-    cu_ptr,
-    num_comp_ptr,
-    start_pos_ptr,
-    mask_ptr,
-    batch_size,
-    table_ptr,
-    table_stride,
-    table_rows,
-    table_width,
-    pool_ptr,
-    pool_pages,
-    rows_per_page,
-    scale_ptr,
-    APPLY_SCALE: tl.constexpr,
-    ROW: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    # Find the row's request from the cumulative counts, then its compressed position.
-    token = tl.program_id(0)
-    req = 0
-    for b in range(1, batch_size):
-        if token >= tl.load(cu_ptr + b):
-            req = b
-    local = token - tl.load(cu_ptr + req)
-    valid = (tl.load(mask_ptr + token) != 0) & (local < tl.load(num_comp_ptr + req))
-    valid = valid & (req < table_rows)
-    pos = tl.load(start_pos_ptr + req) + local
-    column = pos // rows_per_page
-    valid = valid & (pos >= 0) & (column < table_width)
-    page = tl.load(table_ptr + req * table_stride + column, mask=valid, other=-1)
-    if (page >= 0) & (page < pool_pages):
-        slot = page.to(tl.int64) * rows_per_page + pos % rows_per_page
-        _copy_row(rows_ptr, token, pool_ptr, slot, scale_ptr, APPLY_SCALE, ROW, BLOCK)
-
-
-@triton.jit
 def _overlay_rows_kernel(
     topk_ptr,
     topk_stride,
@@ -258,71 +220,37 @@ def write_generation_rows(
     )
 
 
-def retained_row_buffer(metadata, like: torch.Tensor) -> torch.Tensor:
-    """Persistent ``[max tokens, row]`` buffer for the DeepSeek-V4 compressors (one per metadata).
-
-    Allocated before CUDA graph capture: a per-call buffer on the compressor's side stream
-    could be recycled while the compressor is still writing it.
-    """
-    buf = getattr(metadata, "_retained_rows", None)
-    rows = max(int(metadata.max_num_tokens), like.shape[0])
-    if (
-        buf is None
-        or buf.shape[0] < rows
-        or buf.shape[1:] != like.shape[1:]
-        or buf.dtype != like.dtype
-    ):
-        assert not torch.cuda.is_current_stream_capturing(), (
-            "the retained-row buffer must be allocated before CUDA graph capture"
-        )
-        buf = torch.empty((rows, *like.shape[1:]), dtype=like.dtype, device=like.device)
-        metadata._retained_rows = buf
-    return buf[: like.shape[0]]
-
-
-def write_compressed_rows(
+def retained_compress_target(
     compressor,
     metadata,
-    rows: torch.Tensor,
     num_comp_tokens: torch.Tensor,
     cu_new_comp_kv: torch.Tensor,
     start_pos: torch.Tensor,
     compressed_mask: torch.Tensor,
     batch_size: int,
-) -> None:
-    """DeepSeek-V4 compressor: store this step's new compressed rows in the retained twin.
+    total_rows: int,
+):
+    """Twin pool, page table, row mask and rows per page for a second native compressor scatter.
 
-    Row ``i`` belongs to the request whose ``cu_new_comp_kv`` span holds it, at compressed
-    position ``start_pos[request] + offset``; the native FP8 rows carry no per-tensor scale.
+    The native scatter addresses pages straight from the table it is given, so the mask also
+    drops the rows whose page the twin does not hold (-1 in the table). Returns None without a twin.
     """
     pool = _retained_pool(metadata, compressor)
-    if pool is None:
-        return
-    total = rows.shape[0]
-    if total == 0 or batch_size == 0:
-        return
-    width = pool.shape[-1]
-    assert rows.shape[1] == width and rows.is_contiguous(), (rows.shape, width)
+    if pool is None or total_rows == 0 or batch_size == 0:
+        return None
     table = _retained_table(metadata, compressor)
-    _write_compressed_rows_kernel[(total,)](
-        rows,
-        cu_new_comp_kv,
-        num_comp_tokens,
-        start_pos,
-        compressed_mask.view(torch.uint8),
-        batch_size,
-        table,
-        table.stride(0),
-        table.shape[0],
-        table.shape[1],
-        pool,
-        pool.shape[0],
-        pool.shape[1],
-        pool,
-        APPLY_SCALE=False,
-        ROW=width,
-        BLOCK=_block(width),
+    rows_per_page = pool.shape[1]
+    row = torch.arange(total_rows, device=pool.device, dtype=torch.int32)
+    req = torch.searchsorted(cu_new_comp_kv[1 : batch_size + 1], row, right=True)
+    req = req.clamp_(max=batch_size - 1)
+    local = row - cu_new_comp_kv[req]
+    pos = start_pos[req] + local
+    column = torch.div(pos, rows_per_page, rounding_mode="floor").clamp_(
+        min=0, max=table.shape[1] - 1
     )
+    page = table[req.clamp(max=table.shape[0] - 1), column]
+    mask = compressed_mask & (local < num_comp_tokens[req]) & (pos >= 0) & (page >= 0)
+    return pool, table, mask, rows_per_page
 
 
 def overlay_rows(

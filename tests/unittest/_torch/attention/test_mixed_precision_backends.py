@@ -768,11 +768,60 @@ def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
 
 
 @pytest.mark.cpu_only
+def test_retained_compress_target_masks_rows_outside_the_twin():
+    """DeepSeek-V4: the second native scatter only writes rows whose page the twin holds."""
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_overlay import (
+        retained_compress_target,
+    )
+
+    rows_per_page, ratio = 4, 4
+    # Two requests: 6 and 3 new compressed rows, starting at compressed positions 2 and 9.
+    cu = torch.tensor([0, 6, 9], dtype=torch.int32)
+    num_comp = torch.tensor([5, 3], dtype=torch.int32)  # request 0 has one padding row
+    start_pos = torch.tensor([2, 9], dtype=torch.int32)
+    compressed_mask = torch.ones(9, dtype=torch.bool)
+    compressed_mask[7] = False
+    # Twin page table: request 0 holds pages 0 and 1, request 1 holds page 2 only.
+    table = torch.tensor([[10, 11, -1, -1], [-1, -1, 12, -1]], dtype=torch.int32)
+    pool = torch.zeros(16, 1, rows_per_page, 1, 8, dtype=torch.float8_e4m3fn)
+    manager = SimpleNamespace(
+        high_layers={0: 1},
+        layer_offsets={3: 0},
+        _get_mixed_precision_buffers=lambda local, layout, kind: pool,
+    )
+    metadata = SimpleNamespace(kv_cache_manager=manager, mixed_high_block_table={ratio: table})
+    compressor = SimpleNamespace(layer_idx=3, compress_ratio=ratio)
+    out = retained_compress_target(
+        compressor, metadata, num_comp, cu, start_pos, compressed_mask, 2, 9
+    )
+    assert out is not None
+    twin, twin_table, mask, rpp = out
+    assert twin.shape == (16, rows_per_page, 8) and twin_table is table and rpp == rows_per_page
+    expected = []
+    for row in range(9):
+        req = 0 if row < 6 else 1
+        local = row - int(cu[req])
+        pos = int(start_pos[req]) + local
+        page = (
+            int(table[req, pos // rows_per_page]) if pos // rows_per_page < table.shape[1] else -1
+        )
+        expected.append(bool(compressed_mask[row]) and local < int(num_comp[req]) and page >= 0)
+    assert mask.tolist() == expected
+    # request 0: rows at positions 2..6 -> pages 0,0,1,1,1 all held; row 5 is padding.
+    # request 1: positions 9,10(masked),11 -> page 2 held.
+    assert expected == [True, True, True, True, True, False, True, False, True]
+    assert metadata.mixed_high_block_table[ratio] is table
+
+
+@pytest.mark.cpu_only
 def test_mixed_precision_retained_dtype_must_match_model_dtype():
     from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 
     model_config = SimpleNamespace(
-        quant_config=QuantConfig(), quant_config_dict=None, torch_dtype=torch.bfloat16
+        quant_config=QuantConfig(),
+        quant_config_dict=None,
+        torch_dtype=torch.bfloat16,
+        sparse_attention_config=None,
     )
     with pytest.raises(ValueError, match="model dtype"):
         validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_float16")
