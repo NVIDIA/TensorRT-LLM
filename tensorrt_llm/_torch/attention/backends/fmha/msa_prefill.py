@@ -54,6 +54,10 @@ _DENSE_FA4_PAGE_SIZE = 128
 # turns the tile's output NaN. Zeroing those rows first leaves every finite result bitwise unchanged. Kill switch:
 # TRTLLM_MSA_DENSE_FA4_V_TAIL_ZERO=0.
 _DENSE_FA4_V_TAIL_ZERO = os.environ.get("TRTLLM_MSA_DENSE_FA4_V_TAIL_ZERO", "1") != "0"
+# The same zeroing before the FP8 / BF16 fmha_sm100 prefill (dense layers on SM100 / SM103, and SM107 without FA4):
+# it also masks only the scores, so a NaN byte past kv_len on a recycled partial last page turns its P @ V NaN.
+# Kill switch: TRTLLM_MSA_PREFILL_V_TAIL_ZERO=0.
+_FMHA_SM100_V_TAIL_ZERO = os.environ.get("TRTLLM_MSA_PREFILL_V_TAIL_ZERO", "1") != "0"
 # What the patched flash_fwd_sm100 holds for the FP8 rescale threshold.
 _DENSE_FA4_PATCH_MARKER = "0.0 if const_expr(self.q_dtype.width == 8) else"
 # SM107: the FP8-KV prefill's E4M3 query is cast from the strided query rows of the fused QKV output by one Triton pass
@@ -806,6 +810,22 @@ def run_msa_prefill_gqa(
         )
     ):
         return
+
+    kv_rows = rows_of(metadata.msa_kv_lens_cpu)
+    if _FMHA_SM100_V_TAIL_ZERO and kv_rows is not None:
+        if _v_tail_zero_safe(metadata.kv_cache_manager):
+            page_table = metadata.msa_block_table[row_first : row_first + num_rows]
+            _zero_partial_page_v_tail(v_paged, page_table, kv_rows)
+            logger.info_once(
+                "MiniMax-M3 prefill: fmha_sm100 V tail past kv_len zeroed on partial pages",
+                key="minimax_m3_prefill_fmha_sm100_v_tail",
+            )
+        else:
+            logger.warning_once(
+                "MiniMax-M3 prefill: this KV cache can share a partially reused page without copying it, so the "
+                "fmha_sm100 V tail past kv_len is not zeroed; a NaN left there by an earlier request reaches P @ V",
+                key="minimax_m3_prefill_fmha_sm100_v_tail_unsafe",
+            )
 
     run_msa_sparse_gqa(
         q_view,
