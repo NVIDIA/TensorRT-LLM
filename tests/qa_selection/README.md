@@ -15,11 +15,11 @@ Functional tests only; perf runs are selected by their own configuration.
 
 ```bash
 cd tests/integration/defs
-pytest --collect-only -q --test-list=<list> --machine=B200 --selection-out-dir=out/
+pytest --collect-only -q -p qa_selection.plugin --test-list=<list> --machine=B200 --selection-out-dir=out/
 ```
 
-The integration suite's `pytest.ini` loads the plugin (`-p qa_selection.plugin`), and without
-`--machine` it changes nothing.
+The plugin runs only when loaded with `-p qa_selection.plugin`. L0 CI never loads it; the QA
+Jenkins pipelines pass it themselves.
 
 The ladder chooses the question:
 
@@ -32,8 +32,8 @@ The ladder chooses the question:
 Without `--ladder`, the machine's profile answers: its `ladder` (`1,4,8` for B200), or one rung of
 its GPUs per node when it has none. Without `--selection-out-dir` nothing is written.
 
-`pytest --help` in `tests/integration/defs` documents the three options. Elsewhere, load it with
-`-p qa_selection.plugin` and `PYTHONPATH=tests`.
+`pytest -p qa_selection.plugin --help` in `tests/integration/defs` documents the three options.
+Elsewhere, also set `PYTHONPATH=tests`.
 
 ## Layout
 
@@ -78,7 +78,7 @@ counts the test-list and waive filtering.
 ## Acceptance tests
 
 ```bash
-pytest tests/qa_selection/tests      # 55 tests, no GPU, no container, no wheel
+pytest tests/qa_selection/tests      # 56 tests, no GPU, no container, no wheel
 ```
 
 Each test states a command line and the answer expected back, derived from the production
@@ -86,6 +86,7 @@ decorators.
 
 | | principle | criteria |
 |---|---|---|
+| **Loading** | Only `-p qa_selection.plugin` loads the plugin; the integration `pytest.ini` does not | [`test_integration_ini.py`](tests/test_integration_ini.py) (1) |
 | **Before collection** | A machine and a ladder are the whole command, and without a machine the plugin changes nothing | AC-4 [`test_options.py`](tests/test_options.py) (5), AC-6 [`test_inert.py`](tests/test_inert.py) (2) |
 | **During collection** | The target decides, never the collecting host: its architecture, wherever the mark sits, and its largest rung as the GPU count; a test above that rung is deselected with one reason | AC-1 [`test_arch.py`](tests/test_arch.py) (7), AC-2 [`test_gpu_count.py`](tests/test_gpu_count.py) (7), AC-5 [`test_largest_rung.py`](tests/test_largest_rung.py) (4) |
 | **After collection** | Each kept test is in exactly one list, its smallest rung's, and the terminal explains the run | AC-3 [`test_ladder.py`](tests/test_ladder.py) (6), AC-7 [`test_summary.py`](tests/test_summary.py) (5) |
