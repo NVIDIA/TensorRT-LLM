@@ -1197,10 +1197,13 @@ class KvCacheCreator:
                              pretrained_config.num_hidden_layers)
         return [False] * target_num_layers + [True] * num_draft_layers
 
-    def _get_kv_size_per_token(self,
-                               kv_cache_config: Optional[KvCacheConfig] = None
-                               ) -> CacheCost:
-        """Aggregate KV cost across target + (optional) draft as a CacheCost.
+    def _get_kv_size_per_token(
+        self,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        *,
+        include_cross: bool = True,
+    ) -> CacheCost:
+        """Aggregate target, draft, and optional cross KV costs as a CacheCost.
 
         ``max_batch_size`` and ``kv_cache_config`` are passed unconditionally;
         managers that don't need them ignore via ``**kwargs``.
@@ -1215,7 +1218,7 @@ class KvCacheCreator:
             model_config,
             kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
-        if self._is_encoder_decoder():
+        if include_cross and self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
         draft_cost = self._get_draft_cache_cost(
             kv_cache_config,
@@ -2885,9 +2888,10 @@ class KvCacheCreator:
         both estimation and final construction, split the same memory-derived
         budget sources used by the legacy TRT path: the free-memory fraction,
         any explicit ``max_gpu_total_bytes`` override, and any explicit host
-        cache budget. ``max_tokens`` is a logical cap, not a memory split knob,
-        so it is intentionally left unchanged. The creator's base config is not
-        mutated.
+        cache budget. V1 derives each pool's token capacity from its own byte
+        budget and cache cost, capped by any user-provided ``max_tokens``.
+        V2 consumes byte budgets directly and retains the user token cap.
+        The creator's base config is not mutated.
         """
         base_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                 else self._kv_cache_config)
@@ -2924,6 +2928,24 @@ class KvCacheCreator:
                 f"cross={cross_budget / GB:.2f} GiB ({fraction:.0%})")
             self_kv_cache_config.max_gpu_total_bytes = self_budget
             cross_kv_cache_config.max_gpu_total_bytes = cross_budget
+            if not self._is_kv_cache_manager_v2:
+                self_cost = self._get_kv_size_per_token(self_kv_cache_config,
+                                                        include_cross=False)
+                cross_cost = CacheCost.from_raw(
+                    self._get_cross_kv_size_per_token())
+                for pool_config, cost in (
+                    (self_kv_cache_config, self_cost),
+                    (cross_kv_cache_config, cross_cost),
+                ):
+                    max_tokens = cost.tokens_for_budget(
+                        pool_config.max_gpu_total_bytes)
+                    if self._max_kv_tokens_in is not None:
+                        max_tokens = min(max_tokens, self._max_kv_tokens_in)
+                    pool_config.max_tokens = max_tokens
+                    # The byte budget already includes the free-memory
+                    # fraction. Do not apply it again after allocating the
+                    # other pool has reduced the available GPU memory.
+                    pool_config.free_gpu_memory_fraction = None
             split_any_budget = True
 
         host_cache_size = base_kv_cache_config.host_cache_size
@@ -2971,10 +2993,19 @@ class KvCacheCreator:
         (num_layers, num_kv_heads, head_dim,
          max_seq_len) = self._get_cross_kv_cache_layout(fallback_max_seq_len)
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        model_config = self._model_engine.model.model_config
+        cross_model_config = self._get_unquantized_kv_model_config(model_config)
+        if cross_model_config is not model_config and not estimating_kv_cache:
+            model_dtype = torch_dtype_to_str(self._model_engine.dtype)
+            kv_quant_algo = model_config.quant_config.kv_cache_quant_algo
+            logger.info_once(
+                f"Cross-attention KV cache uses model dtype {model_dtype} "
+                f"instead of {kv_quant_algo}; decoder self-attention KV cache "
+                "quantization is unchanged.",
+                key=f"cross_kv_cache_dtype_{model_dtype}_{kv_quant_algo}")
         return _create_kv_cache_manager(
             model_engine=self._model_engine,
-            model_config=self._get_unquantized_kv_model_config(
-                self._model_engine.model.model_config),
+            model_config=cross_model_config,
             kv_cache_manager_cls=self._kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=cross_kv_cache_config,

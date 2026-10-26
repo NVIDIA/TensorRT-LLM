@@ -43,6 +43,9 @@ allocated in the model dtype because cross-attention does not quantize K/V.
 This applies whether FP8 or NVFP4 is selected explicitly or inherited from the
 checkpoint with `dtype="auto"`; existing hardware-specific restrictions still
 apply to the self-attention cache.
+`cross_kv_cache_fraction` divides the memory budget between the two pools.
+Their token capacities reflect their respective dtypes and are each limited
+by an explicit `max_tokens`, when provided.
 ```
 
 Here is an example of how to set the FP8 KV Cache option:
