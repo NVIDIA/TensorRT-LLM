@@ -19,6 +19,28 @@ import triton.language as tl
 
 
 @triton.jit
+def _copy_row(
+    src_ptr,
+    src_row,
+    dst_ptr,
+    dst_row,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
+    ROW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < ROW
+    row = tl.load(src_ptr + src_row.to(tl.int64) * ROW + offs, mask=mask, other=0.0)
+    if APPLY_SCALE:
+        # Per-tensor FP8 KV scale (value -> stored), as the native append kernel applies it.
+        row = row.to(tl.float32) * tl.load(scale_ptr)
+    tl.store(
+        dst_ptr + dst_row.to(tl.int64) * ROW + offs, row.to(dst_ptr.dtype.element_ty), mask=mask
+    )
+
+
+@triton.jit
 def _write_rows_kernel(
     rows_ptr,
     req_ptr,
@@ -30,6 +52,8 @@ def _write_rows_kernel(
     pool_ptr,
     pool_pages,
     rows_per_page,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
     ROW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -41,11 +65,47 @@ def _write_rows_kernel(
     valid = (pos >= 0) & (column < table_width) & (req >= 0) & (req < table_rows)
     page = tl.load(table_ptr + req * table_stride + column, mask=valid, other=-1)
     if (page >= 0) & (page < pool_pages):
-        offs = tl.arange(0, BLOCK)
-        mask = offs < ROW
-        row = tl.load(rows_ptr + token.to(tl.int64) * ROW + offs, mask=mask, other=0.0)
         slot = page.to(tl.int64) * rows_per_page + pos % rows_per_page
-        tl.store(pool_ptr + slot * ROW + offs, row.to(pool_ptr.dtype.element_ty), mask=mask)
+        _copy_row(rows_ptr, token, pool_ptr, slot, scale_ptr, APPLY_SCALE, ROW, BLOCK)
+
+
+@triton.jit
+def _write_compressed_rows_kernel(
+    rows_ptr,
+    cu_ptr,
+    num_comp_ptr,
+    start_pos_ptr,
+    mask_ptr,
+    batch_size,
+    table_ptr,
+    table_stride,
+    table_rows,
+    table_width,
+    pool_ptr,
+    pool_pages,
+    rows_per_page,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
+    ROW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program per compressed row of this step: find its request by the
+    # cumulative row counts, then store it at start_pos[request] + offset.
+    token = tl.program_id(0)
+    req = 0
+    for b in range(1, batch_size):
+        if token >= tl.load(cu_ptr + b):
+            req = b
+    local = token - tl.load(cu_ptr + req)
+    valid = (tl.load(mask_ptr + token) != 0) & (local < tl.load(num_comp_ptr + req))
+    valid = valid & (req < table_rows)
+    pos = tl.load(start_pos_ptr + req) + local
+    column = pos // rows_per_page
+    valid = valid & (pos >= 0) & (column < table_width)
+    page = tl.load(table_ptr + req * table_stride + column, mask=valid, other=-1)
+    if (page >= 0) & (page < pool_pages):
+        slot = page.to(tl.int64) * rows_per_page + pos % rows_per_page
+        _copy_row(rows_ptr, token, pool_ptr, slot, scale_ptr, APPLY_SCALE, ROW, BLOCK)
 
 
 @triton.jit
@@ -65,6 +125,8 @@ def _overlay_rows_kernel(
     scratch_rows,
     rows_per_page,
     K,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
     ROW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -82,15 +144,8 @@ def _overlay_rows_kernel(
     if valid:
         page = tl.load(table_ptr + req * table_stride + column)
         if (page >= 0) & (page < pool_pages):
-            offs = tl.arange(0, BLOCK)
-            mask = offs < ROW
             slot = page.to(tl.int64) * rows_per_page + tok % rows_per_page
-            row = tl.load(pool_ptr + slot * ROW + offs, mask=mask, other=0.0)
-            tl.store(
-                scratch_ptr + compact.to(tl.int64) * ROW + offs,
-                row.to(scratch_ptr.dtype.element_ty),
-                mask=mask,
-            )
+            _copy_row(pool_ptr, slot, scratch_ptr, compact, scale_ptr, APPLY_SCALE, ROW, BLOCK)
 
 
 def _retained_table(metadata, owner) -> Optional[torch.Tensor]:
@@ -126,9 +181,18 @@ def _block(width: int) -> int:
 
 
 def write_rows(
-    metadata, owner, rows: torch.Tensor, req_idx: torch.Tensor, positions: torch.Tensor
+    metadata,
+    owner,
+    rows: torch.Tensor,
+    req_idx: torch.Tensor,
+    positions: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
 ) -> None:
-    """Store ``rows`` (one per token, RoPE already applied) in ``owner``'s retained pool."""
+    """Store ``rows`` (one per token, RoPE already applied) in ``owner``'s retained pool.
+
+    ``scale`` is the attention's per-tensor FP8 KV scale; an FP8 pool stores
+    ``row * scale`` like the native append kernel, a BF16/FP16 pool the row itself.
+    """
     pool = _retained_pool(metadata, owner)
     if pool is None:
         return
@@ -140,6 +204,7 @@ def write_rows(
     width = pool.shape[-1]
     assert rows.shape[1] == width, (rows.shape, width)
     table = _retained_table(metadata, owner)
+    apply_scale = scale is not None and pool.dtype == torch.float8_e4m3fn
     _write_rows_kernel[(rows.shape[0],)](
         rows,
         req_idx,
@@ -151,6 +216,8 @@ def write_rows(
         pool,
         pool.shape[0],
         pool.shape[1],
+        scale if apply_scale else pool,
+        APPLY_SCALE=apply_scale,
         ROW=width,
         BLOCK=_block(width),
     )
@@ -168,6 +235,7 @@ def write_context_rows(attention, metadata, latent_cache: torch.Tensor) -> None:
         latent_cache[:num_ctx],
         metadata.req_idx_per_token[:num_ctx],
         positions,
+        attention.kv_scale_orig_quant,
     )
 
 
@@ -205,7 +273,34 @@ def write_generation_rows(
         rotated.to(rows.dtype),
         metadata.req_idx_per_token[num_ctx : num_ctx + num_rows],
         positions,
+        attention.kv_scale_orig_quant,
     )
+
+
+def retained_row_buffer(metadata, like: torch.Tensor) -> torch.Tensor:
+    """Persistent ``[max tokens, row]`` buffer the DeepSeek-V4 compressors write their rows into.
+
+    One per metadata object, shared by all compressor layers: each layer's
+    retained-row write consumes it on the compressor stream before the next
+    layer's compressor runs. It is allocated before any CUDA graph capture; a
+    buffer allocated on the side stream during capture and dropped afterwards
+    can be handed to the next allocation on the main stream while the
+    compressor is still writing it.
+    """
+    buf = getattr(metadata, "_retained_rows", None)
+    rows = max(int(metadata.max_num_tokens), like.shape[0])
+    if (
+        buf is None
+        or buf.shape[0] < rows
+        or buf.shape[1:] != like.shape[1:]
+        or buf.dtype != like.dtype
+    ):
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "the retained-row buffer must be allocated before CUDA graph capture"
+        )
+        buf = torch.empty((rows, *like.shape[1:]), dtype=like.dtype, device=like.device)
+        metadata._retained_rows = buf
+    return buf[: like.shape[0]]
 
 
 def write_compressed_rows(
@@ -223,19 +318,37 @@ def write_compressed_rows(
     Row ``i`` belongs to the request whose ``cu_new_comp_kv`` span holds it and
     lands at compressed position ``start_pos[request] + offset``; rows past a
     request's ``num_comp_tokens`` or outside ``compressed_mask`` are padding.
+    The native FP8 compressed rows carry no per-tensor scale, so neither do these.
+    No temporaries: this runs on the compressor's side stream.
     """
-    if _retained_pool(metadata, compressor) is None:
+    pool = _retained_pool(metadata, compressor)
+    if pool is None:
         return
     total = rows.shape[0]
-    if total == 0:
+    if total == 0 or batch_size == 0:
         return
-    token_idx = torch.arange(total, dtype=torch.int32, device=rows.device)
-    cu = cu_new_comp_kv[: batch_size + 1].to(torch.int32)
-    batch_idx = torch.searchsorted(cu[1:], token_idx, right=True).clamp(max=batch_size - 1)
-    local_idx = token_idx - cu[batch_idx]
-    valid = compressed_mask[:total].to(torch.bool) & (local_idx < num_comp_tokens[batch_idx])
-    positions = torch.where(valid, start_pos[batch_idx] + local_idx, torch.full_like(local_idx, -1))
-    write_rows(metadata, compressor, rows, batch_idx.to(torch.int32), positions.to(torch.int32))
+    width = pool.shape[-1]
+    assert rows.shape[1] == width and rows.is_contiguous(), (rows.shape, width)
+    table = _retained_table(metadata, compressor)
+    _write_compressed_rows_kernel[(total,)](
+        rows,
+        cu_new_comp_kv,
+        num_comp_tokens,
+        start_pos,
+        compressed_mask.view(torch.uint8),
+        batch_size,
+        table,
+        table.stride(0),
+        table.shape[0],
+        table.shape[1],
+        pool,
+        pool.shape[0],
+        pool.shape[1],
+        pool,
+        APPLY_SCALE=False,
+        ROW=width,
+        BLOCK=_block(width),
+    )
 
 
 def overlay_rows(
@@ -251,6 +364,7 @@ def overlay_rows(
     ``topk_indices`` holds each query row's selected token positions inside its
     request (-1 = none), ``req_idx`` that row's request in batch order and
     ``compact_indices`` the scratch row the gather used for each pair (-1 = none).
+    A BF16/FP16 twin is quantized into the FP8 scratch with the attention's KV scale.
     """
     pool = _retained_pool(metadata, attention)
     if pool is None:
@@ -261,6 +375,7 @@ def overlay_rows(
     assert topk_indices.stride(1) == 1 and compact_indices.stride(1) == 1
     width = pool.shape[-1]
     table = _retained_table(metadata, attention)
+    apply_scale = pool.dtype != scratch.dtype
     _overlay_rows_kernel[(num_rows * k,)](
         topk_indices,
         topk_indices.stride(0),
@@ -277,6 +392,8 @@ def overlay_rows(
         scratch.numel() // width,
         pool.shape[1],
         k,
+        attention.kv_scale_orig_quant if apply_scale else pool,
+        APPLY_SCALE=apply_scale,
         ROW=width,
         BLOCK=_block(width),
     )

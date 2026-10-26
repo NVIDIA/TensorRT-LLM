@@ -514,16 +514,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 )
                 if layer_idx is None:
                     continue
-                tables = torch.full(
-                    (2, self.num_seqs, high_table.shape[1]),
+                table = torch.full(
+                    (self.num_seqs, high_table.shape[1]),
                     -1,
                     dtype=torch.int32,
                     pin_memory=prefer_pinned(),
                 )
-                manager.fill_mixed_precision_page_tables(
-                    self.request_ids, layer_idx, tables.numpy()
-                )
-                high_table[: self.num_seqs].copy_(tables[1], non_blocking=True)
+                manager.fill_retained_page_table(self.request_ids, layer_idx, table.numpy())
+                high_table[: self.num_seqs].copy_(table, non_blocking=True)
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
@@ -753,8 +751,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             state.is_prefill = True
 
     def _has_mixed_precision_kv(self) -> bool:
-        # The compressed history is read through the top-k gather, and the
-        # retained rows are overlaid there (mixed_precision_overlay); no staging.
+        # No dense-path staging copy here. After the indexer's top-k, this
+        # backend's gather already dequantizes the selected compressed rows
+        # into a per-call FP8 scratch (k rows per token, not the whole
+        # history), so that scratch is the staging: the retained tokens' rows
+        # are overlaid onto it after the gather (mixed_precision_overlay.overlay_rows).
         return False
 
     def prepare(self) -> None:
