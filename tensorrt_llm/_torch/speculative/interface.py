@@ -1815,6 +1815,14 @@ class SpecWorkerBase(nn.Module, ABC):
                                          dtype=torch.int,
                                          device=logits.device)
 
+        if (getattr(attn_metadata.kv_cache_manager, "use_kda_replay_update",
+                    False) and batch_size > num_contexts):
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
+
         next_draft_tokens = torch.zeros((batch_size, 0),
                                         dtype=torch.int,
                                         device=logits.device)

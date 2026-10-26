@@ -860,9 +860,13 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
         def __init__(self, *args, **kwargs):
             allocate(*args, **kwargs)
 
-    with patch(
-        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
-        return_value=verify_kernel is True,
+    with (
+        patch("tensorrt_llm._torch.pyexecutor._util.get_sm_version", return_value=100),
+        patch("tensorrt_llm._torch.pyexecutor._util.IS_CUTLASS_DSL_AVAILABLE", True),
+        patch(
+            "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+            return_value=verify_kernel is True,
+        ),
     ):
         with pytest.raises(AllocationReached):
             _create_kv_cache_manager(
