@@ -675,6 +675,7 @@ def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
 
 def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:
     manager = object.__new__(Fp4MlaKVCacheManagerV2)
+    manager.layer_specs = None
     manager.max_batch_size = 3
     manager.mapping = SimpleNamespace(pp_size=2)
     manager.max_num_tokens = 100
