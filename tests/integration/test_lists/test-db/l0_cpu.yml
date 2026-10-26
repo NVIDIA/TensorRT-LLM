@@ -265,6 +265,8 @@ l0_cpu:
   - unittest/others
   - unittest/quantization/test_mode.py
   - unittest/scaffolding
+  - unittest/serve/test_audio_transcriptions.py
+  - unittest/serve/test_openai_audio_transcriptions.py
   - unittest/scripts
   - unittest/tools
   - unittest/usage
