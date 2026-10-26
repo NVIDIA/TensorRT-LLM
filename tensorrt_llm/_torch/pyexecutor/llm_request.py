@@ -1208,8 +1208,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     def create_child_request(self, child_id: int) -> None:
         """Construct a child with copied inputs and fresh execution/output state.
 
-        Mutable Python inputs are copied independently. Encoder features and
-        native tensor inputs are shared read-only; clone before mutation.
+        Mutable Python inputs are copied independently. Logits processor lists
+        are shallow-copied to preserve callable identity and user-owned state.
+        Encoder features and native tensor inputs are shared read-only; clone
+        before mutation.
         Runtime events, cache ownership, sampler progress, and result history
         are initialized by the constructor rather than inherited from a parent.
         """
@@ -1243,7 +1245,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             end_id=self.py_end_id,
             py_lora_path=self.py_lora_path,
             py_lora_ckpt_source=self.py_lora_ckpt_source,
-            py_logits_post_processors=deepcopy(self.py_logits_post_processors),
+            py_logits_post_processors=(self.py_logits_post_processors.copy()
+                                       if self.py_logits_post_processors
+                                       is not None else None),
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
         )

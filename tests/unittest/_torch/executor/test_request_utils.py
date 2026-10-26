@@ -400,6 +400,55 @@ def test_child_factory_owns_inputs_and_resets_execution_state(seed) -> None:
     assert parent._native_child_requests[0].seq_slot == 9
 
 
+@pytest.mark.parametrize("processor_count", [None, 0, 2])
+def test_child_factory_copies_processor_list_and_preserves_callables(processor_count) -> None:
+    class StatefulProcessor:
+        def __init__(self):
+            self.state = []
+
+        def __call__(self, logits):
+            return logits
+
+        def __deepcopy__(self, memo):
+            raise AssertionError("User-supplied processors must not be deep-copied")
+
+    processors = (
+        None if processor_count is None else [StatefulProcessor() for _ in range(processor_count)]
+    )
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
+        is_streaming=False,
+        py_logits_post_processors=processors,
+    )
+    parent.create_child_request(43)
+    parent.create_child_request(44)
+    child, sibling = parent.child_requests
+    if processors is None:
+        assert child.py_logits_post_processors is None
+        assert sibling.py_logits_post_processors is None
+        return
+
+    child_processors = child.py_logits_post_processors
+    sibling_processors = sibling.py_logits_post_processors
+    assert parent.py_logits_post_processors is processors
+    assert child_processors is not processors
+    assert sibling_processors is not processors
+    assert child_processors is not sibling_processors
+    for original, child_processor, sibling_processor in zip(
+        processors, child_processors, sibling_processors, strict=True
+    ):
+        assert child_processor is original
+        assert sibling_processor is original
+        assert child_processor.state is original.state
+
+    child_processors.append(StatefulProcessor())
+    assert len(processors) == processor_count
+    assert len(sibling_processors) == processor_count
+
+
 @pytest.mark.parametrize("runtime_field", ["py_mm_encoder_state", "py_mm_encoder_event"])
 def test_child_factory_rejects_multimodal_encoder_ownership(runtime_field) -> None:
     parent = LlmRequest(
