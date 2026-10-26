@@ -18,7 +18,7 @@ DwdpManager is a thin lifecycle layer that:
 - creates a DWDP MPI sub-communicator
 - owns the Single Source of Truth for registered MoE layer indices
 - forwards runtime calls to the DWDPWeightManager produced by setup_dwdp
-- owns the attached DenseDwdpManager: sets dense DWDP up after setup_dwdp
+- owns the attached DenseDwdpManager: sets dense DWDP up before setup_dwdp
 
 These tests mock out COMM_WORLD / dwdp_global_rank / setup_dwdp so the full
 lifecycle can be exercised on a single CPU without MPI / CUDA / MNNVL.
@@ -26,22 +26,27 @@ lifecycle can be exercised on a single CPU without MPI / CUDA / MNNVL.
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.cute_dsl_utils import sm_reserve
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
 from tensorrt_llm._torch.modules.dwdp.dense.manager import (
+    H0_HOOK,
     DenseDwdpManager,
     get_global_dense_dwdp_manager,
     set_global_dense_dwdp_manager,
 )
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode, DenseSetupError
+from tensorrt_llm._torch.modules.dwdp.weight_buffer import PrefetchRingMemoryError
 from tensorrt_llm._torch.pyexecutor.dwdp import (
     DwdpManager,
+    _AttachedTransfer,
     get_global_dwdp_manager,
     set_global_dwdp_manager,
 )
@@ -468,6 +473,9 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         self.assertIs(result, fake_weight_manager)
         self.assertIs(mgr._weight_manager, fake_weight_manager)
         self.assertEqual(kwargs["repeated_layer_indices"], [])
+        # Dense DWDP is off: the weight manager makes its own copy stream, nothing is reserved.
+        self.assertIsNone(kwargs["copy_stream"])
+        self.assertEqual(kwargs["reserved_storages"], frozenset())
 
     def test_setup_forwards_repeated_dwdp_layers(self, mock_comm_world, _rank, _setup):
         """Repeated layers reach setup_dwdp; layers without a DWDP MoE are dropped."""
@@ -557,6 +565,44 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         fake_wm.wait_and_bind.assert_called_once_with(backend, 5)
 
 
+class _FakeWeightManager:
+    """The DWDPWeightManager calls DwdpManager and its dense manager make, logged."""
+
+    def __init__(self, log: list[tuple]) -> None:
+        self.log = log
+        # What DwdpManager.setup compares with the transfer dense DWDP ran on.
+        self.copy_stream, self.use_gather, self.use_batched_prefetch = None, False, False
+
+    def start_forward(self) -> None:
+        self.log.append(("start_forward",))
+
+
+class _FakeDense:
+    """The DenseDWDP calls the attached dense manager makes, logged; ``slots`` are its rings."""
+
+    def __init__(self, log: list[tuple], layers: list[int], slots: dict | None = None) -> None:
+        self.log, self.layers, self.slots = log, tuple(layers), slots or {}
+        self.primed = self.forward_open = False
+        self.eager_checks: list[str] = []
+
+    def require_eager(self, hook: str) -> None:
+        self.eager_checks.append(hook)
+
+    def prefetch(self, layer: int) -> None:
+        self.log.append(("L", layer))
+
+    def mark_primed(self) -> None:
+        self.log.append(("mark_primed",))
+        self.primed = True
+
+    def war_barrier(self) -> None:
+        self.log.append(("war_barrier",))
+        self.primed = self.forward_open = False
+
+    def release(self) -> None:
+        self.log.append(("dense.release",))
+
+
 class _DenseModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -579,7 +625,7 @@ class TestDwdpManagerDenseSetup(unittest.TestCase):
         self.sub_comm.Free.side_effect = lambda: self.log.append(("group.Free",))
         _start(self, patch(f"{_FAC}.dwdp_global_rank", return_value=self.GLOBAL_RANK))
         _start(self, patch(f"{_FAC}.torch.cuda.current_device", return_value=self.DEVICE_ID))
-        self.weight_manager = object()  # what setup_dwdp returns
+        self.weight_manager = _FakeWeightManager(self.log)
         self.setup_dwdp = _start(
             self, patch(f"{_FAC}.setup_dwdp", return_value=self.weight_manager)
         )
@@ -607,25 +653,37 @@ class TestDwdpManagerDenseSetup(unittest.TestCase):
             manager.add_layer(layer)
         return manager
 
-    def test_setup_runs_dense_setup_when_roots_are_available_but_not_requested(self) -> None:
-        """Collective #1 runs on every rank of a model with roots, requested or not.
+    def test_dense_setup_runs_first_and_hands_its_stream_and_slots_to_the_expert_setup(
+        self,
+    ) -> None:
+        """On every rank of a model with roots, requested or not, before the expert setup.
 
-        It runs after the expert setup, once the model reference is kept, with this rank's
+        The expert setup gets the copy stream dense setup made (none if it made none) and the
+        committed slots.  If it then fails (the ring does not fit), the runtime no manager took
+        over is released and the error propagates as raised.  Dense setup gets this rank's
         ``enable_dense``.
         """
-        seen = []
+        _start(self, patch.dict(os.environ))
+        os.environ.pop("TRTLLM_DWDP_PREFETCH_GATHER", None)
+        stream = object()
+        _start(self, patch(f"{_FAC}.new_expert_copy_stream", return_value=stream))
+        slots = {"ring": [SimpleNamespace(storage=torch.zeros(1)) for _ in range(2)]}
+        dense, seen = _FakeDense(self.log, self.LAYERS, slots), []
 
         def dense_setup(
-            model: nn.Module, weight_manager: object, comm: object, **kwargs: object
-        ) -> None:
-            seen.append((self.manager._model_ref(), self.manager._weight_manager))
+            model: nn.Module, transfer: object, comm: object, **kwargs: object
+        ) -> _FakeDense:
+            seen.append((type(transfer), self.setup_dwdp.call_count, self.manager._model_ref))
+            self.assertIs(transfer.copy_stream, stream)  # the first read, in P2, creates it
+            return dense
 
         self.setup_dense.side_effect = dense_setup
+        self.weight_manager.copy_stream = stream
         self.assertIs(self.manager.setup(self.model), self.weight_manager)
 
         self.setup_dense.assert_called_once_with(
             self.model,
-            self.weight_manager,
+            unittest.mock.ANY,
             self.sub_comm,
             dwdp_rank=self.DWDP_RANK,
             dwdp_size=2,
@@ -633,21 +691,59 @@ class TestDwdpManagerDenseSetup(unittest.TestCase):
             moe_layers=[3, 5, 7],
             config=DenseConfig(enabled=False),
         )
-        self.assertEqual(seen, [(self.model, self.weight_manager)])
-        self.assertEqual(self.setup_dwdp.call_args.kwargs["device_id"], self.DEVICE_ID)
-        self.assertIsNone(self.manager.dense)
-
-    def test_setup_hands_the_committed_runtime_and_the_weight_manager_to_the_dense_manager(
-        self,
-    ) -> None:
-        dense_manager, dense = self.manager.dense_manager, object()
-        attach = _start(self, patch.object(dense_manager, "attach", wraps=dense_manager.attach))
-        self.setup_dense.return_value = dense
-
-        self.manager.setup(self.model)
-
-        attach.assert_called_once_with(dense, expert=self.weight_manager)
+        self.assertEqual(seen, [(_AttachedTransfer, 0, None)])
+        kwargs = self.setup_dwdp.call_args.kwargs
+        self.assertEqual((kwargs["device_id"], kwargs["copy_stream"]), (self.DEVICE_ID, stream))
+        self.assertEqual(kwargs["num_prefetch_slots"], 2)
+        self.assertEqual(kwargs["repeated_layer_indices"], [])
+        storages = {slot.storage.untyped_storage().data_ptr() for slot in slots["ring"]}
+        self.assertEqual(kwargs["reserved_storages"], storages)
         self.assertIs(self.manager.dense, dense)
+
+        self.setup_dense.side_effect = None  # dense DWDP off on every rank: no stream made
+        self.new_manager().setup(_DenseModel())
+        self.assertIsNone(self.setup_dwdp.call_args.kwargs["copy_stream"])
+
+        self.setup_dense.side_effect = lambda *_args, **_kwargs: _FakeDense(self.log, self.LAYERS)
+        error = self.setup_dwdp.side_effect = PrefetchRingMemoryError("the ring does not fit")
+        manager = self.new_manager()
+        with self.assertRaises(PrefetchRingMemoryError) as raised:
+            manager.setup(_DenseModel())
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.log, [("dense.release",)])
+        self.assertIsNone(manager.dense)
+
+    def test_an_expert_setup_on_another_copy_stream_or_transfer_is_refused(self) -> None:
+        """The dense and the expert copies must share one copy stream and one transfer.
+
+        A weight manager on another copy stream than dense setup made, or with another
+        ``use_batched_prefetch``, is refused after the expert setup; the runtime no manager took
+        over is released.
+        """
+        _start(self, patch.dict(os.environ))
+        os.environ.pop("TRTLLM_DWDP_PREFETCH_GATHER", None)
+        stream = object()
+        _start(self, patch(f"{_FAC}.new_expert_copy_stream", return_value=stream))
+
+        def dense_setup(
+            model: nn.Module, transfer: object, comm: object, **kwargs: object
+        ) -> _FakeDense:
+            self.assertIs(transfer.copy_stream, stream)  # the first read, in P2, creates it
+            return _FakeDense(self.log, self.LAYERS)
+
+        self.setup_dense.side_effect = dense_setup
+        for copy_stream, batched in ((object(), False), (stream, True)):
+            with self.subTest(other_stream=copy_stream is not stream, batched=batched):
+                self.log.clear()
+                self.weight_manager.copy_stream = copy_stream
+                self.weight_manager.use_batched_prefetch = batched
+                manager = self.new_manager()
+                with self.assertRaisesRegex(RuntimeError, "must share one copy stream"):
+                    manager.setup(_DenseModel())
+
+                self.assertEqual(self.log, [("dense.release",)])
+                self.assertIsNone(manager.dense)
 
     def test_a_model_without_roots_makes_no_dense_collective(self) -> None:
         """A rank that asks for dense DWDP raises alone, after the expert setup.
@@ -673,16 +769,33 @@ class TestDwdpManagerDenseSetup(unittest.TestCase):
         self.setup_dense.assert_not_called()
         self.sub_comm.allgather.assert_not_called()
 
-    def test_dense_setup_error_propagates_and_cleanup_still_tears_down(self) -> None:
-        self.setup_dense.side_effect = DenseSetupError("dense setup abandoned")
+    def test_setup_priming_abort_recovery_and_teardown_keep_their_calls(self) -> None:
+        """The attached lifecycle against one call log.
 
-        with self.assertRaisesRegex(DenseSetupError, "dense setup abandoned"):
+        The dense priming of the first two layers before every expert start; after an aborted
+        forward the executor's start leaves the recovery to H0: the WAR barrier, the dense
+        priming, then the expert start; dense released first.
+        """
+        dense = _FakeDense(self.log, self.LAYERS)
+        self.setup_dense.return_value = dense
+
+        with self.manager:
             self.manager.setup(self.model)
-        self.assertIsNone(self.manager.dense)
+            self.assertIs(self.manager.dense_manager.dense, dense)
+            self.manager.start_forward()  # the executor loop, before the forward
+            self.manager.ensure_primed()  # H0 of that forward: already primed
+            dense.primed, dense.forward_open = False, True  # the forward aborts midway
+            self.manager.start_forward()  # skipped: H0 recovers on the execution stream
+            self.manager.dense_manager.ensure_primed()  # H0 as the model calls it
+            self.manager.start_forward()  # dense primed again: the expert start only
 
-        self.manager.cleanup()
-
-        self.assertEqual(self.log, [("teardown_dwdp",), ("group.Free",)])
+        priming = [("L", 3), ("L", 5), ("mark_primed",)]
+        start = [("start_forward",)]
+        recovery = [("war_barrier",)] + priming + start
+        teardown = [("dense.release",), ("teardown_dwdp",), ("group.Free",)]
+        self.assertEqual(self.log, priming + start + start + recovery + start + teardown)
+        self.assertEqual(dense.eager_checks, [H0_HOOK, H0_HOOK])
+        self.assertIsNone(get_global_dense_dwdp_manager())
 
     def test_more_than_two_expert_slots_are_logged_when_dense_dwdp_commits(self) -> None:
         """With more than two expert prefetch slots each expert copy runs ahead of its layer's

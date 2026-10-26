@@ -76,11 +76,17 @@ DWDP is wrapper-owned lifecycle, not a scheduler or backend variant:
 ```text
 Executor construction
   → register eligible MoE layer indices
-  → after weight loading: create VMM transport + composite VA + page pool
+  → after weight loading: DwdpManager.setup
+      → dense DWDP first (models with dense roots): setup collectives #1-#6;
+        the commit frees the replicated dense weights
+      → then expert DWDP: VMM transport + composite VA + page pool (the
+        prefetch ring), on the copy stream dense DWDP runs on
+      → the committed dense runtime goes to the attached DenseDwdpManager
 
 PyExecutor forward start
-  → DwdpManager.start_forward(): first MoE layers, unless the previous
-    pass already prefetched them
+  → DwdpManager.start_forward(): the dense weights of the first two layers,
+    then the experts of the first MoE layers, unless the previous pass
+    already prefetched them
   → ConfigurableMoE.wait_and_bind(composite VA)
   → MoEScheduler.forward(... ordinary CuTeDSL kernel ...)
   → main stream joins scheduler auxiliary work
@@ -92,6 +98,7 @@ Control action (weight update, sleep/wakeup)
   → DwdpManager.invalidate_prefetch()
 
 Executor shutdown or construction rollback
+  → release dense DWDP (zero-size dense weights, slots and row store)
   → detach model references
   → synchronize outstanding device work
   → release composite VA, page pool, transport, and MPI sub-communicator

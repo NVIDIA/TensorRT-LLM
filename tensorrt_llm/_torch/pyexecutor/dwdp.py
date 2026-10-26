@@ -26,8 +26,10 @@ This module owns four concerns and delegates the rest:
   * Attached dense DWDP: the ``DenseDwdpManager`` created and registered
     with this manager, through which the model's layer hooks reach the
     ``DenseDWDP`` runtime. ``setup(model)`` commits the runtime over the DWDP
-    group and hands it to the dense manager together with the weight
-    manager; each forward starts the dense prefetch ahead of the expert
+    group before the expert setup allocates its prefetch ring, so the
+    replicated dense weights are freed first, then hands it to the dense
+    manager together with the weight manager, which runs on the same copy
+    stream; each forward starts the dense prefetch ahead of the expert
     prefetch (``start_forward``, ``DenseDwdpManager.ensure_primed``), and
     ``cleanup`` releases dense DWDP before the expert teardown
 
@@ -72,6 +74,7 @@ from tensorrt_llm._torch.modules.dwdp.dense.setup import (
     refuse_dense_dwdp_without_roots,
 )
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
+from tensorrt_llm._torch.modules.dwdp.setup import _release_during_rollback
 from tensorrt_llm._torch.modules.dwdp.weight_manager import expert_transfer
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from tensorrt_llm.logger import logger
@@ -87,6 +90,110 @@ def set_global_dwdp_manager(manager: Optional["DwdpManager"]) -> None:
 
 def get_global_dwdp_manager() -> Optional["DwdpManager"]:
     return _global_dwdp_manager
+
+
+def new_expert_copy_stream(device_id: int) -> torch.cuda.Stream:
+    """The expert DWDP copy stream on ``cuda:<device_id>``, made as ``DWDPWeightManager`` makes it.
+
+    ``DwdpManager.setup`` creates it for attached dense DWDP, which runs before the weight manager
+    exists, and hands it to ``setup_dwdp``.  The test seam: tests monkeypatch it.
+    """
+    return torch.cuda.Stream(device=torch.device("cuda", device_id))
+
+
+class _AttachedTransfer:
+    """The transfer of attached dense DWDP (``DenseTransfer``), before the weight manager exists.
+
+    Dense DWDP commits before ``setup_dwdp`` allocates the expert prefetch ring, so it cannot take
+    the expert weight manager as its transfer.  This stands in with what the weight manager will
+    use:
+
+    * ``copy_stream``: made by ``new_expert_copy_stream`` at the first read, which dense setup
+      makes in P2, inside the phase's local work (a failure is this rank's failed P2 report);
+      ``DwdpManager.setup`` then hands it to ``setup_dwdp``.
+    * ``use_gather`` and ``use_batched_prefetch``: computed when read, as
+      ``DWDPWeightManager.__init__`` computes them (``expert_transfer`` of ``copy_mode`` and
+      ``contention_opt``).
+
+    Construction touches no CUDA, probes nothing and logs nothing.
+    """
+
+    __slots__ = ("_device_id", "_contention_opt", "_copy_mode", "_stream")
+
+    def __init__(
+        self, device_id: int, *, contention_opt: bool, copy_mode: Optional[str] = None
+    ) -> None:
+        self._device_id = device_id
+        self._contention_opt = contention_opt
+        self._copy_mode = copy_mode
+        self._stream: Optional[torch.cuda.Stream] = None
+
+    @property
+    def copy_stream(self) -> torch.cuda.Stream:
+        """The copy stream: created on the first read, the same object on every later one."""
+        if self._stream is None:
+            self._stream = new_expert_copy_stream(self._device_id)
+        return self._stream
+
+    @property
+    def created_stream(self) -> Optional[torch.cuda.Stream]:
+        """The copy stream if a read created it, else None."""
+        return self._stream
+
+    @property
+    def use_gather(self) -> bool:
+        """Whether the expert prefetch uses the SM fabric gather."""
+        return expert_transfer(self._copy_mode, self._contention_opt)[0]
+
+    @property
+    def use_batched_prefetch(self) -> bool:
+        """Whether the expert prefetch uses one batched copy per layer."""
+        return expert_transfer(self._copy_mode, self._contention_opt)[1]
+
+
+def _check_shared_transfer(
+    transfer: _AttachedTransfer | DWDPWeightManager, weight_manager: DWDPWeightManager
+) -> None:
+    """The weight manager must run on the copy stream and transfer dense DWDP was set up with.
+
+    Dense and expert copies share one copy stream, which runs them in the order they are enqueued,
+    and the dense copies follow the expert transfer.  On a repeated setup dense DWDP ran on the
+    weight manager itself, which the expert setup must then have returned.  Nothing to check when
+    dense setup never read the attached transfer's stream.
+
+    Raises:
+        RuntimeError: The weight manager runs on another stream or with other transfer flags.
+    """
+    if transfer is weight_manager:
+        return
+    if isinstance(transfer, _AttachedTransfer):
+        stream = transfer.created_stream
+        if stream is None:
+            return
+    else:
+        stream = transfer.copy_stream
+    dense_flags = (transfer.use_gather, transfer.use_batched_prefetch)
+    expert_flags = (weight_manager.use_gather, weight_manager.use_batched_prefetch)
+    if weight_manager.copy_stream is not stream or expert_flags != dense_flags:
+        raise RuntimeError(
+            "DwdpManager.setup(): the expert weight manager does not run on the copy stream and "
+            "transfer dense DWDP was set up with; the dense and the expert copies must share one "
+            f"copy stream (expert: {weight_manager.copy_stream}, (use_gather, "
+            f"use_batched_prefetch)={expert_flags}; dense: {stream}, {dense_flags})"
+        )
+
+
+def _dense_slot_storages(dense: DenseDWDP | None) -> frozenset[int]:
+    """The storages of a committed dense runtime's slots, which the expert transport must not take.
+
+    After the commit the modules' dense tensors are views of these slots.  Empty without a
+    runtime.
+    """
+    if dense is None:
+        return frozenset()
+    return frozenset(
+        slot.storage.untyped_storage().data_ptr() for ring in dense.slots.values() for slot in ring
+    )
 
 
 class DwdpManager:
@@ -115,7 +222,9 @@ class DwdpManager:
     for the next one; otherwise ``start_forward`` or ``ensure_primed``
     enqueues ``L(first), L(second)``, then the expert prefetch its
     ``E(first), E(second)``. Without a committed runtime the dense manager
-    does nothing.
+    does nothing. ``setup`` commits dense DWDP before the expert setup
+    allocates its prefetch ring, on the copy stream the weight manager then
+    adopts.
     """
 
     def __init__(
@@ -394,37 +503,58 @@ class DwdpManager:
             self._repeated_layers.append(layer_idx)
 
     def setup(self, model: nn.Module) -> Optional[DWDPWeightManager]:
-        """Run the VA initialization pipeline on ``model``.
+        """Set dense DWDP, then the VA pipeline of expert DWDP, up on ``model``.
 
-        Delegates to ``setup_dwdp`` (transport + weight buffer + weight
-        manager + MoE backend fixup). Stores the returned ``DWDPWeightManager``
-        for subsequent runtime calls.
-
-        Then, if the model's decoder layers provide dense roots, runs
+        First, if the model's decoder layers provide dense roots, runs
         ``setup_dense_dwdp`` on every rank, also on a rank that did not ask
         for dense DWDP, so the first dense collective gives every rank of the
         group the same verdict when ranks disagree on
-        ``dwdp_config.enable_dense``. The committed runtime, if any, goes to the
-        dense manager together with the weight manager
-        (``DenseDwdpManager.attach``) and becomes ``dense``; dense setup errors
-        propagate, raised on every rank together. Whether a model has roots
-        depends only on its code, so on a model without them no rank makes a
-        dense collective: a rank that asks for dense DWDP there raises alone,
-        at once (``refuse_dense_dwdp_without_roots``).
+        ``dwdp_config.enable_dense``. Dense setup errors propagate, raised on
+        every rank together, before any expert setup work. A commit
+        returns the replicated dense weights to the driver before the expert
+        setup allocates its prefetch ring, so the setup peak is the larger of
+        the replicated dense weights with the dense store and slots, and the
+        dense shard with the ring, not their sum. Dense setup runs on an
+        attached transfer: a copy stream that the transfer creates when dense
+        setup first reads it, and the transfer flags computed as the weight
+        manager computes them.
+
+        Then ``setup_dwdp`` (transport + weight buffer + weight manager + MoE
+        backend fixup) runs with that copy stream, if dense setup created
+        it, so the dense and the expert copies share one copy stream, and the
+        returned ``DWDPWeightManager`` is stored for subsequent runtime calls.
+        It gets the committed runtime's slots as reserved storages, so that
+        an expert weight dense DWDP moved is refused before the transport
+        would free a slot. The committed runtime, if any, goes to the dense
+        manager together with the weight manager (``DenseDwdpManager.attach``)
+        and becomes ``dense``. If anything fails after the commit and before
+        the dense manager took the runtime over, the runtime is released and
+        the error propagates. Whether a model has roots depends only on its
+        code, so on a model without them no rank makes a dense collective: a
+        rank that asks for dense DWDP there raises alone, at once, after the
+        expert setup (``refuse_dense_dwdp_without_roots``).
 
         Called once from ``py_executor_creator`` after weight loading. Once
         dense DWDP is committed, a later call for the same model returns the
         weight manager and keeps the runtime, making no collective; every
-        rank committed together, so every rank returns early alike.
+        rank committed together, so every rank returns early alike. A later
+        call for the same model after dense DWDP stayed off runs dense setup
+        on the weight manager, whose stream and flags it then uses; the
+        expert setup must return that same weight manager.
 
         Raises:
             RuntimeError: Called after ``cleanup()``; dense DWDP is committed
                 for another model; or the model's dense weights were moved
                 by a dense DWDP runtime this manager does not hold (it was
                 released, so the modules hold zero-size tensors). Each is
-                raised before any expert or dense setup work.
+                raised before any expert or dense setup work. Also raised
+                when the weight manager does not run on the copy stream and
+                transfer dense DWDP was set up with, and when dense DWDP
+                moved an expert weight the transport takes over.
             DenseSetupError: Dense DWDP setup failed, or was requested on a
                 model without dense roots.
+            PrefetchRingMemoryError: The expert prefetch ring does not fit in
+                the free device memory.
         """
         if self.dwdp_group is None:
             raise RuntimeError("DwdpManager.setup() called after cleanup()")
@@ -443,26 +573,36 @@ class DwdpManager:
             )
         layer_indices = sorted(self._registered_layers)
         device_id = torch.cuda.current_device()
-        self._weight_manager = setup_dwdp(
-            model=model,
-            mapping=self._mapping,
-            device_id=device_id,
-            comm=self.dwdp_group,
-            layer_indices=layer_indices,
-            num_experts_per_worker=self.num_experts_per_worker,
-            num_prefetch_experts=self.num_prefetch_experts,
-            contention_opt=self.config.contention_opt,
-            copy_mode=self.config.copy_mode,
-            num_prefetch_slots=self.config.num_prefetch_slots,
-            repeated_layer_indices=[
-                layer for layer in self._repeated_layers if layer in self._registered_layers
-            ],
+        roots = dense_roots_available(model)
+        # A repeated call for the model whose expert setup is done (dense DWDP stayed off): the
+        # expert setup returns its cached weight manager, so dense setup runs on that one.
+        expert_done = (
+            self._weight_manager is not None
+            and self._model_ref is not None
+            and self._model_ref() is model
         )
-        self._model_ref = weakref.ref(model)
-        if dense_roots_available(model):
+        attached = (
+            None
+            if expert_done
+            else _AttachedTransfer(
+                device_id,
+                contention_opt=self.config.contention_opt,
+                copy_mode=self.config.copy_mode,
+            )
+        )
+        transfer = self._weight_manager if attached is None else attached
+        dense = None
+        if roots:  # on every rank, requested or not: collective #1 gives one verdict
+            # Collective #1 is the group's first collective of the setup, where a rank waits for
+            # peers still loading: one line, so that a rank waiting there shows where it waits.
+            logger.info(
+                f"[DwdpManager] DWDP rank {self.dwdp_rank} of {self.dwdp_size}: dense DWDP setup "
+                f"first (its collective #1 waits for every rank of the DWDP group), then expert "
+                f"DWDP setup"
+            )
             dense = setup_dense_dwdp(
                 model,
-                self._weight_manager,
+                transfer,
                 self.dwdp_group,
                 dwdp_rank=self.dwdp_rank,
                 dwdp_size=self.dwdp_size,
@@ -470,9 +610,33 @@ class DwdpManager:
                 moe_layers=layer_indices,
                 config=DenseConfig.from_dwdp_config(self.config),
             )
+        try:
+            self._weight_manager = setup_dwdp(
+                model=model,
+                mapping=self._mapping,
+                device_id=device_id,
+                comm=self.dwdp_group,
+                layer_indices=layer_indices,
+                num_experts_per_worker=self.num_experts_per_worker,
+                num_prefetch_experts=self.num_prefetch_experts,
+                contention_opt=self.config.contention_opt,
+                copy_mode=self.config.copy_mode,
+                num_prefetch_slots=self.config.num_prefetch_slots,
+                repeated_layer_indices=[
+                    layer for layer in self._repeated_layers if layer in self._registered_layers
+                ],
+                copy_stream=None if attached is None else attached.created_stream,
+                reserved_storages=_dense_slot_storages(dense),
+            )
+            self._model_ref = weakref.ref(model)
             if dense is not None:
+                _check_shared_transfer(transfer, self._weight_manager)
                 self._dense_manager.attach(dense, expert=self._weight_manager)
-        elif self.config.enable_dense:
+        except BaseException:
+            if dense is not None and self._dense_manager.dense is not dense:
+                _release_during_rollback(dense, "dense DWDP runtime")
+            raise
+        if not roots and self.config.enable_dense:
             refuse_dense_dwdp_without_roots(model)
         if self.dense is not None and self.config.num_prefetch_slots > 2:
             logger.info(

@@ -15,12 +15,12 @@
 """Dense DWDP setup: phases P1-P6 over six collectives.
 
 Setup runs once per context worker, after the model is fully loaded and post-processed: from
-``DwdpManager.setup`` right after the expert DWDP setup returned (with expert DWDP, so the expert
-transport, buffers and backend fixups are done), or from ``manager.DenseDwdpManager.setup``
-(standalone, over the attention-DP group).  Each phase's local work is wrapped so that a failure
-becomes ``ok=False`` in the next collective instead of an exception that would skip it; every
-rank makes the same collectives in the same order, reaches the same verdict from the same
-gathered payloads, and raises or returns together with the others.
+``DwdpManager.setup`` before the expert DWDP setup (with expert DWDP, so the commit returns the
+replicated dense weights to the driver before the expert prefetch ring is allocated), or from
+``manager.DenseDwdpManager.setup`` (standalone, over the attention-DP group).  Each phase's local
+work is wrapped so that a failure becomes ``ok=False`` in the next collective instead of an
+exception that would skip it; every rank makes the same collectives in the same order, reaches the
+same verdict from the same gathered payloads, and raises or returns together with the others.
 """
 
 from __future__ import annotations
@@ -79,8 +79,9 @@ _MAX_LISTED = 8
 class DenseTransfer(Protocol):
     """Where and how the dense copies run.
 
-    ``DWDPWeightManager`` (with expert DWDP: the expert DWDP copy stream and transfer) and
-    ``manager.StandaloneTransfer`` (standalone: the dense manager's own stream and
+    ``DwdpManager``'s attached transfer (with expert DWDP: the copy stream the expert DWDP weight
+    manager then runs on, and the expert transfer; on a repeated setup the ``DWDPWeightManager``
+    itself) and ``manager.StandaloneTransfer`` (standalone: the dense manager's own stream and
     ``DwdpConfig.copy_mode``) implement it.  Setup first reads ``copy_stream`` in P2, inside the
     phase's local work: an implementation may create the stream on that first read, and a failure
     then becomes this rank's failed P2 report.
@@ -292,8 +293,9 @@ def setup_dense_dwdp(
     Args:
         model: The loaded model (the VL wrapper or the causal LM); the decoder is found like the
             expert setup finds it.
-        transfer: Copy stream and transfer mode: the expert DWDP weight manager with expert DWDP,
-            a ``manager.StandaloneTransfer`` standalone.
+        transfer: Copy stream and transfer mode: with expert DWDP, ``DwdpManager``'s attached
+            transfer, whose copy stream the expert DWDP weight manager then runs on; a
+            ``manager.StandaloneTransfer`` standalone.
         comm: The dense group: the DWDP group, or the attention-DP group standalone.
         dwdp_rank: This rank in the dense group (its DWDP rank, or its tp rank standalone).
         dwdp_size: Dense group size ``N``.
