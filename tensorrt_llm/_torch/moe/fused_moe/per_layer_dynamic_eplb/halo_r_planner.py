@@ -7,7 +7,8 @@ and never reads device data on the host::
 
     MAIN: record input_ready
     COPY: wait input_ready -> HALO-R scheduler -> record plan_ready -> relay copy
-    MAIN: wait plan_ready (first route consumer) ... MegaMoE ... record consumer_done
+    MAIN: wait plan_ready, then wait relay_resident >= relay CTAs (first route
+          consumer) ... MegaMoE ... record consumer_done
     COPY: wait consumer_done -> record copy_idle
     MAIN: wait copy_idle
 
@@ -15,6 +16,11 @@ MAIN is the stream that is current when the layer call starts; it may differ
 between calls (a CUDA graph capture stream, for example) but not within one.
 Each call therefore forks COPY from MAIN and joins it back, so the whole
 call can be captured into a CUDA graph and replayed.
+
+MegaMoE's full grid blocks at the READY gate that the relay opens, so MAIN
+releases it only once every relay CTA holds its SM: each relay CTA adds 1 to
+the layer's relay_resident counter as its first action, and the scheduler
+zeroes it, so the stream wait has a constant target across graph replays.
 
 A native context binds the layer's buffers, COPY and the four events once,
 so each step of the sequence is one native call: ``moe_rebalance_halo_r_submit``
@@ -267,6 +273,7 @@ class HaloRSlotSchedulerGroup:
         self.peer_bases = torch.zeros(self.ep_size, dtype=torch.int64, device=self.device)
         self.relay_completed_ctas = int32(1)
         self.relay_launch_count = int32(1)
+        self.relay_resident_ctas = int32(1)
 
     def _bind_relay_tables(self, arena: Any, pool: Any) -> None:
         """Build the relay's source and destination address tables once."""
@@ -324,6 +331,7 @@ class HaloRSlotSchedulerGroup:
             self.relay_plane_bytes,
             self.relay_completed_ctas,
             self.relay_launch_count,
+            self.relay_resident_ctas,
             self._ready_flag_mc_ptr,
             self.ep_size,
             self.experts,
@@ -432,7 +440,7 @@ class HaloRSlotSchedulerGroup:
         return physical[:num_tokens], _READY_GENERATION
 
     def wait_for_routes(self) -> None:
-        """Order the first MAIN route read after the scheduler, without a host wait."""
+        """Order the first MAIN route read after the scheduler and the relay's residency, without a host wait."""
         self._call_stream()
         if not self._routes_waited:
             torch.ops.trtllm.moe_rebalance_halo_r_wait_routes(self._handle)

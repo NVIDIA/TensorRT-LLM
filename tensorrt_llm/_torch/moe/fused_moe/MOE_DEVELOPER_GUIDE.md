@@ -866,7 +866,10 @@ set wrong has a test that catches it:
   `validate_per_layer_dynamic_eplb_cuda_graph` validator admits that
   combination only. Like HALO-Q, HALO-R binds its buffers, the copy stream
   and its events into a native context once, and each layer call makes three
-  native calls on its handle: submit, wait for routes and release. Its device waits use a fixed wall-clock bound
+  native calls on its handle: submit, wait for routes and release. Like
+  HALO-Q's route epoch, the route wait is a stream wait on a device counter:
+  every relay CTA bumps it on entry, so MegaMoE's full grid is released only
+  once the relay that opens its READY gate holds its SMs. Its device waits use a fixed wall-clock bound
   (`HALO_R_SPIN_BUDGET_NS`) instead of `SchedulerSpinBound`.
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and

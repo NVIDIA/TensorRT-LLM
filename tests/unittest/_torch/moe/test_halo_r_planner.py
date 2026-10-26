@@ -359,3 +359,63 @@ def test_layer_call_rejects_the_copy_stream(monkeypatch):
     with pytest.raises(RuntimeError, match="distinct from the higher-priority COPY"):
         group.plan(_FakeRoutes(fake_torch, 1, 2))
     assert calls == []
+
+
+_DYNAMIC_EPLB_SOURCE = (
+    Path(__file__).resolve().parents[4] / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb"
+)
+
+
+def _function_body(source, signature):
+    """Text between the braces of the first function whose header contains ``signature``."""
+    start = source.index("{", source.index(signature))
+    depth = 0
+    for index in range(start, len(source)):
+        depth += {"{": 1, "}": -1}.get(source[index], 0)
+        if depth == 0:
+            return source[start : index + 1]
+    raise ValueError(f"unbalanced body of {signature}")
+
+
+def test_route_wait_follows_relay_residency():
+    # MegaMoE's full grid blocks at the READY gate the relay opens, so MAIN may
+    # release it only once every relay CTA holds its SM, as HALO-Q gates on
+    # its route epoch. A plan_ready-only wait lets MegaMoE take every SM first.
+    op = _HALO_R_OP_SOURCE.read_text()
+    wait = _function_body(op, "void waitRoutes()")
+    stream_wait = re.search(
+        r"cuStreamWaitValue32\(\s*reinterpret_cast<CUstream>\(execution\),\s*"
+        r"reinterpret_cast<CUdeviceptr>\(mRelay\.residentCtas\),\s*"
+        r"static_cast<cuuint32_t>\(mRelay\.ctas\),\s*CU_STREAM_WAIT_VALUE_GEQ\)",
+        wait,
+    )
+    assert stream_wait is not None
+    # The value wait is queued behind plan_ready, which follows the reset.
+    assert wait.index("mEvents[kPlanReady]") < stream_wait.start()
+    # The scheduler and the relay share the one counter.
+    assert op.count("reinterpret_cast<unsigned*>(relayResidentCtas.data_ptr<int>())") == 2
+
+    # The scheduler zeroes the counter before anything else, so the target
+    # stays the constant CTA count across graph replays.
+    scheduler = _function_body(
+        (_DYNAMIC_EPLB_SOURCE / "moeRebalanceHaloR.cu").read_text(), "void haloRSchedulerKernel("
+    )
+    assert scheduler.index("*p.relayResidentCtas = 0;") < scheduler.index("p.outSlots[index]")
+    # Every relay CTA reports residency before it does any work.
+    relay = _function_body(
+        (_DYNAMIC_EPLB_SOURCE / "moeRebalanceRelay.cu").read_text(), "void haloRRelayKernel("
+    )
+    increment = relay.index('"red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.residentCtas)')
+    assert increment < relay.index("prepareRelayWork(") < relay.index("relayIssue(")
+
+
+def test_context_binds_the_relay_residency_counter():
+    op = _HALO_R_OP_SOURCE.read_text()
+    schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op.split("m.def(")[1:]]
+    create = next(text for text in schemas if text.startswith("moe_rebalance_halo_r_create("))
+    assert "Tensor relay_launch_count, Tensor relay_resident_ctas, int ready_flag_mc_ptr" in create
+    planner = Path(halo_r_planner.__file__).read_text()
+    assert re.search(
+        r"self\.relay_launch_count,\s*self\.relay_resident_ctas,\s*self\._ready_flag_mc_ptr,",
+        planner,
+    )

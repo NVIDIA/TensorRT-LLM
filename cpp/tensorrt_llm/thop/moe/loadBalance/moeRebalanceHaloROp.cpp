@@ -22,6 +22,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda.h>
 #include <torch/custom_class.h>
 #include <torch/extension.h>
 
@@ -80,7 +81,7 @@ T* checkedPointer(std::int64_t value, char const* name)
 //! layer call makes one native call per step:
 //!
 //!     submit:      MAIN record input_ready; COPY wait input_ready -> scheduler -> record plan_ready -> relay copy
-//!     wait_routes: MAIN wait plan_ready
+//!     wait_routes: MAIN wait plan_ready; MAIN wait relay_resident >= relay CTAs
 //!     release:     COPY wait the consumer (consumer_done on MAIN, or the caller's event) -> record copy_idle;
 //!                  MAIN wait copy_idle
 class MoeRebalanceHaloRState : public torch::CustomClassHolder
@@ -90,9 +91,9 @@ public:
         torch::Tensor peerBases, torch::Tensor status, torch::Tensor partial, torch::Tensor routeAux,
         torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, std::int64_t readyFlagsPtr,
         torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
-        torch::Tensor relayCompletedCtas, torch::Tensor relayLaunchCount, std::int64_t readyFlagMcPtr,
-        std::int64_t epValue, std::int64_t expertsValue, std::int64_t helpersValue, std::int64_t sendCountValue,
-        std::int64_t sendWeightValue, std::int64_t localRankValue, std::int64_t topkValue,
+        torch::Tensor relayCompletedCtas, torch::Tensor relayLaunchCount, torch::Tensor relayResidentCtas,
+        std::int64_t readyFlagMcPtr, std::int64_t epValue, std::int64_t expertsValue, std::int64_t helpersValue,
+        std::int64_t sendCountValue, std::int64_t sendWeightValue, std::int64_t localRankValue, std::int64_t topkValue,
         std::int64_t routeCapacityValue, std::int64_t ctasValue, std::int64_t relayCtasValue, std::int64_t copyStream)
     {
         int const ep = checkedInt(epValue, "ep");
@@ -109,6 +110,8 @@ public:
         TORCH_CHECK(topk > 0 && routeCapacity > 0 && routeCapacity % topk == 0,
             "route_capacity must be a positive multiple of topk");
         TORCH_CHECK(copyStream != 0, "copy_stream must be a non-default CUDA stream");
+        // wait_routes waits for every relay CTA to be resident, so a relay of zero CTAs would order nothing.
+        TORCH_CHECK(relayCtasValue >= 1, "relay_ctas must be positive");
         int const planes = checkedInt(relayPlaneBytes.numel(), "planes");
 
         c10::Device const device = plan.device();
@@ -131,6 +134,7 @@ public:
         checkCudaTensor(relayPlaneBytes, device, torch::kInt64, planes, "plane_bytes");
         checkCudaTensor(relayCompletedCtas, device, torch::kInt32, 1, "completed_ctas");
         checkCudaTensor(relayLaunchCount, device, torch::kInt32, 1, "launch_count");
+        checkCudaTensor(relayResidentCtas, device, torch::kInt32, 1, "resident_ctas");
 
         mScheduler = kernels::MoeRebalanceHaloRParams{
             nullptr,
@@ -145,6 +149,7 @@ public:
             plan.data_ptr<int>(),
             routePrefix.data_ptr<int>(),
             checkedPointer<std::uint64_t>(readyFlagsPtr, "ready_flags_ptr"),
+            reinterpret_cast<unsigned*>(relayResidentCtas.data_ptr<int>()),
             ep,
             experts,
             helpers,
@@ -164,6 +169,7 @@ public:
             status.data_ptr<int>(),
             reinterpret_cast<unsigned*>(relayCompletedCtas.data_ptr<int>()),
             reinterpret_cast<unsigned*>(relayLaunchCount.data_ptr<int>()),
+            reinterpret_cast<unsigned*>(relayResidentCtas.data_ptr<int>()),
             checkedPointer<std::uint64_t>(readyFlagMcPtr, "ready_flag_mc_ptr"),
             ep,
             experts,
@@ -190,7 +196,7 @@ public:
         mTensors = {std::move(outSlots), std::move(outIds), std::move(outOwners), std::move(peerBases),
             std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync), std::move(plan),
             std::move(routePrefix), std::move(relaySources), std::move(relayDestinations), std::move(relayPlaneBytes),
-            std::move(relayCompletedCtas), std::move(relayLaunchCount)};
+            std::move(relayCompletedCtas), std::move(relayLaunchCount), std::move(relayResidentCtas)};
         mBound = true;
     }
 
@@ -237,7 +243,18 @@ public:
         kernels::invokeMoeRebalanceRelay(mRelay, mCopyStream);
     }
 
-    //! Orders the current stream after the scheduler of the last submit, without a host wait.
+    //! Orders the current stream after the scheduler of the last submit and after every relay CTA is resident,
+    //! without a host wait.
+    //!
+    //! MegaMoE's full grid blocks at the READY gate that the relay opens, and a relay CTA needs a whole SM. Stream
+    //! priority does not preempt resident CTAs, and graph nodes may not keep it, so MAIN must not release MegaMoE
+    //! until the relay holds its SMs. Each relay CTA adds 1 to relay_resident first; MAIN waits for the CTA count.
+    //! The scheduler zeroes the counter at entry, so the target is a constant that a replayed graph reproduces. The
+    //! reset precedes this launch's increments (the relay is stream-ordered after the scheduler) and follows the
+    //! previous launch's (the scheduler is stream-ordered after the previous relay). The value wait is queued behind
+    //! the plan_ready wait, so it cannot read the previous launch's count before the scheduler has zeroed it.
+    //! While MAIN waits, MegaMoE is not launched and no queued kernel blocks on READY, so the relay's CTAs become
+    //! resident as earlier kernels retire. The scheduler never overlaps them: both run on COPY, in stream order.
     void waitRoutes()
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -246,6 +263,11 @@ public:
         cudaStream_t const execution = currentExecutionStream();
         checkCudaResult(
             cudaStreamWaitEvent(execution, mEvents[kPlanReady], 0), "cudaStreamWaitEvent(HALO-R plan ready)");
+        CUresult const result = cuStreamWaitValue32(reinterpret_cast<CUstream>(execution),
+            reinterpret_cast<CUdeviceptr>(mRelay.residentCtas), static_cast<cuuint32_t>(mRelay.ctas),
+            CU_STREAM_WAIT_VALUE_GEQ);
+        TORCH_CHECK(result == CUDA_SUCCESS, "cuStreamWaitValue32(HALO-R relay resident) failed with CUresult ",
+            static_cast<int>(result));
     }
 
     //! Orders COPY after the consumer: `completionEvent` when nonzero, otherwise the work already queued on the
@@ -333,15 +355,17 @@ MoeRebalanceHaloRStatePtr moeRebalanceHaloRCreate(torch::Tensor outSlots, torch:
     torch::Tensor peerBases, torch::Tensor status, torch::Tensor partial, torch::Tensor routeAux,
     torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, std::int64_t readyFlagsPtr,
     torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
-    torch::Tensor relayCompletedCtas, torch::Tensor relayLaunchCount, std::int64_t readyFlagMcPtr, std::int64_t ep,
-    std::int64_t experts, std::int64_t helpers, std::int64_t sendCount, std::int64_t sendWeight, std::int64_t localRank,
-    std::int64_t topk, std::int64_t routeCapacity, std::int64_t ctas, std::int64_t relayCtas, std::int64_t copyStream)
+    torch::Tensor relayCompletedCtas, torch::Tensor relayLaunchCount, torch::Tensor relayResidentCtas,
+    std::int64_t readyFlagMcPtr, std::int64_t ep, std::int64_t experts, std::int64_t helpers, std::int64_t sendCount,
+    std::int64_t sendWeight, std::int64_t localRank, std::int64_t topk, std::int64_t routeCapacity, std::int64_t ctas,
+    std::int64_t relayCtas, std::int64_t copyStream)
 {
     return c10::make_intrusive<MoeRebalanceHaloRState>(std::move(outSlots), std::move(outIds), std::move(outOwners),
         std::move(peerBases), std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync),
         std::move(plan), std::move(routePrefix), readyFlagsPtr, std::move(relaySources), std::move(relayDestinations),
-        std::move(relayPlaneBytes), std::move(relayCompletedCtas), std::move(relayLaunchCount), readyFlagMcPtr, ep,
-        experts, helpers, sendCount, sendWeight, localRank, topk, routeCapacity, ctas, relayCtas, copyStream);
+        std::move(relayPlaneBytes), std::move(relayCompletedCtas), std::move(relayLaunchCount),
+        std::move(relayResidentCtas), readyFlagMcPtr, ep, experts, helpers, sendCount, sendWeight, localRank, topk,
+        routeCapacity, ctas, relayCtas, copyStream);
 }
 
 // The per-layer ops take this handle instead of the custom class, whose conversion costs several microseconds of
@@ -395,9 +419,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_rebalance_halo_r_create(Tensor out_slots, Tensor out_ids, Tensor out_owners, Tensor peer_bases, "
         "Tensor status, Tensor partial, Tensor route_aux, Tensor grid_sync, Tensor plan, Tensor route_prefix, "
         "int ready_flags_ptr, Tensor relay_sources, Tensor relay_destinations, Tensor relay_plane_bytes, "
-        "Tensor relay_completed_ctas, Tensor relay_launch_count, int ready_flag_mc_ptr, int ep, int experts, "
-        "int helpers, int send_count, int send_weight, int local_rank, int topk, int route_capacity, int ctas, "
-        "int relay_ctas, int copy_stream) -> __torch__.torch.classes.trtllm.MoeRebalanceHaloRState");
+        "Tensor relay_completed_ctas, Tensor relay_launch_count, Tensor relay_resident_ctas, int ready_flag_mc_ptr, "
+        "int ep, int experts, int helpers, int send_count, int send_weight, int local_rank, int topk, "
+        "int route_capacity, int ctas, int relay_ctas, int copy_stream) -> "
+        "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState");
     m.def(
         "moe_rebalance_halo_r_handle("
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState state) -> int");
