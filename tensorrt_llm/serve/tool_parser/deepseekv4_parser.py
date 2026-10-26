@@ -19,7 +19,4 @@ from .deepseekv32_parser import DeepSeekV32Parser
 class DeepSeekV4Parser(DeepSeekV32Parser):
     """Tool parser for the DeepSeek V4 DSML tool call format."""
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.bot_token = "<｜DSML｜tool_calls>"  # nosec B105
-        self.eot_token = "</｜DSML｜tool_calls>"  # nosec B105
+    _CALLS_TAG = "tool_calls"
