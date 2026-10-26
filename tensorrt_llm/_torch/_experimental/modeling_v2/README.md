@@ -71,9 +71,8 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                         +-- modeling_v2_resolve(config, llm_args)
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
-                    models/<x>/routing.py     +-- route(config, mapping, compute_capability,
-                                              |         spec_config, kv_cache_quant_algo,
-                                              |         model_config, llm_args)
+                    models/<x>/routing.py     +-- route(model_config, llm_args,
+                                              |         compute_capability)
                                               |         -> target class, or NoTarget
                                         |
                                      config.modeling_v2_target = class

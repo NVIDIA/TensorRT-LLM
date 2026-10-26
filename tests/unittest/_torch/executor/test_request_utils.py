@@ -6,12 +6,13 @@
 This module tests:
 - Request merging functions (merge_requests, merge_helix_requests)
 - Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request)
+- Rank-0 clock piggyback in RequestBroadcaster
 
 """
 
 import pickle
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -33,10 +34,62 @@ from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
+)
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.sampling_params import LogprobMode
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_multimodal_payload_broadcast_and_children_keep_the_same_contract():
+    import pickle
+
+    metadata = MultimodalItemMetadata(
+        [("audio", 0), ("image", 0)],
+        output_embedding_lengths=[1, 2],
+        input_partitions={"audio": {"features": MultimodalItemPartition(1, (3,))}},
+    )
+    payload = {
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        "audio": {"features": torch.arange(6).reshape(2, 3)},
+        "image": {},
+    }
+    source = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=2,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+    source.py_multimodal_data = payload
+    source.py_conversation_params = None
+    objects = RequestBroadcaster._collect_py_objects(None, [RequestQueueItem(42, source)])
+    # Reproduce the existing Python-object rank handoff, without adding the
+    # request aggregate, CUDA event, or cache state to its wire format.
+    restored_objects = pickle.loads(pickle.dumps(objects))
+    restored = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=2,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+    queue_items = [RequestQueueItem(42, restored)]
+    attach_py_objects_to_requests(queue_items, restored_objects)
+    request = executor_request_to_llm_request(
+        42, restored, child_req_ids=[43], exclude_last_generation_logits=False
+    )
+    params = request.py_multimodal_params
+    child = request.child_requests[0].py_multimodal_params
+    assert params.item_metadata == child.item_metadata == metadata
+    assert child is not params
+    assert child.item_metadata is not params.item_metadata
+    assert params.encoder_state is child.encoder_state is None
+    assert params.multimodal_runtime is child.multimodal_runtime is None
+    assert params.item_metadata.item_refs == (("audio", 0), ("image", 0))
+    torch.testing.assert_close(
+        child.multimodal_data["audio"]["features"], payload["audio"]["features"]
+    )
 
 
 @pytest.fixture
@@ -432,6 +485,147 @@ def test_executor_request_to_llm_request_owns_mrope_data_in_python() -> None:
     assert child_config["mrope_position_deltas"].data_ptr() != position_deltas.data_ptr()
     torch.testing.assert_close(child_config["mrope_position_ids"], position_ids)
     assert child_config["mrope_position_ids"].data_ptr() != position_ids.data_ptr()
+
+
+def _make_broadcast_item(req_id):
+    return RequestQueueItem(
+        req_id,
+        SimpleNamespace(
+            py_logits_post_processors=None,
+            py_multimodal_data=None,
+            py_scheduling_params=None,
+            py_num_logprobs=None,
+            py_disaggregated_params=None,
+            py_conversation_params=None,
+            py_lora_path=None,
+        ),
+    )
+
+
+class _SingleRoundDist:
+    """Fake transport recording the collectives RequestBroadcaster issues.
+
+    ``broadcast_or_none`` behaves like the real one: the root's object comes
+    back on the root, ``received`` stands for what a non-root rank gets.
+    """
+
+    def __init__(self, rank, *, world_size=2, has_pp=False, supports=True, received=None):
+        self.rank = rank
+        self.world_size = world_size
+        self.tp_size = world_size
+        self.cp_size = 1
+        self.has_pp = has_pp
+        # Single PP stage that is both first and last: the PP route then only
+        # runs its intra-stage tp_cp_broadcast (no send/recv chain).
+        self.pp_size = 2 if has_pp else 1
+        self.is_first_pp_rank = True
+        self.is_last_pp_rank = True
+        self.supports_single_round_broadcast = supports
+        self._received = received
+        self.calls = []
+
+    def tp_cp_broadcast(self, obj, root=0, **kwargs):
+        self.calls.append(("tp_cp_broadcast", obj))
+        return obj
+
+    # Resolved (not called) by the PP route on a first-and-last stage.
+    def send_object(self, *args, **kwargs):
+        raise AssertionError("no PP send expected on a first-and-last stage")
+
+    isend_object = recv_object = send_object
+
+    def broadcast_or_none(self, obj, root=0):
+        self.calls.append(("broadcast_or_none", obj))
+        return obj if self.rank == root else self._received
+
+    def broadcast(self, obj, root=0, prefer_cpu=False):
+        self.calls.append(("broadcast", obj, prefer_cpu))
+        return obj
+
+    # Scalar request-count collectives (main routes them through the int64
+    # helpers instead of the object broadcasts).
+    def broadcast_int64(self, values, root=0, prefer_cpu=False):
+        values = list(values)
+        self.calls.append(("broadcast_int64", values, prefer_cpu))
+        return values
+
+    def tp_cp_broadcast_int64(self, values, root=0, **kwargs):
+        values = list(values)
+        self.calls.append(("tp_cp_broadcast_int64", values))
+        return values
+
+
+def test_single_round_empty_iteration_is_one_collective():
+    dist = _SingleRoundDist(rank=0)
+    hang_detector = MagicMock()
+    broadcaster = RequestBroadcaster(dist, hang_detector)
+
+    new_requests, py_request_objects = broadcaster.broadcast([])
+
+    assert (new_requests, py_request_objects) == ([], None)
+    assert dist.calls == [("broadcast_or_none", None)]
+    hang_detector.pause.assert_called_once()
+
+
+def test_single_round_busy_iteration_sends_requests_and_py_objects_once():
+    dist = _SingleRoundDist(rank=0)
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+    items = [_make_broadcast_item(1), _make_broadcast_item(2)]
+
+    new_requests, py_request_objects = broadcaster.broadcast(items)
+
+    assert new_requests == items
+    assert py_request_objects == broadcaster._collect_py_objects(items)
+    assert len(dist.calls) == 1
+    kind, payload = dist.calls[0]
+    assert kind == "broadcast_or_none"
+    assert payload == (items, py_request_objects)
+
+
+def test_single_round_non_root_receives_payload_or_nothing():
+    items = [_make_broadcast_item(7)]
+    py_objects = RequestBroadcaster(_SingleRoundDist(rank=0), MagicMock())._collect_py_objects(
+        items
+    )
+
+    dist = _SingleRoundDist(rank=1, received=(items, py_objects))
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == (items, py_objects)
+    assert dist.calls == [("broadcast_or_none", None)]
+
+    dist = _SingleRoundDist(rank=1, received=None)
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == ([], None)
+
+
+@pytest.mark.parametrize(
+    "kwargs, reason",
+    [
+        ({"supports": False}, "transport without the single-round path"),
+        ({"has_pp": True}, "pipeline route keeps probe + send/recv chain"),
+        ({"world_size": 1}, "single rank never broadcasts"),
+    ],
+)
+def test_single_round_falls_back_to_probe_when_not_applicable(kwargs, reason):
+    dist = _SingleRoundDist(rank=0, **kwargs)
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+    items = [_make_broadcast_item(1)]
+
+    new_requests, _ = broadcaster.broadcast(items)
+
+    assert new_requests == items, reason
+    assert all(kind != "broadcast_or_none" for kind, *_ in dist.calls), reason
+
+
+def test_single_round_idle_path_keeps_cpu_probe():
+    """prefer_cpu marks the idle path: non-root ranks may park in the probe for
+    minutes, so it must stay on the CPU transport (probe first, not the
+    GPU-staged single round)."""
+    dist = _SingleRoundDist(rank=0)
+    broadcaster = RequestBroadcaster(dist, MagicMock())
+
+    new_requests, py_request_objects = broadcaster.broadcast([], prefer_cpu=True)
+
+    assert (new_requests, py_request_objects) == ([], None)
+    assert dist.calls == [("broadcast_int64", [0], True)]
 
 
 def test_merge_helix_requests_with_padding():
@@ -930,3 +1124,99 @@ def test_executor_request_to_llm_request_adopts_return_routed_experts() -> None:
 
     assert _build(None).py_return_routed_experts is False  # default: opted out
     assert _build(True).py_return_routed_experts is True
+
+
+class TestBroadcasterClock:
+    """RequestBroadcaster(sync_clock=True): rank 0's clock and aux ride along
+    with the request count."""
+
+    def _dist(self, rank, world_size=2):
+        dist = Mock()
+        dist.rank = rank
+        dist.world_size = world_size
+        dist.has_pp = False
+        dist.supports_single_round_broadcast = False
+        return dist
+
+    def _hang_detector(self):
+        hd = Mock()
+        hd.pause.return_value.__enter__ = Mock(return_value=None)
+        hd.pause.return_value.__exit__ = Mock(return_value=False)
+        return hd
+
+    def test_default_probe_unchanged(self):
+        dist = self._dist(rank=1)
+        dist.broadcast_int64 = Mock(return_value=[0])
+        b = RequestBroadcaster(dist, self._hang_detector())
+        assert b.broadcast([]) == ([], None)
+        (values,), _ = dist.broadcast_int64.call_args
+        assert list(values) == [0]
+        assert b.rank0_now is None
+
+    def test_sync_clock_keeps_the_count_probe(self):
+        """The single-round broadcast has no room for the clock."""
+        for sync_clock, probes in ((False, 0), (True, 1)):
+            dist = self._dist(rank=1)
+            dist.supports_single_round_broadcast = True
+            dist.broadcast_or_none = Mock(return_value=None)
+            dist.broadcast_int64 = Mock(return_value=[0, 1_000_000, -1])
+            b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=sync_clock)
+            assert b.broadcast([]) == ([], None)
+            assert dist.broadcast_int64.call_count == probes
+            assert dist.broadcast_or_none.call_count == 1 - probes
+
+    def test_default_probe_pp_forwards_count(self):
+        dist = self._dist(rank=4, world_size=8)
+        dist.has_pp = True
+        dist.is_first_pp_rank = False
+        dist.is_last_pp_rank = False
+        dist.pp_size = 2
+        dist.prev_pp_rank, dist.next_pp_rank = 0, 1
+        dist.recv_object = Mock(return_value=[0])
+        dist.send_object = Mock()
+        b = RequestBroadcaster(dist, self._hang_detector())
+        assert b.broadcast([]) == ([], None)
+        dist.send_object.assert_called_once_with([0], 1, 3)
+        assert b.rank0_now is None
+
+    def test_sync_clock_single_rank(self):
+        dist = self._dist(rank=0, world_size=1)
+        b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
+        assert b.broadcast([]) == ([], None)
+        assert b.rank0_now is not None and b.rank0_now > 0
+
+    def test_sync_clock_pp_forwards_header(self):
+        dist = self._dist(rank=4, world_size=8)
+        dist.has_pp = True
+        dist.is_first_pp_rank = False
+        dist.is_last_pp_rank = False
+        dist.pp_size = 2
+        dist.prev_pp_rank, dist.next_pp_rank = 0, 1
+        dist.recv_object = Mock(return_value=[0, 5_000_000, -1])
+        dist.send_object = Mock()
+        b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
+        assert b.broadcast([]) == ([], None)
+        dist.send_object.assert_called_once_with([0, 5_000_000, -1], 1, 3)
+        assert b.rank0_now == pytest.approx(5.0)
+
+    def test_sync_clock_aux_rides_along(self):
+        root = self._dist(rank=0)
+        root.broadcast_int64 = Mock(side_effect=lambda header, root, prefer_cpu: header)
+        b = RequestBroadcaster(root, self._hang_detector(), sync_clock=True)
+        b.aux = 0.25
+        b.broadcast([])
+        (values,), _ = root.broadcast_int64.call_args
+        assert len(values) == 3 and values[2] == 250_000
+        assert b.rank0_aux == pytest.approx(0.25)
+        b.aux = None  # nothing to send yet
+        b.broadcast([])
+        assert b.rank0_aux is None
+
+        other = self._dist(rank=1)
+        other.broadcast_int64 = Mock(return_value=[0, 1_000_000, 170_000])
+        b = RequestBroadcaster(other, self._hang_detector(), sync_clock=True)
+        b.aux = 9.0  # ignored off rank 0
+        b.broadcast([])
+        (values,), _ = other.broadcast_int64.call_args
+        assert list(values) == [0, 0, -1]
+        assert b.rank0_aux == pytest.approx(0.17) and b.rank0_now == pytest.approx(1.0)

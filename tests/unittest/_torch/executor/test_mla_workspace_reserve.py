@@ -302,10 +302,8 @@ def _executor_with_manager(manager, is_warmup=False, max_seq_len=4096):
     # Bypass __init__; the cap getter reads is_warmup, the cap carried on kv_cache_manager, and max_seq_len
     # (only to decide whether the resolved cap is too tight to batch on -- see the degenerate-cap warning).
     # The estimator is the single decision point -- the scheduler never re-derives w or the pool layout.
-    # Set the _is_warmup backing field directly -- the is_warmup property setter also propagates into
-    # model_engine, which this bare (no-__init__) executor doesn't have.
     exe = object.__new__(PyExecutor)
-    exe._is_warmup = is_warmup
+    exe.is_warmup = is_warmup
     exe.kv_cache_manager = manager
     exe.max_seq_len = max_seq_len
     return exe
