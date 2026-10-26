@@ -1446,7 +1446,7 @@ class EncoderCUDAGraphRunner:
             # Neither mode prepares inputs through the encode-only path that
             # validates them and synthesizes capture stand-ins: feature mode
             # stages via its own mirrors, and the encoder-decoder runner
-            # overrides prepare_inputs/_prepare_capture_inputs. The graph would
+            # overrides _prepare_inputs/_prepare_capture_inputs. The graph would
             # capture the caller's tensor and then read it stale (or freed).
             unsupported = ("feature-mode"
                            if self.feature_mode else "encoder-decoder")
