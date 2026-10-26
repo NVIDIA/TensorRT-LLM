@@ -75,7 +75,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
-from ..speculative.utils import update_draft_len
+from ..speculative.utils import disagg_gen_first_draft_tokens, update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
@@ -8125,15 +8125,16 @@ class PyExecutor:
             req.decoding_iter = 1
             req.py_decoding_iter = 1
             first_gen_tokens = req.context_phase_params.first_gen_tokens
-            ctx_draft_tokens = req.context_phase_params.draft_tokens
-            if not ctx_draft_tokens and self.model_engine.enable_spec_decode:
-                # CTX has no speculative decoding — fill dummy draft tokens
-                # so model_engine builds the correct input shape (1 + draft_len
-                # tokens per gen request). Dummies will be rejected on verify,
-                # and the draft model will produce real tokens for next step.
-                ctx_draft_tokens = [0
-                                    ] * self.model_engine.max_total_draft_tokens
-            req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+            # Dummy draft tokens when the context server sent none; under
+            # rejection sampling always dummies, verified against the one-hot
+            # placeholder row (no proposal row exists on this server).
+            req.py_draft_tokens, needs_onehot = disagg_gen_first_draft_tokens(
+                req.context_phase_params.draft_tokens,
+                getattr(self.model_engine, "spec_config", None),
+                self.model_engine.enable_spec_decode,
+                getattr(self.model_engine, "max_total_draft_tokens", 0))
+            if needs_onehot:
+                req.py_needs_onehot_draft_probs = True
             beam_width = req.py_beam_width
             if not self._update_sampler_state_for_disagg_gen_request(
                     req, beam_width, first_gen_tokens):
