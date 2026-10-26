@@ -1196,6 +1196,31 @@ def test_selfsampling_regclus_sampling_rescue(
 
 
 @pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_rescue_negative_inf_tail(k: int, deterministic: bool) -> None:
+    """Partial float4 slots must not duplicate the separately loaded scalar tail."""
+    envelope = 131072
+    valid_lengths = [base + tail for base in (k, 65536) for tail in (1, 2, 3)]
+    rows = len(valid_lengths)
+    assert ss_host.route(rows, envelope, envelope, k, det=deterministic)["kernel"] == "reg_clus"
+    logits = torch.full((rows, envelope), 3e38, dtype=torch.float32, device=_DEV)
+    for row, valid in enumerate(valid_lengths):
+        logits[row, :valid] = -float("inf")
+        # The threshold is -inf, while every real tail element is a strict winner.
+        logits[row, valid // 4 * 4 : valid] = 1
+    lengths = torch.tensor(valid_lengths, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, lengths, out, max_seq_len=envelope, deterministic=deterministic)
+    torch.cuda.synchronize()
+    for row, valid in enumerate(valid_lengths):
+        values = logits[row : row + 1, :valid]
+        _check_exact(logits[row : row + 1], out[row : row + 1], valid, values.topk(k).values)
+        if deterministic:
+            expected = torch.argsort(values, descending=True, stable=True)[:, :k]
+            assert torch.equal(out[row : row + 1].long().sort().values, expected.sort().values)
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
 @pytest.mark.parametrize("candidates", [16384, 16385])
 @pytest.mark.parametrize("tied", [False, True])
 @pytest.mark.parametrize("deterministic", [False, True])
@@ -1204,6 +1229,7 @@ def test_selfsampling_regclus_rescue_candidate_limit(
 ) -> None:
     """Both sides of the rescue limit preserve strict winners and threshold ties."""
     n, npad = 65551, 65600
+    assert ss_host.route(1, n, npad, k, det=deterministic)["kernel"] == "reg_clus"
     logits = torch.full((1, npad), 3e38, dtype=torch.float32, device=_DEV)
     logits[:, :n] = 0
     logits[:, : k // 2] = 2
@@ -1230,6 +1256,7 @@ def test_selfsampling_regclus_rescue_mtp_short_rows(
     """An MTP launch may mix rescued long rows, identity rows and empty windows."""
     next_n, envelope = 4, 32771
     npad = (envelope + 63) // 64 * 64
+    assert ss_host.route(4 * next_n, envelope, npad, k, det=deterministic)["kernel"] == "reg_clus"
     raw_lengths = [
         0,
         (k - 1) * compress_ratio,

@@ -11498,6 +11498,7 @@ class GvrRegClusKernel:
 
             if cutlass.const_expr(self.hint_free):
                 # All cluster CTAs retain their register fragments for exact rescue.
+                # Only complete float4 loads are resident; rank 0 owns the scalar tail.
                 if degen != cutlass.Int32(0):
                     rlo = cutlass.Uint32(0)
                     rhi = cutlass.Uint32(0xFFFFFFFF)
@@ -11530,7 +11531,7 @@ class GvrRegClusKernel:
                                 ) + cutlass.Int32(s % 4)
                                 uk = fkey(_val__regclus(frags, s))
                                 if (
-                                    idx < n
+                                    idx < (n4 << cutlass.Int32(2))
                                     and cutlass.Uint32(uk) >= cutlass.Uint32(rlo)
                                     and cutlass.Uint32(uk) <= cutlass.Uint32(rhi)
                                 ):
@@ -11586,7 +11587,7 @@ class GvrRegClusKernel:
                                 << cutlass.Int32(2)
                             ) + cutlass.Int32(s % 4)
                             uk = fkey(_val__regclus(frags, s))
-                            if idx < n:
+                            if idx < (n4 << cutlass.Int32(2)):
                                 if cutlass.Int64(cutlass.Uint32(uk)) > ethr:
                                     masks_a = masks_a | cutlass.Int32(1 << s)
                                 if (
@@ -11721,7 +11722,7 @@ class GvrRegClusKernel:
                                     << cutlass.Int32(2)
                                 ) + cutlass.Int32(s % 4)
                                 uk = fkey(_val__regclus(frags, s))
-                                if idx < n:
+                                if idx < (n4 << cutlass.Int32(2)):
                                     q1f = cutlass.Int32(cutlass.Int64(cutlass.Uint32(uk)) > ethr)
                                     q2f = cutlass.Int32(
                                         tie_m != cutlass.Int32(0)
@@ -11771,7 +11772,7 @@ class GvrRegClusKernel:
                                     << cutlass.Int32(2)
                                 ) + cutlass.Int32(s % 4)
                                 uk = fkey(_val__regclus(frags, s))
-                                if idx < n:
+                                if idx < (n4 << cutlass.Int32(2)):
                                     q1f = cutlass.Int32(cutlass.Int64(cutlass.Uint32(uk)) > ethr)
                                     q2f = cutlass.Int32(
                                         tie_m != cutlass.Int32(0)
