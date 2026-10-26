@@ -95,10 +95,14 @@ WAN_MULTI_GPU_GOLDEN_BACKSTOP_LPIPS_THRESHOLD = 0.32
 # value.  Same-seed draws of the 384x384 L0 case measured 0.1180, 0.1528 and
 # 0.1732 on two GPUs and 0.0926, 0.1528, 0.1732, 0.1858 and 0.2033 on four
 # (FA4 gives the same output on two and four GPUs); the fusion toggle alone
-# moves the video 0.1776 on one GPU.  Any whole-build numerics change (e.g.
-# a kernel fusion) re-draws from this band, so a bound taken from one draw
-# is not stable.  0.30 keeps ~0.10 over the worst benign draw; broken output
-# (other seed 0.585, time-reversed video 0.459) lands above it.
+# moves the video 0.1776 on one GPU.  That fusion (QK-norm + RoPE) is lossless
+# in accuracy but not in bits: it keeps FP32 and rounds to BF16 once where
+# eager rounds after each of five ops, so 39 % of its outputs differ from
+# eager by one BF16 ULP (rel. L2 3.5e-3; the torch.compile'd unfused path is
+# equally far from eager, 3.6e-3).  Any such whole-build rounding change
+# re-draws from the band, so a bound taken from one draw is not stable.
+# 0.30 keeps ~0.10 over the worst benign draw; broken output (other seed
+# 0.585, time-reversed video 0.459) lands above it.
 MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLD = WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD
 WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND = "FA4"
 WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO = "wan22_t2v_fa4_fully_eager_lpips_golden_video.mp4"
