@@ -1673,16 +1673,14 @@ class DecoderInputPreparer:
                     mrope_position_delta = self._decode_mrope_position_delta(request)
                     if mrope_position_delta is not None:
                         has_gen_mrope_delta = True
-                        # NOTE: Expanding position_ids to 3D tensor who is using mrope
-                        batch_mrope = (
-                            mrope_position_delta.is_cuda
-                            and mrope_position_delta.device
-                            == self._buffers.mrope_position_ids_cuda.device
-                            and mrope_position_delta.dtype == torch.int32
-                            and mrope_position_delta.numel() == 1
-                            and mrope_position_delta.ndim <= 3
+                        # Batch deltas that need no device or dtype conversion.
+                        mrope_position_buffer = self._buffers.mrope_position_ids_cuda
+                        can_batch_mrope = (
+                            mrope_position_delta.numel() == 1
+                            and mrope_position_delta.device == mrope_position_buffer.device
+                            and mrope_position_delta.dtype == mrope_position_buffer.dtype
                         )
-                        if not batch_mrope:
+                        if not can_batch_mrope:
                             gen_mrope_position_ids = (
                                 past_seen_token_num + mrope_position_delta
                             ).expand(3, 1, 1)
@@ -1709,7 +1707,7 @@ class DecoderInputPreparer:
                         for beam in range(beam_width):
                             # Locate this beam's single token in the flat array.
                             token_start = len(position_ids) - beam_width + beam
-                            if batch_mrope:
+                            if can_batch_mrope:
                                 host.lists.generation_mrope_positions.append(
                                     (token_start, past_seen_token_num, mrope_position_delta)
                                 )

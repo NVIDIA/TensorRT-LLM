@@ -1955,6 +1955,64 @@ class DecoderForwardTestCase(unittest.TestCase):
             atol=0,
             rtol=0)
 
+    def test_mrope_mixed_batched_and_fallback_positions_match_fallback(
+            self) -> None:
+        """Mixed scalar batching matches the old per-request writes exactly."""
+        engine, kv_cache_manager = create_model_engine_and_kvcache(
+            llm_args=TorchLlmArgs(model="dummy",
+                                  max_batch_size=2,
+                                  max_num_tokens=64),
+            model=DummyModel(torch.half, rope_scaling={"type": "mrope"}))
+        self.addCleanup(kv_cache_manager.shutdown)
+        preparer = engine._runner._inputs
+        sentinel = 123
+
+        def run(
+            delta_dtypes: tuple[torch.dtype, torch.dtype]
+        ) -> tuple[HostInputs, torch.Tensor]:
+            requests = []
+            for seq_slot, (num_tokens, delta, dtype) in enumerate(
+                    zip((4, 7), (10, -3), delta_dtypes)):
+                request = LlmRequest(
+                    request_id=seq_slot + 1,
+                    max_new_tokens=1,
+                    input_tokens=list(range(1, num_tokens + 1)),
+                    sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                        SamplingParams()._get_sampling_config()),
+                    is_streaming=False)
+                request.py_seq_slot = seq_slot
+                request.py_multimodal_data = {
+                    "mrope_config": {
+                        "mrope_position_deltas":
+                        torch.tensor([[delta]], dtype=dtype, device="cuda")
+                    }
+                }
+                requests.append(request)
+            host = HostInputs(use_mrope=True,
+                              mrope_dummy_seq_slot=engine.max_num_tokens,
+                              extra_inputs=preparer._new_extra_inputs(),
+                              context_prompt_lookahead=None)
+            host.lists.generation_requests.extend(requests)
+            preparer._pack_generation_requests(host, frozenset(), None)
+            host.total_num_tokens = len(host.lists.position_ids)
+            preparer._buffers.mrope_position_ids_cuda.fill_(sentinel)
+            preparer._copy_position_ids_to_device(host)
+            return host, preparer._buffers.mrope_position_ids_cuda.clone()
+
+        mixed_host, mixed = run((torch.int32, torch.int64))
+        fallback_host, fallback = run((torch.int64, torch.int64))
+
+        self.assertEqual(
+            [row for row, _, _ in mixed_host.lists.generation_mrope_positions],
+            [0])
+        self.assertEqual(
+            [(start, end)
+             for start, end, _ in mixed_host.lists.mrope_position_ids],
+            [(1, 2)])
+        self.assertEqual(fallback_host.lists.generation_mrope_positions, [])
+        torch.testing.assert_close(mixed, fallback, atol=0, rtol=0)
+        self.assertTrue(torch.all(mixed[:, :, 2:] == sentinel).item())
+
     def test_mrope_all_text_only_drops_deltas(self) -> None:
         """A generation batch with no MRoPE metadata at all emits no delta
         tensors, so the steady-state generation fast path stays reachable."""

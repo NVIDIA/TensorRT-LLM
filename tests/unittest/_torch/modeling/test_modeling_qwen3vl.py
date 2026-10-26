@@ -862,6 +862,7 @@ def test_qwen_vl_vision_packed_rope_cuda(
         vision_attention.apply_rope(
             *fused_qkv.split(num_heads * head_dim, dim=-1),
             position_embeddings=(cos, sin),
+            packed_qk=fused_qkv[:, : 2 * num_heads * head_dim],
         )
     assert torch.equal(storage, original)
     assert calls.call_count == 1
