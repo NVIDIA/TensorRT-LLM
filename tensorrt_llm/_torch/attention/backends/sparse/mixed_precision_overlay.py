@@ -25,7 +25,10 @@ def _write_rows_kernel(
     pos_ptr,
     table_ptr,
     table_stride,
+    table_rows,
+    table_width,
     pool_ptr,
+    pool_pages,
     rows_per_page,
     ROW: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -34,8 +37,10 @@ def _write_rows_kernel(
     req = tl.load(req_ptr + token)
     pos = tl.load(pos_ptr + token)
     # pos < 0 marks a padding row the caller does not want stored.
-    page = tl.load(table_ptr + req * table_stride + pos // rows_per_page, mask=pos >= 0, other=-1)
-    if page >= 0:
+    column = pos // rows_per_page
+    valid = (pos >= 0) & (column < table_width) & (req >= 0) & (req < table_rows)
+    page = tl.load(table_ptr + req * table_stride + column, mask=valid, other=-1)
+    if (page >= 0) & (page < pool_pages):
         offs = tl.arange(0, BLOCK)
         mask = offs < ROW
         row = tl.load(rows_ptr + token.to(tl.int64) * ROW + offs, mask=mask, other=0.0)
@@ -52,8 +57,12 @@ def _overlay_rows_kernel(
     req_ptr,
     table_ptr,
     table_stride,
+    table_rows,
+    table_width,
     pool_ptr,
+    pool_pages,
     scratch_ptr,
+    scratch_rows,
     rows_per_page,
     K,
     ROW: tl.constexpr,
@@ -64,10 +73,15 @@ def _overlay_rows_kernel(
     col = pair % K
     tok = tl.load(topk_ptr + row_id.to(tl.int64) * topk_stride + col)
     compact = tl.load(compact_ptr + row_id.to(tl.int64) * compact_stride + col)
-    if (tok >= 0) & (compact >= 0):
-        req = tl.load(req_ptr + row_id)
-        page = tl.load(table_ptr + req * table_stride + tok // rows_per_page)
-        if page >= 0:
+    req = tl.load(req_ptr + row_id)
+    # Padding rows and columns of the index tensors may hold stale values;
+    # bound them the way the backends' own index conversion does.
+    column = tok // rows_per_page
+    valid = (tok >= 0) & (column < table_width) & (compact >= 0) & (compact < scratch_rows)
+    valid = valid & (req >= 0) & (req < table_rows)
+    if valid:
+        page = tl.load(table_ptr + req * table_stride + column)
+        if (page >= 0) & (page < pool_pages):
             offs = tl.arange(0, BLOCK)
             mask = offs < ROW
             slot = page.to(tl.int64) * rows_per_page + tok % rows_per_page
@@ -79,14 +93,27 @@ def _overlay_rows_kernel(
             )
 
 
-def _retained_pool(metadata, layer_idx: int) -> Optional[torch.Tensor]:
-    """``[pages, tokens_per_block, row]`` view of the layer's retained pool, else None."""
+def _retained_table(metadata, owner) -> Optional[torch.Tensor]:
+    """Page table of the retained pool that ``owner`` (attention or compressor) uses.
+
+    Twins of different page sizes sit in different pools, so DeepSeek-V4 keeps
+    one table per compression ratio; the DSA backend keeps a single table.
+    """
     table = getattr(metadata, "mixed_high_block_table", None)
+    if isinstance(table, dict):
+        table = table.get(getattr(owner, "compress_ratio", None))
+    return table
+
+
+def _retained_pool(metadata, owner) -> Optional[torch.Tensor]:
+    """``[pages, rows_per_page, row]`` view of ``owner``'s retained pool, else None."""
+    if _retained_table(metadata, owner) is None:
+        return None
     manager = metadata.kv_cache_manager
     high_layers = getattr(manager, "high_layers", None)
-    if table is None or not high_layers:
+    if not high_layers:
         return None
-    local = manager.layer_offsets.get(layer_idx)
+    local = manager.layer_offsets.get(owner.layer_idx)
     if local not in high_layers:
         return None
     # [pages, kv_factor, rows_per_page, heads, width] with one head and no value half.
@@ -99,10 +126,10 @@ def _block(width: int) -> int:
 
 
 def write_rows(
-    metadata, layer_idx: int, rows: torch.Tensor, req_idx: torch.Tensor, positions: torch.Tensor
+    metadata, owner, rows: torch.Tensor, req_idx: torch.Tensor, positions: torch.Tensor
 ) -> None:
-    """Store ``rows`` (one per token, RoPE already applied) in the retained pool."""
-    pool = _retained_pool(metadata, layer_idx)
+    """Store ``rows`` (one per token, RoPE already applied) in ``owner``'s retained pool."""
+    pool = _retained_pool(metadata, owner)
     if pool is None:
         return
     rows = rows.reshape(rows.shape[0], -1)
@@ -112,14 +139,17 @@ def write_rows(
         rows = rows.contiguous()
     width = pool.shape[-1]
     assert rows.shape[1] == width, (rows.shape, width)
-    table = metadata.mixed_high_block_table
+    table = _retained_table(metadata, owner)
     _write_rows_kernel[(rows.shape[0],)](
         rows,
         req_idx,
         positions,
         table,
         table.stride(0),
+        table.shape[0],
+        table.shape[1],
         pool,
+        pool.shape[0],
         pool.shape[1],
         ROW=width,
         BLOCK=_block(width),
@@ -134,7 +164,7 @@ def write_context_rows(attention, metadata, latent_cache: torch.Tensor) -> None:
     num_ctx = metadata.num_ctx_tokens
     write_rows(
         metadata,
-        attention.layer_idx,
+        attention,
         latent_cache[:num_ctx],
         metadata.req_idx_per_token[:num_ctx],
         positions,
@@ -148,7 +178,7 @@ def write_generation_rows(
 
     Same interleaved-pair rotation and cos/sin table as the append kernel.
     """
-    if _retained_pool(metadata, attention.layer_idx) is None:
+    if _retained_pool(metadata, attention) is None:
         return
     rows = latent_cache.reshape(latent_cache.shape[0], -1)
     num_rows = rows.shape[0]
@@ -169,7 +199,7 @@ def write_generation_rows(
     k[..., 1] = y * cos + x * sin
     write_rows(
         metadata,
-        attention.layer_idx,
+        attention,
         # The append kernel rounds the rotated values to the activation dtype
         # before quantizing; do the same so the rows match a plain FP8 pool.
         rotated.to(rows.dtype),
@@ -194,7 +224,7 @@ def write_compressed_rows(
     lands at compressed position ``start_pos[request] + offset``; rows past a
     request's ``num_comp_tokens`` or outside ``compressed_mask`` are padding.
     """
-    if _retained_pool(metadata, compressor.layer_idx) is None:
+    if _retained_pool(metadata, compressor) is None:
         return
     total = rows.shape[0]
     if total == 0:
@@ -205,9 +235,7 @@ def write_compressed_rows(
     local_idx = token_idx - cu[batch_idx]
     valid = compressed_mask[:total].to(torch.bool) & (local_idx < num_comp_tokens[batch_idx])
     positions = torch.where(valid, start_pos[batch_idx] + local_idx, torch.full_like(local_idx, -1))
-    write_rows(
-        metadata, compressor.layer_idx, rows, batch_idx.to(torch.int32), positions.to(torch.int32)
-    )
+    write_rows(metadata, compressor, rows, batch_idx.to(torch.int32), positions.to(torch.int32))
 
 
 def overlay_rows(
@@ -224,7 +252,7 @@ def overlay_rows(
     request (-1 = none), ``req_idx`` that row's request in batch order and
     ``compact_indices`` the scratch row the gather used for each pair (-1 = none).
     """
-    pool = _retained_pool(metadata, attention.layer_idx)
+    pool = _retained_pool(metadata, attention)
     if pool is None:
         return
     num_rows, k = topk_indices.shape
@@ -232,7 +260,7 @@ def overlay_rows(
         return
     assert topk_indices.stride(1) == 1 and compact_indices.stride(1) == 1
     width = pool.shape[-1]
-    table = metadata.mixed_high_block_table
+    table = _retained_table(metadata, attention)
     _overlay_rows_kernel[(num_rows * k,)](
         topk_indices,
         topk_indices.stride(0),
@@ -241,8 +269,12 @@ def overlay_rows(
         req_idx,
         table,
         table.stride(0),
+        table.shape[0],
+        table.shape[1],
         pool,
+        pool.shape[0],
         scratch,
+        scratch.numel() // width,
         pool.shape[1],
         k,
         ROW=width,

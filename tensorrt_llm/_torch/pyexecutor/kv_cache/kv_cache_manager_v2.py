@@ -1822,6 +1822,11 @@ class KVCacheManagerV2(BaseResourceManager):
         assert candidate is not None
         self.kv_cache_manager_py_config = config
         self.impl = candidate
+        # Retained-token pools are read page-wise (and overlaid) before every row
+        # of a page has been written; start them zeroed so never-written rows do
+        # not read as FP8 NaN.
+        for local in self.high_layers:
+            self._get_mixed_precision_buffers(local, "NHD", "high").zero_()
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
