@@ -166,7 +166,15 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
             finally:
                 if request_metrics is not None:
-                    request_metrics.finish(context.code())
+                    status = context.code()
+                    remaining = context.time_remaining()
+                    if (
+                        status in (None, grpc.StatusCode.OK)
+                        and remaining is not None
+                        and remaining <= 0
+                    ):
+                        status = grpc.StatusCode.DEADLINE_EXCEEDED
+                    request_metrics.finish(status)
 
     async def _generate(
         self,

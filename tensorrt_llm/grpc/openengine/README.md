@@ -157,6 +157,8 @@ curl --fail http://127.0.0.1:8001/prometheus/metrics
 
 Metrics use port `8001` and inherit `--host`. Override them with `--openengine-metrics-port` and `--openengine-metrics-host`; the metrics port must differ from the gRPC port. These options change the address, not whether collection is enabled.
 
+Monitoring tools scrape each service's metrics endpoint directly. Configure the engine endpoint as its own target; another service does not need to re-export these metrics. Metrics endpoint discovery through `GetServerInfo` is deferred, so configure the metrics host, port, and path in your monitoring setup.
+
 For Prometheus, add a separate scrape target:
 
 ```yaml

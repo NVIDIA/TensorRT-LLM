@@ -1603,12 +1603,13 @@ def test_generate_reserve_failure_is_unavailable() -> None:
     "failure,expected_status,expected_outcome",
     [
         ("cancel_release", grpc.StatusCode.CANCELLED, "cancelled"),
+        ("deadline_release", grpc.StatusCode.DEADLINE_EXCEEDED, "timeout"),
         ("reject_release", grpc.StatusCode.INVALID_ARGUMENT, "rejected"),
         ("abort_submission", grpc.StatusCode.CANCELLED, "cancelled"),
     ],
 )
 def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expected_outcome):
-    """Real transport cancellation and cleanup errors must not mislabel RPCs."""
+    """Real transport deadlines, cancellation, and cleanup errors retain their outcomes."""
     from tensorrt_llm.grpc.openengine.coordinator import CoordinationError
 
     async def run():
@@ -1623,7 +1624,7 @@ def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expect
 
             async def release(self):
                 entered.set()
-                if failure == "cancel_release":
+                if failure in ("cancel_release", "deadline_release"):
                     await release.wait()
                 elif failure == "reject_release":
                     raise CoordinationError("release failed")
@@ -1661,7 +1662,9 @@ def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expect
                     model="" if failure == "reject_release" else "model",
                     prompt="hello",
                 )
-                call = openengine_pb2_grpc.InferenceStub(channel).Generate(request, timeout=5)
+                call = openengine_pb2_grpc.InferenceStub(channel).Generate(
+                    request, timeout=0.5 if failure == "deadline_release" else 5
+                )
 
                 async def drain():
                     try:
@@ -1671,9 +1674,10 @@ def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expect
                         pass
 
                 task = asyncio.create_task(drain())
-                if failure == "cancel_release":
+                if failure in ("cancel_release", "deadline_release"):
                     await asyncio.wait_for(entered.wait(), 3)
-                    call.cancel()
+                    if failure == "cancel_release":
+                        call.cancel()
                 await task
                 assert await call.code() == expected_status
                 await asyncio.wait_for(server.stop(0), 3)
