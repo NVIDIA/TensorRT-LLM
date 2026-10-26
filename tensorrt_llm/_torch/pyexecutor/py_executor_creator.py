@@ -1365,10 +1365,12 @@ def _create_py_executor(
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
             # Without the KV-cache estimation the executor serves from its
-            # construction: it gets the standalone dense DWDP manager now,
-            # primes it and exits it at shutdown. With the estimation only the
-            # serving phase gets it (rebind_resources below), since
-            # release_resources() exits the managers the executor holds.
+            # construction: it gets the DWDP manager or the standalone dense
+            # DWDP manager now, primes it and exits it at shutdown. With the
+            # estimation only the serving phase gets it (rebind_resources
+            # below), since release_resources() exits the managers the
+            # executor holds.
+            dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
             dense_dwdp_manager=dense_dwdp_manager
             if not estimating_kv_cache else None,
             max_num_sequences=max_num_seq_slots,
