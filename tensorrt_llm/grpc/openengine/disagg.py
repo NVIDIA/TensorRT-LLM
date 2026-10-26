@@ -8,6 +8,7 @@ a generation worker resumes it by echoing that session back on its request.
 """
 
 import base64
+import secrets
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -17,6 +18,7 @@ from google.protobuf.json_format import MessageToDict
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID
 
 from .bindings import generation_pb2, kv_pb2
 from .formatting import clamp_logprob
@@ -210,7 +212,11 @@ def disaggregated_params_from_request(
         )
     if request_type not in _EXTRA_REQUEST_TYPES:
         raise ValueError(f"extra.{_REQUEST_TYPE_KEY} must be one of {sorted(_EXTRA_REQUEST_TYPES)}")
-    return DisaggregatedParams(request_type=request_type)
+    params = DisaggregatedParams(request_type=request_type)
+    if request_type == "context_only":
+        # Local context IDs can collide across independent prefill engines.
+        params.disagg_request_id = MIN_GLOBAL_ID + secrets.randbelow((1 << 63) - MIN_GLOBAL_ID)
+    return params
 
 
 def prefill_ready_response(
