@@ -5215,9 +5215,11 @@ class ModelingV2MiniMaxM31Nvfp4Sm107Tp2Ctx(MiniMaxM3ForCausalLM):
     # The DSpark draft window ships with the context KV in disaggregated serving (F0a); the step loop is otherwise the
     # built-in model's. TP2CTX_PROXY_Q128: the prefill proxy (indexer max-score) plan uses 128-row query tiles with 4 KV
     # splits on steps whose longest query span exceeds 128 rows (MSA maxscore_qo_tile: the same score table bits; the
-    # OnlyScore proxy modes are native on SM107). Kill switch TRTLLM_M31_DISABLE_TP2CTX_PROXY_Q128=1.
+    # OnlyScore proxy modes are native on SM107). Kill switch TRTLLM_M31_DISABLE_TP2CTX_PROXY_Q128=1. The late-compile
+    # detector arms after warmup, as on the generation targets: the server marks ready and logs any compile after it.
     runtime_hooks = RuntimeHooks(
         disagg_draft_kv=True,
+        late_compile_detect=True,
         msa=MsaRuntimePolicy(
             prefill_proxy_qo_tile=None if m31_disabled("TP2CTX_PROXY_Q128") else 128,
             prefill_proxy_kv_splits=None if m31_disabled("TP2CTX_PROXY_Q128") else 4,
