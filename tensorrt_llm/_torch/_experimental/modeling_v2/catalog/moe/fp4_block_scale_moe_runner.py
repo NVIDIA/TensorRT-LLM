@@ -116,7 +116,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     # call per rank over its moe_ep window at its moe_tp slice of the
     # intermediate (dep4 with moe ep4: a 64-wide window at the full 2048; tp8:
     # all 256 experts at 256), so the window cells here and the
-    # intermediate-slice ones in its cells.py are the shapes it runs, and the
+    # intermediate-slice ones in this entry's test are the shapes it runs, and the
     # full stack is the single-rank one.
     R1 = dict(hidden=7168, intermediate=2048, num_experts=256, top_k=8)
 

@@ -32,7 +32,7 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # A prefill shape here; the shipped targets' decode shapes at their hidden
-    # sizes are in their cells.py. Both targets call this op only on the
+    # sizes are in this entry's test. Both targets call this op only on the
     # residual stream, so there is no third width to cover and no 3-D case:
     # unlike plain rmsnorm this one never runs on a per-head view.
     CELLS: tuple[Cell, ...] = (

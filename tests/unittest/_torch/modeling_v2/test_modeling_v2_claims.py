@@ -173,47 +173,46 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
     )
 
 
-def _cells_files() -> list[Path]:
-    return sorted((_ROOT / "models").rglob("cells.py"))
-
-
-@pytest.mark.parametrize("cells", _cells_files(), ids=lambda p: str(p.relative_to(_ROOT)))
-def test_target_cells_feed_entries_the_target_calls(cells):
-    """A `cells.py` holds a target's configurations for the catalog entries it calls.
-
-    It sits in a target's directory, imports entries only from
-    `catalog/<area>/<entry>.py`, and each of those its target's own code
-    imports too: a cell for an entry nothing under it calls certifies nothing
-    it runs. Each entry's test sits at the mirrored path
-    `<area>/test_modeling_v2_<entry>.py` and drives `certified_cells(`, which
-    is how it reaches these cells, and how CBTS finds the tests a `cells.py`
-    change has to rerun.
-    """
-    target_dir = cells.parent
-    assert (target_dir / "modeling.py").is_file(), f"{cells}: not beside a target's modeling.py"
-    used = "".join(
-        p.read_text()
-        for p in target_dir.rglob("*.py")
-        if p != cells and "__pycache__" not in p.parts
+def _target_cells_tests() -> list[Path]:
+    unit_root = Path(__file__).resolve().parent
+    return sorted(
+        p for p in unit_root.glob("*/test_modeling_v2_*.py") if "TARGET_CELLS" in p.read_text()
     )
-    tests_root = Path(__file__).resolve().parent
-    for node in ast.walk(ast.parse(cells.read_text())):
-        if not isinstance(node, ast.ImportFrom) or not node.level:
-            continue
-        module = (node.module or "").split(".")
-        if module == ["catalog", "_op"]:
-            continue
-        assert len(module) == 3 and module[0] == "catalog", (
-            f"{cells}: imports {node.module!r}; cells.py imports catalog entries only"
+
+
+@pytest.mark.parametrize(
+    "test", _target_cells_tests(), ids=lambda p: str(p.relative_to(p.parents[1]))
+)
+def test_target_cells_feed_entries_the_target_calls(test):
+    """An entry test's `TARGET_CELLS` hold the shapes each target calls the entry with.
+
+    The test sits at `<area>/test_modeling_v2_<entry>.py`, mirroring
+    `catalog/<area>/<entry>.py`. Each key is a target directory under
+    `models/`, and that target's own code imports the entry: a cell for an
+    entry the target never calls certifies nothing it runs.
+    """
+    area, entry = test.parent.name, test.stem.removeprefix("test_modeling_v2_")
+    assert (_ROOT / "catalog" / area / f"{entry}.py").is_file(), (
+        f"{test.name}: declares TARGET_CELLS but mirrors no catalog/{area}/{entry}.py"
+    )
+    assert "certified_cells(" in test.read_text(), (
+        f"{test.name}: declares TARGET_CELLS but never drives them through certified_cells("
+    )
+    targets = None
+    for node in ast.parse(test.read_text()).body:
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "TARGET_CELLS":
+            targets = [ast.literal_eval(k) for k in node.value.keys]
+    assert targets, f"{test.name}: TARGET_CELLS is not a dict literal keyed by target directory"
+    for target in targets:
+        target_dir = _ROOT / "models" / target
+        assert (target_dir / "modeling.py").is_file(), (
+            f"{test.name}: {target!r} is not a target directory under models/"
         )
-        _, area, entry = module
+        used = "".join(
+            p.read_text() for p in target_dir.rglob("*.py") if "__pycache__" not in p.parts
+        )
         assert re.search(rf"catalog\.{area}\.{entry} import", used), (
-            f"{cells}: declares cells for {area}/{entry}, which its target never imports"
-        )
-        test = tests_root / area / f"test_modeling_v2_{entry}.py"
-        assert test.is_file() and "certified_cells(" in test.read_text(), (
-            f"{cells}: {area}/{entry} has no test at {test.relative_to(tests_root)} "
-            f"driving certified_cells("
+            f"{test.name}: declares cells for {target}, which never imports {area}/{entry}"
         )
 
 

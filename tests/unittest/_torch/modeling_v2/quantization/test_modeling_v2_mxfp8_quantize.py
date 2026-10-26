@@ -7,6 +7,7 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (  # noqa: E501
     mxfp8_quantize as op,
 )
@@ -37,7 +38,18 @@ def _build(spec, seed):
     return torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
 
 
-CELLS = certified_cells(op)
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="gpt-oss hidden 2880, linear scales, aligned to 512 -> padded 3072",
+            spec=dict(shape=(16, 2880), dtype=torch.bfloat16, swizzled=False, alignment=512),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])

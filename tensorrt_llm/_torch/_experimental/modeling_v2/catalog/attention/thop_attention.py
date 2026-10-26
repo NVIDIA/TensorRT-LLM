@@ -105,7 +105,7 @@ class ThopAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # The shipped targets' cells are in their cells.py. gpt-oss alternates its
+    # The shipped targets' cells are in this entry's test. gpt-oss alternates its
     # two window classes inside one engine, so both of its cells are live every
     # step; deepseek runs context and generation against the same pool. Cells
     # with `cached` (tokens already in the pool) and `new` (this call's q rows)

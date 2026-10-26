@@ -27,8 +27,8 @@ business, not the entry's: nothing on the way to the kernel needs it.
 reads the cell lists and their reasons, not a document -- and what they read is
 what CI proved on the last commit. An entry's own `CELLS` are the
 configurations that belong to the op whoever calls it; the shapes a shipped
-target runs are in that target's `cells.py`, keyed by entry, and the entry's
-test drives both. An input outside them is not known to work, which for most
+target runs are in the entry's test, as `TARGET_CELLS` keyed by target, and
+the test drives both. An input outside them is not known to work, which for most
 of these ops means "nobody measured it" rather than "known broken".
 
 `is_valid` is never called on the way to the kernel. It states, in executable

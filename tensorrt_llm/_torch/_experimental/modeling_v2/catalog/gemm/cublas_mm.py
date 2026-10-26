@@ -20,8 +20,8 @@ class CublasMm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # Both targets use this for every dense projection. Their cells.py carry
-    # the three argument shapes that differ in kind rather than in size: fused
+    # Both targets use this for every dense projection. This entry's test
+    # carries their three argument shapes that differ in kind rather than in size: fused
     # bias (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
     # projections), and an out_dtype that is not the input's (deepseek's router
     # asks for fp32 logits).

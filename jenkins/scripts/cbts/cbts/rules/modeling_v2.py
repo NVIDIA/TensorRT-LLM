@@ -36,10 +36,6 @@ Entry selection: each changed file maps to the tests it can affect.
   every target under it. A target's gate is `Test<TargetClass>` in
   `accuracy/modeling_v2/test_<family>.py`, the class name read from the
   import line in the family's `routing.py` that routes to it.
-- A target's `cells.py` is input configurations for catalog ops and
-  nothing else: it changes no forward. It selects only the unit tests of
-  the catalog ops it imports, at their mirrored paths
-  (`catalog/<area>/<op>.py` -> `unittest/_torch/modeling_v2/<area>/test_modeling_v2_<op>.py`).
 - Anything else -- the catalog, the resolver, `models/__init__.py` -- can
   reach every target and selects every modeling_v2 entry.
 
@@ -50,9 +46,8 @@ A unit test prefix that no entry of a block sits at or under keeps the
 longest entry of that block that covers it instead: a family is one
 directory entry, and a change to one of its targets runs the family's
 unit tests. Whenever the tree on disk cannot answer -- a node directory
-deleted with its `routing.py`, a `cells.py` that cannot be parsed or names
-an op whose test is not at the mirrored path -- the file falls back to the
-wider selection.
+deleted with its `routing.py` -- the file falls back to the wider
+selection.
 
 Outward fallback: not needed, and that is a property of the design
 rather than an accident. Nothing beyond the resolver module is imported
@@ -84,7 +79,6 @@ verifies about the wheel.
 
 from __future__ import annotations
 
-import ast
 import re
 from pathlib import Path
 from typing import Optional
@@ -98,7 +92,6 @@ from .docs import is_docs_path
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
 _MV2_SRC_PREFIXES: tuple[str, ...] = ("tensorrt_llm/_torch/_experimental/modeling_v2/",)
-_MV2_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _ACCURACY_ROOT = "accuracy/modeling_v2"
@@ -200,45 +193,11 @@ class ModelingV2Rule(Rule):
                 gates.add(f"{_ACCURACY_ROOT}/test_{family}.py::Test{target_cls}")
         return gates
 
-    def _cells_tests(self, rel: Path) -> Optional[set[str]]:
-        """Unit tests of the catalog ops a `cells.py` imports; None if not resolvable."""
-        try:
-            tree = ast.parse((self._src_root / rel).read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeDecodeError):
-            return None
-        package = rel.parent.parts
-        tests = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom):
-                continue
-            if node.level:
-                if node.level > len(package) + 1:
-                    return None
-                base = package[: len(package) - node.level + 1]
-                module = (*base, *(node.module or "").split("."))
-            elif (node.module or "").startswith(_MV2_PACKAGE + "."):
-                module = tuple(node.module[len(_MV2_PACKAGE) + 1 :].split("."))
-            else:
-                continue
-            if module[:1] != ("catalog",) or len(module) != 3 or module[1].startswith("_"):
-                if module == ("catalog", "_op"):
-                    continue
-                return None
-            test = f"{_UNIT_ROOT}/{module[1]}/test_modeling_v2_{module[2]}.py"
-            if not (self._tests_root / test).is_file():
-                return None
-            tests.add(test)
-        return tests
-
     def _prefixes_for(self, path: str) -> Optional[set[str]]:
         """Filter prefixes a changed file selects; None selects every modeling_v2 entry."""
         rel = Path(path[len(_MV2_SRC_PREFIXES[0]) :])
         if rel.parts[0] != "models" or len(rel.parts) < 3:
             return None
-        if rel.name == "cells.py":
-            tests = self._cells_tests(rel)
-            if tests is not None:
-                return tests
         node = Path(*rel.parts[1:-1])
         while not self._is_node(node):
             node = node.parent

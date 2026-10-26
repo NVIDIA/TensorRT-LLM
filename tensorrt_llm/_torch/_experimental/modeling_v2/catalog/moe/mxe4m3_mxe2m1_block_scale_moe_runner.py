@@ -170,7 +170,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     # clamped SwiGlu constants the checkpoint carries (alpha 1.702, beta 1.0,
     # clamp limit 7.0). The default target at tp1 holds every expert whole; on
     # more ranks it holds an expert window (moe_ep) and an intermediate slice
-    # (moe_tp), which is what its cells.py covers. `intermediate` is
+    # (moe_tp), which is what its cells in this entry's test cover. `intermediate` is
     # the slice's real width and `intermediate_pad` the width every rank
     # declares (see the default target's weights.py).
     GPT_OSS = dict(hidden=2880, intermediate=2880, num_experts=128, top_k=4)

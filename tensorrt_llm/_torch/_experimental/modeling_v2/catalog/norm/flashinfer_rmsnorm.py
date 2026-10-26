@@ -27,7 +27,7 @@ class FlashinferRmsnorm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # The widths the shipped targets normalize over are in their cells.py.
+    # The widths the shipped targets normalize over are in this entry's test.
     # gpt-oss reaches this op only on its residual stream; deepseek reaches it
     # there and on the two lora ranks its MLA projects through, which is why
     # narrow rows are certified at all -- a 512-wide row is one 128-bit vector
