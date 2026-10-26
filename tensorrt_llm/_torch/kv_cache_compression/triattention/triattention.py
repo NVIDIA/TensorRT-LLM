@@ -105,6 +105,7 @@ def _allocate_block_offset_snapshot(
 
 
 _MEAN_PHASE_MAX_POSITION = 1 << 24
+_MEAN_PHASE_MAX_OFFSET = 1 << 16
 
 
 class TriAttentionCompressionManager(KVCacheCompressionManager):
@@ -337,7 +338,9 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
             int(request.py_max_new_tokens),
             max(int(self.kv_cache_manager.max_seq_len) - int(request.py_prompt_len), 0),
         )
-        if max_position >= _MEAN_PHASE_MAX_POSITION:
+        # compute_mean_phase adds offsets through 2**16 in FP32. Every
+        # integer through 2**24 (inclusive) must remain exactly representable.
+        if max_position + _MEAN_PHASE_MAX_OFFSET > _MEAN_PHASE_MAX_POSITION:
             raise ValueError("TriAttention position exceeds the exact-FP32 phase range")
 
     def on_generation_step_begin(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:

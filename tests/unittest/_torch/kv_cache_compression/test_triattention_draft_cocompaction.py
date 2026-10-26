@@ -195,14 +195,25 @@ def test_request_admission_does_not_grow_workspace():
     manager._build_score_runtime.assert_not_called()
     manager._compaction_done_event.synchronize.assert_not_called()
 
-    # Admission checks the effective position after the sequence-length cap.
-    limit = 1 << 24
-    manager.kv_cache_manager.max_seq_len = limit + 1024
-    manager.on_request_init(_make_request(4, py_prompt_len=100, py_max_new_tokens=limit - 101))
+    # The largest phase offset must still fit the inclusive FP32 integer bound.
+    limit = (1 << 24) - (1 << 16)
+    manager.kv_cache_manager.max_seq_len = 1 << 24
+    for request_id, position in enumerate((limit - 1, limit), start=4):
+        manager.on_request_init(
+            _make_request(request_id, py_prompt_len=100, py_max_new_tokens=position - 100)
+        )
+    for position in (limit + 1, (1 << 24) - 1):
+        with pytest.raises(ValueError, match="exact-FP32"):
+            manager.on_request_init(
+                _make_request(6, py_prompt_len=100, py_max_new_tokens=position - 100)
+            )
+    # Apply max_seq_len before checking the phase range, including the boundary.
+    for sequence_limit in (limit - 1, limit):
+        manager.kv_cache_manager.max_seq_len = sequence_limit
+        manager.on_request_init(_make_request(7, py_prompt_len=100, py_max_new_tokens=1 << 25))
+    manager.kv_cache_manager.max_seq_len = limit + 1
     with pytest.raises(ValueError, match="exact-FP32"):
-        manager.on_request_init(_make_request(5, py_prompt_len=100, py_max_new_tokens=limit - 100))
-    manager.kv_cache_manager.max_seq_len = limit - 1
-    manager.on_request_init(_make_request(6, py_prompt_len=100, py_max_new_tokens=2 * limit))
+        manager.on_request_init(_make_request(8, py_prompt_len=100, py_max_new_tokens=1 << 25))
     manager._build_score_runtime.assert_not_called()
 
 
