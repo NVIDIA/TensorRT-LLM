@@ -1282,7 +1282,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.warning("RPC client not initialized, cannot get stats")
             return []
 
-        stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
+        # Allow transport overhead beyond the worker's queue wait, while
+        # bounding the client even if the worker never replies.
+        stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote(
+            timeout=None if timeout is None else timeout + 1.0)
         return [json.loads(s) if isinstance(s, str) else s for s in stats]
 
     def get_kv_cache_capacity(self) -> dict:
@@ -1390,7 +1393,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         # Fetch stats via RPC and populate the result
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
+                timeout=timeout).remote(
+                    timeout=None if timeout is None else timeout + 1.0)
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             stats = []

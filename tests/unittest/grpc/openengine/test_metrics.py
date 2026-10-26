@@ -35,6 +35,7 @@ def _run_worker(mode: str) -> None:
         "collection_requests",
         "collection_iterations",
         "http_enablement",
+        "rpc_shutdown",
     ],
 )
 def test_prometheus_contract(mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -318,6 +319,22 @@ async def _lifecycle() -> None:
     from tensorrt_llm.grpc.openengine.metrics import OpenEngineMetrics
 
     llm = SimpleNamespace(args=_args(), get_stats=lambda timeout: [])
+    if socket.has_ipv6:
+        try:
+            ipv6_socket = socket.create_server(("::1", 0), family=socket.AF_INET6)
+        except OSError:
+            pass  # IPv6 can be disabled even when the Python build supports it.
+        else:
+            ipv6_socket.close()
+            ipv6 = OpenEngineMetrics(llm, "test-model", "[::1]", 0, True)
+            try:
+                await ipv6.start()
+                await asyncio.to_thread(
+                    lambda: socket.create_connection(("::1", ipv6.port), timeout=2).close()
+                )
+            finally:
+                await ipv6.stop()
+                await ipv6.wait_for_collection()
     with socket.create_server(("127.0.0.1", 0)) as occupied:
         service = OpenEngineMetrics(llm, "test-model", "127.0.0.1", occupied.getsockname()[1], True)
         try:
@@ -409,6 +426,81 @@ async def _collection_mode(requests: bool) -> None:
         await metrics.wait_for_collection()
 
 
+async def _rpc_shutdown() -> None:
+    """An unanswered stats RPC must time out or release its caller on close."""
+    import threading
+
+    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+    from tensorrt_llm.executor.rpc import RPCCancelled, RPCClient, RPCServer, RPCTimeout
+    from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
+    from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
+
+    for mode in ("deadline", "rpc_deadline", "sync", "future", "async", "queued"):
+        entered, release = threading.Event(), threading.Event()
+
+        class App:
+            async def fetch_stats_wait_async(self, timeout):
+                entered.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.01)
+                return []
+
+        server = RPCServer(App(), async_run_task=True)
+        server.bind(get_unique_ipc_addr())
+        server.start()
+        client = RPCClient(server.address, hmac_key=server.hmac_key, num_workers=1)
+        proxy = SimpleNamespace(rpc_client=client)
+        try:
+            if mode == "queued":
+                # Hold the sole worker until close has stopped the RPC loop.
+                blocker = client._executor.submit(release.wait)
+                read = asyncio.wrap_future(
+                    client.fetch_stats_wait_async(timeout=0.1).remote_future()
+                )
+                closing = asyncio.create_task(asyncio.to_thread(client.close))
+                await asyncio.to_thread(client._loop_thread.join, 3)
+                assert not client._loop_thread.is_alive()
+                release.set()
+                await asyncio.wait_for(closing, 3)
+                assert blocker.result(timeout=1)
+                with pytest.raises(RPCCancelled):
+                    await asyncio.wait_for(read, 3)
+                with pytest.raises(RPCCancelled):
+                    GenerationExecutorProxy.get_stats(proxy, timeout=0.1)
+                continue
+            if mode == "async":
+                read = asyncio.create_task(
+                    client.fetch_stats_wait_async(timeout=0.1).remote_async()
+                )
+            elif mode == "future":
+                read = asyncio.wrap_future(
+                    client.fetch_stats_wait_async(timeout=0.1).remote_future()
+                )
+            else:
+                proxy_type = (
+                    GenerationExecutorRpcProxy
+                    if mode == "rpc_deadline"
+                    else GenerationExecutorProxy
+                )
+                read = asyncio.create_task(
+                    asyncio.to_thread(proxy_type.get_stats, proxy, timeout=0.1)
+                )
+            assert await asyncio.to_thread(entered.wait, 3)
+            if mode == "deadline":
+                with pytest.raises(RPCTimeout):
+                    await asyncio.wait_for(read, 3)
+            elif mode == "rpc_deadline":
+                assert await asyncio.wait_for(read, 3) == []
+            else:
+                await asyncio.wait_for(asyncio.to_thread(client.close), 3)
+                with pytest.raises(RPCCancelled):
+                    await asyncio.wait_for(read, 3)
+        finally:
+            release.set()
+            await asyncio.to_thread(client.close)
+            await asyncio.to_thread(server.shutdown)
+
+
 def _http_enablement() -> None:
     """File collection must expose Prometheus without opting HTTP headers in."""
     from tensorrt_llm.serve.openai_server import OpenAIServer
@@ -459,6 +551,8 @@ if __name__ == "__main__":
             asyncio.run(_collection_mode(requests=mode == "collection_requests"))
         elif mode == "http_enablement":
             _http_enablement()
+        elif mode == "rpc_shutdown":
+            asyncio.run(_rpc_shutdown())
         else:
             asyncio.run(_lifecycle())
     finally:

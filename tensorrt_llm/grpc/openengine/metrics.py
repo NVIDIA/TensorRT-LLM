@@ -12,6 +12,8 @@ import time
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 
+import grpc
+
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
 
@@ -135,10 +137,14 @@ class RequestMetrics:
         # Engine candidate accounting is independent of the RPC's outcome.
         self._metrics.record_result(result)
 
-    def finish(self) -> None:
+    def finish(self, status: grpc.StatusCode | None = None) -> None:
         """Record at most once, including when a suspended stream resumes later."""
         if self._finished:
             return
+        if status == grpc.StatusCode.CANCELLED:
+            self._outcome = RpcOutcome.CANCELLED
+        elif status == grpc.StatusCode.DEADLINE_EXCEEDED:
+            self._outcome = RpcOutcome.TIMEOUT
         self._finished = True
         self._metrics.record_outcome(self._phase, self._outcome.value)
 
@@ -262,8 +268,9 @@ class OpenEngineMetrics:
         """Bind the HTTP listener and start periodic collection in the owner only."""
         if not self.owner:
             return
-        family = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)[0][0]
-        self._socket = socket.create_server((self.host, self.port), family=family, backlog=8)
+        bind_host = self.host.strip("[]")
+        family = socket.getaddrinfo(bind_host, self.port, type=socket.SOCK_STREAM)[0][0]
+        self._socket = socket.create_server((bind_host, self.port), family=family, backlog=8)
         self.port = self._socket.getsockname()[1]
         self._thread = threading.Thread(
             target=self._http.run,

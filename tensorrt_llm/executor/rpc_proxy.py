@@ -109,7 +109,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         """
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
+                timeout=timeout).remote(
+                    timeout=None if timeout is None else timeout + 1.0)
             return [json.loads(s) if isinstance(s, str) else s for s in stats]
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
@@ -181,7 +182,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         # Fetch stats via RPC and populate the result
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
+                timeout=timeout).remote(
+                    timeout=None if timeout is None else timeout + 1.0)
         except Exception:
             stats = []
 

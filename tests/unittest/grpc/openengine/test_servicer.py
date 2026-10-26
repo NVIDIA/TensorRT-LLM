@@ -1570,6 +1570,120 @@ def test_oversized_prompt_logprobs_are_refused_not_built(error_on_final_result: 
     assert outcomes == [("aggregated", "engine_error")]
 
 
+def test_generate_reserve_failure_is_unavailable() -> None:
+    """A coordination failure before submission is not an engine failure."""
+    from tensorrt_llm.grpc.openengine.coordinator import CoordinationError
+
+    class Frontend:
+        async def reserve(self, request_id):
+            raise CoordinationError("reservation failed")
+
+    outcomes = []
+    metrics = SimpleNamespace(record_outcome=lambda *args: outcomes.append(args))
+    servicer = OpenEngineInferenceServicer(
+        _FakeLlm([]), "test-model", frontend=Frontend(), metrics=metrics
+    )
+    context = FakeServicerContext()
+    request = generation_pb2.GenerateRequest(
+        request_id="reserve-failure", model="test-model", prompt="hello"
+    )
+
+    async def run():
+        with pytest.raises(AbortError) as error:
+            async for _ in servicer.Generate(request, context):
+                pass
+        assert error.value.code == grpc.StatusCode.UNAVAILABLE
+
+    asyncio.run(run())
+    assert outcomes == [("aggregated", "unavailable")]
+
+
+@pytest.mark.parametrize(
+    "failure,expected_status,expected_outcome",
+    [
+        ("cancel_release", grpc.StatusCode.CANCELLED, "cancelled"),
+        ("reject_release", grpc.StatusCode.INVALID_ARGUMENT, "rejected"),
+        ("abort_submission", grpc.StatusCode.CANCELLED, "cancelled"),
+    ],
+)
+def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expected_outcome):
+    """Real transport cancellation and cleanup errors must not mislabel RPCs."""
+    from tensorrt_llm.grpc.openengine.coordinator import CoordinationError
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        outcomes = []
+
+        class Reservation:
+            aborted = failure == "abort_submission"
+
+            def bind(self, handle):
+                pass
+
+            async def release(self):
+                entered.set()
+                if failure == "cancel_release":
+                    await release.wait()
+                elif failure == "reject_release":
+                    raise CoordinationError("release failed")
+
+        class Frontend:
+            async def reserve(self, request_id):
+                return Reservation()
+
+        output = SimpleNamespace(
+            index=0,
+            token_ids=[10],
+            text="A",
+            logprobs=[],
+            prompt_logprobs=[],
+            finish_reason="length",
+            stop_reason=None,
+        )
+        result = SimpleNamespace(
+            prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None, finished=True
+        )
+        metrics = SimpleNamespace(
+            record_outcome=lambda *args: outcomes.append(args), record_result=lambda _: None
+        )
+        servicer = OpenEngineInferenceServicer(
+            _FakeLlm([result]), "test-model", frontend=Frontend(), metrics=metrics
+        )
+        server = grpc.aio.server()
+        openengine_pb2_grpc.add_InferenceServicer_to_server(servicer, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+                request = generation_pb2.GenerateRequest(
+                    request_id="cleanup",
+                    model="" if failure == "reject_release" else "model",
+                    prompt="hello",
+                )
+                call = openengine_pb2_grpc.InferenceStub(channel).Generate(request, timeout=5)
+
+                async def drain():
+                    try:
+                        async for _ in call:
+                            pass
+                    except (grpc.aio.AioRpcError, asyncio.CancelledError):
+                        pass
+
+                task = asyncio.create_task(drain())
+                if failure == "cancel_release":
+                    await asyncio.wait_for(entered.wait(), 3)
+                    call.cancel()
+                await task
+                assert await call.code() == expected_status
+                await asyncio.wait_for(server.stop(0), 3)
+                assert outcomes == [("aggregated", expected_outcome)]
+        finally:
+            release.set()
+            await server.stop(0)
+
+    asyncio.run(run())
+
+
 def test_generate_aborts_the_engine_when_the_rpc_is_cancelled() -> None:
     """A cancelled RPC must abort the engine request, not just stop streaming.
 

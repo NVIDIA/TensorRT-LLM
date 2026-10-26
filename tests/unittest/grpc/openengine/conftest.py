@@ -46,6 +46,9 @@ class FakeServicerContext:
     def cancelled(self) -> bool:
         return self.is_cancelled
 
+    def code(self) -> grpc.StatusCode | None:
+        return self.abort_code
+
     def add_done_callback(self, callback: Any) -> None:
         self.done_callbacks.append(callback)
 

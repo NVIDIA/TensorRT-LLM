@@ -153,16 +153,20 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             try:
                 if reservation is not None:
                     await asyncio.shield(reservation.release())
-            except CoordinationError as error:
+            except asyncio.CancelledError as error:
                 if request_metrics is not None:
                     request_metrics.observe_exception(error)
+                raise
+            except CoordinationError as error:
                 # Cleanup still fails the serving group through FrontendClient.
                 # Preserve cancellation or an already selected RPC error.
                 if not context.cancelled() and context.code() in (None, grpc.StatusCode.OK):
+                    if request_metrics is not None:
+                        request_metrics.observe_exception(error)
                     await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
             finally:
                 if request_metrics is not None:
-                    request_metrics.finish()
+                    request_metrics.finish(context.code())
 
     async def _generate(
         self,
