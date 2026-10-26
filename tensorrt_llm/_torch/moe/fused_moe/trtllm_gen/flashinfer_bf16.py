@@ -45,9 +45,8 @@ from .kernel_inputs import prepare_kernel_inputs, to_trtllm_gen_act_type
 class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
     """``flashinfer.trtllm_gen.fused_moe.none`` -- the unquantized path.
 
-    FlashInfer-exclusive, and the one leaf reached without the opt-in flag:
-    ``trtllm_bf16_moe`` has no counterpart in TRT-LLM's own cubins, so there is
-    no native leaf to prefer and nothing for a flag to switch between. It is
+    The only FlashInfer leaf: ``trtllm_bf16_moe`` has no counterpart in
+    TRT-LLM's own cubins, so there is no native leaf for this format. It is
     also the only leaf whose kernel does not route internally, which is what
     ``_requires_separated_routing`` below says.
     """
