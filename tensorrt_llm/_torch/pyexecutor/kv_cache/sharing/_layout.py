@@ -280,13 +280,26 @@ class _Heads:
         self.state_rank = self.tp_rank * cp_size + cp_rank
         self._per_rank = list(getattr(manager, "num_kv_heads_per_layer", ()) or ())
         self._total = getattr(manager, "num_kv_heads", None)
-        self._virtual = _manager.virtual_layers(manager) is not None
         self._pp_layers = manager.pp_layers
+        virtual = _manager.virtual_layers(manager)
+        self._virtual = virtual is not None
+        local_of_model = {int(model): local for local, model in enumerate(self._pp_layers)}
+        self._head_index = (
+            {
+                internal: local_of_model[model]
+                for internal, (model, _) in virtual[0].items()
+                if model in local_of_model
+            }
+            if virtual is not None
+            else {}
+        )
 
     def per_rank(self, internal: int) -> int:
         if not self._per_rank:
             return 0
-        index = internal if internal < len(self._per_rank) else 0
+        index = self._head_index.get(internal, internal)
+        if index >= len(self._per_rank):
+            index = 0
         return int(self._per_rank[index] or 0)
 
     def total(self, internal: int) -> int | None:

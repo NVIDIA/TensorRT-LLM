@@ -831,6 +831,22 @@ def test_replicas_are_listed_by_ascending_flat_rank():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tp_size,heads,expected",
+    [
+        (8, (2, 4), [(0, 1), (0, 1), (2, 3), (2, 3), (4, 5), (4, 5), (6, 7), (6, 7)]),
+        (6, (2, 3), [(0, 1), (0, 1), (2,), (3,), (4, 5), (4, 5)]),
+        (8, (4, 8), [(rank,) for rank in range(8)]),
+    ],
+)
+def test_mixed_head_replication_matches_every_buffer(tp_size, heads, expected):
+    ranks = [
+        derive_layout(mixed_shares(tp_size, rank, heads)).page_layout for rank in range(tp_size)
+    ]
+    assert [page_layout.replica_ranks(ranks, rank, 0) for rank in range(tp_size)] == expected
+
+
+@pytest.mark.cpu_only
 def test_each_attention_data_parallel_rank_holds_its_own_requests():
     ranks = replica_instance(
         tp=4, attention_dp=True, groups_of=lambda p, t, c: [("attention", (0, 1), ShardDesc())]
@@ -1428,6 +1444,57 @@ def test_fp4_mla_publishes_each_layer_s_model_layer(kit, monkeypatch):
         groups = derive_layout(mgr).page_layout.layer_groups
         published = {layer: m for g in groups for layer, m in zip(g.layers, g.model_layers)}
         assert published == {layer: layer // 2 for layer in range(6)}, published
+
+
+@gpu
+@skip_pre_hopper
+def test_fp4_mla_lending_requires_the_sidecars_decode_reads(kit, monkeypatch):
+    """A lender fetch must deliver V sidecars because it has no native receive rebuild."""
+    with fp4_mla(kit, monkeypatch, "triton") as mgr:
+        mgr._model_attention_windows = dict.fromkeys(mgr.pp_layers, 1)
+        layout = derive_layout(mgr).page_layout
+        required = [b for b in layout.buffers if b.role in ("mla_v_scale", "mla_v_packed")]
+        assert "mla_v_scale" in {b.role for b in required}
+        assert all(b.transferred for b in required)
+
+
+@gpu
+@skip_pre_blackwell
+def test_retained_precision_twins_describe_their_original_layer_s_head_stride(kit):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    with kit.managed(
+        lambda: KVCacheManagerV2(
+            kv_cache_config=KvCacheConfig(
+                dtype="mixed_nvfp4_bfloat16",
+                mixed_precision_first_n=1,
+                mixed_precision_last_n=65,
+                enable_block_reuse=True,
+                pool_ratio=None,
+                max_gpu_total_bytes=128 << 20,
+            ),
+            kv_cache_type=CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=[2, 4],
+            head_dim=64,
+            tokens_per_block=128,
+            max_seq_len=1024,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            dtype=DataType.BF16,
+        )
+    ) as mgr:
+        layout = derive_layout(mgr).page_layout
+        for original, internal in mgr.high_layers.items():
+            global_layer = _manager.global_layer_ids(mgr, [internal])[0]
+            actual = mgr.get_buffers(original, "HND", mixed_precision_pool="high")
+            head_bytes = actual.stride(-3) * actual.element_size()
+            buffers = [b for b in layout.buffers if b.layer == global_layer]
+            assert buffers and all(b.geometry.bytes_per_head == head_bytes for b in buffers)
 
 
 @pytest.mark.cpu_only

@@ -4444,8 +4444,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Allocates capacity for the full prompt (+ draft) and sets
         ``kv_cache.history_length`` to ``prompt_len``. Returns True on
-        success, False if preparation or resize failed (cache is suspended
-        on resize failure).
+        success, False if preparation or resize failed (an unlocked cache
+        is suspended on first-chunk resize failure).
         """
         reused = self.prepare_context_cache(req)
         if reused is None:
@@ -4479,8 +4479,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         success = kv_cache.resize(capacity, history_len)
         if not success:
-            if req.is_first_context_chunk:
-                self._check_suspendable(kv_cache)
+            if req.is_first_context_chunk and not self._holds_page_locks(req.py_request_id):
                 kv_cache.suspend()
             return False
         self._fill_fresh_kv_pages(req.py_request_id)

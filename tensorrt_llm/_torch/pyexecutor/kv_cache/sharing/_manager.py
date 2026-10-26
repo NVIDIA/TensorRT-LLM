@@ -268,7 +268,9 @@ def role_layouts(manager: KVCacheManagerV2) -> dict[str, object]:
 
 
 def ignored_roles(manager: KVCacheManagerV2) -> frozenset[str]:
-    """Roles the manager declares a transfer leaves out."""
+    """Roles omitted without a receive-time rebuild, which lending does not invoke."""
+    if callable(getattr(manager, "rebuild_disagg_imported_cache", None)):
+        return frozenset()
     getter = getattr(manager, "get_disagg_ignored_roles", None)
     return frozenset(str(role) for role in (getter() if getter else ()))
 

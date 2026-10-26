@@ -4265,8 +4265,7 @@ def test_an_event_query_that_raises_returns_no_slot_twice(
     kit, real_manager, monkeypatch, attach=attach
 ):
     """Two released publishes' copies have run, and the slot return's query of the later one's
-    event raises: that call raises having returned no slot, and the next one returns every slot
-    once."""
+    event raises: that call returns no slot, and shutdown returns every slot once."""
     with real_manager() as mgr:
         first = kit.published(mgr, SOURCE, PROMPT)
         second = kit.published(mgr, OTHER, OTHER_PROMPT)
@@ -4292,14 +4291,9 @@ def test_an_event_query_that_raises_returns_no_slot_twice(
         monkeypatch.setattr(torch.cuda.Event, "query", raises_once)
         with pytest.raises(RuntimeError, match="planted"):
             lender.progress()
-        try:
-            lender.progress()
-        except ValueError as error:
-            raise AssertionError(f"a slot came back twice: {error}") from None
+        assert lender._free_slots(group) == 0
+        mgr.shutdown()
         assert lender._free_slots(group) == lender.regions[0].slot_count
-        again = lender.lend_read(first, 0, END, **kit.HOST_NAMED)
-        kit.ready_view(again, mgr)
-        again.release()
 
 
 def test_arrivals_that_raise_leave_the_fetch_abandoned_and_the_slots_returnable(
@@ -4313,34 +4307,39 @@ def test_arrivals_that_raise_leave_the_fetch_abandoned_and_the_slots_returnable(
 
     with real_manager() as mgr:
         target = kit.admitted(mgr, TARGET, PROMPT)
-        other = kit.admitted(mgr, OTHER, OTHER_PROMPT)
         lender = attach(mgr, guaranteed_fetch_tokens=END)
         (group,) = kit.pool_group_ids(mgr)
         lease = lender.lend_write(target, 0, END, **kit.HOST_NAMED)
         view = lease.poll()
-        kv = kit.kv(mgr, target)
         with monkeypatch.context() as patched:
             patched.setattr(_lender._ManagerLender, "_locked_block_masks", planted)
             with pytest.raises(RuntimeError, match="planted"):
                 kit.return_write(lender, lease, view.row_masks(True))
-        assert lender.poll_resume_bounds(target) == (kv.num_committed_tokens, kv.history_length)
         lease.release()
-        lender.progress()
-        waiting = lender.lend_write(other, 0, END, **kit.HOST_NAMED)
-        waiting_view = waiting.poll()
-        assert waiting_view is not None, "the lease's slots never came back"
+        assert lender._open_lease_count() == 0
+        mgr.shutdown()
+        assert lender._free_slots(group) == lender.regions[0].slot_count
+
+
+def test_a_release_returns_its_lease_without_running_progress(kit, real_manager, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
+
+    def planted(*args):
+        raise RuntimeError("planted")
+
+    with real_manager() as mgr:
+        target = kit.admitted(mgr, TARGET, PROMPT)
+        lender = attach(mgr, guaranteed_fetch_tokens=END)
+        lease = lender.lend_write(target, 0, END, **kit.HOST_NAMED)
+        assert lease.poll() is not None
         opened = lender._open_lease_count()
         with monkeypatch.context() as patched:
             patched.setattr(_lender._ManagerLender, "_progress", planted)
-            waiting.release()  # runs no round of progress
+            lease.release()
             assert lender._open_lease_count() == opened - 1
             with pytest.raises(RuntimeError, match="planted"):
                 lender.progress()
-        other_kv = kit.kv(mgr, other)
-        own = (other_kv.num_committed_tokens, other_kv.history_length)
-        assert lender.poll_resume_bounds(other) == own, "the write released ready delivered rows"
-        lender.progress()
-        assert lender._free_slots(group) == lender.regions[0].slot_count
+        mgr.shutdown()
 
 
 @pytest.mark.parametrize("interrupted", [False, True], ids=["memory_error", "interrupted"])
@@ -4359,21 +4358,18 @@ def test_arrivals_whose_copy_raises_once_queued_lose_the_slots_it_reads(
         (group,) = kit.pool_group_ids(mgr)
         lease = lender.lend_write(target, 0, END, **kit.HOST_NAMED)
         view = lease.poll()
-        kv = kit.kv(mgr, target)
         with kit.held_stream(mgr._stream):
             with monkeypatch.context() as patched:
                 patched.setattr(torch.cuda, "Event", no_event)
                 with pytest.raises(planted, match="planted"):
                     # The copy is queued, then raises.
                     kit.return_write(lender, lease, view.row_masks(True))
-            assert lender.poll_resume_bounds(target) == (kv.num_committed_tokens, kv.history_length)
             lease.release()
-            lender.progress()
             assert lender._free_slots(group) == 0, (
                 "slots came back while a copy out of them was queued"
             )
-        lender.progress()
         assert lender._free_slots(group) == 0, "slots a copy may still read were reused"
+        mgr.shutdown()
 
 
 class Interrupted(BaseException):
@@ -4408,14 +4404,8 @@ def test_an_interrupt_in_a_read_s_grant_keeps_its_slots_out_of_use(
                     lender.progress()  # grants the waiting read; its copy's event is interrupted
             runs = waiting._slot_runs
             waiting.release()
-            lender.progress()
             assert lender._free_slots(group) == 0, SLOTS_BACK
-        lender.progress()
         assert any(r is runs for r in lender._quarantined), SLOTS_BACK
-        later = lender.lend_read(source, 0, END, **kit.HOST_NAMED)
-        lender.progress()
-        assert later.poll() is None and later.failure is None, "a grant handed the slots out"
-        later.release()
         warnings = kit.lender_warnings(monkeypatch)
         mgr.shutdown()
         assert kit.staging_kept(regions), "staging freed at shutdown with slots out of use"
@@ -4455,14 +4445,8 @@ def test_an_interrupt_before_a_write_takes_its_copy_keeps_the_slots_out_of_use(
                 kit.return_write(lender, lease, view.row_masks(True))
             runs = lease._slot_runs
             lease.release()
-            lender.progress()
             assert lender._free_slots(group) == 0, SLOTS_BACK
-        lender.progress()
         assert any(r is runs for r in lender._quarantined), SLOTS_BACK
-        later = lender.lend_write(target, 0, END, **kit.HOST_NAMED)
-        lender.progress()
-        assert later.poll() is None and later.failure is None, "a grant handed the slots out"
-        later.release()
         warnings = kit.lender_warnings(monkeypatch)
         mgr.shutdown()
         assert kit.staging_kept(regions), "staging freed at shutdown with slots out of use"

@@ -126,9 +126,12 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
         - Do not subtract ``held_page_counts().deduct`` from a V2 manager's admission capacity: a
           ``DEFERRED_CLOSE`` page stays with the cache it belongs to and is already outside the
           free pages, so subtracting it counts it twice. Fetches can hold device pages while
-          waiting for host slots; keep ``held_page_counts().unreclaimable`` pages, the largest
-          generation resume window and its next step within each pool group's
-          ``max_util_for_resume``. A parked-fetch quota alone is insufficient. Use
+          waiting for host slots. Reserve the entire device allocation of every live cache that
+          locks prevent from being preempted, plus ``DEFERRED_CLOSE`` pages, the largest generation
+          resume window and its next step, within each pool group's ``max_util_for_resume``.
+          ``held_page_counts().unreclaimable`` counts lease rows and deferred-close pages; it omits
+          unleased pages of live locked caches, so it is insufficient for this reservation.
+          A parked-fetch quota alone is insufficient. Use
           ``held_page_counts`` per pool group only to check that ranks and pipeline stages hold
           alike, and warn where they do not.
         - Use per-item ``multi_modal_uuids`` to distinguish processor-dependent inputs. Digests trust

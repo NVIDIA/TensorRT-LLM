@@ -1854,21 +1854,29 @@ def test_a_commit_held_after_lending_is_dropped_before_a_write_unlock(
 
 
 @gpu
-def test_a_fetch_from_where_the_computed_rows_end_keeps_the_held_commit(kit, real_manager):
+@pytest.mark.parametrize("lock_count", [1, 2])
+def test_a_fetch_from_where_the_computed_rows_end_keeps_the_held_commit(
+    kit, real_manager, lock_count
+):
     """A fetch from where the computed tokens end leaves the held commit to the last unlock."""
     with real_manager() as mgr:
         lender = attach(mgr)
         request = kit.admitted(mgr, SOURCE, PROMPT)
         kv = kit.kv(mgr, request)
         assert mgr.resize_context(request, request.context_remaining_length)
-        lock = lender._locks.lock(kv, {0: [0]}, READ)
+        locks = [lender._locks.lock(kv, {0: [0]}, READ) for _ in range(lock_count)]
         compute_context(mgr, request, 2 * TPB)
         assert kv.num_committed_tokens == 0, "inconclusive: the lock held no commit back"
         lease = lender.lend_write(request, 2 * TPB, len(PROMPT), **kit.DEVICE_ALL)
         assert lease.failure is None, lease.failure
         kit.ready_view(lease, mgr)
         lender.return_writes([(lease, ALL_ARRIVED, True)])
-        lender._locks.unlock(lock)
+        request.context_current_position = len(PROMPT)
+        for lock in locks[:-1]:
+            lender._locks.unlock(lock)
+            assert kv.num_committed_tokens == 0
+            assert mgr._held_commits[id(kv)][2:] == (2 * TPB, True)
+        lender._locks.unlock(locks[-1])
         assert kv.num_committed_tokens == 2 * TPB, "a fetch past the held rows dropped their commit"
 
 
@@ -2057,6 +2065,37 @@ def test_a_hybrid_manager_records_no_receive_event_after_its_slot_reset(
         mgr.prepare_resources(batch)
         assert len(recorded) == before, "the slot reset made an event"
         assert mgr.take_disagg_receive_ready(request) is None, "an event is left to take"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("locked", [False, True])
+def test_disagg_resize_pressure_returns_false_and_preserves_a_locked_cache(kit, locked):
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestType
+
+    request = kit.make_request(
+        SOURCE, PROMPT, llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    )
+    suspended = []
+    kv = SimpleNamespace(
+        capacity=TPB, resize=lambda *args: False, suspend=lambda: suspended.append(True)
+    )
+
+    def check_suspendable(cache):
+        assert not locked, "ordinary allocation pressure must not try suspending a locked cache"
+
+    manager = SimpleNamespace(
+        prepare_context_cache=lambda req: 0,
+        enable_block_reuse=False,
+        kv_cache_map={SOURCE: kv},
+        _has_cp_helix=False,
+        num_extra_kv_tokens=0,
+        _holds_page_locks=lambda request_id: locked,
+        _check_suspendable=check_suspendable,
+    )
+    assert request.is_first_context_chunk
+    assert not kv_cache_manager_v2.KVCacheManagerV2.prepare_disagg_gen_init(manager, request)
+    assert manager.kv_cache_map[SOURCE] is kv
+    assert suspended == ([] if locked else [True])
 
 
 @gpu

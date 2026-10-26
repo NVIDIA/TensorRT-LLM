@@ -239,6 +239,9 @@ def retry_held_commit(manager: KVCacheManagerV2, kv_cache: _KVCache) -> None:
     current = manager.kv_cache_map.get(request.py_request_id)
     if current is None or current is kv_cache:
         stopped = manager._retry_held_commit(request, kv_cache, end, fetch_touched_suffix)
+        retried = manager._held_commits.get(id(kv_cache))
+        if fetch_touched_suffix and retried is not None and retried[1] is request:
+            manager._held_commits[id(kv_cache)] = (*retried[:3], True)
         if stopped and current is kv_cache and manager.conversation_manager is not None:
             manager.conversation_manager.save_drop_plan(request, kv_cache)
 

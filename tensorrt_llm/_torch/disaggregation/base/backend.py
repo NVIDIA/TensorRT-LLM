@@ -141,15 +141,22 @@ class SlotRegion(Protocol):
 class LayerGroupRows(Protocol):
     """One layer group's rows of a view, described by aligned arrays.
 
-    A row is one transfer unit. When addresses are provided, each row occupies one slot in the
-    region. These members are all a backend reads of a group, apart from those a capability it
-    declares names. Row addresses need not be consecutive. A backend given rows it does not
-    recognize rejects the submission with :class:`InvalidSubmission`; it never skips them.
+    A row is one transfer unit. When slots are provided, a row concatenates one slot from each
+    named region, in region order. These members are all a backend reads of a group, apart from
+    those a capability it declares names. Ordinals and slots need not be consecutive. A backend
+    given rows it does not recognize rejects the submission with :class:`InvalidSubmission`;
+    it never skips them.
     """
 
     @property
     def layer_group_index(self) -> int:
         """The lender's local layer-group index, not the group's position in :attr:`View.groups`."""
+        ...
+
+    @property
+    def page_ordinals(self) -> np.ndarray:
+        """One logical page ordinal per row, ``int64`` of shape ``[rows]``, interpreted under the
+        lender's layout and identity rules."""
         ...
 
     @property
@@ -161,16 +168,17 @@ class LayerGroupRows(Protocol):
         ...
 
     @property
-    def addresses(self) -> np.ndarray | None:
-        """One address per row, ``int64`` of shape ``[rows]``: row ``i`` is the slot at
-        ``addresses[i]`` in the :class:`SlotRegion` at index :attr:`region_index`. ``None`` exactly
-        when :attr:`region_index` is."""
+    def slots(self) -> np.ndarray | None:
+        """One non-negative slot per row, ``int64`` of shape ``[rows]``. Row ``i`` concatenates
+        ``slot_bytes`` bytes at ``address + slots[i] * slot_bytes`` from each named
+        :class:`SlotRegion`. Every slot is below every named region's ``slot_count``.
+        ``None`` exactly when :attr:`region_indices` is."""
         ...
 
     @property
-    def region_index(self) -> int | None:
-        """The index, among the lender's regions, of the :class:`SlotRegion` the rows sit in, or
-        ``None``."""
+    def region_indices(self) -> tuple[int, ...] | None:
+        """Nonempty, distinct indices among the lender's regions, in row-byte order, or ``None``.
+        They name region positions, not pool or layer-group IDs."""
         ...
 
     def __len__(self) -> int: ...

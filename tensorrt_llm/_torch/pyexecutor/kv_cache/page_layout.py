@@ -556,6 +556,34 @@ def _same_group(layout: PageLayout, desc: LayerGroupDesc) -> LayerGroupDesc | No
     return None
 
 
+def _attention_head_ranges(
+    layout: PageLayout, desc: LayerGroupDesc
+) -> tuple[tuple[int, str, int, int], ...] | None:
+    """The transferred nonreplicated buffers' head ranges, or None without their geometry."""
+    if desc.kind != "attention":
+        return None
+    topology = layout.topology
+    tp_size = 1 if topology.attention_dp else topology.tp_size
+    tp_rank = 0 if topology.attention_dp else topology.tp_rank
+    ranges = []
+    for buffer in layout.buffers:
+        if (
+            buffer.pool_group != desc.pool_group
+            or buffer.layer not in desc.layers
+            or not buffer.transferred
+            or buffer.mapper is MapperKind.REPLICATED
+        ):
+            continue
+        total = layout.total_kv_heads_by_layer.get(buffer.layer)
+        head_bytes = buffer.geometry.bytes_per_head
+        if not total or head_bytes is None:
+            return None
+        ranges.append(
+            (buffer.layer, buffer.role, tp_rank * total // tp_size, buffer.size // head_bytes)
+        )
+    return tuple(sorted(ranges)) if ranges else None
+
+
 def replica_ranks(
     ranks: Sequence[PageLayout],
     rank: int,
@@ -570,15 +598,16 @@ def replica_ranks(
     attention data-parallel rank); hold the same pages (under Helix an attention group's pages split
     by context-parallel rank, while a state group's rows do not); hold the same layers, in a layer
     group of the same kind; and hold the same share of the group's content: a replicated buffer is
-    the same on every such rank, any other buffer on the ranks whose ``LayerGroupDesc.shard`` is
-    equal.
+    the same on every such rank. Other buffers match when their published content shards are equal,
+    or when every transferred buffer's head range is equal. Per-buffer head ranges also recognize
+    replicas when a group contains layers with different replication factors. Without head
+    geometry, the published content shard is the only basis for matching.
 
     Args:
         ranks: Every rank's layout of one instance, by flat rank.
         rank: The flat rank whose layer group is matched.
         group: The index of the layer group in that rank's layout.
-        replicated: Match the group's replicated buffers; otherwise its other buffers, which
-            split by the published shard.
+        replicated: Match the group's replicated buffers; otherwise its other buffers.
 
     Returns:
         The matching flat ranks, ascending, ``rank`` among them.
@@ -590,6 +619,7 @@ def replica_ranks(
     desc = layout.layer_groups[group]
     topology = layout.topology
     paged_by_context = desc.kind == "attention"
+    head_ranges = None if replicated else _attention_head_ranges(layout, desc)
     out = []
     for other_rank in range(len(ranks)):
         other = ranks[other_rank]
@@ -599,7 +629,13 @@ def replica_ranks(
         if paged_by_context and other_topology.cp_rank != topology.cp_rank:
             continue
         match = _same_group(other, desc)
-        if match is None or (not replicated and match.shard != desc.shard):
+        if match is None:
+            continue
+        if (
+            not replicated
+            and match.shard != desc.shard
+            and (head_ranges is None or _attention_head_ranges(other, match) != head_ranges)
+        ):
             continue
         out.append(other_rank)
     return tuple(out)
