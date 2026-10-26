@@ -270,8 +270,13 @@ def route(
         and kv_cache
         and _tp2ctx_routed()
     ):
+        from tensorrt_llm._torch import cute_aot
+
         from .minimax_m31_nvfp4__sm_107__tp2ctx.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp2Ctx
 
+        # The context target's fused QKV kernel ships an ahead-of-time CuTe DSL object; serve it before the model
+        # builds its kernels.
+        cute_aot.arm()
         return ModelingV2MiniMaxM31Nvfp4Sm107Tp2Ctx
 
     raise NoTarget(

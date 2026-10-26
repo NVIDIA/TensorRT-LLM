@@ -14,9 +14,9 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 
 
 def test_tp2ctx_arms_the_late_compile_detector():
-    hooks = m.ModelingV2MiniMaxM31Nvfp4Sm107Tp2Ctx.runtime_hooks
-    assert hooks.late_compile_detect
-    assert _arm_runtime_opt_ins(hooks)
+    assert m.ModelingV2MiniMaxM31Nvfp4Sm107Tp2Ctx.runtime_hooks.late_compile_detect
+    # The executor arms the detector from that field alone (the target's other opt-ins are process-wide).
+    assert _arm_runtime_opt_ins(RuntimeHooks(late_compile_detect=True))
 
 
 def test_a_model_without_the_opt_in_does_not_arm_it():
