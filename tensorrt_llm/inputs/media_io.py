@@ -54,6 +54,8 @@ class MediaFetchError(RuntimeError):
 
 
 class _DecodedMemoryReservation(Protocol):
+    def check_cancelled(self) -> None: ...
+
     def shrink(self, retained_bytes: int) -> None: ...
 
     def commit(self, retained_bytes: int) -> None: ...
@@ -905,11 +907,19 @@ def _load_video_by_cv2(
         # affected (e.g. every frame retrieves with a drifted shape).
         skip_warned = False
         frame_idx = 0
-        while frame_idx <= max_idx and vidcap.grab():
+        while frame_idx <= max_idx:
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.check_cancelled()
+            if not vidcap.grab():
+                break
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.check_cancelled()
             if frame_idx in target_set:
                 # Reuse a single BGR buffer across retrieves; cv2 replaces its
                 # contents in place when the argument is shape-compatible.
                 ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
+                if decoded_memory_reservation is not None:
+                    decoded_memory_reservation.check_cancelled()
                 if ok:
                     fh, fw = bgr_scratch.shape[:2]
                     if stacked_rgb is None:
@@ -965,6 +975,8 @@ def _load_video_by_cv2(
                     )
                     skip_warned = True
             frame_idx += 1
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.check_cancelled()
         vidcap.release()
 
         if stacked_rgb is None or not valid_indices:

@@ -102,6 +102,9 @@ def test_pt_decode_reserves_peak_then_commits_retained_bytes(sample_video_path: 
         committed = None
         released = False
 
+        def check_cancelled(self) -> None:
+            pass
+
         def commit(self, retained_bytes: int) -> None:
             self.committed = retained_bytes
 
@@ -132,6 +135,9 @@ def test_decode_releases_reservation_after_allocation_failure(sample_video_path:
     class _Reservation:
         released = False
 
+        def check_cancelled(self) -> None:
+            pass
+
         def commit(self, retained_bytes: int) -> None:
             raise AssertionError("failed decode must not commit")
 
@@ -159,6 +165,9 @@ def test_truncated_numpy_video_owns_only_the_counted_frames(sample_video_path: s
     committed = []
 
     class _Reservation:
+        def check_cancelled(self) -> None:
+            pass
+
         def commit(self, retained_bytes: int) -> None:
             committed.append(retained_bytes)
 

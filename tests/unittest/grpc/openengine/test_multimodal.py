@@ -521,6 +521,64 @@ def test_three_720p_videos_fit_independently_of_load_concurrency(workers):
         list(pool.map(decode, range(3)))
 
 
+@pytest.mark.parametrize("cancel_during", ["grab", "retrieve", "convert"])
+def test_video_cancellation_stops_between_frame_operations(cancel_during, monkeypatch):
+    budget = request_mapping._DecodedMediaBudget(1024)
+    operations = []
+
+    def grab():
+        operations.append("grab")
+        if cancel_during == "grab" and operations.count("grab") == 2:
+            budget.cancel()
+        return True
+
+    def retrieve(_scratch):
+        operations.append("retrieve")
+        if cancel_during == "retrieve" and operations.count("retrieve") == 2:
+            budget.cancel()
+        return True, np.zeros((1, 1, 3), dtype=np.uint8)
+
+    def convert(_source, _code, dst):
+        operations.append("convert")
+        dst.fill(0)
+        if cancel_during == "convert":
+            budget.cancel()
+
+    capture = SimpleNamespace(
+        isOpened=lambda: True,
+        get=lambda key: 3 if key == 0 else 1,
+        grab=grab,
+        retrieve=retrieve,
+        release=lambda: operations.append("release"),
+    )
+    monkeypatch.setattr(
+        media_io,
+        "_get_cv2",
+        lambda: SimpleNamespace(
+            VideoCapture=lambda _source: capture,
+            CAP_PROP_FRAME_COUNT=0,
+            CAP_PROP_FPS=1,
+            COLOR_BGR2RGB=2,
+            cvtColor=convert,
+        ),
+    )
+    with pytest.raises(ValueError, match="cancelled"):
+        media_io._load_video_by_cv2(
+            "video.mp4",
+            num_frames=3,
+            fps=-1,
+            format="np",
+            decoded_memory_reserver=budget.reserve,
+        )
+    expected = ["grab", "retrieve", "convert"]
+    if cancel_during in ("grab", "retrieve"):
+        expected.append("grab")
+    if cancel_during == "retrieve":
+        expected.append("retrieve")
+    assert operations == expected + ["release"]
+    assert (budget._used, budget._retained, budget._reserved_retained) == (0, 0, 0)
+
+
 @pytest.mark.parametrize("cancel", [False, True])
 def test_video_peak_reservation_waits_for_settlement_or_cancellation(cancel, monkeypatch):
     budget = request_mapping._DecodedMediaBudget(20, peak_limit=20)

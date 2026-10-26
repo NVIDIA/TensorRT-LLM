@@ -54,6 +54,11 @@ class _DecodedMediaReservation:
         self._retained_bytes = retained_bytes
         self._active = True
 
+    def check_cancelled(self) -> None:
+        with self._budget._condition:
+            if self._budget._cancelled:
+                raise ValueError("decoded media loading was cancelled")
+
     def shrink(self, retained_bytes: int) -> None:
         if not self._active or not 0 <= retained_bytes <= self._retained_bytes:
             raise ValueError("invalid decoded-media reservation shrink")
