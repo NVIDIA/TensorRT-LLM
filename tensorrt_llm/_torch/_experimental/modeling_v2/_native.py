@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """A target's native (C++/CUDA) code: where it is built, and how the target loads it.
 
-Native code of a model family lives in ``cpp/tensorrt_llm/modeling_v2/<familyCamel>/``
-and builds into one torch-op library, ``libth_modeling_v2_<family>.so``, installed
-next to ``libth_common.so``. Nothing of it is in the stock libraries, and nothing
-loads it until routing picks a target of the family: a target package that has
-native code starts with::
+Native code of a model family lives with its Python code, in ``models/<family>/csrc/``
+(the family's ``CMakeLists.txt`` and shared code) and ``models/<family>/<target>/csrc/``
+(a target's own), and builds into one torch-op library,
+``libth_modeling_v2_<family>.so``, installed next to ``libth_common.so``. Nothing of
+it is in the stock libraries, and nothing loads it until routing picks a target of
+the family: a target package that has native code starts with::
 
     from tensorrt_llm._torch._experimental.modeling_v2._native import load_target_ops
 
@@ -30,7 +31,7 @@ of routing, and it follows how the stock code treats its optional native modules
 Ops of a family's shared code are in ``torch.ops.mv2_<family>``; code of the family
 reaches them through :func:`load_family_ops`.
 
-``cpp/tensorrt_llm/modeling_v2/README.md`` is the guide for authors.
+The "Native code" section of the modeling_v2 README is the guide for authors.
 """
 
 from __future__ import annotations
@@ -63,13 +64,6 @@ class NativeLoadError(RuntimeError):
 
 
 # --- Naming (mirrors cpp/cmake/modules/modeling_v2.cmake) --------------------
-
-
-def camel(name: str) -> str:
-    """The C++ directory of a family or target: ``scale_add__sm_10x__default`` ->
-    ``scaleAddSm10xDefault``."""
-    parts = [p for p in name.split("_") if p]
-    return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
 
 
 def identifier(name: str) -> str:

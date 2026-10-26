@@ -18,16 +18,23 @@
 #[[
 Native (C++/CUDA) code of modeling_v2 targets.
 
-Each model family under cpp/tensorrt_llm/modeling_v2/<familyCamel>/ builds into
-one torch-op library, libth_modeling_v2_<family>.so, installed next to
-libth_common.so. Nothing in it is linked into libtensorrt_llm.so or
-libth_common.so; the Python loader
-(tensorrt_llm/_torch/_experimental/modeling_v2/_native.py) opens it only when
-routing picks one of the family's targets. cpp/tensorrt_llm/modeling_v2/README.md
-is the guide for authors.
+A model family's native code lives with its Python code, under
+tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/:
 
-A family's CMakeLists.txt uses three functions. Names are the Python package
-names (snake_case); directories are their camelCase form:
+  csrc/CMakeLists.txt       declares the family, its shared code and its targets
+  csrc/*.cu|*.h|*.cpp       code several targets of the family share
+  <target>/csrc/...         one target's own kernels (.cu) and torch bindings (.cpp)
+
+Each family builds into one torch-op library, libth_modeling_v2_<family>.so,
+installed next to libth_common.so. Nothing in it is linked into
+libtensorrt_llm.so or libth_common.so; the Python loader
+(tensorrt_llm/_torch/_experimental/modeling_v2/_native.py) opens it only when
+routing picks one of the family's targets. modeling_v2/NATIVE.md is the guide
+for authors; cpp/tensorrt_llm/modeling_v2/ holds only what every family shares
+(this discovery, common/ macros, contractSurface.txt).
+
+A family's csrc/CMakeLists.txt uses three functions; names are the Python
+package names:
 
   add_modeling_v2_family(<family>)
   add_modeling_v2_shared(<family> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])
@@ -37,11 +44,14 @@ ARCHS     NN, NNa or NNf. Each is intersected with the build's requested
           architectures, the way flash_mla and deep_ep choose theirs; a target
           with an empty intersection is not built and its family library
           does not carry it.
-SOURCES   Paths or globs relative to the target directory (shared/ for
-          add_modeling_v2_shared). .cu files are compiled for ARCHS without
-          torch; .cpp files are the torch bindings. A target without SOURCES
-          has no directory and no code of its own: it runs its family's
-          shared code, and declaring it is what makes the library carry it.
+SOURCES   Paths or globs relative to the unit's csrc/ directory: the
+          family's for add_modeling_v2_shared, <target>/csrc/ for a target.
+          .cu files are compiled for ARCHS without torch; .cpp files are the
+          torch bindings. Includes of the family's own code are written from
+          the models/ directory: "<family>/csrc/x.h",
+          "<family>/<target>/csrc/x.h". A target without SOURCES has no csrc/
+          and no code of its own: it runs its family's shared code, and
+          declaring it is what makes the library carry it.
           Source properties the family's CMakeLists.txt sets with
           set_source_files_properties (e.g. COMPILE_OPTIONS) apply to shared
           and target sources alike.
@@ -63,29 +73,6 @@ set(_MODELING_V2_KNOWN_DEPS cublas cublaslt cuda_driver internal_cutlass nccl
 set(_MODELING_V2_KNOWN_REQUIRES MULTI_DEVICE NVSHMEM)
 
 # --- Naming ------------------------------------------------------------------
-
-# camelCase form of a snake_case name: minimax_m3_nvfp4__sm_107__tp2 ->
-# minimaxM3Nvfp4Sm107Tp2. The same mapping as camel() in the Python checks.
-function(_modeling_v2_camel out name)
-  string(REPLACE "_" ";" parts "${name}")
-  set(result "")
-  foreach(part IN LISTS parts)
-    if(part STREQUAL "")
-      continue()
-    endif()
-    if(result STREQUAL "")
-      set(result "${part}")
-    else()
-      string(SUBSTRING "${part}" 0 1 head)
-      string(SUBSTRING "${part}" 1 -1 tail)
-      string(TOUPPER "${head}" head)
-      string(APPEND result "${head}${tail}")
-    endif()
-  endforeach()
-  set(${out}
-      "${result}"
-      PARENT_SCOPE)
-endfunction()
 
 # A name usable as a C++ or torch identifier: "__" collapsed to "_", since C++
 # reserves identifiers that contain a double underscore.
@@ -234,13 +221,14 @@ endfunction()
 
 function(add_modeling_v2_family family)
   _modeling_v2_check_family_name("${family}")
-  _modeling_v2_camel(camel "${family}")
   get_filename_component(dir_name "${CMAKE_CURRENT_SOURCE_DIR}" NAME)
-  if(NOT dir_name STREQUAL camel)
+  get_filename_component(package_dir "${CMAKE_CURRENT_SOURCE_DIR}" DIRECTORY)
+  get_filename_component(package_name "${package_dir}" NAME)
+  if(NOT dir_name STREQUAL "csrc" OR NOT package_name STREQUAL family)
     message(
       FATAL_ERROR
-        "modeling_v2: family '${family}' must live in directory '${camel}', not '${dir_name}'"
-    )
+        "modeling_v2: family '${family}' is declared in models/${family}/csrc/CMakeLists.txt, "
+        "not in ${CMAKE_CURRENT_SOURCE_DIR}")
   endif()
   get_property(families GLOBAL PROPERTY MODELING_V2_FAMILIES)
   if(family IN_LIST families)
@@ -249,6 +237,8 @@ function(add_modeling_v2_family family)
   set_property(GLOBAL APPEND PROPERTY MODELING_V2_FAMILIES "${family}")
   set_property(GLOBAL PROPERTY MODELING_V2_${family}_SOURCE_DIR
                                "${CMAKE_CURRENT_SOURCE_DIR}")
+  set_property(GLOBAL PROPERTY MODELING_V2_${family}_PACKAGE_DIR
+                               "${package_dir}")
   set_property(GLOBAL PROPERTY MODELING_V2_${family}_BINARY_DIR
                                "${CMAKE_CURRENT_BINARY_DIR}")
 endfunction()
@@ -392,6 +382,10 @@ function(
   set(definitions
       TRTLLM_MV2_TORCH_NS=${torch_ns} TRTLLM_MV2_FAMILY_TORCH_NS=mv2_${family}
       TRTLLM_MV2_SCOPE=${scope})
+  # Family code includes its own headers from the models/ directory.
+  get_filename_component(models_dir "${family_dir}" DIRECTORY)
+  get_filename_component(models_dir "${models_dir}" DIRECTORY)
+
   set(objects "")
   if(cu_sources)
     add_library(${name}_kernels OBJECT ${cu_sources})
@@ -399,6 +393,7 @@ function(
       ${name}_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_ARCHITECTURES
                                                               "${archs}")
     target_compile_definitions(${name}_kernels PRIVATE ${definitions})
+    target_include_directories(${name}_kernels PRIVATE "${models_dir}")
     _modeling_v2_apply_compile_deps(${name}_kernels ${deps})
     list(APPEND objects ${name}_kernels)
   endif()
@@ -406,6 +401,7 @@ function(
     add_library(${name}_ops OBJECT ${cpp_sources})
     set_target_properties(${name}_ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(${name}_ops PRIVATE ${definitions})
+    target_include_directories(${name}_ops PRIVATE "${models_dir}")
     target_link_libraries(${name}_ops PRIVATE ${TORCH_LIBRARIES})
     _modeling_v2_apply_compile_deps(${name}_ops ${deps})
     list(APPEND objects ${name}_ops)
@@ -455,12 +451,6 @@ function(add_modeling_v2_shared family)
     )
   endif()
   _modeling_v2_check_deps(${arg_DEPS})
-  if(NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shared")
-    message(
-      FATAL_ERROR
-        "modeling_v2: family '${family}' shared code lives in ${CMAKE_CURRENT_SOURCE_DIR}/shared"
-    )
-  endif()
   # Recorded now, built by _modeling_v2_add_family_library only when a target of
   # the family builds: shared code with no target has nothing to serve.
   foreach(field ARCHS SOURCES DEPS REQUIRES)
@@ -479,12 +469,12 @@ function(add_modeling_v2_target family target)
         "modeling_v2: add_modeling_v2_target(${family} ${target}) needs ARCHS")
   endif()
   _modeling_v2_check_deps(${arg_DEPS})
-  _modeling_v2_camel(target_dir_name "${target}")
-  set(target_dir "${CMAKE_CURRENT_SOURCE_DIR}/${target_dir_name}")
+  get_property(package_dir GLOBAL PROPERTY MODELING_V2_${family}_PACKAGE_DIR)
+  set(target_dir "${package_dir}/${target}/csrc")
   if(arg_SOURCES AND NOT IS_DIRECTORY "${target_dir}")
     message(
       FATAL_ERROR
-        "modeling_v2: target '${target}' must live in directory ${target_dir}")
+        "modeling_v2: target '${target}' keeps its code in ${target_dir}")
   endif()
   if(NOT arg_SOURCES)
     get_property(has_shared GLOBAL PROPERTY MODELING_V2_${family}_HAS_SHARED)
@@ -627,8 +617,7 @@ function(_modeling_v2_add_family_library family)
           "this build requests ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
     else()
       get_property(source_dir GLOBAL PROPERTY MODELING_V2_${family}_SOURCE_DIR)
-      _modeling_v2_expand_sources(sources "${source_dir}/shared"
-                                  ${shared_SOURCES})
+      _modeling_v2_expand_sources(sources "${source_dir}" ${shared_SOURCES})
       message(STATUS "modeling_v2: ${family}/shared built for ${shared_archs}")
       _modeling_v2_add_objects(
         th_modeling_v2_${family}_shared

@@ -303,15 +303,14 @@ Outcomes:
 Path-only rule. Claims non-documentation source changes under
 `tensorrt_llm/_torch/_experimental/modeling_v2/`, the self-contained second modeling
 path (one flat forward per checkpoint/arch/parallel triple, assembled
-from a catalog of op wrappers), under `cpp/tensorrt_llm/modeling_v2/`, its
-native code (one torch-op library per model family, loaded only when routing picks
-one of the family's targets), and the native build module
-`cpp/cmake/modules/modeling_v2.cmake`.
+from a catalog of op wrappers), including each family's native code
+(`models/<family>/csrc/`, `models/<family>/<target>/csrc/`: one torch-op library
+per model family, loaded only when routing picks one of the family's targets),
+plus what every family library shares: `cpp/tensorrt_llm/modeling_v2/` and the
+native build module `cpp/cmake/modules/modeling_v2.cmake`.
 
 Scope — per family, else all of modeling_v2: a change confined to one
-family's directories (`models/<family>/` in Python,
-`cpp/tensorrt_llm/modeling_v2/<familyCamel>/` in C++, the family named by the
-Python package whose camelCase form the C++ directory is) keeps that family's
+family's directory (`models/<family>/`, its native code included) keeps that family's
 entries -- `accuracy/modeling_v2/test_<family>.py` and
 `unittest/_torch/modeling_v2/models/<family>` -- plus the modeling_v2 CPU
 checks (`unittest/_torch/modeling_v2/test_modeling_v2_*.py`). Several

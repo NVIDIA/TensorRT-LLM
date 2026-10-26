@@ -101,7 +101,7 @@ def build_rules(
         TestListRule(yaml_index, stages, repo_root=repo_root),
         VisualGenRule(yaml_index, stages),
         SpecDecRule(yaml_index, stages),
-        ModelingV2Rule(yaml_index, stages, repo_root=repo_root),
+        ModelingV2Rule(yaml_index, stages),
         AgentFlowRule(yaml_index, stages),
         OpenEngineRule(yaml_index, stages),
         DocsRule(yaml_index, stages),

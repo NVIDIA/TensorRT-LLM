@@ -28,7 +28,6 @@ import pytest
 from tensorrt_llm._torch._experimental.modeling_v2 import _native
 from tensorrt_llm._torch._experimental.modeling_v2._native import (
     NativeLoadError,
-    camel,
     family_of,
     identifier,
     library_name,
@@ -43,7 +42,9 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 
 pytestmark = pytest.mark.cpu_only
 
-_FIXTURE = "tensorrt_llm._torch._experimental.modeling_v2.models.fixture.scale_add__sm_10x__default"
+_TARGET = (
+    "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default"
+)
 
 
 @pytest.fixture
@@ -56,9 +57,9 @@ def libs(monkeypatch, tmp_path):
 
 
 def _install(libs: Path, monkeypatch, opens) -> None:
-    """Put a fixture library in `libs`; `opens` stands in for dlopen, and no
+    """Put a gpt_oss library in `libs`; `opens` stands in for dlopen, and no
     fake_ops module is imported, since the stand-in defines no op."""
-    (libs / library_name("fixture")).write_bytes(b"")
+    (libs / library_name("gpt_oss")).write_bytes(b"")
     monkeypatch.setattr(_native, "_open_library", lambda path, family: opens())
     monkeypatch.setattr(_native, "_import_fakes", lambda module, family: None)
 
@@ -66,30 +67,16 @@ def _install(libs: Path, monkeypatch, opens) -> None:
 # --- Naming ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "name, expected",
-    [
-        ("fixture", "fixture"),
-        ("minimax_m3", "minimaxM3"),
-        ("glm_moe_dsa", "glmMoeDsa"),
-        ("minimax_m3_nvfp4__sm_107__tp2", "minimaxM3Nvfp4Sm107Tp2"),
-        ("r1_0528_nvfp4__sm_10x__default", "r10528Nvfp4Sm10xDefault"),
-    ],
-)
-def test_camel_is_the_native_directory(name, expected):
-    assert camel(name) == expected
-
-
 def test_names_of_libraries_and_namespaces():
     assert library_name("minimax_m3") == "libth_modeling_v2_minimax_m3.so"
-    assert identifier("scale_add__sm_10x__default") == "scale_add_sm_10x_default"
-    assert torch_namespace("fixture") == "mv2_fixture"
-    assert namespace_of(_FIXTURE) == "mv2_fixture_scale_add_sm_10x_default"
-    assert split_target_package(_FIXTURE) == ("fixture", "scale_add__sm_10x__default")
+    assert identifier("gpt_oss_120b__sm_10x__default") == "gpt_oss_120b_sm_10x_default"
+    assert torch_namespace("gpt_oss") == "mv2_gpt_oss"
+    assert namespace_of(_TARGET) == "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"
+    assert split_target_package(_TARGET) == ("gpt_oss", "gpt_oss_120b__sm_10x__default")
     with pytest.raises(ValueError):
         split_target_package("tensorrt_llm._torch.models")
-    assert family_of(f"{_FIXTURE}.ops.elementwise.scale_add") == "fixture"
-    assert family_of(_FIXTURE.rpartition(".")[0] + ".fake_ops") == "fixture"
+    assert family_of(f"{_TARGET}.weights") == "gpt_oss"
+    assert family_of(_TARGET.rpartition(".")[0] + ".fake_ops") == "gpt_oss"
     with pytest.raises(ValueError):
         family_of("tensorrt_llm._torch._experimental.modeling_v2.models")
 
@@ -98,8 +85,8 @@ def test_names_of_libraries_and_namespaces():
 
 
 def test_a_library_this_installation_lacks_is_no_target(libs):
-    with pytest.raises(NoTarget, match="has no libth_modeling_v2_fixture.so"):
-        load_target_ops(_FIXTURE)
+    with pytest.raises(NoTarget, match="has no libth_modeling_v2_gpt_oss.so"):
+        load_target_ops(_TARGET)
 
 
 def test_a_library_that_fails_to_open_is_a_broken_installation(libs, monkeypatch):
@@ -108,13 +95,13 @@ def test_a_library_that_fails_to_open_is_a_broken_installation(libs, monkeypatch
 
     _install(libs, monkeypatch, fail)
     with pytest.raises(NativeLoadError, match="undefined symbol"):
-        load_target_ops(_FIXTURE)
+        load_target_ops(_TARGET)
 
 
 def test_a_target_the_library_does_not_carry_is_no_target(libs, monkeypatch):
     _install(libs, monkeypatch, lambda: frozenset({"other__sm_90__default"}))
-    with pytest.raises(NoTarget, match="does not carry scale_add__sm_10x__default"):
-        load_target_ops(_FIXTURE)
+    with pytest.raises(NoTarget, match="does not carry gpt_oss_120b__sm_10x__default"):
+        load_target_ops(_TARGET)
 
 
 def test_a_library_opens_once(libs, monkeypatch):
@@ -122,29 +109,31 @@ def test_a_library_opens_once(libs, monkeypatch):
 
     def opens():
         opened.append(1)
-        return frozenset({"scale_add__sm_10x__default"})
+        return frozenset({"gpt_oss_120b__sm_10x__default"})
 
     _install(libs, monkeypatch, opens)
-    assert load_family_library("fixture") == {"scale_add__sm_10x__default"}
-    assert load_family_library("fixture") == {"scale_add__sm_10x__default"}
+    assert load_family_library("gpt_oss") == {"gpt_oss_120b__sm_10x__default"}
+    assert load_family_library("gpt_oss") == {"gpt_oss_120b__sm_10x__default"}
     assert len(opened) == 1
 
 
 @pytest.fixture
 def torch_ops(monkeypatch):
-    """A stand-in torch.ops holding the fixture's namespaces."""
-    ops = types.SimpleNamespace(mv2_fixture=object(), mv2_fixture_scale_add_sm_10x_default=object())
+    """A stand-in torch.ops holding the gpt_oss namespaces."""
+    ops = types.SimpleNamespace(
+        mv2_gpt_oss=object(), mv2_gpt_oss_gpt_oss_120b_sm_10x_default=object()
+    )
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(ops=ops))
     return ops
 
 
 def test_opening_a_library_registers_the_family_fakes_first(libs, monkeypatch, torch_ops):
-    _install(libs, monkeypatch, lambda: frozenset({"scale_add__sm_10x__default"}))
+    _install(libs, monkeypatch, lambda: frozenset({"gpt_oss_120b__sm_10x__default"}))
     imported = []
     monkeypatch.setattr(_native, "_import_fakes", lambda module, family: imported.append(module))
-    assert load_target_ops(_FIXTURE) is torch_ops.mv2_fixture_scale_add_sm_10x_default
-    family_package = _FIXTURE.rpartition(".")[0]
-    assert imported == [f"{family_package}.fake_ops", f"{_FIXTURE}.fake_ops"]
+    assert load_target_ops(_TARGET) is torch_ops.mv2_gpt_oss_gpt_oss_120b_sm_10x_default
+    family_package = _TARGET.rpartition(".")[0]
+    assert imported == [f"{family_package}.fake_ops", f"{_TARGET}.fake_ops"]
 
 
 def test_family_ops_are_the_family_namespace_and_load_once(libs, monkeypatch, torch_ops):
@@ -152,24 +141,24 @@ def test_family_ops_are_the_family_namespace_and_load_once(libs, monkeypatch, to
 
     def opens():
         opened.append(1)
-        return frozenset({"scale_add__sm_10x__default"})
+        return frozenset({"gpt_oss_120b__sm_10x__default"})
 
     _install(libs, monkeypatch, opens)
-    module = f"{_FIXTURE}.ops.elementwise.scale_add"
-    assert load_family_ops(module) is torch_ops.mv2_fixture
-    assert load_family_ops(module) is torch_ops.mv2_fixture
+    module = f"{_TARGET}.weights"
+    assert load_family_ops(module) is torch_ops.mv2_gpt_oss
+    assert load_family_ops(module) is torch_ops.mv2_gpt_oss
     assert len(opened) == 1
 
 
 def test_family_ops_of_a_family_this_installation_lacks_are_no_target(libs):
-    with pytest.raises(NoTarget, match="has no libth_modeling_v2_fixture.so"):
-        load_family_ops(f"{_FIXTURE}.ops.elementwise.scale_add")
+    with pytest.raises(NoTarget, match="has no libth_modeling_v2_gpt_oss.so"):
+        load_family_ops(f"{_TARGET}.weights")
 
 
 def test_windows_has_no_native_targets(libs, monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     with pytest.raises(NoTarget, match="Windows"):
-        load_family_library("fixture")
+        load_family_library("gpt_oss")
 
 
 # --- The installed wheel ---------------------------------------------------------

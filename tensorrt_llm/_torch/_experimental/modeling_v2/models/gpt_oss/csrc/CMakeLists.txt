@@ -15,15 +15,11 @@
 # the License.
 #
 
-# Temporary infrastructure fixture, not a model: one target with one op, so that
-# CI drives the whole native path -- build, packaging, load, built_targets(),
-# fake op, GPU op. Remove this family (with its Python package and tests) once a
-# family with native code has GPU unit tests that run in CI. It is built for
-# 100f only, the B300 its GPU test runs on, to keep the library it adds to every
-# wheel small.
-add_modeling_v2_family(fixture)
+# gpt_oss native code. Each target keeps its own in <target>/csrc/; see the
+# modeling_v2 README.
+add_modeling_v2_family(gpt_oss)
 
 add_modeling_v2_target(
-  fixture scale_add__sm_10x__default
+  gpt_oss gpt_oss_120b__sm_10x__default
   ARCHS 100f
-  SOURCES kernels/scaleAdd.cu ops/scaleAddOp.cpp)
+  SOURCES *.cu *.cpp)

@@ -15,18 +15,20 @@
 
 modeling_v2 is a second modeling path: one self-contained forward per
 (checkpoint, GPU arch, parallel topology), assembled from a catalog of op
-wrappers. Its Python lives under `tensorrt_llm/_torch/_experimental/modeling_v2/`
-and its native code under `cpp/tensorrt_llm/modeling_v2/`, which builds one
-torch-op library per model family, loaded only when routing picks one of the
-family's targets.
+wrappers. It lives under `tensorrt_llm/_torch/_experimental/modeling_v2/`, a
+family's native code included (`models/<family>/csrc/`,
+`models/<family>/<target>/csrc/`), which builds one torch-op library per model
+family, loaded only when routing picks one of the family's targets. What every
+family library shares is in `cpp/tensorrt_llm/modeling_v2/` and
+`cpp/cmake/modules/modeling_v2.cmake`.
 
 Scope — per family, else all of modeling_v2:
-A change confined to one family's directories (`models/<family>/` in Python,
-`cpp/tensorrt_llm/modeling_v2/<familyCamel>/` in C++) selects that family's test
+A change confined to one family's directory (`models/<family>/`, its native
+code included) selects that family's test
 entries -- `accuracy/modeling_v2/test_<family>.py` and
 `unittest/_torch/modeling_v2/models/<family>/` -- plus the modeling_v2 CPU
 checks. Any other modeling_v2 change (catalog, resolver, loader, the native
-build module and its common headers) selects every modeling_v2 entry. Several
+build module, its discovery and common headers) selects every modeling_v2 entry. Several
 families in one PR union their entries.
 
 Why no outward fallback is needed: nothing beyond the resolver is imported, and
@@ -56,7 +58,6 @@ loaded by either, so nothing here is what PackageSanityCheck verifies.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Optional
 
 from cbts.blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree
@@ -67,9 +68,8 @@ from .docs import is_docs_path
 
 _PY_ROOT = "tensorrt_llm/_torch/_experimental/modeling_v2/"
 _PY_MODELS = _PY_ROOT + "models/"
+# What every family library shares: discovery, common/ macros, contractSurface.txt.
 _CPP_ROOT = "cpp/tensorrt_llm/modeling_v2/"
-# Directories of the native tree that are not families.
-_CPP_NON_FAMILY_DIRS = frozenset({"common", "catalog"})
 # The native build module: shared by every family library.
 _CPP_BUILD_FILES = frozenset({"cpp/cmake/modules/modeling_v2.cmake"})
 
@@ -94,20 +94,6 @@ _MV2_ENTRY_PATTERNS: tuple[str, ...] = (
 # The modeling_v2 CPU checks (claims, routing, native loader): selected in
 # every scope, because they are what keeps the narrowing sound.
 _MV2_CHECK_ENTRY = re.compile(r"^unittest/_torch/modeling_v2/test_modeling_v2_[\w]+\.py$")
-
-
-def _camel(name: str) -> str:
-    """The C++ directory of a family: `minimax_m3` -> `minimaxM3`.
-
-    Mirrors `_modeling_v2_camel` in cpp/cmake/modules/modeling_v2.cmake.
-    """
-    parts = [p for p in name.split("_") if p]
-    return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
-
-
-def _snake(camel_name: str) -> str:
-    """Best-effort inverse of `_camel`, used only without a repo root."""
-    return re.sub(r"(?<=[a-z0-9])([A-Z])", lambda m: "_" + m.group(1).lower(), camel_name)
 
 
 def _is_mv2_claim(path: str) -> bool:
@@ -157,33 +143,16 @@ class ModelingV2Rule(Rule):
     name = "modelingv2"
     needs_diff_for: tuple[str, ...] = ()
 
-    def __init__(
-        self,
-        yaml_index: YAMLIndex,
-        stages: dict[str, Stage],
-        repo_root: Optional[Path] = None,
-    ) -> None:
+    def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]) -> None:
         self.yaml_index = yaml_index
         self._stages_by_yaml = stages_by_yaml_stem(stages)
-        # camelCase native directory -> family, from the Python family packages.
-        self._family_of_cpp_dir: dict[str, str] = {}
-        if repo_root is not None:
-            models = Path(repo_root) / _PY_MODELS
-            if models.is_dir():
-                for family_dir in models.iterdir():
-                    if family_dir.is_dir() and (family_dir / "__init__.py").is_file():
-                        self._family_of_cpp_dir[_camel(family_dir.name)] = family_dir.name
 
-    def family_of(self, path: str) -> Optional[str]:
+    @staticmethod
+    def family_of(path: str) -> Optional[str]:
         """The family a claimed path belongs to, or None for shared modeling_v2 code."""
         if path.startswith(_PY_MODELS):
             parts = path[len(_PY_MODELS) :].split("/")
             return parts[0] if len(parts) > 1 else None
-        if path.startswith(_CPP_ROOT):
-            parts = path[len(_CPP_ROOT) :].split("/")
-            if len(parts) < 2 or parts[0] in _CPP_NON_FAMILY_DIRS:
-                return None
-            return self._family_of_cpp_dir.get(parts[0], _snake(parts[0]))
         return None
 
     @staticmethod

@@ -112,33 +112,33 @@ checkpoint of the same shape is ungated.
 ```
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
 _native.py          loads a target's native code (see "Native code" below)
+NATIVE.md           the guide to a target's native (C++/CUDA) code
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
   fake_ops.py       fakes of the family's shared native ops, if it has any
+  csrc/             the family's CMakeLists.txt and the native code its targets share
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
                       fake_ops.py       fakes of the target's native ops, if it has any
+                      csrc/             the target's own kernels and torch bindings
 catalog/<category>/ entries more than one target calls
 ```
 
 ### Native code
 
-A target's C++/CUDA lives beside the stock tree, not in it:
-`cpp/tensorrt_llm/modeling_v2/<familyCamel>/<targetCamel>/`, built into one
-torch-op library per family, `libth_modeling_v2_<family>.so`, installed next to
-`libth_common.so`. Nothing of it is linked into `libtensorrt_llm.so` or
-`libth_common.so`, and nothing loads it until routing imports one of the
-family's targets, whose `__init__.py` starts with
-`native_ops = load_target_ops(__name__)`. As with the stock code's optional
-native modules, a library this installation does not carry is a `NoTarget`, so
-`auto` keeps the built-in model; one that is installed but broken is a
-`NativeLoadError`, never a fallback. Code several targets of a family share is
-built once, in the family's `shared/`; its ops are `torch.ops.mv2_<family>`,
-which family code reaches with `load_family_ops(__name__)`.
-`cpp/tensorrt_llm/modeling_v2/README.md` is the guide, and
-`models/fixture/`, a temporary infrastructure fixture rather than a model, is
-the smallest complete example.
+A target's C++/CUDA lives with its Python code: `<target>/csrc/`, and the
+family's `csrc/` for code its targets share, declared by the family's
+`csrc/CMakeLists.txt`. It builds into one torch-op library per family,
+`libth_modeling_v2_<family>.so`, installed next to `libth_common.so`. Nothing of
+it is linked into `libtensorrt_llm.so` or `libth_common.so`, and nothing loads
+it until routing imports one of the family's targets, whose `__init__.py`
+starts with `native_ops = load_target_ops(__name__)`. As with the stock code's
+optional native modules, a library this installation does not carry is a
+`NoTarget`, so `auto` keeps the built-in model; one that is installed but
+broken is a `NativeLoadError`, never a fallback. Adding a model with kernels
+edits no file under `cpp/`. `NATIVE.md` is the guide, with the directories and
+files a new model adds; `models/gpt_oss/` is the worked example.
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain

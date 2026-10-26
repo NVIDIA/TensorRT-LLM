@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The boundary between stock code and modeling_v2 native code, read off disk.
 
-modeling_v2 native code lives in ``cpp/tensorrt_llm/modeling_v2/`` and builds
-one library per family that loads only when routing picks one of the family's
+modeling_v2 native code lives with the Python code of its family, in
+``models/<family>/csrc/`` and ``models/<family>/<target>/csrc/``, and builds one
+library per family that loads only when routing picks one of the family's
 targets (``_native``). Three things rest on that staying true: ``off`` loading
 nothing, a target never depending on a sibling, and CBTS testing a
 family-only change with that family's tests alone
@@ -25,10 +26,11 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import camel, identifier, torch_namespace
+from tensorrt_llm._torch._experimental.modeling_v2._native import identifier, torch_namespace
 
 _REPO = Path(__file__).resolve().parents[4]
-_NATIVE = _REPO / "cpp/tensorrt_llm/modeling_v2"
+# What every family shares: discovery, common/ macros, contractSurface.txt.
+_INFRA = _REPO / "cpp/tensorrt_llm/modeling_v2"
 _PY = _REPO / "tensorrt_llm/_torch/_experimental/modeling_v2"
 _MODELS = _PY / "models"
 _CMAKE_MODULE = _REPO / "cpp/cmake/modules/modeling_v2.cmake"
@@ -36,12 +38,10 @@ _TEST_DB = _REPO / "tests/integration/test_lists/test-db"
 
 pytestmark = [
     pytest.mark.cpu_only,
-    pytest.mark.skipif(not _NATIVE.is_dir(), reason="needs the source checkout"),
+    pytest.mark.skipif(not _INFRA.is_dir(), reason="needs the source checkout"),
 ]
 
 _NATIVE_SUFFIXES = (".cu", ".cuh", ".h", ".hpp", ".inl", ".cpp")
-# Native directories that are not families.
-_NON_FAMILY_DIRS = {"common", "catalog"}
 # A target name's sm segment that names a family of architectures.
 _SM_GROUPS = {"10x": ((10, 0), (10, 3))}
 
@@ -80,9 +80,9 @@ def _keyword_values(tokens: list[str], keyword: str) -> list[str]:
 
 
 def _families() -> dict[str, Path]:
-    """family -> native family directory, from every family CMakeLists.txt."""
+    """family -> its csrc/ directory, from every models/<family>/csrc/CMakeLists.txt."""
     families = {}
-    for cmake in sorted(_NATIVE.glob("*/CMakeLists.txt")):
+    for cmake in sorted(_MODELS.glob("*/csrc/CMakeLists.txt")):
         calls = _calls(cmake.read_text(), "add_modeling_v2_family")
         assert len(calls) == 1 and len(calls[0]) == 1, (
             f"{cmake.relative_to(_REPO)} must call add_modeling_v2_family(<family>) exactly once"
@@ -94,10 +94,20 @@ def _families() -> dict[str, Path]:
 def _targets() -> list[tuple[str, str, list[str]]]:
     """(family, target, tokens) of every add_modeling_v2_target call."""
     out = []
-    for family_dir in _families().values():
-        for tokens in _calls((family_dir / "CMakeLists.txt").read_text(), "add_modeling_v2_target"):
+    for csrc in _families().values():
+        for tokens in _calls((csrc / "CMakeLists.txt").read_text(), "add_modeling_v2_target"):
             out.append((tokens[0], tokens[1], tokens[2:]))
     return out
+
+
+def _units() -> list[tuple[str, str | None, Path]]:
+    """(family, target or None for shared code, csrc directory) of every unit with code."""
+    units = [(family, None, csrc) for family, csrc in _families().items()]
+    for family, target, _ in _targets():
+        csrc = _MODELS / family / target / "csrc"
+        if csrc.is_dir():
+            units.append((family, target, csrc))
+    return units
 
 
 def _native_files(root: Path) -> list[Path]:
@@ -105,7 +115,7 @@ def _native_files(root: Path) -> list[Path]:
 
 
 def _contract_surface() -> list[str]:
-    lines = (_NATIVE / "contractSurface.txt").read_text().splitlines()
+    lines = (_INFRA / "contractSurface.txt").read_text().splitlines()
     return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
 
 
@@ -113,33 +123,61 @@ def _contract_surface() -> list[str]:
 
 
 def test_every_native_family_is_a_python_family():
-    for family, family_dir in _families().items():
-        assert family_dir.name == camel(family), (
-            f"family {family!r} must live in {_NATIVE.relative_to(_REPO)}/{camel(family)}"
+    for family, csrc in _families().items():
+        assert csrc.parent.name == family, (
+            f"{csrc.relative_to(_REPO)}/CMakeLists.txt declares family {family!r}; "
+            f"it belongs in models/{family}/csrc/"
         )
-        assert (_MODELS / family / "__init__.py").is_file(), (
+        assert (csrc.parent / "__init__.py").is_file(), (
             f"native family {family!r} has no Python family package models/{family}/"
         )
 
 
+def test_native_code_lives_only_in_csrc():
+    """In the Python tree, C++/CUDA and CMake live only in a family's or a
+    target's csrc/, where the build finds them and these checks read them."""
+    offenders = []
+    for path in sorted(_MODELS.rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        native = path.suffix in _NATIVE_SUFFIXES or path.name == "CMakeLists.txt"
+        if not native:
+            continue
+        parts = path.relative_to(_MODELS).parts
+        in_family_csrc = len(parts) >= 3 and parts[1] == "csrc"
+        in_target_csrc = len(parts) >= 4 and parts[2] == "csrc"
+        if path.name == "CMakeLists.txt":
+            ok = len(parts) == 3 and parts[1] == "csrc"
+        else:
+            ok = in_family_csrc or in_target_csrc
+        if not ok:
+            offenders.append(str(path.relative_to(_REPO)))
+    assert not offenders, (
+        "native code outside models/<family>/csrc/ or models/<family>/<target>/csrc/ "
+        f"(CMakeLists.txt only in models/<family>/csrc/): {offenders}"
+    )
+
+
 def test_every_native_target_is_a_python_target_that_loads_it():
-    declared = set()
-    for family, target, _ in _targets():
-        declared.add((family, target))
+    with_code = set()
+    for family, target, tokens in _targets():
         package = _MODELS / family / target / "__init__.py"
         assert package.is_file(), f"native target {family}/{target} has no Python target package"
         assert "load_target_ops(__name__)" in package.read_text(), (
             f"{package.relative_to(_REPO)} must start by loading its native code: "
             "native_ops = load_target_ops(__name__)"
         )
-    for family, family_dir in _families().items():
-        for sub in sorted(p for p in family_dir.iterdir() if p.is_dir()):
-            if sub.name == "shared":
-                continue
-            assert any(camel(t) == sub.name for f, t in declared if f == family), (
-                f"{sub.relative_to(_REPO)} is not the directory of any add_modeling_v2_target "
-                f"of family {family!r}"
+        if _keyword_values(tokens, "SOURCES"):
+            with_code.add((family, target))
+            assert (_MODELS / family / target / "csrc").is_dir(), (
+                f"{family}/{target} declares SOURCES but has no {target}/csrc/"
             )
+    for csrc in sorted(_MODELS.glob("*/*/csrc")):
+        family, target = csrc.parent.parent.name, csrc.parent.name
+        assert (family, target) in with_code, (
+            f"{csrc.relative_to(_REPO)} holds code no add_modeling_v2_target({family} {target} "
+            "... SOURCES ...) builds"
+        )
 
 
 def test_python_targets_that_load_native_code_have_it():
@@ -179,24 +217,26 @@ _INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
 
 def test_native_code_includes_only_its_own_code_and_the_contract_surface():
     surface = _contract_surface()
+    python_families = {p.name for p in _MODELS.iterdir() if (p / "__init__.py").is_file()}
     problems = []
-    for family, family_dir in _families().items():
-        for unit_dir in sorted(p for p in family_dir.iterdir() if p.is_dir()):
-            own = f"tensorrt_llm/modeling_v2/{family_dir.name}/{unit_dir.name}/"
-            allowed = (own, "tensorrt_llm/modeling_v2/common/")
-            if unit_dir.name != "shared":
-                allowed += (f"tensorrt_llm/modeling_v2/{family_dir.name}/shared/",)
-            for path in _native_files(unit_dir):
-                for include in _INCLUDE.findall(path.read_text()):
-                    where = f'{path.relative_to(_REPO)}: "{include}"'
-                    if include.startswith("tensorrt_llm/modeling_v2/"):
-                        if not include.startswith(allowed):
-                            problems.append(f"{where} reaches another target or family")
-                    elif include.startswith("tensorrt_llm/"):
-                        if not any(fnmatch.fnmatch(include, p) for p in surface):
-                            problems.append(f"{where} is not in contractSurface.txt")
-                    elif ".." in include:
-                        problems.append(f"{where} leaves its directory")
+    for family, target, csrc in _units():
+        allowed = [f"{family}/csrc/", "tensorrt_llm/modeling_v2/common/"]
+        if target is not None:
+            allowed.append(f"{family}/{target}/csrc/")
+        for path in _native_files(csrc):
+            for include in _INCLUDE.findall(path.read_text()):
+                where = f'{path.relative_to(_REPO)}: "{include}"'
+                head = include.split("/", 1)[0]
+                if head in python_families or include.startswith("tensorrt_llm/modeling_v2/"):
+                    if not include.startswith(tuple(allowed)):
+                        problems.append(f"{where} reaches another target or family")
+                elif include.startswith("tensorrt_llm/"):
+                    if not any(fnmatch.fnmatch(include, p) for p in surface):
+                        problems.append(f"{where} is not in contractSurface.txt")
+                elif ".." in include or "/" not in include and (csrc / include).exists():
+                    problems.append(
+                        f'{where}: include the family\'s code from models/, "{family}/..."'
+                    )
     assert not problems, "\n".join(problems)
 
 
@@ -215,9 +255,9 @@ def test_native_code_registers_only_into_its_own_namespace():
     namespace; the TRTLLM_MV2_ macros register into the unit's own only."""
     offenders = [
         str(path.relative_to(_REPO))
-        for path in _native_files(_NATIVE)
-        if not path.is_relative_to(_NATIVE / "common")
-        and _RAW_REGISTRATION.search(path.read_text())
+        for _, _, csrc in _units()
+        for path in _native_files(csrc)
+        if _RAW_REGISTRATION.search(path.read_text())
     ]
     assert not offenders, (
         f"use TRTLLM_MV2_LIBRARY_FRAGMENT / TRTLLM_MV2_LIBRARY_IMPL, not TORCH_LIBRARY*: {offenders}"
@@ -233,11 +273,8 @@ def test_every_native_op_has_a_fake():
     cannot see, and a fake without an op fails the load. A target's ops have
     their fakes in the target's fake_ops.py, the family's shared ops in the
     family's."""
-    units = [(_families()[f] / camel(t), _MODELS / f / t) for f, t, _ in _targets()]
-    units += [(d / "shared", _MODELS / f) for f, d in _families().items()]
-    for native_dir, python_dir in units:
-        if not native_dir.is_dir():
-            continue
+    for family, target, native_dir in _units():
+        python_dir = _MODELS / family if target is None else _MODELS / family / target
         ops = sorted(
             {op for p in _native_files(native_dir) for op in _OP_DEF.findall(p.read_text())}
         )
@@ -257,7 +294,8 @@ def test_every_native_op_has_a_fake():
 
 _STOCK_PY_REFERENCE = re.compile(r"modeling_v2[./]models\b|torch\.ops\.mv2_")
 _STOCK_CPP_REFERENCE = re.compile(r'#\s*include\s*"tensorrt_llm/modeling_v2/')
-_STOCK_CMAKE_REFERENCE = re.compile(r"modeling_v2/\w")
+# A path into one family's directory; the discovery's models/*/csrc glob names none.
+_STOCK_FAMILY_PATH = re.compile(r"_experimental/modeling_v2/models/[a-z]")
 
 
 def test_stock_python_does_not_reference_targets():
@@ -273,22 +311,40 @@ def test_stock_python_does_not_reference_targets():
     )
 
 
-def test_stock_native_code_does_not_reference_targets():
+def test_stock_build_does_not_reference_a_family():
+    """A family's native code reaches the build only through
+    cpp/tensorrt_llm/modeling_v2/'s discovery: no stock CMake, C++ or packaging
+    file names a family, so adding one edits none of them."""
     offenders = []
-    for root in ("cpp/tensorrt_llm", "cpp/include", "cpp/tests"):
+    for root in ("cpp/tensorrt_llm", "cpp/include", "cpp/tests", "cpp/cmake"):
         for path in sorted((_REPO / root).rglob("*")):
-            if not path.is_file() or path.is_relative_to(_NATIVE):
+            if not path.is_file() or path.is_relative_to(_INFRA):
                 continue
             # Skip generated cubin sources; they include nothing of interest.
             if path.suffix in _NATIVE_SUFFIXES and path.stat().st_size < (1 << 20):
                 if _STOCK_CPP_REFERENCE.search(path.read_text(errors="ignore")):
                     offenders.append(str(path.relative_to(_REPO)))
-            elif path.name == "CMakeLists.txt":
-                if _STOCK_CMAKE_REFERENCE.search(path.read_text()):
+            elif path.name == "CMakeLists.txt" or path.suffix == ".cmake":
+                if _STOCK_FAMILY_PATH.search(path.read_text()):
                     offenders.append(str(path.relative_to(_REPO)))
-    assert not offenders, (
-        f"stock native code reaches into cpp/tensorrt_llm/modeling_v2: {offenders}"
-    )
+    for name in ("cpp/CMakeLists.txt", "setup.py", "scripts/build_wheel.py"):
+        if _STOCK_FAMILY_PATH.search((_REPO / name).read_text()):
+            offenders.append(name)
+    assert not offenders, f"stock build files name a modeling_v2 family: {offenders}"
+
+
+def test_native_files_carry_the_license_header():
+    """The C++ license checker scans cpp/ only; this covers the families' csrc/."""
+    missing = []
+    for _, _, csrc in _units():
+        for path in [*_native_files(csrc), *csrc.glob("CMakeLists.txt")]:
+            head = path.read_text(errors="ignore")[:400]
+            if (
+                "SPDX-FileCopyrightText" not in head
+                or "SPDX-License-Identifier: Apache-2.0" not in head
+            ):
+                missing.append(str(path.relative_to(_REPO)))
+    assert not missing, f"no NVIDIA SPDX header: {missing}"
 
 
 def test_stock_custom_ops_register_no_fakes_for_targets():
@@ -427,21 +483,15 @@ def test_accuracy_entries_name_a_family():
 
 @pytest.mark.skipif(shutil.which("cmake") is None, reason="needs cmake")
 def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
-    """The loader and CBTS compute directory, namespace and architecture
-    coverage in Python; the build computes them in modeling_v2.cmake."""
-    names = [
-        "fixture",
-        "minimax_m3",
-        "scale_add__sm_10x__default",
-        "r1_0528_nvfp4__sm_10x__default",
-    ]
+    """The loader and these checks compute identifiers, namespaces and
+    architecture coverage in Python; the build computes them in modeling_v2.cmake."""
+    names = ["gpt_oss", "minimax_m3", "r1_0528_nvfp4__sm_10x__default"]
     script = tmp_path / "probe.cmake"
     lines = [f'include("{_CMAKE_MODULE}")']
     for name in names:
         lines += [
-            f'_modeling_v2_camel(c "{name}")',
             f'_modeling_v2_ident(i "{name}")',
-            f'message(STATUS "name {name} ${{c}} ${{i}}")',
+            f'message(STATUS "name {name} ${{i}}")',
         ]
     lines += [
         "_modeling_v2_resolve_archs(r DECLARED 80 90a 100f 103a 120f REQUESTED 86 90 103 107)",
@@ -452,9 +502,9 @@ def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
         ["cmake", "-P", str(script)], capture_output=True, text=True, check=True
     ).stdout
     for name in names:
-        assert f"name {name} {camel(name)} {identifier(name)}" in output, output
+        assert f"name {name} {identifier(name)}" in output, output
     assert "archs 90a-real;100f-real;103a-real" in output, output
     # The family namespace the build registers is the loader's.
-    assert torch_namespace("fixture", "scale_add__sm_10x__default") == (
-        "mv2_fixture_scale_add_sm_10x_default"
+    assert torch_namespace("gpt_oss", "gpt_oss_120b__sm_10x__default") == (
+        "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"
     )

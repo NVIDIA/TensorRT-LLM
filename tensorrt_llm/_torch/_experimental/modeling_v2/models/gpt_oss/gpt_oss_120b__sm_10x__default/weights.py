@@ -49,6 +49,8 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 
+from . import native_ops
+
 #: `layers=ALL_LAYERS` is the common case and the default. A sentinel rather
 #: than a lambda so the table reads as data, and rather than `True` so the
 #: field has one type of answer: which layers.
@@ -184,11 +186,9 @@ def _fc1_perm(rows: int, device) -> torch.Tensor:
 def _swizzle_scales(s: torch.Tensor) -> torch.Tensor:
     """Per-expert 128x4 block-scale swizzle, viewed back as `[E, M, C]`: the
     byte at `(m, c)` moves to flat offset `(m//128)*512*(C//4) + (c//4)*512
-    + (m%32)*16 + ((m%128)//32)*4 + (c%4)`."""
-    e, m, c = s.shape
-    assert m % 128 == 0 and c % 4 == 0, (m, c)
-    v = s.reshape(e, m // 128, 4, 32, c // 4, 4)  # (e, m/128, (m%128)/32, m%32, c/4, c%4)
-    return v.permute(0, 1, 4, 3, 2, 5).reshape(e, m, c).contiguous()
+    + (m%32)*16 + ((m%128)//32)*4 + (c%4)`. This target's own kernel
+    (csrc/swizzleBlockScales.cu) moves it in one pass on the device."""
+    return native_ops.swizzle_block_scales(s)
 
 
 def _experts(t: torch.Tensor, d) -> torch.Tensor:

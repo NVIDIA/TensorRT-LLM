@@ -20,24 +20,19 @@
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <cstdint>
-#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
 
 TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels
 {
 
-enum class ScaleAddDtype
-{
-    kFloat32,
-    kBfloat16,
-};
-
-//! out[i] = x[i] * alpha + beta over `numel` contiguous elements of `dtype`. The product and the sum are each
-//! rounded to fp32 (no fused multiply-add), then the result is rounded once to `dtype`, which is what
-//! `(x.float() * alpha + beta).to(dtype)` computes in torch.
-cudaError_t invokeScaleAdd(
-    void const* x, void* out, int64_t numel, ScaleAddDtype dtype, float alpha, float beta, cudaStream_t stream);
+//! Rearranges MXFP4 block scales, `[experts, rows, cols]` E8M0 bytes, into the 128x4 swizzled layout the MoE
+//! kernel reads: within an expert, the byte at `(m, c)` moves to offset
+//! `(m / 128) * 512 * (cols / 4) + (c / 4) * 512 + (m % 32) * 16 + ((m % 128) / 32) * 4 + c % 4`.
+//! Requires `rows % 128 == 0` and `cols % 4 == 0`.
+cudaError_t invokeSwizzleBlockScales(
+    uint8_t const* in, uint8_t* out, int64_t experts, int64_t rows, int64_t cols, cudaStream_t stream);
 
 } // namespace kernels
 
