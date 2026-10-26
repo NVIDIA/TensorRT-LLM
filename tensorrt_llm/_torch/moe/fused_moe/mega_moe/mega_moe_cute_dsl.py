@@ -375,8 +375,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     The per-architecture kernel variants dispatch inside this one identity,
     because architecture is not an id segment: all four segments hold whichever
     kernel runs. The class name carries its ``kernel_name`` segment because
-    ``CuteDslFusedMoE``'s ``trtllm.cutedsl.grouped_gemm.nvfp4`` will differ from
-    this id in that field alone.
+    ``TrtllmCutedslGroupedGemmNvfp4Impl``'s ``trtllm.cutedsl.grouped_gemm.nvfp4``
+    differs from this id in that field alone.
 
     Capability gate (``can_implement``): SM100/103/107 + NVFP4 +
     bfloat16 activation + CUDA 13 Cutlass DSL runtime present.

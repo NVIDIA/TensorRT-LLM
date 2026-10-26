@@ -235,6 +235,60 @@ def test_mixed_processor_matches_separate_inputs(tensor_images):
             )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
+        Glm5NextInputProcessor,
+        _glm5_next_build_batched_input,
+    )
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+        EncoderGroup,
+        MultimodalModelMixin,
+        encode_multimodal_by_groups,
+    )
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    processor = Glm5NextInputProcessor("unused", _config(), tokenizer=Mock())
+    image_processor = Mock(
+        return_value={
+            "pixel_values": torch.zeros(num_images * 16, 12),
+            "image_grid_thw": torch.tensor([[1, 4, 4]] * num_images),
+        },
+        max_image_tokens=4,
+        merge_size=2,
+    )
+    processor._processor = SimpleNamespace(image_processor=image_processor)
+    model = Mock(spec=MultimodalModelMixin, dtype=torch.float16)
+    profiler = object.__new__(KvCacheCreator)
+    profiler._llm_args = SimpleNamespace(disable_mm_encoder=False)
+    profiler._profiling_stage_data = {"enable_mm_reqs": True}
+    profiler._model_engine = SimpleNamespace(
+        model=model,
+        input_processor=processor,
+        encoder_max_num_tokens=num_images * 16,
+        encoder_batch_size=num_images,
+    )
+
+    params = profiler._create_dummy_encoder_inputs()
+
+    def encode(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        assert grid_thw.shape == (num_images, 3)
+        return pixel_values.new_zeros((pixel_values.shape[0] // 4, 2))
+
+    output = encode_multimodal_by_groups(
+        (EncoderGroup(("image", "video"), encode, _glm5_next_build_batched_input),), params
+    )
+    assert output.shape == (num_images * 4, 2)
+    assert output.dtype == torch.float16
+    metadata = params[0].item_metadata
+    assert metadata is not None
+    metadata.validate()
+    assert metadata.item_refs == tuple(("image", i) for i in range(num_images))
+    assert metadata.encoder_token_lengths == (16,) * num_images
+    assert metadata.output_embedding_lengths == (4,) * num_images
+
+
 def _materialize_meta(module: torch.nn.Module) -> None:
     """Allocate meta tensors on CUDA as ModelLoader does after MetaInitMode construction."""
     module._apply(lambda t: torch.empty_like(t, device="cuda") if t.is_meta else t)
@@ -832,10 +886,28 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
             )
     allocate.assert_called_once()
     assert allocate.call_args.kwargs["dtype"] == (DataType.FP8 if fp8_kv_cache else DataType.BF16)
+    assert allocate.call_args.kwargs["conv_state_layout"] == "q_k_v"
+    assert "kda_replay_num_spec" not in allocate.call_args.kwargs
+    manager = object.__new__(Glm5NextCacheManager)
+    manager._requested_num_spec = None
+    manager._requested_draft_records = False
+    manager._kda_replay = None
+    manager._mamba_ssm_stochastic_rounding = False
+    manager.spec_config = spec_config
+    manager._state_layout = SimpleNamespace(
+        spec_config=spec_config,
+        mamba_pp_layers=(),
+        conv_state_layout="q_k_v",
+        conv_section_dims=(),
+    )
+    with patch(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        return_value=verify_kernel is True,
+    ):
+        state = manager._initialize_spec_state()
+    assert manager.use_kda_replay_update is (verify_kernel is True)
     if verify_kernel is True:
-        assert allocate.call_args.kwargs["kda_replay_num_spec"] == 3
-    else:
-        assert "kda_replay_num_spec" not in allocate.call_args.kwargs
+        assert state.num_speculative_tokens == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

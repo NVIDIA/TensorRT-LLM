@@ -45,8 +45,8 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
-from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
-from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
+from tensorrt_llm.inputs.multimodal import (get_multimodal_item_metadata,
+                                            strip_mm_data_for_generation)
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ExecutorMemoryType, PeftCacheConfig,
                                           PrefillCudaGraphBackend,
@@ -571,6 +571,13 @@ class PyExecutor:
                 sampler.stage_in_graph_sampling)
             model_engine.register_sample_in_graph_callable(
                 self._sample_in_graph)
+        # Under beam search a request's per-beam token lists are not the
+        # hypotheses the beams hold; the sampler rebuilds those for the engine's
+        # logits post-processors.
+        if (hasattr(model_engine, "register_beam_histories_callable")
+                and hasattr(sampler, "start_beam_histories")):
+            model_engine.register_beam_histories_callable(
+                sampler.start_beam_histories)
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
@@ -6727,8 +6734,10 @@ class PyExecutor:
                 continue
             mm_data = getattr(queue_item.request, "py_multimodal_data", None)
             try:
-                item_metadata = (get_multimodal_encoder_item_metadata(mm_data)
+                item_metadata = (get_multimodal_item_metadata(mm_data)
                                  if isinstance(mm_data, dict) else None)
+                if item_metadata is not None:
+                    item_metadata.validate()
             except (TypeError, ValueError):
                 # Admission only estimates capacity. Pass malformed requests
                 # through so the normal request-scoped validation path can
@@ -8184,21 +8193,11 @@ class PyExecutor:
         self.resource_manager.resource_managers[
             ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(requests)
         self._setup_sampler_step(requests)
-        # KDA fused-verify replay caches: the ctx->gen state transfer
-        # populates only the base mamba conv/ssm pools; with one-model
-        # spec decoding (e.g. SA) the first forward for these requests
-        # takes the fused verify path, which reads the per-slot
-        # kda_conv_* replay caches instead of the conv pool. Seed them
-        # from the transferred conv states before the first step
-        # (otherwise the recurrent state is permanently contaminated by
-        # a zero/stale conv window; K3 SA-in-disagg GSM8K -0.6pp).
         if self.enable_spec_decode:
             kv_mgr = self.resource_manager.resource_managers.get(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
-                           None)
-            if seed is not None:
-                seed([
+            if isinstance(kv_mgr, BaseMambaCacheManager):
+                kv_mgr.on_state_transfer_complete([
                     req.py_request_id for req in cache_trans_complete_requests
                 ])
         # Cache state that the generation worker derives from the imported KV
@@ -8667,6 +8666,10 @@ class PyExecutor:
             for cache_key in cache_keys:
                 encoder_cache.release(cache_key)
 
+        params = getattr(request, "py_multimodal_params", None)
+        if params is not None:
+            params.encoder_event = None
+            params.multimodal_input = None
         mm_data = getattr(request, "py_multimodal_data", None)
         if mm_data:
             strip_mm_data_for_generation(mm_data)

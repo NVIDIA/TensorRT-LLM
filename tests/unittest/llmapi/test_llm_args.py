@@ -2883,7 +2883,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        to bound startup time and CUDA graph memory; the model-engine filter
        (invariants 2 and 3) clamps out-of-range entries to the reachable ceiling
        and never invents sizes beyond this list.
-    2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
+    2. `filter_prefill_capture_num_tokens` caps the candidate list at
        `max_batch_size * (max_seq_len - 1)` --
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
@@ -3002,10 +3002,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             )
 
     def test_prefill_filter_sorts_dedupes_and_drops_nonpositive(self):
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_prefill_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, unrecordable = _filter_prefill_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             [256, 0, -1, 128, 256],
             max_num_tokens=512,
             max_batch_size=1,
@@ -3063,11 +3063,11 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         full ceiling shape. The filter must never invent sizes the user
         did not request.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
         candidates = [512, 1024, 2048, 4096, 8192, 13914]
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             candidates,
             max_num_tokens=65536,
             max_batch_size=896,
@@ -3078,10 +3078,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
     def test_piecewise_filter_clamps_multiple_oversized_candidates(self):
         """All above-ceiling candidates collapse to one ceiling entry."""
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             [64, 120, 128, 200, 256],
             max_num_tokens=256,
             max_batch_size=1,
@@ -3099,8 +3099,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         `unrecordable` so the warning fires. ISLs in the gap still get a
         graph at the nearest recordable size.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
         candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, enable_padding=True)
@@ -3113,7 +3113,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             f"{max_capturable}. Update this test if CudaGraphConfig "
             "behavior changed.")
 
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             candidates,
             max_num_tokens=128,
             max_batch_size=1,
@@ -3133,12 +3133,12 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         `unrecordable` is empty. The ceiling (128 here) coincides with the
         largest candidate so no extra entry is appended.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
         candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, enable_padding=True)
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             candidates,
             max_num_tokens=129,
             max_batch_size=1,
@@ -3152,10 +3152,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
     def test_piecewise_filter_does_not_double_append_ceiling(self):
         """Ceiling already present in candidates -> not duplicated."""
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, _ = _filter_piecewise_capture_num_tokens(
+        kept, _ = filter_prefill_capture_num_tokens(
             [1, 64, 128],
             max_num_tokens=129,
             max_batch_size=1,
@@ -3170,10 +3170,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         ceiling itself is not appended, so the warning "exceeds reachable
         ceiling 0; raise max_seq_len" fires for the full candidate list.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             [1, 2, 4],
             max_num_tokens=8,
             max_batch_size=1,
@@ -3188,10 +3188,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         The ceiling (1016 here) is not appended; iterations above the
         largest candidate run eagerly at their true size.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, _ = _filter_piecewise_capture_num_tokens(
+        kept, _ = filter_prefill_capture_num_tokens(
             [1, 2, 4, 8],
             max_num_tokens=1024,
             max_batch_size=8,
