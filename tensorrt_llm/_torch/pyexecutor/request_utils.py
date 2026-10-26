@@ -518,6 +518,7 @@ class RequestBroadcaster:
             collect_py_objects_from_requests(new_requests, attribute_name)
             for attribute_name in (
                 "py_logits_post_processors",
+                "py_apply_batched_logits_processor",
                 "py_multimodal_data",
                 "py_scheduling_params",
                 "py_num_logprobs",
