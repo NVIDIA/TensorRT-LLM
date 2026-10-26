@@ -719,6 +719,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
             **kwargs):
+        self.py_prompt_tuning: bool = False
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         # Owned entirely on the Python side: the TorchSampler is the only
@@ -1666,10 +1667,6 @@ def executor_request_to_llm_request(
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
-        prompt_embedding_table=None if executor_request.prompt_tuning_config
-        is None else executor_request.prompt_tuning_config.embedding_table,
-        prompt_vocab_size=None if executor_request.prompt_tuning_config is None
-        else executor_request.prompt_tuning_config.embedding_table.shape[0],
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
@@ -1727,6 +1724,10 @@ def executor_request_to_llm_request(
         return_routed_experts=getattr(executor_request,
                                       "py_return_routed_experts", False),
     )
+
+    # Carry only the rejection marker through child construction. Admission
+    # reports the error per request before model or cache preparation.
+    llm_request.py_prompt_tuning = executor_request.prompt_tuning_config is not None
 
     # Bad-words list for the TorchSampler path, kept in its native
     # list[list[int]] form (single- and multi-token words). This is the

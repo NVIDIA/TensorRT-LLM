@@ -178,6 +178,7 @@ def test_enqueue_request_wraps_lora_load_error():
     request = type(
         "Request", (), {
             "id": 1,
+            "prompt_adapter_request": None,
             "lora_request": type("LoraRequest", (), {"adapter_id": 999})(),
         })()
 
@@ -428,3 +429,14 @@ def test_generation_logprobs_need_no_worker_recomputation():
     response = SimpleNamespace(client_id=7,
                                result=SimpleNamespace(is_final=False))
     assert _get_logprobs(worker, response) is None
+
+
+@pytest.mark.cpu_only
+def test_prompt_adapter_rejected_before_loading_or_changing_tokens() -> None:
+    request = SimpleNamespace(id=1,
+                              prompt_adapter_request=object(),
+                              prompt_token_ids=[10, 11])
+    # An unsupported adapter must fail before accessing any worker resources.
+    with pytest.raises(RequestError, match="Prompt adapters are not supported"):
+        BaseWorker._enqueue_request(SimpleNamespace(), request)
+    assert request.prompt_token_ids == [10, 11]

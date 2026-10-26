@@ -198,7 +198,7 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
 }
 
 void LlmRequest::validate(
-    SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool enableKVCacheReuse)
+    SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool /*enableKVCacheReuse*/)
 {
     if (mPromptLen > maxInputLen)
     {
@@ -243,16 +243,6 @@ void LlmRequest::validate(
             "Number of requested output tokens is changed to (%d).",
             mPromptLen, mMaxNewTokens, draftLenPerEngineStep, maxSequenceLen, maxNewTokens);
         mMaxNewTokens = maxNewTokens;
-    }
-
-    // validate extra ids when enabling kv cache reuse with prompt table
-    if (enableKVCacheReuse && mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value())
-    {
-        TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value(),
-            "Input token extra ids must be provided when enabling kv cache reuse with prompt table");
-        TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
-            "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
-            mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
     }
 }
 
