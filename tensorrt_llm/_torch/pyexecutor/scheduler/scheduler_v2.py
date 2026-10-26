@@ -239,6 +239,22 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.chunking_policy = ctx_chunk_config[0]
             self.chunk_unit_size = ctx_chunk_config[1]
 
+        # Long-prefill demotion (opt-in, see _demote_long_contexts): a context request whose
+        # router-estimated uncached prefill exceeds this many tokens goes behind the others;
+        # only chunking can give it the budget they leave.
+        demotion_tokens = max(0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0")))
+        self._ctx_demotion_tokens = demotion_tokens if self.chunking_enabled else 0
+        # Consecutive demoted iterations after which a request keeps arrival order (0: no bound).
+        self._ctx_demotion_max_iters = max(
+            0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
+        )
+        self._ctx_demoted_iters: dict[int, int] = {}
+        self._ctx_demotion_released: set[int] = set()
+        if demotion_tokens and not self.chunking_enabled:
+            logger.warning(
+                "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS needs chunked prefill; context demotion is off"
+            )
+
         # State value caches for fast comparison.
         # Default range [CONTEXT_INIT, GENERATION_TO_COMPLETE) matches C++
         # MicroBatchScheduler. For encoder-decoder models, caller should pass
@@ -279,6 +295,46 @@ class KVCacheV2Scheduler(RequestScheduler):
         self,
     ) -> tuple[LlmRequestState, LlmRequestState]:
         return self.no_schedule_until_state, self.no_schedule_after_state
+
+    def _is_long_context(self, req: LlmRequest) -> bool:
+        """Whether more than the demotion threshold of uncached prefill is left.
+
+        Before the first chunk only the router's estimate is known (no radix
+        probe per pending request per iteration); a started request's remainder
+        is exact.
+        """
+        if req.state_value != self._context_init_state_value:
+            return False
+        estimate = req.py_uncached_prefill_tokens
+        if estimate is None or estimate <= self._ctx_demotion_tokens:
+            return False
+        return (
+            req.context_current_position == 0
+            or req.context_remaining_length > self._ctx_demotion_tokens
+        )
+
+    def _demote_long_contexts(self, pending_ctx: RequestList) -> tuple[RequestList, set[int]]:
+        """Move long prefills behind the others, arrival order kept within each class.
+
+        A request demoted ``_ctx_demotion_max_iters`` consecutive iterations is
+        released: it keeps its arrival order until its prefill completes.
+        Returns the new order and the ids demoted this iteration.
+        """
+        kept: RequestList = []
+        demoted: RequestList = []
+        for req in pending_ctx:
+            rid = req.py_request_id
+            if rid not in self._ctx_demotion_released and self._is_long_context(req):
+                if (
+                    self._ctx_demotion_max_iters
+                    and self._ctx_demoted_iters.get(rid, 0) >= self._ctx_demotion_max_iters
+                ):
+                    self._ctx_demotion_released.add(rid)
+                else:
+                    demoted.append(req)
+                    continue
+            kept.append(req)
+        return kept + demoted, {req.py_request_id for req in demoted}
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -332,13 +388,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         for req in requests:
             if req.state_value in (self._context_init_state_value, self._encoder_init_state_value):
                 if (
-                    phase is RemoteTailPhase.CONTEXT
+                    phase in (RemoteTailPhase.CONTEXT, RemoteTailPhase.MIXED)
                     and req.request_id in self._remote_tail_context_ids
                 ):
                     eligible.append(req)
             elif self.is_request_in_schedulable_state(req):
                 if (
-                    phase is RemoteTailPhase.DECODE
+                    phase in (RemoteTailPhase.DECODE, RemoteTailPhase.MIXED)
                     and req.request_id in self._remote_tail_generation_ids
                 ):
                     eligible.append(req)
@@ -384,7 +440,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and self.remote_tail_phase is not RemoteTailPhase.DECODE
                 and req.request_id not in inflight_request_ids
                 and req.state_value == self._context_init_state_value
-                and getattr(req, "py_csa2_remote_tail_mode", None) is not None
+                and getattr(req, "py_csa2_remote_tail_mode", None) == "source"
             ),
             None,
         )
@@ -496,7 +552,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             else:
                 if exclusive_remote_mode is not None:
-                    # Replay-only batches harvest the preceding decode on CPU
+                    # Source-only batches harvest the preceding decode on CPU
                     # without launching its next step. On resume, use the host
                     # token count rather than the one-step-behind overlap path.
                     self._clear_request_runtime_state(req)
@@ -531,6 +587,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # itself a started context request still sits in pending_ctx, so
         # re-admitting it would spend the pages its own preemption released.
         preempted_ids: set[int] = set()
+        # Set by long-prefill demotion below, before phase 2 can preempt.
+        arrival_ctx = pending_ctx
+        demoted_ids: set[int] = set()
 
         def preempt_for_pages(req: LlmRequest) -> bool:
             """Free pages for `req` by giving up one started request.
@@ -543,6 +602,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
+            # Demotion reorders compute, not page priority: a demoted request that arrived
+            # before `req` would have been scheduled, and so protected, ahead of it in FCFS order.
+            if demoted_ids:
+                for other in arrival_ctx:
+                    if other is req:
+                        break
+                    if other.py_request_id in demoted_ids:
+                        protected.add(other.py_request_id)
             return self._try_preempt_for_pages(
                 requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
             )
@@ -565,6 +632,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
+
+        if self._ctx_demotion_tokens:
+            pending_ctx, demoted_ids = self._demote_long_contexts(pending_ctx)
 
         for req in pending_ctx:
             if budget.requests_full:
@@ -589,7 +659,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req.context_remaining_length
             ):
                 continue
-            if scheduled_ctx and remote_mode != scheduled_remote_mode:
+            if (
+                scheduled_ctx
+                and remote_mode != scheduled_remote_mode
+                and (remote_mode == "source" or scheduled_remote_mode == "source")
+            ):
                 continue
             # Probe context requests before peft_pages_needed and before
             # _try_schedule_context so that a deferral costs nothing: KV pages
@@ -667,6 +741,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             # pages. Retry admission without replay; keep its forward isolated.
             return self._schedule_loop(
                 requests_list, inflight_request_ids, defer_remote_tail_context=True
+            )
+
+        if self._ctx_demotion_tokens:
+            # Rebuilt each iteration, so requests that left hold no entry.
+            self._ctx_demoted_iters = {
+                rid: self._ctx_demoted_iters.get(rid, 0) + 1 for rid in demoted_ids
+            }
+            self._ctx_demotion_released.intersection_update(
+                req.py_request_id for req in active_requests
             )
 
         # Phase and frozen-membership deferrals are not KV capacity stalls.

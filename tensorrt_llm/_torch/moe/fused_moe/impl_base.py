@@ -27,7 +27,14 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, is_gated_activation
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation, install_activation_params
 from .impl_blocks import MoEEplbWeightLayoutMixin, MoEExecutionContractMixin, MoEWeightOwnerMixin
-from .impl_contract import MoEDeployment, MoEEligibility, MoEEplbBinding, MoEProblem, MoERunContext
+from .impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEEplbBinding,
+    MoEFusedRouteQuant,
+    MoEProblem,
+    MoERunContext,
+)
 from .interface import MoESchedulerKind, MoEWeightLoadingMode, _compute_ep_partition
 from .routing import BaseMoeRoutingMethod
 
@@ -258,12 +265,11 @@ class MoEImplBase(
 
     def try_fused_route_quant(
         self, x: "torch.Tensor", router_logits: "torch.Tensor"
-    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None":
+    ) -> "MoEFusedRouteQuant | None":
         """Offer to fuse routing and input quantization into one launch.
 
-        Accepting returns what the scheduler otherwise assembles from two calls,
-        in that order: ``routing_method.apply``'s selected experts and scales,
-        then ``quantize_input``'s quantized activations and scaling factors.
+        Accepting returns what ``routing_method.apply`` and ``quantize_input``
+        would, plus optionally this backend's routing tables for ``run_moe``.
 
         Declining is the default and the common case: the one implementation
         that accepts is shape-, SM-, and quant-specialized and checks all of

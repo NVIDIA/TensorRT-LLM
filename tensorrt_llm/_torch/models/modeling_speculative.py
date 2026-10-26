@@ -1560,6 +1560,11 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         # this and never writes back, so drafters read _runtime_position_ceiling.
         # None sizes position tables from max_position_embeddings: 1M for K3.
         max_seq_len=model_config.max_seq_len,
+        # The MoE combine wire format is an engine setting (moe_config), not a
+        # checkpoint property: a drafter's expert-parallel MoE communication uses
+        # the same format as the target's.
+        use_low_precision_moe_combine=model_config.
+        use_low_precision_moe_combine,
     )
     # Only the embedded DSpark draft shares the target's EPLB namespace (its
     # stages are target decoder blocks registered into the target's balancer).
@@ -1813,6 +1818,33 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 and getattr(self.draft_model, "shares_target_kv_cache", False)):
             self.draft_model.load_weights_from_target_model(self)
 
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.spec_worker is not None:
+            # Collective over the TP group; every rank loads in step.
+            self.spec_worker.prepare_vocab_sharded_sampling(self.lm_head)
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        return (self.spec_worker is not None
+                and self.spec_worker.samples_from_vocab_shards)
+
+    def _verify_logits(
+            self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata,
+            spec_metadata: SpecMetadata) -> Tuple[torch.Tensor, bool]:
+        """The target logits the worker verifies, and whether they are this rank's vocabulary
+        columns, which the worker samples without the head's gather."""
+        vocab_sharded = self.spec_worker.takes_vocab_sharded_target_logits(
+            attn_metadata, spec_metadata)
+        logits = self.logits_processor.forward(
+            hidden_states[spec_metadata.gather_ids],
+            self.lm_head.local_logits if vocab_sharded else self.lm_head,
+            attn_metadata,
+            True,
+            keep_lm_head_dtype=self.spec_worker.reads_lm_head_dtype_logits,
+        )
+        return logits, vocab_sharded
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1851,13 +1883,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            logits, vocab_sharded = self._verify_logits(hidden_states,
+                                                        attn_metadata,
+                                                        spec_metadata)
+            worker_kwargs = {
+                "vocab_sharded_logits": True
+            } if vocab_sharded else {}
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs
@@ -1882,7 +1913,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
                                     draft_model=self.draft_model,
-                                    resource_manager=resource_manager)
+                                    resource_manager=resource_manager,
+                                    **worker_kwargs)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,

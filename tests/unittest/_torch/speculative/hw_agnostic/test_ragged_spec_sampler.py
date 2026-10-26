@@ -14,6 +14,7 @@
 # limitations under the License.
 """Ragged one-model speculative sampling and penalty tests."""
 
+import contextlib
 import types
 from typing import Optional
 
@@ -274,10 +275,15 @@ def test_ragged_padding_rejects_incomplete_layout():
 
 @pytest.mark.parametrize("ragged", [False, True])
 def test_sampling_parameter_rows_follow_metadata_not_stale_request_windows(ragged):
-    config = types.SimpleNamespace(temperature=0.7, top_k=4, top_p=0.8, min_p=0.1)
+    config = types.SimpleNamespace(temperature=0.7, top_k=4, top_p=0.8, min_p=0.1, seed=None)
     requests = [
         types.SimpleNamespace(
-            sampling_config=config, state=state, py_seq_slot=slot, py_verify_len=window
+            sampling_config=config,
+            state=state,
+            py_seq_slot=slot,
+            py_verify_len=window,
+            py_spec_sampling_params=None,
+            py_logits_post_processors=None,
         )
         for slot, (state, window) in enumerate(
             [
@@ -292,6 +298,7 @@ def test_sampling_parameter_rows_follow_metadata_not_stale_request_windows(ragge
         is_ragged_verify=ragged,
         dummy_slot_row=9,
         group_all_greedy_sample=None,
+        samples_from_vocab_shards=False,
     )
     normalized, slots = SpecMetadata._scan_one_model_sampling(metadata, requests)
     assert [row[-1] for row in normalized] == ([1, 2, 4] if ragged else [1, 6, 6])
@@ -576,9 +583,19 @@ def test_rejection_retains_request_local_bonus_distribution(
             assert passed_probs.untyped_storage().data_ptr() != scratch.untyped_storage().data_ptr()
 
 
+def _index_copy_scatter(
+    slots, new, next_new, lens, drafts, store_new, store_next, store_lens, store_drafts
+):
+    """The store scatter as four index_copy_, on any device."""
+    store_new.T.index_copy_(0, slots, new)
+    store_next.T.index_copy_(0, slots, next_new)
+    store_lens.index_copy_(0, slots, lens)
+    store_drafts.index_copy_(0, slots, drafts)
+
+
 @pytest.fixture
 def cpu_sampler(monkeypatch):
-    """Replace only CUDA transfers/events and the unrelated stop-criteria API."""
+    """Replace only CUDA transfers/events and the CUDA store scatter."""
     original_to = torch.Tensor.to
 
     def to_cpu(tensor, *args, **kwargs):
@@ -587,28 +604,36 @@ def cpu_sampler(monkeypatch):
         return original_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", to_cpu)
-    monkeypatch.setattr(sampler_ops, "handle_stop_criteria", lambda *args, **kwargs: False)
+    monkeypatch.setattr(sampler_ops, "spec_store_scatter", _index_copy_scatter)
     sampler = SpecSampler.__new__(SpecSampler)
     sampler.draft_len = 5
     sampler.max_accepted_path_len = 6
     sampler.max_seq_len = 128
-    sampler.store = types.SimpleNamespace(
-        new_tokens=torch.zeros(6, 5, 1, dtype=torch.int32),
-        next_new_tokens=torch.zeros(6, 5, 1, dtype=torch.int32),
-        next_draft_tokens=torch.zeros(5, 5, dtype=torch.int32),
-        new_tokens_lens=torch.zeros(5, dtype=torch.int32),
+    sampler.store = SpecSampler.Store.allocate(
+        num_slots=5, accepted_len=6, draft_len=5, beam_width=1, device="cpu"
     )
+    sampler.store.host_read.zero_()
+    sampler.store.next_new_tokens.zero_()
+    sampler._last_slot_index = None
+    sampler._store_snapshot_done = None
+    sampler._async_worker = None
     transfers = []
 
     def copy_to_host(tensor):
         transfers.append(("copy", tuple(tensor.shape)))
         return tensor.clone()
 
-    def record_event():
+    @contextlib.contextmanager
+    def side_stream_copier():
+        copier = types.SimpleNamespace(stage_copy_to_host=copy_to_host, event=None)
+        yield copier
+
+    def record_event(side_stream_event=None):
         transfers.append(("record", None))
         return types.SimpleNamespace(synchronize=lambda: transfers.append(("sync", None)))
 
     sampler._copy_to_host = copy_to_host
+    sampler._make_side_stream_copier = side_stream_copier
     sampler._record_sampler_event = record_event
     return sampler, transfers
 
@@ -626,8 +651,14 @@ def _sampling_step():
             py_verify_len=None,
             py_decoding_iter=0,
             tokens=[],
+            # Stop criteria that never fire here.
+            py_end_id=None,
+            py_stop_words_list=None,
+            py_orig_prompt_len=0,
+            py_max_new_tokens=1 << 20,
         )
         result.add_new_token = lambda token, beam_idx: result.tokens.append(token)
+        result.get_num_tokens = lambda beam_idx: len(result.tokens)
         return result
 
     context, first, complete = request(7, 2, True), request(8, 3), request(9, 0)
@@ -665,7 +696,8 @@ def test_step_windows_survive_request_and_output_reuse(
     assert state.requests == [context, first, complete]
     assert state.draft_lens == [0, 3, 3]
     assert state.runtime_draft_len == 3
-    assert len(transfers) == (5 if authority == "device" else 4)
+    # One snapshot of the store, plus the executed windows when published.
+    assert len(transfers) == (3 if authority == "device" else 2)
     assert transfers[-1] == ("record", None)
     if authority == "device":
         assert state.host.verify_lens.tolist() == [1, 2, 4]
@@ -987,11 +1019,17 @@ def test_dspark_forward_publishes_execution_not_confidence_flag(return_confidenc
 
     worker = DSv4DSparkWorker.__new__(DSv4DSparkWorker)
     worker.spec_config = types.SimpleNamespace(max_draft_len=1)
+    worker.mapping = types.SimpleNamespace(enable_attention_dp=False, pp_size=1, cp_size=1)
     worker.return_confidence = return_confidence
     worker.guided_decoder = None
+    worker._d2t = None
+    worker._prep_fork_model = ()
+    worker._prep_fork = None
     worker._output_verify_lens = torch.empty(4, dtype=torch.int32)
     worker._lazy_init = lambda *_args: None
     worker._execute_guided_decoder_if_present = lambda *_args: None
+    # The stubs below model the unfused acceptance path.
+    worker._fused_accept = lambda *_args, **_kwargs: None
     worker.sample_and_accept_draft_tokens = lambda *_args: (
         torch.tensor([[11, 12]]),
         torch.tensor([2]),
@@ -1003,6 +1041,8 @@ def test_dspark_forward_publishes_execution_not_confidence_flag(return_confidenc
     metadata = types.SimpleNamespace(
         batch_indices_cuda=torch.tensor([0]),
         draft_probs_last_dim=8,
+        use_rejection_sampling=False,
+        is_all_greedy_sample=True,
         verify_lens=None
         if executed_window is None
         else torch.tensor([executed_window], dtype=torch.int32),
@@ -1015,7 +1055,8 @@ def test_dspark_forward_publishes_execution_not_confidence_flag(return_confidenc
         logits=torch.zeros((2, 8)),
         attn_metadata=types.SimpleNamespace(num_seqs=1, num_contexts=0),
         spec_metadata=metadata,
-        draft_model=types.SimpleNamespace(block_size=1),
+        # The mocks return draft logits, not greedy proposals.
+        draft_model=types.SimpleNamespace(block_size=1, supports_greedy_token_reuse=False),
     )
 
     if executed_window is None:
@@ -1066,6 +1107,7 @@ def test_publisher_exact_copy_owns_two_pending_steps(cpu_sampler, monkeypatch, d
     copies = DeferredCopies()
     copier._async_worker = copies if deferred else None
     copier._async_worker_futures = []
+    sampler._async_worker = copier._async_worker
     sampler._copy_to_host = copier._copy_to_host
     sampler._record_sampler_event = copier._record_sampler_event
     storage = torch.empty(8, dtype=torch.int32)
@@ -1089,8 +1131,9 @@ def test_publisher_exact_copy_owns_two_pending_steps(cpu_sampler, monkeypatch, d
     assert states[0].host.verify_lens.data_ptr() != states[1].host.verify_lens.data_ptr()
     assert copier._async_worker_futures == []
     if deferred:
-        assert len(states[0].sampler_event.worker_futures) == 4
-        assert len(states[1].sampler_event.worker_futures) == 4
+        # One copy of the store snapshot and one of the executed windows per step.
+        assert len(states[0].sampler_event.worker_futures) == 2
+        assert len(states[1].sampler_event.worker_futures) == 2
         assert states[0].sampler_event.worker_futures is not states[1].sampler_event.worker_futures
 
 

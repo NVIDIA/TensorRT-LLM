@@ -45,7 +45,7 @@ def test_full_context_logits_do_not_claim_encoder_only_prefix(
     config, sparse, dtype = cache_config
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", str(int(encoder_replay)))
-    with cache_case(config, sparse, dtype, [257], [0], 1, reuse=True) as case:
+    with cache_case(config, sparse, dtype, [257], [0], 1, reuse=True, scratch=True) as case:
         manager = case[0].kv_cache_manager
         source = manager.kv_cache_map[0]
         source.commit(list(range(256)))
@@ -69,14 +69,10 @@ def test_snapshot_policy_follows_reuse_and_encoder_recovery(
     config, sparse, dtype = cache_config
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", str(int(replay)))
-    with cache_case(config, sparse, dtype, [257], [0], 1, reuse=reuse) as case:
+    with cache_case(config, sparse, dtype, [257], [0], 1, reuse=reuse, scratch=True) as case:
         manager = case[0].kv_cache_manager
         expected_encoder = (
-            AttentionReusePolicy.PRIVATE
-            if not reuse
-            else AttentionReusePolicy.OPTIONAL
-            if replay
-            else AttentionReusePolicy.REQUIRED
+            AttentionReusePolicy.OPTIONAL if replay else AttentionReusePolicy.REQUIRED
         )
         for layer in manager.impl.init_config.layers:
             owner, _, role = manager._physical_roles[layer.layer_id, layer.buffers[0].role]
@@ -90,6 +86,10 @@ def test_snapshot_policy_follows_reuse_and_encoder_recovery(
             assert layer.reuse_policy == expected
         encoder = manager._layer_roles[0, 1, CSA2CacheRole.SWA]
         decoder = manager._layer_roles[5, 1, CSA2CacheRole.SWA]
+        assert (
+            manager.layer_to_pool_mapping_dict[encoder]
+            != manager.layer_to_pool_mapping_dict[decoder]
+        )
         if reuse:
             assert all(
                 role not in (CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX)
@@ -102,10 +102,13 @@ def test_snapshot_policy_follows_reuse_and_encoder_recovery(
                     if layer.reuse_policy == AttentionReusePolicy.OPTIONAL
                 }
                 assert set(manager._encoder_optional_groups) == expected_groups
-            assert (
-                manager.layer_to_pool_mapping_dict[encoder]
-                != manager.layer_to_pool_mapping_dict[decoder]
-            )
+        else:
+            assert manager.kv_cache_map[0].num_committed_tokens == 0
+            source = request(0, 257)
+            source.context_current_position = 256
+            manager.try_commit_blocks(source)
+            assert manager.kv_cache_map[0].num_committed_tokens == 0
+            assert manager.probe_context_reuse(request(1, 257)) is None
 
 
 @pytest.mark.parametrize("prefix", [129, 255])
@@ -132,7 +135,7 @@ def test_partial_global_hit_copies_tail_and_replays_encoder(cache_config, monkey
             cache = manager.kv_cache_map[1]
             assert cache.num_committed_tokens == prefix
             assert isinstance(reader.py_ced_replay, EncoderReplay)
-            assert reader.py_ced_replay.start == prefix - 128
+            assert reader.py_ced_replay.start == max(0, prefix - 140)
             assert not any(
                 cache.reuse_status[group].complete for group in manager._encoder_optional_groups
             )
@@ -161,39 +164,67 @@ def test_recovery_retention_matches_static_sizing(
 
     config, sparse, dtype = cache_config
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
-    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", str(int(encoder_replay)))
+    monkeypatch.delenv("TRTLLM_V41_ENCODER_REPLAY", raising=False)
+    replay_window = capture_window + 12
+    monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", str(replay_window))
+    config.max_num_tokens = replay_window + int(encoder_replay)
     spec = None
     if capture_window > 128:
         monkeypatch.setattr(config.pretrained_config, "sliding_window", capture_window)
         spec = DSparkDecodingConfig(max_draft_len=5)
         spec.__dict__["draft_is_embedded_in_target"] = True
-    with cache_case(config, sparse, dtype, [384], [0], 1, reuse=True, spec_config=spec) as case:
+    with cache_case(
+        config,
+        sparse,
+        dtype,
+        [min(384, config.max_num_tokens)],
+        [0],
+        1,
+        reuse=True,
+        scratch=True,
+        spec_config=spec,
+        max_num_tokens=config.max_num_tokens,
+    ) as case:
         manager = case[0].kv_cache_manager
+        assert manager._encoder_replay_enabled == encoder_replay
         assert manager.layout.window_size == 128
         reserve = manager.max_draft_len + manager.reuse_match_backoff
         for layer in manager.pp_layers:
             physical = manager._layer_roles[layer, 1, CSA2CacheRole.SWA]
             window = manager.impl.init_config.layers[physical].sliding_window_size
-            expected = (
-                capture_window + 1 if encoder_replay else capture_window if layer >= 5 else 128
-            )
+            expected = replay_window + 1 if encoder_replay or layer >= 5 else 128
             assert window == expected + reserve
         sizes, windows = manager._get_runtime_cache_size_layer_components()
-        per_token, fixed = base._estimate_swa_cache_size(
-            sizes, windows, 128, context=False, scratch=False
+        groups = manager._get_runtime_cache_size_scratch_group_keys()
+        assert groups == [layer.reuse_policy.value for layer in manager.impl.init_config.layers]
+        context, generation, fixed = base._estimate_cache_size_components(
+            sizes,
+            windows,
+            128,
+            scratch=True,
+            generation_capacity_headroom=manager._generation_kv_capacity_headroom,
+            scratch_group_keys=groups,
         )
-        expected = (base._estimate_full_attn_size_per_token(sizes, windows) + per_token, fixed * 3)
+        expected = (
+            generation,
+            fixed * 3 + (context - generation) * manager.max_num_tokens,
+        )
         assert (
             CSA2CacheManager.get_cache_size_per_token(
                 config,
                 config.pretrained_config.mapping,
                 tokens_per_block=128,
                 max_batch_size=3,
+                max_num_tokens=manager.max_num_tokens,
                 spec_config=spec,
-                kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=True, enable_swa_scratch_reuse=True
+                ),
             )
             == expected
         )
+        quota = manager._get_quota_from_max_tokens(2048)
+        assert manager._get_max_tokens_from_quota(quota) == pytest.approx(2048)
 
 
 def test_dummy_context_uses_base_lifecycle_without_publishing(cache_config, monkeypatch):
@@ -340,6 +371,7 @@ def test_encoder_window_spans_two_blocks(cache_config, monkeypatch, missing_page
     monkeypatch.setattr(config.pretrained_config.text_config, "sliding_window", 256)
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", "268")
     with cache_case(config, sparse, dtype, [768], [0], 1, reuse=True) as case:
         manager = case[0].kv_cache_manager
         assert manager.layout.window_size == 256 and manager.tokens_per_block == 128
@@ -351,13 +383,13 @@ def test_encoder_window_spans_two_blocks(cache_config, monkeypatch, missing_page
         if missing_page:
             _introspection.drop_optional_pages(warm, 384, [group])
         manager.free_resources(request(0, 768))
-        fresh = request(1, 768)
+        fresh = request(1, 780)
         assert manager.prepare_context(fresh)
         assert manager.kv_cache_map[1].is_active
         assert fresh.context_current_position == 512
-        assert manager.context_replay_tokens(fresh) == (256 if missing_page else 0)
-        fresh.context_chunk_size = 256
-        assert manager.resize_context(fresh, 256)
+        assert manager.context_replay_tokens(fresh) == (268 if missing_page else 0)
+        fresh.context_chunk_size = 268
+        assert manager.resize_context(fresh, 268)
         if not missing_page:
             assert manager.get_cache_indices(1, 0, CSA2CacheRole.SWA)[2:4] == original
         manager.free_resources(fresh)
@@ -386,7 +418,7 @@ def test_context_prepare_resumes_before_budgeting_and_retries(
             if policy == "evicted":
                 _introspection.drop_optional_pages(manager.kv_cache_map[0], 256)
         manager.free_resources(request(0, 384))
-        req = request(1, 257 if policy == "short-suffix" else 384)
+        req = request(1, 257 if policy == "short-suffix" else 396)
         resume = manager._resume_and_restore
         selections = []
 
@@ -416,7 +448,7 @@ def test_context_prepare_resumes_before_budgeting_and_retries(
             assert selections[-1] == ()
         else:
             assert plan is None
-        expected_tokens = None if policy == "cold" else 0 if policy == "hit" else 128
+        expected_tokens = None if policy == "cold" else 0 if policy == "hit" else 140
         assert manager.context_replay_tokens(req) == expected_tokens
 
         # A budget rejection or allocation failure can suspend the admitted

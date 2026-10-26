@@ -6346,7 +6346,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 output_indices_fake,
                 output_values_fake,
                 stream=fake_stream,
-                min_blocks_per_mp=4 if large_occupancy else 1,
+                min_blocks_per_mp=filtered_topk_func.blocks_per_sm,
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled_kernel

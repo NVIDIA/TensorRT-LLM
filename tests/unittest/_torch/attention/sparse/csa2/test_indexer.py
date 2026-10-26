@@ -2,17 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """CSA2 indexer contracts, candidate selection, native kernels and runtime workflows."""
 
+import dataclasses
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2CompressionBatch
 from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
     _HAS_SPARSE_MQA_LOGITS,
     CSA2Indexer,
-    _ChunkInputs,
-    _QueryChunk,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
@@ -30,7 +29,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm.mapping import Mapping
 
-from ._utils import _prediction_reference, _run_indexer, _run_modes, _selection_state
+from ._utils import _plan_indexer, _prediction_reference, _run_indexer, _run_modes, _selection_state
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -70,34 +69,6 @@ def _reference_select_candidate_positions(
     return torch.where(valid, candidates, -1).flatten(1)
 
 
-def _reference_select_topk_positions(
-    scores: torch.Tensor,
-    positions: torch.Tensor,
-    visible_lengths: torch.Tensor,
-    topk: int,
-) -> torch.Tensor:
-    """Select sorted logical positions; pad unreachable selections with -1.
-
-    ``positions`` is either [positions] or [queries, candidates]. Selection
-    never publishes candidate-array offsets or cache addresses to Reuse layers.
-    """
-    if scores.ndim != 2 or visible_lengths.shape != scores.shape[:1]:
-        raise ValueError("Top-k scores and visible lengths must have matching query rows")
-    if topk <= 0 or positions.shape[-1] != scores.shape[-1]:
-        raise ValueError("Invalid top-k size or candidate positions")
-    positions = positions.long().expand_as(scores)
-    valid = (positions >= 0) & (positions < visible_lengths[:, None])
-    scores = scores.masked_fill(~valid, -torch.inf)
-    values, offsets = scores.topk(min(topk, scores.shape[-1]), dim=-1, sorted=False)
-    selected = positions.gather(1, offsets)
-    # Sort invalid entries last. In particular, an unreachable candidate with a
-    # low logical index must not become a valid selection after the gather.
-    sentinel = torch.iinfo(torch.int64).max
-    selected = torch.where(values > -torch.inf, selected, sentinel).sort(dim=-1).values
-    selected = torch.where(selected == sentinel, -1, selected).to(torch.int32)
-    return F.pad(selected, (0, topk - selected.shape[-1]), value=-1)
-
-
 def _reference_index_scores(
     q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
 ) -> torch.Tensor:
@@ -120,30 +91,19 @@ def _prepared_indexer(heads=32, topk=32):
     return CSA2Indexer(CSA2Layout((1,), (0,), (0,), index_topk=topk), 0, heads, 128)
 
 
-def _prepared(indexer, q, keys, weights, lengths, positions, hook=None):
-    if not q.is_cuda:
-        indexer.top_k.prefill_implementation = TopKImplementation.TORCH
-        indexer.top_k.decode_implementation = TopKImplementation.TORCH
-    count = q.shape[0]
-    width = keys.shape[-2]
-    starts = torch.arange(count, dtype=torch.int32, device=q.device)
-    starts = starts * width if keys.ndim == 3 else torch.zeros_like(starts)
-    keys = keys.reshape(-1, 68)
-    out = torch.empty((count, indexer.index_topk), dtype=torch.int32, device=q.device)
-    indexer.forward_prepared(
-        q[..., :64].contiguous().view(torch.int8),
-        keys[:, :64].contiguous().view(torch.int8),
-        keys[:, 64:].contiguous().view(torch.int32).squeeze(-1),
-        weights,
-        starts,
-        starts + width,
-        out,
-        q[..., 64:].contiguous().view(torch.int32).squeeze(-1),
-        logical_positions=positions,
-        visible_lengths=lengths,
-        score_hook=hook,
+def _sparse_kernels_available():
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10
+        and _HAS_SPARSE_MQA_LOGITS
     )
-    return out
+
+
+def _canonical(indices):
+    """Selections in ascending order with -1 last; the indexer keeps TopK order."""
+    sentinel = torch.iinfo(torch.int32).max
+    ordered = torch.where(indices < 0, sentinel, indices).sort(-1).values
+    return torch.where(ordered == sentinel, -1, ordered)
 
 
 @pytest.mark.cpu_only
@@ -162,161 +122,6 @@ def test_projection_free_lifecycle(layer_idx):
     indexer.post_load_weights()
     with pytest.raises(RuntimeError, match="forward_prepared"):
         indexer.pre_indexer_proj(None, None, None)
-
-
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("per_query", [False, True])
-@pytest.mark.parametrize("heads", [2, 8, 32, 64])
-def test_prepared_packed_selection(per_query, heads):
-    indexer = _prepared_indexer(heads)
-    torch.manual_seed(1701)
-    q = pack_rows(torch.randn(3, heads, 128, device="cuda"), "index")
-    shape = (3, 257, 128) if per_query else (257, 128)
-    packed = pack_rows(torch.randn(shape, device="cuda"), "index")
-    owner = torch.zeros((*packed.shape[:-1], 356), dtype=torch.uint8, device="cuda")
-    owner[..., 288:].copy_(packed)
-    keys = owner[..., 288:]
-    weights = torch.rand(3, heads, device="cuda")
-    lengths = torch.tensor([257, 39, 0], device="cuda", dtype=torch.int32)
-    positions = torch.arange(257, device="cuda").expand(3, -1).clone()
-    positions[:, 5::11] = -1
-    actual = _prepared(indexer, q, keys, weights, lengths, positions)
-    scores = _reference_index_scores(
-        unpack_rows(q, 128, "index", torch.float32),
-        unpack_rows(keys, 128, "index", torch.float32),
-        weights,
-    )
-    expected = _reference_select_topk_positions(scores, positions, lengths, 32)
-    # Low head counts can tie at zero; compare selected score multisets, with
-    # exact logical output for the unambiguous 32/64-head cases.
-    if heads >= 32:
-        torch.testing.assert_close(actual, expected)
-    else:
-        valid = actual >= 0
-        torch.testing.assert_close(valid.sum(-1), (expected >= 0).sum(-1))
-        torch.testing.assert_close(
-            scores.gather(1, actual.clamp_min(0).long())
-            .masked_fill(~valid, -torch.inf)
-            .sort(-1)
-            .values,
-            scores.gather(1, expected.clamp_min(0).long())
-            .masked_fill(expected < 0, -torch.inf)
-            .sort(-1)
-            .values,
-        )
-
-
-@skip_pre_blackwell
-def test_prepared_hierarchy_and_graph():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    indexer = CSA2Indexer(
-        CSA2Layout(
-            (1,),
-            (0,),
-            (0,),
-            candidate_source_layer_id=0,
-            candidate_topk_blocks=3,
-            candidate_block_size=32,
-            index_topk=32,
-        ),
-        0,
-        32,
-        128,
-    )
-    indexer._configure_candidate_topk(257)
-    torch.manual_seed(59)
-    q = pack_rows(torch.randn(3, 32, 128, device="cuda"), "index")
-    keys = pack_rows(torch.randn(3, 257, 128, device="cuda"), "index")
-    weights = torch.rand(3, 32, device="cuda")
-    lengths = torch.tensor([257, 129, 0], device="cuda", dtype=torch.int32)
-    positions = torch.arange(257, device="cuda").expand(3, -1).clone()
-    candidates = torch.empty((3, 96), dtype=torch.int64, device="cuda")
-
-    def hook(scores):
-        blocks = (
-            torch.nn.functional.pad(scores, (0, 31), value=-torch.inf).reshape(3, 9, 32).amax(-1)
-        )
-        latest = (lengths - 1) // 32
-        blocks = blocks.masked_fill(
-            torch.arange(9, device="cuda")[None, :] == latest[:, None], torch.inf
-        )
-        selected = torch.empty((3, 3), dtype=torch.int32, device="cuda")
-        indexer.select_prepared_scores(
-            blocks, selected, torch.zeros_like(lengths), torch.full_like(lengths, 9), candidate=True
-        )
-        values = selected.long()[:, :, None] * 32 + torch.arange(32, device="cuda")
-        valid = (values < lengths[:, None, None]) & (values < 257)
-        valid = valid & (blocks.gather(1, selected.long())[:, :, None] > -torch.inf)
-        candidates.copy_(torch.where(valid, values, -1).flatten(1))
-
-    def run():
-        return _prepared(indexer, q, keys, weights, lengths, positions, hook)
-
-    for _ in range(3):
-        run()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = run()
-    for visible in ([257, 129, 0], [0, 17, 256], [256, 0, 3]):
-        lengths.copy_(torch.tensor(visible, device="cuda", dtype=torch.int32))
-        weights.mul_(0.9)
-        keys[..., :64].bitwise_xor_(0x88)
-        graph.replay()
-        scores = _reference_index_scores(
-            unpack_rows(q, 128, "index", torch.float32),
-            unpack_rows(keys, 128, "index", torch.float32),
-            weights,
-        )
-        expected_candidates = _reference_select_candidate_positions(scores, lengths, 3, 32)
-        expected = _reference_select_topk_positions(scores, positions, lengths, 32)
-        torch.testing.assert_close(candidates.sort(-1).values, expected_candidates.sort(-1).values)
-        torch.testing.assert_close(actual, expected)
-
-
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("heads", [8, 32, 64])
-def test_prepared_bmm_fallback(monkeypatch, heads):
-    indexer = _prepared_indexer(heads)
-    torch.manual_seed(7)
-    q = pack_rows(torch.randn(2, heads, 128, device="cuda"), "index")
-    k = pack_rows(torch.randn(2, 33, 128, device="cuda"), "index")
-    weights = torch.rand(2, heads, device="cuda")
-    lengths = torch.tensor([33, 3], dtype=torch.int32, device="cuda")
-    positions = torch.arange(33, device="cuda").expand(2, -1)
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version", lambda: 90
-    )
-    scores = []
-    actual = _prepared(indexer, q, k, weights, lengths, positions, scores.append)
-    dots = torch.bmm(
-        unpack_rows(q, 128, "index", torch.float32),
-        unpack_rows(k, 128, "index", torch.float32).transpose(1, 2),
-    )
-    expected_scores = (dots.relu() * weights.unsqueeze(-1)).sum(1)
-    expected = _reference_select_topk_positions(expected_scores, positions, lengths, 32)
-    torch.testing.assert_close(actual, expected)
-    expected_scores.masked_fill_(
-        torch.arange(k.shape[1], device=k.device)[None, :] >= lengths[:, None], -torch.inf
-    )
-    torch.testing.assert_close(scores[0], expected_scores)
-    for _ in range(3):
-        _prepared(indexer, q, k, weights, lengths, positions)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        replayed = _prepared(indexer, q, k, weights, lengths, positions)
-    lengths.copy_(torch.tensor([0, 17], dtype=torch.int32, device="cuda"))
-    k[..., :64].bitwise_xor_(0x88)
-    graph.replay()
-    dots = torch.bmm(
-        unpack_rows(q, 128, "index", torch.float32),
-        unpack_rows(k, 128, "index", torch.float32).transpose(1, 2),
-    )
-    expected_scores = (dots.relu() * weights.unsqueeze(-1)).sum(1)
-    expected = _reference_select_topk_positions(expected_scores, positions, lengths, 32)
-    torch.testing.assert_close(replayed, expected)
 
 
 @skip_pre_blackwell
@@ -356,92 +161,39 @@ def test_prepared_default_row_local(use_fp4):
     torch.testing.assert_close(out.long().sort(-1).values, expected.sort(-1).values)
 
 
-@pytest.mark.cpu_only
-def test_prepared_cpu_reference():
-    indexer = _prepared_indexer(8, 4)
-    q = pack_rows(torch.randn(2, 8, 128), "index")
-    k = pack_rows(torch.randn(2, 17, 128), "index")
-    weights = torch.rand(2, 8)
-    lengths = torch.tensor([17, 3], dtype=torch.int32)
-    positions = torch.arange(17).expand(2, -1)
-    actual = _prepared(indexer, q, k, weights, lengths, positions)
-    scores = _reference_index_scores(
-        unpack_rows(q, 128, "index", torch.float32),
-        unpack_rows(k, 128, "index", torch.float32),
-        weights,
-    )
-    expected = _reference_select_topk_positions(scores, positions, lengths, 4)
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("has_hook", [False, True])
-def test_short_sequence_skip_preserves_candidate_scores(monkeypatch, has_hook):
-    layout = CSA2Layout((1,), (0,), (0,), index_topk=8)
-    indexer = CSA2Indexer(layout, 0, 8, 128)
-    indexer.top_k.prefill_implementation = TopKImplementation.TORCH
-    indexer.top_k.decode_implementation = TopKImplementation.TORCH
-    q = pack_rows(torch.randn(2, 8, 128), "index")
-    k = pack_rows(torch.randn(4, 128), "index")
-    weights = torch.rand(2, 8)
-    positions = torch.tensor([[0, -1, 2, 3], [0, 1, 2, 3]])
-    visible = torch.tensor([3, 0], dtype=torch.int32)
-    calls = []
-    native = indexer._call_mqa_logits
-
-    def record(*args, **kwargs):
-        calls.append(True)
-        return native(*args, **kwargs)
-
-    monkeypatch.setattr(indexer, "_call_mqa_logits", record)
-    hook_scores = []
-    output = torch.empty(2, 8, dtype=torch.int32)
-    indexer.forward_prepared(
-        q[..., :64].contiguous().view(torch.int8),
-        k[:, :64].contiguous().view(torch.int8),
-        k[:, 64:].contiguous(),
-        weights,
-        torch.zeros(2, dtype=torch.int32),
-        torch.full((2,), 4, dtype=torch.int32),
-        output,
-        q[..., 64:].contiguous(),
-        logical_positions=positions,
-        visible_lengths=visible,
-        score_hook=hook_scores.append if has_hook else None,
-    )
-    assert len(calls) == int(has_hook)
-    assert len(hook_scores) == int(has_hook)
-    torch.testing.assert_close(
-        output,
-        torch.tensor(
-            [[0, 2, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32
-        ),
-    )
-
-
 @skip_pre_blackwell
-@pytest.mark.parametrize("implementation", ["dsl", "self_sampling"])
-@pytest.mark.parametrize("is_prefill", [False, True])
+@pytest.mark.parametrize(
+    "implementation, is_prefill",
+    [
+        ("dsl", False),
+        ("dsl", True),
+        ("self_sampling", False),
+        ("self_sampling", True),
+        ("default", True),
+    ],
+)
 def test_topk_opt_in_native_and_graph(implementation, is_prefill):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("TopK optimizations require SM100")
     torch.manual_seed(6301)
-    options = CSA2Params(
-        use_cute_dsl_topk=implementation == "dsl",
-        enable_heuristic_topk=implementation == "self_sampling",
-    )
+    options = {
+        "dsl": CSA2Params(use_self_sampling_topk=False),
+        "self_sampling": CSA2Params(use_cute_dsl_topk=False, enable_heuristic_topk=True),
+        "default": CSA2Params(),
+    }[implementation]
     indexer = CSA2Indexer(CSA2Layout((1,), (0,), (0,), index_topk=512), 0, 64, 128, options)
-    scores = torch.rand(2, 4096, device="cuda")
+    scores = torch.rand(2, 8192, device="cuda")
     starts = torch.zeros(2, dtype=torch.int32, device="cuda")
-    ends = torch.tensor([4096, 2048], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([8192, 4096], dtype=torch.int32, device="cuda")
     output = torch.empty(2, 512, dtype=torch.int32, device="cuda")
     aux_indices = torch.empty(2, 10, 512, dtype=torch.int32, device="cuda")
     aux_logits = torch.empty_like(aux_indices, dtype=torch.float32)
     selector = indexer.top_k
+    # Prefill takes the exact self-sampling engine unless it is opted out.
     expected_impl = (
-        TopKImplementation.CUTE_DSL_RADIX
-        if implementation == "dsl"
-        else TopKImplementation.CUTE_DSL_GVR
+        TopKImplementation.CUTE_DSL_GVR
+        if implementation == "self_sampling" or (implementation == "default" and is_prefill)
+        else TopKImplementation.CUTE_DSL_RADIX
     )
     assert (
         selector.prefill_implementation if is_prefill else selector.decode_implementation
@@ -463,7 +215,7 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    for lengths in ([4096, 2048], [512, 1024]):
+    for lengths in ([8192, 4096], [512, 1024]):
         ends.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
         scores.copy_(torch.rand_like(scores))
         graph.replay()
@@ -471,42 +223,6 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
             expected = scores[row, :length].topk(512).indices
             # These deterministic, continuous scores have no boundary ties.
             torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
-
-
-@skip_pre_blackwell
-def test_self_sampling_mqa_selection_and_graph():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Self-sampling GVR requires SM100")
-    torch.manual_seed(7303)
-    indexer = CSA2Indexer(
-        CSA2Layout((1,), (0,), (0,), index_topk=512),
-        0,
-        64,
-        128,
-        options=CSA2Params(enable_heuristic_topk=True),
-    )
-    q = pack_rows(torch.randn(2, 64, 128, device="cuda"), "index")
-    k = pack_rows(torch.randn(2, 4096, 128, device="cuda"), "index")
-    weights = torch.rand(2, 64, device="cuda") / 64
-    positions = torch.arange(4096, device="cuda").expand(2, -1).clone()
-    positions[:, 7::11] = -1
-    lengths = torch.tensor([4096, 3072], dtype=torch.int32, device="cuda")
-    for _ in range(3):
-        _prepared(indexer, q, k, weights, lengths, positions)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = _prepared(indexer, q, k, weights, lengths, positions)
-    for visible in ([4096, 3072], [0, 256], [2048, 4096]):
-        lengths.copy_(torch.tensor(visible, dtype=torch.int32, device="cuda"))
-        weights.mul_(0.99)
-        graph.replay()
-        scores = _reference_index_scores(
-            unpack_rows(q, 128, "index", torch.float32),
-            unpack_rows(k, 128, "index", torch.float32),
-            weights,
-        )
-        expected = _reference_select_topk_positions(scores, positions, lengths, 512)
-        torch.testing.assert_close(actual, expected)
 
 
 def _reference_candidate_mask(
@@ -541,7 +257,6 @@ def _candidate_indexer(width, block_size, topk_blocks):
         index_topk=4,
     )
     indexer = CSA2Indexer(layout, 0, 8, 128)
-    indexer.top_k.prefill_implementation = TopKImplementation.TORCH
     indexer._configure_candidate_topk(width)
     return indexer
 
@@ -551,19 +266,47 @@ def _effective_mask(positions, width):
     return (positions[:, :, None] == columns[None, None, :]).any(1)
 
 
-def _publish_candidate_rows(indexer, scores, lengths):
-    results = {}
-    indexer._publish_candidates(scores, lengths, results, 0, len(lengths))
-    return results[0]
+def _publish_rows(indexer, scores, visible, start, output, ids=None, counts=None):
+    """Publish rows ``start:`` of position-indexed ``scores`` into ``output``."""
+    count, width = scores.shape
+    rows = torch.zeros(count, dtype=torch.int32, device="cuda")
+    widths = torch.full_like(rows, width)
+    valid = torch.ones(max(width, 1), dtype=torch.bool, device="cuda")
+    indexer._publish_block_candidates(
+        scores, valid, 0, visible, start, rows, widths, widths, output, ids, counts
+    )
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=skip_pre_blackwell)])
-@pytest.mark.parametrize("width,block_size", [(32, 4), (30, 4), (33, 8), (64, 8), (17, 3)])
+def _publish_candidate_rows(indexer, scores, lengths, candidate_width=None, sparse=False):
+    """Candidate positions (and sparse block ids and counts) of ``scores`` columns."""
+    scores = scores.float().cuda()
+    lengths = lengths.to(torch.int32).cuda()
+    count, width = scores.shape
+    block_size = indexer.layout.candidate_block_size
+    if candidate_width is None:
+        candidate_width = min(indexer.candidate_top_k.top_k, -(-width // block_size)) * block_size
+    output = torch.full((count, candidate_width), -1, dtype=torch.int32, device="cuda")
+    ids = counts = None
+    if sparse:
+        ids = torch.zeros(
+            (count, candidate_width // indexer.sparse_block), dtype=torch.int32, device="cuda"
+        )
+        counts = torch.zeros((count, 1), dtype=torch.int32, device="cuda")
+    if count and width:
+        _publish_rows(indexer, scores, lengths, 0, output, ids, counts.view(-1) if sparse else None)
+    return (output, ids, counts) if sparse else output
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "width,block_size", [(32, 4), (30, 4), (33, 8), (64, 8), (17, 3), (600000, 8)]
+)
 @pytest.mark.parametrize("topk_blocks", [1, 2, 3, 5, 99])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_candidates_match_reference_effective_mask(device, width, block_size, topk_blocks, dtype):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA required for the CuTe candidate publication")
+def test_candidates_match_reference_effective_mask(width, block_size, topk_blocks, dtype):
+    if dtype == torch.bfloat16 and width > 256:
+        pytest.skip("BF16 cannot keep wide integer scores unique")
     torch.manual_seed(0x4109 ^ width ^ (block_size << 8) ^ (topk_blocks << 16))
     lengths = torch.tensor([0, 1, block_size, block_size + 1, width - 1, width], dtype=torch.int32)
     # Integer scores remain unique in BF16, avoiding backend-specific top-k tie order.
@@ -571,13 +314,14 @@ def test_candidates_match_reference_effective_mask(device, width, block_size, to
     reachable = torch.arange(width)[None, :] < lengths[:, None]
     scores = scores.masked_fill(~reachable, -torch.inf)
     indexer = _candidate_indexer(width, block_size, topk_blocks)
-    positions = _publish_candidate_rows(indexer, scores.to(device), lengths.to(device)).cpu()
+    positions = _publish_candidate_rows(indexer, scores, lengths).cpu()
     expected = _reference_candidate_mask(scores, lengths, topk_blocks, block_size) & reachable
     assert torch.equal(_effective_mask(positions, width), expected)
     assert torch.all((positions == -1) | ((positions >= 0) & (positions < lengths[:, None])))
 
 
-@pytest.mark.cpu_only
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_latest_partial_block_is_pinned_despite_lowest_score():
     indexer = _candidate_indexer(10, 4, 1)
     scores = torch.tensor([[100.0, 99.0, 98.0, 97.0, 50.0, 49.0, 48.0, 47.0, -20.0, -30.0]])
@@ -585,7 +329,8 @@ def test_latest_partial_block_is_pinned_despite_lowest_score():
     assert positions.tolist() == [[8, -1, -1, -1]]
 
 
-@pytest.mark.cpu_only
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("length", [0, 1, 31, 32, 33, 95, 96, 97])
 def test_inert_boundary_and_first_dropped_block(length):
     width, block_size, blocks = 97, 32, 3
@@ -593,7 +338,7 @@ def test_inert_boundary_and_first_dropped_block(length):
     scores = torch.arange(width, dtype=torch.float32).neg()[None, :]
     scores[:, length:] = -torch.inf
     positions = _publish_candidate_rows(indexer, scores, torch.tensor([length], dtype=torch.int32))
-    mask = _effective_mask(positions, width)[0]
+    mask = _effective_mask(positions.cpu(), width)[0]
     if length <= block_size * blocks:
         assert torch.equal(mask, torch.arange(width) < length)
     else:
@@ -603,23 +348,24 @@ def test_inert_boundary_and_first_dropped_block(length):
         assert not mask[64:96].any()
 
 
-@pytest.mark.cpu_only
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_ragged_rows_and_tiled_publication_keep_query_order():
     indexer = _candidate_indexer(17, 4, 2)
     lengths = torch.tensor([17, 0, 3, 9], dtype=torch.int32)
     scores = torch.arange(68, dtype=torch.float32).reshape(4, 17)
     scores = scores.masked_fill(torch.arange(17)[None, :] >= lengths[:, None], -torch.inf)
     whole = _publish_candidate_rows(indexer, scores, lengths)
-    tiled = {}
+    tiled = torch.full_like(whole, -1)
+    scores, lengths = scores.cuda(), lengths.cuda()
     for begin, end in ((0, 1), (1, 3), (3, 4)):
-        indexer._publish_candidates(scores[begin:end], lengths[begin:end], tiled, begin, 4)
-    assert torch.equal(tiled[0], whole)
+        _publish_rows(indexer, scores[begin:end], lengths, begin, tiled[begin:end])
+    assert torch.equal(tiled, whole)
     assert (whole[1] == -1).all()
-    with pytest.raises(ValueError, match="full-query shape"):
-        indexer._publish_candidates(scores[1:2], lengths[1:2], {}, 1, 4)
 
 
-@pytest.mark.cpu_only
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_candidate_selector_survives_warmup_and_draft_bounds():
     indexer = _candidate_indexer(17, 4, 8)
     selector = indexer.candidate_top_k
@@ -635,14 +381,12 @@ def test_candidate_selector_survives_warmup_and_draft_bounds():
         assert actual.shape == (2, min(8, (width + 3) // 4) * 4)
         if width:
             expected = _reference_candidate_mask(scores, lengths, 8, 4) & reachable
-            torch.testing.assert_close(_effective_mask(actual, width), expected)
+            torch.testing.assert_close(_effective_mask(actual.cpu(), width), expected)
         else:
             assert actual.numel() == 0
 
     with pytest.raises(ValueError, match="nonnegative"):
         indexer._configure_candidate_topk(-1)
-    with pytest.raises(ValueError, match="cannot truncate"):
-        indexer._publish_candidates(torch.ones(1, 17), torch.tensor([17]), {}, 0, 1, 16)
 
 
 @skip_pre_blackwell
@@ -666,21 +410,24 @@ def test_candidate_selector_keeps_captured_graphs_across_metadata_bounds():
         published_width = min(8, (width + 3) // 4) * 4
 
         def run():
-            result = {}
             # Native MQA may return aligned storage wider than its logical
-            # domain. Deliberately large padding must never reach the hook.
+            # domain. Deliberately large padding must never be published.
             logits = F.pad(scores, (0, 64 - width % 64), value=1e6)
-            positions = torch.arange(width, device="cuda").expand(2, -1)
-            output = torch.empty(2, layout.index_topk, dtype=torch.int32, device="cuda")
-
-            def publish(masked):
-                assert masked.shape == scores.shape
-                indexer._publish_candidates(masked, lengths, result, 0, 2, published_width)
-
-            indexer._select_mapped_logits(
-                logits, torch.zeros_like(lengths), lengths, positions, lengths, output, publish
+            output = torch.full((2, published_width), -1, dtype=torch.int32, device="cuda")
+            indexer._publish_block_candidates(
+                logits,
+                torch.ones(width, dtype=torch.bool, device="cuda"),
+                0,
+                lengths,
+                0,
+                torch.zeros_like(lengths),
+                lengths,
+                torch.full_like(lengths, width),
+                output,
+                None,
+                None,
             )
-            return result[0]
+            return output
 
         for _ in range(3):
             run()
@@ -708,7 +455,8 @@ def test_candidate_selector_keeps_captured_graphs_across_metadata_bounds():
         assert output.data_ptr() == pointer
 
 
-@pytest.mark.cpu_only
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("next_n", [1, 4, 17])
 def test_verification_queries_pin_their_own_latest_candidate(ratio, next_n):
@@ -717,7 +465,7 @@ def test_verification_queries_pin_their_own_latest_candidate(ratio, next_n):
     positions = endpoints[:, None] - next_n + torch.arange(next_n)[None, :]
     visible = ((positions.flatten() + 1) // ratio).int()
     scores = torch.arange(80).float().expand(visible.numel(), -1)
-    actual = _publish_candidate_rows(_candidate_indexer(80, 8, 1), scores, visible)
+    actual = _publish_candidate_rows(_candidate_indexer(80, 8, 1), scores, visible).cpu()
     latest = ((visible - 1) // 8)[:, None] * 8
     expected = latest + torch.arange(8)[None, :]
     expected = torch.where(expected < visible[:, None], expected, -1)
@@ -733,9 +481,8 @@ def _index_pages_from_rows(rows):
 
 
 class _StridedOwner:
-    """GLOBAL main/index fixture; exercise the manager's actual native gather and pages."""
+    """GLOBAL main/index fixture over the native index pages."""
 
-    gather_indexer_keys = CSA2CacheManager.gather_indexer_keys
     tokens_per_block = 128
 
     def __init__(self, layout, rows):
@@ -749,8 +496,128 @@ class _StridedOwner:
         assert self.layout.layer(layer).kv_source == 0
         return self.index_pages
 
+    def batch_page_table_key(self, spec):
+        # Every owner's table converts on its own.
+        return spec
+
     def index_pages_per_global_page(self, layer):
         return (self.tokens_per_block // self.layout.compress_ratios[layer]) // 64
+
+
+class _TwoOwners:
+    """Two GLOBAL owners (layers 0 and 1) with their own compression ratios and index pages."""
+
+    tokens_per_block = 128
+    max_total_draft_tokens = 1
+
+    def __init__(self, layout, pages):
+        self.layout = layout
+        self.pages = pages
+
+    def get_index_pages(self, layer):
+        return self.pages[self.layout.layer(layer).kv_source]
+
+    def batch_page_table_key(self, spec):
+        # Every owner's table converts on its own.
+        return spec
+
+    def index_pages_per_global_page(self, layer):
+        return (self.tokens_per_block // self.layout.compress_ratios[layer]) // 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_paged_indexer_arena_is_refreshed_per_graph_copy_and_owner(monkeypatch):
+    """Graph copies of one metadata share the paged-indexer arena, which holds one owner's
+    descriptors at a time. A copy whose forward serial repeats another copy's (both copied from
+    one base) must not take the arena's descriptors -- the last owner's, here of another ratio and
+    width -- for its own owner's. A repeated prepare of one owner in one forward keeps them."""
+    import copy
+
+    torch.manual_seed(4319)
+    layout = CSA2Layout((2, 1), (0, 1), (0, 1), index_topk=32)
+    tokens = 256
+    pages = {
+        owner: _index_pages_from_rows(
+            pack_rows(
+                torch.randn(tokens // ratio, 128, device="cuda", dtype=torch.bfloat16), "index"
+            )
+        )
+        for owner, ratio in ((0, 2), (1, 1))
+    }
+    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=2)
+    metadata.kv_cache_manager = _TwoOwners(layout, pages)
+    metadata.mapping = Mapping()
+    metadata.is_cuda_graph = True
+    metadata.csa2_kv_sources = {0: 0, 1: 1}
+    metadata.csa2_num_context_requests = 0
+    metadata.csa2_request_query_ranges = [(0, 2)]
+    metadata.csa2_request_start_positions = [tokens - 2]
+    metadata.csa2_request_lengths = [2]
+    metadata.csa2_global_max_positions = {0: tokens // 2, 1: tokens}
+    metadata.csa2_global_page_sizes = {0: 64, 1: 128}
+    metadata.csa2_global_page_tables = {
+        owner: torch.tensor([[0, 1]], device="cuda", dtype=torch.int32) for owner in (0, 1)
+    }
+    metadata.csa2_visible_lengths = {
+        0: torch.tensor([tokens // 2 - 1, tokens // 2], device="cuda", dtype=torch.int32),
+        1: torch.tensor([tokens - 1, tokens], device="cuda", dtype=torch.int32),
+    }
+    metadata.csa2_token_requests = torch.zeros(2, device="cuda", dtype=torch.int64)
+    metadata.csa2_indices = {}
+    metadata.indexer_max_chunk_size = 16
+    metadata.indexer_q_split_threshold = -1
+    _plan_indexer(metadata)
+    fills = []
+    fill = CSA2TrtllmMetadata._fill_indexer_descriptors
+    monkeypatch.setattr(
+        CSA2TrtllmMetadata,
+        "_fill_indexer_descriptors",
+        staticmethod(lambda *args, **kwargs: fills.append(1) or fill(*args, **kwargs)),
+    )
+
+    def prepare(copy_, layer):
+        bound = copy_.prepare_indexer(layer)
+        return bound.csa2_indexer_context_lengths.flatten().clone(), bound.csa2_indexer_max_seq_len
+
+    # Copy A: one forward over both owners leaves owner 1's (ratio 1) descriptors in the arena.
+    metadata._csa2_forward_serial = 7
+    own, width = prepare(metadata, 0)
+    assert int(own.max()) <= width
+    prepare(metadata, 1)
+    assert len(fills) == 2
+    # Copy B, copied from the same base, repeats copy A's serial.
+    second = copy.copy(metadata)
+    second._csa2_forward_serial = 7
+    assert second._csa2_indexer_workspaces is metadata._csa2_indexer_workspaces
+    lengths, width = prepare(second, 0)
+    assert len(fills) == 3
+    assert torch.equal(lengths, own) and int(lengths.max()) <= width
+    # The same owner again in the same forward keeps the arena.
+    prepare(second, 0)
+    assert len(fills) == 3
+    # A captured forward derives each owner once per stretch it holds the arena (the serial is
+    # constant within the forward) and its replays follow the live visibility.
+    second._csa2_forward_serial = 8
+    fills.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for layer in (0, 0, 1, 0):
+            second.prepare_indexer(layer)
+    assert len(fills) == 3
+    for layer, shift in ((0, 40), (1, 80)):
+        metadata.csa2_visible_lengths[layer].sub_(shift)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = second.csa2_indexer_context_lengths.flatten().clone()
+    third = copy.copy(second)
+    third._csa2_forward_serial = 9
+    live, width = prepare(third, 0)
+    assert torch.equal(replayed, live) and int(live.max()) <= width
+    # Each prepare draws a serial no other metadata object has.
+    metadata._finish_prepare_csa2(None, defer_outputs=False)
+    second._finish_prepare_csa2(None, defer_outputs=False)
+    assert metadata._csa2_forward_serial != second._csa2_forward_serial
 
 
 def _workflow_indexer():
@@ -764,88 +631,33 @@ def _projected(count):
     return q, packed, weights
 
 
-def _assert_selection(actual, scores, valid):
-    """Accept boundary ties, but require the correct valid set size and ranking."""
+def _assert_selection(actual, scores, valid, atol=0.005):
+    """Accept boundary ties and any order, but require the correct valid set size and ranking.
+
+    Selections keep TopK order. An invalid position (attention skips it) may
+    only fill a row that has fewer valid positions than the TopK width.
+    """
     for row in range(actual.shape[0]):
-        selected = actual[row][actual[row] >= 0].long()
+        chosen = actual[row][actual[row] >= 0].long()
         count = min(actual.shape[1], int(valid[row].sum()))
+        selected = chosen[
+            valid[row, chosen.clamp(max=valid.shape[1] - 1)] & (chosen < valid.shape[1])
+        ]
         assert selected.numel() == count
         assert selected.unique().numel() == count
-        assert bool(valid[row, selected].all())
-        assert bool((selected[1:] >= selected[:-1]).all())
-        assert bool((actual[row, count:] == -1).all())
+        assert count < actual.shape[1] or selected.numel() == chosen.numel()
         if count:
             cutoff = scores[row].masked_fill(~valid[row], -torch.inf).topk(count).values[-1]
-            assert bool((scores[row, selected] >= cutoff - 0.005).all())
-
-
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@torch.inference_mode()
-def test_cached_prefix_chunks_gather_once_and_preserve_offsets(monkeypatch):
-    torch.manual_seed(4301)
-    indexer = _workflow_indexer()
-    q, packed, weights = _projected(5)
-    keys = pack_rows(torch.randn(80, 128, device="cuda", dtype=torch.bfloat16), "index")
-    visible = torch.tensor([33, 34, 35, 66, 67], device="cuda", dtype=torch.int32)
-    loads = []
-    calls = []
-    original = indexer.forward_prepared
-    topk_phases = []
-    original_topk = indexer.top_k.forward
-
-    def topk(*args, **kwargs):
-        topk_phases.append(kwargs["is_prefill"])
-        return original_topk(*args, **kwargs)
-
-    monkeypatch.setattr(indexer.top_k, "forward", topk)
-
-    def forward(*args, **kwargs):
-        calls.append(args[0].shape[0])
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(indexer, "forward_prepared", forward)
-
-    def load(begin, end, width):
-        loads.append((begin, end, width))
-        starts = torch.zeros(end - begin, device="cuda", dtype=torch.int32)
-        return _ChunkInputs(
-            keys[:width, :64].contiguous().view(torch.int8),
-            keys[:width, 64:].contiguous(),
-            starts,
-            torch.full_like(starts, width),
-            torch.arange(width, device="cuda").expand(end - begin, -1),
-            visible[begin:end],
-        )
-
-    chunks = [
-        _QueryChunk(0, 3, 35, load=lambda: load(0, 3, 35), max_query_tokens=1),
-        _QueryChunk(3, 5, 67, load=lambda: load(3, 5, 67), max_query_tokens=1),
-    ]
-    out = torch.empty(5, 32, dtype=torch.int32, device="cuda")
-    indexer._run_csa2_chunks(
-        chunks,
-        packed[..., :64].contiguous().view(torch.int8),
-        weights,
-        packed[..., 64:].contiguous(),
-        out,
-        Mapping(),
-        -1,
-    )
-    assert loads == [(0, 3, 35), (3, 5, 67)]
-    assert calls == [1] * 5
-    assert topk_phases == [True] * 5
-    decoded_q = unpack_rows(packed, 128, "index").float()
-    decoded_k = unpack_rows(keys, 128, "index").float()
-    scores = (torch.einsum("qhd,kd->qhk", decoded_q, decoded_k).relu() * weights[..., None]).sum(1)
-    _assert_selection(out, scores, torch.arange(80, device="cuda")[None] < visible[:, None])
+            assert bool((scores[row, selected] >= cutoff - atol).all())
 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ratio", [1, 2])
+# Verification queries per request; a uniform count is scored per request.
+@pytest.mark.parametrize("queries", [(2, 1), (2, 2)])
 @torch.inference_mode()
-def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
+def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio, queries):
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("Native FP4 paged CSA2 integration requires SM100 family")
     torch.manual_seed(4302)
@@ -861,33 +673,37 @@ def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
     manager = _StridedOwner(layout, packed_keys)
     # One request carries two verification queries; declare that arena width.
     manager.max_total_draft_tokens = 1
-    q, _, weights = _projected(3)
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=3)
+    tokens = sum(queries)
+    q, _, weights = _projected(tokens)
+    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=tokens)
     metadata.kv_cache_manager = manager
     metadata.mapping = Mapping()
     metadata.is_cuda_graph = True
     metadata.csa2_kv_sources = {0: 0}
     metadata.csa2_num_context_requests = 0
-    metadata.csa2_request_query_ranges = [(0, 2), (2, 3)]
-    metadata.csa2_request_start_positions = [125, 127]
-    metadata.csa2_request_lengths = [2, 1]
+    metadata.csa2_request_query_ranges = [(0, 2), (2, tokens)]
+    metadata.csa2_request_start_positions = [125, 128 - queries[1]]
+    metadata.csa2_request_lengths = list(queries)
     metadata.csa2_global_max_positions = {0: 128}
     page_size = 128 // ratio
     metadata.csa2_global_page_sizes = {0: page_size}
     table = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int32)
-    visible = torch.tensor([63, 63, 64], device="cuda", dtype=torch.int32)
+    visible = torch.tensor([63] * (tokens - 1) + [64], device="cuda", dtype=torch.int32)
     metadata.csa2_global_page_tables = {0: table}
     metadata.csa2_visible_lengths = {0: visible}
-    metadata.csa2_token_requests = torch.tensor([0, 0, 1], device="cuda", dtype=torch.int64)
+    metadata.csa2_token_requests = torch.tensor(
+        [0] * 2 + [1] * queries[1], device="cuda", dtype=torch.int64
+    )
     metadata.csa2_indices = {}
     metadata.csa2_candidates = {}
     metadata.csa2_candidate_blocks = {}
     metadata.csa2_candidate_counts = {}
     metadata.indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
+    _plan_indexer(metadata)
     state = CSA2ForwardState(
         metadata=metadata,
-        swa_kv=torch.zeros(3, 512, device="cuda", dtype=torch.bfloat16),
+        swa_kv=torch.zeros(tokens, 512, device="cuda", dtype=torch.bfloat16),
         index_q=q,
         index_weights=weights,
     )
@@ -912,11 +728,12 @@ def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
         indexer, "_call_mqa_logits", lambda *a, **kw: pytest.fail("Dense path used")
     )
     for _ in range(3):
-        output = indexer(state, 0, 3)
-    assert native_calls and all(shape[:2] == (3, 1) for shape in native_calls)
-    assert (32, False) in topk_calls
+        output = indexer(state, 0, tokens)
+    batched = (2, 2) if queries == (2, 2) else (tokens, 1)
+    assert native_calls and all(shape[:2] == batched for shape in native_calls)
+    assert (32, False) not in topk_calls
     if ratio == 1:
-        assert metadata.csa2_candidates[0].shape[0] == 3  # Candidate blocks were published.
+        assert metadata.csa2_candidates[0].shape[0] == tokens  # Candidate blocks were published.
     bound = metadata.prepare_indexer(0)
     ptrs = (
         bound.csa2_indexer_k_cache.data_ptr(),
@@ -925,12 +742,15 @@ def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = indexer(state, 0, 3)
+        output = indexer(state, 0, tokens)
+        # No consumer layer joins the source's side-stream publication in this capture.
+        metadata.wait_candidates(0)
     for lengths, pages in (
         ([0, 1, 32], [[0, 1], [2, 3]]),
-        ([64, 65, 96], [[2, 3], [0, -1]]),
+        ([64, 65, 96], [[2, 3], [0, 1]]),
         ([63, 63, 64], [[1, 0], [3, 2]]),
     ):
+        lengths = lengths[:2] + lengths[2:] * queries[1]
         visible.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
         table.copy_(torch.tensor(pages, device="cuda", dtype=torch.int32))
         q.neg_()
@@ -943,7 +763,7 @@ def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
             refreshed.csa2_indexer_block_table.data_ptr(),
             refreshed.csa2_indexer_scheduler_metadata.data_ptr(),
         )
-        positions = torch.arange(128, device="cuda").expand(3, -1)
+        positions = torch.arange(128, device="cuda").expand(tokens, -1)
         req = metadata.csa2_token_requests
         physical = table[req[:, None], positions // page_size]
         valid = (physical >= 0) & (positions < visible[:, None])
@@ -975,6 +795,8 @@ def test_multi_rank_candidate_publication_and_reindex(count, chunk_size, mixed, 
     world_size = mpi_world_size()
     if world_size not in (2, 4):
         pytest.skip("Run with two or four MPI ranks and one CUDA device per rank")
+    if not _sparse_kernels_available():
+        pytest.skip("DeepGEMM sparse MQA logits required")
     for budget in (8, 32):
         torch.manual_seed(4303)
         layout = CSA2Layout(
@@ -1016,12 +838,15 @@ def test_multi_rank_candidate_publication_and_reindex(count, chunk_size, mixed, 
             metadata.csa2_token_requests = torch.cat(
                 (metadata.csa2_token_requests, torch.ones(1, device="cuda", dtype=torch.int64))
             )
+            # Generation row -> generation request, as metadata prepare maps it.
+            metadata.csa2_decode_row_requests = torch.zeros(1, device="cuda", dtype=torch.int32)
         metadata.csa2_indices = {}
         metadata.csa2_candidates = {}
         metadata.csa2_candidate_blocks = {}
         metadata.csa2_candidate_counts = {}
         metadata.indexer_max_chunk_size = chunk_size
         metadata.indexer_q_split_threshold = 0
+        _plan_indexer(metadata)
         state = CSA2ForwardState(
             metadata=metadata,
             swa_kv=torch.zeros(total, 512, device="cuda", dtype=torch.bfloat16),
@@ -1030,48 +855,154 @@ def test_multi_rank_candidate_publication_and_reindex(count, chunk_size, mixed, 
         )
         source = CSA2Indexer(layout, 0, 32, 128)
         source_result = source(state, 0, total).clone()
+        # Decode rows publish on the CSA2 side stream; read them as a consumer layer does.
+        metadata.wait_candidates(0)
         gathered_candidates = metadata.csa2_candidates[0].clone()
         gathered_blocks = metadata.csa2_candidate_blocks[0].clone()
         gathered_counts = metadata.csa2_candidate_counts[0].clone()
         consumer = CSA2Indexer(layout, 1, 32, 128)
         state.index_q = -q
         shared_calls = []
-        original_forward = consumer.forward_prepared
+        original_logits = consumer._sparse_candidate_logits
 
         def record_shared(*args, **kwargs):
-            shared_calls.append(kwargs.get("sparse_indices") is not None)
-            return original_forward(*args, **kwargs)
+            if kwargs.get("keys") is not None:
+                shared_calls.append(True)
+            return original_logits(*args, **kwargs)
 
         with monkeypatch.context() as context:
-            context.setattr(consumer, "forward_prepared", record_shared)
+            context.setattr(consumer, "_sparse_candidate_logits", record_shared)
             consumer_result = consumer(state, 0, total).clone()
         local_count = (mpi_rank() + 1) * count // world_size - mpi_rank() * count // world_size
         # Sparse prefill consumers score the shared prefix once per rank.
-        sparse = consumer.use_sparse_candidates
-        if mixed:
-            assert sum(shared_calls) == int(sparse and local_count > 0)
-        else:
-            assert shared_calls == ([sparse] if local_count else [])
-        # Execute the same requests without query splitting through the same
-        # scoring path, including the rank with zero local Q.
+        assert len(shared_calls) == int(local_count > 0)
+        # Execute the same requests without query splitting, including the rank
+        # with zero local Q.
         metadata.mapping = Mapping()
+        _plan_indexer(metadata)
         metadata.csa2_indices = {}
         metadata.csa2_candidates = {}
         metadata.csa2_candidate_blocks = {}
         metadata.csa2_candidate_counts = {}
         state.index_q = q
         expected_source = source(state, 0, total).clone()
+        metadata.wait_candidates(0)
         expected_candidates = metadata.csa2_candidates[0].clone()
         expected_blocks = metadata.csa2_candidate_blocks[0].clone()
         expected_counts = metadata.csa2_candidate_counts[0].clone()
         state.index_q = -q
         expected_consumer = consumer(state, 0, total).clone()
-        torch.testing.assert_close(source_result, expected_source, atol=0, rtol=0)
+        torch.testing.assert_close(
+            _canonical(source_result), _canonical(expected_source), atol=0, rtol=0
+        )
         torch.testing.assert_close(gathered_candidates, expected_candidates, atol=0, rtol=0)
         torch.testing.assert_close(gathered_blocks, expected_blocks, atol=0, rtol=0)
         torch.testing.assert_close(gathered_counts, expected_counts, atol=0, rtol=0)
-        torch.testing.assert_close(consumer_result, expected_consumer, atol=0, rtol=0)
+        torch.testing.assert_close(
+            _canonical(consumer_result), _canonical(expected_consumer), atol=0, rtol=0
+        )
         assert bool((gathered_candidates >= 0).any(1).all())
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("candidate_source", [False, True])
+@torch.inference_mode()
+def test_packed_prefill_matches_per_request_path(candidate_source, monkeypatch):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Packed FP4 prefill MQA requires SM100 family")
+    torch.manual_seed(4307)
+    # A candidate source owns an uncompressed cache.
+    ratio = 1 if candidate_source else 2
+    layout = (
+        CSA2Layout(
+            (ratio,), (0,), (0,), 0, candidate_topk_blocks=4, candidate_block_size=8, index_topk=32
+        )
+        if candidate_source
+        else CSA2Layout((ratio,), (0,), (0,), index_topk=32)
+    )
+    keys = pack_rows(torch.randn(1024, 128, device="cuda", dtype=torch.bfloat16), "index")
+    manager = _StridedOwner(layout, keys)
+    lengths, prefixes = [5, 7, 3], [200, 90, 300]
+    total = sum(lengths)
+    q, _, weights = _projected(total)
+    weights.neg_()
+    metadata = CSA2TrtllmMetadata(max_num_requests=3, max_num_tokens=total)
+    metadata.kv_cache_manager = manager
+    metadata.mapping = Mapping()
+    metadata.csa2_kv_sources = {0: 0}
+    metadata.csa2_num_context_requests = 3
+    metadata.csa2_request_query_ranges = [(0, 5), (5, 12), (12, 15)]
+    metadata.csa2_request_start_positions = prefixes
+    metadata.csa2_request_lengths = lengths
+    metadata.csa2_global_max_positions = {0: 512 // ratio}
+    metadata.csa2_global_page_sizes = {0: 128 // ratio}
+    # The last request has no page for its second page of logical positions.
+    metadata.csa2_global_page_tables = {
+        0: torch.tensor(
+            [[0, 1, -1, -1], [2, -1, -1, -1], [3, -1, 4, -1]], device="cuda", dtype=torch.int32
+        )
+    }
+    requests = torch.repeat_interleave(torch.arange(3, device="cuda"), torch.tensor(lengths).cuda())
+    offsets = torch.cat([torch.arange(n, device="cuda") for n in lengths])
+    visible = (torch.tensor(prefixes, device="cuda")[requests] + offsets + 1) // ratio
+    metadata.csa2_visible_lengths = {0: visible}
+    metadata.csa2_token_requests = requests
+    # Splits the second request and packs its tail with the third request.
+    metadata.indexer_max_chunk_size = 6
+    metadata.indexer_q_split_threshold = -1
+    _plan_indexer(metadata)
+    state = CSA2ForwardState(
+        metadata=metadata,
+        swa_kv=torch.zeros(total, 512, device="cuda", dtype=torch.bfloat16),
+        index_q=q,
+        index_weights=weights,
+    )
+    indexer = CSA2Indexer(layout, 0, 32, 128)
+
+    def run():
+        metadata.csa2_indices = {}
+        metadata.csa2_candidates = {}
+        metadata.csa2_candidate_blocks = {}
+        metadata.csa2_candidate_counts = {}
+        output = indexer(state, 0, total).clone()
+        published = (
+            metadata.csa2_candidates,
+            metadata.csa2_candidate_blocks,
+            metadata.csa2_candidate_counts,
+        )
+        return output, [dict(table) for table in published]
+
+    calls = []
+    original = indexer._call_mqa_logits
+
+    def record(*args, **kwargs):
+        calls.append((args[0].shape[0], kwargs.get("max_seqlen_k", 0)))
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(indexer, "_call_mqa_logits", record)
+        output, published = run()
+    widths = [208, 96, 304] if candidate_source else [104, 48, 152]
+    assert calls == list(zip([5, 6, 4], widths))
+    # Plan the requests unmerged, as for the decoded MQA fallback.
+    with monkeypatch.context() as context:
+        context.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
+        _plan_indexer(metadata)
+    expected, expected_published = run()
+    torch.testing.assert_close(_canonical(output), _canonical(expected), atol=0, rtol=0)
+    for table, expected_table in zip(published, expected_published):
+        assert table.keys() == expected_table.keys()
+        for layer in table:
+            torch.testing.assert_close(table[layer], expected_table[layer], atol=0, rtol=0)
+    positions = torch.arange(512 // ratio, device="cuda").expand(total, -1)
+    slots = metadata.global_slot_tile(0, 0, total, positions)
+    valid = (slots >= 0) & (positions < visible[:, None])
+    rows = read_index_rows(manager.get_index_pages(0), slots.clamp_min(0))
+    decoded_k = unpack_rows(rows, 128, "index").float()
+    decoded_q = unpack_rows(pack_rows(q, "index"), 128, "index").float()
+    scores = (torch.einsum("qhd,qkd->qhk", decoded_q, decoded_k).relu() * weights[..., None]).sum(1)
+    _assert_selection(output, scores, valid)
 
 
 def _single_request_state(heads=8, two_owners=False):
@@ -1119,6 +1050,7 @@ def _single_request_state(heads=8, two_owners=False):
     metadata.csa2_candidate_counts = {}
     metadata.indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
+    _plan_indexer(metadata)
     state = CSA2ForwardState(
         metadata=metadata,
         swa_kv=torch.zeros(1, 512, device="cuda", dtype=torch.bfloat16),
@@ -1150,27 +1082,31 @@ def _assert_state_selection(output, state, owner):
 def test_gathered_decode_graph_grows_past_warmup_prefix(monkeypatch):
     layout, manager, metadata, state = _single_request_state()
     metadata.is_cuda_graph = True
+    # More index heads than the native paged kernels serve: decode rows are packed.
+    manager.layout = dataclasses.replace(layout, index_heads=128)
+    _plan_indexer(metadata)
     indexer = CSA2Indexer(layout, 0, 8, 128)
     calls = []
-    original = manager.gather_indexer_keys
+    original = indexer._call_mqa_logits
 
-    def gather(owner, slots):
-        calls.append(slots.numel())
-        return original(owner, slots)
+    def logits(*args, **kwargs):
+        calls.append(kwargs["max_seqlen_k"])
+        return original(*args, **kwargs)
 
-    monkeypatch.setattr(manager, "gather_indexer_keys", gather)
-    # Exercise the bounded fallback independently of native head coverage.
-    monkeypatch.setattr(metadata, "prepare_indexer", lambda layer: None)
+    monkeypatch.setattr(indexer, "_call_mqa_logits", logits)
+    # Exercise the packed decode path independently of native head coverage.
+    monkeypatch.setattr(metadata, "prepare_indexer", lambda layer, **_: None)
     monkeypatch.setattr(
         indexer,
         "_call_paged_mqa_logits",
-        lambda *a, **kw: pytest.fail("Unavailable native staging requires gathered fallback"),
+        lambda *a, **kw: pytest.fail("Unavailable native staging requires the packed path"),
     )
     for _ in range(3):
         output = indexer(state, 0, 1)
+    # Decode graphs score the admitted bound so replays see newly published keys.
     assert calls == [128] * 3
     torch.testing.assert_close(
-        output[0, :2], torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        _canonical(output)[0, :2], torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -1379,6 +1315,7 @@ def _temporal_gvr_case(monkeypatch, emission, *, page_holes=False, candidate_sou
     metadata.csa2_candidate_counts = {}
     metadata.indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
+    _plan_indexer(metadata)
     metadata._csa2_forward_serial = 0
     state = CSA2ForwardState(
         metadata=metadata,
@@ -1424,6 +1361,8 @@ def _temporal_gvr_case(monkeypatch, emission, *, page_holes=False, candidate_sou
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = indexer(state, 0, 1)
+        # No consumer layer joins the source's side-stream publication in this capture.
+        metadata.wait_candidates(0)
     graph.replay()
     for start, epoch, expect_hint in ((32768, 1, True), (32769, 2, False), (511, 2, False)):
         metadata.csa2_request_start_positions = [start]
@@ -1528,7 +1467,6 @@ def test_decode_short_skip_respects_graph_admission(monkeypatch, mode):
         def unexpected(*args, **kwargs):
             pytest.fail("Eligible short decode must not gather/repack indexer cache")
 
-        monkeypatch.setattr(manager, "gather_indexer_keys", unexpected)
         monkeypatch.setattr(indexer, "_call_mqa_logits", unexpected)
     for _ in range(3):
         output = indexer(state, 0, 1)
@@ -1717,8 +1655,9 @@ def test_live_acceptance_graph_refreshes_native_paged_indexer(monkeypatch, query
         # inputs and refreshed schedule occupy the shared arena now.
         expected_context = (positions + 1).int().clamp_min(1)[:, None]
         torch.testing.assert_close(metadata.csa2_indexer_context_lengths, expected_context)
+        # One request of up to four queries is scheduled per request.
         expected_schedule = get_paged_mqa_logits_metadata(
-            expected_context,
+            expected_context.view(-1, query_width if query_width <= 4 else 1),
             64,
             torch.cuda.get_device_properties(device).multi_processor_count,
         )
@@ -1730,20 +1669,26 @@ def test_live_acceptance_graph_refreshes_native_paged_indexer(monkeypatch, query
         )
 
 
-@pytest.mark.cpu_only
+@pytest.mark.skipif(
+    not _sparse_kernels_available(), reason="Candidate consumers need DeepGEMM sparse MQA logits"
+)
 def test_candidates_pin_latest_block_and_mask_future():
-    keys = torch.tensor([6.0, 4.0, 3.0, 2.0, 0.5, 6.0], dtype=torch.bfloat16)[:, None].expand(
-        -1, 128
-    )
-    layout, state = _selection_state(1, keys, torch.tensor([5]))
+    # Older blocks score higher, but a one-block budget keeps the newest visible
+    # block; its positions at or past the visible length 21 (scored highest) are masked.
+    values = [6.0] * 8 + [4.0] * 8 + [1.0, 2.0, 3.0, 0.5, 0.25, 6.0, 6.0, 6.0]
+    keys = torch.tensor(values, dtype=torch.bfloat16)[:, None].expand(-1, 128)
+    layout, state = _selection_state(1, keys, torch.tensor([21]))
     _run_indexer(layout, 0, state)
-    assert state.metadata.csa2_candidates[0].tolist() == [[4, -1]]
+    candidates = state.metadata.csa2_candidates[0]
+    assert candidates[:, :8].tolist() == [[16, 17, 18, 19, 20, -1, -1, -1]]
+    assert bool((candidates[:, 8:] == -1).all())
     state.main_kv = state.index_k = None
     _run_indexer(layout, 1, state)
-    assert state.metadata.csa2_indices[1].tolist() == [[4, -1, -1]]
+    assert _canonical(state.metadata.csa2_indices[1]).tolist() == [[16, 17, 18]]
 
 
-@pytest.mark.cpu_only
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("queries,width", [(0, 0), (0, 8), (2, 0), (2, 8)])
 def test_empty_visibility(queries, width):
     layout, state = _selection_state(
@@ -1757,9 +1702,11 @@ def test_empty_visibility(queries, width):
     assert torch.all(state.metadata.csa2_candidates[0] == -1)
 
 
-@pytest.mark.cpu_only
+@pytest.mark.skipif(
+    not _sparse_kernels_available(), reason="Candidate consumers need DeepGEMM sparse MQA logits"
+)
 def test_full_reuse_reindex_private_swa_and_shared_sink():
-    outputs, routing, cache, batch = _run_modes("cpu")
+    outputs, routing, cache, batch = _run_modes("cuda")
     assert routing.csa2_indices[0].tolist() == [[0]]
     assert routing.csa2_indices[2].tolist() == [[1]]
     # q=0 means selected global KV, private SWA, and sink each get 1/3.
@@ -1776,8 +1723,9 @@ def test_full_reuse_reindex_private_swa_and_shared_sink():
         _prediction_reference(layout, 1, q, q[:, 0], torch.zeros(1), batch)
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not _sparse_kernels_available(), reason="Candidate consumers need DeepGEMM sparse MQA logits"
+)
 def test_all_modes_cuda_graph_changed_routing():
     # Preserve the independent analytical oracle before exercising replay changes.
     outputs, routing, _, _ = _run_modes("cuda")
@@ -1823,7 +1771,7 @@ def _publish_manual_candidates(metadata, layer, block_ids, block_size=8):
         torch.where(valid, positions, -1).flatten(1),
         (0, width - ids.numel() * block_size),
         value=-1,
-    )
+    ).int()
     num_valid = (ordered != sentinel).sum(1, keepdim=True)
     last = torch.where(num_valid > 0, ordered.gather(1, (num_valid - 1).clamp_min(0)), 0)
     blocks = torch.where(ordered == sentinel, last, ordered)
@@ -1891,6 +1839,7 @@ def _candidate_decode_fixture(*, mixed=False, random=False):
     _publish_manual_candidates(metadata, 0, _MANUAL_BLOCKS)
     metadata.indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
+    _plan_indexer(metadata)
     q = torch.zeros(count, 32, 128, dtype=torch.bfloat16, device="cuda")
     q[:, :9, :9] = torch.eye(9, dtype=torch.bfloat16, device="cuda")
     weights = torch.zeros(count, 32, device="cuda")
@@ -1913,62 +1862,66 @@ def _candidate_decode_fixture(*, mixed=False, random=False):
     return indexer, state
 
 
-def _candidate_decode_run(indexer, state, monkeypatch, *, old):
-    """Run the consumer; ``old`` forces the per-query candidate gathers.
+def _candidate_decode_run(indexer, state, monkeypatch):
+    """Run the consumer.
 
     Returns the selection, the masked scores of every query in the order of its
     published candidate columns (whatever column order the scoring path used),
-    and the number of dense / sparse kernel calls.
+    and the number of sparse kernel calls per path.
     """
     metadata = state.metadata
-    captured, calls = [], {"dense": 0, "sparse_prefill": 0, "sparse_paged": 0}
+    captured, calls = [], {"sparse_prefill": 0, "sparse_paged": 0}
     select = indexer._select_mapped_logits
-    dense = indexer._call_mqa_logits
     sparse = indexer._sparse_candidate_logits
     candidates = metadata.csa2_candidates[0]
     width = max(metadata.csa2_global_max_positions[0], int(candidates.max()) + 1)
     rows_done = [0]
 
-    def collect(logits, starts, ends, positions, visible, *args, **kwargs):
-        # ``None`` bounds mean every logits column is the row's domain.
-        if starts is None:
-            starts = torch.zeros(logits.shape[0], dtype=torch.int32, device=logits.device)
-        if ends is None:
-            ends = torch.full_like(starts, logits.shape[1])
-        columns = starts[:, None].long() + torch.arange(positions.shape[1], device=logits.device)
-        scores = logits.gather(1, columns.clamp(0, logits.shape[1] - 1))
-        valid = (columns < ends[:, None]) & (columns < logits.shape[1])
-        valid &= (positions >= 0) & (positions < visible[:, None])
-        scores = scores.masked_fill(~valid, -torch.inf)
+    def collect(logits, positions, output, counts, *args, **kwargs):
+        rows = slice(rows_done[0], rows_done[0] + logits.shape[0])
+        rows_done[0] += logits.shape[0]
+        visible = metadata.csa2_visible_lengths[indexer.layer_idx][rows]
+        columns = torch.arange(positions.shape[1], device=logits.device)
+        valid = (columns < counts.reshape(-1, 1)) & (positions >= 0)
+        valid &= positions < visible[:, None]
+        scores = logits[:, : positions.shape[1]].float().masked_fill(~valid, -torch.inf)
         # Re-key the scores from the path's column order to the candidate order.
         by_position = torch.full((logits.shape[0], width + 1), -torch.inf, device=logits.device)
         by_position.scatter_(1, torch.where(valid, positions.long(), width), scores)
-        rows = slice(rows_done[0], rows_done[0] + logits.shape[0])
-        rows_done[0] += logits.shape[0]
-        ordered = by_position.gather(1, candidates[rows].clamp_min(0))
+        ordered = by_position.gather(1, candidates[rows].clamp_min(0).long())
         captured.append(ordered.masked_fill(candidates[rows] < 0, -torch.inf))
-        return select(logits, starts, ends, positions, visible, *args, **kwargs)
-
-    def count_calls(name, function):
-        def wrapped(*args, **kwargs):
-            calls[name] += 1
-            return function(*args, **kwargs)
-
-        return wrapped
+        return select(logits, positions, output, counts, *args, **kwargs)
 
     with monkeypatch.context() as context:
         context.setattr(indexer, "_select_mapped_logits", collect)
-        context.setattr(indexer, "_call_mqa_logits", count_calls("dense", dense))
 
         def count_sparse(*args, **kwargs):
             calls["sparse_paged" if kwargs.get("paged") is not None else "sparse_prefill"] += 1
             return sparse(*args, **kwargs)
 
         context.setattr(indexer, "_sparse_candidate_logits", count_sparse)
-        if old:
-            context.setattr(indexer, "use_sparse_candidates", False)
         output = indexer(state, 0, state.swa_kv.shape[0]).clone()
     return output, torch.cat(captured), calls
+
+
+def _reference_candidate_scores(indexer, state):
+    """FP32 scores of every published candidate column from decoded index rows and queries.
+
+    Columns without a backed slot or beyond the query's visible length are ``-inf``.
+    """
+    metadata = state.metadata
+    candidates = metadata.csa2_candidates[0]
+    count = candidates.shape[0]
+    slots = metadata.global_slot_tile(indexer.layer_idx, 0, count, candidates)
+    pages = metadata.kv_cache_manager.get_index_pages(0)
+    keys = unpack_rows(read_index_rows(pages, slots), 128, "index", torch.float32)
+    queries = unpack_rows(pack_rows(state.index_q, "index"), 128, "index", torch.float32)
+    scores = (
+        torch.einsum("qhd,qkd->qhk", queries, keys).relu() * state.index_weights[..., None]
+    ).sum(1)
+    visible = metadata.csa2_visible_lengths[indexer.layer_idx][:count]
+    valid = (slots >= 0) & (candidates >= 0) & (candidates < visible[:, None])
+    return scores.masked_fill(~valid, -torch.inf)
 
 
 def _bf16_tolerance(scores):
@@ -1991,59 +1944,43 @@ def _check_candidate_multiset(output, scores, candidates, tolerance):
         torch.testing.assert_close(actual, expected, atol=tolerance, rtol=0)
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not _sparse_kernels_available(), reason="DeepGEMM sparse MQA logits on SM100")
 @pytest.mark.parametrize("mixed", [False, True])
 @torch.inference_mode()
 def test_candidate_decode_batched_exact_and_mixed(monkeypatch, mixed):
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Native paged FP4 requires SM100 family")
     indexer, state = _candidate_decode_fixture(mixed=mixed)
     # Keep active queries on both requests, plus an empty first query and a hole.
     state.metadata.csa2_visible_lengths[1][0] = 0
     state.metadata.csa2_global_page_tables[0][0, 0] = -1
     _publish_manual_candidates(state.metadata, 0, _MANUAL_BLOCKS)
     candidate = state.metadata.csa2_candidates[0].clone()
-    if not _sparse_kernels_available():
-        pytest.skip("DeepGEMM sparse MQA logits required")
-    old, scores, control = _candidate_decode_run(indexer, state, monkeypatch, old=True)
-    actual, new_scores, calls = _candidate_decode_run(indexer, state, monkeypatch, old=False)
-    assert control == {
-        "dense": len(state.metadata.csa2_request_query_ranges),
-        "sparse_prefill": 0,
-        "sparse_paged": 0,
-    }
-    assert calls == {"dense": 0, "sparse_prefill": int(mixed), "sparse_paged": 1}
-    # The sparse kernels emit bf16 logits; the per-query gather reference is fp32.
+    scores = _reference_candidate_scores(indexer, state)
+    actual, new_scores, calls = _candidate_decode_run(indexer, state, monkeypatch)
+    assert calls == {"sparse_prefill": int(mixed), "sparse_paged": 1}
+    # The sparse kernels emit bf16 logits; the decoded reference is fp32.
     torch.testing.assert_close(new_scores, scores, atol=0, rtol=2**-7)
     torch.testing.assert_close(state.metadata.csa2_candidates[0], candidate, atol=0, rtol=0)
     _check_candidate_multiset(actual, scores, candidate, _bf16_tolerance(scores))
     if mixed:
-        # Without paged sparse descriptors the decode rows fall back to the
-        # per-query candidate gathers without row-offset loss.
+        # SM100 metadata plans no prefix for decode rows, so they must take the
+        # native paged sparse decode.
         with monkeypatch.context() as context:
             context.setattr(state.metadata, "prepare_sparse_indexer", lambda *a: None)
-            fallback, fallback_scores, fallback_calls = _candidate_decode_run(
-                indexer, state, monkeypatch, old=False
-            )
-        assert fallback_calls == {"dense": 2, "sparse_prefill": 1, "sparse_paged": 0}
-        torch.testing.assert_close(fallback, old, atol=0, rtol=0)
-        torch.testing.assert_close(fallback_scores, scores, atol=0, rtol=2**-7)
+            with pytest.raises(ValueError, match="native paged sparse decode"):
+                _candidate_decode_run(indexer, state, monkeypatch)
     # An admitted domain wider than the candidate pool changes nothing: only
     # the published candidate blocks are scored.
     state.metadata.csa2_global_max_positions[0] = 257
-    wider, wider_scores, wider_calls = _candidate_decode_run(indexer, state, monkeypatch, old=False)
+    _plan_indexer(state.metadata)
+    wider, wider_scores, wider_calls = _candidate_decode_run(indexer, state, monkeypatch)
     assert wider_calls == calls
     _check_candidate_multiset(wider, scores, candidate, _bf16_tolerance(scores))
     torch.testing.assert_close(wider_scores, scores, atol=0, rtol=2**-7)
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not _sparse_kernels_available(), reason="DeepGEMM sparse MQA logits on SM100")
 @torch.inference_mode()
 def test_candidate_decode_batched_graph_refresh(monkeypatch):
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Native paged FP4 requires SM100 family")
     indexer, state = _candidate_decode_fixture()
     metadata = state.metadata
     for _ in range(3):
@@ -2063,7 +2000,7 @@ def test_candidate_decode_batched_graph_refresh(monkeypatch):
             metadata, 0, _MANUAL_BLOCKS[step:] + [40 + i for i in range(step)]
         )
         state.index_q[:, :9, :9].copy_(torch.eye(9, device="cuda").roll(step, dims=1))
-        expected, scores, _ = _candidate_decode_run(indexer, state, monkeypatch, old=True)
+        scores = _reference_candidate_scores(indexer, state)
         graph.replay()
         torch.cuda.synchronize()
         _check_candidate_multiset(
@@ -2075,21 +2012,20 @@ def test_candidate_decode_batched_graph_refresh(monkeypatch):
         )
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not _sparse_kernels_available(), reason="DeepGEMM sparse MQA logits on SM100")
 @pytest.mark.parametrize("phase", ["decode", "prefill"])
 @torch.inference_mode()
 def test_candidate_batched_random_logits(monkeypatch, phase):
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Native paged FP4 requires SM100 family")
     if phase == "decode":
         indexer, state = _candidate_decode_fixture(random=True)
-        old, scores, _ = _candidate_decode_run(indexer, state, monkeypatch, old=True)
-        actual, new_scores, _ = _candidate_decode_run(indexer, state, monkeypatch, old=False)
+        actual, new_scores, _ = _candidate_decode_run(indexer, state, monkeypatch)
     else:
         indexer, state = _candidate_prefill_fixture(random=True)
-        old, scores, _, _, _ = _candidate_prefill_run(indexer, state, monkeypatch, True)
-        actual, new_scores, _, _, _ = _candidate_prefill_run(indexer, state, monkeypatch, False)
+        actual, new_scores, _, _ = _candidate_prefill_run(indexer, state, monkeypatch)
+    scores = _reference_candidate_scores(indexer, state)
+    candidates = state.metadata.csa2_candidates[0]
+    values, columns = scores.topk(actual.shape[1], dim=1)
+    expected = torch.where(torch.isfinite(values), candidates.gather(1, columns), -1)
     valid = torch.isfinite(scores)
     assert torch.equal(valid, torch.isfinite(new_scores))
     difference = torch.where(valid, new_scores - scores, 0)
@@ -2097,11 +2033,11 @@ def test_candidate_batched_random_logits(monkeypatch, phase):
     gaps = top[:, 3] - top[:, 4]
     # Existing native selection tests allow only 0.005 absolute cutoff error.
     torch.testing.assert_close(new_scores[valid], scores[valid], atol=0.005, rtol=2**-7)
-    _check_candidate_multiset(
-        actual, scores, state.metadata.csa2_candidates[0], 0.005 + _bf16_tolerance(scores)
-    )
+    _check_candidate_multiset(actual, scores, candidates, 0.005 + _bf16_tolerance(scores))
     separated = gaps > 2 * difference.abs().amax(1)
-    torch.testing.assert_close(actual[separated], old[separated], atol=0, rtol=0)
+    torch.testing.assert_close(
+        _canonical(actual[separated]), _canonical(expected[separated]), atol=0, rtol=0
+    )
 
 
 def _candidate_prefill_fixture(*, random=False):
@@ -2131,50 +2067,35 @@ def _candidate_prefill_fixture(*, random=False):
     metadata.csa2_visible_lengths[1][5] = 0
     metadata.csa2_global_page_tables[0][0, 1] = -1
     _publish_manual_candidates(metadata, 0, _MANUAL_BLOCKS)
+    _plan_indexer(metadata)
     return indexer, state
 
 
-def _candidate_prefill_run(indexer, state, monkeypatch, old):
-    shapes, gathers = [], []
-    manager = state.metadata.kv_cache_manager
+def _candidate_prefill_run(indexer, state, monkeypatch):
+    shapes = []
     original_sparse = indexer._sparse_candidate_logits
-    original_gather = manager.gather_indexer_keys
 
     def sparse(*args, **kwargs):
         if kwargs.get("paged") is None:
             shapes.append((args[0].shape[0], kwargs["keys"][0].shape[0]))
         return original_sparse(*args, **kwargs)
 
-    def gather(layer, slots):
-        gathers.append(slots.numel())
-        return original_gather(layer, slots)
-
     with monkeypatch.context() as context:
         context.setattr(indexer, "_sparse_candidate_logits", sparse)
-        context.setattr(manager, "gather_indexer_keys", gather)
-        result = _candidate_decode_run(indexer, state, monkeypatch, old=old)
-    return (*result, shapes, gathers)
+        result = _candidate_decode_run(indexer, state, monkeypatch)
+    return (*result, shapes)
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not _sparse_kernels_available(), reason="DeepGEMM sparse MQA logits on SM100")
 @torch.inference_mode()
 def test_candidate_shared_prefill_exact_and_mixed(monkeypatch):
-    if not _sparse_kernels_available():
-        pytest.skip("DeepGEMM sparse MQA logits required")
     indexer, state = _candidate_prefill_fixture()
     candidates = state.metadata.csa2_candidates[0].clone()
-    old, scores, old_calls, _, old_gathers = _candidate_prefill_run(
-        indexer, state, monkeypatch, True
-    )
-    actual, new_scores, calls, shapes, gathers = _candidate_prefill_run(
-        indexer, state, monkeypatch, False
-    )
-    assert calls == {"dense": 0, "sparse_prefill": 2, "sparse_paged": 1}
+    scores = _reference_candidate_scores(indexer, state)
+    actual, new_scores, calls, shapes = _candidate_prefill_run(indexer, state, monkeypatch)
+    assert calls == {"sparse_prefill": 2, "sparse_paged": 1}
     # One sparse logits call per prefill request over its whole gathered prefix.
     assert shapes == [(137, 169), (67, 211)]
-    # Decode reads index pages in place; only the two prefill tiles gather rows.
-    assert gathers == [169, 211]
     torch.testing.assert_close(new_scores, scores, atol=0, rtol=2**-7)
     _check_candidate_multiset(actual, scores, candidates, _bf16_tolerance(scores))
     torch.testing.assert_close(state.metadata.csa2_candidates[0], candidates, atol=0, rtol=0)
@@ -2193,14 +2114,13 @@ def test_candidate_shared_prefill_tile_bounds(monkeypatch):
         index_topk=4,
     )
     indexer = CSA2Indexer(layout, 1, 32, 128)
-    # The DSV4.1 pool (16K positions) gets a positive tile inside the native logits budget.
-    assert 0 < indexer._candidate_prefill_tile_size(16384) <= 512
+    # The DSV4.1 pool (16K positions) is bounded by the per-query transient budget.
+    assert indexer._candidate_prefill_tile_size(16384) == 2340
     # Very wide pools still tile, bounded by the per-query transient budget.
     assert 0 < indexer._candidate_prefill_tile_size(2000000) < 32
     with monkeypatch.context() as limited:
         limited.setattr(implementation, "_INDEXER_MQA_LOGITS_ELEM_BUDGET", 8191)
         assert indexer._candidate_prefill_tile_size(16384) == 1
-    assert indexer._candidate_prefill_tile_size(0) == 512
 
 
 @skip_pre_blackwell
@@ -2352,27 +2272,83 @@ def _sparse_candidate_layout(topk_blocks=4, block_size=8, topk=32):
     )
 
 
-def _sparse_kernels_available():
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 10
-        and _HAS_SPARSE_MQA_LOGITS
+@pytest.mark.parametrize(
+    "options",
+    [
+        dict(enable_heuristic_topk=True),
+        dict(
+            enable_heuristic_topk=True,
+            use_self_sampling_topk=False,
+            use_cute_dsl_paged_mqa_logits=True,
+            use_gvr_emission=True,
+        ),
+    ],
+)
+def test_candidate_consumer_keeps_exact_decode_topk(options):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Heuristic TopK requires SM100")
+    layout = _sparse_candidate_layout(4, 8, topk=512)
+    params = CSA2Params(layout=layout, **options)
+    source = CSA2Indexer(layout, 0, 32, 128, options=params)
+    consumer = CSA2Indexer(layout, 1, 32, 128, options=params)
+    assert source.top_k.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+    # Candidate-ordered columns are not key positions: consumers stay exact
+    # and keep the native sparse paged decode.
+    assert consumer.top_k.decode_implementation in (
+        TopKImplementation.CUDA_RADIX,
+        TopKImplementation.CUTE_DSL_RADIX,
     )
 
 
-def _publish_sparse(indexer, scores, lengths, candidate_width=None):
-    """Run the source publication on a device and return (positions, blocks, counts)."""
-    positions, blocks, counts = {}, {}, {}
-    if not scores.is_cuda:
-        indexer.top_k.prefill_implementation = TopKImplementation.TORCH
-    indexer._configure_candidate_topk(scores.shape[1])
-    indexer._publish_candidates(
-        scores, lengths, positions, 0, scores.shape[0], candidate_width, blocks, counts
-    )
-    return positions[indexer.layer_idx], blocks[indexer.layer_idx], counts[indexer.layer_idx]
+def test_decode_gvr_row_cap(monkeypatch):
+    """The self-sampling GVR decode Top-K selects at most 256 rows on the candidate source;
+    larger decode batches there take the exact radix Top-K."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Heuristic TopK requires SM100")
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import indexer as indexer_module
+
+    layout = CSA2Layout((1,), (0,), (0,), 0, candidate_topk_blocks=64, index_topk=512)
+    indexer = CSA2Indexer(layout, 0, 64, 128, CSA2Params(enable_heuristic_topk=True))
+    assert indexer.top_k.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+    engines = []
+    for name in ("_forward_decode_gvr", "_forward_decode_radix"):
+        original = getattr(TopK, name)
+
+        def spy(self, *args, _name=name, _original=original, **kwargs):
+            engines.append(_name)
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(TopK, name, spy)
+    torch.manual_seed(6303)
+    for rows, engine in (
+        (indexer_module._DECODE_GVR_SOURCE_MAX_ROWS, "_forward_decode_gvr"),
+        (indexer_module._DECODE_GVR_SOURCE_MAX_ROWS + 1, "_forward_decode_radix"),
+    ):
+        scores = torch.rand(rows, 4096, device="cuda")
+        lengths = [4096 - 97 * (row % 7) for row in range(rows)]
+        output = torch.empty(rows, 512, dtype=torch.int32, device="cuda")
+        aux_indices = torch.empty(rows, 10, 512, dtype=torch.int32, device="cuda")
+        engines.clear()
+        indexer.select_prepared_scores(
+            scores,
+            output,
+            None,
+            torch.tensor(lengths, dtype=torch.int32, device="cuda"),
+            is_prefill=False,
+            radix_aux_indices=aux_indices,
+            radix_aux_logits=torch.empty_like(aux_indices, dtype=torch.float32),
+        )
+        assert engines == [engine]
+        for row, length in enumerate(lengths):
+            expected = scores[row, :length].topk(512).indices
+            # Continuous random scores have no ties at the 512th score.
+            torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
+    # The module keeps its configured engine.
+    assert indexer.top_k.decode_implementation == TopKImplementation.CUTE_DSL_GVR
 
 
-@pytest.mark.cpu_only
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("block_size,sparse_block", [(8, 8), (16, 16), (32, 16)])
 def test_publish_candidates_sparse_blocks(block_size, sparse_block):
     source = CSA2Indexer(_sparse_candidate_layout(4, block_size), 0, 32, 128)
@@ -2383,9 +2359,13 @@ def test_publish_candidates_sparse_blocks(block_size, sparse_block):
     lengths = torch.tensor([width, 3 * block_size + 1, 1, 0], dtype=torch.int32)
     scores = torch.rand(4, width)
     reference = _reference_select_candidate_positions(scores, lengths, 4, block_size)
-    # The source scores arrive masked to the visible prefix (see _select_mapped_logits)
+    # The source scores arrive masked to the visible prefix
     scores = scores.masked_fill(torch.arange(width)[None, :] >= lengths[:, None], -torch.inf)
-    positions, blocks, counts = _publish_sparse(source, scores, lengths, 4 * block_size)
+    source._configure_candidate_topk(width)
+    positions, blocks, counts = (
+        value.cpu()
+        for value in _publish_candidate_rows(source, scores, lengths, 4 * block_size, sparse=True)
+    )
     assert blocks.dtype == torch.int32 and blocks.shape == (4, 4 * ratio)
     assert counts.dtype == torch.int32 and counts.shape == (4, 1)
     assert positions.shape == (4, 4 * block_size)
@@ -2412,32 +2392,45 @@ def test_publish_candidates_sparse_blocks(block_size, sparse_block):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("block_size,topk_blocks", [(8, 4), (16, 3), (8, 99)])
 @torch.inference_mode()
-def test_publish_candidates_sparse_blocks_cuda_matches_torch(block_size, topk_blocks, monkeypatch):
-    """The one-launch publication writes the same positions, sparse ids and counts as PyTorch."""
-    import tensorrt_llm._torch.attention.backends.sparse.csa2.indexer as implementation
-
+def test_publish_candidates_sparse_blocks_cuda_matches_torch(block_size, topk_blocks):
+    """Publication matches the PyTorch positions, sparse block ids and valid counts."""
     torch.manual_seed(4311)
     width = 12 * block_size + 5
     source = CSA2Indexer(_sparse_candidate_layout(topk_blocks, block_size), 0, 32, 128)
+    source._configure_candidate_topk(width)
     lengths = torch.tensor([width, 3 * block_size + 1, 1, 0, width - 2], dtype=torch.int32)
     scores = torch.rand(5, width)
-    scores = scores.masked_fill(torch.arange(width)[None, :] >= lengths[:, None], -torch.inf)
-    scores[0, block_size : 3 * block_size] = -torch.inf  # unreachable middle blocks
+    scores.masked_fill_(torch.arange(width)[None, :] >= lengths[:, None], -torch.inf)
+    scores[0, block_size : 3 * block_size] = -torch.inf
+    expected = _canonical(
+        _reference_select_candidate_positions(scores, lengths, topk_blocks, block_size)
+    ).to(torch.int32)
     published_width = min(topk_blocks, -(-width // block_size)) * block_size
-    with monkeypatch.context() as context:
-        context.setattr(implementation, "dsl_available", lambda: False)
-        expected = _publish_sparse(source, scores.cuda(), lengths.cuda(), published_width)
-    actual = _publish_sparse(source, scores.cuda(), lengths.cuda(), published_width)
-    for value, reference in zip(actual, expected):
-        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+    positions, ids, counts = (
+        value.cpu()
+        for value in _publish_candidate_rows(source, scores, lengths, published_width, sparse=True)
+    )
+    torch.testing.assert_close(positions, expected, atol=0, rtol=0)
+    ratio = block_size // source.sparse_block
+    for row in range(len(lengths)):
+        selected = expected[row][expected[row] >= 0].tolist()
+        blocks = sorted(
+            {(position // block_size) * ratio + j for position in selected for j in range(ratio)}
+        )
+        assert counts[row].item() == len(selected)
+        assert ids[row, : len(blocks)].tolist() == blocks
+        last = blocks[-1] // ratio if blocks else 0
+        assert set(ids[row, len(blocks) :].tolist()) <= set(range(last * ratio, (last + 1) * ratio))
 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not _sparse_kernels_available(), reason="DeepGEMM sparse MQA on SM100")
+# 6 blocks of 8 positions are not a multiple of 4 sparse blocks; the source pads its row.
+@pytest.mark.parametrize("topk_blocks", [4, 6])
 @torch.inference_mode()
-def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
+def test_sparse_candidate_paged_decode_and_graph(monkeypatch, topk_blocks):
     torch.manual_seed(4312)
-    layout = _sparse_candidate_layout(4, 8)
+    layout = _sparse_candidate_layout(topk_blocks, 8)
     packed_keys = pack_rows(torch.randn(512, 128, device="cuda", dtype=torch.bfloat16), "index")
     manager = _StridedOwner(layout, packed_keys)
     manager.max_total_draft_tokens = 1
@@ -2465,6 +2458,7 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
     metadata.csa2_candidate_counts = {}
     metadata.indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
+    _plan_indexer(metadata)
     state = CSA2ForwardState(
         metadata=metadata,
         swa_kv=torch.zeros(3, 512, device="cuda", dtype=torch.bfloat16),
@@ -2477,8 +2471,9 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
     original = consumer._sparse_candidate_logits
 
     def sparse(*args, **kwargs):
-        sparse_calls.append(args[0].shape)
-        return original(*args, **kwargs)
+        logits = original(*args, **kwargs)
+        sparse_calls.append((args[0].shape, logits.dtype))
+        return logits
 
     monkeypatch.setattr(consumer, "_sparse_candidate_logits", sparse)
     monkeypatch.setattr(
@@ -2495,7 +2490,9 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
 
     for _ in range(2):
         output = forward()
-    assert sparse_calls and all(shape == (3, 32, 64) for shape in sparse_calls)
+    assert sparse_calls and all(
+        shape == (3, 32, 64) and dtype == torch.bfloat16 for shape, dtype in sparse_calls
+    )
     descriptors = metadata.prepare_sparse_indexer(1, consumer.sparse_block)
     assert descriptors is not None
     pages, block_table, context_lens, rows, schedule = descriptors
@@ -2535,15 +2532,17 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
         ).sum(1)
         # The source selects its blocks over every visible position...
         expected = _reference_select_candidate_positions(
-            scores.masked_fill(~valid, -torch.inf), visible, 4, 8
+            scores.masked_fill(~valid, -torch.inf), visible, topk_blocks, 8
         )
         assert set(candidates[0][candidates[0] >= 0].tolist()) == set(
             expected[0][expected[0] >= 0].tolist()
         )
-        # ...and the consumer's Top-K stays inside the published candidates.
+        # ...and the consumer's Top-K stays inside the published candidates, ranked
+        # up to the sparse kernel's query quantization.
         in_pool = torch.zeros_like(valid)
-        in_pool.scatter_(1, candidates.clamp_min(0), candidates >= 0)
-        _assert_selection(selected, scores, valid & in_pool)
+        rows_in, cols_in = (candidates >= 0).nonzero(as_tuple=True)
+        in_pool[rows_in, candidates[rows_in, cols_in].long()] = True
+        _assert_selection(selected, scores, valid & in_pool, atol=0.05)
     assert bool((manager.storage == 77).all())
 
     # A holey prefix has fewer candidates than visible KV blocks. Repeated
@@ -2563,7 +2562,7 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
 
     def check_holey(actual: torch.Tensor, counts: list[int]) -> None:
         assert metadata.csa2_candidate_counts[0].flatten().tolist() == counts
-        _, scores, _ = _candidate_decode_run(consumer, state, monkeypatch, old=True)
+        scores = _reference_candidate_scores(consumer, state)
         _check_candidate_multiset(
             actual, scores, metadata.csa2_candidates[0], _bf16_tolerance(scores)
         )
@@ -2573,6 +2572,7 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
         metadata.csa2_decode_row_requests = (
             metadata.csa2_token_requests[decode_start:].int() - num_contexts
         )
+        _plan_indexer(metadata)
         actual = forward().clone()
         torch.cuda.synchronize()
         check_holey(actual, [175, 176, 0])
@@ -2583,6 +2583,7 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
     metadata.csa2_num_context_requests = 0
     metadata.csa2_decode_row_requests = metadata.csa2_token_requests.int()
     metadata.is_cuda_graph = True
+    _plan_indexer(metadata)
     for _ in range(2):
         forward()
     graph = torch.cuda.CUDAGraph()

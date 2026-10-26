@@ -9,11 +9,16 @@ This module tests:
 
 """
 
+import pickle
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import cloudpickle
+import numpy as np
 import pytest
 import torch
+from mpi4py import MPI
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
@@ -29,9 +34,12 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.mapping import CpType
+from tensorrt_llm.mapping import CpType, Mapping
 
 pytestmark = pytest.mark.cpu_only
+
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
 
 @pytest.fixture
@@ -134,6 +142,39 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.draft_tokens == draft_tokens
     assert llm_request.py_draft_tokens == draft_tokens
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+
+def test_long_prompt_admitted_through_int32_array_equals_list_path() -> None:
+    """A 128K-token generation-only prompt reaches the LlmRequest through the
+    owned int32 array exactly as through a token list."""
+    prompt = [(i * 7919) % 129280 for i in range(128 * 1024)]
+    executor_request = trtllm.Request(
+        input_token_ids=prompt,
+        max_tokens=16,
+        type=trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=trtllm.ContextPhaseParams([100], 1, None, None, None, None),
+    )
+
+    tokens = executor_request.input_token_ids_array
+    assert tokens.dtype == np.int32 and tokens.flags["C_CONTIGUOUS"]
+    tokens[0] += 1  # The array owns a copy; the request keeps its prompt.
+    assert executor_request.input_token_ids[0] == prompt[0]
+
+    from_array = executor_request_to_llm_request(
+        1, executor_request, child_req_ids=[], exclude_last_generation_logits=False
+    )
+    from_list = executor_request_to_llm_request(
+        2,
+        executor_request,
+        child_req_ids=[],
+        exclude_last_generation_logits=False,
+        input_token_ids=executor_request.input_token_ids,
+    )
+
+    assert from_array.get_tokens(0) == prompt
+    assert from_list.get_tokens(0) == prompt
+    assert from_array.prompt_len == from_list.prompt_len == len(prompt)
+    assert from_array.is_disagg_generation_init_state
 
 
 def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:
@@ -726,3 +767,106 @@ def test_executor_request_to_llm_request_adopts_return_routed_experts() -> None:
 
     assert _build(None).py_return_routed_experts is False  # default: opted out
     assert _build(True).py_return_routed_experts is True
+
+
+def _owner_prompt_fetch_rank(prompts_to_owners: bool) -> list:
+    """One rank of the attention-DP fetch: broadcast, wait/route, deliver prompts, merge."""
+    from contextlib import nullcontext
+
+    from tensorrt_llm._torch.distributed import MPIDist
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
+    from tensorrt_llm.scheduling_params import SchedulingParams
+
+    num_ranks = MPI.COMM_WORLD.Get_size()
+    mapping = Mapping(
+        world_size=num_ranks,
+        rank=MPI.COMM_WORLD.Get_rank(),
+        tp_size=num_ranks,
+        enable_attention_dp=True,
+    )
+    dist = MPIDist(mapping)
+    router = DefaultADPRouter(dist)
+    assert not router.reads_prompt_tokens
+    broadcaster = RequestBroadcaster(dist, SimpleNamespace(pause=nullcontext), prompts_to_owners)
+    items = []
+    if dist.rank == 0:
+        for request_id, prompt in _owner_prompts().items():
+            request = trtllm.Request(
+                input_token_ids=np.asarray(prompt, dtype=np.int32),
+                max_tokens=8,
+                type=trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+                context_phase_params=trtllm.ContextPhaseParams(
+                    [7], request_id, None, None, None, None
+                ),
+            )
+            request.py_conversation_params = None
+            # The last request may only run on rank 1, which is full in the first pass.
+            request.py_scheduling_params = (
+                SchedulingParams(attention_dp_rank=1, attention_dp_relax=False)
+                if request_id == max(_owner_prompts())
+                else None
+            )
+            items.append(RequestQueueItem(request_id, request))
+    received, py_objects = broadcaster.broadcast(items)
+    if dist.rank != 0:
+        attach_py_objects_to_requests(received, py_objects)
+        if prompts_to_owners:
+            assert all(item.request.num_input_tokens == 1 for item in received)
+    waiting = FCFSWaitingQueue()
+    waiting.add_requests(received)
+
+    max_active = 4
+    active = [0, max_active, 0, 0]
+    owned = []
+    for _ in range(2):
+        new = get_from_waiting_queue(waiting, len(waiting), True, max_active, list(active), router)
+        states = [
+            RankState(rank=r, num_active_requests=active[r], num_active_tokens=0)
+            for r in range(num_ranks)
+        ]
+        assignments, _ = router.route_requests(states, new, max_active)
+        broadcaster.deliver_prompts(assignments)
+        if prompts_to_owners and dist.rank != 0:
+            for rank, assigned in assignments.items():
+                assert all(
+                    (item.prompt_token_ids is not None) == (rank == dist.rank) for item in assigned
+                )
+            assert all(item.prompt_token_ids is None for item in waiting)
+        for rank, assigned in assignments.items():
+            active[rank] += len(assigned)
+        owned += merge_requests(
+            assignments[dist.rank],
+            cp_config={},
+            cp_rank=0,
+            cp_size=1,
+            exclude_last_generation_logits=False,
+        )
+        active[1] -= 1  # Rank 1 frees a slot for the waiting request.
+    assert not waiting
+    return dist.rank, sorted(
+        (req.py_request_id, req.get_tokens(0), req.prompt_len) for req in owned
+    )
+
+
+def _owner_prompts() -> dict:
+    return {
+        100 + i: [(i * 7919 + j * 104729) % 129280 for j in range(5000 + 3000 * i)]
+        for i in range(6)
+    }
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_owner_prompt_delivery_matches_full_broadcast(mpi_pool_executor) -> None:
+    """Under attention DP each owner gets exactly the prompts the full broadcast gives it,
+    also for a request that waits a pass for its rank, and no other rank gets them."""
+    full = dict(mpi_pool_executor.starmap(_owner_prompt_fetch_rank, [(False,)] * 4))
+    delivered = dict(mpi_pool_executor.starmap(_owner_prompt_fetch_rank, [(True,)] * 4))
+    assert delivered == full
+    full = [full[rank] for rank in range(4)]
+    prompts = _owner_prompts()
+    assert sorted(request_id for rank in full for request_id, _, _ in rank) == sorted(prompts)
+    assert all(full), "every rank owns a request"
+    assert [request_id for request_id, _, _ in full[1]] == [max(prompts)]
+    for rank in full:
+        for request_id, tokens, prompt_len in rank:
+            assert tokens == prompts[request_id] and prompt_len == len(tokens)

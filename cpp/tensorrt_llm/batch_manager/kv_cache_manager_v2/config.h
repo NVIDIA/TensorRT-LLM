@@ -52,7 +52,8 @@ struct GpuCacheTierConfig
 
 struct HostCacheTierConfig
 {
-    size_t quota = 0; // bytes
+    size_t quota = 0;            // bytes
+    std::optional<int> numaNode; // binds the tier's host memory to this node; unset keeps the default policy
 
     CacheTier tier() const noexcept
     {
@@ -63,6 +64,8 @@ struct HostCacheTierConfig
     {
         if (quota == 0)
             throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
+        if (numaNode && *numaNode < 0)
+            throw std::invalid_argument("HostCacheTierConfig: numa_node must be >= 0");
     }
 };
 

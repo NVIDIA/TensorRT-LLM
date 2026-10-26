@@ -21,13 +21,14 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional, Protocol, Type
 
+import numpy as np
 import torch
 from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm.logger import logger
 
-from ..._utils import get_sm_version, prefer_pinned
+from ..._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
@@ -42,11 +43,14 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
+from tensorrt_llm.sampling_params import SamplingParams
 
 from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
-from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from ..pyexecutor.sampler.ops.vanilla import (GREEDY_TEMPERATURE_THRESHOLD,
+                                              greedy_search_sampling_batch)
+from ..pyexecutor.sampler.sampler_common import request_random_seed
 
 
 def rejection_sampling_one_model(
@@ -467,6 +471,74 @@ _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 _RNG_SLOT_SPAN = 32
 
 
+@dataclass(frozen=True, slots=True)
+class OneModelSamplingParams:
+    """A request's normalized one-model sampling parameters, cached on it.
+
+    The config is fixed per request and each binding read copies all of it.
+    """
+    temperature: float
+    top_k: int
+    top_p: float
+    min_p: float
+    is_greedy: bool
+    # The user's ``SamplingParams.seed``, None when unset.
+    seed: Optional[int]
+
+    @property
+    def is_temperature_only(self) -> bool:
+        """Sampled with a temperature alone: no top-k, top-p or min-p filter."""
+        return (not self.is_greedy
+                and self.top_k == torch.iinfo(torch.int32).max
+                and self.top_p >= 1.0 and self.min_p <= 0.0)
+
+    @classmethod
+    def of_request(cls, request: "LlmRequest") -> "OneModelSamplingParams":
+        params = request.py_spec_sampling_params
+        if params is None:
+            params = cls._normalize(request)
+            request.py_spec_sampling_params = params
+        return params
+
+    @classmethod
+    def _normalize(cls, request: "LlmRequest") -> "OneModelSamplingParams":
+        sampling_config = request.sampling_config
+        temperature = sampling_config.temperature
+        top_k = sampling_config.top_k
+        top_p = sampling_config.top_p
+        min_p = sampling_config.min_p
+        # min_p must take part: a min_p-only request is not greedy, and this
+        # flag also picks the CUDA graph variant.
+        is_greedy = SamplingParams.params_imply_greedy_decoding(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            use_beam_search=False)
+        use_top_k = not is_greedy and top_k is not None and top_k > 0
+
+        # Greedy rows get a sentinel below the kernels' greedy threshold
+        # (non-zero, one-hot under softmax); non-greedy rows default to 1.0.
+        disable_temperature = GREEDY_TEMPERATURE_THRESHOLD / 10
+        return cls(
+            temperature=(disable_temperature if is_greedy else
+                         (temperature or 1.0)),
+            # Very large values disable top-k.
+            top_k=top_k if use_top_k else torch.iinfo(torch.int32).max,
+            top_p=1.0 if is_greedy or top_p is None else top_p,
+            # Unlike top_p, min_p's neutral value is 0.0, not 1.0.
+            min_p=0.0 if is_greedy or min_p is None else min_p,
+            is_greedy=is_greedy,
+            seed=request_random_seed(request),
+        )
+
+
+def _upload_host_values(dst: torch.Tensor, values: np.ndarray) -> None:
+    """Copy ``values`` into the head of ``dst`` without blocking."""
+    dst[:len(values)].copy_(maybe_pin_memory(torch.from_numpy(values)),
+                            non_blocking=True)
+
+
 @dataclass
 class SpecMetadata:
     """
@@ -582,6 +654,12 @@ class SpecMetadata:
     # a greedy rank pulled onto the advanced path still samples greedily via
     # its sentinel params.
     group_all_greedy_sample: Optional[bool] = None
+    # Deploy-time: the worker samples greedy and temperature-only target rows from this
+    # rank's LM-head columns; temperature-only steps are a CUDA graph variant of their own.
+    samples_from_vocab_shards: bool = False
+    # Part of the CUDA graph key: the batch is not all greedy, every sampled row sets
+    # only a temperature, and the worker samples such rows from vocabulary shards.
+    is_all_temperature_only: bool = False
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
@@ -844,26 +922,19 @@ class SpecMetadata:
         from each other and from every other unseeded request's, including its
         own earlier steps -- unseeded requests sample independently of each
         other, just reproducibly for a given traffic history.
-        """
-        from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
-            request_random_seed
 
-        user_seeds = [request_random_seed(request) for request in requests]
-        request_seeds = [
-            DEFAULT_SAMPLING_SEED if seed is None else seed
-            for seed in user_seeds
+        An all-greedy batch, which draws no random numbers, only advances the
+        window counters.
+        """
+        user_seeds = [
+            OneModelSamplingParams.of_request(request).seed
+            for request in requests
         ]
         request_offsets = self._take_rng_window_offsets(
             requests, [seed is not None for seed in user_seeds])
-        num_tokens_per_request = [n for *_, n in per_request_normalized]
-
-        flat_seeds: list[int] = []
-        flat_offsets: list[int] = []
-        for seed, offset, num_tokens in zip(request_seeds, request_offsets,
-                                            num_tokens_per_request):
-            flat_seeds.extend(seed for _ in range(num_tokens))
-            flat_offsets.extend(offset + row * _RNG_SLOT_SPAN
-                                for row in range(num_tokens))
+        num_tokens_per_request = np.array(
+            [n for *_, n in per_request_normalized], dtype=np.int64)
+        num_rows = int(num_tokens_per_request.sum())
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
@@ -873,6 +944,7 @@ class SpecMetadata:
         assert len(requests) <= self.max_num_requests, (
             f"batch has {len(requests)} requests but max_num_requests is "
             f"{self.max_num_requests}")
+        # Allocated on greedy steps too: sampled graphs keep these addresses.
         if (self.request_seeds is None
                 or self.request_seeds.numel() < self.max_num_requests):
             self.request_seeds = torch.zeros(self.max_num_requests,
@@ -881,11 +953,11 @@ class SpecMetadata:
             self.request_offsets = torch.zeros(self.max_num_requests,
                                                dtype=torch.int64,
                                                device='cuda')
-        if self.seeds is None or self.seeds.numel() < len(flat_seeds):
+        if self.seeds is None or self.seeds.numel() < num_rows:
             # Match the per-token buffers' capacity so a later batch with more
             # rows does not reallocate mid-stream.
             capacity = max(
-                len(flat_seeds),
+                num_rows,
                 self.temperatures.numel()
                 if self.temperatures is not None else 0)
             self.seeds = torch.zeros(capacity, dtype=torch.int64, device='cuda')
@@ -893,16 +965,27 @@ class SpecMetadata:
                                        dtype=torch.int64,
                                        device='cuda')
 
-        def _upload(dst: torch.Tensor, values: list[int]) -> None:
-            dst[:len(values)].copy_(torch.tensor(values,
-                                                 dtype=torch.int64,
-                                                 pin_memory=prefer_pinned()),
-                                    non_blocking=True)
+        if self.is_all_greedy_sample:
+            return
 
-        _upload(self.request_seeds, request_seeds)
-        _upload(self.request_offsets, request_offsets)
-        _upload(self.seeds, flat_seeds)
-        _upload(self.offsets, flat_offsets)
+        request_seeds = np.array([
+            DEFAULT_SAMPLING_SEED if seed is None else seed
+            for seed in user_seeds
+        ],
+                                 dtype=np.int64)
+        request_offsets = np.array(request_offsets, dtype=np.int64)
+        # Row r of a request's window draws from slot r.
+        flat_seeds = np.repeat(request_seeds, num_tokens_per_request)
+        row_starts = np.cumsum(num_tokens_per_request) - num_tokens_per_request
+        row_in_request = (np.arange(num_rows, dtype=np.int64) -
+                          np.repeat(row_starts, num_tokens_per_request))
+        flat_offsets = (np.repeat(request_offsets, num_tokens_per_request) +
+                        row_in_request * _RNG_SLOT_SPAN)
+
+        _upload_host_values(self.request_seeds, request_seeds)
+        _upload_host_values(self.request_offsets, request_offsets)
+        _upload_host_values(self.seeds, flat_seeds)
+        _upload_host_values(self.offsets, flat_offsets)
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -1208,76 +1291,17 @@ class SpecMetadata:
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import (
             LlmRequestState, get_request_tokens_per_gen_step)
-        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
-            GREEDY_TEMPERATURE_THRESHOLD
-        from tensorrt_llm.sampling_params import SamplingParams
-
-        # Sentinel temperature for greedy / temperature-disabled rows. Must stay
-        # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
-        # recognize these rows as greedy; small enough that even if a row were
-        # (incorrectly) sampled, softmax(logits / val) is effectively one-hot,
-        # and non-zero to avoid division by 0.
-        DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
-        # Very large values disable topk.
-        DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
-        DISABLE_TOPP_VAL = 1.0
-        DISABLE_MINP_VAL = 0.0
-
-        def _normalize_request_sampling_params(
-            *,
-            temperature: Optional[float],
-            top_k: Optional[int],
-            top_p: Optional[float],
-            min_p: Optional[float],
-        ) -> tuple[float, int, float, float, bool]:
-            """Convert request sampling params into normalized per-request scalars."""
-            # min_p participates in the greedy classification and must: a request whose
-            # ONLY knob is min_p is not greedy (params_imply_greedy_decoding treats
-            # 0 < min_p < 1 as an active sampling knob), and min_p == 1.0 is explicit
-            # greedy. Omitting it here would classify a min_p-only request as greedy, send
-            # it down the argmax fast path, and drop min_p silently -- and since this flag
-            # is part of the CUDA graph key, it would also pick the wrong graph variant.
-            is_greedy = SamplingParams.params_imply_greedy_decoding(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                min_p=min_p,
-                use_beam_search=False)
-
-            use_top_k = not is_greedy and top_k is not None and top_k > 0
-
-            # The sentinel is one-hot under softmax, so it must not reach a
-            # non-greedy row; those resolve 1.0, as resolve_sampling_strategy does.
-            normalized_temperature = (DISABLE_TEMP_VAL if is_greedy else
-                                      (temperature or 1.0))
-            normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
-            normalized_top_p = (DISABLE_TOPP_VAL
-                                if is_greedy or top_p is None else top_p)
-            # Unlike top_p, min_p's neutral value is 0.0, not 1.0.
-            normalized_min_p = (DISABLE_MINP_VAL
-                                if is_greedy or min_p is None else min_p)
-
-            return (
-                normalized_temperature,
-                normalized_top_k,
-                normalized_top_p,
-                normalized_min_p,
-                is_greedy,
-            )
 
         # Phase 1: collect per-request flags and normalized values.
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
+        all_temperature_only = True
         per_request_slot_ids: list[int] = []
         ragged_verify = self.is_ragged_verify
         default_generation_tokens = 1 + self.runtime_draft_len
 
         for request in requests:
-            sampling_config = request.sampling_config
-            temp_val = sampling_config.temperature
-            tk_val = sampling_config.top_k
-            tp_val = sampling_config.top_p
-            mp_val = sampling_config.min_p
+            params = OneModelSamplingParams.of_request(request)
 
             # Generation requests contribute one row per verified position,
             # per-request under ragged verification: the buffers are indexed
@@ -1290,23 +1314,12 @@ class SpecMetadata:
             else:
                 num_tokens = 1
 
-            (
-                temp_val,
-                tk_val,
-                tp_val,
-                mp_val,
-                is_greedy,
-            ) = _normalize_request_sampling_params(
-                temperature=temp_val,
-                top_k=tk_val,
-                top_p=tp_val,
-                min_p=mp_val,
-            )
-
-            has_non_greedy_requests |= not is_greedy
+            has_non_greedy_requests |= not params.is_greedy
+            all_temperature_only &= params.is_greedy or params.is_temperature_only
 
             per_request_normalized.append(
-                (temp_val, tk_val, tp_val, mp_val, num_tokens))
+                (params.temperature, params.top_k, params.top_p, params.min_p,
+                 num_tokens))
             # py_seq_slot is a stable per-request id used to scatter/gather draft
             # probs across iterations. Dummy/padding requests (py_seq_slot is
             # None) route to the scratch row captured at allocation time (the
@@ -1328,6 +1341,9 @@ class SpecMetadata:
         # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
+        self.is_all_temperature_only = (self.samples_from_vocab_shards
+                                        and all_temperature_only
+                                        and not self.is_all_greedy_sample)
         return per_request_normalized, per_request_slot_ids
 
     @property
@@ -1464,78 +1480,45 @@ class SpecMetadata:
                 or need_update_expanded_sampler_param):
             return
 
-        if need_update_sampler_param:
-            request_temperatures: list[float] = []
-            request_top_ks: list[int] = []
-            request_top_ps: list[float] = []
-            request_min_ps: list[float] = []
-            for temp_val, tk_val, tp_val, mp_val, _ in per_request_normalized:
-                request_temperatures.append(temp_val)
-                request_top_ks.append(tk_val)
-                request_top_ps.append(tp_val)
-                if fill_min_p:
-                    request_min_ps.append(mp_val)
+        # Columns: temperature, top_k, top_p, min_p. float64 holds every int32
+        # top_k exactly and narrows to float32 like torch.tensor does.
+        params = np.array([entry[:4] for entry in per_request_normalized],
+                          dtype=np.float64).reshape(-1, 4)
+        request_temperatures = params[:, 0].astype(np.float32)
+        request_top_ks = params[:, 1].astype(np.int32)
+        request_top_ps = params[:, 2].astype(np.float32)
+        request_min_ps = params[:, 3].astype(np.float32)
 
-            self.request_temperatures[:len(request_temperatures)].copy_(
-                torch.tensor(request_temperatures,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True)
-            self.request_top_ks[:len(request_top_ks)].copy_(
-                torch.tensor(request_top_ks,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
-            self.request_top_ps[:len(request_top_ps)].copy_(
-                torch.tensor(request_top_ps,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+        if need_update_sampler_param:
+            _upload_host_values(self.request_temperatures, request_temperatures)
+            _upload_host_values(self.request_top_ks, request_top_ks)
+            _upload_host_values(self.request_top_ps, request_top_ps)
             if fill_min_p:
-                self.request_min_ps[:len(request_min_ps)].copy_(
-                    torch.tensor(request_min_ps,
-                                 dtype=torch.float32,
-                                 pin_memory=prefer_pinned()),
-                    non_blocking=True,
-                )
+                _upload_host_values(self.request_min_ps, request_min_ps)
 
             # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
             # encounter boolean-tensor indexing (dynamic size) or .item()
-            # calls. DISABLE_TOPK_VAL (INT32_MAX) is the "top-k disabled"
-            # sentinel. Derived from the same values as the per-request
-            # buffers, so it is refreshed exactly when they are.
-            _disable_topk = torch.iinfo(torch.int32).max
-            self.top_k_max = max(
-                (tk for tk in request_top_ks if 0 < tk < _disable_topk),
-                default=0)
+            # calls. INT32_MAX is the "top-k disabled" sentinel. Derived from
+            # the same values as the per-request buffers, so it is refreshed
+            # exactly when they are.
+            enabled_top_ks = request_top_ks[
+                (request_top_ks > 0)
+                & (request_top_ks < torch.iinfo(torch.int32).max)]
+            self.top_k_max = int(
+                enabled_top_ks.max()) if enabled_top_ks.size else 0
 
         if need_update_expanded_sampler_param:
-            temperatures: list[float] = []
-            top_ks: list[int] = []
-            top_ps: list[float] = []
-            min_ps: list[float] = []
-            for temp_val, tk_val, tp_val, mp_val, num_tokens in per_request_normalized:
-                temperatures.extend(temp_val for _ in range(num_tokens))
-                top_ks.extend(tk_val for _ in range(num_tokens))
-                top_ps.extend(tp_val for _ in range(num_tokens))
-                if fill_min_p:
-                    min_ps.extend(mp_val for _ in range(num_tokens))
-
-            self.temperatures[:len(temperatures)].copy_(torch.tensor(
-                temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                        non_blocking=True)
-            self.top_ks[:len(top_ks)].copy_(torch.tensor(
-                top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
-            self.top_ps[:len(top_ps)].copy_(torch.tensor(
-                top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
+            num_tokens = np.array([n for *_, n in per_request_normalized],
+                                  dtype=np.int64)
+            _upload_host_values(self.temperatures,
+                                np.repeat(request_temperatures, num_tokens))
+            _upload_host_values(self.top_ks,
+                                np.repeat(request_top_ks, num_tokens))
+            _upload_host_values(self.top_ps,
+                                np.repeat(request_top_ps, num_tokens))
             if fill_min_p:
-                self.min_ps[:len(min_ps)].copy_(torch.tensor(
-                    min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                non_blocking=True)
+                _upload_host_values(self.min_ps,
+                                    np.repeat(request_min_ps, num_tokens))
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, float, int]]
@@ -1642,6 +1625,11 @@ class SpecWorkerBase(nn.Module, ABC):
     Provides common functionality for sampling and token handling.
     """
 
+    #: Whether the target logits may stay in the LM head's dtype (no fp32
+    #: copy). The acceptance helpers compute in fp32 either way; a worker opts
+    #: in only if its other uses of the logits are dtype-safe too.
+    reads_lm_head_dtype_logits: bool = False
+
     def __init__(self, use_separate_draft_kv_cache: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
@@ -1669,6 +1657,26 @@ class SpecWorkerBase(nn.Module, ABC):
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
         self._auxiliary_state_handlers: list[
             AuxiliarySpeculativeStateHandler] = []
+
+    def prepare_vocab_sharded_sampling(self, lm_head: nn.Module) -> None:
+        """Set up target sampling from ``lm_head``'s vocabulary shards; called once after load.
+
+        Collective over the tensor-parallel group: every rank calls it at the same point.
+        """
+
+    def takes_vocab_sharded_target_logits(self, attn_metadata,
+                                          spec_metadata) -> bool:
+        """Whether this step's target logits stay this rank's LM-head columns.
+
+        When True the model passes those columns with ``vocab_sharded_logits=True``.
+        """
+        return False
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        """Whether greedy and temperature-only target rows are sampled from vocabulary shards;
+        temperature-only steps are a CUDA graph variant (``SpecMetadata.is_all_temperature_only``)."""
+        return False
 
     def register_auxiliary_state_handler(
             self, handler: AuxiliarySpeculativeStateHandler) -> None:
@@ -2122,7 +2130,8 @@ class SpecWorkerBase(nn.Module, ABC):
         # Copy first: apply_penalties rewrites in place, and the caller keeps this
         # tensor as the step's reported logits. Penalizing it directly would feed
         # the penalized scores back to logprobs and to the next step's consumers.
-        penalized = logits.clone()
+        # fp32 whatever the logits' dtype.
+        penalized = logits.to(torch.float32, copy=True)
         penalty_ops.apply_penalties(penalized, spec_metadata, row_slots,
                                     intra_tokens, intra_valid)
         return penalized
@@ -2283,6 +2292,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                            min_ps,
                                                            seed=seed,
                                                            offset=offset)
+        # The flashinfer chain computes in its input dtype.
+        logits = logits.float()
         top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
             advanced_sampling_mode, top_ks, top_ps)
         return flashinfer_sampling.sample_from_logits_op(logits,
@@ -2313,6 +2324,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
+        logits = logits.float()
         top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
             advanced_sampling_mode, top_ks, top_ps)
         return flashinfer_sampling.sampling_batch_spec_dec_one_model_for_rejection(
@@ -2330,6 +2342,7 @@ class SpecWorkerBase(nn.Module, ABC):
         if advanced_sampling_mode.is_fused:
             return fused_sampling.fused_compute_probs_from_logits(
                 logits, temperatures, top_ks, top_ps, min_ps)
+        logits = logits.float()
         top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
             advanced_sampling_mode, top_ks, top_ps)
         return flashinfer_sampling.compute_probs_from_logits(

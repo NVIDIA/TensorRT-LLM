@@ -113,14 +113,6 @@ std::tuple<torch::Tensor, torch::Tensor> fusedInvRopeFp8Quant( //
     TORCH_CHECK(
         static_cast<int64_t>(static_cast<int>(tma_aligned_T)) == tma_aligned_T, "scale_buf_m exceeds int range");
 
-    // The kernel reads `positions` as int64. If the caller passed int32 we
-    // need an upcast — cheap, single dim.
-    torch::Tensor positions_i64 = positions;
-    if (positions.scalar_type() == torch::kInt32)
-    {
-        positions_i64 = positions.to(torch::kInt64);
-    }
-
     auto stream = at::cuda::getCurrentCUDAStream(o.get_device());
 
     // Strides in element units. Input layout is [T, num_heads, head_dim]
@@ -132,12 +124,15 @@ std::tuple<torch::Tensor, torch::Tensor> fusedInvRopeFp8Quant( //
     int const scale_stride_group = static_cast<int>(scale_buf.stride(0));
     int const scale_stride_k = static_cast<int>(scale_buf.stride(1));
 
-    tensorrt_llm::kernels::invokeInverseRopeFp8Quant(o.data_ptr(),                                    //
-        positions_i64.data_ptr(), cos_sin_cache.data_ptr(), fp8_buf.data_ptr(), scale_buf.data_ptr(), //
-        static_cast<int>(num_tokens), static_cast<int>(num_heads), static_cast<int>(heads_per_group), //
-        static_cast<int>(chunks_per_head), is_neox, static_cast<int>(tma_aligned_T),                  //
-        o_stride_token, o_stride_head, fp8_stride_group, fp8_stride_token, scale_stride_group,        //
-        scale_stride_k, stream);
+    AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fusedInvRopeFp8Quant",
+        [&]
+        {
+            tensorrt_llm::kernels::invokeInverseRopeFp8Quant(o.data_ptr(), positions.data_ptr<index_t>(),
+                cos_sin_cache.data_ptr(), fp8_buf.data_ptr(), scale_buf.data_ptr(), static_cast<int>(num_tokens),
+                static_cast<int>(num_heads), static_cast<int>(heads_per_group), static_cast<int>(chunks_per_head),
+                is_neox, static_cast<int>(tma_aligned_T), o_stride_token, o_stride_head, fp8_stride_group,
+                fp8_stride_token, scale_stride_group, scale_stride_k, stream);
+        });
 
     return {fp8_buf, scale_buf};
 }

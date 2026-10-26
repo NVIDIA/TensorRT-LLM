@@ -34,6 +34,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <vector>
@@ -691,6 +692,19 @@ void initRequestBindings(nb::module_& m)
         nb::arg("cache_salt") = nb::none()
     ) // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
+        // The prompt as an int32 array owning a copy: one memcpy instead of a PyLong per token.
+        .def_prop_ro(
+            "input_token_ids_array",
+            [](tle::Request const& self)
+            {
+                auto tokens = std::make_unique<VecTokens>(self.getInputTokenIds());
+                nb::capsule owner(tokens.get(), [](void* p) noexcept { delete static_cast<VecTokens*>(p); });
+                auto* ownedTokens = tokens.release();
+                return nb::ndarray<nb::numpy, VecTokens::value_type, nb::ndim<1>, nb::c_contig>(
+                    ownedTokens->data(), {ownedTokens->size()}, owner);
+            },
+            // A getter defaults to reference_internal, which an array with its own owner rejects.
+            nb::rv_policy::automatic)
         .def_prop_ro("num_input_tokens", &tle::Request::getNumInputTokens)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)

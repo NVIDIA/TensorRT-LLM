@@ -204,6 +204,7 @@ set(TRTLLM_LINK_LIBS
     cute_dsl_src
     runtime_src
     compressorKernels_src
+    csa2_sparse_context_src
     fusedSamplingKernels_src
     mhcKernels_src
     userbuffers_src

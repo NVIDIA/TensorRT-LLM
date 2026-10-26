@@ -33,6 +33,10 @@ l0_gb300_multi_gpus_perf_sanity:
       stage: post_merge
       backend: pytorch
   tests:
+  # deepseek_v41_flash_grace_blackwell (8k1k)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v41_flash_grace_blackwell-v41_flash_tep4_8k1k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v41_flash_grace_blackwell-v41_flash_dep4_8k1k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v41_flash_grace_blackwell-v41_flash_tep4_dspark_8k1k] TIMEOUT (90)
   # ctx_only tests (disagg config)
   # deepseek-r1-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-r1-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)

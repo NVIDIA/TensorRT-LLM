@@ -32,6 +32,7 @@ from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
+                                          PrefillCudaGraphBackend,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -1945,6 +1946,9 @@ class ModelLoader:
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         config.extra_attrs["bounded_replay_on_generation"] = (
             self.llm_args.bounded_replay_on_generation)
+        config.extra_attrs["breakable_prefill_cuda_graph"] = (
+            self.llm_args.prefill_cuda_graph_backend ==
+            PrefillCudaGraphBackend.BREAKABLE)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

@@ -2,17 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native and Flash provider numerics, dispatch and metadata lifecycle."""
 
+import itertools
 import math
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2FlashInfer, CSA2FlashMLA
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
+    CSA2FlashInfer,
+    CSA2FlashMLA,
+    _fused_context_supported,
+)
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Params
+
+from ._utils import _plan_indexer
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="This test requires Blackwell or newer",
+)
+skip_no_fused_context = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _fused_context_supported(torch.cuda.current_device()),
+    reason="The fused CSA2 context kernel requires an SM100-family GPU",
 )
 
 
@@ -28,6 +39,34 @@ def _reference(q, swa, extra, swa_valid, extra_valid, sink):
         ..., :-1
     ]
     return torch.einsum("qhk,qkd->qhd", probs, kv.float()).to(q.dtype)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("staging_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("shared", [False, True])
+def test_staging_keeps_minimum_tma_backing(staging_dtype, shared):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    q = torch.empty(1, 8, 512, dtype=torch.bfloat16, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(
+        q,
+        0,
+        staging_dtype=staging_dtype,
+        context_lengths=[1] if shared else None,
+        shared_rows=75 if shared else None,
+    )
+    if shared:
+        assert metadata.shared_pool.shape == (75, 512)
+        assert metadata.swa_pool is metadata.extra_pool is metadata.shared_pool
+    else:
+        assert metadata.swa_pool.shape == (1, 128, 512)
+        assert metadata.extra_pool.shape == (1, 1, 512)
+    for pool in (metadata.swa_pool, metadata.extra_pool):
+        remaining_storage = pool.untyped_storage().nbytes() - (
+            pool.storage_offset() * pool.element_size()
+        )
+        assert remaining_storage >= 128 << 10
 
 
 def _backend(
@@ -326,6 +365,7 @@ def test_standard_backend_multiple_tiles_and_reuse(monkeypatch):
         runtime.csa2_global_page_sizes = {0: 128}
         runtime.csa2_global_max_positions = {0: 6}
         runtime.csa2_main_write_slots = {0: global_slots}
+        _plan_indexer(runtime)
         runtime.csa2_kv_sources = {0: 0, 1: 0, 2: 0}
         runtime.csa2_swa_indices = {}
         runtime.csa2_swa_write_slots = {}
@@ -942,14 +982,20 @@ def test_global_slot_graph_mapping_folds_visibility(monkeypatch):
         ("generation", 512, 64),
         ("context", 512, 64),
         ("captured_context", 512, 64),
+        ("captured_generation", 512, 64),
     ],
 )
 @torch.inference_mode()
 def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, record_property):
     from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
     from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import unpack_rows
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    # FP8 staging path: keep the direct decode, which takes <= 16-row generation tiles, out.
+    monkeypatch.setattr(CSA2TrtllmAttention, "direct_decode_serves", lambda *args: False)
 
     torch.manual_seed(482)
     count = 5
@@ -980,7 +1026,7 @@ def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, 
     # Staging derives both scales from the packed pools; the oracle below reads
     # them back off the metadata and the forward args.
     source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=count)
-    if phase == "generation":
+    if phase in ("generation", "captured_generation"):
         metadata = CSA2TrtllmMetadata.for_query_tile(
             q, extra_width, staging_dtype=attn.staging_dtype
         )
@@ -1036,19 +1082,22 @@ def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, 
             assert args.quant_q_buffer is None
         return result
 
-    for _ in range(3):
-        output = run()
-    assert calls and all(p == args.attention_input_type for p in calls)
-    graph = None
-    if phase == "captured_context":
-        pointers = (
-            metadata.swa_pool.data_ptr(),
-            metadata.extra_pool.data_ptr(),
-            metadata.workspace.data_ptr(),
-        )
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+    # As in the graph runner, captured generation warms up and captures with multi-stream
+    # work on, so it quantizes Q on a stream of its own.
+    with with_multi_stream(phase == "captured_generation"):
+        for _ in range(3):
             output = run()
+        assert calls and all(p == args.attention_input_type for p in calls)
+        graph = None
+        if phase.startswith("captured"):
+            pointers = (
+                metadata.swa_pool.data_ptr(),
+                metadata.extra_pool.data_ptr(),
+                metadata.workspace.data_ptr(),
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = run()
     for replay in range(2 if graph else 1):
         if graph:
             q.neg_()
@@ -1132,7 +1181,7 @@ def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, 
     [("generation", 128), ("generation", 512), ("context", 512)],
 )
 @torch.inference_mode()
-def test_native_fp8_staging_keeps_rows_beyond_the_e4m3_range(phase, extra_width):
+def test_native_fp8_staging_keeps_rows_beyond_the_e4m3_range(phase, extra_width, monkeypatch):
     """Staged rows whose real magnitudes run past 448 must not be clamped to it.
 
     Both persistent encodings carry group scales in real magnitudes, so a unit
@@ -1146,10 +1195,13 @@ def test_native_fp8_staging_keeps_rows_beyond_the_e4m3_range(phase, extra_width)
     from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
     from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
         _CONTEXT_STAGE_SCALE_MAX_EXPONENT,
+        CSA2TrtllmAttention,
     )
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import unpack_rows
 
+    # FP8 staging path: keep the direct decode, which takes <= 16-row generation tiles, out.
+    monkeypatch.setattr(CSA2TrtllmAttention, "direct_decode_serves", lambda *args: False)
     torch.manual_seed(482)
     count, heads = 5, 64
     attn = _backend(heads, kv_cache_dtype="fp8")
@@ -1329,11 +1381,18 @@ def test_native_fp8_rejects_incompatible_options():
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "implementation,kv_dtype", [("trtllm", "auto"), ("trtllm", "fp8"), ("flashinfer", "auto")]
+    "implementation,kv_dtype,decisive",
+    [
+        ("trtllm", "auto", "main"),
+        ("trtllm", "fp8", "main"),
+        ("trtllm", "fp8", "swa"),
+        ("trtllm", "fp8", "none"),
+        ("flashinfer", "auto", "main"),
+    ],
 )
 @torch.inference_mode()
 def test_shared_native_context_matches_selected_rows(
-    implementation, kv_dtype, monkeypatch, record_property
+    implementation, kv_dtype, decisive, monkeypatch, record_property
 ):
     from tensorrt_llm._torch.attention.backends.interface import (
         AttentionForwardArgs,
@@ -1353,6 +1412,9 @@ def test_shared_native_context_matches_selected_rows(
     torch.manual_seed(489)
     count, heads, width = 5, 64, 512
     attn = _backend(heads, kv_cache_dtype=kv_dtype, compute_backend=implementation)
+    # Shared and selected staging must feed trtllm-gen identical operands; the fused FP8
+    # context kernel serves shared tiles by default (test_fused_context_matches_trtllm_gen).
+    attn.fused_context = False
     q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
     positions = torch.tensor([0, 1, 2, 1024, 1025], device="cuda", dtype=torch.int64)
     requests = torch.tensor([0, 0, 0, 1, 1], device="cuda", dtype=torch.int64)
@@ -1363,9 +1425,14 @@ def test_shared_native_context_matches_selected_rows(
     main_pages[0, 0] = 9
     main_pages[1] = torch.arange(9, device="cuda", dtype=torch.int32)
     swa = pack_rows(torch.randn(384, 512, device="cuda", dtype=torch.bfloat16), "swa")
-    main_storage = torch.empty(1280, 356, device="cuda", dtype=torch.uint8)
+    main_storage = torch.empty(1280, 360, device="cuda", dtype=torch.uint8)
     main = main_storage[:, :288]
     main.copy_(pack_rows(torch.randn(1280, 512, device="cuda", dtype=torch.bfloat16), "main"))
+    # A selected row whose group scales need a non-unit staging scale.
+    if decisive == "main":
+        main[0, 256:] = 126
+    elif decisive == "swa":
+        swa[256, 512:] = 129
     swa_logical = positions[:, None] - 127 + torch.arange(128, device="cuda")
     main_logical = torch.arange(width, device="cuda").expand(count, -1).clone()
 
@@ -1394,6 +1461,9 @@ def test_shared_native_context_matches_selected_rows(
         num_requests=2,
         swa_rows=259,
         main_rows=1029,
+        swa_first=torch.tensor([0, 2], device="cuda", dtype=torch.int64),
+        swa_floors=torch.tensor([0, 897], device="cuda", dtype=torch.int64),
+        window=1 << 40,
     )
     calls = []
     native_stage = kernel.stage_shared_rows
@@ -1545,3 +1615,370 @@ def test_flashinfer_shared_plans_bound_eager_context_and_keep_protected(monkeypa
     assert helper._paged_plans[key(3)] is captured
     assert helper._paged_plans[key(1)] is generation
     assert plans == [3, 1, 2, 4, 5]
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_native_fp8_staging_groups_scan_main_scales_once(monkeypatch):
+    """Each staging group scans its selected MAIN scale bytes once per forward and tile.
+
+    The Reuse layer shares its owner's selections and MAIN cache, so it keeps the
+    owner's MAIN bits but never its SWA bits; the Reindex layer selects its own rows
+    and scans again. Every tile's scale, and the attention it feeds, must match a
+    forward that scans each layer on its own, and the next forward must scan the
+    rewritten cache.
+    """
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
+        CSA2CacheManager,
+        CSA2CacheRole,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import (
+        CSA2IndexerGroup,
+        CSA2TrtllmMetadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+        CSA2BackendForwardArgs,
+        CSA2ForwardState,
+        CSA2Layout,
+        CSA2Mode,
+    )
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    # FP8 staging path: keep the direct decode, which takes <= 16-row generation tiles, out.
+    monkeypatch.setattr(CSA2TrtllmAttention, "direct_decode_serves", lambda *args: False)
+    torch.manual_seed(1230)
+    layout = CSA2Layout((1, 1, 1), (0,), (0, 2), index_topk=4, window_size=4)
+    assert [layout.layer(i).mode for i in range(3)] == [
+        CSA2Mode.FULL,
+        CSA2Mode.REUSE,
+        CSA2Mode.REINDEX,
+    ]
+    count, heads = 19, 8
+    manager = CSA2CacheManager(
+        KvCacheConfig(max_gpu_total_bytes=64 << 20, host_cache_size=0, dtype="fp8"),
+        CacheType.SELFKONLY,
+        num_layers=3,
+        tokens_per_block=128,
+        max_seq_len=64,
+        max_batch_size=1,
+        max_num_tokens=count,
+        mapping=Mapping(),
+        vocab_size=8192,
+        layout=layout,
+    )
+    try:
+        request = manager._create_kv_cache(100, None, [])
+        assert manager._resume_and_restore(100, request)
+        assert request.resize(count)
+        runtime = CSA2TrtllmMetadata(
+            max_num_requests=1, max_num_tokens=count, kv_cache_manager=manager
+        )
+        positions = torch.arange(count, device="cuda")
+        q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+        swa = torch.randn(count, 512, device="cuda", dtype=torch.bfloat16)
+        main = torch.randn(6, 512, device="cuda", dtype=torch.bfloat16)
+        index_k = torch.randn(6, 128, device="cuda", dtype=torch.bfloat16)
+        index_q = torch.randn(count, 2, 128, device="cuda", dtype=torch.bfloat16)
+        weights = torch.ones(count, 2, device="cuda", dtype=torch.bfloat16)
+        sink = torch.randn(heads, device="cuda")
+        global_base = manager.get_cache_indices(100, 0, CSA2CacheRole.GLOBAL)[0] * 128
+        runtime.csa2_token_requests = torch.zeros(count, dtype=torch.int64, device="cuda")
+        runtime.csa2_request_query_ranges = ((0, count),)
+        runtime.csa2_request_start_positions = (0,)
+        runtime.csa2_num_context_requests = 1
+        runtime.csa2_indexer_groups = {
+            0: (
+                CSA2IndexerGroup(
+                    is_prefill=True,
+                    first=0,
+                    last=count,
+                    lo=0,
+                    hi=count,
+                    sizes=None,
+                    width=6,
+                    keys=6,
+                    descriptors=torch.tensor([[0, 6, 0, 0, 0]], dtype=torch.int32, device="cuda"),
+                ),
+            )
+        }
+        runtime.csa2_global_page_tables = {
+            0: torch.tensor([[global_base // 128]], dtype=torch.int32, device="cuda")
+        }
+        runtime.csa2_global_page_sizes = {0: 128}
+        runtime.csa2_global_max_positions = {0: 6}
+        runtime.csa2_main_write_slots = {0: global_base + torch.arange(6, device="cuda")}
+        runtime.csa2_kv_sources = {0: 0, 1: 0, 2: 0}
+        runtime.csa2_swa_indices = {}
+        runtime.csa2_swa_write_slots = {}
+        runtime.csa2_visible_lengths = {}
+        for layer in range(3):
+            swa_base = manager.get_cache_indices(100, layer, CSA2CacheRole.SWA)[0] * 128
+            local = positions[:, None] - torch.arange(4, device="cuda")[None, :]
+            runtime.csa2_swa_indices[layer] = torch.where(local >= 0, local + swa_base, -1)
+            runtime.csa2_swa_write_slots[layer] = positions + swa_base
+            runtime.csa2_visible_lengths[layer] = positions.remainder(6) + 1
+        backends = [_backend(heads, layer, layout, kv_cache_dtype="fp8") for layer in range(3)]
+        assert all(backend.native_fp8 for backend in backends)
+
+        main_scans = []
+        original_launch = kernel._launch
+
+        def launch(key, *values):
+            if key[0] == "stage_scales" and key[2]:
+                main_scans.append(key)
+            return original_launch(key, *values)
+
+        original_scratch = CSA2TrtllmMetadata._stage_scratch
+
+        def unshared(self, source, group, count, field="serial"):
+            entry, compact = original_scratch(self, source, group, count, field)
+            return entry, compact or field == "scale_serial"
+
+        monkeypatch.setattr(kernel, "_launch", launch)
+
+        def run(main_scale, owner_swa_scale, share):
+            main_scans.clear()
+            runtime.reset_routing()
+            scales, outputs = [], []
+            scope = (
+                nullcontext()
+                if share
+                else patch.object(CSA2TrtllmMetadata, "_stage_scratch", unshared)
+            )
+            with scope:
+                for layer, backend in enumerate(backends):
+                    rows = {}
+                    if layer != 1:
+                        rows.update(index_q=index_q * (-1 if layer else 1), index_weights=weights)
+                    if layer == 0:
+                        rows.update(main_kv=main * main_scale, index_k=index_k)
+                    layer_swa = swa * owner_swa_scale if layer == 0 else swa
+                    state = CSA2ForwardState(metadata=runtime, swa_kv=layer_swa, **rows)
+                    for start in range(0, count, 16):
+                        tile = q[start : start + 16]
+                        frame = runtime.get_query_tile_metadata(
+                            tile, layout.index_topk, staging_dtype=backend.staging_dtype
+                        )
+                        args = AttentionForwardArgs(
+                            attention_input_type=AttentionInputType.generation_only,
+                            attention_sinks=sink,
+                            sparse_backend_args=CSA2BackendForwardArgs(
+                                state=state, query_start=start
+                            ),
+                        )
+                        output = backend.forward(
+                            tile.flatten(1), None, None, frame, forward_args=args
+                        )
+                        outputs.append(output.clone())
+                        scales.append(frame.stage_kv_scales[1].item())
+            return scales, outputs, len(main_scans)
+
+        # Rows past the E4M3 range set the exponent: 900 saturates the MAIN group
+        # scales at 6 * 448, three binades that Q's headroom still affords, and the
+        # owner's SWA rows at 2000 need at least as many. Unscaled rows keep the unit
+        # scale, so a Reuse layer that kept the owner's SWA bits would not.
+        for main_scale, owner_swa_scale in ((900.0, 1.0), (1.0, 2000.0), (1.0, 1.0)):
+            shared_scales, shared_outputs, shared_scans = run(
+                main_scale, owner_swa_scale, share=True
+            )
+            alone_scales, alone_outputs, alone_scans = run(main_scale, owner_swa_scale, share=False)
+            # Owner and Reindex layers scan both tiles; the Reuse layer scans none.
+            assert (shared_scans, alone_scans) == (4, 6)
+            assert shared_scales == alone_scales
+            owner, reuse = shared_scales[:2], shared_scales[2:4]
+            if main_scale > 1.0:
+                assert owner == reuse == [8.0, 8.0]
+            elif owner_swa_scale > 1.0:
+                assert min(owner) > 1.0 and reuse == [1.0, 1.0]
+            else:
+                assert owner == reuse == [1.0, 1.0]
+            for shared, alone in zip(shared_outputs, alone_outputs):
+                torch.testing.assert_close(shared, alone, atol=0, rtol=0)
+    finally:
+        for request_id in list(manager.kv_cache_map):
+            manager.free_resources(SimpleNamespace(py_request_id=request_id))
+        manager.shutdown()
+
+
+def _fused_context_call(lengths, full, seed):
+    """One eager FP8 context phase over the shared bank (Full: SWA window + top-512 of ratio-2 rows)."""
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import (
+        CSA2SharedKVPlan,
+        CSA2TrtllmMetadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
+
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    heads, dim, window, topk = 64, 512, 128, 512
+    page, ratio = 128, 2
+    requests, count = len(lengths), sum(lengths)
+    swa_pages = [math.ceil(length / page) for length in lengths]
+    order = torch.randperm(sum(swa_pages) + 4, device="cuda", generator=g).int()
+    swa_table = torch.full((requests, max(swa_pages)), -1, device="cuda", dtype=torch.int32)
+    used = 0
+    for r, n in enumerate(swa_pages):
+        swa_table[r, :n] = order[used : used + n]
+        used += n
+    swa_pool = pack_rows(
+        torch.randn(order.numel() * page, dim, device="cuda", generator=g).bfloat16(), "swa"
+    )
+    request = torch.cat(
+        [torch.full((n,), r, device="cuda", dtype=torch.int64) for r, n in enumerate(lengths)]
+    )
+    position = torch.cat([torch.arange(n, device="cuda") for n in lengths])
+    logical_swa = position[:, None] - (window - 1) + torch.arange(window, device="cuda")[None, :]
+    swa_page = swa_table[request[:, None], logical_swa.clamp_min(0) // page].long()
+    swa_slots = torch.where(
+        (logical_swa >= 0) & (swa_page >= 0), swa_page * page + logical_swa % page, -1
+    )
+    swa_counts = [n + window - 1 for n in lengths]
+    swa_offsets = [1]
+    for n in swa_counts:
+        swa_offsets.append(swa_offsets[-1] + n)
+    total = swa_offsets[-1]
+    main_offsets = [total] * (requests + 1)
+    main_rows, main_table, main_pool, logical, mapping = 0, None, None, None, None
+    if full:
+        main_counts = [n // ratio for n in lengths]
+        main_offsets = [total]
+        for n in main_counts:
+            main_offsets.append(main_offsets[-1] + n)
+        main_rows = sum(main_counts)
+        main_page = page // ratio
+        pages = [max(1, math.ceil(n / main_page)) for n in main_counts]
+        morder = torch.randperm(sum(pages) + 4, device="cuda", generator=g).int()
+        main_table = torch.full((requests, max(pages)), -1, device="cuda", dtype=torch.int32)
+        used = 0
+        for r, n in enumerate(pages):
+            main_table[r, :n] = morder[used : used + n]
+            used += n
+        main_pool = pack_rows(
+            torch.randn(morder.numel() * main_page, dim, device="cuda", generator=g).bfloat16(),
+            "main",
+        )
+        visible = (position + 1) // ratio
+        scores = torch.rand(count, max(main_counts + [1]), device="cuda", generator=g)
+        column = torch.arange(scores.shape[1], device="cuda")[None, :]
+        scores = scores.masked_fill(column >= visible[:, None], -1.0)
+        top = scores.topk(min(topk, scores.shape[1]), dim=1)
+        logical = torch.where(top.values >= 0, top.indices, 1 << 30).sort(dim=1).values
+        logical = torch.where(logical >= 1 << 30, -1, logical)
+        logical = torch.nn.functional.pad(logical, (0, topk - logical.shape[1]), value=-1)
+        logical = logical.int().contiguous()
+        mapping = (main_table, main_page, 8192, request, visible)
+    plan = CSA2SharedKVPlan(
+        query_requests=request,
+        query_positions=position.int(),
+        swa_starts=torch.zeros(requests, device="cuda", dtype=torch.int64),
+        swa_offsets=torch.tensor(swa_offsets, device="cuda", dtype=torch.int64),
+        main_offsets=torch.tensor(main_offsets, device="cuda", dtype=torch.int64),
+        swa_pages=swa_table,
+        main_pages=main_table,
+        swa_page_size=page,
+        main_page_size=page // ratio,
+        num_requests=requests,
+        swa_rows=sum(swa_counts),
+        main_rows=main_rows,
+        swa_first=torch.tensor([0, *itertools.accumulate(lengths)][:-1], device="cuda"),
+        swa_floors=torch.zeros(requests, device="cuda", dtype=torch.int64),
+        window=window,
+    )
+    q = (torch.randn(count, heads, dim, device="cuda", generator=g) * 0.5).bfloat16()
+    metadata = CSA2TrtllmMetadata.for_query_tile(
+        q,
+        topk if full else 0,
+        staging_dtype=torch.float8_e4m3fn,
+        context_lengths=list(lengths),
+        shared_rows=1 + sum(swa_counts) + main_rows,
+    )
+    metadata.shared_plan = plan
+    sink = torch.randn(heads, device="cuda", generator=g)
+    inputs = CSA2BackendForwardArgs(
+        swa_pool=swa_pool,
+        swa_indices=swa_slots,
+        main_pool=main_pool,
+        topk_indices=logical,
+        main_logical_indices=logical,
+        main_mapping=mapping,
+    )
+
+    def call(attn):
+        out = torch.empty(count, heads * dim, device="cuda", dtype=torch.bfloat16)
+        args = AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            attention_sinks=sink,
+            output=out,
+            sparse_backend_args=inputs,
+        )
+        attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
+        return out.view(count, heads, dim)
+
+    return call, metadata, q, sink
+
+
+@skip_no_fused_context
+@pytest.mark.parametrize(
+    "lengths,full",
+    [
+        ([300, 1, 129, 1500], True),
+        ([2048], True),
+        ([5, 127, 640, 1], False),
+        ([1024, 1024], False),
+    ],
+)
+@torch.inference_mode()
+def test_fused_context_matches_trtllm_gen(monkeypatch, lengths, full):
+    """Shared-bank FP8 context tiles run the fused kernel on exactly the staged operands."""
+    reference_attn = _backend(64, kv_cache_dtype="fp8_ds_mla")
+    reference_attn.fused_context = False
+    fused_attn = _backend(64, kv_cache_dtype="fp8_ds_mla")
+    assert fused_attn.fused_context
+    call, metadata, q, sink = _fused_context_call(lengths, full, seed=sum(lengths))
+    op = torch.ops.trtllm.csa2_sparse_context
+    calls = []
+
+    def record(*args):
+        calls.append(args[1].shape[0])
+        return op(*args)
+
+    monkeypatch.setattr(torch.ops.trtllm, "csa2_sparse_context", record)
+    production = call(reference_attn)
+    assert not calls
+    count = q.shape[0]
+    staged = (
+        metadata.shared_pool.clone(),
+        q,
+        metadata.stage_kv_scales[0].clone(),
+        metadata.prepared_indices[:count].clone(),
+        metadata.prepared_lens[:count].clone(),
+        metadata.mla_bmm1_scale.clone(),
+        metadata.mla_bmm2_scale.clone(),
+        sink,
+    )
+    fused = call(fused_attn)
+    assert calls == [count]
+    # The kernel reads exactly the staged operands, with Q quantized as the context quantizer does.
+    direct = torch.empty_like(fused)
+    op(*staged, direct)
+    torch.cuda.synchronize()
+    error = (fused.float() - production.float()).norm() / production.float().norm()
+    assert error <= 2e-4
+    assert torch.equal(fused.view(torch.int16), direct.view(torch.int16))

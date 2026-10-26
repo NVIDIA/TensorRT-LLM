@@ -37,7 +37,12 @@ from cutlass.utils.hardware_info import HardwareInfo
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
-from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel, st_release_gpu
+from .single_pass_multi_cta_radix_topk import (
+    _TIE_COUNT,
+    _TIE_LIST_COUNT,
+    SinglePassMultiCTARadixTopKKernel,
+    st_release_gpu,
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -284,6 +289,9 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
         output_indices_row,
         output_values_row,
         tidx,
+        remaining_k,
+        cta_in_group,
+        tie_list,
     ):
         """Collect elements into output: first > pivot, then == pivot.
 
@@ -296,6 +304,10 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
         A cluster barrier separates the two passes to ensure all > pivot
         elements from all CTAs are counted before == pivot elements start
         filling the remaining slots.
+
+        Each CTA reads the tie counts of the CTAs before it
+        (``local_histogram[_TIE_COUNT]``, over DSMEM) and admits its ties
+        lowest column first after theirs (``remaining_k`` in all).
         """
         # Reuse local_histogram for counters (FlashInfer convention):
         #   [0] = local_offset_gt  (local position within CTA allocation)
@@ -305,36 +317,51 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
             local_histogram[1] = cutlass.Int32(0)  # global_base_gt
             if local_gt_count > 0:
                 local_histogram[1] = atomicAdd(output_counter_ptr, local_gt_count)
+            local_histogram[_TIE_LIST_COUNT] = cutlass.Int32(0)
         cute.arch.barrier()
 
-        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
-        self._collect_pass_gt(
+        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot); the same pass
+        # lists the ties.
+        self._collect_gt_and_list_ties(
             shared_ordered,
             chunk_start,
             prologue_elems,
             aligned_size,
             left_size,
             ordered_pivot,
+            local_histogram.iterator,
+            local_histogram[1],
             local_histogram,
+            tie_list,
             output_indices_row,
             output_values_row,
             tidx,
         )
 
-        # Cluster barrier between pass 1 and pass 2
-        cute.arch.cluster_arrive_relaxed()
+        # Cluster barrier between pass 1 and pass 2 (a release arrive: the peers read our tie
+        # count after it)
+        cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
 
         # Pass 2: equal to pivot
-        self._collect_pass_eq(
+        lane = tidx % 32
+        before = cutlass.Int32(0)
+        if lane < cta_in_group:
+            before = ld_shared_cluster_i32(
+                mapa_shared_cluster(local_histogram.iterator + _TIE_COUNT, lane)
+            )
+        self._admit_listed_ties(
             shared_ordered,
             chunk_start,
             prologue_elems,
             aligned_size,
-            left_size,
+            actual_chunk_size,
             ordered_pivot,
             top_k,
-            output_counter_ptr,
+            remaining_k,
+            cute.arch.warp_reduction_sum(before),
+            local_histogram,
+            tie_list,
             output_indices_row,
             output_values_row,
             tidx,
@@ -537,6 +564,9 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
                         output_indices_row,
                         output_values_row,
                         tidx,
+                        remaining_k,
+                        cta_in_group,
+                        prefix_buf,
                     )
 
                     # Final cluster barrier: ensure all CTAs finish before

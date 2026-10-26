@@ -324,8 +324,8 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
             auto& block = mBlocks[ord];
             for (BeamIndex bi{0}; bi < block.pages.size(); ++bi)
             {
-                bool isScratch = scratchRange.contains(ord);
-                TLLM_CHECK_DEBUG(isScratch == blockPageIsNull(block.pages[bi][lcId]));
+                bool const isScratch = blockPageIsNull(block.pages[bi][lcId]);
+                TLLM_CHECK_DEBUG(!isScratch || scratchRange.contains(ord));
                 if (!isScratch)
                     result.push_back({ord, bi, lcId});
             }
@@ -1042,7 +1042,15 @@ void KvCache::close()
     // Python always enters _record_event() here; _cuda_stream is valid for both ACTIVE and SUSPENDED.
     {
         auto scope = recordEventScope();
-        _clearBlocks();
+        // Every block goes, so its page indices are invalidated in one pass afterwards rather than
+        // per released lock. Debug mode keeps the per-lock path and its checks.
+        BlockOrdinal const numBlocks = mBlocks.size();
+        bool const bulkPageIndexRelease = !gDebug;
+        _clearBlocks(bulkPageIndexRelease);
+        if (bulkPageIndexRelease)
+        {
+            _invalidateBasePageIndices(numBlocks);
+        }
     }
     if (mPageStorageBatch != nullptr)
     {
@@ -1264,11 +1272,30 @@ bool KvCache::_hasReuseSource(BlockPage const& page)
 // _clearBlocks
 // ---------------------------------------------------------------------------
 
-void KvCache::_clearBlocks()
+void KvCache::_clearBlocks(bool keepPageIndices)
 {
     // Drop last block first (mirrors Python: while self._blocks: self._blocks.pop()).
     while (!mBlocks.empty())
+    {
+        if (keepPageIndices)
+        {
+            // The block's own destruction order (tree block, then pages), minus the index updates.
+            auto& block = mBlocks.back();
+            block.treeBlock.reset();
+            for (auto& beamPages : block.pages)
+            {
+                for (auto& bp : beamPages)
+                {
+                    if (auto* lock = std::get_if<SharedPageLock>(&bp))
+                    {
+                        KVCM2_POISON_ON_EXCEPT([lock]() { lock->unlock(/*keepPageIndex=*/true); });
+                    }
+                    bp = std::monostate{};
+                }
+            }
+        }
         mBlocks.pop_back();
+    }
     _freeScratchSlots();
     // Clear SSM blocks.
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
@@ -1531,6 +1558,43 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
     // Scratch reuse: enforce constraint.
     bool enableScratch = mEnableSwaScratchReuse;
+    if (enableScratch && newCap < mCapacity && newHist == mHistoryLength)
+    {
+        // No input tokens become history, so the rewind bound does not apply.
+        // Every retained input block must already have a normal page.
+        BlockOrdinal const newNumBlocks{divUp(newCap, mTokensPerBlock)};
+        auto const& lcs = mManager->lifeCycles();
+        for (auto const& [lcId, lc] : lcs)
+        {
+            if (std::holds_alternative<SsmLifeCycle>(lc))
+                continue;
+            if (_getScratchRange(lc, newHist, newCap))
+            {
+                throw std::invalid_argument("Cannot shrink SWA scratch capacity while scratch blocks would remain");
+            }
+            for (BlockOrdinal ord{divUp(newHist, mTokensPerBlock)}; ord < newNumBlocks; ++ord)
+            {
+                for (auto const& beamBlock : mBlocks[ord].pages)
+                {
+                    if (blockPageIsNull(beamBlock[lcId]))
+                    {
+                        throw std::invalid_argument(
+                            "Cannot shrink SWA scratch capacity: a retained live block has no normal page");
+                    }
+                }
+            }
+        }
+        _subtractPendingAllocationRange(newNumBlocks, mBlocks.size());
+        {
+            auto scope = recordEventScope();
+            _freeScratchSlots();
+            _decreaseCapacity(newNumBlocks);
+        }
+        mCapacity = newCap;
+        _refreshGenerationAllocReady();
+        TLLM_CHECK_DEBUG(_checkSanity());
+        return true;
+    }
     if (enableScratch && newCap != mCapacity)
     {
         int const maxRewindLen = _swaScratchMaxRewindLen();
@@ -1784,6 +1848,15 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
         // Create SeqBlocks for new ordinals (pop slots from end, matching Python).
         _resizePageIndexBuffers(newNumBlocks);
+        size_t numNewPages = 0;
+        for (auto const& lcSlots : slots)
+            numNewPages += lcSlots.size();
+        PageSlab slab(numNewPages);
+        // Geometric, so decode growth one block at a time does not move every block each time.
+        if (toSizeT(newNumBlocks) > mBlocks.capacity())
+        {
+            mBlocks.reserve(BlockOrdinal{std::max(newNumBlocks.value(), 2 * oldNumBlocks.value())});
+        }
         for (BlockOrdinal ord = oldNumBlocks; ord < newNumBlocks; ++ord)
         {
             SeqBlock sb;
@@ -1809,9 +1882,9 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     }
                     auto slot = std::move(slots[lc].back());
                     slots[lc].pop_back();
-                    auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, bi);
+                    auto page = slab.makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, bi);
                     page->setSlot(slot);
-                    sb.pages[bi][lc] = page->lock(*this, bi, ord, lc, /*skipWait=*/true);
+                    sb.pages[bi][lc] = page->lock(*this, bi, ord, lc, /*skipWait=*/true, &slab);
                 }
             }
             mBlocks.push_back(std::move(sb));
@@ -3079,12 +3152,7 @@ bool KvCache::_checkSanity() const
                     continue;
                 }
 
-                if (scratchRange.contains(ordinal))
-                {
-                    // Scratch blocks have no per-block pages.
-                    TLLM_CHECK_DEBUG(blockPageIsNull(bp));
-                }
-                else if (staleRange.beg <= ordinal && ordinal < staleRange.end)
+                if (staleRange.beg <= ordinal && ordinal < staleRange.end)
                 {
                     if (isPrivateLifeCycle(lcs[lc]) || isCommitted || mCommitState != CommitState::ALLOWED)
                     {
@@ -3104,8 +3172,14 @@ bool KvCache::_checkSanity() const
                             || (blockPageIsNull(bp) && (mCommittedTokens.empty() || mManager->commitMinSnapshot())));
                     }
                 }
+                else if (blockPageIsNull(bp))
+                {
+                    TLLM_CHECK_DEBUG(scratchRange.contains(ordinal));
+                }
                 else
                 {
+                    // A prior speculative reservation can retain a normal page
+                    // inside the current chunk's scratch range.
                     // The page must be present, and locked exactly when the cache is
                     // active; a suspended cache holds it instead.
                     TLLM_CHECK_DEBUG(!std::holds_alternative<std::monostate>(bp)
@@ -3420,6 +3494,24 @@ std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex 
         }
     }
     return result;
+}
+
+void KvCache::_invalidateBasePageIndices(BlockOrdinal numBlocks)
+{
+    for (auto& beamIndices : mBasePageIndices)
+    {
+        for (auto& buf : beamIndices)
+        {
+            std::visit(
+                [numBlocks](auto& b)
+                {
+                    auto const n = std::min(static_cast<size_t>(b.size()), toSizeT(numBlocks));
+                    std::fill(b.data(), b.data() + n, kBadPageIndex.value());
+                },
+                buf);
+        }
+    }
+    onPageStorageChanged();
 }
 
 void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len)

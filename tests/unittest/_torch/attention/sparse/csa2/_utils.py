@@ -19,7 +19,6 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     INDEX_PAGE_ROWS,
     gather_rows,
     pack_index_queries_split,
-    read_index_rows,
     row_bytes,
     store_index_rows,
     store_rows,
@@ -31,13 +30,6 @@ def _index_pages(rows: int, device="cpu") -> torch.Tensor:
     pages = (max(rows, 1) + INDEX_PAGE_ROWS - 1) // INDEX_PAGE_ROWS
     return torch.zeros(pages * INDEX_PAGE_BYTES, dtype=torch.uint8, device=device).view(
         pages, INDEX_PAGE_ROWS, 1, INDEX_PAGE_BYTES // INDEX_PAGE_ROWS
-    )
-
-
-def _split_index_rows(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        rows[..., :64].contiguous().view(torch.int8),
-        rows[..., 64:].contiguous().view(torch.int32),
     )
 
 
@@ -59,9 +51,6 @@ def _test_pools(swa, main, index):
         get_swa_buffer=lambda layer: swa[layer],
         get_main_buffer=lambda owner: main[owner],
         get_index_pages=lambda owner: index[owner],
-        gather_indexer_keys=lambda owner, slots: _split_index_rows(
-            read_index_rows(index[owner], slots.clamp_min(0))
-        ),
         write_swa=lambda layer, slots, values, transform=None: store_rows(
             swa[layer], slots, values, "swa", transform
         ),
@@ -75,6 +64,11 @@ def _attention_reference(q, kv, valid, sink):
     scores.masked_fill_(~valid[:, None, :], -torch.inf)
     scores = torch.cat((scores, sink[None, :, None].expand(q.shape[0], -1, -1)), -1)
     return torch.einsum("qhk,qkd->qhd", scores.softmax(-1)[..., :-1], kv.float()).to(q.dtype)
+
+
+def _plan_indexer(metadata):
+    """Build the indexer plans prepare uploads, for metadata assembled field by field."""
+    metadata._prepare_indexer_plans(lambda key, value: torch.from_numpy(value).to("cuda"))
 
 
 def _page_metadata(table, requests, page_size, max_positions):
@@ -103,6 +97,7 @@ def _model_metadata(
     main_writes,
 ):
     meta = _page_metadata(table, requests, page_size, max_positions)
+    manager.layout = layout
     meta.kv_cache_manager = manager
     meta.csa2_swa_indices = {i: swa_reads for i in range(len(layout.compress_ratios))}
     meta.csa2_swa_write_slots = {i: swa_writes for i in range(len(layout.compress_ratios))}
@@ -145,15 +140,12 @@ def _run_indexer(layout, layer_idx, state):
         if layer.index_source not in meta.csa2_indices:
             raise ValueError("CSA2 index source did not run")
         return meta.csa2_indices[layer.index_source]
+    if not torch.cuda.is_current_stream_capturing():
+        _plan_indexer(meta)
     if layer_idx not in manager.indexers:
         manager.indexers[layer_idx] = CSA2Indexer(
             layout, layer_idx, state.index_q.shape[1], state.index_q.shape[-1]
         )
-    if not state.index_q.is_cuda:
-        from tensorrt_llm._torch.modules.top_k import TopKImplementation
-
-        manager.indexers[layer_idx].top_k.prefill_implementation = TopKImplementation.TORCH
-        manager.indexers[layer_idx].top_k.decode_implementation = TopKImplementation.TORCH
     return manager.indexers[layer_idx](state, 0, state.swa_kv.shape[0])
 
 
@@ -180,43 +172,44 @@ def _prediction_reference(layout, layer, q, swa, sink, meta, **kwargs):
 
 def _selection_state(queries, keys, visible, topk=3):
     width = keys.shape[0]
+    device = "cuda"
     layout = CSA2Layout(
         (1, 1),
         (0,),
         (0, 1),
         0,
         candidate_topk_blocks=1,
-        candidate_block_size=2,
+        candidate_block_size=8,
         index_topk=topk,
         window_size=1,
     )
     manager = _test_pools(
         {
-            i: torch.zeros(max(queries, 1), row_bytes(128, "swa"), dtype=torch.uint8)
+            i: torch.zeros(max(queries, 1), row_bytes(128, "swa"), dtype=torch.uint8, device=device)
             for i in range(2)
         },
-        {0: torch.zeros(max(width, 1), row_bytes(128, "main"), dtype=torch.uint8)},
-        {0: _index_pages(width)},
+        {0: torch.zeros(max(width, 1), row_bytes(128, "main"), dtype=torch.uint8, device=device)},
+        {0: _index_pages(width, device)},
     )
     meta = _model_metadata(
         layout,
         manager,
-        torch.arange(queries)[:, None],
-        torch.arange(queries),
-        torch.arange(width)[None, :],
-        torch.zeros(queries, dtype=torch.int64),
+        torch.arange(queries, device=device)[:, None],
+        torch.arange(queries, device=device),
+        torch.arange(width, device=device)[None, :],
+        torch.zeros(queries, dtype=torch.int64, device=device),
         1,
         width,
-        visible,
-        torch.arange(width),
+        visible.to(device),
+        torch.arange(width, device=device),
     )
     state = CSA2ForwardState(
         metadata=meta,
-        swa_kv=torch.zeros(queries, 128, dtype=torch.bfloat16),
-        index_q=torch.ones(queries, 1, 128, dtype=torch.bfloat16),
-        index_weights=torch.ones(queries, 1),
-        main_kv=torch.zeros(width, 128, dtype=torch.bfloat16),
-        index_k=keys,
+        swa_kv=torch.zeros(queries, 128, dtype=torch.bfloat16, device=device),
+        index_q=torch.ones(queries, 32, 128, dtype=torch.bfloat16, device=device),
+        index_weights=torch.full((queries, 32), 1 / 32, device=device),
+        main_kv=torch.zeros(width, 128, dtype=torch.bfloat16, device=device),
+        index_k=keys.to(device),
     )
     return layout, state
 
@@ -228,7 +221,7 @@ def _run_modes(device, graph_replay=False):
         (0, 2),
         0,
         candidate_topk_blocks=2,
-        candidate_block_size=1,
+        candidate_block_size=8,
         index_topk=1,
         window_size=1,
     )
@@ -259,12 +252,14 @@ def _run_modes(device, graph_replay=False):
         (torch.full((dim,), 3.0, device=device), torch.full((dim,), 6.0, device=device))
     ).bfloat16()
     key = torch.stack((torch.ones(dim, device=device), -torch.ones(dim, device=device))).bfloat16()
-    iq = torch.ones(1, 1, dim, dtype=torch.bfloat16, device=device)
-    weights = torch.ones(1, 1, dtype=torch.bfloat16, device=device)
+    iq = torch.ones(1, 32, dim, dtype=torch.bfloat16, device=device)
+    weights = torch.full((1, 32), 1 / 32, dtype=torch.bfloat16, device=device)
     sink = torch.zeros(1, device=device)
 
-    def run():
+    def run(captured=False):
         meta = copy(base)
+        # As in model graph warmup, warm and capture calls mark the graph.
+        meta.is_cuda_graph = captured
         meta.reset_routing()
         outputs = []
         for i in range(3):
@@ -277,11 +272,15 @@ def _run_modes(device, graph_replay=False):
     if not graph_replay:
         outputs, routing = run()
         return outputs, routing, cache, base
+    # Captured layers read the plans prepare uploaded before capture.
+    base.is_cuda_graph = True
+    _plan_indexer(base)
+    base.is_cuda_graph = False
     for _ in range(3):
-        run()
+        run(captured=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        outputs, routing = run()
+        outputs, routing = run(captured=True)
     for sign, visible, reverse in (
         (1.0, 2, False),
         (-1.0, 2, True),

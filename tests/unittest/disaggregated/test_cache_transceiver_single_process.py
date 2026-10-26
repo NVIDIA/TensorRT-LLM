@@ -188,6 +188,7 @@ class KvCacheConfigV2:
     sink_token_length: Optional[int] = None
     free_gpu_memory_fraction: Optional[float] = None
     host_cache_size: Optional[int] = None
+    host_cache_bind_to_gpu_numa_node: bool = False
     disk_cache_size: Optional[int] = None
     disk_cache_path: Optional[str] = None
     onboard_blocks: bool = True
@@ -2069,11 +2070,13 @@ def _offload_cycle_manager(
     )
 
 
-def _offload_request_pair(index: int, tokens: List[int], ctx_info_endpoint):
+def _offload_request_pair(
+    index: int, tokens: List[int], ctx_info_endpoint, gen_tracks_unique_tokens: bool = True
+):
     """Context/generation request pair for one prompt (ids ``2*index`` and ``2*index + 1``)."""
     disagg_request_id = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
 
-    def make(request_id, request_type):
+    def make(request_id, request_type, track_unique_tokens=True):
         return LlmRequest(
             request_id=request_id,
             max_new_tokens=1,
@@ -2083,11 +2086,16 @@ def _offload_request_pair(index: int, tokens: List[int], ctx_info_endpoint):
             ),
             is_streaming=False,
             llm_request_type=request_type,
+            track_unique_tokens=track_unique_tokens,
         )
 
     ctx = make(2 * index, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
     ctx.py_disaggregated_params = DisaggregatedParams(disagg_request_id=disagg_request_id)
-    gen = make(2 * index + 1, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY)
+    gen = make(
+        2 * index + 1,
+        LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        track_unique_tokens=gen_tracks_unique_tokens,
+    )
     gen.py_disaggregated_params = DisaggregatedParams(
         ctx_request_id=ctx.py_request_id,
         ctx_dp_rank=0,
@@ -2303,7 +2311,7 @@ def test_cache_transceiver_v1_sends_primary_slots_under_host_offload():
 
 
 def _offload_lifecycle_executor(
-    manager: KVCacheManager, transceiver: KvCacheTransceiverV2
+    manager: KVCacheManager | KVCacheManagerV2, transceiver: KvCacheTransceiverV2
 ) -> tuple[PyExecutor, list]:
     """Real resource/response lifecycle, without model loading or response transport.
 
@@ -2351,8 +2359,96 @@ def _offload_lifecycle_executor(
         registry=PyExecutorRequestRegistry(executor),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=True,
+        is_kv_manager_v2=isinstance(manager, KVCacheManagerV2),
     )
     return executor, responses
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_deferred_gen_receive(monkeypatch) -> None:
+    """A gen-init admission behind a step in flight does not block the host.
+
+    Real V2 managers, coordinator and Python/NIXL transfer: receive_gen_init(defer=True)
+    returns while a long kernel standing in for the forward step still runs ahead of the
+    admission work; start_deferred_gen_receives waits for it, posts the receive, and the
+    received KV equals the context KV. The generation request is built as a reuse-off
+    generation engine builds it, without unique tokens, and decodes after the receive.
+    """
+    for name in (
+        "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY",
+        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP",
+        "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    config = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+    )
+    prompt_len = 3 * TOKENS_PER_BLOCK + 5
+    gen_stream = torch.cuda.Stream()
+
+    with ExitStack() as cleanup:
+        ctx_mgr = _create_cache_manager(mapping, is_mla=False, use_v2=True)
+        cleanup.callback(ctx_mgr.shutdown)
+        with torch.cuda.stream(gen_stream):
+            gen_mgr = _create_cache_manager(mapping, is_mla=False, use_v2=True)
+        cleanup.callback(gen_mgr.shutdown)
+        _init_pool_data_v2([ctx_mgr], 1, is_mla=False, fill_random=True)
+        _init_pool_data_v2([gen_mgr], 1, is_mla=False, fill_random=False)
+        torch.cuda.synchronize()
+        (ctx_tc,) = create_instance_transceivers(1, 1, False, [ctx_mgr], config, False)
+        cleanup.callback(ctx_tc.shutdown)
+        (gen_tc,) = create_instance_transceivers(1, 1, False, [gen_mgr], config, False)
+        cleanup.callback(gen_tc.shutdown)
+        cleanup.callback(torch.cuda.synchronize)
+        gen, _ = _offload_lifecycle_executor(gen_mgr, gen_tc)
+        assert not gen_tc.reads_unique_tokens and not gen_mgr.enable_block_reuse
+        ctx_req, gen_req = _offload_request_pair(
+            0, list(range(prompt_len)), ctx_tc._context_info_endpoint, False
+        )
+        assert ctx_req.tracks_unique_tokens() and not gen_req.tracks_unique_tokens()
+        with pytest.raises(RuntimeError, match="without unique tokens"):
+            gen_req.get_unique_tokens(0)
+        _add_sequence(ctx_mgr, ctx_req.py_request_id, prompt_len, use_v2=True)
+        ctx_tc.respond_and_send_async(ctx_req)
+
+        gen.active_requests.append(gen_req)
+        with torch.cuda.stream(gen_stream):
+            torch.cuda._sleep(1_000_000_000)
+            step_done = torch.cuda.Event()
+            step_done.record()
+            # The scheduler's admission queues its page work behind the step.
+            assert gen_mgr.prepare_disagg_gen_init(gen_req)
+            gen.disagg.receive_gen_init([gen_req], defer=True)
+        assert not step_done.query()
+        assert gen_req.state == LlmRequestState.DISAGG_GENERATION_INIT
+
+        gen.disagg.start_deferred_gen_receives()
+        assert step_done.query()
+        assert gen_req.state != LlmRequestState.DISAGG_GENERATION_INIT
+
+        ctx_tc.check_context_transfer_status(None, mark_complete=True)
+        gen_tc.check_gen_transfer_status(None)
+        assert gen_req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        assert gen.disagg.try_finish_gen_receive(gen_req)
+        for token in range(7):
+            gen_req.add_new_token(1000 + token, 0)
+        assert gen_req.get_tokens(0) == list(range(prompt_len)) + list(range(1000, 1007))
+        verify_all_requests(
+            request_lengths=[prompt_len],
+            ctx_managers=[ctx_mgr],
+            gen_managers=[gen_mgr],
+            ctx_tp=1,
+            ctx_pp=1,
+            gen_tp=1,
+            gen_pp=1,
+            ctx_enable_dp=False,
+            gen_enable_dp=False,
+            ctx_request_ids=[ctx_req.py_request_id],
+            gen_request_ids=[gen_req.py_request_id],
+            is_mla=False,
+            use_v2=True,
+        )
 
 
 @pytest.mark.timeout(180)

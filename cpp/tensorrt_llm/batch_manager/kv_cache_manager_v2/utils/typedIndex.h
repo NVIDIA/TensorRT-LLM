@@ -177,13 +177,13 @@ template <typename T, typename Tag, T DefaultValue>
     return static_cast<std::size_t>(index.value());
 }
 
-template <typename Index, typename T>
+template <typename Index, typename T, typename Container = std::vector<T>>
 class TypedVec
 {
 public:
     using IndexType = Index;
     using ValueType = T;
-    using ContainerType = std::vector<T>;
+    using ContainerType = Container;
     using iterator = typename ContainerType::iterator;
     using const_iterator = typename ContainerType::const_iterator;
 
@@ -232,6 +232,11 @@ public:
     [[nodiscard]] Index size() const noexcept
     {
         return Index{static_cast<typename Index::ValueType>(mData.size())};
+    }
+
+    [[nodiscard]] std::size_t capacity() const noexcept
+    {
+        return mData.capacity();
     }
 
     [[nodiscard]] std::size_t stdSize() const noexcept

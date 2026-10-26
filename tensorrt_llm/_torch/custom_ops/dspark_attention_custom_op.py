@@ -5,9 +5,8 @@
 
 The op runs the tcgen05 MMA kernel
 (:class:`DSparkAttention`) on the supported DSV4 DSpark
-geometry: 128 heads, head_dim 512, draft block 5 or 6, and a 128-row rolling
-window. Other shapes fall back to the pure-PyTorch reference path in
-``models/modeling_dspark.py``.
+geometry: 8, 16, 32, 64 or 128 heads, head_dim 512, a draft block of at most 8 tokens, and
+a 128-row rolling window. ``models/modeling_dspark.py`` rejects other shapes.
 """
 
 from collections.abc import Callable
@@ -28,11 +27,11 @@ from .dspark_rmsnorm_rope_custom_op import (
     cute_dsl_dspark_rmsnorm_rope_draft_block,
 )
 
-_DSV4_DSPARK_NUM_HEADS = 128
+_DSV4_DSPARK_NUM_HEADS = (8, 16, 32, 64, 128)
 _DSV4_DSPARK_HEAD_DIM = 512
 _DSV4_DSPARK_WINDOW_SIZE = 128
 _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
-_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
+_DSV4_DSPARK_BLOCK_SIZES = tuple(range(1, _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE + 1))
 _DSV4_DSPARK_ROPE_DIM = 64
 
 
@@ -53,7 +52,7 @@ def is_dsv4_dspark_attention_config_supported(
     """Return whether static model geometry matches the DSV4 specialization."""
     return (
         block_size in _DSV4_DSPARK_BLOCK_SIZES
-        and num_heads == _DSV4_DSPARK_NUM_HEADS
+        and num_heads in _DSV4_DSPARK_NUM_HEADS
         and head_dim == _DSV4_DSPARK_HEAD_DIM
         and window_size == _DSV4_DSPARK_WINDOW_SIZE
     )
@@ -68,7 +67,7 @@ def is_fused_dsv4_dspark_attention_supported(
 ) -> bool:
     """Return whether tensors can use the fused DSV4 DSpark attention kernel."""
     if _get_dspark_arch_str() is None:
-        return _log_unsupported(f"SM {get_sm_version()} is not SM100 or SM103", "sm_version")
+        return _log_unsupported(f"SM {get_sm_version()} is not SM100, SM103 or SM107", "sm_version")
     if not all(t.is_cuda for t in (q, kv_cache, valid_len, attn_sink, inverse_rope_freqs)):
         return _log_unsupported("all inputs must be CUDA tensors", "device")
     if q.dtype != torch.bfloat16:
@@ -91,11 +90,13 @@ def is_fused_dsv4_dspark_attention_supported(
         return _log_unsupported(
             f"expected q/kv_cache ranks 4/3, got {q.ndim}/{kv_cache.ndim}", "tensor_ranks"
         )
+    if q.shape[0] == 0:
+        return _log_unsupported("batch must be nonempty", "batch_size")
     if q.shape[1] not in _DSV4_DSPARK_BLOCK_SIZES:
-        return _log_unsupported(f"draft block size must be 5 or 6, got {q.shape[1]}", "block_size")
-    if q.shape[2:] != (_DSV4_DSPARK_NUM_HEADS, _DSV4_DSPARK_HEAD_DIM):
+        return _log_unsupported(f"draft block size must be 1 to 8, got {q.shape[1]}", "block_size")
+    if q.shape[2] not in _DSV4_DSPARK_NUM_HEADS or q.shape[3] != _DSV4_DSPARK_HEAD_DIM:
         return _log_unsupported(
-            "q must have 128 heads and head_dim 512; "
+            "q must have 8, 16, 32, 64 or 128 heads and head_dim 512; "
             f"got {q.shape[2]} heads and head_dim {q.shape[3]}",
             "q_shape",
         )
@@ -120,9 +121,9 @@ def is_fused_dsv4_dspark_attention_supported(
             f"valid_len shape must be {(q.shape[0],)}, got {tuple(valid_len.shape)}",
             "valid_len_shape",
         )
-    if attn_sink.shape != (_DSV4_DSPARK_NUM_HEADS,):
+    if attn_sink.shape != (q.shape[2],):
         return _log_unsupported(
-            f"attn_sink shape must be {(_DSV4_DSPARK_NUM_HEADS,)}, got {tuple(attn_sink.shape)}",
+            f"attn_sink shape must be {(q.shape[2],)}, got {tuple(attn_sink.shape)}",
             "attn_sink_shape",
         )
     expected_freqs_shape = (q.shape[0], q.shape[1], _DSV4_DSPARK_ROPE_DIM // 2, 2)
@@ -197,7 +198,7 @@ def _is_fused_dsv4_dspark_attention_input_supported(
     return True
 
 
-_dspark_attention_kernel_cache: dict[tuple[int, str], Callable[..., None]] = {}
+_dspark_attention_kernel_cache: dict[tuple[int, str, int], Callable[..., None]] = {}
 
 
 def _make_compile_gmem_pointer(dtype: Type[Numeric], assumed_align: int) -> Pointer:
@@ -213,9 +214,10 @@ def _make_compile_gmem_pointer(dtype: Type[Numeric], assumed_align: int) -> Poin
 def _compile_dspark_attention(
     block_size: int,
     arch_str: str,
+    num_heads: int,
 ) -> Callable[..., None]:
     """Compile the pointer host wrapper without runtime tensor specimens."""
-    num_heads, head_dim = _DSV4_DSPARK_NUM_HEADS, _DSV4_DSPARK_HEAD_DIM
+    head_dim = _DSV4_DSPARK_HEAD_DIM
     batch = cute.sym_int()
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16,
@@ -240,6 +242,7 @@ def _compile_dspark_attention(
         _DSV4_DSPARK_WINDOW_SIZE,
         0.0,
         seq_len_q=block_size,
+        num_heads=num_heads,
         mma_qk_tiler_k=128,
         inverse_rope_dim=_DSV4_DSPARK_ROPE_DIM,
         arch_str=arch_str,
@@ -286,15 +289,16 @@ def _run_dspark_attention(
     block_size = q.shape[1]
     arch_str = _get_dspark_arch_str()
     if arch_str is None:
-        raise RuntimeError("fused DSV4 DSpark attention requires SM100 or SM103")
-    cache_key = (block_size, arch_str)
+        raise RuntimeError("fused DSV4 DSpark attention requires SM100, SM103 or SM107")
+    num_heads = q.shape[2]
+    cache_key = (block_size, arch_str, num_heads)
     compiled = _dspark_attention_kernel_cache.get(cache_key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "fused DSV4 DSpark attention must be warmed up before CUDA graph capture"
             )
-        compiled = _compile_dspark_attention(block_size, arch_str)
+        compiled = _compile_dspark_attention(block_size, arch_str, num_heads)
         _dspark_attention_kernel_cache[cache_key] = compiled
 
     output = torch.empty_like(q)
@@ -346,8 +350,8 @@ def fused_dsv4_dspark_attention(
     ):
         raise ValueError(
             "fused_dsv4_dspark_attention requires contiguous supported DSV4 DSpark tensors "
-            "([B, 5|6, 128, 512] queries, [B, 8, 512] draft blocks, INT32 indices, "
-            "and a 128-row BF16 window) on SM100 or SM103"
+            "([B, 1-8, 8|16|32|64|128, 512] queries, [B, 8, 512] draft blocks, INT32 indices, "
+            "and a 128-row BF16 window) on SM100, SM103 or SM107"
         )
 
     return _run_dspark_attention(
@@ -380,9 +384,13 @@ def _(
     return torch.empty_like(q)
 
 
-def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float) -> None:
+def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float, num_heads: int) -> None:
     """Best-effort prewarm of the production DSV4 DSpark fused-op path."""
-    if _get_dspark_arch_str() is None or block_size not in _DSV4_DSPARK_BLOCK_SIZES:
+    if (
+        _get_dspark_arch_str() is None
+        or block_size not in _DSV4_DSPARK_BLOCK_SIZES
+        or num_heads not in _DSV4_DSPARK_NUM_HEADS
+    ):
         return
 
     batch = 1
@@ -390,7 +398,7 @@ def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float) -> None:
     try:
         with torch.inference_mode():
             q = torch.zeros(
-                (batch, block_size, _DSV4_DSPARK_NUM_HEADS, _DSV4_DSPARK_HEAD_DIM),
+                (batch, block_size, num_heads, _DSV4_DSPARK_HEAD_DIM),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -442,7 +450,7 @@ def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float) -> None:
                 slots_i32,
                 cache_seqs,
                 torch.zeros((batch,), dtype=torch.int64, device=device),
-                torch.zeros((_DSV4_DSPARK_NUM_HEADS,), dtype=torch.float32, device=device),
+                torch.zeros((num_heads,), dtype=torch.float32, device=device),
                 block_freqs.view(
                     batch,
                     block_size,

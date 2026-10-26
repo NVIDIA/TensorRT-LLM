@@ -22,6 +22,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/ops/index_select.h>
+#include <algorithm>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -31,6 +32,18 @@ namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
+
+// Caller-computed routing for one tile size in the routing kernel's int32 layout (an expert's rows in any order);
+// with them the routing kernel is skipped.
+struct RoutingTables
+{
+    torch::Tensor expanded_idx_to_permuted_idx; // [num_tokens * top_k]
+    torch::Tensor permuted_idx_to_token_idx;    // >= getRouteMapAllocCount(max permuted padded count)
+    torch::Tensor cta_idx_xy_to_batch_idx;      // >= getMaxNumCtasInBatchDim(...)
+    torch::Tensor cta_idx_xy_to_mn_limit;       // >= getMaxNumCtasInBatchDim(...)
+    torch::Tensor num_non_exiting_ctas;         // [1]
+    torch::Tensor total_num_padded_tokens;      // [1]
+};
 
 std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
@@ -46,7 +59,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
-    torch::optional<torch::Tensor> const& out_tensor = torch::nullopt)
+    torch::optional<torch::Tensor> const& out_tensor, RoutingTables const* routing_tables)
 {
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
@@ -207,16 +220,44 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     int32_t max_num_padded_tokens_gemm2
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
-    at::Tensor total_num_padded_tokens
-        = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
-    at::Tensor expanded_idx_to_permuted_idx
-        = at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
-
     // Sized via getRouteMapAllocCount: the gemm1 cubins read one element past the end of the route
     // map, see the comment on that helper.
-    at::Tensor permuted_idx_to_token_idx = at::detail::empty_cuda(
-        {tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getRouteMapAllocCount(max_num_padded_tokens)},
-        at::ScalarType::Int, routing_device, std::nullopt);
+    int64_t const route_map_alloc_count
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getRouteMapAllocCount(max_num_padded_tokens);
+    int32_t const max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
+        args.num_tokens, args.top_k, args.local_num_experts, tile_tokens_dim);
+    if (routing_tables != nullptr)
+    {
+        TORCH_CHECK(
+            topk_ids.has_value() && topk_weights.has_value(), "routing tables require topk_ids and topk_weights.");
+        TORCH_CHECK(local_num_experts == num_experts && local_expert_offset == 0,
+            "routing tables require all experts to be local.");
+        auto check = [&](torch::Tensor const& table, int64_t numel, char const* name)
+        {
+            TORCH_CHECK(table.device() == routing_device && table.scalar_type() == at::ScalarType::Int
+                    && table.is_contiguous() && table.numel() >= numel,
+                name, " must be a contiguous int32 tensor of at least ", numel, " elements on the routing device.");
+        };
+        check(
+            routing_tables->expanded_idx_to_permuted_idx, args.num_tokens * args.top_k, "expanded_idx_to_permuted_idx");
+        check(routing_tables->permuted_idx_to_token_idx, route_map_alloc_count, "permuted_idx_to_token_idx");
+        check(routing_tables->cta_idx_xy_to_batch_idx, max_num_ctas, "cta_idx_xy_to_batch_idx");
+        check(routing_tables->cta_idx_xy_to_mn_limit, max_num_ctas, "cta_idx_xy_to_mn_limit");
+        check(routing_tables->num_non_exiting_ctas, 1, "num_non_exiting_ctas");
+        check(routing_tables->total_num_padded_tokens, 1, "total_num_padded_tokens");
+    }
+    at::Tensor total_num_padded_tokens = routing_tables != nullptr
+        ? routing_tables->total_num_padded_tokens
+        : at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
+    at::Tensor expanded_idx_to_permuted_idx = routing_tables != nullptr
+        ? routing_tables->expanded_idx_to_permuted_idx.narrow(0, 0, args.num_tokens * args.top_k)
+              .view({args.num_tokens, args.top_k})
+        : at::Tensor(
+            at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt));
+    at::Tensor permuted_idx_to_token_idx = routing_tables != nullptr
+        ? routing_tables->permuted_idx_to_token_idx
+        : at::Tensor(
+            at::detail::empty_cuda({route_map_alloc_count}, at::ScalarType::Int, routing_device, std::nullopt));
     // expert_weights is the routing kernel's topk-weights output and is consumed by moe_finalize,
     // which requires `dtype == scale_dtype` against gemm2_output. Track args.mDtypeOut so the two
     // buffers stay in lock-step automatically; do NOT tie this to the bias dtype, which is allowed
@@ -264,14 +305,15 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
-    int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
-        args.num_tokens, args.top_k, args.local_num_experts, tile_tokens_dim);
-    at::Tensor cta_idx_xy_to_batch_idx
-        = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor cta_idx_xy_to_mn_limit
-        = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor num_non_exiting_ctas
-        = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
+    at::Tensor cta_idx_xy_to_batch_idx = routing_tables != nullptr
+        ? routing_tables->cta_idx_xy_to_batch_idx
+        : at::Tensor(at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt));
+    at::Tensor cta_idx_xy_to_mn_limit = routing_tables != nullptr
+        ? routing_tables->cta_idx_xy_to_mn_limit
+        : at::Tensor(at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt));
+    at::Tensor num_non_exiting_ctas = routing_tables != nullptr
+        ? routing_tables->num_non_exiting_ctas
+        : at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
 
     // Set the optional pointer to the expert weights and expert ids
     void* expert_weights_ptr = args.topk_weights ? args.topk_weights : expert_weights.data_ptr();
@@ -280,22 +322,25 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     // TopK routing
     //
 
-    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
-    auto const& stream = at::cuda::getCurrentCUDAStream(
-        routing_logits.has_value() ? routing_logits.value().get_device() : topk_ids.value().get_device());
-    auto const dtypeRoutingLogits = routing_logits.has_value()
-        ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
-        : btg::Dtype::Bfloat16;
-    routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
-        /* num_fused_shared_expert */ 0, args.n_group, args.topk_group, args.local_expert_offset,
-        args.local_num_experts, args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
-        expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
-        expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
-        permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
-        num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
-        cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt,
-        false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
-        static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits, args.mDtypeBias);
+    if (routing_tables == nullptr)
+    {
+        tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
+        auto const& stream = at::cuda::getCurrentCUDAStream(
+            routing_logits.has_value() ? routing_logits.value().get_device() : topk_ids.value().get_device());
+        auto const dtypeRoutingLogits = routing_logits.has_value()
+            ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
+            : btg::Dtype::Bfloat16;
+        routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
+            /* num_fused_shared_expert */ 0, args.n_group, args.topk_group, args.local_expert_offset,
+            args.local_num_experts, args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
+            expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
+            expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
+            permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
+            num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
+            cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt,
+            false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
+            static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits, args.mDtypeBias);
+    }
 
     //
     // FC13 (gemm1) + FC2 (gemm2)
@@ -500,7 +545,11 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     if (!do_finalize)
     {
-        return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+        // An op output must not alias an input: with routing tables the permutation is row 0 of this tile's
+        // table, which an empty [0, tile] placeholder names.
+        return {gemm2_output, expert_weights,
+            routing_tables != nullptr ? at::empty({0, tile_tokens_dim}, expanded_idx_to_permuted_idx.options())
+                                      : expanded_idx_to_permuted_idx};
     }
 
     return {output};
@@ -589,7 +638,8 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output,
+        torch::optional<torch::Tensor> const& routing_tables, std::vector<int64_t> const& routing_table_tiles)
     {
         int64_t tileN = moeConfigIndex[0];
         int64_t config = moeConfigIndex[1];
@@ -634,12 +684,28 @@ public:
             runner = &getRunner(tileN, /* useFineGrained */ false);
             configToRun = config;
         }
+        // routing_tables [tiles, 5, width]: per tile the RoutingTables rows, the last holding (num_non_exiting_ctas,
+        // total_num_padded_tokens). Only this tactic's tile is used; other tiles route as usual.
+        std::optional<RoutingTables> tables;
+        if (routing_tables.has_value())
+        {
+            auto const& all = routing_tables.value();
+            TORCH_CHECK(
+                all.dim() == 3 && all.size(0) == static_cast<int64_t>(routing_table_tiles.size()) && all.size(1) == 5,
+                "routing_tables must be [len(routing_table_tiles), 5, width].");
+            auto const it = std::find(routing_table_tiles.begin(), routing_table_tiles.end(), tileN);
+            if (it != routing_table_tiles.end())
+            {
+                auto const t = all.select(0, std::distance(routing_table_tiles.begin(), it));
+                tables = RoutingTables{t[0], t[1], t[2], t[3], t[4].narrow(0, 0, 1), t[4].narrow(0, 1, 1)};
+            }
+        }
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *runner, configToRun,
-            topk_weights, topk_ids, output);
+            topk_weights, topk_ids, output, tables.has_value() ? &tables.value() : nullptr);
     }
 
 private:
@@ -726,7 +792,8 @@ public:
             std::nullopt, std::nullopt, gemm2_weights, gemm2_weights_scale, std::nullopt, output1_scales_scalar,
             output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group, topk_group,
             intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
-            routing_method_type, do_finalize, mDtypeAct, *mRunners[tileN], config, topk_weights, topk_ids, output);
+            routing_method_type, do_finalize, mDtypeAct, *mRunners[tileN], config, topk_weights, topk_ids, output,
+            /* routing_tables */ nullptr);
     }
 
 private:

@@ -222,6 +222,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      prompt_token_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PromptTokenCacheConfig]
+        default: null
+        status: prototype
       enable_iter_req_stats:
         annotation: bool
         default: False

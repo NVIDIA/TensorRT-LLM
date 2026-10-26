@@ -68,6 +68,7 @@ __all__ = [
     "check_stop_words_length",
     "fast_greedy_sample_kernel",
     "handle_stop_criteria",
+    "max_token_room",
     "meet_max_token_stop_criteria",
     "meet_stop_token_criteria",
     "scatter_new_tokens",
@@ -344,6 +345,21 @@ def meet_max_token_stop_criteria(
     return bool(
         (num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens)
         or (num_tokens >= max_seq_len)
+    )
+
+
+def max_token_room(request: LlmRequest, max_seq_len: int, beam_idx: int = DEFAULT_BEAM_IDX) -> int:
+    """How many more tokens ``request`` can take before ``meet_max_token_stop_criteria``.
+
+    Its ``n``-th new token meets it exactly when ``n >=`` this value, read before the first.
+    """
+    num_tokens = request.get_num_tokens(beam_idx)
+    return cast(
+        int,
+        min(
+            request.py_max_new_tokens - (num_tokens - request.py_orig_prompt_len),
+            max_seq_len - num_tokens,
+        ),
     )
 
 

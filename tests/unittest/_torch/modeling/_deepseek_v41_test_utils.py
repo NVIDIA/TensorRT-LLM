@@ -87,6 +87,8 @@ def cache_config(request, monkeypatch):
     text.candidate_source_layer_id = 5
     text.candidate_topk_blocks = 72
     text.candidate_block_size = 8
+    # Candidate consumers score with DeepGEMM sparse MQA logits over 32 index heads.
+    text.index_n_heads = 32
     model_config.extra_attrs["kv_cache_dtype"] = request.param
     model_config.quant_config = QuantConfig(
         kv_cache_quant_algo="FP8" if request.param == "fp8" else None
@@ -119,6 +121,7 @@ def cache_case(
     scratch=False,
     spec_config=None,
     tokens_per_block=128,
+    max_num_tokens=2048,
 ):
     text = config.pretrained_config
     batch = len(lengths)
@@ -127,7 +130,7 @@ def cache_case(
             dtype=dtype,
             enable_block_reuse=reuse,
             enable_swa_scratch_reuse=scratch,
-            max_tokens=4096,
+            max_gpu_total_bytes=64 << 20,
             event_buffer_max_size=0,
         ),
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
@@ -142,11 +145,12 @@ def cache_case(
         if dtype == "fp8"
         else tensorrt_llm.bindings.DataType.BF16,
         vocab_size=text.vocab_size,
-        max_num_tokens=2048,
+        max_num_tokens=max_num_tokens,
         sparse_attention_config=sparse,
         model_config=config,
         spec_config=spec_config,
         pretrained_config=text,
+        bounded_replay_on_generation=config.extra_attrs.get("bounded_replay_on_generation", False),
     )
     requests = []
     try:
@@ -176,7 +180,7 @@ def cache_case(
             seq_lens=torch.tensor(lengths, dtype=torch.int32),
             num_contexts=num_contexts,
             max_num_requests=batch,
-            max_num_tokens=2048,
+            max_num_tokens=max_num_tokens,
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=list(past)),
             kv_cache_manager=manager,
             request_ids=list(range(batch)),
@@ -381,7 +385,7 @@ def request(i, prompt_len=257):
 def enable_ced(model):
     model.model.decoder_replay_split = 5
     model.model.ced_kv_precompute = True
-    model.model.decoder_replay_window = 128
+    model.model.decoder_replay_window = 140
     # Match post_load_weights: CED materializes this boundary for decoder queries,
     # and decode graphs must use the same post-update rounding there.
     model.model.layers[4]._v41_defer_post_mapping = False

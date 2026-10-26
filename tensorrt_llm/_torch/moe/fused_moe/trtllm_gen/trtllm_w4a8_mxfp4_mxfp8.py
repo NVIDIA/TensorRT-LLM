@@ -21,7 +21,7 @@ import torch
 from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 from tensorrt_llm._utils import is_sm_100f
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
+from ..impl_contract import MoEDeployment, MoEEligibility, MoEFusedRouteQuant, MoEProblem
 from ..impl_identity import register_moe_impl
 from ..routing import DeepSeekV3MoeRoutingMethod
 from .eligibility import check_trtllm_gen_leaf
@@ -51,7 +51,7 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         self,
         x: torch.Tensor | MxFp8QuantizedTensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    ) -> MoEFusedRouteQuant | None:
         """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
 
         The op is MXFP8-activation and native-cubin only, which is exactly this
@@ -93,6 +93,8 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         ):
             return None
 
-        return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
-            router_logits, bias, x, routing.routed_scaling_factor
+        return MoEFusedRouteQuant(
+            *torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+                router_logits, bias, x, routing.routed_scaling_factor
+            )
         )

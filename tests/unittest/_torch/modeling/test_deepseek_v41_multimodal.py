@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -25,6 +27,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv41_multimodal import (
 )
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import PreparedLlmInputs
 from tensorrt_llm.inputs import create_input_processor_with_hash
+from tensorrt_llm.inputs.shared_prompt_store import SharedPromptStore
 
 pytestmark = pytest.mark.cpu_only
 _IMAGE_ID = 129264
@@ -300,3 +303,104 @@ def test_wrapper_request_lifecycle_preserves_image_history() -> None:
     )
     wrapper.release_request_state(41)
     provider.release_request_state.assert_called_once_with(41)
+
+
+_V41_CHECKPOINT = (
+    Path(os.environ.get("LLM_MODELS_ROOT", "/code/llm-models")) / "DeepSeek-V4.1-Flash"
+)
+
+
+def _shared_cache_frontend(cache_dir: str, max_bytes: int, requests, results) -> None:
+    """A frontend process: encode each prompt it receives through the shared cache."""
+    from tensorrt_llm._torch.models.deepseek_v41_processor import DeepseekV41InputProcessor
+    from tensorrt_llm.llmapi.llm_args import PromptTokenCacheConfig
+    from tensorrt_llm.sampling_params import SamplingParams
+    from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
+
+    tokenizer = DeepseekV41Tokenizer.from_pretrained(str(_V41_CHECKPOINT))
+    processor = DeepseekV41InputProcessor(
+        str(_V41_CHECKPOINT),
+        PretrainedConfig.from_pretrained(str(_V41_CHECKPOINT)),
+        tokenizer,
+        prompt_token_cache_config=PromptTokenCacheConfig(path=cache_dir, max_bytes=max_bytes),
+    )
+    params = SamplingParams(add_special_tokens=False)
+    for prompt in iter(requests.get, None):
+        ids, _ = processor({"prompt": prompt}, params)
+        results.put(ids == tokenizer.encode(prompt, add_special_tokens=False))
+
+
+@pytest.mark.skipif(
+    not (_V41_CHECKPOINT / "tokenizer.json").is_file(),
+    reason=f"DeepSeek-V4.1 tokenizer not present at {_V41_CHECKPOINT}",
+)
+@pytest.mark.parametrize("max_bytes", [64 << 20, 8192], ids=["large", "evicting"])
+def test_prompt_token_cache_shared_by_processes(tmp_path, max_bytes: int) -> None:
+    """prompt_token_cache_config: frontend processes sharing one directory give every
+    multi-turn prompt the ids of a full encode, reusing turns other processes stored."""
+    import multiprocessing
+    import random
+
+    from tensorrt_llm.tokenizer.deepseek_v41 import encode_messages
+
+    rng = random.Random(0)
+    words = ["alpha", "beta", " gamma", "12345", "\n\n", "工具", "tool_call", "  x", "é"]
+    conversations = [[{"role": "system", "content": f"Agent {c}. " * 60}] for c in range(4)]
+    schedule = []
+    for _ in range(5):
+        for messages in conversations:
+            messages.append({"role": "user", "content": " ".join(rng.choices(words, k=40))})
+            schedule.append(encode_messages(messages, thinking_mode="thinking"))
+            messages.append({"role": "assistant", "content": " ".join(rng.choices(words, k=30))})
+
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    frontends = []
+    for _ in range(3):
+        requests = context.Queue()
+        process = context.Process(
+            target=_shared_cache_frontend,
+            args=(str(tmp_path / "cache"), max_bytes, requests, results),
+        )
+        process.start()
+        frontends.append((process, requests))
+    try:
+        # 3 processes and 4 conversations: consecutive turns go to different processes.
+        for index, prompt in enumerate(schedule):
+            frontends[index % len(frontends)][1].put(prompt)
+            assert results.get(timeout=300), f"request {index} differs from a full encode"
+    finally:
+        for process, requests in frontends:
+            requests.put(None)
+            process.join(timeout=60)
+        # Each queue's feeder thread exits once the queue is closed and joined.
+        for queue in [results] + [requests for _, requests in frontends]:
+            queue.close()
+            queue.join_thread()
+    assert all(process.exitcode == 0 for process, _ in frontends)
+
+    entries = [entry.stat() for entry in (tmp_path / "cache").glob("*.entry")]
+    assert sum(entry.st_size for entry in entries) <= max_bytes
+    # A directory other users can write is refused: they could plant ids for a known prompt.
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o770)
+    with pytest.raises(PermissionError, match="not writable by group or others"):
+        SharedPromptStore(str(shared), max_bytes)
+    # Entries are owner-only; a directory swapped in at the path or an entry others can
+    # write is not read.
+    assert all(entry.st_mode & 0o077 == 0 for entry in entries)
+    store = SharedPromptStore(str(tmp_path / "own"), max_bytes)
+    store.put(b"key", b"value")
+    (tmp_path / "own").rename(tmp_path / "moved")
+    (tmp_path / "own").mkdir(mode=0o700)
+    assert store.get(b"key") == b"value"
+    next((tmp_path / "moved").glob("*.entry")).chmod(0o664)
+    assert store.get(b"key") is None
+    if max_bytes > 8192:
+        # Each turn stored its prompt; every later turn reused the previous turn's entry,
+        # written by another process, and demoted it.
+        assert len(entries) == len(schedule)
+        assert sum(entry.st_mtime == 0 for entry in entries) == len(schedule) - len(conversations)
+    else:
+        assert 0 < len(entries) < len(schedule)

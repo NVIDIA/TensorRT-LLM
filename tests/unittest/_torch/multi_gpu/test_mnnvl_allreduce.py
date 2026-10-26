@@ -469,6 +469,74 @@ def mnnvl_quant_fusion_forward(
 
 
 @torch.inference_mode()
+def mnnvl_rms_norm_forward(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    dtype: torch.dtype,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    fusion_op: AllReduceFusionOp,
+    reference_norm: torch.Tensor,
+    reference_residual: torch.Tensor,
+):
+    del residual, scale, fusion_op, reference_residual
+    input = input.cuda()
+    norm_weight = norm_weight.cuda()
+    reference_norm = reference_norm.cuda()
+
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    MPI.COMM_WORLD.barrier()
+
+    allreduce = AllReduce(
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        strategy=AllReduceStrategy.MNNVL,
+        dtype=dtype,
+    )
+    assert allreduce.mnnvl_allreduce is not None
+    rms_params = AllReduceParams(fusion_op=AllReduceFusionOp.RMS_NORM,
+                                 norm_weight=norm_weight,
+                                 eps=eps)
+
+    # RMSNorm of the reduced sum matches the residual variant with a zero residual.
+    output = allreduce(input, all_reduce_params=rms_params)
+    assert isinstance(output, torch.Tensor)
+    norm_zero_residual, residual_out = allreduce(
+        input,
+        all_reduce_params=AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=torch.zeros_like(input),
+            norm_weight=norm_weight,
+            eps=eps))
+    assert torch.equal(output, norm_zero_residual)
+    torch.testing.assert_close(output, reference_norm, rtol=0.05, atol=0.15)
+    assert torch.equal(residual_out, allreduce(input))
+
+    # CUDA graph replay matches eager; the warmup call sizes the workspace before capture.
+    larger = torch.cat([input, input], dim=0)
+    allreduce(larger)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = allreduce(larger, all_reduce_params=rms_params)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(static_out,
+                       allreduce(larger, all_reduce_params=rms_params))
+    assert torch.equal(static_out[:input.shape[0]], output)
+
+    # The workspace serves only its own dtype.
+    other = torch.float16 if dtype == torch.bfloat16 else torch.bfloat16
+    assert allreduce.mnnvl_allreduce(input.to(other),
+                                     all_reduce_params=rms_params) is None
+
+
+@torch.inference_mode()
 def mnnvl_nvfp4_reject_fp32_forward(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -804,3 +872,44 @@ def test_nccl_symmetric_row_linear_residual_norm_fusion(seq_len, hidden_size,
         fusion,
         mpi_pool_executor,
     )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("seq_len, hidden_size", [
+    pytest.param(6, 5120, id="oneshot_m6_n5120"),
+    pytest.param(2048, 5120, id="twoshot_m2048_n5120"),
+])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mnnvl_rms_norm_without_residual(seq_len, hidden_size,
+                                         mpi_pool_executor):
+    torch.manual_seed(42)
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    dtype = torch.bfloat16
+    eps = 1e-6
+
+    x = torch.randn((tensor_parallel_size, seq_len, hidden_size), dtype=dtype)
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype)
+    reference_sum = torch.sum(x.to(torch.float32), dim=0)
+    reference_norm = rms_norm(reference_sum, norm_weight.to(torch.float32),
+                              eps).to(dtype)
+    unused = torch.empty(0)
+
+    results = mpi_pool_executor.map(
+        run_quant_single_rank,
+        *zip(*[(
+            tensor_parallel_size,
+            mnnvl_rms_norm_forward,
+            x[i, :, :],
+            unused,
+            norm_weight,
+            unused,
+            eps,
+            dtype,
+            AllReduceFusionOp.RMS_NORM,
+            reference_norm,
+            unused,
+        ) for i in range(tensor_parallel_size)]),
+    )
+    for r in results:
+        assert r is True

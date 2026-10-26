@@ -12,8 +12,8 @@ from tensorrt_llm._utils import get_sm_version
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not IS_CUTLASS_DSL_AVAILABLE
-    or get_sm_version() not in (100, 103),
-    reason="DSpark fused RMSNorm+RoPE requires an SM100 or SM103 CUDA GPU",
+    or get_sm_version() not in (100, 103, 107),
+    reason="DSpark fused RMSNorm+RoPE requires an SM100, SM103 or SM107 CUDA GPU",
 )
 
 
@@ -115,7 +115,7 @@ def test_cute_dsl_dspark_rmsnorm_rope_rejects_invalid_inputs():
 
 
 def test_dspark_rmsnorm_rope_kernel_rejects_invalid_num_heads():
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.dspark.rmsnorm_rope import (
         DSparkRMSNormRoPEKernel,
     )
 

@@ -1592,8 +1592,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("assert_valid", &kv::GpuCacheTierConfig::assertValid) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t>(), nb::arg("quota"))
+        .def(nb::init<size_t, std::optional<int>>(), nb::arg("quota"), nb::arg("numa_node") = nb::none())
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
+        .def_rw("numa_node", &kv::HostCacheTierConfig::numaNode)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("assert_valid", &kv::HostCacheTierConfig::assertValid) DEF_COPY(kv::HostCacheTierConfig);
 

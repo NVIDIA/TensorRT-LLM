@@ -57,6 +57,9 @@ l0_dgx_b200:
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
+  # DSpark draft Markov chain with its in-kernel cross-rank exchange (graph replays mixed with all-reduces).
+  - unittest/_torch/speculative/test_dspark_markov_chain.py
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_mhc_allreduce_boundary_matches_allreduce_then_boundary
   - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[linear] TIMEOUT (60)
@@ -194,6 +197,10 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  # DeepSeek-V4.1 has 24 Engram hash heads and is served at TP=8, so the head cut is
+  # its default path -- and the all-gather that reassembles the shards is only
+  # exercised at a real world size. Cheap (~70 s) next to the accuracy runs below.
+  - unittest/_torch/multi_gpu/test_engram_sharding.py
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2-overlap_on] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2-overlap_on] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput] TIMEOUT (60)
@@ -212,6 +219,8 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm TIMEOUT (240)
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4 TIMEOUT (90)
+  # Long recall covers compressed/indexer KV transfer beyond the 128-token SWA window.
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v41_gsm8k_ctxtp4_gentp4[DeepSeek-V4.1-Flash-NVFP4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_8gpus[attention_dp_on-cutedsl] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_8gpus[attention_dp_off-trtllm] TIMEOUT (60)

@@ -18,6 +18,7 @@ class DSparkRMSNormRoPEKernel:
     """Apply optional RMSNorm and last-dimension RoPE with one warp per row."""
 
     num_threads = cute.arch.WARP_SIZE
+    rows_per_cta = 4
 
     def __init__(
         self,
@@ -92,6 +93,10 @@ class DSparkRMSNormRoPEKernel:
         self.elements_per_thread = hidden_dim // self.num_threads
         self.nope_elements_per_thread = self.nope_dim // self.num_threads
         self.pairs_per_thread = self.rope_pairs // self.num_threads
+        self.loaded_elements_per_thread = max(
+            self.norm_elements_per_thread if apply_rmsnorm else 0,
+            self.nope_elements_per_thread if write_nope else 0,
+        )
 
     @cute.jit
     def __call__(
@@ -111,8 +116,8 @@ class DSparkRMSNormRoPEKernel:
         so they cannot disagree.
         """
         self.kernel(x, weight, freqs, output).launch(
-            grid=[x.shape[0], 1, 1],
-            block=[self.num_threads, 1, 1],
+            grid=[(x.shape[0] + self.rows_per_cta - 1) // self.rows_per_cta, 1, 1],
+            block=[self.num_threads * self.rows_per_cta, 1, 1],
             stream=stream,
         )
 
@@ -124,51 +129,132 @@ class DSparkRMSNormRoPEKernel:
         freqs: cute.Tensor,
         output: cute.Tensor,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
-        row, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        tidx = thread % self.num_threads
+        row = cta * self.rows_per_cta + thread // self.num_threads
+        if row < x.shape[0]:
+            # Issue every load before the first store: output may alias x, so no
+            # load could otherwise move above an earlier store.
+            values = []
+            for item in cutlass.range_constexpr(self.loaded_elements_per_thread):
+                values.append(cutlass.Float32(x[row, tidx + item * self.num_threads]))
+            nope_weights = []
+            if cutlass.const_expr(self.write_nope and self.apply_weight):
+                for item in cutlass.range_constexpr(self.nope_elements_per_thread):
+                    nope_weights.append(cutlass.Float32(weight[tidx + item * self.num_threads]))
+            pairs = []
+            if cutlass.const_expr(self.rope_pairs > 0):
+                freq_row = row // self.num_heads
+                for item in cutlass.range_constexpr(self.pairs_per_thread):
+                    pair = tidx + item * self.num_threads
+                    real_dim = self.nope_dim + pair * 2
+                    imag_dim = real_dim + 1
+                    real_weight = imag_weight = None
+                    if cutlass.const_expr(self.norm_covers_rope and self.apply_weight):
+                        real_weight = cutlass.Float32(weight[real_dim])
+                        imag_weight = cutlass.Float32(weight[imag_dim])
+                    pairs.append(
+                        (
+                            cutlass.Float32(x[row, real_dim]),
+                            cutlass.Float32(x[row, imag_dim]),
+                            real_weight,
+                            imag_weight,
+                            cutlass.Float32(freqs[freq_row, pair, 0]),
+                            cutlass.Float32(freqs[freq_row, pair, 1]),
+                        )
+                    )
 
-        inverse_rms = cutlass.Float32(1.0)
-        if cutlass.const_expr(self.apply_rmsnorm):
-            sum_sq = cutlass.Float32(0.0)
-            for item in cutlass.range_constexpr(self.norm_elements_per_thread):
-                dim = tidx + item * self.num_threads
-                value = cutlass.Float32(x[row, dim])
-                sum_sq += value * value
-            sum_sq = cute.arch.warp_reduction_sum(sum_sq)
-            inverse_rms = cute.math.rsqrt(sum_sq / self.norm_dim + self.eps)
+            inverse_rms = cutlass.Float32(1.0)
+            if cutlass.const_expr(self.apply_rmsnorm):
+                sum_sq = cutlass.Float32(0.0)
+                for item in cutlass.range_constexpr(self.norm_elements_per_thread):
+                    value = values[item]
+                    sum_sq += value * value
+                sum_sq = cute.arch.warp_reduction_sum(sum_sq)
+                inverse_rms = cute.math.rsqrt(sum_sq / self.norm_dim + self.eps)
 
-        if cutlass.const_expr(self.write_nope):
-            for item in cutlass.range_constexpr(self.nope_elements_per_thread):
-                dim = tidx + item * self.num_threads
-                value = cutlass.Float32(x[row, dim]) * inverse_rms
-                if cutlass.const_expr(self.apply_weight):
-                    value *= cutlass.Float32(weight[dim])
-                output[row, dim] = value.to(output.element_type)
+            if cutlass.const_expr(self.write_nope):
+                for item in cutlass.range_constexpr(self.nope_elements_per_thread):
+                    dim = tidx + item * self.num_threads
+                    value = values[item] * inverse_rms
+                    if cutlass.const_expr(self.apply_weight):
+                        value *= nope_weights[item]
+                    output[row, dim] = value.to(output.element_type)
 
-        if cutlass.const_expr(self.rope_pairs > 0):
-            freq_row = row // self.num_heads
-            for item in cutlass.range_constexpr(self.pairs_per_thread):
-                pair = tidx + item * self.num_threads
-                real_dim = self.nope_dim + pair * 2
-                imag_dim = real_dim + 1
-                out_real = self.out_rope_offset + pair * 2
+            for item in cutlass.range_constexpr(len(pairs)):
+                real, imag, real_weight, imag_weight, cos, sin = pairs[item]
+                out_real = self.out_rope_offset + (tidx + item * self.num_threads) * 2
                 out_imag = out_real + 1
-                real = cutlass.Float32(x[row, real_dim])
-                imag = cutlass.Float32(x[row, imag_dim])
                 # Outside norm_dim the rope lanes are passed through raw: no RMS
                 # scale, no weight. weight is only norm_dim long in that case.
                 if cutlass.const_expr(self.norm_covers_rope):
                     real *= inverse_rms
                     imag *= inverse_rms
                     if cutlass.const_expr(self.apply_weight):
-                        real *= cutlass.Float32(weight[real_dim])
-                        imag *= cutlass.Float32(weight[imag_dim])
-                cos = cutlass.Float32(freqs[freq_row, pair, 0])
-                sin = cutlass.Float32(freqs[freq_row, pair, 1])
+                        real *= real_weight
+                        imag *= imag_weight
                 if cutlass.const_expr(self.inverse_rope):
                     sin = -sin
                 output[row, out_real] = (real * cos - imag * sin).to(output.element_type)
                 output[row, out_imag] = (imag * cos + real * sin).to(output.element_type)
+
+    @cute.jit
+    def store_normalized_row(
+        self,
+        x: cute.Tensor,
+        row: cutlass.Int32,
+        weight: cute.Tensor,
+        freqs: cute.Tensor,
+        freq_row: cutlass.Int32,
+        dst: cute.Tensor,
+    ):
+        """Store the weighted RMSNorm and forward RoPE of ``x[row]`` into the row ``dst``."""
+        tidx = cute.arch.thread_idx()[0] % self.num_threads
+        # All loads precede the stores, which may alias them.
+        values = []
+        for item in cutlass.range_constexpr(self.elements_per_thread):
+            values.append(cutlass.Float32(x[row, tidx + item * self.num_threads]))
+        nope_weights = []
+        for item in cutlass.range_constexpr(self.nope_elements_per_thread):
+            nope_weights.append(cutlass.Float32(weight[tidx + item * self.num_threads]))
+        pairs = []
+        for item in cutlass.range_constexpr(self.pairs_per_thread):
+            pair = tidx + item * self.num_threads
+            real_dim = self.nope_dim + pair * 2
+            imag_dim = real_dim + 1
+            pairs.append(
+                (
+                    cutlass.Float32(x[row, real_dim]),
+                    cutlass.Float32(x[row, imag_dim]),
+                    cutlass.Float32(weight[real_dim]),
+                    cutlass.Float32(weight[imag_dim]),
+                    cutlass.Float32(freqs[freq_row, pair, 0]),
+                    cutlass.Float32(freqs[freq_row, pair, 1]),
+                )
+            )
+
+        sum_sq = cutlass.Float32(0.0)
+        for item in cutlass.range_constexpr(self.elements_per_thread):
+            value = values[item]
+            sum_sq += value * value
+        sum_sq = cute.arch.warp_reduction_sum(sum_sq)
+        inverse_rms = cute.math.rsqrt(sum_sq / self.hidden_dim + self.eps)
+
+        for item in cutlass.range_constexpr(self.nope_elements_per_thread):
+            value = values[item] * inverse_rms
+            value *= nope_weights[item]
+            dst[tidx + item * self.num_threads] = value.to(dst.element_type)
+
+        for item in cutlass.range_constexpr(self.pairs_per_thread):
+            real, imag, real_weight, imag_weight, cos, sin = pairs[item]
+            real_dim = self.nope_dim + (tidx + item * self.num_threads) * 2
+            real = real * inverse_rms
+            imag = imag * inverse_rms
+            real *= real_weight
+            imag *= imag_weight
+            dst[real_dim] = (real * cos - imag * sin).to(dst.element_type)
+            dst[real_dim + 1] = (imag * cos + real * sin).to(dst.element_type)
 
 
 class DSparkRMSNormRoPECacheWriteKernel(DSparkRMSNormRoPEKernel):
@@ -224,40 +310,10 @@ class DSparkRMSNormRoPECacheWriteKernel(DSparkRMSNormRoPEKernel):
         cache_seq = cutlass.Int32(start_pos[row])
         cache_pos = cache_seq % self.window_size
 
+        self.store_normalized_row(x, row, weight, freqs, row, kv_cache[slot, cache_pos, None])
         if tidx == 0:
             slots_i32[row] = slot
             cache_seqs[row] = cache_seq
-
-        sum_sq = cutlass.Float32(0.0)
-        for item in cutlass.range_constexpr(self.elements_per_thread):
-            dim = tidx + item * self.num_threads
-            value = cutlass.Float32(x[row, dim])
-            sum_sq += value * value
-        sum_sq = cute.arch.warp_reduction_sum(sum_sq)
-        inverse_rms = cute.math.rsqrt(sum_sq / self.hidden_dim + self.eps)
-
-        for item in cutlass.range_constexpr(self.nope_elements_per_thread):
-            dim = tidx + item * self.num_threads
-            value = cutlass.Float32(x[row, dim]) * inverse_rms
-            value *= cutlass.Float32(weight[dim])
-            kv_cache[slot, cache_pos, dim] = value.to(kv_cache.element_type)
-
-        for item in cutlass.range_constexpr(self.pairs_per_thread):
-            pair = tidx + item * self.num_threads
-            real_dim = self.nope_dim + pair * 2
-            imag_dim = real_dim + 1
-            real = cutlass.Float32(x[row, real_dim]) * inverse_rms
-            imag = cutlass.Float32(x[row, imag_dim]) * inverse_rms
-            real *= cutlass.Float32(weight[real_dim])
-            imag *= cutlass.Float32(weight[imag_dim])
-            cos = cutlass.Float32(freqs[row, pair, 0])
-            sin = cutlass.Float32(freqs[row, pair, 1])
-            kv_cache[slot, cache_pos, real_dim] = (real * cos - imag * sin).to(
-                kv_cache.element_type
-            )
-            kv_cache[slot, cache_pos, imag_dim] = (imag * cos + real * sin).to(
-                kv_cache.element_type
-            )
 
 
 class DSparkRMSNormRoPEDraftBlockKernel(DSparkRMSNormRoPEKernel):
@@ -284,8 +340,9 @@ class DSparkRMSNormRoPEDraftBlockKernel(DSparkRMSNormRoPEKernel):
         output: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        # One CTA per real row, plus one that zero-fills the padding rows.
         self.kernel(x, weight, freqs, output).launch(
-            grid=[output.shape[0], self.storage_size, 1],
+            grid=[output.shape[0], min(self.block_size + 1, self.storage_size), 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -303,37 +360,64 @@ class DSparkRMSNormRoPEDraftBlockKernel(DSparkRMSNormRoPEKernel):
 
         if page_row < self.block_size:
             row = batch * self.block_size + page_row
-            sum_sq = cutlass.Float32(0.0)
-            for item in cutlass.range_constexpr(self.elements_per_thread):
-                dim = tidx + item * self.num_threads
-                value = cutlass.Float32(x[row, dim])
-                sum_sq += value * value
-            sum_sq = cute.arch.warp_reduction_sum(sum_sq)
-            inverse_rms = cute.math.rsqrt(sum_sq / self.hidden_dim + self.eps)
-
-            for item in cutlass.range_constexpr(self.nope_elements_per_thread):
-                dim = tidx + item * self.num_threads
-                value = cutlass.Float32(x[row, dim]) * inverse_rms
-                value *= cutlass.Float32(weight[dim])
-                output[batch, page_row, dim] = value.to(output.element_type)
-
-            for item in cutlass.range_constexpr(self.pairs_per_thread):
-                pair = tidx + item * self.num_threads
-                real_dim = self.nope_dim + pair * 2
-                imag_dim = real_dim + 1
-                real = cutlass.Float32(x[row, real_dim]) * inverse_rms
-                imag = cutlass.Float32(x[row, imag_dim]) * inverse_rms
-                real *= cutlass.Float32(weight[real_dim])
-                imag *= cutlass.Float32(weight[imag_dim])
-                cos = cutlass.Float32(freqs[row, pair, 0])
-                sin = cutlass.Float32(freqs[row, pair, 1])
-                output[batch, page_row, real_dim] = (real * cos - imag * sin).to(
-                    output.element_type
-                )
-                output[batch, page_row, imag_dim] = (imag * cos + real * sin).to(
-                    output.element_type
-                )
+            self.store_normalized_row(x, row, weight, freqs, row, output[batch, page_row, None])
         else:
-            for item in cutlass.range_constexpr(self.elements_per_thread):
-                dim = tidx + item * self.num_threads
-                output[batch, page_row, dim] = cutlass.BFloat16(0.0)
+            for pad_row in cutlass.range_constexpr(self.block_size, self.storage_size):
+                for item in cutlass.range_constexpr(self.elements_per_thread):
+                    dim = tidx + item * self.num_threads
+                    output[batch, pad_row, dim] = cutlass.BFloat16(0.0)
+
+
+class DSparkBackfillKernel(DSparkRMSNormRoPEKernel):
+    """Write each valid ``(interim token, stage)`` RMSNorm/RoPE row into its rolling-window slot."""
+
+    def __init__(
+        self, hidden_dim: int, rope_dim: int, eps: float, window_size: int, num_stages: int
+    ):
+        super().__init__(hidden_dim, rope_dim, 1, eps, True, True, False)
+        self.window_size = window_size
+        self.num_stages = num_stages
+
+    @cute.jit
+    def __call__(
+        self,
+        kv: cute.Tensor,
+        weight: cute.Tensor,
+        freqs: cute.Tensor,
+        mask: cute.Tensor,
+        positions: cute.Tensor,
+        slots: cute.Tensor,
+        windows: cute.Tensor,
+        interim: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(kv, weight, freqs, mask, positions, slots, windows, interim).launch(
+            grid=[mask.shape[0], self.num_stages, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        kv: cute.Tensor,
+        weight: cute.Tensor,
+        freqs: cute.Tensor,
+        mask: cute.Tensor,
+        positions: cute.Tensor,
+        slots: cute.Tensor,
+        windows: cute.Tensor,
+        interim: cutlass.Int32,
+    ):
+        token, stage, _ = cute.arch.block_idx()
+        if mask[token] != 0:
+            position = cutlass.Int32(positions[token])
+            slot = cutlass.Int32(slots[token // interim])
+            self.store_normalized_row(
+                kv,
+                token * self.num_stages + stage,
+                weight[stage, None],
+                freqs,
+                position,
+                windows[slot, stage, position % self.window_size, None],
+            )

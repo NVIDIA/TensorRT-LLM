@@ -28,7 +28,7 @@ from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
-from .block_scan import block_prefix_sum_kernel
+from .block_scan import block_prefix_sum_kernel, warp_scan
 from .filtered_top_k_varlen_util import float_as_uint32, half_as_ushort
 
 # ---------------------------------------------------------------------------
@@ -47,6 +47,14 @@ _HIST_BUF_2 = 2 * _HIST_SIZE
 _ARRIVAL_COUNTER = 3 * _HIST_SIZE  # 768
 _OUTPUT_COUNTER = 3 * _HIST_SIZE + 1  # 769
 STATE_SIZE = 3 * _HIST_SIZE + 2  # 770
+
+# Shared-memory slots of the tie admission, in the histogram buffer (free once the radix rounds
+# are done): a CTA's tie count, the tie list's counter and the per-warp counts of the scan
+# fallback. The tie list itself (the chunk's ties in any order) lives in prefix_buf.
+_TIE_COUNT = 3
+_TIE_LIST_COUNT = 4
+_TIE_WARP_COUNTS = 32
+_TIE_LIST = 256
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +174,10 @@ class SinglePassMultiCTARadixTopKKernel:
          a. Pass 1: elements strictly greater than pivot → atomicAdd to get
             position in output.
          b. Inter-CTA barrier.
-         c. Pass 2: elements equal to pivot → per-element atomicAdd, write
-            only while pos < k.
+         c. Pass 2: elements equal to pivot, lowest column first (see
+            ``deterministic_ties``): CTA c takes the first ``k - (> pivot) -
+            (ties of CTAs before c)`` of its own, ranked by warp ballots in
+            column order.
     """
 
     def __init__(
@@ -206,6 +216,15 @@ class SinglePassMultiCTARadixTopKKernel:
 
         # Vec size for loading
         self.vec_size = num_copy_bits // dtype.width
+
+    @property
+    def deterministic_ties(self) -> bool:
+        """Whether the keys tied at the k-th value are admitted lowest column first, so that the
+        selected set does not depend on the order in which threads and CTAs reach them. The
+        multi-CTA kernels exchange each CTA's tie count (DSMEM, or a histogram buffer that is idle
+        during the collection), so the distributed kernel admits a group of more than 256 CTAs
+        in arrival order."""
+        return self.ctas_per_group <= _HIST_SIZE
 
     # ------------------------------------------------------------------
     # Bit-pattern helpers
@@ -294,6 +313,10 @@ class SinglePassMultiCTARadixTopKKernel:
             fix_bytes = align_bytes - misalign
 
         prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
+        # A chunk shorter than the misaligned prefix (e.g. a CTA whose chunk starts at or past
+        # the row's end) is all prologue: the region sizes must not go negative.
+        if prologue_elems > actual_chunk_size:
+            prologue_elems = actual_chunk_size
         remaining = actual_chunk_size - prologue_elems
         aligned_size = (remaining // vec_size) * vec_size
         left_size = remaining - aligned_size
@@ -675,16 +698,24 @@ class SinglePassMultiCTARadixTopKKernel:
         Uses warp reduction (FlashInfer pattern): each thread counts its
         elements, then a butterfly warp-sum reduces 32 threads to one
         atomicAdd per warp, cutting smem contention by 32x.
+        With ``deterministic_ties`` it also counts the elements equal to the
+        pivot into ``local_histogram[_TIE_COUNT]``.
         """
         if tidx == 0:
             local_histogram[0] = cutlass.Int32(0)
+            if cutlass.const_expr(self.deterministic_ties):
+                local_histogram[_TIE_COUNT] = cutlass.Int32(0)
         cute.arch.barrier()
 
         my_count = cutlass.Int32(0)
+        my_ties = cutlass.Int32(0)
         for i in range(tidx, actual_chunk_size, self.num_threads):
             ordered = shared_ordered[i]
             if ordered < ordered_pivot:
                 my_count = my_count + 1
+            if cutlass.const_expr(self.deterministic_ties):
+                if ordered == ordered_pivot:
+                    my_ties = my_ties + 1
 
         # Warp-level reduction: butterfly sum across 32 threads.
         warp_sum = cute.arch.warp_reduction_sum(my_count)
@@ -692,6 +723,11 @@ class SinglePassMultiCTARadixTopKKernel:
         if cute.arch.lane_idx() == 0:
             if warp_sum > 0:
                 atomicAdd(local_histogram.iterator, warp_sum)
+        if cutlass.const_expr(self.deterministic_ties):
+            warp_ties = cute.arch.warp_reduction_sum(my_ties)
+            if cute.arch.lane_idx() == 0:
+                if warp_ties > 0:
+                    atomicAdd(local_histogram.iterator + _TIE_COUNT, warp_ties)
         cute.arch.barrier()
 
         return local_histogram[0]
@@ -805,6 +841,296 @@ class SinglePassMultiCTARadixTopKKernel:
                         output_values_row[pos] = self.from_ordered(ordered_pivot)
 
     # ------------------------------------------------------------------
+    # Step 3b-deterministic: admit ties lowest column first
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _chunk_slot(self, column, prologue_elems, aligned_size):
+        """Shared-memory slot of chunk column ``column`` in load_chunk_to_smem's layout
+        (aligned region first, then the prologue, then the tail)."""
+        slot = column
+        if column < prologue_elems + aligned_size:
+            slot = column - prologue_elems
+        if column < prologue_elems:
+            slot = aligned_size + column
+        return slot
+
+    @cute.jit
+    def _emit_selected(
+        self,
+        chunk_column,
+        chunk_start,
+        slot,
+        ordered,
+        output_indices_row,
+        output_values_row,
+        mark_flags,
+    ):
+        """Write a selected element to output slot ``slot`` or, with ``mark_flags`` (a shared
+        bitmap over the chunk's columns), flag its chunk column instead."""
+        if cutlass.const_expr(mark_flags is not None):
+            cute.arch.atomic_or(
+                ptr=(mark_flags.iterator + (chunk_column // 32)).llvm_ptr,
+                val=cutlass.Uint32(1) << cutlass.Uint32(chunk_column % 32),
+                sem="relaxed",
+                scope="cta",
+            )
+        else:
+            output_indices_row[slot] = cutlass.Int32(chunk_start + chunk_column)
+            if cutlass.const_expr(output_values_row is not None):
+                output_values_row[slot] = self.from_ordered(ordered)
+
+    @cute.jit
+    def _collect_gt_and_list_ties(
+        self,
+        shared_ordered,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        left_size,
+        ordered_pivot,
+        gt_counter_ptr,
+        gt_base,
+        local_histogram,
+        tie_list,
+        output_indices_row,
+        output_values_row,
+        tidx,
+        mark_flags=None,
+    ):
+        """One pass over the chunk: write each element above the pivot to slot
+        ``gt_base + atomicAdd(gt_counter_ptr, 1)`` (or flag it in ``mark_flags``) and list each
+        element equal to it (its chunk column, in any order) in the first ``_TIE_LIST`` entries
+        of ``tie_list``, counting them at ``local_histogram[_TIE_LIST_COUNT]`` (both counters
+        zeroed before a barrier)."""
+        val_one = cutlass.Int32(1)
+        tie_counter = local_histogram.iterator + _TIE_LIST_COUNT
+        for i in range(tidx, aligned_size, self.num_threads):
+            ordered = shared_ordered[i]
+            if ordered < ordered_pivot:
+                pos = gt_base + atomicAdd(gt_counter_ptr, val_one)
+                self._emit_selected(
+                    cutlass.Int32(i + prologue_elems),
+                    chunk_start,
+                    pos,
+                    ordered,
+                    output_indices_row,
+                    output_values_row,
+                    mark_flags,
+                )
+            if ordered == ordered_pivot:
+                slot = atomicAdd(tie_counter, val_one)
+                if slot < _TIE_LIST:
+                    tie_list[slot] = cutlass.Int32(prologue_elems + i)
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
+            if ordered < ordered_pivot:
+                pos = gt_base + atomicAdd(gt_counter_ptr, val_one)
+                self._emit_selected(
+                    cutlass.Int32(i),
+                    chunk_start,
+                    pos,
+                    ordered,
+                    output_indices_row,
+                    output_values_row,
+                    mark_flags,
+                )
+            if ordered == ordered_pivot:
+                slot = atomicAdd(tie_counter, val_one)
+                if slot < _TIE_LIST:
+                    tie_list[slot] = cutlass.Int32(i)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered < ordered_pivot:
+                pos = gt_base + atomicAdd(gt_counter_ptr, val_one)
+                self._emit_selected(
+                    cutlass.Int32(prologue_elems + aligned_size + i),
+                    chunk_start,
+                    pos,
+                    ordered,
+                    output_indices_row,
+                    output_values_row,
+                    mark_flags,
+                )
+            if ordered == ordered_pivot:
+                slot = atomicAdd(tie_counter, val_one)
+                if slot < _TIE_LIST:
+                    tie_list[slot] = cutlass.Int32(prologue_elems + aligned_size + i)
+
+    @cute.jit
+    def _admit_listed_ties(
+        self,
+        shared_ordered,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        actual_chunk_size,
+        ordered_pivot,
+        top_k,
+        remaining_k,
+        before,
+        local_histogram,
+        tie_list,
+        output_indices_row,
+        output_values_row,
+        tidx,
+    ):
+        """Write this CTA's listed ties after the ``before`` ties of the CTAs ahead of it, up to
+        ``remaining_k`` ties in all."""
+        need = remaining_k - before
+        if need > local_histogram[_TIE_COUNT]:
+            need = local_histogram[_TIE_COUNT]
+        if need > 0:
+            self._write_listed_ties(
+                shared_ordered,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                actual_chunk_size,
+                ordered_pivot,
+                need,
+                top_k - remaining_k + before,
+                local_histogram,
+                tie_list,
+                output_indices_row,
+                output_values_row,
+                tidx,
+            )
+
+    @cute.jit
+    def _write_listed_ties(
+        self,
+        shared_ordered,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        actual_chunk_size,
+        ordered_pivot,
+        need,
+        out_base,
+        local_histogram,
+        tie_list,
+        output_indices_row,
+        output_values_row,
+        tidx,
+        mark_flags=None,
+    ):
+        """Write the chunk's first ``need`` (block-uniform) elements equal to the pivot, lowest
+        column first, to output slots ``out_base ..`` (or flag them in ``mark_flags``), after
+        ``_collect_gt_and_list_ties`` and a barrier: a listed tie's rank is the number of listed
+        ties in lower columns. A chunk with more than ``_TIE_LIST`` ties is ranked by warp
+        ballots instead."""
+        ties = local_histogram[_TIE_LIST_COUNT]
+        if ties <= _TIE_LIST:
+            for t in range(tidx, ties, self.num_threads):
+                column = tie_list[t]
+                rank = cutlass.Int32(0)
+                for u in cutlass.range(0, ties, 1, unroll=8):
+                    if tie_list[u] < column:
+                        rank = rank + 1
+                if rank < need:
+                    self._emit_selected(
+                        column,
+                        chunk_start,
+                        out_base + rank,
+                        ordered_pivot,
+                        output_indices_row,
+                        output_values_row,
+                        mark_flags,
+                    )
+        else:
+            self._collect_ties_by_scan(
+                shared_ordered,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                actual_chunk_size,
+                ordered_pivot,
+                need,
+                out_base,
+                local_histogram,
+                output_indices_row,
+                output_values_row,
+                tidx,
+                mark_flags,
+            )
+
+    @cute.jit
+    def _collect_ties_by_scan(
+        self,
+        shared_ordered,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        actual_chunk_size,
+        ordered_pivot,
+        need,
+        out_base,
+        local_histogram,
+        output_indices_row,
+        output_values_row,
+        tidx,
+        mark_flags=None,
+    ):
+        """``_write_listed_ties`` for chunks with many ties.
+
+        Each warp owns a contiguous run of 32-column steps: it counts its ties by ballot, one
+        scan over the warps' counts gives each warp its first rank, then each warp ranks its
+        ties by ballot until ``need`` are written.
+        """
+        num_warps = cutlass.const_expr(self.num_warps)
+        warp = tidx // 32
+        lane = tidx % 32
+        steps = (actual_chunk_size + 31) // 32
+        per_warp = (steps + (num_warps - 1)) // num_warps
+        first = warp * per_warp
+        last = first + per_warp
+        if last > steps:
+            last = steps
+        lanes_below = cutlass.Uint32(cute.arch.lanemask_lt())
+        count = cutlass.Int32(0)
+        for step in range(first, last):
+            column = step * 32 + lane
+            hit = cutlass.Int32(0)
+            if column < actual_chunk_size:
+                slot = self._chunk_slot(column, prologue_elems, aligned_size)
+                if shared_ordered[slot] == ordered_pivot:
+                    hit = cutlass.Int32(1)
+            ballot = cute.arch.vote_ballot_sync(hit != cutlass.Int32(0))
+            count = count + cutlass.Int32(cute.arch.popc(ballot))
+        if lane == 0:
+            local_histogram[_TIE_WARP_COUNTS + warp] = count
+        cute.arch.barrier()
+        # Exclusive prefix of the warps' counts (one warp count per lane).
+        warp_count = cutlass.Int32(0)
+        if lane < num_warps:
+            warp_count = local_histogram[_TIE_WARP_COUNTS + lane]
+        inclusive = warp_scan(warp_count, tidx, lane, 32)
+        taken = cute.arch.shuffle_sync(inclusive - warp_count, warp)
+        step = first
+        while (step < last) & (taken < need):
+            column = step * 32 + lane
+            hit = cutlass.Int32(0)
+            if column < actual_chunk_size:
+                slot = self._chunk_slot(column, prologue_elems, aligned_size)
+                if shared_ordered[slot] == ordered_pivot:
+                    hit = cutlass.Int32(1)
+            ballot = cute.arch.vote_ballot_sync(hit != cutlass.Int32(0))
+            if hit != cutlass.Int32(0):
+                rank = taken + cutlass.Int32(cute.arch.popc(ballot & lanes_below))
+                if rank < need:
+                    self._emit_selected(
+                        column,
+                        chunk_start,
+                        out_base + rank,
+                        ordered_pivot,
+                        output_indices_row,
+                        output_values_row,
+                        mark_flags,
+                    )
+            taken = taken + cutlass.Int32(cute.arch.popc(ballot))
+            step = step + 1
+
+    # ------------------------------------------------------------------
     # Step 3: Collect output indices and values
     # ------------------------------------------------------------------
     @cute.jit
@@ -827,6 +1153,11 @@ class SinglePassMultiCTARadixTopKKernel:
         output_indices_row,
         output_values_row,
         tidx,
+        remaining_k,
+        cta_in_group,
+        state_row,
+        tie_counts_offset,
+        tie_list,
     ):
         """Collect elements into output: first > pivot, then == pivot.
 
@@ -839,6 +1170,11 @@ class SinglePassMultiCTARadixTopKKernel:
         An inter-CTA barrier separates the two passes to ensure all > pivot
         elements from all CTAs are counted before == pivot elements start
         filling the remaining slots.
+
+        With ``deterministic_ties`` each CTA publishes its tie count at
+        ``state_row[tie_counts_offset + cta_in_group]`` before that barrier
+        and then admits ties lowest column first after the ties of the CTAs
+        before it (``remaining_k`` ties in all).
         """
         # Reuse local_histogram for counters (FlashInfer convention):
         #   [0] = local_offset_gt  (local position within CTA allocation)
@@ -848,21 +1184,42 @@ class SinglePassMultiCTARadixTopKKernel:
             local_histogram[1] = cutlass.Int32(0)  # global_base_gt
             if local_gt_count > 0:
                 local_histogram[1] = atomicAdd(output_counter_ptr, local_gt_count)
+            if cutlass.const_expr(self.deterministic_ties):
+                state_row[tie_counts_offset + cta_in_group] = local_histogram[_TIE_COUNT]
+                local_histogram[_TIE_LIST_COUNT] = cutlass.Int32(0)
         cute.arch.barrier()
 
-        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
-        self._collect_pass_gt(
-            shared_ordered,
-            chunk_start,
-            prologue_elems,
-            aligned_size,
-            left_size,
-            ordered_pivot,
-            local_histogram,
-            output_indices_row,
-            output_values_row,
-            tidx,
-        )
+        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot); with
+        # deterministic ties, the same pass lists the ties.
+        if cutlass.const_expr(self.deterministic_ties):
+            self._collect_gt_and_list_ties(
+                shared_ordered,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                left_size,
+                ordered_pivot,
+                local_histogram.iterator,
+                local_histogram[1],
+                local_histogram,
+                tie_list,
+                output_indices_row,
+                output_values_row,
+                tidx,
+            )
+        else:
+            self._collect_pass_gt(
+                shared_ordered,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                left_size,
+                ordered_pivot,
+                local_histogram,
+                output_indices_row,
+                output_values_row,
+                tidx,
+            )
 
         # Inter-CTA barrier between pass 1 and pass 2 (only thread 0 signals)
         if tidx == 0:
@@ -871,19 +1228,42 @@ class SinglePassMultiCTARadixTopKKernel:
         barrier_inter_cta(arrival_counter_ptr, barrier_phase * ctas_per_group, tidx)
 
         # Pass 2: equal to pivot
-        self._collect_pass_eq(
-            shared_ordered,
-            chunk_start,
-            prologue_elems,
-            aligned_size,
-            left_size,
-            ordered_pivot,
-            top_k,
-            output_counter_ptr,
-            output_indices_row,
-            output_values_row,
-            tidx,
-        )
+        if cutlass.const_expr(self.deterministic_ties):
+            lane = tidx % 32
+            before = cutlass.Int32(0)
+            for base in cutlass.range_constexpr(0, self.ctas_per_group, 32):
+                if base + lane < cta_in_group:
+                    before = before + state_row[tie_counts_offset + base + lane]
+            self._admit_listed_ties(
+                shared_ordered,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                actual_chunk_size,
+                ordered_pivot,
+                top_k,
+                remaining_k,
+                cute.arch.warp_reduction_sum(before),
+                local_histogram,
+                tie_list,
+                output_indices_row,
+                output_values_row,
+                tidx,
+            )
+        else:
+            self._collect_pass_eq(
+                shared_ordered,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                left_size,
+                ordered_pivot,
+                top_k,
+                output_counter_ptr,
+                output_indices_row,
+                output_values_row,
+                tidx,
+            )
 
         return barrier_phase
 
@@ -905,74 +1285,60 @@ class SinglePassMultiCTARadixTopKKernel:
         output_indices_row,
         output_values_row,
         tidx,
+        tie_list,
+        mark_flags=None,
     ):
-        """Single-CTA output collection using a smem counter.
+        """Single-CTA output collection using a smem counter (or flags in ``mark_flags``).
 
         No inter-CTA barrier is needed.  ``local_histogram[2]`` is reused as
         a smem output counter (safe because the histogram phase is complete).
         With the descending ordered mapping, float > pivot ↔ ordered < pivot.
         """
-        val_one = cutlass.Int32(1)
-
         # Reuse local_histogram[2] as smem output counter
         if tidx == 0:
             local_histogram[2] = cutlass.Int32(0)
+            local_histogram[_TIE_LIST_COUNT] = cutlass.Int32(0)
         cute.arch.barrier()
 
-        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
-        # 3-region structure
-        for i in range(tidx, aligned_size, self.num_threads):
-            ordered = shared_ordered[i]
-            if ordered < ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
-        for i in range(tidx, prologue_elems, self.num_threads):
-            ordered = shared_ordered[i + aligned_size]
-            if ordered < ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
-        for i in range(tidx, left_size, self.num_threads):
-            ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered < ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                output_indices_row[pos] = cutlass.Int32(
-                    chunk_start + prologue_elems + aligned_size + i
-                )
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
+        # One pass: the elements above the pivot, and the ties listed; then the first
+        # k - (> pivot) ties, lowest column first.
+        self._collect_gt_and_list_ties(
+            shared_ordered,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            ordered_pivot,
+            local_histogram.iterator + cutlass.Int32(2),
+            cutlass.Int32(0),
+            local_histogram,
+            tie_list,
+            output_indices_row,
+            output_values_row,
+            tidx,
+            mark_flags,
+        )
         cute.arch.barrier()
-
-        # Pass 2: equal to pivot (fill remaining slots up to k)
-        for i in range(tidx, aligned_size, self.num_threads):
-            ordered = shared_ordered[i]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
-        for i in range(tidx, prologue_elems, self.num_threads):
-            ordered = shared_ordered[i + aligned_size]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
-        for i in range(tidx, left_size, self.num_threads):
-            ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(
-                        chunk_start + prologue_elems + aligned_size + i
-                    )
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+        greater = local_histogram[2]
+        self._write_listed_ties(
+            shared_ordered,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            actual_chunk_size,
+            ordered_pivot,
+            top_k - greater,
+            greater,
+            local_histogram,
+            tie_list,
+            output_indices_row,
+            output_values_row,
+            tidx,
+            mark_flags,
+        )
+        # A persistent CTA's next row overwrites shared_ordered: wait for every warp's
+        # collection first.
+        cute.arch.barrier()
 
     # ------------------------------------------------------------------
     # Single-CTA radix select + collect (shared by parent and subclasses)
@@ -1033,6 +1399,7 @@ class SinglePassMultiCTARadixTopKKernel:
             output_indices_row,
             output_values_row,
             tidx,
+            prefix_buf,
         )
 
     # ------------------------------------------------------------------
@@ -1326,6 +1693,17 @@ class SinglePassMultiCTARadixTopKKernel:
                     output_counter_ptr = state_base_ptr + cutlass.Int32(_OUTPUT_COUNTER)
                     arrival_counter_ptr = state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER)
 
+                    # The CTAs' tie counts go to the histogram buffer of round
+                    # num_rounds - 2: every CTA has read it before the last round's
+                    # barrier, and CTA 0 clears it (as the next row's round-1
+                    # buffer) only after this row's final barrier.
+                    tie_counts_offset = (
+                        (
+                            iter_var * cutlass.Int32(num_rounds_const)
+                            + cutlass.Int32(num_rounds_const - 2)
+                        )
+                        % cutlass.Int32(3)
+                    ) * cutlass.Int32(self.radix)
                     barrier_phase = self.collect_output(
                         shared_ordered,
                         actual_chunk_size,
@@ -1344,6 +1722,11 @@ class SinglePassMultiCTARadixTopKKernel:
                         output_indices_row,
                         output_values_row,
                         tidx,
+                        remaining_k,
+                        cta_in_group,
+                        state_row,
+                        tie_counts_offset,
+                        prefix_buf,
                     )
 
                     # Final inter-CTA barrier: ensure all CTAs finish before

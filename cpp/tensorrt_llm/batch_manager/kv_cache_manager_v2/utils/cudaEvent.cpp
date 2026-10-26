@@ -166,18 +166,18 @@ TemporaryCudaStream::TemporaryCudaStream(std::vector<CUevent> priorEvents)
 // Mirrors Python's merge_events() in _utils.py.
 // ---------------------------------------------------------------------------
 
-CachedCudaEvent mergeEvents(std::vector<CachedCudaEvent>& events)
+CachedCudaEvent mergeEvents(CachedCudaEvent* events, size_t count)
 {
     // A single live event is returned as is rather than merged, so track one live event and
     // how many there are.
     CachedCudaEvent* onlyLive = nullptr;
     size_t numLive = 0;
-    for (auto& ev : events)
+    for (size_t i = 0; i < count; ++i)
     {
-        if (!ev.isClosed())
+        if (!events[i].isClosed())
         {
             ++numLive;
-            onlyLive = &ev;
+            onlyLive = &events[i];
         }
     }
     if (numLive == 0)
@@ -187,9 +187,9 @@ CachedCudaEvent mergeEvents(std::vector<CachedCudaEvent>& events)
     // Multiple live events: merge via TemporaryCudaStream. Closed events yield a null handle,
     // which streamWaitEvents drops.
     std::vector<CUevent> priors;
-    priors.reserve(events.size());
-    for (auto const& ev : events)
-        priors.push_back(ev.handle());
+    priors.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+        priors.push_back(events[i].handle());
     TemporaryCudaStream tempStream(std::move(priors));
     {
         auto scope = tempStream.enter();

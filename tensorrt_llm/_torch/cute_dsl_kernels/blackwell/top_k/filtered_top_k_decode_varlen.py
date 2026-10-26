@@ -176,7 +176,17 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         cache_smem_values: bool = False,
         single_pass_multi_cta: bool = False,
     ):
-        self._large_occupancy = large_occupancy
+        # Single-CTA fp32 rows wide enough to keep a least-coarse-key byte per vector (16 KB key
+        # cap) for the filter pass to list its vectors in the second candidate buffer; their
+        # large-occupancy launch is 1024 threads x 2 CTAs/SM with a larger candidate buffer.
+        wide = (
+            dtype == cutlass.Float32
+            and max_num_cols >= 32768
+            and overflow_policy != "REREAD_ALWAYS"
+            and not (enable_multi_cta or merge_blocks or single_pass_multi_cta)
+        )
+        # CTAs per SM the launch targets (min_blocks_per_mp) and the SMEM budget is sized for.
+        self.blocks_per_sm = (2 if wide else 4) if large_occupancy else 1
         super().__init__(
             dtype,
             max_num_cols,
@@ -188,9 +198,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             num_ctas_per_row,
             merge_blocks,
             overflow_policy=overflow_policy,
-            # large_occupancy always uses 512 threads; pass it early so that
+            # large_occupancy uses 512 threads (1024 for wide fp32 rows); pass it early so that
             # _compute_smem_input_size_for_occupancy() sees the correct num_warps.
-            num_threads_override=512 if large_occupancy else 0,
+            num_threads_override=512 if large_occupancy and not wide else 0,
             cache_smem_values=cache_smem_values,
             single_pass_multi_cta=single_pass_multi_cta,
         )
@@ -201,6 +211,8 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         self.num_ctas_per_row = num_ctas_per_row
         self.enable_dynamic_multi_cta = enable_dynamic_multi_cta
         self.varlen_merge_input = varlen_merge_input
+        if wide:
+            self.key_cache_vectors = min(max_num_cols // self.vec_size, 16384)
 
         if cutlass.const_expr(self.merge_blocks):
             # Cap vec_size so tile_width (num_threads_per_cta * vec_size) <= max_num_cols,
@@ -212,9 +224,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             self.vec_size = self.num_copy_bits // self.dtype.width
 
     def _compute_smem_input_size(self) -> int:
-        if cutlass.const_expr(self._large_occupancy):
-            return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=4)
-        return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=1)
+        return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=self.blocks_per_sm)
 
     @cute.kernel
     def filtered_topk_kernel(
@@ -325,6 +335,20 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             )
         else:
             s_hist_merged = None
+        if cutlass.const_expr(self.key_cache_vectors > 0):
+            s_vec_key = smem.allocate_tensor(
+                element_type=cutlass.Uint8,
+                layout=cute.make_ordered_layout((self.key_cache_vectors,), order=(0,)),
+                byte_alignment=128,
+            )
+            s_list_count = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((1,), order=(0,)),
+                byte_alignment=128,
+            )
+        else:
+            s_vec_key = None
+            s_list_count = None
 
         # Thread and block indexing
         bidx, bidy, _ = cute.arch.block_idx()
@@ -450,6 +474,8 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                 need_cluster_sync,
                 s_hist_merged,
                 cta_in_group,
+                s_vec_key=s_vec_key,
+                s_list_count=s_list_count,
             )
 
         griddepcontrol_launch_dependents()
@@ -613,7 +639,7 @@ def cute_dsl_radix_filter_topk_wrapper(
             output_values_fake,
             stream=fake_stream,
             # TODO: check the perf.
-            min_blocks_per_mp=4 if large_occupancy else 1,
+            min_blocks_per_mp=filtered_topk_func.blocks_per_sm,
             options="--enable-tvm-ffi",
         )
         compiled_filter_topk_dict[key] = compiled_kernel
@@ -1104,7 +1130,7 @@ def run_filtered_topk_decode(
         output_values_fake,
         stream=fake_stream,
         # TODO: confirm this parameter.
-        min_blocks_per_mp=4 if large_occupancy else 1,
+        min_blocks_per_mp=filtered_topk_func.blocks_per_sm,
         options="--enable-tvm-ffi",
     )
 

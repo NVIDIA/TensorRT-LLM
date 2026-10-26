@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <system_error>
 #include <thread>
@@ -183,8 +184,9 @@ bool HostMem::shouldUseChunkedRegistration()
     return chunked;
 }
 
-HostMem::HostMem(size_t size)
+HostMem::HostMem(size_t size, std::optional<int> numaNode)
     : mUseThp(hostUseThp())
+    , mNumaNode(numaNode)
 {
     if (size == 0)
     {
@@ -195,6 +197,7 @@ HostMem::HostMem(size_t size)
     mSize = size;
     try
     {
+        bindToNumaNode();
         madvisePageMode();
         int const prefaultThreads = hostPrefaultThreads();
         if (prefaultThreads > 0)
@@ -226,6 +229,7 @@ void HostMem::resize(size_t newSize)
         mAddr = hostMremap(mAddr, mSize, newSize);
         TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
         mSize = newSize;
+        bindToNumaNode();
         madvisePageMode();
     }
     catch (...)
@@ -246,6 +250,28 @@ void HostMem::destroy()
     hostMunmap(mAddr, mSize);
     mAddr = 0;
     mSize = 0;
+}
+
+void HostMem::bindToNumaNode()
+{
+    if (!mNumaNode)
+    {
+        return;
+    }
+    // mbind(2) without libnuma. It sets the policy for pages faulted in later and moves none.
+    constexpr int kMpolBind = 2;
+    constexpr size_t kBitsPerWord = 8 * sizeof(unsigned long);
+    auto const node = static_cast<size_t>(*mNumaNode);
+    std::vector<unsigned long> mask(node / kBitsPerWord + 1, 0);
+    mask[node / kBitsPerWord] = 1UL << (node % kBitsPerWord);
+    // The kernel reads maxnode - 1 bits of the mask.
+    if (::syscall(
+            SYS_mbind, reinterpret_cast<void*>(mAddr), mSize, kMpolBind, mask.data(), mask.size() * kBitsPerWord + 1, 0)
+        != 0)
+    {
+        throw std::system_error(
+            errno, std::generic_category(), "mbind to NUMA node " + std::to_string(*mNumaNode) + " failed");
+    }
 }
 
 void HostMem::madvisePageMode()

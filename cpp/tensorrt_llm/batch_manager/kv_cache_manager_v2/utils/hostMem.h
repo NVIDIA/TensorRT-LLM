@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 
 #include <cstddef>
+#include <optional>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -30,6 +31,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //
 // Memory is:
 //   - Anonymous private mmap
+//   - Optionally bound to one NUMA node (MPOL_BIND), also after resize
 //   - Advised according to TLLM_KV_CACHE_MANAGER_V2_THP
 //   - Optionally prefaulted in parallel before CUDA registration
 //   - Registered to CUDA as page-locked (CU_MEMHOSTREGISTER_DEVICEMAP)
@@ -44,7 +46,7 @@ public:
     static constexpr size_t kChunkSize = 2ULL << 30;           // 2 GB
     static constexpr size_t kPrefaultChunkSize = 512ULL << 20; // 512 MB
 
-    explicit HostMem(size_t size);
+    explicit HostMem(size_t size, std::optional<int> numaNode = std::nullopt);
     ~HostMem();
 
     HostMem(HostMem const&) = delete;
@@ -72,6 +74,7 @@ public:
 private:
     void registerToCuda();
     void unregisterFromCuda();
+    void bindToNumaNode();
     void madvisePageMode();
     void parallelPrefault(int numThreads);
 
@@ -79,6 +82,7 @@ private:
     size_t mSize = 0;
     int mNumRegisteredChunks = 0;
     bool mUseThp = true;
+    std::optional<int> mNumaNode;
 };
 
 // ---------------------------------------------------------------------------

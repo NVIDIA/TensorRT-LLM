@@ -189,6 +189,8 @@ public:
 
 private:
     void scrubEvents();
+    // Takes one free slot, preferring ready recycled ones; the caller has scanned readiness.
+    Slot takeFreeSlot();
     [[nodiscard]] bool check() const noexcept;
 
     SlotCount mCapacity;
@@ -270,7 +272,7 @@ private:
 class HostSlotPool : public SlotPoolBase
 {
 public:
-    HostSlotPool(size_t slotSize, SlotCount numSlots);
+    HostSlotPool(size_t slotSize, SlotCount numSlots, std::optional<int> numaNode = std::nullopt);
 
     SlotCount numSlots() const noexcept override;
     void destroy() override;
@@ -401,7 +403,8 @@ public:
 class HostPoolGroup : public PoolGroupBase
 {
 public:
-    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
+    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        std::optional<int> numaNode = std::nullopt);
 
     [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
 };
@@ -576,7 +579,7 @@ class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
     HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<int> numaNode = std::nullopt);
 
     CacheTier cacheTier() const noexcept override
     {

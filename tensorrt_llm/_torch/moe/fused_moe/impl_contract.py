@@ -593,6 +593,27 @@ class MoECommPlan:
 
 
 @dataclass(frozen=True)
+class MoERoutingTables:
+    """Routing tables in the kernel's layout, one entry per tile of ``tiles``; a tactic with
+    another tile routes itself."""
+
+    tables: torch.Tensor
+    tiles: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MoEFusedRouteQuant:
+    """``routing_method.apply`` and ``quantize_input`` results from one launch, plus the
+    backend kernel's optional routing tables."""
+
+    token_selected_experts: torch.Tensor
+    token_final_scales: torch.Tensor
+    x: torch.Tensor
+    x_sf: torch.Tensor
+    routing_tables: Optional[MoERoutingTables] = None
+
+
+@dataclass(frozen=True)
 class MoERunContext:
     """Everything ``run_moe`` needs that the CALLER genuinely produces.
 
@@ -618,6 +639,8 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
+    # produced by a fused route+quant launch for the routing above
+    routing_tables: Optional[MoERoutingTables] = None
 
 
 def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:

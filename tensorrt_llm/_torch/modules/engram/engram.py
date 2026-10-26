@@ -24,6 +24,7 @@ All operations run on device:
   - GPU main stream forward: SDP gating + short conv
 """
 
+import ctypes
 import math
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -31,16 +32,20 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import triton  # type: ignore[import]
-import triton.language as tl  # type: ignore[import]
+from cuda.bindings import runtime as cudart
 from tokenizers import Regex, normalizers
 from torch import nn
 from transformers import AutoTokenizer
 
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.engram.decode_hash import (
+    compile_engram_decode_hash,
+)
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.engram.lookup import compile_engram_lookup
 from tensorrt_llm._torch.host_staging import copy_host_to_device
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import CUASSERT, prefer_pinned
+from tensorrt_llm.logger import logger
 
-from ._decode_hash import _decode_hash_kernel
+from ._host_memory import HostNumaMem, HostNumaOutOfMemoryError, HostRegisteredMem, host_numa_node
 
 # Default Engram embedding vocabulary size per n-gram level.
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
@@ -694,7 +699,10 @@ class EngramHashProvider:
         if self._decode_row_map is not None and self._decode_row_map[0] == key:
             return self._decode_row_map[1]
         row_map = self._upload_history_tensor(
-            "decode_rows", torch.tensor(rows, dtype=torch.long, device="cpu")
+            "decode_rows",
+            torch.tensor(rows, dtype=torch.long, device="cpu").repeat_interleave(
+                torch.tensor(lengths)
+            ),
         )
         self._decode_row_map = (key, row_map)
         return row_map
@@ -709,10 +717,11 @@ class EngramHashProvider:
         token_mask: torch.Tensor | None,
         padded_num_tokens: int | None,
     ) -> dict[int, torch.Tensor] | None:
-        # Packed contexts, speculative batches, and incomplete host metadata
-        # keep the general path. Capture already returned its warmup buffers.
-        # Unique rows fuse the scatter too; aliased rows retain Torch's scatter
-        # before any hash reads, including repeated CUDA graph dummy requests.
+        # Incomplete host metadata keeps the general path. Capture already
+        # returned its warmup buffers. Single-token unique rows fuse the
+        # scatter too; aliased rows and multi-token requests, whose tokens read
+        # each other's cells, retain Torch's scatter before any hash reads,
+        # including repeated CUDA graph dummy requests.
         if (
             not input_ids.is_cuda
             or input_ids.ndim != 1
@@ -725,7 +734,6 @@ class EngramHashProvider:
             or position_ids.dtype not in (torch.int32, torch.int64)
             or request_ids is None
             or not request_ids
-            or len(request_ids) != input_ids.numel()
             or seq_lens_host is None
             or seq_lens_host.device.type != "cpu"
             or seq_lens_host.ndim != 1
@@ -741,12 +749,12 @@ class EngramHashProvider:
         ):
             return None
         lengths = tuple(seq_lens_host[: len(request_ids)].tolist())
-        if any(length != 1 for length in lengths):
+        if min(lengths) < 1 or sum(lengths) != input_ids.numel():
             return None
 
         # Constants can move independently of retained history and captured
         # outputs. Keep cross-device calls on the general path instead of
-        # passing another device's storage to a raw Triton kernel.
+        # passing another device's storage to a raw CuTe kernel.
         if self._history is not None and self._history.device != input_ids.device:
             return None
         num_tokens = input_ids.numel()
@@ -760,7 +768,8 @@ class EngramHashProvider:
             return None
 
         aliased_rows = len(set(request_ids)) != len(request_ids)
-        if aliased_rows:
+        scatter_first = aliased_rows or len(request_ids) != input_ids.numel()
+        if scatter_first:
             # Preserve the general path's compression and int32 index_put
             # geometry/order. Repeated IDs may have different input tokens or
             # positions: hashing each token's register value would bypass the
@@ -781,7 +790,7 @@ class EngramHashProvider:
         # a released request can immediately reuse the same physical row.
         self._consume_history_seeds(request_ids, rows)
         row_map = self._decode_history_rows(rows, lengths, input_ids.device)
-        if aliased_rows:
+        if scatter_first:
             self._history[row_map, positions] = compressed.to(torch.int32)
         elif token_mask is not None:
             token_mask = token_mask.to(device=input_ids.device)
@@ -793,29 +802,29 @@ class EngramHashProvider:
                 for layer_id in self.config.layer_ids
             }
             self._cached_hashes_store[shape_key] = cached
+        mask = (
+            None if scatter_first or token_mask is None else token_mask.view(-1).view(torch.uint8)
+        )
         for index, layer_id in enumerate(self.config.layer_ids):
-            _decode_hash_kernel[(num_output_tokens,)](
-                input_ids,
-                position_ids,
+            compile_engram_decode_hash(
+                tuple(tuple(moduli) for moduli in self._moduli_ints[layer_id]),
+                self._pad_id,
+                self._DEAD,
+                index == 0 and not scatter_first,
+                scatter_first,
+                mask is not None,
+                input_ids.dtype,
+                position_ids.dtype,
+            )(
+                input_ids.view(-1),
+                position_ids.view(-1),
                 row_map,
-                None if aliased_rows else token_mask,
+                mask,
                 self._lookup_table,
                 self._history,
                 self._multipliers[layer_id],
                 cached[layer_id],
                 num_tokens,
-                self._history.shape[1],
-                VOCAB_SIZE=self._lookup_table.numel(),
-                PAD_ID=self._pad_id,
-                DEAD=self._DEAD,
-                MODULI=tuple(tuple(moduli) for moduli in self._moduli_ints[layer_id]),
-                N_HEAD=self.config.n_head_per_ngram,
-                MAX_NGRAM=self.config.max_ngram_size,
-                WRITE_HISTORY=index == 0 and not aliased_rows,
-                READ_CURRENT_HISTORY=aliased_rows,
-                HAS_MASK=token_mask is not None and not aliased_rows,
-                BLOCK_HEAD=triton.next_power_of_2(self.config.n_head_per_ngram),
-                num_warps=1,
             )
         self._cached_hashes = cached
         return cached
@@ -1067,8 +1076,8 @@ class _CudaArrayInterfaceView:
 def _uva_device_view(host_tensor: torch.Tensor) -> torch.Tensor:
     """Return a zero-copy CUDA view with the pinned tensor's shape and dtype.
 
-    UVA maps pinned host memory at the same device address. The byte view
-    requires contiguous single-byte storage to preserve element strides.
+    CUDA-allocated pinned memory shares its host and device address under UVA.
+    The byte view requires contiguous single-byte storage to preserve strides.
     """
     if host_tensor.device.type != "cpu":
         raise ValueError(
@@ -1091,6 +1100,56 @@ def _uva_device_view(host_tensor: torch.Tensor) -> torch.Tensor:
         device=torch.device("cuda", torch.cuda.current_device()),
     )
     return view.view(host_tensor.dtype)
+
+
+def _host_numa_table(shape: Tuple[int, ...], dtype: torch.dtype) -> Optional[torch.Tensor]:
+    """Prefer host-NUMA VMM, with a registered host mapping if its node is full."""
+    device = torch.cuda.current_device()
+    numa_node = host_numa_node(device)
+    if numa_node is None:
+        return None
+    nbytes = math.prod(shape) * dtype.itemsize
+    # The driver API maps memory in the context current on this thread.
+    CUASSERT(cudart.cudaSetDevice(device))
+    try:
+        host = HostNumaMem(nbytes, device, numa_node)
+    except HostNumaOutOfMemoryError as error:
+        (can_use_host_pointer,) = CUASSERT(
+            cudart.cudaDeviceGetAttribute(
+                cudart.cudaDeviceAttr.cudaDevAttrCanUseHostPointerForRegisteredMem, device
+            )
+        )
+        if not can_use_host_pointer:
+            logger.warning(f"Engram: {error}; retrying with the default pinned allocator")
+            return None
+        logger.warning(
+            f"Engram: {error}; retrying with CUDA-registered host memory under the process NUMA "
+            "policy. Pages may span NUMA nodes; lookup performance may be lower."
+        )
+        host = HostRegisteredMem(nbytes, device)
+    raw = (ctypes.c_uint8 * nbytes).from_address(host.address)
+    # The tensor's storage keeps ``raw``, and so the mapping, alive.
+    raw.host_mem = host
+    return torch.frombuffer(raw, dtype=torch.uint8).view(dtype).view(shape)
+
+
+def _pinned_host_table(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a page-locked host table for random-row UVA gathers.
+
+    With base pages, nearly every row of a multi-GB table misses the GPU's
+    address-translation caches, capping the gather far below the host-link
+    bandwidth, so tables are mapped in large pages with ``HostNumaMem``. If that
+    NUMA node cannot satisfy the allocation, a CUDA-registered anonymous mapping
+    uses the process NUMA policy and requests transparent huge pages. Devices
+    without host-NUMA virtual memory management use the default pinned allocator,
+    as does construction under an init mode that defers host allocations to the
+    meta device; such tables are materialized later through this function.
+    """
+    if not torch.empty(0, dtype=dtype, device="cpu").is_meta:
+        table = _host_numa_table(shape, dtype)
+        if table is not None:
+            return table
+    return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=prefer_pinned())
 
 
 class MultiHeadEmbedding(nn.Module):
@@ -1441,97 +1500,10 @@ class Engram(nn.Module):
         return output
 
 
-# Rows per program in the fused lookup below. A row is one (token, head) pair, so a
-# block of 16 rows is 16 scattered gathers of `D` bytes; larger blocks buy nothing
-# because the addresses are unrelated and each one misses on its own.
-_LOOKUP_BLOCK_R = 16
-
-# The exponent bitcast needs explicit ue8m0 code 0 (2**-127, FP32 denormal)
-# and code 255 (NaN) handling.
-_E8M0_DENORM = tl.constexpr(5.877471754111438e-39)
-
-
 @lru_cache(maxsize=None)
 def _multi_processor_count(device_index: int) -> int:
     """Cache the fixed per-device SM count to avoid repeated property queries."""
     return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-@triton.jit(
-    do_not_specialize=[
-        "num_rows",
-        "vocab_start",
-        "vocab_end",
-        "ids_stride_t",
-        "ids_stride_h",
-        "grid_size",
-    ]
-)
-def _engram_lookup_kernel(
-    weight_ptr,
-    scale_ptr,
-    ids_ptr,
-    offsets_ptr,
-    out_ptr,
-    vocab_start,
-    vocab_end,
-    num_rows,
-    ids_stride_t,
-    ids_stride_h,
-    grid_size,
-    HEAD_START: tl.constexpr,
-    LOCAL_HEADS: tl.constexpr,
-    DIM: tl.constexpr,
-    DIM_PAD: tl.constexpr,
-    QB: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-    MASKED: tl.constexpr,
-):
-    """Gather and dequantize into contiguous ``[T * LOCAL_HEADS, DIM]`` output.
-
-    A capped grid-stride loop processes ``BLOCK_R`` rows per program, limiting
-    TLB contention and reserving SMs for main-stream work on background calls.
-    Head shards use rebased offsets. Row shards mask unowned values to zero
-    with scale code 127 (1.0), so their contribution is exactly zero.
-    """
-    cols = tl.arange(0, DIM_PAD)
-    in_dim = cols < DIM
-    scale_cols = cols // QB
-    for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, grid_size * BLOCK_R):
-        rows = base + tl.arange(0, BLOCK_R)
-        valid = rows < num_rows
-        # Contiguous [T, LOCAL_HEADS, DIM]: heads are adjacent within each token.
-        head = rows % LOCAL_HEADS
-        token = (rows // LOCAL_HEADS).to(tl.int64)
-        index = tl.load(
-            ids_ptr + token * ids_stride_t + (HEAD_START + head) * ids_stride_h,
-            mask=valid,
-            other=0,
-        ).to(tl.int64)
-        # Keep int64 addressing: ~48M rows * 256 lanes exceeds the int32 range.
-        index += tl.load(offsets_ptr + head, mask=valid, other=0).to(tl.int64)
-        if MASKED:
-            owned = valid & (index >= vocab_start) & (index < vocab_end)
-            local = tl.where(owned, index - vocab_start, 0)
-        else:
-            owned = valid
-            local = index
-        gather = owned[:, None] & in_dim[None, :]
-        values = tl.load(weight_ptr + local[:, None] * DIM + cols[None, :], mask=gather, other=0.0)
-        code = tl.load(
-            scale_ptr + local[:, None] * (DIM // QB) + scale_cols[None, :],
-            mask=gather,
-            other=127,
-        )
-        # ue8m0 codes map to the FP32 exponent field, except 0 and 255 below.
-        scale = (code.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        scale = tl.where(code == 0, _E8M0_DENORM, scale)
-        scale = tl.where(code == 255, float("nan"), scale)
-        tl.store(
-            out_ptr + rows[:, None] * DIM + cols[None, :],
-            (values.to(tl.float32) * scale).to(out_ptr.dtype.element_ty),
-            mask=valid[:, None] & in_dim[None, :],
-        )
 
 
 class ShardedFp8MultiHeadEmbedding(nn.Module):
@@ -1606,23 +1578,11 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         if not prefer_pinned():
             raise RuntimeError("Engram tables require the pinned-memory runtime policy")
         self.weight = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                D,
-                dtype=torch.float8_e4m3fn,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            ),
+            _pinned_host_table((self.part_num_embeddings, D), torch.float8_e4m3fn),
             requires_grad=False,
         )
         self.scale = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                D // block_size,
-                dtype=torch.float8_e8m0fnu,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            ),
+            _pinned_host_table((self.part_num_embeddings, D // block_size), torch.float8_e8m0fnu),
             requires_grad=False,
         )
 
@@ -1639,13 +1599,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             if not prefer_pinned():
                 raise RuntimeError("Engram tables require the pinned-memory runtime policy")
             pinned = nn.Parameter(
-                torch.empty(
-                    param.shape,
-                    device="cpu",
-                    dtype=param.dtype,
-                    pin_memory=prefer_pinned(),
-                ),
-                requires_grad=False,
+                _pinned_host_table(tuple(param.shape), param.dtype), requires_grad=False
             )
             if not pinned.is_pinned():
                 raise RuntimeError(f"Engram {name} allocation is not pinned")
@@ -1726,31 +1680,60 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             return out
         weight, scale = self.storage()
         num_sms = _multi_processor_count(input_ids.device.index)
-        grid_size = min(
-            triton.cdiv(num_rows, _LOOKUP_BLOCK_R),
+        compile_engram_lookup(
+            self.head_start,
+            self.num_local_heads,
+            input_ids.shape[1],
+            self.embedding_dim,
+            self.block_size,
+            # Hashes must stay within each head's bucket. With rebased offsets,
+            # head shards own every lookup and need no ownership mask.
+            not self.shard_heads,
+            self.dtype,
+        )(
+            weight.view(torch.uint8),
+            scale.view(torch.uint8),
+            input_ids,
+            self.offsets,
+            out.view(num_rows, self.embedding_dim),
+            self.vocab_start_idx,
+            self.vocab_end_idx,
             max(1, num_sms // 2) if background else num_sms,
         )
-        _engram_lookup_kernel[(grid_size,)](
-            weight,
-            # Triton reads ue8m0 exponent bytes through uint8.
+        return out
+
+    def forward_packed(
+        self, input_ids: torch.Tensor, max_ctas: Optional[int] = None
+    ) -> torch.Tensor:
+        """``[T, num_heads]`` indices -> uint8 rows of the owned heads' E4M3 bytes, then their
+        UE8M0 codes; the lookup uses at most half the SMs, or ``max_ctas`` CTAs."""
+        local_width = self.num_local_heads * self.embedding_dim
+        out = torch.empty(
+            (input_ids.shape[0], local_width + local_width // self.block_size),
+            dtype=torch.uint8,
+            device=input_ids.device,
+        )
+        weight, scale = self.storage()
+        num_ctas = max(1, _multi_processor_count(input_ids.device.index) // 2)
+        if max_ctas is not None:
+            num_ctas = min(num_ctas, max_ctas)
+        compile_engram_lookup(
+            self.head_start,
+            self.num_local_heads,
+            input_ids.shape[1],
+            self.embedding_dim,
+            self.block_size,
+            False,
+            torch.uint8,
+            packed=True,
+        )(
+            weight.view(torch.uint8),
             scale.view(torch.uint8),
             input_ids,
             self.offsets,
             out,
             self.vocab_start_idx,
             self.vocab_end_idx,
-            num_rows,
-            input_ids.stride(0),
-            input_ids.stride(1),
-            grid_size,
-            HEAD_START=self.head_start,
-            LOCAL_HEADS=self.num_local_heads,
-            DIM=self.embedding_dim,
-            DIM_PAD=triton.next_power_of_2(self.embedding_dim),
-            QB=self.block_size,
-            # Hashes must stay within each head's bucket. With rebased offsets,
-            # head shards own every lookup and need no ownership mask.
-            MASKED=not self.shard_heads,
-            BLOCK_R=_LOOKUP_BLOCK_R,
+            num_ctas,
         )
         return out

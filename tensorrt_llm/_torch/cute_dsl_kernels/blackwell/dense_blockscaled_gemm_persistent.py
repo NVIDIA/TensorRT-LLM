@@ -94,6 +94,49 @@ def _indexer_q_pack_fp4x4(value0: cutlass.Float32,
         ))
 
 
+@dsl_user_op
+def _q_rope_mul_add(a: cutlass.Float32,
+                    b: cutlass.Float32,
+                    c: cutlass.Float32,
+                    d: cutlass.Float32,
+                    *,
+                    loc=None,
+                    ip=None) -> cutlass.Float32:
+    """Preserve the CUDA RoPE kernel's rounded product followed by FMA."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            cutlass.Float32.mlir_type,
+            [value.ir_value(loc=loc, ip=ip) for value in (a, b, c, d)],
+            "{ .reg .f32 product; mul.rn.f32 product, $3, $4; fma.rn.f32 $0, $1, $2, product; }",
+            "=f,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip))
+
+
+@dsl_user_op
+def _bf16x2_abs_max(a: cutlass.Uint32,
+                    b: cutlass.Uint32,
+                    *,
+                    loc=None,
+                    ip=None) -> cutlass.Uint32:
+    """Lane-wise max(|a|, |b|) of two BF16 pairs; NaN wins and sign bits are meaningless."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            cutlass.Uint32.mlir_type,
+            [a.ir_value(loc=loc, ip=ip),
+             b.ir_value(loc=loc, ip=ip)],
+            "max.NaN.xorsign.abs.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip))
+
+
 class Sm100BlockScaledPersistentDenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and Blackwell GPU architectural features, including persistent tile scheduling and warp specialization.
@@ -137,6 +180,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         raster_along_m: bool = True,
         indexer_q_fusion: bool = False,
         indexer_transform_warps: int = 4,
+        q_rope_fusion: bool = False,
+        mxfp8_out: bool = False,
+        q_fp8_amax: bool = False,
+        q_fp8_only: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -160,6 +207,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
             swizzle_size (int): Tile-scheduler swizzle size in clusters (default 1).
             raster_along_m (bool): Tile-scheduler rasterization order (default M-major).
+            mxfp8_out (bool): Quantize each BF16 output row's 32-column epilogue slices to
+                MXFP8 into ``q_fp8_tensor`` with UE8M0 scales in ``out_scale_tensor``, laid
+                out as the CUTLASS 128x4 activation scales of a ``[M, N * L]`` operand, and
+                skip the BF16 store.
+            q_fp8_amax (bool): With ``q_rope_fusion``, store only the unit-scale E4M3
+                output into ``q_fp8_tensor`` (no BF16 store) and raise ``q_amax_tensor[0]``
+                to the FP32 bits of the largest rotated BF16 magnitude (one atomic max per
+                epilogue warp).
+            q_fp8_only (bool): With ``q_rope_fusion``, store only the unit-scale E4M3
+                output into ``q_fp8_tensor`` (no BF16 store, no amax); implied by
+                ``q_fp8_amax``.
         """
 
         self.acc_dtype = cutlass.Float32
@@ -172,6 +230,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.swizzle_size = swizzle_size
         self.raster_along_m = raster_along_m
         self.indexer_q_fusion = indexer_q_fusion
+        self.q_rope_fusion = q_rope_fusion
+        self.mxfp8_out = mxfp8_out
+        self.q_fp8_amax = q_fp8_amax
+        self.q_fp8_only = q_fp8_only or q_fp8_amax
         self.indexer_transform_warps = indexer_transform_warps
         if self.indexer_q_fusion and (sf_vec_size != 32 or mma_tiler_mn[0]
                                       != 128 or mma_tiler_mn[1] != 16
@@ -318,6 +380,24 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         self.epi_tile_n = cute.size(self.epi_tile[1])
+        if self.q_rope_fusion and (
+                self.indexer_q_fusion or self.sf_vec_size != 32
+                or self.c_layout != utils.LayoutEnum.ROW_MAJOR
+                or self.c_dtype != cutlass.BFloat16
+                or cute.size(self.epi_tile[0]) != 128 or self.epi_tile_n != 32):
+            raise ValueError(
+                "Q RoPE fusion requires row-major BF16 MXFP8 with 128x32-aligned epilogue tiles"
+            )
+        if self.mxfp8_out and (self.indexer_q_fusion or self.q_rope_fusion
+                               or self.c_layout != utils.LayoutEnum.ROW_MAJOR
+                               or self.c_dtype != cutlass.BFloat16
+                               or cute.size(self.epi_tile[0]) != 128
+                               or self.epi_tile_n != 32):
+            raise ValueError(
+                "MXFP8 output requires row-major BF16 with 128x32 epilogue tiles"
+            )
+        if self.q_fp8_only and (not self.q_rope_fusion or self.mxfp8_out):
+            raise ValueError("Q FP8-only output requires the Q RoPE fusion")
         expected_indexer_epi_n = min(self.mma_tiler[1], 32)
         if (self.indexer_q_fusion
                 and (cute.size(self.epi_tile[0]) != 128
@@ -342,6 +422,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.sf_vec_size,
             self.smem_capacity,
             self.occupancy,
+            self.q_fp8_fusion,
         )
 
         # Compute A/B/SFA/SFB/C shared memory layout
@@ -375,6 +456,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epi_tile,
             self.num_c_stage,
         )
+        self.q_fp8_smem_size = 0
+        self.q_fp8_smem_layout = None
+        if self.q_fp8_fusion:
+            self.q_fp8_smem_layout = sm100_utils.make_smem_layout_epi(
+                cutlass.Float8E4M3FN, self.c_layout, self.epi_tile,
+                self.num_c_stage)
+            self.q_fp8_smem_size = cute.cosize(self.q_fp8_smem_layout.outer)
 
         self.overlapping_accum = self.num_acc_stage == 1
         if self.indexer_q_fusion and self.overlapping_accum:
@@ -413,6 +501,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         indexer_scale_tensor: Optional[cute.Tensor] = None,
         position_ids_tensor: Optional[cute.Tensor] = None,
         cos_sin_cache_tensor: Optional[cute.Tensor] = None,
+        q_fp8_tensor: Optional[cute.Tensor] = None,
+        out_scale_tensor: Optional[cute.Tensor] = None,
+        q_amax_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -444,6 +535,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.b_major_mode = utils.LayoutEnum.from_tensor(
             b_tensor).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
+        self.q_fp8_fusion = q_fp8_tensor is not None
+        if cutlass.const_expr(
+                self.mxfp8_out
+                and (q_fp8_tensor is None or out_scale_tensor is None)):
+            raise ValueError(
+                "MXFP8 output requires the E4M3 output and its scale tensor")
+        if cutlass.const_expr(self.q_fp8_amax and
+                              (q_fp8_tensor is None or q_amax_tensor is None)):
+            raise ValueError(
+                "Q FP8 amax output requires the E4M3 output and the amax word")
+        if cutlass.const_expr(self.q_fp8_only and q_fp8_tensor is None):
+            raise ValueError("Q FP8-only output requires the E4M3 output")
 
         if cutlass.const_expr(
                 self.indexer_q_fusion and
@@ -584,6 +687,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             epi_smem_layout,
             self.epi_tile,
         )
+        tma_atom_q_fp8 = None
+        tma_tensor_q_fp8 = None
+        if cutlass.const_expr(self.q_fp8_fusion):
+            tma_atom_q_fp8, tma_tensor_q_fp8 = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), q_fp8_tensor,
+                cute.slice_(self.q_fp8_smem_layout, (None, None, 0)),
+                self.epi_tile)
 
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
@@ -616,6 +726,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     self.c_dtype,
                     cute.cosize(self.c_smem_layout_staged.outer),
                 ],
+                self.buffer_align_bytes,
+            ]
+            sQFp8: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E4M3FN,
+                                     self.q_fp8_smem_size],
                 self.buffer_align_bytes,
             ]
             # (MMA, MMA_M, MMA_K, STAGE)
@@ -665,6 +780,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             indexer_scale_tensor,
             position_ids_tensor,
             cos_sin_cache_tensor,
+            tma_atom_q_fp8,
+            tma_tensor_q_fp8,
+            out_scale_tensor,
+            q_amax_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -672,6 +791,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.c_smem_layout_staged,
+            self.q_fp8_smem_layout,
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
@@ -707,6 +827,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mIndexerScale_nml: Optional[cute.Tensor],
         mPositionIds: Optional[cute.Tensor],
         mCosSinCache: Optional[cute.Tensor],
+        tma_atom_q_fp8: Optional[cute.CopyAtom],
+        mQFp8: Optional[cute.Tensor],
+        mOutScale: Optional[cute.Tensor],
+        mQAmax: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -714,6 +838,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
+        q_fp8_smem_layout: Optional[cute.ComposedLayout],
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
@@ -736,6 +861,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
             cpasync.prefetch_descriptor(tma_atom_c)
+            if cutlass.const_expr(self.q_fp8_fusion):
+                cpasync.prefetch_descriptor(tma_atom_q_fp8)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -813,6 +940,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = storage.sC.get_tensor(c_smem_layout_staged.outer,
                                    swizzle=c_smem_layout_staged.inner)
+        if cutlass.const_expr(self.q_fp8_fusion):
+            sQFp8 = storage.sQFp8.get_tensor(q_fp8_smem_layout.outer,
+                                             swizzle=q_fp8_smem_layout.inner)
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer,
                                    swizzle=a_smem_layout_staged.inner)
@@ -884,6 +1014,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        if cutlass.const_expr(self.q_fp8_fusion):
+            gQFp8 = cute.local_tile(
+                mQFp8, cute.slice_(self.mma_tiler, (None, None, 0)),
+                (None, None, None))
+            tCgQFp8 = thr_mma.partition_C(gQFp8)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1410,6 +1545,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_atom_c, bSG_sC, bSG_gC_partitioned = (
                 self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC,
                                                     epi_tile, sC))
+            if cutlass.const_expr(self.q_fp8_fusion):
+                tTR_rQFp8 = cute.make_rmem_tensor(tTR_rAcc.shape,
+                                                  cutlass.Float8E4M3FN)
+                copy_r2s_q_fp8, tRS_rQFp8, tRS_sQFp8 = self.epilog_smem_copy_and_partition(
+                    tiled_copy_t2r, tTR_rQFp8, epi_tidx, sQFp8)
+                tma_atom_q_fp8, bSG_sQFp8, bSG_gQFp8_partitioned = self.epilog_gmem_copy_and_partition(
+                    epi_tidx, tma_atom_q_fp8, tCgQFp8, epi_tile, sQFp8)
 
             #
             # Persistent tile scheduling loop
@@ -1420,6 +1562,24 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage)
+            # Two BF16 lanes whose magnitudes hold the largest |C| seen.
+            q_amax = cutlass.Uint32(0)
+            rope = None
+            rope_next = None
+            lookahead = None
+            if cutlass.const_expr(self.q_rope_fusion):
+                # This thread's token row of the RoPE table (32 cosines, then 32 sines) for
+                # the current tile; the next tile's row loads one tile ahead.
+                rope = cute.make_rmem_tensor((64, ), cutlass.Float32)
+                rope_next = cute.make_rmem_tensor((64, ), cutlass.Float32)
+                lookahead = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(),
+                    cute.arch.grid_dim())
+                first = lookahead.get_current_work()
+                if first.is_valid_tile:
+                    self._q_rope_load(first.tile_idx[0], first.tile_idx[1],
+                                      mPositionIds, mCosSinCache, rope)
+                lookahead.advance_to_next_work()
 
             # Threads/warps participating in tma store pipeline
             c_producer_group = pipeline.CooperativeGroup(
@@ -1451,6 +1611,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     None,
                     *mma_tile_coord_mnl,
                 )]
+                if cutlass.const_expr(self.q_fp8_fusion):
+                    bSG_gQFp8 = bSG_gQFp8_partitioned[(None, None, None,
+                                                       *mma_tile_coord_mnl)]
 
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1465,6 +1628,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None,
                                           acc_stage_index)]
 
+                if cutlass.const_expr(self.q_rope_fusion):
+                    upcoming = lookahead.get_current_work()
+                    if upcoming.is_valid_tile:
+                        self._q_rope_load(upcoming.tile_idx[0],
+                                          upcoming.tile_idx[1], mPositionIds,
+                                          mCosSinCache, rope_next)
+                    lookahead.advance_to_next_work()
+
                 #
                 # Wait for accumulator buffer full
                 #
@@ -1472,6 +1643,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                if cutlass.const_expr(self.q_fp8_fusion):
+                    bSG_gQFp8 = cute.group_modes(bSG_gQFp8, 1,
+                                                 cute.rank(bSG_gQFp8))
 
                 #
                 # Store accumulator to global memory in sub-tiles
@@ -1509,17 +1683,37 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     acc_vec = epilogue_op(alpha_value *
                                           acc_vec.to(self.c_dtype))
                     tRS_rC.store(acc_vec)
+                    if cutlass.const_expr(self.q_rope_fusion):
+                        self._q_rope_transform(tRS_rC, cur_tile_coord[0],
+                                               cur_tile_coord[1],
+                                               real_subtile_idx, mPositionIds,
+                                               rope)
+                    if cutlass.const_expr(self.mxfp8_out):
+                        self._mxfp8_out_transform(tRS_rC, cur_tile_coord[0],
+                                                  cur_tile_coord[1],
+                                                  cur_tile_coord[2],
+                                                  real_subtile_idx, mC_mnl,
+                                                  mOutScale)
+                    if cutlass.const_expr(self.q_fp8_amax):
+                        q_amax = self._q_amax_update(tRS_rC, cur_tile_coord[0],
+                                                     mC_mnl, q_amax)
 
                     #
                     # Store C to shared memory
                     #
                     c_buffer = (num_prev_subtiles +
                                 subtile_idx) % self.num_c_stage
-                    cute.copy(
-                        tiled_copy_r2s,
-                        tRS_rC,
-                        tRS_sC[(None, None, None, c_buffer)],
-                    )
+                    if cutlass.const_expr(not (
+                            self.mxfp8_out or self.q_fp8_only)):
+                        cute.copy(
+                            tiled_copy_r2s,
+                            tRS_rC,
+                            tRS_sC[(None, None, None, c_buffer)],
+                        )
+                    if cutlass.const_expr(self.q_fp8_fusion):
+                        tRS_rQFp8.store(tRS_rC.load().to(cutlass.Float8E4M3FN))
+                        cute.copy(copy_r2s_q_fp8, tRS_rQFp8,
+                                  tRS_sQFp8[(None, None, None, c_buffer)])
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
                         "async.shared",
@@ -1553,11 +1747,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         )
                     else:
                         if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
-                                tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, real_subtile_idx)],
-                            )
+                            if cutlass.const_expr(not (
+                                    self.mxfp8_out or self.q_fp8_only)):
+                                cute.copy(
+                                    tma_atom_c,
+                                    bSG_sC[(None, c_buffer)],
+                                    bSG_gC[(None, real_subtile_idx)],
+                                )
+                            if cutlass.const_expr(self.q_fp8_fusion):
+                                cute.copy(tma_atom_q_fp8,
+                                          bSG_sQFp8[(None, c_buffer)],
+                                          bSG_gQFp8[(None, real_subtile_idx)])
                             # Fence and barrier to make sure shared memory store is visible to TMA store
                             c_pipeline.producer_commit()
                             c_pipeline.producer_acquire()
@@ -1573,12 +1773,28 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     with cute.arch.elect_one():
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
+                if cutlass.const_expr(self.q_rope_fusion):
+                    rope.store(rope_next.load())
 
                 #
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+
+            if cutlass.const_expr(self.q_fp8_amax):
+                # Sign-cleared FP32 bit patterns order as integers, NaN above infinity.
+                largest = cutlass.Int32((q_amax & cutlass.Uint32(0x7FFF)) << 16)
+                high = cutlass.Int32(q_amax & cutlass.Uint32(0x7FFF0000))
+                if high > largest:
+                    largest = high
+                for offset in cutlass.range_constexpr(5):
+                    other = cute.arch.shuffle_sync_bfly(largest,
+                                                        offset=1 << offset)
+                    if other > largest:
+                        largest = other
+                if cute.arch.lane_idx() == 0 and largest > 0:
+                    cute.arch.atomic_max(mQAmax.iterator, largest)
 
             #
             # Dealloc the tensor memory buffer
@@ -1652,6 +1868,130 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     work_tile = tile_sched.get_current_work()
 
         griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _mxfp8_out_transform(
+        self,
+        rC: cute.Tensor,
+        tile_m: cutlass.Int32,
+        tile_n: cutlass.Int32,
+        tile_l: cutlass.Int32,
+        subtile: cutlass.Int32,
+        mC: cute.Tensor,
+        scales: cute.Tensor,
+    ):
+        """Scale this thread's 32 BF16 row values to E4M3 range and store their UE8M0 byte.
+
+        The scaled values are exact in BF16; the FP8 store converts them. Rows past M
+        up to the next multiple of 128 store a zero scale; rows beyond store none.
+        """
+        thread = cute.arch.thread_idx()[0]
+        row = tile_m * self.cta_tile_shape_mnk[0] + thread
+        width = mC.shape[1]
+        block = (tile_l * width + tile_n * self.cta_tile_shape_mnk[1] +
+                 subtile * self.epi_tile_n) // 32
+        values = cute.make_tensor(rC.iterator, cute.make_layout(32))
+        amax = cutlass.Float32(0.0)
+        for column in cutlass.range_constexpr(32):
+            value = values[column].to(cutlass.Float32)
+            amax = cute.arch.fmax(amax, cute.arch.fmax(value, -value))
+        bits = cutlass.Uint32(
+            llvm.bitcast(cutlass.Uint32.mlir_type,
+                         (amax * cutlass.Float32(1.0 / 448.0)).ir_value()))
+        exponent = (bits >> 23) & cutlass.Uint32(255)
+        if bits & cutlass.Uint32(0x7FFFFF) != cutlass.Uint32(0):
+            exponent = exponent + cutlass.Uint32(1)
+        if exponent > cutlass.Uint32(254):
+            exponent = cutlass.Uint32(254)
+        reciprocal = cutlass.Float32(
+            llvm.bitcast(cutlass.Float32.mlir_type,
+                         ((cutlass.Uint32(254) - exponent) << 23).ir_value()))
+        if amax == cutlass.Float32(0.0):
+            reciprocal = cutlass.Float32(0.0)
+        for column in cutlass.range_constexpr(32):
+            values[column] = (values[column].to(cutlass.Float32) *
+                              reciprocal).to(cutlass.BFloat16)
+        if row >= mC.shape[0]:
+            exponent = cutlass.Uint32(0)
+        blocks = width * mC.shape[2] // 32
+        offset = ((row // 128) * blocks * 128 + (block // 4) * 512 +
+                  (row % 32) * 16 + ((row % 128) // 32) * 4 + block % 4)
+        if row < (mC.shape[0] + 127) // 128 * 128:
+            scales[offset] = cutlass.Uint8(exponent)
+
+    @cute.jit
+    def _q_amax_update(
+        self,
+        rC: cute.Tensor,
+        tile_m: cutlass.Int32,
+        mC: cute.Tensor,
+        largest: cutlass.Uint32,
+    ) -> cutlass.Uint32:
+        """Fold this thread's 32 BF16 row values into the BF16 pair ``largest``.
+
+        Rows past M do not count.
+        """
+        thread = cute.arch.thread_idx()[0]
+        result = largest
+        if tile_m * self.cta_tile_shape_mnk[0] + thread < mC.shape[0]:
+            pairs = cute.recast_tensor(
+                cute.make_tensor(rC.iterator, cute.make_layout(32)),
+                cutlass.Uint32)
+            for index in cutlass.range_constexpr(16):
+                result = _bf16x2_abs_max(result, pairs[index])
+        return result
+
+    @cute.jit
+    def _q_rope_load(
+        self,
+        tile_m: cutlass.Int32,
+        tile_n: cutlass.Int32,
+        positions: cute.Tensor,
+        cos_sin: cute.Tensor,
+        rope: cute.Tensor,
+    ):
+        """Load this thread's token row of ``cos_sin`` if the tile holds rotary channels."""
+        thread = cute.arch.thread_idx()[0]
+        token = tile_m * self.cta_tile_shape_mnk[0] + thread
+        first = tile_n * self.cta_tile_shape_mnk[1] % 512
+        if token < positions.shape[0]:
+            if first + self.cta_tile_shape_mnk[1] > 448:
+                rope.store(cos_sin[positions[token], None].load())
+
+    @cute.jit
+    def _q_rope_transform(
+        self,
+        rC: cute.Tensor,
+        tile_m: cutlass.Int32,
+        tile_n: cutlass.Int32,
+        subtile: cutlass.Int32,
+        positions: cute.Tensor,
+        rope: cute.Tensor,
+    ):
+        """Rotate the 32 contiguous BF16 Q channels owned by each epilogue thread."""
+        thread = cute.arch.thread_idx()[0]
+        column_base = tile_n * self.cta_tile_shape_mnk[
+            1] + subtile * self.epi_tile_n
+        token = tile_m * self.cta_tile_shape_mnk[0] + thread
+        values = cute.make_tensor(rC.iterator, cute.make_layout(32))
+        if token < positions.shape[0]:
+            if column_base % 512 >= 480:
+                self._q_rope_rotate(values, rope, 16)
+            elif column_base % 512 >= 448:
+                self._q_rope_rotate(values, rope, 0)
+
+    @cute.jit
+    def _q_rope_rotate(self, values: cute.Tensor, rope: cute.Tensor,
+                       first_pair: cutlass.Constexpr):
+        for pair in cutlass.range_constexpr(16):
+            x = values[2 * pair].to(cutlass.Float32)
+            y = values[2 * pair + 1].to(cutlass.Float32)
+            cosine = rope[first_pair + pair]
+            sine = rope[first_pair + pair + 32]
+            values[2 * pair] = _q_rope_mul_add(cosine, x, -sine,
+                                               y).to(cutlass.BFloat16)
+            values[2 * pair + 1] = _q_rope_mul_add(sine, x, cosine,
+                                                   y).to(cutlass.BFloat16)
 
     @cute.jit
     def _indexer_q_transform_rows(
@@ -1899,9 +2239,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 - tRS_sC: The partitioned tensor C (smem destination)
         """
         copy_atom_r2s = sm100_utils.get_smem_store_op(self.c_layout,
-                                                      self.c_dtype,
+                                                      tTR_rC.element_type,
                                                       self.acc_dtype,
                                                       tiled_copy_t2r)
+        if self.q_rope_fusion and tTR_rC.element_type == cutlass.Float8E4M3FN:
+            copy_atom_r2s = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(),
+                                                cutlass.Float8E4M3FN,
+                                                num_bits_per_copy=128)
         tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         # (R2S, R2S_M, R2S_N, PIPE_D)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
@@ -1968,6 +2312,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         smem_capacity: int,
         occupancy: int,
+        q_fp8_fusion: bool = False,
     ) -> Tuple[int, int, int]:
         """Computes the optimal number of pipeline stages for operands.
 
@@ -2042,6 +2387,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mbar_helpers_bytes = 1024
         c_bytes_per_stage = cute.size_in_bytes(c_dtype,
                                                c_smem_layout_staged_one)
+        if q_fp8_fusion:
+            c_bytes_per_stage += cute.size_in_bytes(
+                cutlass.Float8E4M3FN,
+                sm100_utils.make_smem_layout_epi(cutlass.Float8E4M3FN, c_layout,
+                                                 epi_tile, 1))
         c_bytes = c_bytes_per_stage * num_c_stage
 
         # Calculate A/B/SFA/SFB stages:

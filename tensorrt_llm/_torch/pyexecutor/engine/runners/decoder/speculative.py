@@ -35,7 +35,7 @@ def create_spec_metadata(
     spec_resource_manager: BaseResourceManager | None,
 ) -> SpecMetadata | None:
     """Create speculative metadata sized by the runner capacities."""
-    return get_spec_metadata(
+    metadata = get_spec_metadata(
         config.spec_config,
         pretrained_config,
         config.max_batch_size,
@@ -44,6 +44,9 @@ def create_spec_metadata(
         max_seq_len=config.max_seq_len,
         num_seq_slots=config.num_seq_slots,
     )
+    if metadata is not None:
+        metadata.samples_from_vocab_shards = config.samples_from_vocab_shards
+    return metadata
 
 
 def update_spec_metadata(

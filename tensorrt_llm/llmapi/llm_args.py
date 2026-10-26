@@ -1660,8 +1660,15 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         )
 
 
-class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
-    """Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend."""
+class CSA2SparseAttentionConfig(DeepSeekSparseAttentionConfig):
+    """Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend.
+
+    The indexer runtime options are shared with DSA. The indexer geometry
+    (``index_n_heads``, ``index_head_dim``, ``index_topk``), the index cache
+    format and RoPE layout come from the checkpoint, so ``indexer_k_dtype``,
+    ``indexer_rope_interleave``, ``index_share_for_mtp_iteration`` and
+    ``seq_len_threshold`` do not apply to CSA2.
+    """
     algorithm: Literal["csa2"] = "csa2"
     use_fp8_staging: Optional[bool] = Field(
         default=None,
@@ -1675,9 +1682,30 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
         "kv_cache_config.dtype, and no packed sparse attention. Set True to "
         "require it, which rejects a configuration that cannot serve it instead "
         "of falling back, or False to pin BF16 staging.")
+    use_cute_dsl_topk: bool = Field(
+        default=True,
+        description=
+        "Whether to use the CuTe DSL radix Top-K kernel instead of the CUDA "
+        "C++ radix Top-K on SM100-family GPUs.")
+
+    @model_validator(mode="after")
+    def _validate_gvr_emission(self):
+        if self.use_gvr_emission and (not self.enable_heuristic_topk
+                                      or self.use_self_sampling_topk or
+                                      not self.use_cute_dsl_paged_mqa_logits):
+            raise ValueError(
+                "use_gvr_emission requires enable_heuristic_topk=True, "
+                "use_self_sampling_topk=False and "
+                "use_cute_dsl_paged_mqa_logits=True")
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        # CSA2 skips the indexer inside its graphs instead of capturing a
+        # separate short-sequence family.
+        return False
 
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
@@ -1686,6 +1714,12 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
         return CSA2Params(
             layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")),
             use_fp8_staging=self.use_fp8_staging,
+            skip_indexer_for_short_seqs=self.skip_indexer_for_short_seqs,
+            use_cute_dsl_topk=self.use_cute_dsl_topk,
+            use_cute_dsl_paged_mqa_logits=self.use_cute_dsl_paged_mqa_logits,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1693,7 +1727,10 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
             CSA2Layout, CSA2MetadataParams)
 
         return CSA2MetadataParams(
-            layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")))
+            layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")),
+            indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
+            q_split_threshold=self.q_split_threshold,
+        )
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
@@ -2059,6 +2096,20 @@ class AttentionDpConfig(StrictBaseModel):
             "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_strict_conversation_affinity: bool = Field(
+        default=False,
+        description=
+        "Admit a later turn of a conversation only on its conversation's rank. "
+        "While that rank is at its active-request limit, the turn waits in the "
+        "queue in arrival order and the requests behind it are still admitted, "
+        "instead of overflowing to a rank that does not cache its prefix. Only "
+        "used when kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_strict_affinity_max_wait_iters: NonNegativeInt = Field(
+        default=0,
+        description=
+        "Scheduler iterations a turn may wait for its conversation's rank under "
+        "kv_cache_routing_strict_conversation_affinity before it overflows to "
+        "another rank; 0 waits without limit.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -3623,6 +3674,26 @@ class AutoDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class PromptTokenCacheConfig(StrictBaseModel):
+    """Token ids of earlier prompts, shared by all serving frontends of a node.
+
+    A multi-turn prompt repeats the previous turn's prompt; frontends that support the
+    cache tokenize only the text after the longest cached prefix. The ids always equal a
+    full tokenization.
+    """
+
+    path: str = Field(
+        description=
+        "Directory for the cache on a node-local file system such as a tmpfs, created "
+        "if missing. Every frontend of the server must use the same directory.",
+        status="prototype")
+    max_bytes: PositiveInt = Field(
+        description=
+        "Cap on the cached bytes in ``path``; the least recently used entries "
+        "are evicted first.",
+        status="prototype")
+
+
 class PrometheusMetricsConfig(StrictBaseModel):
     """Configuration for Prometheus metrics collection.
 
@@ -4609,6 +4680,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=None,
         description=
         "Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used."
+    )
+    host_cache_bind_to_gpu_numa_node: bool = Field(
+        default=False,
+        description=
+        "Allocate the host cache tier only on the GPU's host NUMA node, reclaiming page "
+        "cache there instead of spilling to another node. Startup fails on every rank when "
+        "that node cannot hold the tiers of all co-located ranks. Only used by KV cache "
+        "manager v2 in the PyTorch backend, on devices that report a host NUMA node."
     )
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
@@ -6303,6 +6382,14 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
+        status="prototype")
+
+    prompt_token_cache_config: Optional[PromptTokenCacheConfig] = Field(
+        default=None,
+        description=
+        "Prompt token ids shared by all serving frontends of a node, for multi-turn prompts. "
+        "Used by input processors that support it (DeepSeek-V4.1), where it takes precedence "
+        "over enable_tokenization_cache.",
         status="prototype")
 
     enable_iter_req_stats: bool = Field(

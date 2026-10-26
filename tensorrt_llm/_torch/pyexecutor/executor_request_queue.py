@@ -9,6 +9,8 @@ import threading
 import time
 from typing import Iterable, List, Optional
 
+import numpy as np
+
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
@@ -54,6 +56,12 @@ class RequestQueueItem:
     # applies when the broadcast reaches them.
     profile_config: Optional[dict] = None
     finished_prefix_load_ids: Optional[list[int]] = None
+    # Waiting-queue passes that left this request queued because its rank was full.
+    admission_wait_iters: int = 0
+    # Prompt length, kept when ``request`` travels without its prompt, and the prompt
+    # itself on the rank that owns such a request (see RequestBroadcaster).
+    num_input_tokens: Optional[int] = None
+    prompt_token_ids: Optional[np.ndarray] = None
 
     @property
     def is_shutdown_request(self):
@@ -236,7 +244,8 @@ class ExecutorRequestQueue:
                 self.request_queue.put(
                     RequestQueueItem(req_id,
                                      request,
-                                     child_req_ids=child_req_ids))
+                                     child_req_ids=child_req_ids,
+                                     num_input_tokens=request.num_input_tokens))
                 req_ids.append(req_id)
         return req_ids
 

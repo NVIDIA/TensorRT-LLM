@@ -54,6 +54,23 @@ including input tokens of requests assigned in the current batch. The default
 is `round_robin`; `least_queued` uses active-request counts. Existing
 conversation affinity still applies.
 
+By default a later turn whose rank is at its active-request limit overflows to
+another rank, where its prefix is not cached. Under saturation that turns cached
+turns into full prefills. `kv_cache_routing_strict_conversation_affinity: true`
+keeps such a turn queued, in arrival order, until its rank has a slot; requests
+behind it are still admitted. `kv_cache_routing_strict_affinity_max_wait_iters`
+bounds that wait in scheduler iterations (0, the default, waits without limit).
+
+With KV cache manager V2 and chunked prefill, the router can also keep long
+uncached prefills from holding the token budget while short turns wait. It
+estimates each turn's uncached prefill: the tokens added since the
+conversation's previous prompt, or the whole prompt for a first turn. The
+environment variable `TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS` schedules a request
+estimated above that many tokens after the other context requests of each
+iteration, and `TLLM_V2_CTX_DEMOTE_MAX_ITERS` bounds how many consecutive
+iterations a request is demoted before it keeps its arrival order (0, the
+default, means no limit). Both default to off.
+
 Use `/v1/chat/completions` for both instance and ADP-rank affinity. The
 `/v1/completions` endpoint supports instance affinity only.
 

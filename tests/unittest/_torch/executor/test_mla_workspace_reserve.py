@@ -252,6 +252,9 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
             index_topk=512,
             sliding_window=128,
         )
+        model_config.sparse_attention_config.indexer_max_chunk_size = None
+        model_config.max_num_tokens = 8192
+        model_config.max_seq_len = 8192
     w = get_attention_workspace_bytes_per_token(
         model_config,
         SimpleNamespace(enable_attention_dp=False, tp_size=8),

@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInp
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import make_weak_ref
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -303,6 +305,24 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
     assert body.forward == original_forward
 
 
+def test_runner_skips_capture_after_warmup_when_batch_is_ineligible():
+    body = _Body().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    inputs = {"value": torch.zeros((8, 4), device="cuda")}
+    calls = 0
+
+    def engine_forward():
+        nonlocal calls
+        calls += 1
+        return body(inputs["value"])
+
+    assert not runner.capture(8, engine_forward, can_capture=lambda: False)
+    assert calls == runner._WARMUP_STEPS
+    assert not runner.has_graph(8)
+    assert runner.state is BreakableCUDAGraphRunnerState.IDLE
+    assert runner._memory_pool is None
+
+
 def test_runner_first_bucket_segments_share_one_memory_pool():
     class BreakableBody(nn.Module):
         @staticmethod
@@ -361,6 +381,68 @@ def test_runner_graph_miss_nested_execute_and_exception_recovery():
         runner.execute(4, fail)
     assert runner.state == BreakableCUDAGraphRunnerState.IDLE
     assert body.forward == original_forward
+
+
+def test_runner_refreshes_pre_capture_state_through_a_model_wrapper():
+    """Replay matches eager when the body reads state computed outside capture (Engram hashes)."""
+
+    class StatefulBody(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hashes = torch.zeros((8, 4), device="cuda")
+
+        def refresh(self, value):
+            self.hashes[: value.shape[0]].copy_(value * 10)
+
+        def forward(self, value):
+            if not torch.cuda.is_current_stream_capturing():
+                self.refresh(value)
+            return value + self.hashes[: value.shape[0]]
+
+    body = StatefulBody().cuda()
+
+    class CausalLM(DecoderModelForCausalLM):
+        def prepare_breakable_cuda_graph_replay(self, inputs):
+            self.model.refresh(inputs["value"])
+
+        def forward(self, value):
+            return self.model(value=value)
+
+    causal_lm = object.__new__(CausalLM)
+    nn.Module.__init__(causal_lm)
+    causal_lm.model = body
+
+    class Wrapper(nn.Module):
+        """Exposes the causal LM only as ``llm``, like a multimodal model."""
+
+        def __init__(self):
+            super().__init__()
+            self.llm = causal_lm
+
+        def forward(self, value):
+            return self.llm(value)
+
+    model = Wrapper()
+    decoder_runner = object.__new__(DecoderRunner)
+    decoder_runner.model = model
+    decoder_runner.cuda_graph_runner = object()
+    decoder_runner._config = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE
+    )
+    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    staged = torch.zeros((4, 4), device="cuda")
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: model(staged))
+        return model(staged)
+
+    runner.capture(4, engine_forward)
+    for value in (2.0, 7.0):
+        staged.fill_(value)
+        replayed = runner.execute(4, engine_forward).clone()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replayed, model(staged))
 
 
 def test_runner_warmup_exception_restores_idle_state():
