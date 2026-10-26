@@ -76,14 +76,16 @@ TRTLLM_NAMESPACE_BEGIN
 namespace common::nccl_util
 {
 
-// Record a non-owning association with the matching host group. Explicit ranks select
-// members of an existing host communicator; no new host communicator is created.
-// An empty process-group rank list selects the entire process group.
+// Associate comm with ranks in an existing host communicator without taking ownership.
+// The caller must keep hostComm valid until comm is destroyed.
 void registerHostCommunicator(ncclComm_t comm, MPI_Comm hostComm, std::vector<int> const& ranks);
+
+// Associate comm with a weak reference to hostComm. Empty ranks selects the entire group.
+// Consensus fails if hostComm has expired.
 void registerHostCommunicator(
     ncclComm_t comm, c10::intrusive_ptr<c10d::ProcessGroup> const& hostComm, std::vector<int> ranks = {});
 
-// Blocking CPU consensus; throws if the matching host group is missing or expired.
+// Blocking host consensus: returns true only if every participating rank votes true.
 // Votes on overlapping groups sharing a host communicator must run in matching order across ranks.
 bool hostAllTrue(ncclComm_t comm, bool localOk);
 

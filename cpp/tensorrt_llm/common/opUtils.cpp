@@ -65,7 +65,7 @@ ncclUniqueId getUniqueId(std::set<int> const& group)
         ncclUniqueId id{};
         auto bytes = at::from_blob(&id, {sizeof(id)}, at::TensorOptions().dtype(at::kByte));
         int const root = *group.begin();
-        int const tag = static_cast<int>(mpi::MpiTag::kDefault);
+        int const tag = static_cast<int>(mpi::MpiTag::kNcclUniqueId);
         if (pg->getRank() == root)
         {
             NCCLCHECK_THROW(ncclGetUniqueId(&id));
@@ -91,12 +91,12 @@ ncclUniqueId getUniqueId(std::set<int> const& group)
         NCCLCHECK_THROW(ncclGetUniqueId(&id));
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
-            COMM_SESSION.sendValue(id, *it, tensorrt_llm::mpi::MpiTag::kDefault);
+            COMM_SESSION.sendValue(id, *it, tensorrt_llm::mpi::MpiTag::kNcclUniqueId);
         }
     }
     else
     {
-        COMM_SESSION.recvValue(id, *group.begin(), tensorrt_llm::mpi::MpiTag::kDefault);
+        COMM_SESSION.recvValue(id, *group.begin(), tensorrt_llm::mpi::MpiTag::kNcclUniqueId);
     }
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return id;
