@@ -66,6 +66,8 @@ from tensorrt_llm._torch.speculative.interface import \
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata)
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor)
 from tensorrt_llm.llmapi import (CudaGraphConfig, MTPDecodingConfig,
@@ -382,6 +384,7 @@ def _make_forward_only_engine(
     decoder._get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
     engine.iter_states = decoder._iter_states = {}
     decoder.forward_pass_callable = None
+    decoder.start_beam_histories_callable = None
     decoder._stage_in_graph_sampling = None
     decoder._moe_load_balancer = None
     engine._runner = decoder
@@ -3730,7 +3733,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         context.context_chunk_size = 2
         context.py_seq_slot = 0
         context.py_mm_encoder_state = object()
-        multimodal_data = {"multimodal_embedding_lengths": [2]}
+        multimodal_data = {
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+            MultimodalItemMetadata([('image', 0)], output_embedding_lengths=[2])
+        }
         context.py_multimodal_data = multimodal_data
         model_engine._mm_item_scheduler = Mock()
         model_engine._runner._inputs._mm_item_scheduler = model_engine._mm_item_scheduler

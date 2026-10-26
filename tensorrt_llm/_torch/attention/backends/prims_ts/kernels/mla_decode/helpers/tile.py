@@ -45,7 +45,7 @@ def local_kv_tile_idx(
         return Int32(inst_id)
     if cutlass.const_expr(section == MlaStage.Loop):
         base = stage_info.loop_offset * Int32(cfg.num_insts_kv)
-        if cutlass.const_expr(is_v):
+        if cutlass.const_expr(is_v or (cfg.serial_swap_reuse and inst_id == 1)):
             return base + Int32(inst_id)
         return base + Int32(cfg.num_insts_kv + inst_id)
     if cutlass.const_expr(cfg.total_kv_tiles <= cfg.num_insts_kv):
@@ -109,6 +109,8 @@ def runtime_split_pruning_is_profitable(configured_splits_kv: int) -> bool:
 def _runtime_configured_local_kv_tiles(cfg: MlaConfig, seq_len_kv):
     """Return the instruction-aligned local span for configured split capacity."""
 
+    if cutlass.const_expr(cfg.fixed_sparse_kv_tiles > 0):
+        return Int32(cfg.fixed_sparse_kv_tiles)
     total_kv_tiles = runtime_total_kv_tiles(cfg, seq_len_kv)
     num_insts_kv = Int32(cfg.num_insts_kv)
     tiles_per_group = Int32(cfg.num_ctas_per_seq_kv) * num_insts_kv
@@ -134,6 +136,16 @@ def runtime_num_ctas_kv(cfg: MlaConfig, seq_len_kv):
 @cute.jit
 def runtime_local_kv_tiles(cfg: MlaConfig, seq_len_kv):
     """Return the padded local KV tile count assigned to each KV CTA group."""
+    if cutlass.const_expr(cfg.fixed_sparse_kv_tiles > 0):
+        return Int32(cfg.fixed_sparse_kv_tiles)
+    if cutlass.const_expr(
+        cfg.sparse_direct and cfg.seq_len_kv <= 256 and cfg.num_ctas_per_seq_kv == 1
+    ):
+        # The short direct schedule executes its planned padded tiles. Every
+        # consumer must use that same domain: using the smaller live length
+        # here makes tail PV overwrite O with its final masked tile instead
+        # of accumulating into the earlier nonempty tile.
+        return Int32(cfg.local_kv_tiles(cfg.total_kv_tiles))
     if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
         return runtime_total_kv_tiles(cfg, seq_len_kv)
     return _runtime_configured_local_kv_tiles(cfg, seq_len_kv)

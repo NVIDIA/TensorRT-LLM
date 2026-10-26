@@ -30,6 +30,7 @@ l0_cpu:
   # catches a pruned reference before the post-merge canary does.
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
+  - unittest/others/test_http_utils_fail_fast.py
   - unittest/scripts/test_perf_client_readiness.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
@@ -48,6 +49,9 @@ l0_cpu:
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
+  # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_draft_exchange.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
   - unittest/_torch/executor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
@@ -203,6 +207,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
+  - unittest/llmapi/apps/test_openai_protocol_chat_store.py
   - unittest/llmapi/apps/test_openai_server_iteration_stats.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   - unittest/llmapi/apps/test_render_callers.py

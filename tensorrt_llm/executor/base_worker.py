@@ -333,6 +333,7 @@ class BaseWorker(GenerationExecutor):
                          result_wait_queue=None) -> int:
         assert request.id is not None
         py_lora_path = None
+        py_lora_ckpt_source = None
         if self._lora_manager is not None and request.lora_request is not None:
             try:
                 # Each rank loads independently from disk via py_lora_path in
@@ -344,6 +345,7 @@ class BaseWorker(GenerationExecutor):
                     weights=None,
                     config=self._lora_manager.cpp_lora_config[uid])
                 py_lora_path = request.lora_request.lora_path
+                py_lora_ckpt_source = request.lora_request.ckpt_source
             except Exception as e:
                 raise RequestError(f"Failed to load LoRA adapter: {e}") from e
         else:
@@ -483,6 +485,7 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
+            executor_request.py_lora_ckpt_source = py_lora_ckpt_source
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
@@ -498,8 +501,6 @@ class BaseWorker(GenerationExecutor):
                     # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
-                if request.multimodal_params.mm_item_order:
-                    executor_request.py_mm_item_order = request.multimodal_params.mm_item_order
 
             if request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute
