@@ -853,38 +853,34 @@ void initRequestBindings(nb::module_& m)
 
     auto resultSetstate = [](tle::Result& self, nb::tuple const& state)
     {
-        if (state.size() != 11)
+        if (state.size() != 9)
         {
             throw std::runtime_error("Invalid Result state!");
         }
         tle::Result result;
         result.isFinal = nb::cast<bool>(state[0]);
         result.outputTokenIds = nb::cast<std::vector<VecTokens>>(state[1]);
-        result.cumLogProbs = nb::cast<std::optional<std::vector<float>>>(state[2]);
-        result.logProbs = nb::cast<std::optional<std::vector<std::vector<float>>>>(state[3]);
-        result.finishReasons = nb::cast<std::vector<tle::FinishReason>>(state[4]);
-        result.sequenceIndex = nb::cast<SizeType32>(state[5]);
-        result.isSequenceFinal = nb::cast<bool>(state[6]);
-        result.decodingIter = nb::cast<SizeType32>(state[7]);
-        result.avgDecodedTokensPerIter = nb::cast<float>(state[8]);
-        result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[9]);
-        result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[10]);
+        result.finishReasons = nb::cast<std::vector<tle::FinishReason>>(state[2]);
+        result.sequenceIndex = nb::cast<SizeType32>(state[3]);
+        result.isSequenceFinal = nb::cast<bool>(state[4]);
+        result.decodingIter = nb::cast<SizeType32>(state[5]);
+        result.avgDecodedTokensPerIter = nb::cast<float>(state[6]);
+        result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[7]);
+        result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[8]);
         new (&self) tle::Result(result);
     };
 
     auto resultGetstate = [](tle::Result const& self)
     {
-        return nb::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.finishReasons,
-            self.sequenceIndex, self.isSequenceFinal, self.decodingIter, self.avgDecodedTokensPerIter,
-            self.contextPhaseParams, self.requestPerfMetrics);
+        return nb::make_tuple(self.isFinal, self.outputTokenIds, self.finishReasons, self.sequenceIndex,
+            self.isSequenceFinal, self.decodingIter, self.avgDecodedTokensPerIter, self.contextPhaseParams,
+            self.requestPerfMetrics);
     };
 
     nb::class_<tle::Result>(m, "Result")
         .def(nb::init<>())
         .def_rw("is_final", &tle::Result::isFinal)
         .def_rw("output_token_ids", &tle::Result::outputTokenIds)
-        .def_rw("cum_log_probs", &tle::Result::cumLogProbs, nb::arg("cum_log_probs").none())
-        .def_rw("log_probs", &tle::Result::logProbs, nb::arg("log_probs").none())
         .def_rw("finish_reasons", &tle::Result::finishReasons)
         .def_rw("sequence_index", &tle::Result::sequenceIndex)
         .def_rw("is_sequence_final", &tle::Result::isSequenceFinal)

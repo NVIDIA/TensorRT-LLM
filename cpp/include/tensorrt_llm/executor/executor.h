@@ -732,12 +732,6 @@ struct Result
     /// @brief The output tokens for each beam
     BeamTokens outputTokenIds;
 
-    /// @brief The cumulative log probabilities. Size beamSize.
-    std::optional<VecLogProbs> cumLogProbs;
-
-    /// @brief The log probabilities for each generated token. Size [beamSize, outputLen]
-    std::optional<std::vector<VecLogProbs>> logProbs;
-
     /// @brief The reason why the model stopped generating tokens for each beam in this request. Size [beamSize].
     /// Currently only supported when beamSize is 1 and when using in-flight batching.
     std::vector<FinishReason> finishReasons;

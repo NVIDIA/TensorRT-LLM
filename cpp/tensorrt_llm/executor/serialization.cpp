@@ -935,8 +935,6 @@ Result Serialization::deserializeResult(std::istream& is)
     Result result{};
     result.isFinal = su::deserialize<bool>(is);
     result.outputTokenIds = su::deserialize<BeamTokens>(is);
-    result.cumLogProbs = su::deserialize<std::optional<VecLogProbs>>(is);
-    result.logProbs = su::deserialize<std::optional<std::vector<VecLogProbs>>>(is);
     result.finishReasons = su::deserialize<std::vector<FinishReason>>(is);
     result.contextPhaseParams = su::deserialize<std::optional<ContextPhaseParams>>(is);
     result.decodingIter = su::deserialize<SizeType32>(is);
@@ -951,8 +949,6 @@ void Serialization::serialize(Result const& result, std::ostream& os)
 {
     su::serialize(result.isFinal, os);
     su::serialize(result.outputTokenIds, os);
-    su::serialize(result.cumLogProbs, os);
-    su::serialize(result.logProbs, os);
     su::serialize(result.finishReasons, os);
     su::serialize(result.contextPhaseParams, os);
     su::serialize(result.decodingIter, os);
@@ -967,8 +963,6 @@ size_t Serialization::serializedSize(Result const& result)
     size_t totalSize = 0;
     totalSize += su::serializedSize(result.isFinal);
     totalSize += su::serializedSize(result.outputTokenIds);
-    totalSize += su::serializedSize(result.cumLogProbs);
-    totalSize += su::serializedSize(result.logProbs);
     totalSize += su::serializedSize(result.finishReasons);
     totalSize += su::serializedSize(result.contextPhaseParams);
     totalSize += su::serializedSize(result.decodingIter);

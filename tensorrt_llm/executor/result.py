@@ -399,14 +399,19 @@ class GenerationResultBase:
                 output.token_ids.extend(decoder_output_prefix)
             output.token_ids.extend(output_token_ids[src_idx])
 
-        if (cum_log_probs := response_tensors.cum_log_probs) is not None:
+        # Sampler logprobs belong to the Python result. Native results carry
+        # token/lifecycle metadata and can also reach this response handler.
+        has_sampler_outputs = not isinstance(response_tensors, tllm.Result)
+        if has_sampler_outputs and (cum_log_probs :=
+                                    response_tensors.cum_log_probs) is not None:
             output.cumulative_logprob = cum_log_probs[src_idx]
 
         # prompt logprobs handling
         if logprobs_result and logprobs_result.prompt is not None:
             output.prompt_logprobs = logprobs_result.prompt
         # Generation logprobs are computed by the sampler.
-        if (log_probs := response_tensors.log_probs) is not None:
+        if has_sampler_outputs and (log_probs :=
+                                    response_tensors.log_probs) is not None:
             # handle logprobs directly from response tensors given by sampler
             if decoder_output_prefix and self.sampling_params.use_beam_search:
                 output.logprobs = [

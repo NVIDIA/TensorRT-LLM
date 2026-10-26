@@ -714,8 +714,8 @@ def test_python_logprob_response_snapshots(streaming, beam_width, simple_format)
     # all logprobs each iteration rather than emitting greedy streaming deltas.
     snapshot = pickle.loads(pickle.dumps(first_response))
     native_result = first_response.result.get_result()
-    assert native_result.log_probs is None
-    assert native_result.cum_log_probs is None
+    assert not hasattr(native_result, "log_probs")
+    assert not hasattr(native_result, "cum_log_probs")
     assert snapshot.result.log_probs == first_probs
     assert snapshot.result.cum_log_probs == [-0.5] * beam_width
     request.add_new_tokens([5] * beam_width)
