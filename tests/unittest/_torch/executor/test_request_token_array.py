@@ -149,14 +149,15 @@ def test_llm_request_accepts_an_int32_array_and_a_list():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA tensor")
-def test_llm_request_reads_a_device_array_through_the_sequence_path():
-    # Only a host int32 array is copied as raw memory; a CUDA tensor takes the element-wise cast.
+def test_llm_request_rejects_a_device_array():
+    # Only a host int32 array is copied as raw memory; a CUDA tensor takes the sequence cast, which rejects it (it is
+    # never read through a device pointer).
     tokens = torch.tensor(PROMPT, dtype=torch.int32, device="cuda")
-    llm_req = lr_mod.LlmRequest(
-        request_id=4,
-        max_new_tokens=4,
-        input_tokens=tokens,
-        sampling_config=tllm.SamplingConfig(1),
-        is_streaming=False,
-    )
-    assert llm_req.get_tokens(0) == PROMPT
+    with pytest.raises(RuntimeError):
+        lr_mod.LlmRequest(
+            request_id=4,
+            max_new_tokens=4,
+            input_tokens=tokens,
+            sampling_config=tllm.SamplingConfig(1),
+            is_streaming=False,
+        )
