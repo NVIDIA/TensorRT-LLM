@@ -6066,6 +6066,30 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
             calls += streaming.finish(sample_tools).calls
             assert calls[-1].parameters == expected
 
+    def test_value_that_fails_serialization_keeps_raw_text(
+            self, sample_tools, parser, monkeypatch):
+        """A value that decodes but fails the json.dumps probe keeps its text."""
+        value = '{"probe": 1}'
+        real_dumps = json.dumps
+
+        def dumps(obj, *args, **kwargs):
+            if obj == [{"probe": 1}]:
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_dumps(obj, *args, **kwargs)
+
+        monkeypatch.setattr(json, "dumps", dumps)
+        text = self._section(
+            self._call("get_weather", 1, self._argument("count", "object",
+                                                        value)))
+
+        result = parser.detect_and_parse(text, sample_tools)
+        assert json.loads(result.calls[0].parameters) == {"count": value}
+
+        streaming = KimiK3ToolParser()
+        calls = streaming.parse_streaming_increment(text, sample_tools).calls
+        calls += streaming.finish(sample_tools).calls
+        assert json.loads(calls[-1].parameters) == {"count": value}
+
     def test_attribute_unescaping(self, sample_tools, parser):
         """Unescape encoded XTML attribute values.
 
@@ -7594,12 +7618,9 @@ def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
 # ============================================================================
 
 
-@pytest.mark.parametrize("value", ["[" * 100000 + "]" * 100000, "9" * 5000],
-                         ids=["deeply_nested", "too_many_digits"])
-def test_minimax_m3_undecodable_json_keeps_text(value):
-    """JSON that nests too deeply or has too many digits keeps its text."""
-    from tensorrt_llm.serve.tool_parser.minimax_m3_parser import \
-        MiniMaxM3ToolParser
+def _minimax_m3_options_call(
+        value: str) -> tuple[str, list[ChatCompletionToolsParam]]:
+    """A MiniMax-M3 call that passes `value` as an object parameter."""
     tools = [
         ChatCompletionToolsParam(
             type="function",
@@ -7620,6 +7641,39 @@ def test_minimax_m3_undecodable_json_keeps_text(value):
     text = (f'{ns}<tool_call>\n{ns}<invoke name="configure">\n'
             f"{ns}<options>{value}{ns}</options>\n{ns}</invoke>\n"
             f"{ns}</tool_call>")
+    return text, tools
+
+
+@pytest.mark.parametrize("value", ["[" * 100000 + "]" * 100000, "9" * 5000],
+                         ids=["deeply_nested", "too_many_digits"])
+def test_minimax_m3_undecodable_json_keeps_text(value):
+    """JSON that nests too deeply or has too many digits keeps its text."""
+    from tensorrt_llm.serve.tool_parser.minimax_m3_parser import \
+        MiniMaxM3ToolParser
+    text, tools = _minimax_m3_options_call(value)
+
+    result = MiniMaxM3ToolParser().detect_and_parse(text, tools)
+
+    assert [(call.name, json.loads(call.parameters))
+            for call in result.calls] == [("configure", {
+                "options": value
+            })]
+
+
+def test_minimax_m3_value_that_fails_serialization_keeps_text(monkeypatch):
+    """A value that decodes but fails the json.dumps probe keeps its text."""
+    from tensorrt_llm.serve.tool_parser.minimax_m3_parser import \
+        MiniMaxM3ToolParser
+    value = '{"probe": 1}'
+    real_dumps = json.dumps
+
+    def dumps(obj, *args, **kwargs):
+        if obj == [{"probe": 1}]:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real_dumps(obj, *args, **kwargs)
+
+    monkeypatch.setattr(json, "dumps", dumps)
+    text, tools = _minimax_m3_options_call(value)
 
     result = MiniMaxM3ToolParser().detect_and_parse(text, tools)
 
