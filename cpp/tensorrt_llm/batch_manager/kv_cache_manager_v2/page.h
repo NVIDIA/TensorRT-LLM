@@ -79,6 +79,9 @@ public:
 
     PageStatus status() const noexcept;
 
+    // Locality domain whose memory backs this page's slot; nullopt off a localized GPU tier.
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainId() const;
+
     bool scheduledForEviction() const noexcept
     {
         return nodeRef.has_value();
