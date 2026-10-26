@@ -341,7 +341,7 @@ class TestVanillaAttention(unittest.TestCase):
         kv_cache = torch.zeros(1, 1, 1, 1, 2)
 
         with patch(
-                "tensorrt_llm._torch.attention_backend.utils.append_mla_latent_cache",
+                "tensorrt_llm._torch.attention.backends.utils.append_mla_latent_cache",
                 return_value=kv_cache,
         ):
             result = attention._mla_forward_generation(
