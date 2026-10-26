@@ -1270,6 +1270,22 @@ def test_stream_thinking_left_open_is_signed_when_the_stream_ends():
     assert deltas[-1] == {"type": "signature_delta", "signature": thinking_signature("unfinished")}
 
 
+def test_stream_error_signs_the_open_thinking_block_before_the_error():
+    reframer = AnthropicStreamReframer(model=MODEL)
+    frames = reframer.process_chunk(chunk({"reasoning_content": "partial"}))
+    frames += reframer.error("engine failed")
+    events = parse_frames(frames)
+    (delta_name, delta), (stop_name, stop), (error_name, error) = events[-3:]
+    assert [delta_name, stop_name, error_name] == [
+        "content_block_delta",
+        "content_block_stop",
+        "error",
+    ]
+    assert delta["delta"] == {"type": "signature_delta", "signature": thinking_signature("partial")}
+    assert stop["index"] == delta["index"]
+    assert error["error"]["message"] == "engine failed"
+
+
 def test_stream_each_thinking_block_is_signed_with_its_own_text():
     events = run_reframer(
         [
