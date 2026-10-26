@@ -86,8 +86,7 @@ def forward_context_sparse_attn(
         self.mqa.mla_rope_append_paged_kv_assign_q(
             q, latent_cache, attn_metadata, is_generation=False
         )
-        # The append kernel leaves the rotated k_pe in latent_cache: store the
-        # retained tokens' rows at the attention dtype as well.
+        # The append kernel rotated k_pe in latent_cache: store the retained rows too.
         write_context_rows(self.mqa, attn_metadata, latent_cache)
         return self.forward_absorption_context(
             q,

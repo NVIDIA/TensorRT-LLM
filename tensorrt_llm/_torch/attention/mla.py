@@ -1703,8 +1703,7 @@ class MLA(nn.Module):
                             **fp4_rope_kwargs,
                         )
                         if getattr(attn_metadata, "mixed_high_block_table", None) is not None:
-                            # Sparse MLA on a mixed-precision cache: also keep
-                            # the retained tokens' rows at the attention dtype.
+                            # Mixed precision: store the retained rows too.
                             write_generation_rows(
                                 self.mqa, attn_metadata, latent_cache, position_ids
                             )

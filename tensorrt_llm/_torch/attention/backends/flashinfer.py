@@ -931,7 +931,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         view = self.mixed_precision_staging
         if (view is not None and view.lengths is not None
                 and view.manager is self.kv_cache_manager):
-            # The staging gather and writeback follow the corrected lengths.
+            # Speculative decoding + overlap: staging lengths take the same fix.
             view.lengths[:, row_slice].add_(runtime_offsets, alpha=direction)
 
         for wrappers in self._plan_params_to_wrappers.values():

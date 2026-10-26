@@ -1064,11 +1064,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
-    # Mixed-precision KV: the compressed history (COMPRESS of the ratio-4 and
-    # ratio-128 layers) gains a retained-token twin holding the compressed rows
-    # of the first_n / last_n tokens at mixed.high. The sliding-window and
-    # compressor-state pools already keep full precision. Twins are keyed by the
-    # local model layer; the base byte accounting addresses only the native pools.
+    # Mixed-precision KV: each COMPRESS layer gains a twin holding its retained rows at mixed.high.
     _supports_mixed_precision_kv = True
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:

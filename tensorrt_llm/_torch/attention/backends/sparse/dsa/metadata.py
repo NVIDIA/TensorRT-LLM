@@ -378,11 +378,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
     def _has_mixed_precision_kv(self) -> bool:
-        # No dense-path staging copy here. After the indexer's top-k, this
-        # backend's gather already dequantizes the selected rows into a
-        # per-call FP8 scratch (k rows per token, not the whole sequence), so
-        # that scratch is the staging: the retained tokens' rows are overlaid
-        # onto it after the gather (mixed_precision_overlay.overlay_rows).
+        # No staging: the gather's FP8 scratch already is one; retained rows are overlaid onto it.
         return False
 
     def prepare(self):
@@ -1114,8 +1110,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # Mixed-precision KV: page table of the retained-token (high) pool in
-        # block_table's row order; -1 where a page is not retained.
+        # Mixed-precision KV: retained-pool page table in block_table row order, -1 = not retained.
         self.mixed_high_block_table = None
         self.mixed_ctx_positions = None
         if getattr(self.kv_cache_manager, "high_layers", None):

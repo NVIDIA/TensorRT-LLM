@@ -2,13 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Retained-token rows for sparse MLA backends whose history lives in a native NVFP4 pool.
 
-Such a backend already dequantizes the rows its top-k selected into an FP8 scratch
-before attention. Mixed precision adds the standard manager's retained-token twin
-layer next to that pool: the KV append also stores the token's row in the twin
-(first_n / last_n tokens survive there, the rest is released by the twin's window),
-and after the gather the rows the twin still holds replace the dequantized ones.
-The twin's page table comes from the manager's existing builder; page >= 0 means
-retained.
+The KV append also writes each token's row into the manager's retained-token twin layer;
+after the backend's top-k gather, the rows the twin still holds replace the dequantized
+rows in its FP8 scratch. Twin page table: page >= 0 means retained.
 """
 
 from typing import Optional
@@ -33,7 +29,7 @@ def _copy_row(
     mask = offs < ROW
     row = tl.load(src_ptr + src_row.to(tl.int64) * ROW + offs, mask=mask, other=0.0)
     if APPLY_SCALE:
-        # Per-tensor FP8 KV scale (value -> stored), as the native append kernel applies it.
+        # Per-tensor FP8 KV scale, as the native append kernel applies it.
         row = row.to(tl.float32) * tl.load(scale_ptr)
     tl.store(
         dst_ptr + dst_row.to(tl.int64) * ROW + offs, row.to(dst_ptr.dtype.element_ty), mask=mask
@@ -89,8 +85,7 @@ def _write_compressed_rows_kernel(
     ROW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # One program per compressed row of this step: find its request by the
-    # cumulative row counts, then store it at start_pos[request] + offset.
+    # Find the row's request from the cumulative counts, then its compressed position.
     token = tl.program_id(0)
     req = 0
     for b in range(1, batch_size):
@@ -136,8 +131,7 @@ def _overlay_rows_kernel(
     tok = tl.load(topk_ptr + row_id.to(tl.int64) * topk_stride + col)
     compact = tl.load(compact_ptr + row_id.to(tl.int64) * compact_stride + col)
     req = tl.load(req_ptr + row_id)
-    # Padding rows and columns of the index tensors may hold stale values;
-    # bound them the way the backends' own index conversion does.
+    # Index tensors may hold stale padding: bound them like the backends' own conversion.
     column = tok // rows_per_page
     valid = (tok >= 0) & (column < table_width) & (compact >= 0) & (compact < scratch_rows)
     valid = valid & (req >= 0) & (req < table_rows)
@@ -149,11 +143,7 @@ def _overlay_rows_kernel(
 
 
 def _retained_table(metadata, owner) -> Optional[torch.Tensor]:
-    """Page table of the retained pool that ``owner`` (attention or compressor) uses.
-
-    Twins of different page sizes sit in different pools, so DeepSeek-V4 keeps
-    one table per compression ratio; the DSA backend keeps a single table.
-    """
+    """Retained page table ``owner`` uses (one per compression ratio on DeepSeek-V4)."""
     table = getattr(metadata, "mixed_high_block_table", None)
     if isinstance(table, dict):
         table = table.get(getattr(owner, "compress_ratio", None))
@@ -188,11 +178,7 @@ def write_rows(
     positions: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
 ) -> None:
-    """Store ``rows`` (one per token, RoPE already applied) in ``owner``'s retained pool.
-
-    ``scale`` is the attention's per-tensor FP8 KV scale; an FP8 pool stores
-    ``row * scale`` like the native append kernel, a BF16/FP16 pool the row itself.
-    """
+    """Store ``rows`` (RoPE applied) in ``owner``'s retained pool (FP8 pool: ``row * scale``)."""
     pool = _retained_pool(metadata, owner)
     if pool is None:
         return
@@ -242,10 +228,7 @@ def write_context_rows(attention, metadata, latent_cache: torch.Tensor) -> None:
 def write_generation_rows(
     attention, metadata, latent_cache: torch.Tensor, position_ids: torch.Tensor
 ) -> None:
-    """Generation phase: the fused kernel leaves ``latent_cache`` unrotated, so rotate k_pe here.
-
-    Same interleaved-pair rotation and cos/sin table as the append kernel.
-    """
+    """Generation: rotate k_pe like the append kernel (the fused kernel leaves it unrotated)."""
     if _retained_pool(metadata, attention) is None:
         return
     rows = latent_cache.reshape(latent_cache.shape[0], -1)
@@ -253,8 +236,7 @@ def write_generation_rows(
     if num_rows == 0:
         return
     assert position_ids is not None, "the retained-row write needs the generation positions"
-    # Callers pass either the whole batch's positions or only the generation
-    # slice; the generation tokens are the trailing ones either way.
+    # Generation tokens are the trailing positions whichever slice the caller passes.
     positions = position_ids.reshape(-1)[-num_rows:]
     num_ctx = metadata.num_ctx_tokens
     rope_dim = attention.mla_params.qk_rope_head_dim
@@ -268,8 +250,7 @@ def write_generation_rows(
     write_rows(
         metadata,
         attention,
-        # The append kernel rounds the rotated values to the activation dtype
-        # before quantizing; do the same so the rows match a plain FP8 pool.
+        # Round to the activation dtype first, like the append kernel.
         rotated.to(rows.dtype),
         metadata.req_idx_per_token[num_ctx : num_ctx + num_rows],
         positions,
@@ -278,14 +259,10 @@ def write_generation_rows(
 
 
 def retained_row_buffer(metadata, like: torch.Tensor) -> torch.Tensor:
-    """Persistent ``[max tokens, row]`` buffer the DeepSeek-V4 compressors write their rows into.
+    """Persistent ``[max tokens, row]`` buffer for the DeepSeek-V4 compressors (one per metadata).
 
-    One per metadata object, shared by all compressor layers: each layer's
-    retained-row write consumes it on the compressor stream before the next
-    layer's compressor runs. It is allocated before any CUDA graph capture; a
-    buffer allocated on the side stream during capture and dropped afterwards
-    can be handed to the next allocation on the main stream while the
-    compressor is still writing it.
+    Allocated before CUDA graph capture: a per-call buffer on the compressor's side stream
+    could be recycled while the compressor is still writing it.
     """
     buf = getattr(metadata, "_retained_rows", None)
     rows = max(int(metadata.max_num_tokens), like.shape[0])
@@ -313,13 +290,10 @@ def write_compressed_rows(
     compressed_mask: torch.Tensor,
     batch_size: int,
 ) -> None:
-    """DeepSeek-V4 compressor: store this step's new compressed rows (one per ratio tokens).
+    """DeepSeek-V4 compressor: store this step's new compressed rows in the retained twin.
 
-    Row ``i`` belongs to the request whose ``cu_new_comp_kv`` span holds it and
-    lands at compressed position ``start_pos[request] + offset``; rows past a
-    request's ``num_comp_tokens`` or outside ``compressed_mask`` are padding.
-    The native FP8 compressed rows carry no per-tensor scale, so neither do these.
-    No temporaries: this runs on the compressor's side stream.
+    Row ``i`` belongs to the request whose ``cu_new_comp_kv`` span holds it, at compressed
+    position ``start_pos[request] + offset``; the native FP8 rows carry no per-tensor scale.
     """
     pool = _retained_pool(metadata, compressor)
     if pool is None:
@@ -359,12 +333,10 @@ def overlay_rows(
     compact_indices: torch.Tensor,
     scratch: torch.Tensor,
 ) -> None:
-    """After the backend's gather: copy the retained rows over the dequantized scratch rows.
+    """After the gather: copy the retained rows over the dequantized scratch rows.
 
-    ``topk_indices`` holds each query row's selected token positions inside its
-    request (-1 = none), ``req_idx`` that row's request in batch order and
-    ``compact_indices`` the scratch row the gather used for each pair (-1 = none).
-    A BF16/FP16 twin is quantized into the FP8 scratch with the attention's KV scale.
+    ``topk_indices``: selected positions per query row (-1 = none); ``req_idx``: that row's
+    request; ``compact_indices``: the scratch row the gather used for each pair (-1 = none).
     """
     pool = _retained_pool(metadata, attention)
     if pool is None:
