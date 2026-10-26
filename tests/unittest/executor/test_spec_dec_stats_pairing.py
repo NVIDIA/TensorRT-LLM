@@ -15,7 +15,7 @@
 """Step-pairing tests for speculative-decoding acceptance stats.
 
 py_draft_tokens is not a valid acceptance-rate denominator at response time:
-it is padded to the static max for CUDA graphs (two-model flow), and in the
+it is padded to the static max for CUDA graphs (drafter flow), and in the
 one-model flow SpecSampler.update_requests replaces it with the NEXT
 step's buffer before responses are handled. The samplers therefore write
 py_num_draft_tokens_verified — the real proposal count of the same step the

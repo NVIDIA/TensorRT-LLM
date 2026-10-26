@@ -16,6 +16,7 @@
 
 import asyncio
 import gc
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -29,8 +30,8 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     openengine_pb2_grpc,
     server_pb2,
 )
+from tensorrt_llm.inputs.media_io import _get_aiohttp_session
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
-from tensorrt_llm.inputs.media_io import _get_aiohttp_session  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
 # down only once its internal state is released, which happens after the event
@@ -42,22 +43,37 @@ pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 def test_format_bind_address_brackets_ipv6() -> None:
     """A bare IPv6 host is bracketed; IPv4 and already-bracketed hosts are not."""
-    from tensorrt_llm.grpc.openengine.server import _format_bind_address
+    from tensorrt_llm.inputs.media_io import _get_aiohttp_session
+from tensorrt_llm.grpc.openengine.server import _format_bind_address
 
     assert _format_bind_address("127.0.0.1", 8000) == "127.0.0.1:8000"
     assert _format_bind_address("::1", 8000) == "[::1]:8000"
     assert _format_bind_address("[::1]", 8000) == "[::1]:8000"
 
 
-def test_stop_closes_media_session_when_grpc_stop_fails() -> None:
-    async def exercise_stop() -> None:
+@pytest.mark.parametrize("fail_stop", [False, True])
+def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> None:
+    async def exercise_stop():
         server = OpenEngineServer.__new__(OpenEngineServer)
-        server._server = SimpleNamespace(stop=AsyncMock(side_effect=RuntimeError("stop failed")))
+        server._server = SimpleNamespace(
+            stop=AsyncMock(side_effect=RuntimeError("stop failed") if fail_stop else None)
+        )
+        server._input_executor = ThreadPoolExecutor(max_workers=1)
+        server._media_executor = ThreadPoolExecutor(max_workers=1)
+        futures = [
+            pool.submit(lambda: True) for pool in (server._input_executor, server._media_executor)
+        ]
         media_session = await _get_aiohttp_session()
-        with pytest.raises(RuntimeError, match="stop failed"):
+        if fail_stop:
+            with pytest.raises(RuntimeError, match="stop failed"):
+                await server.stop(grace=0)
+        else:
             await server.stop(grace=0)
-        server._server.stop.assert_awaited_once_with(grace=0)
         assert media_session.closed
+        assert all(future.result() for future in futures)
+        for pool in (server._input_executor, server._media_executor):
+            with pytest.raises(RuntimeError, match="shutdown"):
+                pool.submit(lambda: None)
 
     asyncio.run(exercise_stop())
 
@@ -93,7 +109,6 @@ def test_openengine_server_serves_the_control_contract() -> None:
         assert server.port != 0
 
         await server.start()
-        media_session = await _get_aiohttp_session()
         with pytest.raises(RuntimeError, match="Failed to bind"):
             OpenEngineServer(host="127.0.0.1", port=server.port, llm=llm, model="test-model")
         channel = grpc.aio.insecure_channel(f"127.0.0.1:{server.port}")
@@ -115,7 +130,6 @@ def test_openengine_server_serves_the_control_contract() -> None:
         finally:
             await channel.close()
             await server.stop(grace=0)
-        assert media_session.closed
 
     asyncio.run(exercise_server())
 
@@ -153,7 +167,8 @@ def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> Non
 
 def test_is_loopback_classifies_bind_hosts() -> None:
     """The listener is unauthenticated, so a non-loopback bind must be flagged."""
-    from tensorrt_llm.grpc.openengine.server import _is_loopback
+    from tensorrt_llm.inputs.media_io import _get_aiohttp_session
+from tensorrt_llm.grpc.openengine.server import _is_loopback
 
     assert _is_loopback("127.0.0.1")
     assert _is_loopback("::1")

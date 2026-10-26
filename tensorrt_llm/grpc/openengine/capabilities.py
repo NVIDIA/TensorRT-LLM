@@ -79,6 +79,9 @@ def resolve_media_capabilities(
     A live registered processor prevents registry-only false positives.
     """
     input_processor = getattr(llm, "input_processor", None)
+    if getattr(getattr(llm, "args", None), "disable_mm_encoder", False):
+        return MediaCapabilities({})
+
     model_type = _loaded_model_type(llm)
     if not model_type:
         return MediaCapabilities({})

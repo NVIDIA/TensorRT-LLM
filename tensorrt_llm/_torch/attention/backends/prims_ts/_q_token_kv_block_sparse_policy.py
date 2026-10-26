@@ -121,7 +121,17 @@ def select_sparse_launch(
         tile_size_q=candidate.tile_size_q,
         num_insts_kv=instances,
         splits_kv=splits,
-        head_dim_per_stage_kv=128 if head_dim == 256 else 0,
+        # Full FP8 stages preserve the 128-byte swizzled planes while issuing
+        # PV at N256. BF16 and Swaps retain their existing D128 head bands.
+        head_dim_per_stage_kv=(
+            256
+            if head_dim == 256
+            and q_dtype_key == "float8_e4m3fn"
+            and candidate.variant == "keeps_mma_ab"
+            else 128
+            if head_dim == 256
+            else 0
+        ),
         o_stages=1 if head_dim == 256 and candidate.variant == "keeps_mma_ab" else 2,
         use_persistent_scheduler=(
             splits == 1

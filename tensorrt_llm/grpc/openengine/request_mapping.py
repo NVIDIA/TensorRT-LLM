@@ -6,7 +6,8 @@
 import asyncio
 import importlib
 import threading
-from collections.abc import Awaitable, Callable, Mapping
+from collections import Counter
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -45,6 +46,7 @@ _DETOKENIZE_EXTRA_KEY = "detokenize"
 
 
 _MediaLoader = Callable[[generation_pb2.MediaItem, int], Awaitable[Any]]
+_MediaValidator = Callable[[generation_pb2.MediaItem, int], None]
 
 
 class _DecodedMediaReservation:
@@ -53,6 +55,11 @@ class _DecodedMediaReservation:
         self._peak_bytes = peak_bytes
         self._retained_bytes = retained_bytes
         self._active = True
+
+    def check_cancelled(self) -> None:
+        with self._budget._condition:
+            if self._budget._cancelled:
+                raise ValueError("decoded media loading was cancelled")
 
     def shrink(self, retained_bytes: int) -> None:
         if not self._active or not 0 <= retained_bytes <= self._retained_bytes:
@@ -154,10 +161,18 @@ def _always_available() -> bool:
 @dataclass(frozen=True)
 class _MediaHandler:
     name: str
+    validate: _MediaValidator
     loader_factory: Callable[[Any, _DecodedMediaBudget], _MediaLoader]
     decoded_bytes: Callable[[Any], int]
     runtime_available: Callable[[], bool] = _always_available
     reserves_decoded_bytes: bool = False
+
+
+@dataclass(frozen=True)
+class _PreparedInput:
+    inputs: str | dict[str, list[int]]
+    media: tuple[tuple[generation_pb2.MediaItem, _MediaHandler], ...]
+    capabilities: MediaCapabilities | None
 
 
 def conversation_affinity_enabled(llm: Any) -> bool:
@@ -416,32 +431,65 @@ def _media_io_for_model(
     return media_io_type.create(defaults, runtime_kwargs)
 
 
-async def _load_media_item(
-    item: generation_pb2.MediaItem, media_io: Any, index: int, modality: str
-) -> Any:
+def _validate_media_item(item: generation_pb2.MediaItem, index: int, modality: str) -> None:
     source = item.WhichOneof("source")
     if source is None:
         raise ValueError(f"media[{index}] must set exactly one source")
     if source == "url":
-        if urlparse(item.url).scheme.lower() not in ("http", "https"):
+        try:
+            parsed = urlparse(item.url)
+            hostname = parsed.hostname
+            _ = parsed.port  # Access validates the port syntax and range.
+        except ValueError as error:
+            raise ValueError(f"media[{index}].url is malformed: {error}") from error
+        if parsed.scheme.lower() not in ("http", "https"):
             raise ValueError(f"media[{index}].url must use http or https")
-        value = item.url
+        if not hostname:
+            raise ValueError(f"media[{index}].url must include a hostname")
     elif source == "data_uri":
-        if urlparse(item.data_uri).scheme.lower() != "data":
+        parsed = urlparse(item.data_uri)
+        if parsed.scheme.lower() != "data":
             raise ValueError(f"media[{index}].data_uri must use the data scheme")
-        value = item.data_uri
+        data_spec, separator, payload = parsed.path.partition(",")
+        if not separator or not payload:
+            raise ValueError(f"media[{index}].data_uri must include a comma and a payload")
+        media_type, _, encoding = data_spec.partition(";")
+        if encoding != "base64":
+            raise ValueError(f"media[{index}].data_uri must use base64 encoding")
+        if media_type and not media_type.lower().startswith(f"{modality}/"):
+            raise ValueError(f"media[{index}].data_uri must declare an {modality} type")
     elif source == "raw_bytes":
         if item.mime_type and not item.mime_type.lower().startswith(f"{modality}/"):
             raise ValueError(
                 f"media[{index}].mime_type must start with {modality}/ for raw {modality} bytes"
             )
+    else:
+        raise ValueError(f"media[{index}] has an unknown source '{source}'")
+
+
+def _validate_image_item(item: generation_pb2.MediaItem, index: int) -> None:
+    _validate_media_item(item, index, "image")
+
+
+def _validate_audio_item(item: generation_pb2.MediaItem, index: int) -> None:
+    _validate_media_item(item, index, "audio")
+
+
+def _validate_video_item(item: generation_pb2.MediaItem, index: int) -> None:
+    _validate_media_item(item, index, "video")
+
+
+async def _load_media_item(
+    item: generation_pb2.MediaItem, media_io: Any, index: int, modality: str
+) -> Any:
+    source = item.WhichOneof("source")
+    if source == "raw_bytes":
         try:
             return await media_io.async_load_bytes(bytes(item.raw_bytes))
         except Exception as error:
             raise ValueError(f"media[{index}].raw_bytes could not be decoded: {error}") from error
-    else:
-        raise ValueError(f"media[{index}] has an unknown source '{source}'")
 
+    value = item.url if source == "url" else item.data_uri
     try:
         return await media_io.async_load(value)
     except MediaFetchError as error:
@@ -527,17 +575,18 @@ def _video_runtime_available() -> bool:
 
 _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
     generation_pb2.MODALITY_IMAGE: _MediaHandler(
-        "image", _image_loader_factory, _decoded_image_bytes
+        "image", _validate_image_item, _image_loader_factory, _decoded_image_bytes
     ),
     generation_pb2.MODALITY_VIDEO: _MediaHandler(
         "video",
+        _validate_video_item,
         _video_loader_factory,
         _decoded_video_bytes,
         _video_runtime_available,
         reserves_decoded_bytes=True,
     ),
     generation_pb2.MODALITY_AUDIO: _MediaHandler(
-        "audio", _audio_loader_factory, _decoded_audio_bytes, reserves_decoded_bytes=True
+        "audio", _validate_audio_item, _audio_loader_factory, _decoded_audio_bytes, reserves_decoded_bytes=True
     ),
 }
 
@@ -556,15 +605,15 @@ def _modality_name(modality: int) -> str:
         return f"unknown ({modality})"
 
 
-async def _input_from_request(
+def _prepare_input_from_request(
     request: generation_pb2.GenerateRequest,
     llm: Any,
     media_capabilities: MediaCapabilities | None = None,
-) -> str | dict[str, Any]:
-    """Build LLM API inputs without blocking the event loop on media."""
+) -> _PreparedInput:
+    """Validate request media without starting any fetch or decode work."""
     inputs = _base_input_from_request(request, llm)
     if not request.media:
-        return inputs
+        return _PreparedInput(inputs, (), None)
 
     capabilities = media_capabilities or media_capabilities_for_model(llm)
     modalities = capabilities.modalities
@@ -591,9 +640,100 @@ async def _input_from_request(
             )
         resolved_handlers.append(handler)
 
+    media = tuple(zip(request.media, resolved_handlers))
+    for index, (item, handler) in enumerate(media):
+        handler.validate(item, index)
+
+    return _PreparedInput(inputs, media, capabilities)
+
+
+def _count_token_sequences(
+    prompt_ids: Sequence[int], sequences: Iterable[tuple[int, ...]]
+) -> Counter[tuple[int, ...]]:
+    """Count overlapping markers in one traversal, sharing common prefixes."""
+    trie: dict = {}
+    for sequence in sequences:
+        node = trie
+        for token_id in sequence:
+            node = node.setdefault(token_id, {})
+        node[None] = sequence
+    counts: Counter[tuple[int, ...]] = Counter()
+    for start, token_id in enumerate(prompt_ids):
+        node = trie.get(token_id)
+        index = start + 1
+        while node is not None:
+            sequence = node.get(None)
+            if sequence is not None:
+                counts[sequence] += 1
+            if index == len(prompt_ids):
+                break
+            node = node.get(prompt_ids[index])
+            index += 1
+    return counts
+
+
+def _validate_media_placeholders(prepared: _PreparedInput, llm: Any) -> None:
+    """Reject placeholder mismatches before probing the stateful MM processor."""
+    if not prepared.media or prepared.capabilities is None:
+        return
+    processor = llm.input_processor
+    if not isinstance(processor, BaseMultimodalInputProcessor):
+        return
+    if not processor.requires_input_placeholders(tokenized=not isinstance(prepared.inputs, str)):
+        return
+    tokenizer = llm.tokenizer
+    prompt_ids = (
+        tokenizer.encode(prepared.inputs, add_special_tokens=False)
+        if isinstance(prepared.inputs, str)
+        else prepared.inputs["prompt_token_ids"]
+    )
+    item_counts: Counter[str] = Counter()
+    expected_sequences: Counter[tuple[int, ...]] = Counter()
+    for _, handler in prepared.media:
+        item_counts[handler.name] += 1
+        placeholder = prepared.capabilities.placeholder(handler.name, item_counts[handler.name])
+        sequence = tuple(tokenizer.encode(placeholder, add_special_tokens=False))
+        if not sequence:
+            raise ValueError(f"{handler.name} placeholder must encode to at least one token")
+        expected_sequences[sequence] += 1
+
+    actual_sequences = _count_token_sequences(prompt_ids, expected_sequences)
+    for sequence, expected in expected_sequences.items():
+        actual = actual_sequences[sequence]
+        if actual != expected:
+            raise ValueError(
+                f"media placeholder count does not match media items: expected {expected}, "
+                f"got {actual} for placeholder token IDs {list(sequence)}"
+            )
+
+    mm_ids = processor.get_mm_token_ids()
+    if mm_ids is not None:
+        special_ids = processor.get_mm_special_token_ids()
+        content_ids = set(mm_ids.tolist()) - (
+            set(special_ids.tolist()) if special_ids is not None else set()
+        )
+        expected_tokens: Counter[int] = Counter()
+        for sequence, count in expected_sequences.items():
+            for token_id in sequence:
+                if token_id in content_ids:
+                    expected_tokens[token_id] += count
+        actual_tokens = Counter(token_id for token_id in prompt_ids if token_id in content_ids)
+        if actual_tokens != expected_tokens:
+            raise ValueError("multimodal placeholder token counts do not match media items")
+
+
+async def _load_prepared_input(prepared: _PreparedInput, llm: Any) -> str | dict[str, Any]:
+    """Fetch and decode media from an already validated request plan."""
+    if not prepared.media:
+        return prepared.inputs
+
+    capabilities = prepared.capabilities
+    if capabilities is None:
+        raise RuntimeError("media input plan is missing capabilities")
+
     budget = _DecodedMediaBudget(_MAX_TOTAL_DECODED_MEDIA_BYTES)
     loaders: dict[str, _MediaLoader] = {}
-    for handler in resolved_handlers:
+    for _, handler in prepared.media:
         if handler.name not in loaders:
             loaders[handler.name] = handler.loader_factory(llm, budget)
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEDIA_LOADS)
@@ -609,7 +749,7 @@ async def _input_from_request(
 
     tasks = [
         asyncio.create_task(load_bounded(item, index, handler))
-        for index, (item, handler) in enumerate(zip(request.media, resolved_handlers))
+        for index, (item, handler) in enumerate(prepared.media)
     ]
     try:
         decoded_media = await asyncio.gather(*tasks)
@@ -623,7 +763,7 @@ async def _input_from_request(
     grouped_media: dict[str, list[Any]] = {}
     grouped_uuids: dict[str, list[str | None]] = {}
     item_order: list[dict[str, Any]] = []
-    for item, handler, decoded in zip(request.media, resolved_handlers, decoded_media):
+    for (item, handler), decoded in zip(prepared.media, decoded_media):
         modality_items = grouped_media.setdefault(handler.name, [])
         modality_index = len(modality_items)
         modality_items.append(decoded)
@@ -636,12 +776,24 @@ async def _input_from_request(
             }
         )
 
-    mapped: dict[str, Any] = {"prompt": inputs} if isinstance(inputs, str) else dict(inputs)
+    mapped: dict[str, Any] = (
+        {"prompt": prepared.inputs} if isinstance(prepared.inputs, str) else dict(prepared.inputs)
+    )
     mapped["multi_modal_data"] = grouped_media
-    if any(item.uuid for item in request.media):
+    if any(item.uuid for item, _ in prepared.media):
         mapped["multi_modal_uuids"] = grouped_uuids
     mapped["mm_item_order"] = item_order
     return mapped
+
+
+async def _input_from_request(
+    request: generation_pb2.GenerateRequest,
+    llm: Any,
+    media_capabilities: MediaCapabilities | None = None,
+) -> str | dict[str, Any]:
+    """Build LLM API inputs without blocking the event loop on media."""
+    prepared = _prepare_input_from_request(request, llm, media_capabilities)
+    return await _load_prepared_input(prepared, llm)
 
 
 __all__ = [

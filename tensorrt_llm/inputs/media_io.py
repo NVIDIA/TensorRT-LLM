@@ -12,7 +12,10 @@ import socket
 import tempfile
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from concurrent.futures import Executor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from stat import S_ISREG
@@ -24,7 +27,6 @@ from typing import (
     Dict,
     Generic,
     List,
-    Literal,
     Mapping,
     Optional,
     Protocol,
@@ -44,7 +46,7 @@ from blake3 import blake3
 from packaging.version import Version
 from PIL import Image
 
-from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
+from tensorrt_llm.inputs.multimodal_data import AudioData, MediaModality, VideoData
 from tensorrt_llm.logger import logger
 
 
@@ -53,6 +55,8 @@ class MediaFetchError(RuntimeError):
 
 
 class _DecodedMemoryReservation(Protocol):
+    def check_cancelled(self) -> None: ...
+
     def shrink(self, retained_bytes: int) -> None: ...
 
     def commit(self, retained_bytes: int) -> None: ...
@@ -120,9 +124,6 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
     else:
         return image.convert(to_mode)
 
-
-# Canonical set of supported media modalities for Pydantic field validation.
-MediaModality = Literal["image", "video", "audio"]
 
 # Output representations supported by `ImageMediaIO`:
 # `"pt"` -> `torch.Tensor`, `"np"` -> uint8 HWC `numpy.ndarray`,
@@ -346,38 +347,33 @@ async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
     await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-
-    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
-        current_url = url
-        for _ in range(_MAX_REDIRECTS + 1):
-            try:
-                async with fetch_session.get(
-                    current_url, timeout=timeout, allow_redirects=False
-                ) as response:
-                    if response.status in _REDIRECT_STATUSES:
-                        redirect_url = response.headers.get("Location", "")
-                        current_url = urljoin(current_url, redirect_url)
-                        await asyncio.to_thread(_validate_url, current_url)
-                        continue
-                    maybe_coro = response.raise_for_status()
-                    if asyncio.iscoroutine(maybe_coro):
-                        await maybe_coro
-                    return await _read_aiohttp_content(response)
-            except MediaFetchError:
-                raise
-            except aiohttp.ClientResponseError as error:
-                if error.status in (408, 429) or error.status >= 500:
-                    raise MediaFetchError(
-                        f"remote media server returned HTTP {error.status}"
-                    ) from error
-                raise
-            except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-                raise MediaFetchError(f"remote media fetch failed: {error}") from error
-        raise RuntimeError("Too many redirects")
-
-    return await _fetch(await _get_aiohttp_session())
+    session = await _get_aiohttp_session()
+    current_url = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        try:
+            async with session.get(current_url, timeout=timeout, allow_redirects=False) as response:
+                if response.status in _REDIRECT_STATUSES:
+                    redirect_url = response.headers.get("Location", "")
+                    current_url = urljoin(current_url, redirect_url)
+                    await asyncio.to_thread(_validate_url, current_url)
+                    continue
+                maybe_coro = response.raise_for_status()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+                return await _read_aiohttp_content(response)
+        except MediaFetchError:
+            raise
+        except aiohttp.ClientResponseError as error:
+            if error.status in (408, 429) or error.status >= 500:
+                raise MediaFetchError(
+                    f"remote media server returned HTTP {error.status}"
+                ) from error
+            raise
+        except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            raise MediaFetchError(f"remote media fetch failed: {error}") from error
+    raise RuntimeError("Too many redirects")
 
 
 def _load_and_convert_image(image):
@@ -915,11 +911,19 @@ def _load_video_by_cv2(
         # affected (e.g. every frame retrieves with a drifted shape).
         skip_warned = False
         frame_idx = 0
-        while frame_idx <= max_idx and vidcap.grab():
+        while frame_idx <= max_idx:
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.check_cancelled()
+            if not vidcap.grab():
+                break
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.check_cancelled()
             if frame_idx in target_set:
                 # Reuse a single BGR buffer across retrieves; cv2 replaces its
                 # contents in place when the argument is shape-compatible.
                 ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
+                if decoded_memory_reservation is not None:
+                    decoded_memory_reservation.check_cancelled()
                 if ok:
                     fh, fw = bgr_scratch.shape[:2]
                     if stacked_rgb is None:
@@ -975,6 +979,8 @@ def _load_video_by_cv2(
                     )
                     skip_warned = True
             frame_idx += 1
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.check_cancelled()
         vidcap.release()
 
         if stacked_rgb is None or not valid_indices:
@@ -1139,6 +1145,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     # Servers can publish a dedicated pool via `set_executor` so
     # media decoding does not contend with unrelated `to_thread` callers.
     _executor: ClassVar[Optional[Executor]] = None
+    _request_executor: ClassVar[ContextVar[Optional[Executor]]] = ContextVar(
+        "media_io_executor", default=None
+    )
 
     # Required MIME type prefix for `data:` URIs handled by this modality
     # (e.g. `"image/"`). A data URI whose declared media type falls outside
@@ -1154,6 +1163,16 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         than once replaces the previously configured executor.
         """
         BaseMediaIO._executor = executor
+
+    @classmethod
+    @contextmanager
+    def use_executor(cls, executor: Optional[Executor]) -> Iterator[None]:
+        """Scope decode work to a server-owned executor without replacing other servers' pools."""
+        token = BaseMediaIO._request_executor.set(executor)
+        try:
+            yield
+        finally:
+            BaseMediaIO._request_executor.reset(token)
 
     @classmethod
     def create(
@@ -1240,7 +1259,8 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         if kwargs:
             fn = functools.partial(fn, **kwargs)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(BaseMediaIO._executor, fn, *args)
+        executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
+        return await loop.run_in_executor(executor, fn, *args)
 
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):

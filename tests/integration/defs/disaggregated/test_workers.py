@@ -34,6 +34,7 @@ from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
+from tensorrt_llm.llmapi.disagg_utils import get_global_disagg_request_id
 from tensorrt_llm.serve.disagg_auth import build_internal_disagg_auth_headers
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
@@ -186,7 +187,11 @@ class BasicWorkerTester:
         ctx_request = copy.deepcopy(request)
         gen_request = copy.deepcopy(request)
 
-        ctx_request["disaggregated_params"] = {"request_type": "context_only"}
+        # Context workers have independent local request ID sequences.
+        ctx_request["disaggregated_params"] = {
+            "request_type": "context_only",
+            "disagg_request_id": get_global_disagg_request_id(node_id=0),
+        }
         ctx_response = await self.send_request(session, ctx_url, ctx_request)
         assert len(ctx_response["choices"]) == 1
 
