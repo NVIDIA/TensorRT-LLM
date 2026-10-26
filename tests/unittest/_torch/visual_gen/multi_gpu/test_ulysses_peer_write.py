@@ -65,8 +65,13 @@ def _worker(rank: int, port: int) -> None:
                 result = compiled_output(actual[0])
                 torch.testing.assert_close(result, q, rtol=0, atol=0)
                 for key_mask in (None, mask):
+                    assert attention._supports_packed_self_attention(
+                        q, k, v, {"key_padding_mask": key_mask}
+                    )
                     expected = attention.forward(q, k, v, key_padding_mask=key_mask)
                     actual_output = compiled_attention(q, k, v, key_padding_mask=key_mask)
+                    # Ensure parity cannot pass by silently taking the packed-QKV fallback.
+                    assert actual_output.data_ptr() == state.output.data_ptr()
                     torch.testing.assert_close(actual_output, expected, rtol=0, atol=0)
                 # Consume the borrowed result before the next exchange overwrites it.
                 assert result.data_ptr() == state.output.data_ptr()

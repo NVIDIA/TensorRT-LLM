@@ -467,6 +467,22 @@ class UlyssesAttention(AttentionBackend):
                 f"by world_size ({self.world_size})."
             )
 
+        workspace = self.peer_write
+        if (
+            workspace is not None
+            and not torch.is_grad_enabled()
+            and self.inner_backend.preferred_layout == AttentionTensorLayout.NHD
+            and not any(
+                kwargs.get(key) is not None
+                for key in (*_REPLICATED_KV_KWARGS, "gate_compress", "gate_fine")
+            )
+            and workspace.matches(q, k, v)
+        ):
+            q, k, v = workspace.exchange_qkv(q, k, v)
+            kwargs.update(batch_size=q.shape[0], seq_len=q.shape[1], seq_len_kv=k.shape[1])
+            output = self.inner_backend.forward(q=q, k=k, v=v, **kwargs)
+            return workspace.exchange_output(output.reshape(q.shape))
+
         if self.inner_backend.support_fused_qkv():
             out = self._forward_fused(q, k, v, **kwargs)
         elif self._supports_packed_self_attention(q, k, v, kwargs):
@@ -573,22 +589,6 @@ class UlyssesAttention(AttentionBackend):
         v: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        workspace = self.peer_write
-        if (
-            workspace is not None
-            and not torch.is_grad_enabled()
-            and self.inner_backend.preferred_layout == AttentionTensorLayout.NHD
-            and not any(
-                kwargs.get(key) is not None
-                for key in (*_REPLICATED_KV_KWARGS, "gate_compress", "gate_fine")
-            )
-            and workspace.matches(q, k, v)
-        ):
-            q, k, v = workspace.exchange_qkv(q, k, v)
-            kwargs.update(batch_size=q.shape[0], seq_len=q.shape[1], seq_len_kv=k.shape[1])
-            output = self.inner_backend.forward(q=q, k=k, v=v, **kwargs)
-            return workspace.exchange_output(output.reshape(q.shape))
-
         # gate_compress / gate_fine (VSA) must follow the same all-to-all as
         # Q/K/V so they arrive at the inner backend in the same (full-S, sharded-H) layout.
         gate_compress = kwargs.pop("gate_compress", None)
