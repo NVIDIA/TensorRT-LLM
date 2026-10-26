@@ -166,7 +166,7 @@ class BatchedLogitsProcessor(ABC):
         req_ids: List[int],
         logits: List[torch.Tensor],
         token_ids: List[List[List[int]]],
-        stream_ptr: int,
+        stream_ptr: Optional[int],
         client_ids: List[Optional[int]],
     ) -> None:
         """Batched logits processing callback. The callback is expected to inplace modify the logits.
@@ -175,8 +175,11 @@ class BatchedLogitsProcessor(ABC):
             req_ids (List[int]): A batch of request ids.
             logits (List[torch.Tensor]): A batch of the logits tensors.
             token_ids (List[List[List[int]]]): A batch of the token ids produced by the requests so far.
-                The shape is batch * beam_width * sequence_length.
-            stream_ptr (int): The operation stream used by the logits tensors.
+                The shape is batch * beam_width * sequence_length. Each entry is what the
+                request's own ``LogitsProcessor`` would receive (see its ``token_ids``).
+            stream_ptr (int, optional): The operation stream used by the logits tensors.
+                On the PyTorch backend this is the CUDA stream the logits live on,
+                or None when they are not on a CUDA device.
             client_ids (List[Optional[int]]): A batch of optional client ids.
         """
         pass  # noqa
@@ -209,6 +212,8 @@ class SamplingParams:
             If a list, each processor is applied in order during generation (supported in PyTorch backend only).
         apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
             The BatchedLogitsProcessor class is recommended for callback creation. The callback must be provided when initializing LLM.
+            The callback is called once per decoding step with every scheduled request that sets this, after each
+            request's own logits_processor(s).
 
         n (int): Number of sequences to generate. Defaults to 1.
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
