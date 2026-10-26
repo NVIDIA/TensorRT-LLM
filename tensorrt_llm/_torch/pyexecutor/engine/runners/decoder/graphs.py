@@ -57,7 +57,7 @@ from tensorrt_llm.mapping import Mapping
 from ...lora import LoraParamBuilder
 from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
-from .dummy_requests import DummyRequestFactory
+from .dummy_requests import DummyRequestFactory, supports_generation_warmup
 from .metadata import DecoderMetadata
 from .warmup import WarmupAgreement
 
@@ -333,6 +333,11 @@ class DecoderCudaGraphs:
 
     def preallocate_padding_dummies(self, resource_manager: ResourceManager) -> None:
         """Allocate the padding dummies while the KV cache is still empty."""
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if not supports_generation_warmup(kv_cache_manager):
+            return
         self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
 
     def warmup_and_capture(self, resource_manager: ResourceManager) -> None:
@@ -442,9 +447,9 @@ class DecoderCudaGraphs:
         if not (
             scheduled_requests.num_context_requests > 0
             and scheduled_requests.attention_dp_phase is not RemoteTailPhase.CONTEXT
-            # A physically pruned context cache cannot become a decode
-            # batch, including single-token synthetic prefill warmup rows.
-            and getattr(kv_cache_manager, "context_swa_layer_limit", None) is None
+            # Context-only caches cannot execute promoted decode rows.
+            and supports_generation_warmup(kv_cache_manager)
+            and not getattr(kv_cache_manager, "use_kda_2fp4_replay", False)
             and self.cuda_graph_runner.enabled
             and can_promote_spec_decode
             and not ced_enabled
@@ -661,9 +666,7 @@ class DecoderCudaGraphs:
                 kv_cache_manager = resource_manager.get_resource_manager(
                     ResourceManagerType.KV_CACHE_MANAGER
                 )
-                context_only = (
-                    getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
-                )
+                context_only = not supports_generation_warmup(kv_cache_manager)
                 # Context-only workers only use the separate prefill capture.
                 if not context_only:
                     from tensorrt_llm._torch.modules.linear import (

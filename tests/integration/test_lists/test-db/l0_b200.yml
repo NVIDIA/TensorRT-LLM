@@ -168,6 +168,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
+  - unittest/_torch/modules/kimi_kda/test_kda_2fp4_replay.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
