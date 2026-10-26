@@ -20,6 +20,10 @@ __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as M,
 )
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -67,7 +71,9 @@ def _request(image=None, video=None, order=None, **overrides):
         data["image"] = _media("image", image)
     if video is not None:
         data["video"] = _media("video", video)
-    fields = {"py_multimodal_data": data, "py_mm_item_order": order, "prompt_len": prompt_len}
+    if order is not None:
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    fields = {"py_multimodal_data": data, "prompt_len": prompt_len}
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
@@ -77,7 +83,7 @@ def _admit(request):
 
 
 def _item(modality, index):
-    return {"modality": modality, "index": index}
+    return modality, index
 
 
 IMAGES = [(1, 4, 4), (1, 2, 2)]
@@ -173,9 +179,9 @@ def test_missing_or_mis_sized_position_ids_fail_the_request():
 
 
 def test_a_mixed_request_needs_its_manifest():
-    with pytest.raises(ValueError, match="needs mm_item_order"):
+    with pytest.raises(ValueError, match="needs item metadata"):
         _admit(_request(image=IMAGES, video=VIDEOS))
-    with pytest.raises(ValueError, match="needs mm_item_order"):
+    with pytest.raises(ValueError, match="needs item metadata"):
         _admit(_request(image=IMAGES, video=VIDEOS, order=[]))
 
 
@@ -187,7 +193,7 @@ def test_a_manifest_that_disagrees_with_the_payload_is_refused():
     with pytest.raises(ValueError, match="is not an item of this request"):
         _admit(_request(image=IMAGES, video=VIDEOS, order=MIXED_ORDER + [_item("audio", 0)]))
     with pytest.raises(ValueError, match="is not an item of this request"):
-        _admit(_request(image=IMAGES, video=VIDEOS, order=[{"modality": "image"}]))
+        _admit(_request(image=IMAGES, video=VIDEOS, order=[("image",)]))
 
 
 def test_the_placeholder_count_is_the_sum_over_both_modalities():

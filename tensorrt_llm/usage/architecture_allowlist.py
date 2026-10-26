@@ -28,6 +28,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "BertForSequenceClassification",
         "CLIPVisionModel",
         "Cohere2ForCausalLM",
+        "Cosmos3EdgeForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "DeciLMForCausalLM",
         "DeepSeekV2ForCausalLM",
