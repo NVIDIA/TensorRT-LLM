@@ -65,6 +65,10 @@ class DeepSeekV32Parser(BaseToolParser):
 
     _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
 
+    # The encoders write a blank line between a reply's content and its tool-call
+    # block: it belongs to the format, not to the content.
+    _CALLS_SEPARATOR = "\n\n"
+
     # Invoke header up to the function name, which is arbitrary text.
     _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
     _INVOKE_BEGIN_TEMPLATE = '<｜DSML｜invoke name="{name}">'  # nosec B105
@@ -135,7 +139,7 @@ class DeepSeekV32Parser(BaseToolParser):
         if self._eos_token in text:
             text = text.replace(self._eos_token, "")
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
+        normal_text = text[:idx].removesuffix(self._CALLS_SEPARATOR) if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
@@ -168,6 +172,27 @@ class DeepSeekV32Parser(BaseToolParser):
             logger.error(f"Error in detect_and_parse: {e}")
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
+
+    def _separator_prefix_at_end(self, text: str) -> str:
+        """The tail of ``text`` that could still begin the blank line before a calls block."""
+        for size in range(len(self._CALLS_SEPARATOR), 0, -1):
+            if text.endswith(self._CALLS_SEPARATOR[:size]):
+                return text[-size:]
+        return ""
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Emit, as content, what the stream ended while holding back.
+
+        That is a trailing blank line no tool-call block followed, or a tail that
+        never completed into a delimiter. Inside an unfinished calls block nothing
+        is emitted.
+        """
+        if self._in_calls_block:
+            return StreamingParseResult()
+        held, self._buffer = self._buffer, ""
+        for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
+            held = held.replace(e_token, "")
+        return StreamingParseResult(normal_text=held)
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """Streaming incremental parsing tool calls for DeepSeekV32 format.
@@ -210,7 +235,12 @@ class DeepSeekV32Parser(BaseToolParser):
 
         if not has_tool_call and not ends_with_partial_token:
             normal_text = current_text
-            self._buffer = ""
+            # Trailing newlines may begin the blank line before a tool-call block,
+            # which is not content: hold them until the next increment, or
+            # finish(), shows what follows.
+            held = "" if self._in_calls_block else self._separator_prefix_at_end(normal_text)
+            self._buffer = held
+            normal_text = normal_text[: len(normal_text) - len(held)]
             for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
                 normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text)
@@ -226,6 +256,8 @@ class DeepSeekV32Parser(BaseToolParser):
             if self._in_calls_block and not normal_text.strip():
                 # The separator before the next invoke.
                 normal_text = ""
+            elif not self._in_calls_block and current_text.startswith(self.bot_token):
+                normal_text = normal_text.removesuffix(self._CALLS_SEPARATOR)
             self._in_calls_block = True
 
         if not hasattr(self, "_tool_indices"):
