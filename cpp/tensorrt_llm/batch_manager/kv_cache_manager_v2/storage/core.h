@@ -64,7 +64,6 @@ struct Slot
     Slot(Slot&& other) noexcept
         : readyEvent(std::move(other.readyEvent))
         , mSlotId(std::exchange(other.mSlotId, std::nullopt))
-        , mLocalityDomainId(std::exchange(other.mLocalityDomainId, std::nullopt))
     {
     }
 
@@ -74,7 +73,6 @@ struct Slot
         {
             readyEvent = std::move(other.readyEvent);
             mSlotId = std::exchange(other.mSlotId, std::nullopt);
-            mLocalityDomainId = std::exchange(other.mLocalityDomainId, std::nullopt);
         }
         return *this;
     }
@@ -98,21 +96,9 @@ struct Slot
         mSlotId = id;
     }
 
-    // Locality domain whose physical memory backs this slot; nullopt for non-localized storage.
-    [[nodiscard]] std::optional<LocalityDomainId> localityDomainId() const noexcept
-    {
-        return mLocalityDomainId;
-    }
-
-    void setLocalityDomainId(std::optional<LocalityDomainId> id) noexcept
-    {
-        mLocalityDomainId = id;
-    }
-
     void resetSlot() noexcept
     {
         mSlotId.reset();
-        mLocalityDomainId.reset();
     }
 
     bool queryReady()
@@ -138,15 +124,12 @@ struct Slot
         Slot previous;
         auto replacementId = std::exchange(replacement.mSlotId, std::nullopt);
         previous.mSlotId = std::exchange(mSlotId, replacementId);
-        auto replacementDomain = std::exchange(replacement.mLocalityDomainId, std::nullopt);
-        previous.mLocalityDomainId = std::exchange(mLocalityDomainId, replacementDomain);
         previous.readyEvent = std::exchange(readyEvent, std::move(replacement.readyEvent));
         return previous;
     }
 
 private:
     std::optional<SlotId> mSlotId;
-    std::optional<LocalityDomainId> mLocalityDomainId;
 };
 
 // ---------------------------------------------------------------------------
@@ -567,6 +550,13 @@ public:
     // Returns the slot to the allocator of the domain that issued it.
     void release(Slot slot);
     void destroy();
+
+    // Locality domain whose memory backs a slot id this group issued; nullopt when not localized.
+    [[nodiscard]] virtual std::optional<LocalityDomainId> localityDomainOf(SlotId /*slot*/) const noexcept
+    {
+        return std::nullopt;
+    }
+
     virtual void resizePools(
         std::optional<SlotCount> newNumSlots = std::nullopt, LocalityDomainId localityDomainId = LocalityDomainId{0});
 
@@ -732,6 +722,16 @@ public:
         return static_cast<GpuSlotPool const&>(pool).mappedRanges();
     }
 
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainOf(SlotId slot) const noexcept override
+    {
+        if (mSlotMaps.empty())
+        {
+            return std::nullopt;
+        }
+        int8_t const owner = mChunkOwner[slotCountToSizeT(slot.value() / mChunkSize)];
+        return owner < 0 ? std::nullopt : std::optional<LocalityDomainId>{LocalityDomainId{owner}};
+    }
+
 protected:
     SlotCount getNumSlotsFromPools(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept override;
 
@@ -744,6 +744,8 @@ private:
     size_t mMaxChunks{0};
     size_t mNumChunks{0};
     std::priority_queue<size_t, std::vector<size_t>, std::greater<>> mFreeChunks;
+    // Owning locality domain of each chunk of the slot-id space, kept in step with mSlotMaps.
+    std::vector<int8_t> mChunkOwner;
 };
 
 //! Host pools are committed progressively on a background thread, so a slot may
@@ -876,6 +878,11 @@ public:
     }
 
     PoolGroupBase& poolGroup(PoolGroupIndex pgIdx)
+    {
+        return *mPoolGroups.at(pgIdx);
+    }
+
+    PoolGroupBase const& poolGroup(PoolGroupIndex pgIdx) const
     {
         return *mPoolGroups.at(pgIdx);
     }

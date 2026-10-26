@@ -163,6 +163,8 @@ public:
 
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
+    // Locality domain whose memory backs a slot of this life cycle at this level; nullopt when not localized.
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainOf(CacheLevel level, LifeCycleId lc, SlotId slot) const;
 
     // ---- Eviction ----------------------------------------------------------
 

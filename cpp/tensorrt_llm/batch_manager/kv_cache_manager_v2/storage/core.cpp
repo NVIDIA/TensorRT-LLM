@@ -171,7 +171,6 @@ Slot SlotAllocator::allocate()
     else if (mNumActiveSlots < std::min(mCapacity, mTargetCapacity))
     {
         slot.setSlotId(slotId(mNumActiveSlots++));
-        slot.setLocalityDomainId(mLocalityDomainId);
     }
     else
     {
@@ -209,8 +208,7 @@ void SlotAllocator::release(Slot slot)
         throw LogicError("SlotAllocator::release: slot has no valid id");
     }
     auto const local = localIndex(slot.slotId());
-    if (slot.localityDomainId() != mLocalityDomainId || !local.has_value() || *local < 0 || *local >= mCapacity
-        || !mOccupiedMask.get(slotCountToSizeT(*local)))
+    if (!local.has_value() || *local < 0 || *local >= mCapacity || !mOccupiedMask.get(slotCountToSizeT(*local)))
     {
         // The id is not one this allocator has outstanding, so drop it rather than let the
         // rejected slot look like an unreleased one.
@@ -670,7 +668,7 @@ std::vector<Slot> PoolGroupBase::allocateMultiple(SlotCount numSlots, LocalityDo
 
 void PoolGroupBase::release(Slot slot)
 {
-    LocalityDomainId const owner = slot.localityDomainId().value_or(LocalityDomainId{0});
+    LocalityDomainId const owner = localityDomainOf(slot.slotId()).value_or(LocalityDomainId{0});
     mSlotAllocators.at(owner)->release(std::move(slot));
 }
 
@@ -823,6 +821,7 @@ GpuPoolGroup::GpuPoolGroup(TypedVec<LocalityDomainId, SlotCount> const& numSlots
     mChunkSize = static_cast<SlotCount>(chunkSize);
     // At most one partially used chunk per domain needs extra VA padding.
     mMaxChunks = divUp(maxSlots, chunkSize) + static_cast<size_t>(numLocalityDomains);
+    mChunkOwner.assign(mMaxChunks, -1);
 
     mSlotMaps.reserve(LocalityDomainId{numLocalityDomains});
     mSlotAllocators.clear();
@@ -917,10 +916,13 @@ void GpuPoolGroup::resizeSlotMap(SlotCount numSlots, LocalityDomainId localityDo
             chunk = mNumChunks++;
         }
         slotMap.append(chunk);
+        mChunkOwner[chunk] = static_cast<int8_t>(localityDomainId.value());
     }
     while (slotMap.chunks().size() > numChunks)
     {
-        mFreeChunks.push(slotMap.pop());
+        size_t const chunk = slotMap.pop();
+        mChunkOwner[chunk] = -1;
+        mFreeChunks.push(chunk);
     }
 }
 

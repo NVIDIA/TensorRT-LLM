@@ -891,6 +891,11 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
+std::optional<LocalityDomainId> StorageManager::localityDomainOf(CacheLevel level, LifeCycleId lc, SlotId slot) const
+{
+    return mLevels.at(level).storage->poolGroup(getPoolGroupIndex(level, lc)).localityDomainOf(slot);
+}
+
 // ---------------------------------------------------------------------------
 // isEvictable
 // ---------------------------------------------------------------------------
