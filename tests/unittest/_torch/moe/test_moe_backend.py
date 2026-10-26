@@ -770,7 +770,7 @@ def test_scheduler_quantizes_input_async_only_under_multi_stream(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
-        backend=CuteDslFusedMoE.__new__(CuteDslFusedMoE),
+        backend=TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl),
         comm=object() if has_comm else None,
         apply_router_weight_on_input=router_weight_on_input,
     )
@@ -784,7 +784,7 @@ def test_scheduler_skips_async_quantization_without_backend_support(monkeypatch)
     monkeypatch.setattr(moe_scheduler, "do_multi_stream", lambda: True)
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
-        backend=CutlassFusedMoE.__new__(CutlassFusedMoE),
+        backend=TrtllmCutlassNvfp4Impl.__new__(TrtllmCutlassNvfp4Impl),
         comm=None,
         apply_router_weight_on_input=False,
     )
@@ -5357,6 +5357,29 @@ def test_situ_survives_resolution_not_just_construction(backend_cls):
     )
     rejection = _reject_unsupported_activation(backend_cls, problem)
     assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_cutedsl_nvfp4_situ_admitted_on_blackwell_and_rubin(sm):
+    """The NVFP4 grouped-GEMM leaf admits SiTU on SM100/SM103 and on Rubin (SM107).
+
+    Kimi K3 runs NVFP4 SiTU on ``CUTEDSL`` without degradation, so a gate here
+    would fail it at construction rather than fall back.
+    """
+    deps = (MoEDep.CUTEDSL_RUBIN,) if sm == 107 else ()
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=256,
+        env=MoEEnvironment(sm=sm, available_deps=deps),
+    )
+    verdict = TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(
+        _nvfp4_problem(2048, "SiTu"), deployment
+    )
+    assert verdict.eligible, verdict.detail
 
 
 def test_cutedsl_fc12_refuses_relu2_at_resolution():

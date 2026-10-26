@@ -3024,7 +3024,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     )
 
 
-def _cute_dsl_eligibility(**deployment_kwargs):
+def _cute_dsl_eligibility(activation: str = "Swiglu", **deployment_kwargs):
     """``can_implement`` verdict for NVFP4 on an SM107 machine with Rubin DSL."""
     from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
         MoEDeployment,
@@ -3033,7 +3033,7 @@ def _cute_dsl_eligibility(**deployment_kwargs):
     )
     from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
 
-    problem = MoEProblem(quant="NVFP4", dtype_act=torch.bfloat16)
+    problem = MoEProblem(quant="NVFP4", dtype_act=torch.bfloat16, activation=activation)
     deployment = MoEDeployment(
         ep_size=1,
         tp_size=1,
@@ -3067,6 +3067,12 @@ def test_cute_dsl_sm107_requires_fused_finalize():
     verdict = _cute_dsl_eligibility(fused_finalize_enabled=False)
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.FINALIZE_FUSION_REQUIRED
+
+
+def test_cute_dsl_nvfp4_admits_relu2_on_rubin():
+    """The NVFP4 FC1 fuses Relu2 too; only the BF16 leaf is SwiGLU-only."""
+    verdict = _cute_dsl_eligibility(activation="Relu2")
+    assert verdict.eligible, verdict.detail
 
 
 def test_cute_dsl_locality_domain_disables_dwdp():
