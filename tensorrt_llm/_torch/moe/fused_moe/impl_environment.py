@@ -52,9 +52,6 @@ class MoEDep(str, Enum):
 class MoEEnvFlag(str, Enum):
     """Environment variables that MoE selection is allowed to read."""
 
-    #: Opt-in to the FlashInfer provider for quantized TRTLLM-Gen. Changes the
-    #: routing split, which is why load-balancer eligibility depends on it.
-    TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
     #: Opt-in to folding the shared experts into the routed grouped GEMM.
     #: Collected rather than read from ``os.environ`` because it changes how
     #: many expert slots the GEMM builds: two ranks disagreeing on it would
@@ -143,7 +140,6 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
 
 # Preserve prior defaults when environment variables are unset.
 _ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, str] = {
-    MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER: "0",
     MoEEnvFlag.SHARED_EXPERT_FUSION: "0",
 }
 

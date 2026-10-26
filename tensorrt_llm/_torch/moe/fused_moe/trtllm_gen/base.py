@@ -67,10 +67,11 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     - ``quant`` decides which kernel ``run_moe`` calls, how weights and inputs
       are prepared, and which activation ABI applies. Held by a per-quant class
       in the module named for that kernel ABI -- :mod:`.fp4_block_scale` or
-      :mod:`.fp8_block_scale` -- one per format that two providers share. A
-      format only one provider serves has no such class.
-    - ``provider`` decides which op backend executes, which configurations are
-      eligible, and whether the kernel writes into the caller's workspace. Read
+      :mod:`.fp8_block_scale` -- for the formats that share a runner op. A
+      format on a runner op of its own has no such class.
+    - ``provider`` decides which op backend executes and whether the kernel
+      writes into the caller's workspace. Every quantized format runs on the
+      native ``trtllm`` provider and the unquantized one on FlashInfer. Read
       off the leaf's own descriptor by ``__init_subclass__`` below, so a leaf
       is just an identity and a ``can_implement``.
 
@@ -98,16 +99,15 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     #: ``__init_subclass__``, not declared per leaf.
     provider: ClassVar[str]
     #: ``provider == PROVIDER_FLASHINFER``, read from outside as a plain
-    #: attribute by ``ConfigurableMoE`` and the backend tests. Derived with
-    #: ``provider``.
+    #: attribute by the backend tests. Derived with ``provider``.
     use_flashinfer: ClassVar[bool]
     #: Whether this format has a fused cubin for the gpt-oss SwiGLU package
     #: (expert bias plus alpha/beta). Read off the *class* at resolution time,
     #: where there is no instance to ask.
     supports_gptoss_style: ClassVar[bool] = False
     #: Whether this leaf can run SiTu. Per-leaf and not per-format: the format
-    #: needs a fused SiTu FC1 cubin *and* the provider has to call it, so a
-    #: FlashInfer sibling of a supported format may still be False.
+    #: needs a fused SiTu FC1 cubin *and* the provider has to call it, and only
+    #: the native op backend does.
     supports_situ: ClassVar[bool] = False
     #: Whether this format's cubins always read an FC bias, so a model without
     #: one still needs a zeroed buffer. Declarative rather than an override
