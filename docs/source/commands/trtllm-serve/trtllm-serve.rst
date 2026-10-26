@@ -161,9 +161,9 @@ Then, start the server with the configuration file:
 Multimodal Chat API
 ~~~~~~~~~~~~~~~~~~~
 
-You can query Completions API with any http clients, a typical example is OpenAI Python client:
+You can query the Chat Completions API with any HTTP client. A typical example uses the OpenAI Python client:
 
-.. literalinclude:: ../../../../examples/serve/openai_completion_client_for_multimodal.py
+.. literalinclude:: ../../../../examples/serve/openai_chat_client_for_multimodal.py
     :language: python
     :linenos:
 
@@ -367,6 +367,7 @@ Start the server and specify the ``--config`` argument with the path to the YAML
 
 After sending at least one inference request to the server, you can fetch runtime iteration statistics by polling the ``/metrics`` endpoint.
 Since the statistics are stored in an internal queue and removed once retrieved, it's recommended to poll the endpoint shortly after each request and store the results if needed.
+Each statistic is returned to only one caller, so poll the endpoint from a single client: when several clients poll at once, one of them may receive an empty list.
 
 .. code-block:: bash
 

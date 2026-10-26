@@ -103,6 +103,21 @@ class FusedQkNormRope(OpWrapper):
             "GEMMA_PREFILL_ATOL",
             spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_MAIN),
         ),
+        # The main rope run in place on qwen4_exp's fused input projection, whose
+        # row is [q | k | v | gate | index | pad] = 55 heads of 256: everything
+        # after k is passed as v heads, which only sets the row stride.
+        Cell(
+            why="qwen4_exp fused-row main rope, 1 token: 29 v heads only set the row stride",
+            spec=dict(tokens=1, **{**_QWEN_MAIN, "num_heads_v": 29}),
+        ),
+        Cell(
+            why="qwen4_exp fused-row main rope, 128 tokens: decode at max concurrency",
+            spec=dict(tokens=128, **{**_QWEN_MAIN, "num_heads_v": 29}),
+        ),
+        Cell(
+            why="qwen4_exp fused-row main rope, 8192 tokens: prefill, under GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **{**_QWEN_MAIN, "num_heads_v": 29}),
+        ),
         Cell(
             why="qwen4_exp index rope (mRoPE), 1 token: one k and one v head, the "
             "narrowest layout; 5 warps of an 8-warp block",

@@ -590,6 +590,7 @@ def test_selfsampling_route_factorization():
                 2560,
                 4096,
                 8192,
+                12288,
                 16384,
                 4 * 1024,
                 4 * 4096,
@@ -635,42 +636,40 @@ def test_selfsampling_dispatch_is_pure_and_total():
             assert r["block"] >= 128 and r["grid"][0] >= 1
 
 
-def test_selfsampling_route_4k_8k_register_rungs():
-    """4K < n <= 8K (n4 in (1024, 2048]) dispatches to two one-wave register
-    rungs: wide rows BLK=1024 x VPT=2 with 2*NB bins, 148 < b <= 296 BLK=512 x
-    VPT=4 x MINB=2 with NB bins; b > 296 keeps the main slab and both band
-    edges keep their previous plans. Every register plan carries QC == QUADC
-    and the kernel pin IMGOFF == NBH. CPU-only."""
+def test_selfsampling_route_4k_8k_register_rungs() -> None:
+    """Check register launch geometry, boundary tails and histogram layout."""
     for k in (512, 1024, 2048):
         for n in (4100, 6144, 8192, 8195):
             npad = (n + 63) // 64 * 64
             for b in (1, 64, 148):
                 r = ss_host.route(b, n, npad, k)
-                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == (1024, 2, 1), (b, n, k, r)
+                want = (512, 3, 1) if k == 2048 and n <= 6144 else (1024, 2, 1)
+                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == want, (b, n, k, r)
                 assert r["tpl"][7] == 2 * ss_host.NB
-            for b in (149, 160, 256, 296):
+            for b in (149, 160, 256, 296, 297):
                 r = ss_host.route(b, n, npad, k)
-                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == (512, 4, 2), (b, n, k, r)
+                want = (512, 3, 2) if n <= 6144 else (512, 4, 2)
+                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == want, (b, n, k, r)
                 assert r["tpl"][7] == ss_host.NB
-            assert ss_host.route(297, n, npad, k)["kernel"] == "main"
-        # band edges: n4 == 1024 keeps the n4 <= 1024 rungs, n4 == 2049 the VPT=4 plan
+        lower_edge = {
+            512: ("regimg", (1024, 1, 2)),
+            1024: ("reg", (1024, 1, 1)),
+            2048: ("reg", (512, 2, 1)),
+        }
         lo = ss_host.route(64, 4099, 4160, k)
-        assert lo["kernel"] == ("regimg" if k == 512 else "reg") and tuple(lo["tpl"][:3]) == (
-            1024,
-            1,
-            2,
-        )
+        assert (lo["kernel"], tuple(lo["tpl"][:3])) == lower_edge[k]
         assert tuple(ss_host.route(160, 4099, 4160, k)["tpl"][:3]) == (512, 2, 4)
         hi = ss_host.route(64, 8196, 8256, k)
-        assert hi["kernel"] == "reg" and tuple(hi["tpl"][:3]) == (1024, 4, 1)
-        assert ss_host.route(160, 8196, 8256, k)["kernel"] == "main"
+        assert hi["kernel"] == "reg" and tuple(hi["tpl"][:3]) == (1024, 3, 1)
+        mid_hi = ss_host.route(160, 8196, 8256, k)
+        assert mid_hi["kernel"] == "reg" and tuple(mid_hi["tpl"][:3]) == (512, 5, 2)
     for k in (512, 1024, 2048):
         for b in (1, 148, 149, 296, 297, 1024):
             for n in range(k + 1, 16385, 97):
                 npad = (n + 63) // 64 * 64
                 r = ss_host.route(b, n, npad, k)
                 if r["kernel"] in ("reg", "regimg"):
-                    assert r["rt"]["QC"] == ss_host.QUADC, (b, n, k)
+                    assert r["rt"]["QC"] == 160, (b, n, k)
                     assert r["rt"]["IMGOFF"] == r["tpl"][7], (
                         b,
                         n,
@@ -678,6 +677,10 @@ def test_selfsampling_route_4k_8k_register_rungs():
                         r["rt"]["IMGOFF"],
                         r["tpl"][7],
                     )
+                    scratch = 2 * r["rt"]["CMP"]
+                    if r["kernel"] == "regimg":
+                        scratch = max(scratch, (n + 3) & ~3)
+                    assert r["smem"] == (r["tpl"][7] + scratch) * 4, (b, n, k, r)
 
 
 def test_selfsampling_register_rungs_follow_available_sms() -> None:
@@ -692,11 +695,17 @@ def test_selfsampling_register_rungs_follow_available_sms() -> None:
                 mid = ss_host.route(rows, n, npad, k, num_sms)
                 assert mid["kernel"] == "reg"
                 assert tuple(mid["tpl"][:3]) == (512, 4, 2)
-            assert ss_host.route(2 * num_sms + 1, n, npad, k, num_sms)["kernel"] == "main"
+            tall = ss_host.route(2 * num_sms + 1, n, npad, k, num_sms)
+            assert tall["kernel"] == "reg"
+            assert tuple(tall["tpl"][:3]) == (512, 4, 2)
 
             n, npad = 12288, 12288
-            assert ss_host.route(num_sms, n, npad, k, num_sms)["kernel"] == "reg"
-            assert ss_host.route(num_sms + 1, n, npad, k, num_sms)["kernel"] == "main"
+            wide = ss_host.route(num_sms, n, npad, k, num_sms)
+            assert wide["kernel"] == "reg"
+            assert tuple(wide["tpl"][:3]) == (1024, 3, 1)
+            mid = ss_host.route(num_sms + 1, n, npad, k, num_sms)
+            assert mid["kernel"] == "reg"
+            assert tuple(mid["tpl"][:3]) == (512, 6, 2)
 
         # Streaming and clustered-register tuning is intentionally invariant.
         for rows, n, k, family in (
@@ -716,11 +725,47 @@ def test_selfsampling_register_rungs_follow_available_sms() -> None:
             )
 
 
+def test_selfsampling_route_12k_register_coverage() -> None:
+    """The 12K register envelope covers both architectures and all batch sizes."""
+    for sm_version in (100, 103):
+        for num_sms in (148, 160, 208):
+            for k in (512, 1024, 2048):
+                for rows in (
+                    1,
+                    num_sms,
+                    num_sms + 1,
+                    2 * num_sms,
+                    2 * num_sms + 1,
+                    512,
+                    768,
+                    1024,
+                    1280,
+                    2048,
+                    8192,
+                ):
+                    for n in (8196, 10240, 12287, 12288):
+                        for det in (False, True):
+                            npad = (n + 63) // 64 * 64
+                            plan = ss_host.route(rows, n, npad, k, num_sms, sm_version, det)
+                            assert plan["kernel"] == "reg", (rows, n, k, plan)
+                            assert plan["grid"] == (rows, 1) and plan["cluster"] == 1
+                            assert not plan["ws"]
+                            assert plan["tpl"][0] * plan["tpl"][1] >= n // 4
+                            if det:
+                                assert plan["tpl"][1] <= 8
+
+                # K=2048 also retains a float4 rung through its three scalar tails.
+                for n in (12289, 12290, 12291, 12292):
+                    plan = ss_host.route(8192, n, 12352, k, num_sms, sm_version)
+                    family = "reg" if k == 2048 and n <= 12291 else "main"
+                    assert plan["kernel"] == family, (n, k, plan)
+
+
 def test_selfsampling_route_sms_factorization() -> None:
     """The factored route preserves topology-dependent register plans."""
     for num_sms in (148, 160, 208):
         for rows in (num_sms, num_sms + 1, 2 * num_sms, 2 * num_sms + 1):
-            for n in (4100, 8195, 12288, 131072):
+            for n in (4100, 8195, 12288, 12289, 12292, 131072):
                 for k in (512, 1024, 2048):
                     npad = (n + 63) // 64 * 64
                     assert ss_host.route_split(rows, n, npad, k, num_sms) == ss_host.route(
@@ -729,15 +774,15 @@ def test_selfsampling_route_sms_factorization() -> None:
 
 
 def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
-    """The B300 tuning is architecture- and shape-exact."""
-    baseline = ss_host.route(512, 8192, 8192, 2048, 148)
+    """SM100 and SM103 share the large-batch K=2048 register launch geometry."""
+    sm100 = ss_host.route(512, 8192, 8192, 2048, 148)
     tuned = ss_host.route(512, 8192, 8192, 2048, 148, sm_version=103)
-    assert baseline["kernel"] == "main"
+    assert sm100 == tuned
     assert tuned["kernel"] == "reg"
     assert tuned["tpl"] == (512, 4, 2, 1, True, True, False, 1024)
     assert ss_host.route(1024, 8192, 8192, 2048, 148, 103)["kernel"] == "reg"
 
-    # Nearby K, batch, topology and architecture points retain the baseline.
+    # Nearby K, batch and topology points agree across SM100 and SM103.
     for rows, top_k, num_sms, sm_version in (
         (512, 1024, 148, 103),
         (384, 2048, 148, 103),
@@ -752,24 +797,29 @@ def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
 
     assert ss_host.route_split(512, 8192, 8192, 2048, 148, 103) == tuned
 
-    # The integer-divided n4 rung starts at n=4100 and ends at n=8195.
-    assert ss_host.route(512, 4099, 4160, 2048, 148, 103) == ss_host.route(
-        512, 4099, 4160, 2048, 148
-    )
-    assert ss_host.route(512, 4100, 4160, 2048, 148, 103)["kernel"] == "reg"
-    assert ss_host.route(512, 8195, 8256, 2048, 148, 103)["kernel"] == "reg"
-    assert ss_host.route(512, 8196, 8256, 2048, 148, 103) == ss_host.route(
-        512, 8196, 8256, 2048, 148
-    )
+    for sm_version in (100, 103):
+        for n, expected in (
+            (4099, (512, 2, 4)),
+            (4100, (256, 5, 4)),
+            (4111, (256, 5, 4)),
+            (6144, (512, 3, 2)),
+            (8192, (512, 4, 2)),
+            (8195, (512, 4, 2)),
+            (8196, (512, 5, 2)),
+        ):
+            npad = (n + 63) // 64 * 64
+            plan = ss_host.route(512, n, npad, 2048, 148, sm_version)
+            assert plan["kernel"] == "reg"
+            assert tuple(plan["tpl"][:3]) == expected, (n, sm_version, plan)
 
 
-@pytest.mark.skipif(getSMVersion() != 103, reason="requires an SM103 GPU")
+@pytest.mark.skipif(getSMVersion() not in (100, 103), reason="requires an SM100 or SM103 GPU")
 def test_selfsampling_sm103_b512_k2048_cuda_graph() -> None:
-    """Exercise the 148-SM SM103 register plan through warmup and graph replay."""
+    """Exercise the shared 148-SM SM100/SM103 plan through warmup and graph replay."""
     rows, n, npad, top_k = 512, 4111, 4160, 2048
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     if properties.multi_processor_count != 148:
-        pytest.skip("requires an SM103 GPU with 148 SMs")
+        pytest.skip("requires an SM100 or SM103 GPU with 148 SMs")
     plan = ss_host.route(
         rows,
         n,
@@ -779,7 +829,7 @@ def test_selfsampling_sm103_b512_k2048_cuda_graph() -> None:
         properties.major * 10 + properties.minor,
     )
     assert plan["kernel"] == "reg"
-    assert tuple(plan["tpl"][:3]) == (512, 4, 2)
+    assert tuple(plan["tpl"][:3]) == (256, 5, 4)
 
     ss_host.warmup_varlen(
         top_k,
@@ -1162,27 +1212,49 @@ def test_selfsampling_varlen_reg_cuda_graph():
         assert torch.equal(got, ref_v)
 
 
+@pytest.mark.parametrize("rows,n", [(256, 8196), (1024, 9216), (256, 12288)])
+def test_selfsampling_register_histogram_layout_exactness(rows: int, n: int) -> None:
+    """Both register entry points use the shared-memory layout selected by NBH."""
+    top_k = 512
+    npad = (n + 63) // 64 * 64
+    plan = ss_host.route(rows, n, npad, top_k)
+    assert plan["kernel"] == "reg" and plan["tpl"][7] == 1024
+    assert plan["rt"]["IMGOFF"] == 1024
+    assert plan["smem"] == (1024 + 2 * plan["rt"]["CMP"]) * 4
+
+    logits, pre_idx, indices, ref_vals = _make_case(rows, n, top_k, seed=rows + n)
+    ss_host.run(logits, pre_idx, n, indices)
+    torch.cuda.synchronize()
+    _check_exact(logits, indices, n, ref_vals)
+
+    kv_lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    indices.fill_(-7)
+    ss_host.run_varlen(logits, kv_lens, indices, max_seq_len=n)
+    torch.cuda.synchronize()
+    _check_exact(logits, indices, n, ref_vals)
+
+
 @pytest.mark.parametrize(
-    "rows,n,top_k",
+    "rows,n,top_k,expected_tpl",
     [
-        (64, 8192, 512),  # wide rung (1024,2,1)
-        (148, 4100, 2048),  # wide rung, DEG tuple, band floor
-        (160, 8195, 512),  # mid rung (512,4,2), band ceiling
-        (256, 6144, 1024),  # mid rung, KPT=2
-        (296, 8192, 2048),  # mid rung, one full wave, DEG tuple (n <= 4k+64), k > BLK
+        (64, 8192, 512, (1024, 2, 1)),
+        (148, 4100, 2048, (512, 3, 1)),
+        (160, 8195, 512, (512, 4, 2)),
+        (256, 6144, 1024, (512, 3, 2)),
+        (296, 8192, 2048, (512, 4, 2)),
     ],
     ids=["wide_b64_k512", "wide_b148_k2048", "mid_b160_k512", "mid_b256_k1024", "mid_b296_k2048"],
 )
-def test_selfsampling_varlen_4k_8k_rungs_exact(rows, n, top_k):
+def test_selfsampling_varlen_4k_8k_rungs_exact(
+    rows: int, n: int, top_k: int, expected_tpl: tuple[int, int, int]
+) -> None:
     """The 4K < n <= 8K register rungs under the hint-free varlen engine on a
     heterogeneous batch: full rows, mid-length rows, a short row (n <= k), a
     two-valued row (boundary tie class of thousands -> the crossing-bin count
-    saturates, non-quad refine) and a heavy-tailed row (first-k bracket misses
-    the k-th value -> QC = QUADC routes it to the key-space narrowing)."""
+    saturates, non-quad refine) and a heavy-tailed row."""
     npad = (n + 63) // 64 * 64
-    want = (1024, 2, 1) if rows <= 148 else (512, 4, 2)
     plan = ss_host.route(rows, n, npad, top_k)
-    assert plan["kernel"] == "reg" and tuple(plan["tpl"][:3]) == want, plan["tpl"]
+    assert plan["kernel"] == "reg" and tuple(plan["tpl"][:3]) == expected_tpl, plan["tpl"]
     gen = torch.Generator(device=_DEV).manual_seed(rows + n)
     logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
     kv = [n - (i % 7) * 3 for i in range(rows)]

@@ -96,8 +96,8 @@ class SOLCuTeDSLAttention(AttentionBackend):
     Inputs the kernel cannot serve (shape, dtype, architecture) are delegated to
     dense attention up front by ``_run_sol_attn_bthd``; a kernel error is not
     recovered from and propagates. This class adds the ``dense_layers`` guard
-    (evaluated at construction time, no external plumbing needed) and forwards
-    the routing knobs from config.
+    (resolved for this layer at construction) and forwards the routing knobs
+    from config.
     """
 
     def __init__(
@@ -136,7 +136,8 @@ class SOLCuTeDSLAttention(AttentionBackend):
         self.tau = sparse_params.tau
         self.thresh_type = sparse_params.thresh_type
         self.disabled_until_timestep = sparse_params.disabled_until_timestep
-        self.dense_layers = sparse_params.dense_layers
+        # Resolved here so compiled callers do not specialize on layer_idx.
+        self.is_dense_layer = layer_idx in sparse_params.dense_layers
 
         # SOL's dense steps must run the backend the user selected. Without
         # this they ran torch SDPA while a `backend: CUTEDSL` baseline ran
@@ -284,7 +285,7 @@ class SOLCuTeDSLAttention(AttentionBackend):
             != PredefinedAttentionMask.FULL
         ):
             return False
-        if self.layer_idx in self.dense_layers:
+        if self.is_dense_layer:
             return False
         if self.disabled_until_timestep is not None and self._dense_by_step(kwargs.get("timestep")):
             return False
@@ -362,8 +363,6 @@ class SOLTrtllmAttention(TrtllmAttention):
         if not self.should_use_sparse(forward_args.sparse_attn_phase):
             return None
 
-        if self.quant_attention_config is not None:
-            raise ValueError("SOL sparse execution does not support quant_attention_config")
         if not any(
             isinstance(fmha, PrimsTSBlockSparseFmha) for fmha in self._fmha_manager.fmha_libs
         ):

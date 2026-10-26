@@ -82,6 +82,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
 
     executor.dist = MagicMock(tp_size=1, cp_size=1, pp_size=1)
     executor.enable_attention_dp = True
+    executor.enable_early_first_token_response = False
     executor.kv_connector_manager = None
     executor._is_kv_manager_v2 = False
     executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
@@ -594,7 +595,7 @@ def test_connector_failure_shutdown_retains_registered_pools() -> None:
     executor.shutdown()
     executor.shutdown_event.wait.assert_called_once()
     executor.resource_manager.shutdown.assert_not_called()
-    executor.model_engine._release_cuda_graphs.assert_not_called()
+    executor.model_engine.release_executor_resources.assert_not_called()
 
 
 @pytest.mark.parametrize("overlap", [False, True])
@@ -710,7 +711,9 @@ def test_shutdown_drains_save_before_loop_exit(
             assert not executor.kv_connector_manager.get_pending_transfer_requests()
             assert not executor._kv_connector_deadlines
             executor.worker_thread.join.assert_called_once()
-            engine._release_cuda_graphs.assert_called_once()
+            engine.release_executor_resources.assert_called_once_with(
+                release_model_owned_graphs=True
+            )
             resource.shutdown.assert_called_once()
         if outcome == "complete":
             assert polls == 2
@@ -730,7 +733,7 @@ def test_shutdown_drains_save_before_loop_exit(
             assert executor._kv_connector_failed
             executor._release_transfer.assert_not_called()
             executor.worker_thread.join.assert_called_once()
-            engine._release_cuda_graphs.assert_not_called()
+            engine.release_executor_resources.assert_not_called()
             resource.shutdown.assert_not_called()
     executors[0]._release_transfer.assert_not_called()
     assert executors[0].kv_connector_manager.worker.get_finished.call_count == polls
@@ -988,6 +991,7 @@ def test_forward_connector_failure_retains_pending_dma(failure_source: str) -> N
     executor._compute_adp_dummy_tokens = MagicMock(return_value=(0, 0))
     executor._iter_adp_dummy_ctx_tokens = executor._iter_adp_dummy_gen_tokens = 0
     executor.model_engine = MagicMock()
+    executor.model_engine.route_capture = None
     executor.sampler = MagicMock()
     executor.execution_stream = MagicMock()
     executor.resource_manager = MagicMock()
@@ -1132,7 +1136,7 @@ def test_failed_executor_survives_outer_worker_gc(monkeypatch: pytest.MonkeyPatc
     assert executor_ref() is not None
     assert engine_ref() is not None
     assert pool_ref() is not None
-    engine_ref()._release_cuda_graphs.assert_not_called()
+    engine_ref().release_executor_resources.assert_not_called()
     executor_ref().resource_manager.shutdown.assert_not_called()
 
 
@@ -1214,6 +1218,8 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor._pop_from_waiting_queue = MagicMock(return_value=[])
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True
+        executor.disable_overlap_scheduler = False
+        executor.previous_batch = None
         executor._should_exclude_last_generation_logits = MagicMock(return_value=False)
         executor.num_fetch_requests = executor.num_fetch_requests_cur_rank = 0
         executor.max_num_active_requests = 2
@@ -1360,6 +1366,8 @@ def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> Non
         executor.enable_iter_perf_stats = False
         executor._pop_from_waiting_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True
+        executor.disable_overlap_scheduler = False
+        executor.previous_batch = None
         executor._should_exclude_last_generation_logits = MagicMock(return_value=False)
         executor.num_fetch_requests = executor.num_fetch_requests_cur_rank = 0
         executor.max_num_active_requests = 2
@@ -1468,7 +1476,11 @@ def test_prefix_load_recovery_lifetime(
     executor.max_total_draft_tokens = 0
     executor._should_skip_dummy_for_benchmark_disagg = MagicMock(return_value=False)
     executor._count_schedulable_active_requests = MagicMock(return_value=0)
-    executor._has_adp_dummy_kv_capacity = lambda _: executor._terminate_request.called
+
+    def has_dummy_capacity(token_nums: list[int] | None, draft_reserve: int | None = None) -> bool:
+        return executor._terminate_request.called
+
+    executor._has_adp_dummy_kv_capacity = has_dummy_capacity
     executor.kv_cache_manager.add_dummy_requests.return_value = [_request(999, dummy=True)]
 
     class RecoveryComplete(Exception):

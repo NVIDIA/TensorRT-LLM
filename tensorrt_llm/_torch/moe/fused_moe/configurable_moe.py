@@ -123,9 +123,10 @@ class ConfigurableMoE(MoE):
     Auto-Detection:
         - EPLB: Enabled if get_moe_load_balancer() is not None
         - Backend: Resolved from ``model_config.moe_backend`` by
-                   ``moe_resolution.resolve_moe_impl``, which degrades to
-                   CutlassFusedMoE when the requested backend cannot serve the
-                   layer and records the reason in the returned report.
+                   ``moe_resolution.resolve_moe_impl``, which degrades to the
+                   CUTLASS leaf for the layer's format when the requested
+                   backend cannot serve the layer and records the reason in
+                   the returned report.
                    ``create_moe`` passes the resolved class in as ``moe_cls``;
                    constructing this wrapper directly resolves on demand.
         - Communication: Auto-selected based on hardware (NVLINK > DeepEP > AllGather);
@@ -137,14 +138,14 @@ class ConfigurableMoE(MoE):
         """Always ineligible: ConfigurableMoE delegates, it does not compute.
 
         Answering ``False`` rather than raising is what lets a registry walk
-        include this class harmlessly. Query the backend it would delegate to
-        (``CutlassFusedMoE``, ``TRTLLMGenFusedMoE``, ...) instead.
+        include this class harmlessly. Resolve the layer instead
+        (``moe_resolution.resolve_moe_impl``) and query the leaf it picks.
         """
         del p, d  # a wrapper's answer cannot depend on the question
         return _reject(
             MoERejectReason.NOT_AN_IMPL,
             "ConfigurableMoE is a wrapper class. "
-            "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly.",
+            "Resolve the layer (moe_resolution.resolve_moe_impl) and query the leaf it picks.",
         )
 
     def __init__(
@@ -194,7 +195,7 @@ class ConfigurableMoE(MoE):
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # ========== Create MoE Backend (selected by model_config.moe_backend) ==========
-        self._create_and_sync_backend(
+        backend_model_config = self._create_and_sync_backend(
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
@@ -237,8 +238,10 @@ class ConfigurableMoE(MoE):
 
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
-        # The default value is max_num_tokens * dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens
+        # The default value is max_num_tokens * dp_size. Read it from the config
+        # the backend was built with: a backend may cap it there (DeepGEMM sizes
+        # its workspace from it).
+        self.moe_max_num_tokens = backend_model_config.moe_max_num_tokens
         default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
 
         # Auxiliary stream for chunking overlap
@@ -310,8 +313,10 @@ class ConfigurableMoE(MoE):
         override_quant_config: Optional["QuantConfig"],
         moe_cls: Optional[Type] = None,
         **kwargs,
-    ) -> None:
+    ) -> ModelConfig:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
+
+        Returns the ``ModelConfig`` the backend was built with.
 
         Why this dance:
         - ``init_load_balancer=False``: the backend would otherwise
@@ -352,7 +357,9 @@ class ConfigurableMoE(MoE):
 
         backend_model_config = model_config
         if override_quant_config is not None:
-            backend_model_config = copy.deepcopy(model_config)
+            # A shallow copy shares the per-weight quant_config_dict instead of
+            # cloning it for every layer.
+            backend_model_config = copy.copy(model_config)
             backend_model_config.quant_config = override_quant_config
 
         with self._temporarily_skip_weight_creation(backend_model_config):
@@ -395,14 +402,14 @@ class ConfigurableMoE(MoE):
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
-        # Layerwise quantization is applied after the model is constructed.
-        # Defer allocation so the backend is built from the final wrapper
-        # quant_config rather than an earlier global value. Module exclusions
+        # Layerwise quantization is applied after the model is constructed, so
+        # allocation waits for the final wrapper quant_config. Module exclusions
         # reset _weights_created on matching modules during __post_init__, so
-        # unrelated exclusions retain the historical eager allocation path.
+        # unrelated exclusions keep eager allocation.
         has_post_init_quant_config = model_config.quant_config_dict is not None
         if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
             self.create_weights()
+        return backend_model_config
 
     def _reject_non_divisible_ep_backend(self) -> None:
         """Enforce the non-divisible-EP contract on the resolved backend.
@@ -760,7 +767,7 @@ class ConfigurableMoE(MoE):
         wrapper-owned attribute is assigned (EPLB / num_slots /
         ep_size via ``MoE.__init__`` -> ``_init_load_balancer``,
         ``self.comm`` from ``_create_comm_strategy_auto``, and
-        ``self.moe_max_num_tokens`` from ``model_config``). Backend
+        ``self.moe_max_num_tokens`` from the backend's ``model_config``). Backend
         hooks can therefore inspect them directly without ``getattr``
         guards or sentinel defaults.
         """
@@ -944,6 +951,15 @@ class ConfigurableMoE(MoE):
     def has_nvfp4(self):
         """Delegate has_nvfp4 to backend"""
         return getattr(self.backend, "has_nvfp4", False)
+
+    @property
+    def _moe_lora_enabled(self) -> bool:
+        """Delegate to the backend, which holds the routed-expert LoRA state.
+
+        Read by ``MoE.forward`` to refuse MoE LoRA on the torch.compile graph
+        path; a backend that does not fuse MoE LoRA reads as False.
+        """
+        return getattr(self.backend, "_moe_lora_enabled", False)
 
     def forward_fake(
         self,

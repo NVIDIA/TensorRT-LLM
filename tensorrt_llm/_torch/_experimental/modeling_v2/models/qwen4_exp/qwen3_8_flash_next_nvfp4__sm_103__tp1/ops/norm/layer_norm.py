@@ -41,44 +41,19 @@ class LayerNorm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: shape, dtype; `param_dtype` (default dtype) for weight and bias;
-    # `bias` (default True); `layout` "contiguous" (default) or "column_slice"
-    # (the second half of a [rows, 2N] per-token buffer). Weight and bias are
-    # drawn over the checkpoint's measured ranges.
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"vision norm, {rows} patch rows x 1152 bf16",
-                spec=dict(shape=(rows, WIDTH), dtype=torch.bfloat16),
-            )
-            for rows in (1, 7, 256, 1024, 4096)
+    # spec: shape, dtype (weight and bias share it). Weight and bias are drawn
+    # over the checkpoint's measured ranges.
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"vision norm, {rows} patch rows x 1152 bf16",
+            spec=dict(shape=(rows, WIDTH), dtype=torch.bfloat16),
         )
-        + tuple(
-            Cell(
-                why=f"{str(dtype)[6:]} activations, {rows} rows",
-                spec=dict(shape=(rows, WIDTH), dtype=dtype),
-            )
-            for dtype in (torch.float16, torch.float32)
-            for rows in (7, 1024)
-        )
-        + (
-            Cell(
-                why="fp32 weight/bias against bf16 x: widened on load",
-                spec=dict(shape=(512, WIDTH), dtype=torch.bfloat16, param_dtype=torch.float32),
-            ),
-            Cell(
-                why="bias=None drops the additive term",
-                spec=dict(shape=(256, WIDTH), dtype=torch.bfloat16, bias=False),
-            ),
-            Cell(
-                why="3-D input keeps its shape",
-                spec=dict(shape=(4, 64, WIDTH), dtype=torch.bfloat16),
-            ),
-            Cell(
-                why="column slice of a [rows, 2N] buffer, read in place",
-                spec=dict(shape=(512, WIDTH), dtype=torch.bfloat16, layout="column_slice"),
-            ),
-        )
+        for rows in (1, 1024)
+    ) + (
+        Cell(
+            why="vision norm at the tower call ceiling, 32768 patch rows x 1152 bf16",
+            spec=dict(shape=(32768, WIDTH), dtype=torch.bfloat16),
+        ),
     )
 
     note = """
@@ -87,23 +62,29 @@ class LayerNorm(OpWrapper):
 
     Layout: `x.stride(-1) == 1` is read in place through its row stride; any
     other `x`, and non-contiguous `weight`/`bias`, are silently `.contiguous()`d
-    first (one extra copy, correct result). `weight`/`bias` dtype is free.
+    first (one extra copy). `weight`/`bias` dtype is free.
+
+    Certified: contiguous bf16 `[rows, 1152]` `x` at 1, 1024 and 32768 rows
+    with a bf16 weight and bias, as the vision tower calls it. Not certified:
+    strided or 3-D `x`, `bias=None`, fp16/fp32 activations, weight/bias in
+    another dtype than `x`.
 
     Loud failures (left to the callable): weight or bias length != N raises a
     bare AssertionError with no message; `next_pow2(N) * x.element_size() >
     64KB` raises "This layer norm doesn't support feature dim >= 64KB" (N =
     65536 in bf16); CPU tensors fail before or at the Triton launch.
 
-    Accuracy: at the checkpoint's affine (weights to 17.5, biases to -25.6) the
-    bf16 result is the correctly rounded fp64 value on >= 99.9989% of elements;
-    where it differs, by <= 2^-7 of the summed term magnitude. A constant row
-    returns `bias` bitwise. `eps` sits inside the sqrt.
+    Accuracy, measured beyond the cells' default gate and not certified: at
+    the checkpoint's affine (weights to 17.5, biases to -25.6) the bf16 result
+    is the correctly rounded fp64 value on >= 99.9989% of elements; where it
+    differs, by <= 2^-7 of the summed term magnitude. A constant row returns
+    `bias` bitwise. `eps` sits inside the sqrt.
 
     Accepted but not certified: an fp8-e4m3 `x` returns fp8-e4m3 (output is
     `empty_like(x)`), within one e4m3 ulp of the exact value; fp64 `x`.
-    Forward only: the autograd Function has no backward. Runs unchanged under
-    `inference_mode`; CUDA-graph capturable after a warm-up call compiles the
-    Triton kernel.
+    Forward only: the autograd Function has no backward. Measured, not
+    certified: one kernel launch, runs unchanged under `inference_mode`,
+    CUDA-graph capturable after a warm-up call compiles the Triton kernel.
     """
 
     def __call__(
