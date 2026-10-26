@@ -21,6 +21,7 @@ import grpc
 import uvloop
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._frontend_processes import (
     FrontendStartupCancelled,
@@ -240,6 +241,7 @@ def launch_server(
         enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
+    _warn_if_python_protobuf()
 
     async def serve() -> None:
         logger.info("Initializing TensorRT-LLM OpenEngine server...")

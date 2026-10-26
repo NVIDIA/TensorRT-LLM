@@ -79,7 +79,7 @@ only names the code that demonstrates them. Paths are relative to
   `MoEWeightOwnerMixin` (the default lifecycle hooks, delegating to
   `self.quant_method`), `MoEEplbWeightLayoutMixin`.
 - One class per identity: `fused_moe_deepgemm.py`
-  (`DeepgemmCudaFp8BlockScalesImpl`) and `fused_moe_densegemm.py`
+  (`DeepgemmCudaFp8BlockScalesImpl`) and `cutedsl/dense_gemm.py`
   (`TrtllmCutedslDenseGemmNvfp4Impl`).
 - Family root plus leaves:
   - `cutlass/`: `CutlassFusedMoEBase` in `base.py` (construction, the
@@ -93,6 +93,13 @@ only names the code that demonstrates them. Paths are relative to
     `trtllm_<quant>.py` / `flashinfer_<quant>.py` leaves.
   - `marlin/`: one kernel ABI, so `MarlinFusedMoEBase` implements three of the
     four abstract methods and a leaf is an identity plus `can_implement`.
+  - `cutedsl/`: laid out like the id `trtllm.cutedsl.<kernel>.<quant>`.
+    `grouped_gemm/` holds `CuteDslFusedMoEBase` (construction, the
+    layer-format check in `create_weights`, the locality-domain plan, the
+    weight lifecycle) and its NVFP4 and BF16 leaves; the `_init_format_state`
+    and `_locality_domain_scale_shard` hooks and the leaf-declared
+    `_locality_domain_full_scale_params` carry what only one format needs.
+    The other kernels share only the package-level modules with it.
 - Inheriting another implementation: `fused_moe_cute_dsl_b12x.py`
   (`CuteDslB12xNvfp4FusedMoE`, `CuteDslB12xFusedMoEBase`); the guide's B12x
   note says what that inheritance costs.
