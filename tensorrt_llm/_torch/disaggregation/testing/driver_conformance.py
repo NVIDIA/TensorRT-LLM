@@ -24,6 +24,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Generator, Sequence
+from typing import NoReturn
 
 import pytest
 
@@ -166,10 +167,12 @@ def _revoke_again(driver: RegistersRegionsTogether, handle: RegionHandle) -> Non
         pytest.fail(f"a second revocation of the batch raised {error!r}")
 
 
-def _prove_registered(driver: StoreDriver, memory: Memory, index: int, timeout: float) -> None:
-    """A row inside ``memory`` moves and its access ends: the region is registered. A probe by
-    registration could not tell, since a driver that takes one batch at a time refuses a new one
-    whatever the region's state."""
+def _prove_registered(driver: StoreDriver, memory: Memory, index: int, timeout: float) -> bool:
+    """A row inside memory moves: the region is registered, as the driver refuses a row outside
+    one. A probe by registration could not tell, since a driver that takes one batch at a time
+    refuses a new one whatever the region's state. Returns whether the row's access ended: a
+    get-only driver without ``absent_is_miss`` may conclude the get of the fresh key as FAULT and
+    leave its access unprovable, after which the batch cannot be revoked."""
     row = RowIO(key_of(f"R{index}", "t" + secrets.token_hex(4)), (Span(memory.address, SLOT),))
     try:
         if driver.capabilities.put:
@@ -182,7 +185,27 @@ def _prove_registered(driver: StoreDriver, memory: Memory, index: int, timeout: 
     wait_until(lambda: concluded(driver.poll(op)), "the operation to conclude", timeout)
     if driver.capabilities.put:
         assert statuses(driver, op) == [RowStatus.READY]
-    wait_until(lambda: driver.access_ended(op), "access to end", timeout)
+    return _access_settled(driver, op, timeout)
+
+
+def _access_settled(driver: StoreDriver, op: OpHandle, timeout: float) -> bool:
+    """Waits until the operation's access ended or the driver declared that it can never prove
+    it did; returns whether it ended."""
+    wait_until(
+        lambda: driver.access_ended(op) or driver.access_unprovable(op),
+        "access to end or to be declared unprovable",
+        timeout,
+    )
+    return driver.access_ended(op)
+
+
+def _skip_unprovable(index: int) -> NoReturn:
+    """The contract allows a store to leave a row's access unprovable, and a batch with such a row
+    cannot be revoked: the check ends here, and its ``finally`` retains the memory."""
+    pytest.skip(
+        f"region {index}: the store left a row's access unprovable, so the batch stays registered "
+        "and its memory is retained"
+    )
 
 
 def specs_of(memory: Sequence[Memory], slot: int = SLOT) -> list[RegionSpec]:
@@ -1135,7 +1158,8 @@ class DriverConformance:
                 driver.unregister_regions(stray)
                 pytest.fail(f"region {index} of the batch was not registered")
             for index, region in enumerate(memory):  # the registrations are real: rows move
-                _prove_registered(driver, region, index, self.timeout)
+                if not _prove_registered(driver, region, index, self.timeout):
+                    _skip_unprovable(index)
             driver.unregister_regions(handle)
             _revoke_again(driver, handle)
             try:
@@ -1191,11 +1215,13 @@ class DriverConformance:
                 f"a busy batch was revoked: {refusal[0]!r}"
             )
             for index, region in enumerate(memory[:-1]):  # the idle regions stayed registered
-                _prove_registered(driver, region, index, self.timeout)
+                if not _prove_registered(driver, region, index, self.timeout):
+                    _skip_unprovable(index)
             unblock()
             getter.join(self.timeout)
             assert not getter.is_alive(), "the stalled get never returned"
-            wait_until(lambda: driver.access_ended(slow["op"]), "access to end", self.timeout)
+            if not _access_settled(driver, slow["op"], self.timeout):
+                _skip_unprovable(len(memory) - 1)
             driver.unregister_regions(handle)
             _revoke_again(driver, handle)
             assert driver.drain(self.timeout) is True

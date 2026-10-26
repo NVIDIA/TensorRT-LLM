@@ -11,6 +11,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 
 import pytest
 
@@ -26,6 +27,7 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     RegionSpec,
     RegistrationError,
     RowIO,
+    RowResult,
     RowStatus,
     Span,
     StoreDriver,
@@ -41,6 +43,7 @@ from tensorrt_llm._torch.disaggregation.testing.broken_drivers import (
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import (
     SLOT,
     UNRELEASED_ENDPOINTS,
+    UNRELEASED_MEMORY,
     Allocation,
     DriverConformance,
     Endpoint,
@@ -1286,6 +1289,80 @@ def test_a_skip_on_the_broken_side_is_not_an_expected_failure() -> None:
     with pytest.raises(UnexpectedSkip):
         with pytest.raises(CHECK_FAILED):  # the shape the pairing test uses; must not catch it
             _run_check(suite, "test_probe_reports_hit_and_miss")
+
+
+class _CannotTellAbsenceFromFailure(TogetherMemoryDriver):
+    """A driver whose store cannot tell absence from failure: a get of a key the store does not
+    hold concludes FAULT and leaves its access unprovable, which the contract allows; every other
+    operation ends its access as usual. ``gets`` records the statuses of every get."""
+
+    gets: list[list[RowStatus]] = []
+
+    def __init__(self, store: MemoryStore, **options: object) -> None:
+        super().__init__(store, controlled=True, **options)
+
+    def _get_row(self, io: RowIO) -> RowResult:
+        result = super()._get_row(io)
+        if result.status is RowStatus.MISS:
+            raise StoreError("the store cannot tell absence from failure")
+        return result
+
+    def put(self, rows: Sequence[RowIO]) -> MemoryOp:
+        op = super().put(rows)
+        self.complete(op)
+        self.end_access(op)
+        return op
+
+    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> MemoryOp:
+        op = super().get(rows, hint)
+        self.complete(op)
+        self.gets.append(statuses(self, op))
+        if RowStatus.FAULT in self.gets[-1]:
+            self.mark_unprovable(op)
+        else:
+            self.end_access(op)
+        return op
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "check", "region"),
+    [
+        pytest.param(
+            replace(DEFAULT_CAPABILITIES, put=False, absent_is_miss=False),
+            "test_regions_registered_together_are_revoked_together_and_the_range_freed",
+            0,
+            id="get-only probe",
+        ),
+        pytest.param(
+            replace(DEFAULT_CAPABILITIES, put=False, absent_is_miss=False),
+            "test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy",
+            0,
+            id="get-only probe of a busy batch",
+        ),
+        pytest.param(
+            replace(DEFAULT_CAPABILITIES, absent_is_miss=False),
+            "test_a_batch_is_not_revoked_while_any_of_its_regions_is_busy",
+            1,
+            id="stalled get",
+        ),
+    ],
+)
+def test_a_row_left_unprovable_skips_the_batch_check_and_retains_the_memory(
+    capabilities: DriverCapabilities, check: str, region: int
+) -> None:
+    """The batch checks move a row through each region to prove it registered, and the busy check
+    waits for its stalled get; a store that leaves such a row's access unprovable ends the check
+    as a skip naming the region, before any revocation, with the batch memory retained. A get-only
+    driver's probe is a get of a fresh key, which faults at once; with put the probes succeed and
+    the stalled get, of a key nobody holds, faults once released."""
+    _CannotTellAbsenceFromFailure.gets = []
+    suite = _conformance(_CannotTellAbsenceFromFailure, capabilities, TestTogetherDriverConformance)
+    retained = len(UNRELEASED_MEMORY)
+    with pytest.raises(pytest.skip.Exception, match=f"region {region}: .*unprovable"):
+        getattr(suite, check)()
+    assert len(UNRELEASED_MEMORY) == retained + 2  # both regions of the batch
+    gets = _CannotTellAbsenceFromFailure.gets
+    assert gets and all(got == [RowStatus.FAULT] for got in gets), gets
 
 
 def test_each_broken_driver_breaks_one_rule_and_names_an_existing_check() -> None:
