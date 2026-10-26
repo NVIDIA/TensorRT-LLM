@@ -96,7 +96,7 @@ Use these configurations as starting points for 4x B200 with FP8 weights and a B
 
 For low-concurrency serving of long prompts, run the routed experts tensor-parallel with `--ep_size 1` instead of `--ep_size 4`. With prompts of more than 10K tokens, short outputs, MTP (`max_draft_len: 3`) and an FP8 KV cache, EP1 raised per-user output speed at concurrency 1 by about 6% on 4x B300, with concurrency-8 throughput about the same, because it avoids the expert-parallel load imbalance in the MoE all-reduce. This applies to the tensor-parallel configurations; keep `--ep_size 4` with attention data parallelism, which targets high concurrency, where expert-parallel load evens out. The chart in [Performance](#performance) shows where each configuration is fastest.
 
-Setting `TRTLLM_LOW_M_GEMM_BACKEND=auto` before launching the server routes BF16 projections with at most 32 rows to autotuned low-M GEMM kernels. For this checkpoint the gain is small: in the workload above it raised per-user output speed at concurrency 1 by about 1%, with time to first token and concurrency-8 throughput unchanged, but kernel tuning adds a few minutes to server startup.
+For latency-sensitive serving, consider `TRTLLM_LOW_M_GEMM_BACKEND=auto` before launching the server. It routes BF16 projections with at most 32 rows to autotuned low-M GEMM kernels, so it is worth trying when decoding steps run with few tokens in flight. The kernel tuning it triggers adds minutes to every server start, so it suits long-running servers rather than ones that restart often.
 
 #### B200 FP8 Config
 
