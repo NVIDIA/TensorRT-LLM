@@ -240,6 +240,30 @@ class RuntimeHooks:
     # Standalone-drafter KV pool: ceil(heads / tp) per-rank cost and the history-first context resize
     # (kv_cache_manager_v2.py). Armed process-wide by the KV-cache creator before any sizing.
     draft_pool_fixes: bool = False
+    # DFlash / DSpark draft KV manager: reserve the drafter's block width per generation step and keep page 0 as an
+    # unowned guard page, so drafter writes through unallocated block-table entries cannot land in another request's
+    # page (kv_cache_manager_v2.py). Armed process-wide by the KV-cache creator before any sizing. Kill switches
+    # TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE / TRTLLM_M31_DISABLE_DRAFT_KV_GUARD.
+    draft_kv_reserve_guard: bool = False
+    # KV cache manager V2 with block reuse: prefetch waiting context requests' host-tier prefix to the GPU and admit
+    # them after a short rank-agreed hold (py_executor.py). Kill switch TRTLLM_M31_DISABLE_KV_GPU_PREFETCH.
+    kv_gpu_prefetch: bool = False
+    # Hand a context-only request's prompt tokens to LlmRequest as the executor request's int32 array instead of a
+    # list (llm_request.py). Kill switch TRTLLM_M31_DISABLE_L1_TOKEN_ARRAY.
+    context_token_array: bool = False
+    # On SM107, run the MSA NVFP4 sparse prefill through the fmha_sm100 BF16X / E4M3X fork when it is installed and
+    # the geometry matches (attention/backends/fmha/msa_prefill.py). Kill switch TRTLLM_M31_DISABLE_TP2CTX_BF16X.
+    msa_prefill_fork: bool = False
+    # Reuse the step's MSA indexer proxy max-score buffer across sparse layers (msa_indexer.py). Kill switch
+    # TRTLLM_M31_DISABLE_PROXY_MS_REUSE.
+    proxy_ms_reuse: bool = False
+    # Write the context one-hot draft-prob rows with index_fill_ instead of an advanced-index put that synchronizes
+    # the host (speculative/interface.py; the same elements). Kill switch TRTLLM_M31_DISABLE_ONEHOT_INDEX_FILL.
+    context_onehot_index_fill: bool = False
+    # DFlash / DSpark: compute a context chunk's draft allocation on the host when the draft block table counts full
+    # rows, instead of reading it back from the device (speculative/dflash.py). Kill switch
+    # TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC.
+    dflash_host_ctx_alloc: bool = False
     # Skip the per-step Philox seed and offset uploads on all-greedy
     # one-model speculative batches (the argmax path never reads them).
     skip_greedy_rng_upload: bool = False

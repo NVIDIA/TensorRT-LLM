@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <strings.h>
 
 #include <cub/cub.cuh>
@@ -873,10 +874,12 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
 
 namespace
 {
-// TOPP_V6: on unless TRTLLM_M31_DISABLE_TOPP_V6 is set to 1 / true / on / yes (read once per process).
+// TOPP_V6: the chain-prefetch summation on sm_107 devices unless TRTLLM_M31_DISABLE_TOPP_V6 is set to 1 / true / on /
+// yes; other devices run the staged loop. The switch is read once per process and the compute capability once per
+// device.
 bool chainPrefetchOn()
 {
-    static bool const on = []
+    static bool const allowed = []
     {
         char const* v = std::getenv("TRTLLM_M31_DISABLE_TOPP_V6");
         if (v == nullptr)
@@ -886,15 +889,34 @@ bool chainPrefetchOn()
         return !(std::strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "on") == 0
             || strcasecmp(v, "yes") == 0);
     }();
-    return on;
+    if (!allowed)
+    {
+        return false;
+    }
+    static std::once_flag smOnce[64];
+    static bool sm107[64] = {};
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+    {
+        return false;
+    }
+    std::call_once(smOnce[device % 64],
+        [device]
+        {
+            int major = 0;
+            int minor = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+            sm107[device % 64] = major == 10 && minor == 7;
+        });
+    return sm107[device % 64];
 }
 
-template <bool kPdl, bool kCandList, bool kList, int kCopies>
-cudaError_t launchV3(cudaLaunchConfig_t& cfg, float const* probs, float* out, float const* topP, int d,
+template <bool kPdl, bool kCandList, bool kList, int kCopies, bool kChainPf>
+cudaError_t launchV3Kernel(cudaLaunchConfig_t& cfg, float const* probs, float* out, float const* topP, int d,
     toppv3::RowWorkspace* ws, int* keptOut)
 {
-    auto* kernel = chainPrefetchOn() ? toppv3::toppRenormDetV3Kernel<kPdl, kCandList, kList, kCopies, true>
-                                     : toppv3::toppRenormDetV3Kernel<kPdl, kCandList, kList, kCopies, false>;
+    auto* kernel = toppv3::toppRenormDetV3Kernel<kPdl, kCandList, kList, kCopies, kChainPf>;
     static cudaError_t const attrErr = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(toppv3::dynSmemBytes<kCopies>()));
     if (attrErr != cudaSuccess)
@@ -903,6 +925,15 @@ cudaError_t launchV3(cudaLaunchConfig_t& cfg, float const* probs, float* out, fl
     }
     cfg.dynamicSmemBytes = toppv3::dynSmemBytes<kCopies>();
     return cudaLaunchKernelEx(&cfg, kernel, probs, out, topP, d, ws, keptOut);
+}
+
+template <bool kPdl, bool kCandList, bool kList, int kCopies>
+cudaError_t launchV3(cudaLaunchConfig_t& cfg, float const* probs, float* out, float const* topP, int d,
+    toppv3::RowWorkspace* ws, int* keptOut)
+{
+    return chainPrefetchOn()
+        ? launchV3Kernel<kPdl, kCandList, kList, kCopies, true>(cfg, probs, out, topP, d, ws, keptOut)
+        : launchV3Kernel<kPdl, kCandList, kList, kCopies, false>(cfg, probs, out, topP, d, ws, keptOut);
 }
 
 template <bool kPdl, bool kCandList>

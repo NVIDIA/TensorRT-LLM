@@ -317,14 +317,26 @@ def _combine_takes(fn, name: str) -> bool:
 
 _TP2CTX_BF16X_STATE: dict = {"taken": 0, "skip": {}, "q8kv4_taken": 0, "e4m3x_taken": 0}
 
+# The BF16X / E4M3X fork is a model opt-in (RuntimeHooks.msa_prefill_fork), armed by the executor (arm_prefill_fork).
+_PREFILL_FORK_ARMED = False
+
+
+def arm_prefill_fork() -> None:
+    """Let the MSA NVFP4 sparse prefill take the BF16X / E4M3X fork in this process (RuntimeHooks.msa_prefill_fork)."""
+    global _PREFILL_FORK_ARMED
+    _PREFILL_FORK_ARMED = True
+
 
 def _tp2ctx_bf16x_run():
     """(run, reason): fmha_sm100.prefill_bf16x.run_prefill (BF16X fork m3b) when TP2CTX_BF16X may run here, else None.
 
-    Default ON; TRTLLM_M31_DISABLE_TP2CTX_BF16X=1 (read per call) keeps the CuTe-DSL forward. The probe is cached.
+    Armed by a model opt-in; TRTLLM_M31_DISABLE_TP2CTX_BF16X=1 (read per call) keeps the CuTe-DSL forward. The probe
+    is cached.
     """
     import os
 
+    if not _PREFILL_FORK_ARMED:
+        return None, "not_armed"
     if os.environ.get("TRTLLM_M31_DISABLE_TP2CTX_BF16X", "0") == "1":
         return None, "disabled_by_env"
     if "run" not in _TP2CTX_BF16X_STATE:

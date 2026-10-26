@@ -8793,6 +8793,13 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
         fp8_saturating_casts=True,
         msa_kv_cache_fixes=True,
         draft_pool_fixes=True,
+        draft_kv_reserve_guard=True,
+        kv_gpu_prefetch=True,
+        context_token_array=True,
+        msa_prefill_fork=True,
+        proxy_ms_reuse=True,
+        context_onehot_index_fill=True,
+        dflash_host_ctx_alloc=True,
         persist_flashinfer_mxfp8_tactics=True,
         # Bundled name-keyed tactic pins (m31_pins); kill: TRTLLM_M31_DISABLE_BUNDLED_PINS=1.
         install_tactic_pins=lambda rank: m31_pins.install("tp2", rank),

@@ -54,6 +54,7 @@ def aot(monkeypatch, tmp_path):
         return _Compiled("loaded")
 
     monkeypatch.setattr(cute_aot, "_load", load)
+    monkeypatch.setattr(cute_aot, "_armed", True)
     monkeypatch.setenv(cute_aot.DIR_ENV, str(tmp_path / "data"))
     for env in (cute_aot.EXPORT_DIR_ENV, cute_aot.DISABLE_ENV):
         monkeypatch.delenv(env, raising=False)
@@ -73,6 +74,19 @@ def test_shipped_object_is_loaded_not_compiled(aot, tmp_path):
     assert got.tag == "loaded"
     assert aot == [(path, cute_aot.digest(cute_aot.full_key("gemv m=8")), False)]
     assert cute_aot.counts() == {"loaded": 1, "compiled": 0}
+
+
+def test_unarmed_process_only_compiles(aot, tmp_path, monkeypatch):
+    # A process whose model does not ship objects never looks one up or exports, even with the export directory set.
+    monkeypatch.setattr(cute_aot, "_armed", False)
+    monkeypatch.setenv(cute_aot.EXPORT_DIR_ENV, str(tmp_path / "export"))
+    _ship(tmp_path, "gemv m=8")
+    calls = []
+    for _ in range(2):
+        got = cute_aot.compile_or_load("gemv m=8", lambda: calls.append(1) or _Compiled("jit"))
+    assert got.tag == "jit" and calls == [1]
+    assert aot == [] and not (tmp_path / "export").exists()
+    assert cute_aot.counts() == {"loaded": 0, "compiled": 0}
 
 
 def test_missing_object_compiles_once_per_key(aot):

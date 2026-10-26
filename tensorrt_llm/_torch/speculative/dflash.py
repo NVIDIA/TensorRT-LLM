@@ -520,7 +520,17 @@ def dflash_allocated_ctx_limit(
     return (block_counts * page_size - block_size).clamp(min=0)
 
 
-_HOST_CTX_ALLOC_DISABLED = os.environ.get("TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC", "0") == "1"
+# The host-side context allocation is a model opt-in (RuntimeHooks.dflash_host_ctx_alloc), armed by the executor
+# (arm_host_ctx_alloc); kill switch TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC=1.
+_HOST_CTX_ALLOC_DISABLED = True
+
+
+def arm_host_ctx_alloc() -> None:
+    """Compute the context allocation on the host where it is known (RuntimeHooks.dflash_host_ctx_alloc)."""
+    global _HOST_CTX_ALLOC_DISABLED
+    _HOST_CTX_ALLOC_DISABLED = os.environ.get("TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC", "0") == "1"
+
+
 _HOST_CTX_ALLOC_CHECK = os.environ.get("TRTLLM_DFLASH_CHECK_HOST_CTX_ALLOC", "0") == "1"
 # Bound on the disagg drafter-context maps (context-side store events, generation-side seeds): an
 # entry is normally consumed within an iteration, so only requests that failed or were cancelled in

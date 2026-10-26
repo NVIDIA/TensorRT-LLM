@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request as lr_mod
 from tensorrt_llm.bindings import executor as tllm
@@ -145,3 +146,17 @@ def test_llm_request_accepts_an_int32_array_and_a_list():
     from_array = make(np.asarray(PROMPT, dtype=np.int32))
     from_list = make(list(PROMPT))
     assert from_array.get_tokens(0) == from_list.get_tokens(0) == PROMPT
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA tensor")
+def test_llm_request_reads_a_device_array_through_the_sequence_path():
+    # Only a host int32 array is copied as raw memory; a CUDA tensor takes the element-wise cast.
+    tokens = torch.tensor(PROMPT, dtype=torch.int32, device="cuda")
+    llm_req = lr_mod.LlmRequest(
+        request_id=4,
+        max_new_tokens=4,
+        input_tokens=tokens,
+        sampling_config=tllm.SamplingConfig(1),
+        is_streaming=False,
+    )
+    assert llm_req.get_tokens(0) == PROMPT

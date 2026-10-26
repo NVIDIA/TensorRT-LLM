@@ -239,9 +239,14 @@ def route(
         and m31_spec_miss is None
         and kv_cache
     ):
+        from tensorrt_llm._torch import cute_aot
+
         from .fake_ops import register
 
         register()
+        # The sm_107 targets ship ahead-of-time CuTe DSL objects (cute_aot_data); serve them before the model builds
+        # its kernels.
+        cute_aot.arm()
         if parallel == "tp2":
             from .minimax_m31_nvfp4__sm_107__tp2.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp2
 

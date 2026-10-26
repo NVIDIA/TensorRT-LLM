@@ -559,28 +559,26 @@ def max_admissible_sequences(
     return max_num_sequences * (2 if needs_extra_leases else 1)
 
 
+def _m31_killed(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "on", "yes")
+
+
 # DRAFT_KV_RESERVE: the draft KV cache manager reserves the DFlash / DSpark drafter's block width per
-# generation step (see _get_generation_kv_capacity). Kill switch TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE=1,
-# read at import.
-_DRAFT_KV_RESERVE = os.environ.get(
-    "TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE", "0"
-).strip().lower() not in (
-    "1",
-    "true",
-    "on",
-    "yes",
-)
+# generation step (see _get_generation_kv_capacity). DRAFT_KV_GUARD: a DFlash / DSpark draft KV cache
+# manager reserves the guard page (page 0) (see KVCacheManagerV2.__init__); TRTLLM_KV_GUARD_PAGE, when
+# set, still wins. Both are a model opt-in (RuntimeHooks.draft_kv_reserve_guard), armed process-wide by
+# the KV-cache creator before any sizing (arm_draft_kv_reserve_guard). Kill switches
+# TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE=1 / TRTLLM_M31_DISABLE_DRAFT_KV_GUARD=1.
+_DRAFT_KV_RESERVE = False
+_DRAFT_KV_GUARD = False
 
 
-# DRAFT_KV_GUARD: a DFlash / DSpark draft KV cache manager reserves the guard page (page 0) by
-# default (see KVCacheManagerV2.__init__). Kill switch TRTLLM_M31_DISABLE_DRAFT_KV_GUARD=1, read at
-# import; TRTLLM_KV_GUARD_PAGE, when set, still wins.
-_DRAFT_KV_GUARD = os.environ.get("TRTLLM_M31_DISABLE_DRAFT_KV_GUARD", "0").strip().lower() not in (
-    "1",
-    "true",
-    "on",
-    "yes",
-)
+def arm_draft_kv_reserve_guard() -> None:
+    """Take the drafter block-width reserve and the guard page in this process
+    (RuntimeHooks.draft_kv_reserve_guard), unless their kill switches are set."""
+    global _DRAFT_KV_RESERVE, _DRAFT_KV_GUARD
+    _DRAFT_KV_RESERVE = not _m31_killed("TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE")
+    _DRAFT_KV_GUARD = not _m31_killed("TRTLLM_M31_DISABLE_DRAFT_KV_GUARD")
 
 
 def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, int]:

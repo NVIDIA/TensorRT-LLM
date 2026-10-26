@@ -228,6 +228,8 @@ def test_opt_ins_and_e4m3x_are_bitwise_the_stock_call(monkeypatch, reqs) -> None
     )
 
     require_msa_module()
+    # The fork is a model opt-in (RuntimeHooks.msa_prefill_fork) the sm_107 targets arm.
+    monkeypatch.setattr(mp, "_PREFILL_FORK_ARMED", True)
     q, k, v, sc, kbi, md, kg, vg = _case(reqs, seed=sum(p for _, p in reqs) + len(reqs))
     outs = {}
     arms = {
