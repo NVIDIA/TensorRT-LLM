@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch import minimax_m3_decode_glue as _glue
 from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_processor_count_for_device
 from tensorrt_llm._utils import async_tensor_h2d
 from tensorrt_llm.logger import logger
@@ -349,49 +348,6 @@ def _combined_topk_table(
         out = out.transpose(0, 1)
     out[:ctx_tokens].copy_(ctx_table)
     out[ctx_tokens:].copy_(gen_table)
-    return out
-
-
-# minimax_m3_select_long covers rows of 129..9216 blocks; shorter rows keep the stock selector.
-_LONG_SELECT_MIN_BLOCKS = 128
-_LONG_SELECT_MAX_BLOCKS = 9216
-
-
-def _long_select(
-    max_score_kv: torch.Tensor,
-    n_valid_blocks: torch.Tensor,
-    init_blocks: int,
-    local_blocks: int,
-) -> Optional[torch.Tensor]:
-    """Top-16 table from minimax_m3_select_long for decode-sized steps on SM100/SM103 (see minimax_m3_decode_glue),
-    or None outside its gate or shapes. Same head-major backed [total_q, num_kv_heads, 16] int32 table as
-    select_blocks_from_maxscore(..., head_major_output=True)."""
-    if not _glue.SELECT or torch.compiler.is_compiling() or not _glue.arch_ok():
-        return None
-    if max_score_kv.dtype != torch.float32 or max_score_kv.dim() != 3 or not max_score_kv.is_cuda:
-        return None
-    num_kv_heads, num_blocks, total_q = (int(x) for x in max_score_kv.shape)
-    if (
-        not _LONG_SELECT_MIN_BLOCKS < num_blocks <= _LONG_SELECT_MAX_BLOCKS
-        or total_q <= 0
-        or not _glue.rows_in(_glue.SELECT_ROWS, total_q)
-        or init_blocks < 0
-        or local_blocks < 0
-    ):
-        return None
-    nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
-    if nvb.numel() < total_q:
-        return None
-    out = torch.empty(
-        (num_kv_heads, total_q, MSA_REQUIRED_TOPK), dtype=torch.int32, device=max_score_kv.device
-    ).permute(1, 0, 2)
-    torch.ops.trtllm.minimax_m3_select_long(
-        max_score_kv, nvb, out, init_blocks, local_blocks, _glue.USE_PDL, False
-    )
-    logger.info_once(
-        f"MSA decode select: minimax_m3_select_long (rows {_glue.SELECT_ROWS})",
-        key="minimax_m3_long_select",
-    )
     return out
 
 
@@ -768,11 +724,6 @@ class MsaIndexer:
             )
             if table is not None:
                 return table
-        table = _long_select(
-            max_score_kv, n_valid_blocks, self.config.init_blocks, self.config.local_blocks
-        )
-        if table is not None:
-            return table
         return select_blocks_from_maxscore(
             max_score_kv,
             topk=MSA_REQUIRED_TOPK,
