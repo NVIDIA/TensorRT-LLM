@@ -1267,14 +1267,10 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 def _cbtsEnsureCliDependencies(pipeline)
 {
     try {
-        // preparation() runs this in the Debian package pod (trt-llm), not
-        // the pipeline's Alpine agent. Install before any CBTS CLI call.
-        sh "apt-get update -qq && apt-get install -y -qq python3-pip python3-yaml"
-        sh "python3 -m pip config set global.break-system-packages true"
-        sh "python3 -m pip install --disable-pip-version-check " +
+        // The preparation pod is Debian; requirements.txt includes Click and PyYAML.
+        sh "apt-get update -qq && apt-get install -y -qq python3-pip"
+        sh "python3 -m pip install --break-system-packages --disable-pip-version-check " +
            "-r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt"
-        sh "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
-           "python3 -m cbts.command --help > /dev/null"
         return true
     } catch (InterruptedException e) {
         throw e
