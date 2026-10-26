@@ -818,11 +818,12 @@ class TestModelDefaults:
     )
     @pytest.mark.parametrize("kv_setting",
                              ["omitted", "dict", "object", "opt_out"])
+    @pytest.mark.parametrize("enable_block_reuse", [False, True])
     def test_gemma_scratch_defaults(self, monkeypatch: pytest.MonkeyPatch,
                                     model: str, sm: int, backend: str | None,
                                     mtp: bool, expected_backend: str,
-                                    expected_scratch: bool,
-                                    kv_setting: str) -> None:
+                                    expected_scratch: bool, kv_setting: str,
+                                    enable_block_reuse: bool) -> None:
         from tensorrt_llm._torch.models.modeling_gemma3vl import Gemma3VLM
         from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
         from tensorrt_llm._torch.models.modeling_gemma4_unified import \
@@ -849,7 +850,7 @@ class TestModelDefaults:
         if mtp:
             kwargs["speculative_config"] = MTPDecodingConfig(max_draft_len=1)
         if kv_setting != "omitted":
-            kv_config = {"enable_block_reuse": False}
+            kv_config = {"enable_block_reuse": enable_block_reuse}
             if kv_setting == "opt_out":
                 kv_config["enable_swa_scratch_reuse"] = False
             kwargs["kv_cache_config"] = (KvCacheConfig(
@@ -861,9 +862,50 @@ class TestModelDefaults:
 
         assert args.attn_backend == expected_backend
         assert args.kv_cache_config.enable_swa_scratch_reuse == (
-            expected_scratch and kv_setting != "opt_out")
+            expected_scratch and kv_setting != "opt_out"
+            and not args.kv_cache_config.enable_block_reuse)
         if kv_setting != "omitted":
-            assert args.kv_cache_config.enable_block_reuse is False
+            assert args.kv_cache_config.enable_block_reuse is enable_block_reuse
+
+    @pytest.mark.parametrize("model", ["gemma3", "gemma4"])
+    @pytest.mark.parametrize("kv_setting", ["dict", "object"])
+    @pytest.mark.parametrize("enable_block_reuse", [False, True])
+    @pytest.mark.parametrize("scratch", [None, False, True])
+    def test_gemma_scratch_reuse_opt_in(self, monkeypatch: pytest.MonkeyPatch,
+                                        model: str, kv_setting: str,
+                                        enable_block_reuse: bool,
+                                        scratch: bool | None) -> None:
+        from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.models.modeling_gemma3.get_sm_version",
+            lambda: 100)
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+            lambda: True)
+        kv_config = {"enable_block_reuse": enable_block_reuse}
+        if scratch is not None:
+            kv_config["enable_swa_scratch_reuse"] = scratch
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(
+                **kv_config) if kv_setting == "object" else kv_config)
+        model_cls = Gemma3ForCausalLM if model == "gemma3" else Gemma4ForCausalLM
+        with patch("tensorrt_llm.logger.logger.info") as log_info:
+            defaults = model_cls.get_model_defaults(args)
+        apply_model_defaults_to_llm_args(args, defaults)
+
+        assert args.kv_cache_config.enable_swa_scratch_reuse is (
+            not enable_block_reuse if scratch is None else scratch)
+        if enable_block_reuse and scratch is None:
+            log_info.assert_called_once()
+            message = log_info.call_args.args[0]
+            assert "not enabled by default" in message
+            assert "enable_block_reuse=True" in message
+            assert "shared-prefix" in message
+            assert "enable_swa_scratch_reuse=True" in message
+        else:
+            log_info.assert_not_called()
 
     def test_compute_applied_llm_defaults_simple_field(self):
         model_defaults = {"enable_chunked_prefill": False}

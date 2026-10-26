@@ -27,6 +27,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import (AttentionMetadata,
@@ -383,12 +384,21 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Enable prefill scratch reuse for TRTLLM attention on SM90 and newer."""
+        """Default to prefill scratch reuse on SM90+ when block reuse is disabled."""
+        enable_scratch = (getattr(llm_args, "attn_backend", "TRTLLM").upper()
+                          == "TRTLLM" and get_sm_version() >= 90)
+        kv_cache_config = llm_args.kv_cache_config
+        if enable_scratch and kv_cache_config.enable_block_reuse:
+            enable_scratch = False
+            if "enable_swa_scratch_reuse" not in kv_cache_config.model_fields_set:
+                logger.info(
+                    "SWA scratch reuse is not enabled by default because "
+                    "kv_cache_config.enable_block_reuse=True. Scratch slots "
+                    "can reduce shared-prefix KV cache reuse. Set "
+                    "kv_cache_config.enable_swa_scratch_reuse=True to opt in.")
         return {
             "kv_cache_config": {
-                "enable_swa_scratch_reuse":
-                getattr(llm_args, "attn_backend", "TRTLLM").upper() == "TRTLLM"
-                and get_sm_version() >= 90,
+                "enable_swa_scratch_reuse": enable_scratch,
             },
         }
 

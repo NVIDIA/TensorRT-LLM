@@ -1432,12 +1432,21 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         effective_backend = default_backend
         if "attn_backend" in getattr(llm_args, "model_fields_set", set()):
             effective_backend = llm_args.attn_backend
+        enable_scratch = effective_backend.upper() == "TRTLLM" and not uses_external_shared_kv
+        kv_cache_config = llm_args.kv_cache_config
+        if enable_scratch and kv_cache_config.enable_block_reuse:
+            enable_scratch = False
+            if "enable_swa_scratch_reuse" not in kv_cache_config.model_fields_set:
+                logger.info(
+                    "SWA scratch reuse is not enabled by default because "
+                    "kv_cache_config.enable_block_reuse=True. Scratch slots "
+                    "can reduce shared-prefix KV cache reuse. Set "
+                    "kv_cache_config.enable_swa_scratch_reuse=True to opt in."
+                )
         return {
             "attn_backend": default_backend,
             "kv_cache_config": {
-                "enable_swa_scratch_reuse": (
-                    effective_backend.upper() == "TRTLLM" and not uses_external_shared_kv
-                ),
+                "enable_swa_scratch_reuse": enable_scratch,
             },
         }
 
