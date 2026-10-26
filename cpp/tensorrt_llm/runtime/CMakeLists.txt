@@ -115,15 +115,13 @@ target_link_libraries(
 target_compile_features(tllm_runtime_gdr PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_gdr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(
-  tllm_runtime_host_accessible_memory STATIC
-  moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
-  moeLoadBalancer/topologyDetector.cpp)
+add_library(tllm_runtime_host_accessible_memory STATIC
+            moeLoadBalancer/hostAccessibleDeviceAllocator.cpp)
 add_library(tllm::runtime_host_accessible_memory ALIAS
             tllm_runtime_host_accessible_memory)
 target_link_libraries(
   tllm_runtime_host_accessible_memory
-  PUBLIC tllm::runtime_gdr Threads::Threads
+  PUBLIC tllm::runtime_gdr tllm::runtime_topology Threads::Threads
   PRIVATE tllm::common_environment)
 if(NOT WIN32)
   target_link_libraries(tllm_runtime_host_accessible_memory PUBLIC NUMA::NUMA)
