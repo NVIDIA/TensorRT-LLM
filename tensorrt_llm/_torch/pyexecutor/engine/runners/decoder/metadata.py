@@ -278,6 +278,7 @@ def create_spec_metadata(
         spec_resource_manager=spec_resource_manager,
         max_seq_len=config.max_seq_len,
         num_seq_slots=config.num_seq_slots,
+        watermark_config=config.watermark_config,
     )
 
 

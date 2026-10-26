@@ -277,6 +277,12 @@ models:
         default: null
         status: prototype
         required: false
+      watermarking:
+        kind: extension
+        type: Optional[bool]
+        default: null
+        status: stable
+        required: false
       add_special_tokens:
         kind: extension
         type: bool
@@ -669,6 +675,12 @@ models:
         type: Optional[int]
         default: null
         status: prototype
+        required: false
+      watermarking:
+        kind: extension
+        type: Optional[bool]
+        default: null
+        status: stable
         required: false
       prompt_ignore_length:
         kind: extension

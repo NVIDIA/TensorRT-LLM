@@ -27,7 +27,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generic, List, Optional, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeAlias, TypeVar, cast
 
 import torch
 
@@ -37,6 +37,7 @@ from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.logger import logger
+from tensorrt_llm.watermark.sampling import gumbel_sample_from_probs
 
 from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -83,6 +84,10 @@ from .sampling_resolution import SamplingMode, SlotSamplingParams
 from .seed_manager import _SeedManager
 from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
 from .top_p_decay import TopPDecayHandler
+from .watermark import WatermarkHandler
+
+if TYPE_CHECKING:
+    from tensorrt_llm.watermark.config import WatermarkConfig
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -503,6 +508,9 @@ class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTenso
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     SampleState = SampleStateTorch
 
+    # Text-watermark state; set by __init__ when the engine configures a watermark.
+    _watermark: WatermarkHandler | None = None
+
     @override
     def get_cache_indirection(self) -> torch.Tensor | None:
         if (beam_search_store := self.store.beam_search_store) is not None:
@@ -584,6 +592,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         disable_overlap_scheduler: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
+        watermark_config: "Optional[WatermarkConfig]" = None
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -594,6 +603,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._batch_fastpath_eligible: bool = self.max_beam_width == 1
         if args.max_total_draft_tokens > 0 and args.max_beam_width > 1:
             raise ValueError("TorchSampler does not support beam search with speculative decoding")
+        if args.watermark_config is not None and args.max_total_draft_tokens > 0:
+            raise ValueError(
+                "watermark_config is not supported with speculative decoding that verifies "
+                "draft tokens in TorchSampler (NGram or user-provided drafts). Disable "
+                "speculative decoding or remove watermark_config."
+            )
         self.max_num_sequences = args.max_num_sequences
         # With the overlap scheduler, sample_async for step i runs before
         # update_requests for step i-1, so the host-side token lists lag the
@@ -668,6 +683,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self.store = self._create_store()
             # One row per sequence slot plus the scratch row (dummy_slot_row).
             self._slot_params = SlotSamplingParams(self.max_num_sequences + 1, device="cuda")
+            self._watermark: WatermarkHandler | None = (
+                WatermarkHandler(
+                    args.watermark_config,
+                    max_num_sequences=self.max_num_sequences,
+                    max_seq_len=self.max_seq_len,
+                    device="cuda",
+                )
+                if args.watermark_config is not None
+                else None
+            )
             self._finish_reasons_handler = FinishReasonsHandler(
                 max_num_sequences=self.max_num_sequences,
                 max_beam_width=self.max_beam_width,
@@ -801,6 +826,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             if modes[slot] is not SamplingMode.SAMPLING:
                 return False
             if self._top_p_decay.uses_decay(slot):
+                return False
+            # Watermarked rows need the filtered probabilities, which the fast tier never forms.
+            if self._watermark is not None and self._watermark.requested(req):
                 return False
             # The fast tier emits tokens only and samples the raw logits, so
             # anything that rewrites them first is excluded. Stop words are
@@ -1832,6 +1860,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # device sync on every call.
         torch._assert_async(~torch.any(torch.isnan(logits_cuda)))
         params = (logits_cuda, temperature, top_k, top_p, min_p)
+        watermark = self._watermark
+        watermark_rows = watermark.begin(slots_per_row) if watermark is not None else None
+        if watermark is not None and watermark_rows is not None:
+            # Rows that carry a watermark replace the uniform draw by the keyed Gumbel-max
+            # draw over the same filtered distribution; the rest keep their ordinary draw.
+            tokens, probs = fused_sample_from_logits_with_probs(
+                *params, seed=seeds.seed, offset=seeds.offset
+            )
+            active = watermark_rows.active[:, 0]
+            keyed = gumbel_sample_from_probs(probs, watermark_rows.seeds[:, 0], active)
+            tokens = torch.where(active, keyed, tokens)
+            watermark.commit(watermark_rows, tokens)
+            return tokens, (probs if return_probs else None), temperature
         if return_probs:
             tokens, probs = fused_sample_from_logits_with_probs(
                 *params, seed=seeds.seed, offset=seeds.offset
@@ -1864,6 +1905,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         cuda_device = logits_cuda.device
 
         self._seed_manager.observe(requests)
+        if self._watermark is not None:
+            slot_modes = self._slot_params.modes
+            self._watermark.observe(
+                requests,
+                lambda request: request.py_seq_slot is not None
+                and slot_modes[request.py_seq_slot] is SamplingMode.SAMPLING,
+            )
 
         seq_slots_list = seq_slots.tolist()
         groups = self._group_requests(requests, seq_slots_list)

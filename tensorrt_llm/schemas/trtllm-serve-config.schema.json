@@ -6417,6 +6417,88 @@
       ],
       "title": "WaitingQueuePolicy",
       "type": "string"
+    },
+    "WatermarkConfig": {
+      "additionalProperties": false,
+      "description": "Configuration of the statistical text watermark applied while sampling.\n\nThe watermark is keyed: the same ``key`` and sampling settings are needed\nto detect it later. ``key`` is a secret and is excluded from ``repr``.",
+      "properties": {
+        "algorithm": {
+          "default": "gumbel",
+          "description": "Watermarking algorithm. 'gumbel' replaces the random draw of the final token selection with a keyed Gumbel-max draw, which leaves the output distribution unchanged on average over keys. 'gumbel_dual_key' is the same for ordinary decoding and additionally supports speculative decoding with rejection sampling: draft tokens are drawn under the key, and the tokens that replace rejected drafts (or follow the last accepted one) under a second key derived from it, which keeps the output distribution exact.",
+          "enum": [
+            "gumbel",
+            "gumbel_dual_key"
+          ],
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "allow_request_opt_out": {
+          "default": true,
+          "description": "Whether a request may disable watermarking with SamplingParams.watermarking=False. Set to False to enforce the watermark on every request that can carry one.",
+          "title": "Allow Request Opt Out",
+          "type": "boolean"
+        },
+        "allow_target_only_watermarking": {
+          "default": false,
+          "description": "Only relevant to rejection-sampling speculative decoding. Accepted draft tokens are then not watermarked, so the signal weakens in proportion to the acceptance rate.",
+          "title": "Allow Target Only Watermarking",
+          "type": "boolean"
+        },
+        "context_width": {
+          "default": 4,
+          "description": "Number of preceding tokens that seed each sampling decision. Larger values make the mark less robust to edits.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Context Width",
+          "type": "integer"
+        },
+        "deduplicate_contexts": {
+          "default": "single_turn",
+          "description": "How repeated contexts are treated. A repeated context would repeat its token and be counted as independent evidence, so it falls back to ordinary sampling. 'none' disables this; 'single_turn' deduplicates within one generation.",
+          "enum": [
+            "none",
+            "single_turn"
+          ],
+          "title": "Deduplicate Contexts",
+          "type": "string"
+        },
+        "deduplicate_contexts_max_history": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 8192,
+          "description": "How many generated positions back the repeated-context search reaches. None means the whole generation.",
+          "title": "Deduplicate Contexts Max History"
+        },
+        "key": {
+          "description": "Secret key, an integer in [0, 2**64). Detection needs the same value.",
+          "exclusiveMaximum": 18446744073709551616,
+          "minimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Key",
+          "type": "integer"
+        },
+        "prf": {
+          "const": "philox",
+          "default": "philox",
+          "description": "Pseudo-random function that turns (key, context) into per-token random numbers. Fast and parallel, but not a cryptographic PRF: it does not protect against key recovery or forgery.",
+          "title": "Prf",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "title": "WatermarkConfig",
+      "type": "object"
     }
   },
   "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-config.schema.json",
@@ -7899,6 +7981,19 @@
       "status": "prototype",
       "title": "Use Fine Grained Sync",
       "type": "boolean"
+    },
+    "watermark_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WatermarkConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Enables statistical text watermarking of generated tokens (Gumbel-max). Requests may opt out with SamplingParams.watermarking=False unless allow_request_opt_out is False. Greedy and beam-search requests cannot carry a watermark and are generated normally. The key is a secret and must match at detection time (see tensorrt_llm.watermark).",
+      "status": "prototype"
     }
   },
   "required": [],

@@ -267,8 +267,11 @@ def _populate_meta(mode, draft_len=1):
         # Not under test.
         prepare_rejection_sampling_buffers=lambda: None,
         prepare_penalty_buffers=lambda: None,
+        prepare_watermark_buffers=lambda: None,
+        watermark_handler=None,
         _populate_request_rng_state=lambda requests, normalized: None,
         _populate_penalty_params=lambda requests: None,
+        _populate_watermark_params=lambda requests: None,
     )
     for name in (
         "_scan_one_model_sampling",

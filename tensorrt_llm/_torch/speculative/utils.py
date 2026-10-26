@@ -339,7 +339,8 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       max_seq_len=262144,
-                      num_seq_slots=None):
+                      num_seq_slots=None,
+                      watermark_config=None):
     metadata = _build_spec_metadata(spec_config,
                                     model_config,
                                     max_num_requests,
@@ -360,6 +361,8 @@ def get_spec_metadata(spec_config,
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
+        metadata.watermark_config = watermark_config
+        metadata.watermark_max_seq_len = max_seq_len
     return metadata
 
 
@@ -651,6 +654,46 @@ def get_spec_resource_manager(model_engine):
     return None
 
 
+def _watermark_unsupported_reason(spec_config,
+                                  watermark_config=None) -> Optional[str]:
+    """Why text watermarking cannot be served by this one-model configuration, or None.
+
+    With exact-match verification the watermark relies on the target's own sample at every
+    verified position, committed in order. Tree rows follow root paths and relaxed
+    acceptance commits non-matching tokens, so neither is supported. Rejection sampling
+    accepts drafts that the target did not sample: it needs either dual-key watermarking
+    (the drafts are drawn under one key, the token after the accepted prefix under a second
+    one) or the explicit opt-in to leave accepted drafts unmarked.
+    """
+    if _is_effective_dynamic_tree(spec_config):
+        return (
+            "Text watermarking is not supported with tree (dynamic tree) speculative "
+            "decoding. Use a linear speculation mode or disable speculative decoding."
+        )
+    if (getattr(spec_config, "use_rejection_sampling", False)
+            and watermark_config is not None):
+        dual_key = watermark_config.algorithm == "gumbel_dual_key"
+        if not dual_key and not watermark_config.allow_target_only_watermarking:
+            return (
+                "Text watermarking with use_rejection_sampling needs "
+                "watermark_config.algorithm='gumbel_dual_key', or "
+                "allow_target_only_watermarking=True to leave accepted draft tokens "
+                "unmarked (the signal weakens with the acceptance rate). Alternatively "
+                "disable use_rejection_sampling to keep exact-match verification."
+            )
+        if dual_key and spec_config.spec_dec_mode.is_parallel_draft():
+            return (
+                "watermark_config.algorithm='gumbel_dual_key' is not supported "
+                "with parallel-draft speculation. Use an autoregressive drafter "
+                "(Eagle3, MTP, DraftTarget) or allow_target_only_watermarking=True."
+            )
+    if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
+        return (
+            "Text watermarking is not supported with relaxed acceptance for thinking. "
+            "Disable use_relaxed_acceptance_for_thinking.")
+    return None
+
+
 def get_spec_decoder(
     sampler_args: TorchSampler.Args,
     spec_config: "DecodingBaseConfig",
@@ -669,10 +712,13 @@ def get_spec_decoder(
         # supported yet and are rejected at admission rather than mispenalized.
         penalty_supported = not _is_effective_dynamic_tree(spec_config)
         fused_sampling = (spec_config.advanced_sampling_mode.is_fused)
-        return SpecSampler(sampler_args,
-                           enable_penalty=spec_config.enable_penalty,
-                           penalty_supported=penalty_supported,
-                           fused_sampling=fused_sampling)
+        return SpecSampler(
+            sampler_args,
+            enable_penalty=spec_config.enable_penalty,
+            penalty_supported=penalty_supported,
+            fused_sampling=fused_sampling,
+            watermark_unsupported_reason=_watermark_unsupported_reason(
+                spec_config, sampler_args.watermark_config))
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

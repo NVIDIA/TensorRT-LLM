@@ -760,6 +760,7 @@ class ModelEngine:
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
+            watermark_config=self.llm_args.watermark_config,
             **extra_fields,
         )
 
