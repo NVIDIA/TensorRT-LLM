@@ -103,19 +103,30 @@ protocol. `ConfigurableMoE` owns wait/bind/record placement so those calls
 happen once per layer rather than once per scheduler chunk. Schedulers must not
 perform DWDP lifecycle calls.
 
-Dense DWDP (`dwdp_config.enable_dense`, which row-shards the replicated dense weights
-of the MoE decoder layers the same way) is owned by `DwdpManager` and the
-model's decoder-layer hooks, which enqueue each layer's dense weights on the
-same copy stream two layers ahead, and those of the first two layers of the
-next pass at the end of a pass, as the expert prefetch does.
-`DwdpManager.start_forward` enqueues the dense weights of the first two MoE
-layers before it starts the expert prefetch, unless the previous pass already
-enqueued them; after an aborted forward it leaves both to the model's forward
-entry (`DwdpManager.ensure_primed`). That entry does the same in every
-forward, also those the executor loop does not start (warmup, KV-cache
-estimation); after an aborted forward it first resets the dense slots, then
-the expert prefetch restarts its sequence. `ConfigurableMoE` is unaware of
-dense DWDP and keeps the expert wait/bind/finish protocol above unchanged.
+Dense DWDP (`dwdp_config.enable_dense`, which row-shards the replicated dense
+weights of the MoE decoder layers the same way) is owned by `DenseDwdpManager`
+(`modules/dwdp/dense/manager.py`), which the model's decoder-layer hooks reach
+through `get_global_dense_dwdp_manager()`. With expert DWDP, `DwdpManager`
+builds the dense manager and drives it: dense DWDP shards over the DWDP group,
+and the hooks enqueue each layer's dense weights on the same copy stream two
+layers ahead, and those of the first two layers of the next pass at the end of
+a pass, as the expert prefetch does. `DwdpManager.start_forward` enqueues the
+dense weights of the first two MoE layers before it starts the expert
+prefetch, unless the previous pass already enqueued them; after an aborted
+forward it leaves both to the model's forward entry
+(`DenseDwdpManager.ensure_primed`). That entry does the same in every forward,
+also those the executor loop does not start (warmup, KV-cache estimation);
+after an aborted forward it first resets the dense slots, then the expert
+prefetch restarts its sequence. Without expert DWDP
+(`dwdp_config.enable_experts: false`), dense DWDP runs standalone on an
+attention-DP instance (`tp_size > 1`): the executor creator builds the dense
+manager, which shards over the attention-DP group on its own copy stream. The
+non-overlap executor loop primes it before each forward, and the model's
+forward entry primes any forward the loop did not, so the overlap scheduler,
+whose loop does not prime, is allowed there. In both modes `ConfigurableMoE`
+is unaware of dense DWDP: with expert DWDP it keeps the wait/bind/finish
+protocol above unchanged; standalone it runs without DWDP (expert-parallel
+experts, no wait/bind/finish).
 
 The composite mapping exposes the full expert table through the backend's
 ordinary weight attributes, so DWDP returns `None` from

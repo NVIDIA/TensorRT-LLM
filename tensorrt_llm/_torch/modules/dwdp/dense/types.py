@@ -22,7 +22,7 @@ rank ``r`` stores row ``r``.
 
 This module holds what more than one part of the implementation reads or writes:
 
-* segment kinds and their slot rings (``A``: depth 2, ``D``: depth 3),
+* segment kinds and their slot rings (``A``: depth 2, ``D``: depth 3), copy modes and run modes,
 * the per-tensor (:class:`TensorBinding`) and per-storage (:class:`AnchorRecord`) records,
 * the per-(layer, segment) row layout, the store offsets and chunks (:class:`DenseLayout`),
 * slot specifications and slot buffers,
@@ -164,7 +164,11 @@ class BindingKind(str, enum.Enum):
 
 
 class CopyMode(str, enum.Enum):
-    """Transfer used to gather a layer into its slots; follows the expert DWDP transfer."""
+    """Transfer used to gather a layer into its slots.
+
+    With expert DWDP it follows the expert DWDP transfer; standalone, ``DwdpConfig.copy_mode`` picks
+    it, batched when unset.
+    """
 
     GATHER = "gather"
     """One ``trtllm::dwdp_fabric_gather`` launch per layer (expert ``use_gather``)."""
@@ -175,6 +179,18 @@ class CopyMode(str, enum.Enum):
 
     PER_SLICE = "per_slice"
     """One ``Tensor.copy_`` per copy descriptor."""
+
+
+class DenseMode(str, enum.Enum):
+    """How dense DWDP runs; ``gate.validate_dense_gate`` decides it from the launch."""
+
+    ATTACHED = "attached"
+    """With expert DWDP (``DwdpConfig.enable_experts``): the DWDP group, the expert DWDP copy stream
+    and its transfer."""
+
+    STANDALONE = "standalone"
+    """On an attention-DP instance with ``tp_size > 1``, without expert DWDP: the tp group, the
+    dense manager's own copy stream and ``DwdpConfig.copy_mode``."""
 
 
 #: Key of one blob: ``(layer index, segment kind)``.

@@ -301,6 +301,16 @@
       "path": "dwdp_config.contention_opt"
     },
     {
+      "allowed_values": [
+        "per_slice",
+        "batched",
+        "gather"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.copy_mode"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.dwdp_size"
@@ -309,6 +319,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "dwdp_config.enable_dense"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_experts"
     },
     {
       "capture_policy": "int",

@@ -108,6 +108,22 @@ def test_resident_sms_is_the_block_count_of_a_resident_gather(monkeypatch):
     assert fabric_gather.resident_sms() == 24
 
 
+def test_resident_sms_of_a_gather_chosen_by_the_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Standalone dense DWDP passes its own transport choice instead of the expert one."""
+    _unset(monkeypatch, "TRTLLM_CUTEDSL_SM_RESERVE")
+    monkeypatch.setenv("TRTLLM_DWDP_GATHER_BLOCKS", "30")
+    monkeypatch.setattr(fabric_gather, "available", lambda: False)
+    monkeypatch.setattr(fabric_gather, "THREADS", 1024)
+    assert fabric_gather.resident_sms(gather=True) == 30
+    assert fabric_gather.resident_sms(gather=False) == 0
+    monkeypatch.setattr(fabric_gather, "available", lambda: True)
+    assert fabric_gather.resident_sms(gather=False) == 0
+    monkeypatch.setattr(fabric_gather, "THREADS", 128)
+    assert fabric_gather.resident_sms(gather=True) == 0
+    monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", "24")
+    assert fabric_gather.resident_sms(gather=False) == 24
+
+
 def test_sm_reserve_is_set_explicitly():
     from tensorrt_llm._torch import cute_dsl_utils
 

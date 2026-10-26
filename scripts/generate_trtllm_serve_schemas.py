@@ -153,6 +153,43 @@ def generate_serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
+    # Mirror DwdpConfig._validate_modes(): without expert DWDP, dense DWDP is on and the expert
+    # fields keep their defaults; contention_opt, which selects batched copies, rules out another
+    # copy_mode.
+    dwdp = schema["$defs"]["DwdpConfig"]
+    expert_fields = (
+        "dwdp_size",
+        "num_groups",
+        "num_experts_per_worker",
+        "num_prefetch_experts",
+        "contention_opt",
+        "num_prefetch_slots",
+    )
+    dwdp["allOf"] = [
+        {
+            "if": {
+                "properties": {"enable_experts": {"const": False}},
+                "required": ["enable_experts"],
+            },
+            "then": {
+                "properties": {
+                    "enable_dense": {"const": True},
+                    **{
+                        name: {"const": dwdp["properties"][name]["default"]}
+                        for name in expert_fields
+                    },
+                },
+                "required": ["enable_dense"],
+            },
+        },
+        {
+            "if": {
+                "properties": {"contention_opt": {"const": True}},
+                "required": ["contention_opt"],
+            },
+            "then": {"properties": {"copy_mode": {"enum": ["batched", None]}}},
+        },
+    ]
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

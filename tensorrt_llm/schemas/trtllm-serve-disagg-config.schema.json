@@ -3429,13 +3429,96 @@
     },
     "DwdpConfig": {
       "additionalProperties": false,
-      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).\n\nDense DWDP (enable_dense) also shards the replicated dense weights of the\nMoE decoder layers over the DWDP group.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "enable_experts": {
+                "const": false
+              }
+            },
+            "required": [
+              "enable_experts"
+            ]
+          },
+          "then": {
+            "properties": {
+              "contention_opt": {
+                "const": false
+              },
+              "dwdp_size": {
+                "const": 1
+              },
+              "enable_dense": {
+                "const": true
+              },
+              "num_experts_per_worker": {
+                "const": 0
+              },
+              "num_groups": {
+                "const": 1
+              },
+              "num_prefetch_experts": {
+                "const": 0
+              },
+              "num_prefetch_slots": {
+                "const": 2
+              }
+            },
+            "required": [
+              "enable_dense"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "contention_opt": {
+                "const": true
+              }
+            },
+            "required": [
+              "contention_opt"
+            ]
+          },
+          "then": {
+            "properties": {
+              "copy_mode": {
+                "enum": [
+                  "batched",
+                  null
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).\n\nDense DWDP (enable_dense) also shards the replicated dense weights of the\nMoE decoder layers, over the DWDP group or, without expert DWDP\n(enable_experts=False), over the attention-DP ranks of one instance.",
       "properties": {
         "contention_opt": {
           "default": false,
           "description": "Enable limited-contention prefetch optimization. Uses batched memcpy with round-robin slice ordering across peers and a 2 MiB slice granularity to reduce NVLink contention.",
           "title": "Contention Opt",
           "type": "boolean"
+        },
+        "copy_mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "per_slice",
+                "batched",
+                "gather"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The transfer of every DWDP copy, the expert prefetch and the dense gathers alike: per_slice (one copy-engine copy per slice), batched (one batched copy-engine copy per layer) or gather (the SM fabric gather kernel, which keeps SMs from the compute kernels while it runs). None keeps the default selection: the expert prefetch uses per_slice, batched with contention_opt, or gather when the TRTLLM_DWDP_PREFETCH_GATHER environment variable is set; dense copies follow the expert transfer, and dense DWDP without expert DWDP uses batched. contention_opt requires batched or None.",
+          "status": "prototype",
+          "title": "Copy Mode"
         },
         "dwdp_size": {
           "default": 1,
@@ -3445,9 +3528,16 @@
         },
         "enable_dense": {
           "default": false,
-          "description": "Dense DWDP: row-shard the replicated dense weights of the MoE decoder layers (attention, shared expert, router and the other dense weights of the MoE block) over the DWDP group, and gather each layer into small staging slots two layers ahead of its use, which frees most of them for the KV cache. Only for models whose decoder layers provide dense DWDP roots (Kimi-K3), on context servers: trtllm-serve refuses it on a server launched with --server_role GENERATION or as a generation server of a disaggregated MPI launch, and warns on any other server without the context role, so launch context servers with --server_role CONTEXT. Every server of the DWDP group must set the same value. It needs eager execution (no CUDA graphs, torch.compile or prefill CUDA graphs), no sleep, LoRA or speculative config, locality domains off, tensor, pipeline and context parallel size 1, disable_overlap_scheduler=True and FABRIC peer handles.",
+          "description": "Dense DWDP: row-shard the replicated dense weights of the MoE decoder layers (attention, shared expert, router and the other dense weights of the MoE block) over the DWDP group, or without expert DWDP over the attention-DP ranks of the instance, and gather each layer into small staging slots two layers ahead of its use, which frees most of them for the KV cache. Only for models whose decoder layers provide dense DWDP roots (Kimi-K3), on context servers: trtllm-serve refuses it on a server launched with --server_role GENERATION or as a generation server of a disaggregated MPI launch, and warns on any other server without the context role, so launch context servers with --server_role CONTEXT. Every server of the DWDP group must set the same value. It needs eager execution (no CUDA graphs, torch.compile or prefill CUDA graphs), no sleep, LoRA or speculative config, locality domains off, pipeline and context parallel size 1 and FABRIC peer handles; with expert DWDP also tensor parallel size 1 and disable_overlap_scheduler=True, without it enable_attention_dp with tensor_parallel_size > 1.",
           "status": "prototype",
           "title": "Enable Dense",
+          "type": "boolean"
+        },
+        "enable_experts": {
+          "default": true,
+          "description": "Expert DWDP: each worker of the DWDP group stores a range of the routed experts and prefetches the others from its peers. Set it to False, with enable_dense, for dense DWDP alone on one attention-DP instance (enable_attention_dp with tensor_parallel_size > 1), whose dense weights are then sharded over the instance's attention-DP ranks; the expert DWDP fields (dwdp_size, num_groups, num_experts_per_worker, num_prefetch_experts, contention_opt, num_prefetch_slots) must then keep their defaults.",
+          "status": "prototype",
+          "title": "Enable Experts",
           "type": "boolean"
         },
         "num_experts_per_worker": {

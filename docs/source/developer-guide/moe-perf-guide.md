@@ -408,27 +408,43 @@ Usage: [`examples/dwdp/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/m
 
 #### Dense DWDP
 
-Dense DWDP (prototype) applies the same idea to the dense weights of the MoE decoder layers: the attention, the shared expert, the router and the other dense weights of the MoE block, which every context rank otherwise holds in full. Each rank of the DWDP group keeps one row-shard of every covered layer, and dense DWDP gathers each layer into small staging slots two layers ahead of its use, on the copy stream of the expert prefetch and with its transfer. Most of the replicated dense weights are freed for the KV cache. It applies to models whose decoder layers provide dense DWDP roots, currently Kimi-K3.
+Dense DWDP (prototype) applies the same idea to the dense weights of the MoE decoder layers: the attention, the shared expert, the router and the other dense weights of the MoE block, which every context rank otherwise holds in full. Each rank of the group keeps one row-shard of every covered layer, and dense DWDP gathers each layer into small staging slots two layers ahead of its use. Most of the replicated dense weights are freed for the KV cache. It applies to models whose decoder layers provide dense DWDP roots, currently Kimi-K3.
 
-Turn it on in the configuration of the context servers:
+It runs in one of two modes:
 
-```yaml
-dwdp_config:
-  dwdp_size: 16
-  num_experts_per_worker: 56
-  num_prefetch_experts: 56
-  enable_dense: true
-disable_overlap_scheduler: true
-cuda_graph_config: null
-```
+- With expert DWDP, on the context servers of a DWDP group: the dense rows are sharded over the DWDP group, and the dense copies run on the copy stream of the expert prefetch, with its transfer.
+
+  ```yaml
+  dwdp_config:
+    dwdp_size: 16
+    num_experts_per_worker: 56
+    num_prefetch_experts: 56
+    enable_dense: true
+  disable_overlap_scheduler: true
+  cuda_graph_config: null
+  ```
+
+- Without expert DWDP, on one attention-DP context instance: the dense rows are sharded over the attention-DP ranks of the instance, the copies run on a copy stream of their own, and the overlap scheduler may stay on.
+
+  ```yaml
+  tensor_parallel_size: 16
+  enable_attention_dp: true
+  dwdp_config:
+    enable_experts: false
+    enable_dense: true
+  cuda_graph_config: null
+  ```
+
+`dwdp_config.copy_mode` picks the transfer of every DWDP copy, the expert prefetch and the dense gathers alike: `per_slice` (one copy-engine copy per slice), `batched` (one batched copy-engine copy per layer) or `gather` (the SM fabric gather kernel, which keeps SMs from the compute kernels while it runs). Left unset, the expert prefetch keeps its usual selection (`per_slice`, `batched` with `contention_opt`, `gather` with the `TRTLLM_DWDP_PREFETCH_GATHER` environment variable), the dense copies follow it, and dense DWDP without expert DWDP uses `batched`.
 
 The launch is checked before the model is built. Dense DWDP needs:
 
-- `disable_overlap_scheduler: true` and pipeline and context parallel size 1, as expert DWDP requires, and tensor parallel size 1;
 - eager execution: no `cuda_graph_config`, `torch_compile_config` or prefill CUDA graphs;
 - no `sleep_config`, `lora_config` or `speculative_config`;
-- `enable_locality_domains` off;
-- FABRIC peer memory handles (multi-node NVLink systems).
+- `enable_locality_domains` off, and pipeline and context parallel size 1;
+- FABRIC peer memory handles (multi-node NVLink systems);
+- with expert DWDP, `dwdp_size > 1` and `disable_overlap_scheduler: true`, as expert DWDP requires, and tensor parallel size 1;
+- without expert DWDP, `enable_attention_dp: true` with `tensor_parallel_size > 1`, the MPI backend, and the gather kernel when `copy_mode` is `gather`. The expert DWDP fields (`dwdp_size`, `num_groups`, `num_experts_per_worker`, `num_prefetch_experts`, `contention_opt`, `num_prefetch_slots`) keep their defaults.
 
 Every server of a DWDP group must set the same `enable_dense`: setup compares it in its first collective, and a disagreement, or a setup failure on any rank, makes every rank of the group raise. Dense DWDP is meant for context servers; on a generation server every decode step would gather every covered layer. `trtllm-serve` refuses `enable_dense` on a server launched with `--server_role GENERATION` or as a generation server of a disaggregated MPI launch, and warns on a server without the context role, so launch context servers with `--server_role CONTEXT`. A Kimi-K3 server with expert DWDP and `enable_dense` off still runs the first collective of dense setup at startup, so that a group whose servers disagree fails at once.
 

@@ -267,17 +267,74 @@ def test_shutdown_settings(
         ({"enable_dense": False}, True),
         ({"enable_dense": "always"}, False),
         ({"enable_dense_dwdp": True}, False),
+        ({"enable_experts": False, "enable_dense": True}, True),
+        ({"enable_experts": "no"}, False),
+        ({"copy_mode": "gather"}, True),
+        ({"copy_mode": "per_slice"}, True),
+        ({"copy_mode": None}, True),
+        ({"copy_mode": "fast"}, False),
     ],
 )
 def test_dense_dwdp_setting(
     schemas: dict[str, dict], filename: str, dwdp_config: dict, valid: bool
 ) -> None:
-    """dwdp_config.enable_dense, at the top level or under context_servers."""
+    """enable_experts, enable_dense and copy_mode of dwdp_config, also under context_servers."""
     config = {"dwdp_config": dwdp_config}
     if filename == generator.DISAGG_SCHEMA:
         config = {"context_servers": config}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+_DENSE_ONLY = {"enable_experts": False, "enable_dense": True}
+
+
+@pytest.mark.parametrize(
+    ("dwdp_config", "error"),
+    [
+        ({}, None),
+        ({"enable_dense": True}, None),
+        ({"enable_experts": True, "enable_dense": False}, None),
+        (_DENSE_ONLY, None),
+        ({**_DENSE_ONLY, "dwdp_size": 1, "contention_opt": False}, None),
+        ({**_DENSE_ONLY, "copy_mode": "gather"}, None),
+        ({"enable_experts": False}, "nothing to distribute"),
+        ({"enable_experts": False, "enable_dense": False}, "nothing to distribute"),
+        ({**_DENSE_ONLY, "dwdp_size": 4}, "configure expert DWDP"),
+        ({**_DENSE_ONLY, "num_groups": 2}, "configure expert DWDP"),
+        (
+            {**_DENSE_ONLY, "num_experts_per_worker": 1, "num_prefetch_experts": 1},
+            "configure expert DWDP",
+        ),
+        ({**_DENSE_ONLY, "contention_opt": True}, "configure expert DWDP"),
+        ({**_DENSE_ONLY, "num_prefetch_slots": 3}, "configure expert DWDP"),
+        ({"contention_opt": True}, None),
+        ({"contention_opt": True, "copy_mode": None}, None),
+        ({"contention_opt": True, "copy_mode": "batched"}, None),
+        ({"contention_opt": True, "copy_mode": "gather"}, "selects batched copies"),
+        ({"contention_opt": True, "copy_mode": "per_slice"}, "selects batched copies"),
+        ({"contention_opt": False, "copy_mode": "gather"}, None),
+    ],
+)
+def test_dwdp_modes_match_runtime(
+    schemas: dict[str, dict], dwdp_config: dict[str, object], error: str | None
+) -> None:
+    """Both schemas accept a DwdpConfig mode combination exactly when DwdpConfig does."""
+    from tensorrt_llm.llmapi.llm_args import DwdpConfig
+
+    if error is None:
+        DwdpConfig(**dwdp_config)
+    else:
+        with pytest.raises(ValueError, match=error):
+            DwdpConfig(**dwdp_config)
+
+    config = {"dwdp_config": dwdp_config}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == (error is None), filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == (error is None), section
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:

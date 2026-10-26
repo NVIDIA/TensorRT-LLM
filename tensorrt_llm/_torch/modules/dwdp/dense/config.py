@@ -14,10 +14,11 @@
 # limitations under the License.
 """Settings of dense DWDP.
 
-``DwdpConfig.enable_dense`` turns dense DWDP on for a launch; nothing else of it is configurable.
-:class:`DenseConfig` holds what setup and the runtime read: :meth:`DenseConfig.from_dwdp_config`
-builds it for a launch, with every other field at the value every deployment uses, and tests
-construct it directly to exercise other values.
+``DwdpConfig.enable_dense`` turns dense DWDP on for a launch, and ``DwdpConfig.copy_mode`` picks the
+transfer of every DWDP copy, the dense ones included; nothing else of dense DWDP is configurable.
+:class:`DenseConfig` holds what setup and the dense managers read:
+:meth:`DenseConfig.from_dwdp_config` builds it for a launch, with every other field at the value
+every deployment uses, and tests construct it directly to exercise other values.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .types import DEFAULT_MIN_BYTES, SEGMENT_ORDER, DigestSwitches, SegmentKind
+from .types import DEFAULT_MIN_BYTES, SEGMENT_ORDER, CopyMode, DigestSwitches, SegmentKind
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DwdpConfig
@@ -48,6 +49,9 @@ class DenseConfig:
             cannot shard cleanly, an original weight storage still alive after the commit (every
             rank raises together), and at run time a demand fetch or a fence fallback.  Off for
             launches.
+        copy: The transfer of standalone dense DWDP (``DwdpConfig.copy_mode``); None means
+            batched.  Strings are accepted and converted.  With expert DWDP the dense copies follow
+            the expert transfer, which ``DwdpConfig.copy_mode`` sets as well.
     """
 
     enabled: bool = False
@@ -55,10 +59,13 @@ class DenseConfig:
     min_bytes: int = DEFAULT_MIN_BYTES
     store_chunk_mb: int = 0
     strict: bool = False
+    copy: CopyMode | None = None
 
     def __post_init__(self) -> None:
         segments = _canonical_segments(self.segments)
         object.__setattr__(self, "segments", segments)
+        if self.copy is not None:
+            object.__setattr__(self, "copy", CopyMode(self.copy))
         for name in ("min_bytes", "store_chunk_mb"):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -67,12 +74,22 @@ class DenseConfig:
 
     @classmethod
     def from_dwdp_config(cls, config: DwdpConfig | None) -> DenseConfig:
-        """The settings of a launch: ``enabled`` from ``config.enable_dense``, the rest defaults.
+        """The settings of a launch: ``enabled`` and ``copy`` from ``config``, the rest defaults.
 
         Args:
             config: The launch's ``DwdpConfig``; None turns dense DWDP off.
         """
-        return cls(enabled=config is not None and config.enable_dense)
+        if config is None:
+            return cls()
+        return cls(enabled=config.enable_dense, copy=config.copy_mode)
+
+    def standalone_copy_mode(self) -> CopyMode:
+        """The transfer of standalone dense DWDP: ``copy``, or ``BATCHED`` when it is None.
+
+        Only standalone code calls it (the gate and ``DenseDwdpManager``); with expert DWDP the
+        dense copies follow the expert transfer.
+        """
+        return CopyMode.BATCHED if self.copy is None else self.copy
 
     def digest_switches(self, num_ranks: int) -> DigestSwitches:
         """The settings the layout depends on, for a group of ``num_ranks`` ranks."""

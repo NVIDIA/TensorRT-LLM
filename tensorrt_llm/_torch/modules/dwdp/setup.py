@@ -96,6 +96,7 @@ def setup_dwdp(
     num_prefetch_slots: int,
     contention_opt: bool = False,
     repeated_layer_indices: Sequence[int] = (),
+    copy_mode: Optional[str] = None,
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -132,6 +133,8 @@ def setup_dwdp(
             ``cudaMemcpyBatchAsync`` per layer (``DwdpConfig.contention_opt``).
         repeated_layer_indices: Layers of ``layer_indices`` that run several
             times in a row within a forward pass (``DwdpManager.add_repeated_layer``).
+        copy_mode: The prefetch transfer (``DwdpConfig.copy_mode``); None keeps
+            the selection by ``contention_opt`` and ``TRTLLM_DWDP_PREFETCH_GATHER``.
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
@@ -282,6 +285,7 @@ def setup_dwdp(
             dwdp_size=mapping.dwdp_size,
             contention_opt=contention_opt,
             repeated_layer_indices=repeated_layer_indices,
+            copy_mode=copy_mode,
         )
     except BaseException:
         _release_during_rollback(weight_buffer, "weight buffer")

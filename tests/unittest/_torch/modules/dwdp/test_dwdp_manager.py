@@ -18,12 +18,13 @@ DwdpManager is a thin lifecycle layer that:
 - creates a DWDP MPI sub-communicator
 - owns the Single Source of Truth for registered MoE layer indices
 - forwards runtime calls to the DWDPWeightManager produced by setup_dwdp
-- owns the dense DWDP runtime: sets it up after setup_dwdp
+- owns the attached DenseDwdpManager: sets dense DWDP up after setup_dwdp
 
 These tests mock out COMM_WORLD / dwdp_global_rank / setup_dwdp so the full
 lifecycle can be exercised on a single CPU without MPI / CUDA / MNNVL.
 """
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -33,7 +34,12 @@ import torch.nn as nn
 from tensorrt_llm._torch.cute_dsl_utils import sm_reserve
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
-from tensorrt_llm._torch.modules.dwdp.dense.types import DenseSetupError
+from tensorrt_llm._torch.modules.dwdp.dense.manager import (
+    DenseDwdpManager,
+    get_global_dense_dwdp_manager,
+    set_global_dense_dwdp_manager,
+)
+from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode, DenseSetupError
 from tensorrt_llm._torch.pyexecutor.dwdp import (
     DwdpManager,
     get_global_dwdp_manager,
@@ -88,19 +94,25 @@ def _start(test: unittest.TestCase, patcher: object) -> MagicMock:
     return mock
 
 
+def _clear_global_managers() -> None:
+    """Unregister both managers: a leftover one fails the next ``__init__``."""
+    set_global_dwdp_manager(None)
+    set_global_dense_dwdp_manager(None)
+
+
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.setup_dwdp")
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.dwdp_global_rank", return_value=0)
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.COMM_WORLD")
 class TestDwdpManagerLifecycle(unittest.TestCase):
     def setUp(self):
         # Ensure no leftover global singleton from a prior test.
-        set_global_dwdp_manager(None)
+        _clear_global_managers()
         # Dense DWDP off: a model without dense roots, enable_dense unset.
         _start(self, patch(f"{_FAC}.dense_roots_available", return_value=False))
         self.setup_dense = _start(self, patch(f"{_FAC}.setup_dense_dwdp"))
 
     def tearDown(self):
-        set_global_dwdp_manager(None)
+        _clear_global_managers()
         self.setup_dense.assert_not_called()
 
     # ------------------------------------------------------------------
@@ -209,10 +221,39 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             mapping=_make_mapping(),
         )
         self.assertIsNone(get_global_dwdp_manager())
+        self.assertIsNone(get_global_dense_dwdp_manager())
         mgr.__enter__()
         self.assertIs(get_global_dwdp_manager(), mgr)
+        self.assertIs(get_global_dense_dwdp_manager(), mgr.dense_manager)
+        self.assertIs(mgr.dense_manager.mode, DenseMode.ATTACHED)
         mgr.__exit__(None, None, None)
         self.assertIsNone(get_global_dwdp_manager())
+        self.assertIsNone(get_global_dense_dwdp_manager())
+
+    def test_enter_frees_the_group_when_the_dense_manager_cannot_register(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, _setup: MagicMock
+    ) -> None:
+        """Neither stays registered; a failing Free is logged and the registration error raised."""
+        sub_comm = _configure_mock_comm_world(mock_comm_world)
+        sub_comm.Free.side_effect = RuntimeError("free failed")
+        mgr = DwdpManager(
+            config=_make_config(), dist=MagicMock(spec=MPIDist), mapping=_make_mapping()
+        )
+        stray = DenseDwdpManager(DenseMode.ATTACHED).__enter__()
+
+        with patch(f"{_FAC}.logger.error") as log_error:
+            with self.assertRaisesRegex(
+                RuntimeError, "^DenseDwdpManager already registered globally$"
+            ):
+                mgr.__enter__()
+
+        sub_comm.Free.assert_called_once_with()
+        self.assertIn("free failed", log_error.call_args.args[0])
+        self.assertIsNone(mgr.dwdp_group)
+        self.assertIsNone(get_global_dwdp_manager())
+        self.assertIs(get_global_dense_dwdp_manager(), stray)
+        with self.assertRaisesRegex(RuntimeError, r"setup\(\) called after cleanup\(\)"):
+            mgr.setup(MagicMock())
 
     def test_enter_reserves_the_gather_sms(self, mock_comm_world, _rank, _setup):
         """The gather's resident SMs reach the persistent grids through set_sm_reserve, from
@@ -232,6 +273,60 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         self.assertEqual(sm_reserve(), 30)
         mgr.__exit__(None, None, None)
         self.assertEqual(sm_reserve(), 0)
+
+    def test_copy_mode_selects_the_expert_transfer_through_the_config(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, mock_setup: MagicMock
+    ) -> None:
+        """copy_mode reaches setup_dwdp and decides the gather's SM reserve; it overrides
+        TRTLLM_DWDP_PREFETCH_GATHER, with one warning when the two disagree."""
+        _configure_mock_comm_world(mock_comm_world)
+        cases = [
+            # (copy_mode, TRTLLM_DWDP_PREFETCH_GATHER, gather, warned)
+            ("gather", None, True, False),
+            ("batched", None, False, False),
+            ("batched", "1", False, True),
+            ("gather", "0", True, True),
+            ("gather", "1", True, False),
+            (None, "1", True, False),
+        ]
+        for copy_mode, env, gather, warned in cases:
+            with (
+                self.subTest(copy_mode=copy_mode, env=env),
+                patch.dict(os.environ),
+                patch(f"{_FAC}.fabric_gather.gather_op", return_value=object()),
+                patch(f"{_FAC}.fabric_gather.resident_sms", return_value=0) as resident_sms,
+                patch(f"{_FAC}.logger.warning") as warning,
+                patch(f"{_FAC}.torch.cuda.current_device", return_value=0),
+            ):
+                os.environ.pop("TRTLLM_DWDP_PREFETCH_GATHER", None)
+                if env is not None:
+                    os.environ["TRTLLM_DWDP_PREFETCH_GATHER"] = env
+                config = _make_config().model_copy(update={"copy_mode": copy_mode})
+                mgr = DwdpManager(
+                    config=config, dist=MagicMock(spec=MPIDist), mapping=_make_mapping()
+                )
+                resident_sms.assert_called_once_with(gather=gather)
+                overrides = [
+                    call.args[0]
+                    for call in warning.call_args_list
+                    if "overrides TRTLLM_DWDP_PREFETCH_GATHER" in call.args[0]
+                ]
+                self.assertEqual(len(overrides), int(warned))
+                mgr.setup(MagicMock())
+                self.assertEqual(mock_setup.call_args.kwargs["copy_mode"], copy_mode)
+                mgr.cleanup()
+
+    def test_copy_mode_gather_without_its_op_fails_before_the_group(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, _setup: MagicMock
+    ) -> None:
+        _configure_mock_comm_world(mock_comm_world)
+        config = _make_config().model_copy(update={"copy_mode": "gather"})
+        with patch(f"{_FAC}.fabric_gather.gather_op", return_value=None):
+            with self.assertRaisesRegex(
+                ValueError, "copy_mode='gather' needs trtllm::dwdp_fabric_gather"
+            ):
+                DwdpManager(config=config, dist=MagicMock(spec=MPIDist), mapping=_make_mapping())
+        mock_comm_world.Create_group.assert_not_called()
 
     def test_cleanup_frees_comm_and_idempotent(self, mock_comm_world, _rank, _setup):
         sub_comm = MagicMock()
@@ -264,6 +359,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
                 mgr.__exit__(None, None, None)
 
         self.assertIsNone(get_global_dwdp_manager())
+        self.assertIsNone(get_global_dense_dwdp_manager())
 
     def test_cleanup_frees_comm_when_weight_release_fails(self, mock_comm_world, _rank, _setup):
         sub_comm = _configure_mock_comm_world(mock_comm_world)
@@ -469,15 +565,15 @@ class _DenseModel(nn.Module):
 
 
 class TestDwdpManagerDenseSetup(unittest.TestCase):
-    """A DwdpManager over fakes, not entered unless a test enters it."""
+    """A DwdpManager over fakes, not entered unless a test enters it; its dense manager is real."""
 
     LAYERS = [3, 5, 7]
     #: Global rank 3 is DWDP rank 1 of group 1 on device 2: passing one for another shows.
     GLOBAL_RANK, DWDP_RANK, DEVICE_ID = 3, 1, 2
 
     def setUp(self) -> None:
-        set_global_dwdp_manager(None)
-        self.addCleanup(set_global_dwdp_manager, None)
+        _clear_global_managers()
+        self.addCleanup(_clear_global_managers)
         self.log: list[tuple] = []
         self.sub_comm = _configure_mock_comm_world(_start(self, patch(f"{_FAC}.COMM_WORLD")))
         self.sub_comm.Free.side_effect = lambda: self.log.append(("group.Free",))
@@ -540,6 +636,18 @@ class TestDwdpManagerDenseSetup(unittest.TestCase):
         self.assertEqual(seen, [(self.model, self.weight_manager)])
         self.assertEqual(self.setup_dwdp.call_args.kwargs["device_id"], self.DEVICE_ID)
         self.assertIsNone(self.manager.dense)
+
+    def test_setup_hands_the_committed_runtime_and_the_weight_manager_to_the_dense_manager(
+        self,
+    ) -> None:
+        dense_manager, dense = self.manager.dense_manager, object()
+        attach = _start(self, patch.object(dense_manager, "attach", wraps=dense_manager.attach))
+        self.setup_dense.return_value = dense
+
+        self.manager.setup(self.model)
+
+        attach.assert_called_once_with(dense, expert=self.weight_manager)
+        self.assertIs(self.manager.dense, dense)
 
     def test_a_model_without_roots_makes_no_dense_collective(self) -> None:
         """A rank that asks for dense DWDP raises alone, after the expert setup.

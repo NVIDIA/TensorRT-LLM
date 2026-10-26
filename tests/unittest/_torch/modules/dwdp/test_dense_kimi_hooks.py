@@ -12,16 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The Kimi-K3 side of dense DWDP: hook placement and the load guard.
+"""The Kimi-K3 side of dense DWDP: hook placement, the load guard and what the collector moves.
 
-Covers the hook calls H0-H3 of ``modeling_kimi_linear`` and its load guard on a real model built
-from a tiny Kimi-Linear config.  A real forward of the attention and MoE submodules needs
-attention metadata, KV-cache pools and the routed-expert kernels, so recorders replace exactly
-those submodules; everything else in the model forward runs for real, on CPU in fp32.  Stand-ins
-without tensors replace the routed experts and the MLA mixer (``KimiK3MLAAttention``, whose
-attention backends allocate on CUDA); the MLA layer keeps its real MLA branch and
-``KimiMLARuntime`` wrapper.  The model reaches dense DWDP through the ``DwdpManager`` it captures
-when built (``get_global_dwdp_manager``).
+Covers the hook calls H0-H3 of ``modeling_kimi_linear``, its load guard and the dense layout of its
+real decoder layers, on a real model built from a tiny Kimi-Linear config.  A real forward of the
+attention and MoE submodules needs attention metadata, KV-cache pools and the routed-expert kernels,
+so recorders replace exactly those submodules; everything else in the model forward runs for real,
+on CPU in fp32.  Stand-ins without tensors replace the routed experts and the MLA mixer
+(``KimiK3MLAAttention``, whose attention backends allocate on CUDA); the MLA layer keeps its real
+MLA branch and ``KimiMLARuntime`` wrapper.  The model reaches dense DWDP through the dense DWDP
+manager it captures when built (``get_global_dense_dwdp_manager``), in both modes: attached and
+standalone.
 """
 
 from types import SimpleNamespace
@@ -36,6 +37,11 @@ from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
 from tensorrt_llm._torch.modules import kimi_k3_mla
+from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
+from tensorrt_llm._torch.modules.dwdp.dense.layout import collect_dense_layout
+from tensorrt_llm._torch.modules.dwdp.dense.manager import set_global_dense_dwdp_manager
+from tensorrt_llm._torch.modules.dwdp.dense.types import SegmentKind
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, CutlassFusedMoE
 from tensorrt_llm._torch.pyexecutor.dwdp import set_global_dwdp_manager
 from tensorrt_llm.mapping import Mapping
@@ -138,14 +144,16 @@ class _CpuRoutedExperts(ConfigurableMoE):
 def _cpu_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     """CPU stand-ins for the routed experts, the MLA mixer and the model's auxiliary streams.
 
-    Layers capture the global DWDP manager when built: every test starts and ends without one.
+    Layers capture the global managers when built: every test starts and ends without one.
     """
     monkeypatch.setattr(mkl, "create_moe", lambda **kwargs: _CpuRoutedExperts(**kwargs))
     monkeypatch.setattr(kimi_k3_mla, "KimiK3MLAAttention", _CpuMlaMixer)
     monkeypatch.setattr(torch.cuda, "Stream", object)
     set_global_dwdp_manager(None)
+    set_global_dense_dwdp_manager(None)
     yield
     set_global_dwdp_manager(None)
+    set_global_dense_dwdp_manager(None)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +197,7 @@ class _RecordingDense:
 
 
 def _manager(log: list, dense: object | None) -> SimpleNamespace:
-    """``DwdpManager.dense`` and ``DwdpManager.ensure_primed``, recorded."""
+    """``DenseDwdpManager.dense`` and ``DenseDwdpManager.ensure_primed``, recorded."""
     return SimpleNamespace(dense=dense, ensure_primed=lambda: log.append(("ensure_primed",)))
 
 
@@ -222,6 +230,18 @@ def _layer_reads(index: int, dense: bool) -> list[tuple]:
     ]
 
 
+@pytest.mark.parametrize("registered", [True, False], ids=["registered", "unregistered"])
+def test_the_model_and_its_layers_capture_the_registered_dense_manager(registered: bool) -> None:
+    """Built with or without a registered dense DWDP manager, the model and each layer keep it."""
+    manager = _manager([], None) if registered else None
+    set_global_dense_dwdp_manager(manager)
+
+    model = mkl.KimiLinearModel(_model_config(_kimi_config()))
+
+    assert model._dense_dwdp is manager
+    assert model.layers and all(layer._dense_dwdp is manager for layer in model.layers)
+
+
 @pytest.mark.parametrize("state", ["dense", "no_dense", "no_manager"])
 def test_the_model_primes_first_and_brackets_the_reads_of_covered_layers(state: str) -> None:
     """H0 primes before the embedding; H1-H3 bracket the attention and MoE reads of KDA and MLA."""
@@ -235,10 +255,10 @@ def test_the_model_primes_first_and_brackets_the_reads_of_covered_layers(state: 
         "no_dense": _manager(log, None),
         "no_manager": None,
     }[state]
-    model._dwdp = manager
+    model._dense_dwdp = manager
     for layer in model.layers:
         _install_recorders(layer, log)
-        layer._dwdp = manager
+        layer._dense_dwdp = manager
     # fp32 activations keep the residual mixing and the norms on their eager CPU paths.
     metadata = SimpleNamespace(num_tokens=_TOKENS)
 
@@ -280,3 +300,101 @@ def test_load_weights_refuses_while_dense_is_active() -> None:
     for active in (False, None):
         with pytest.raises(_LoadReached):
             _causal_lm(active=active).load_weights({})
+
+
+# ---------------------------------------------------------------------------
+# What the collector moves from the real layers
+# ---------------------------------------------------------------------------
+
+
+def _finish_loading(model: mkl.KimiLinearModel) -> None:
+    """What the loader does after the checkpoint: transform each Linear, build the KDA tensors.
+
+    ``finalize_decode_weights`` skips CPU, so its fused projections and constants are built here.
+    """
+    for module in model.modules():
+        if isinstance(module, Linear):
+            module.post_load_weights()
+    for layer in model.layers:
+        if layer.is_kda:
+            kda = layer.linear_attn
+            kda._qkvg_proj_weight = kda._merge_projection_weights(
+                (kda.q_proj, kda.k_proj, kda.v_proj, kda.g_proj)
+            )
+            kda._bfa_proj_weight = kda._merge_projection_weights(
+                (kda.f_a_proj, kda.b_proj), pad_rows_to=8
+            )
+            kda._build_decode_kernel_constants()
+            kda._build_mtp_conv_weights()
+
+
+def _root_tensors(roots: list[tuple[str, nn.Module]]) -> set[str]:
+    """The names dense DWDP binds under ``roots``: the tensors that may move and their aliases.
+
+    Parameters, buffers and the tensor attributes ``DWDP_DENSE_ATTR_ALLOW`` names may move unless
+    ``DWDP_DENSE_EXCLUDE`` names them; any other tensor reference under the roots moves only as a
+    view of a storage that moves.
+    """
+    references = []
+    for root_path, root in roots:
+        for path, module in root.named_modules(prefix=root_path):
+            for table in (module._parameters, module._buffers):
+                references += [
+                    (f"{path}.{name}", tensor, name not in mkl.DWDP_DENSE_EXCLUDE)
+                    for name, tensor in table.items()
+                    if tensor is not None
+                ]
+            for name, value in vars(module).items():
+                allowed = name in mkl.DWDP_DENSE_ATTR_ALLOW - mkl.DWDP_DENSE_EXCLUDE
+                if isinstance(value, torch.Tensor):
+                    references.append((f"{path}.{name}", value, allowed))
+                elif isinstance(value, (tuple, list)) and value:
+                    if all(isinstance(item, torch.Tensor) for item in value):
+                        references += [
+                            (f"{path}.{name}[{index}]", item, allowed)
+                            for index, item in enumerate(value)
+                        ]
+    storage = lambda tensor: tensor.untyped_storage().data_ptr()  # noqa: E731
+    moving = {storage(tensor) for _, tensor, may_move in references if may_move}
+    return {name for name, tensor, _ in references if storage(tensor) in moving}
+
+
+def test_the_collector_moves_every_root_tensor_of_the_moe_layers_and_nothing_else() -> None:
+    """Each tensor under the attention and MoE-dense roots moves; layer 0 and the experts stay.
+
+    Strict collection with a 1-byte threshold also fails on any plain tensor attribute under the
+    roots that ``DWDP_DENSE_ATTR_ALLOW`` and ``DWDP_DENSE_EXCLUDE`` do not account for.
+    """
+    model = mkl.KimiLinearModel(_model_config(_kimi_config()))
+    _finish_loading(model)
+
+    layout = collect_dense_layout(
+        list(enumerate(model.layers)),
+        DenseConfig(enabled=True, min_bytes=1, strict=True),
+        num_ranks=2,
+        device=torch.device("cpu"),
+        attr_allow=mkl.DWDP_DENSE_ATTR_ALLOW,
+        exclude=mkl.DWDP_DENSE_EXCLUDE,
+    )
+
+    assert layout.layers == _MOE_LAYERS
+    assert layout.warnings == []
+    for index in _MOE_LAYERS:
+        layer = model.layers[index]
+        attention = "linear_attn" if layer.is_kda else "self_attn"
+        assert [path for path, _ in layer.dense_dwdp_roots("attn")] == [attention]
+        assert [path for path, _ in layer.dense_dwdp_roots("moe")] == [
+            "block_sparse_moe.gate",
+            "block_sparse_moe.shared_experts",
+            "block_sparse_moe.routed_expert_down_proj",
+            "block_sparse_moe.routed_expert_up_proj",
+            "block_sparse_moe.routed_expert_norm",
+        ]
+        for kind in (SegmentKind.ATTN, SegmentKind.MOE):
+            moved = {
+                binding.qualified_name
+                for anchor in layout.segment(index, kind).anchors
+                for binding in anchor.bindings
+            }
+            assert moved == _root_tensors(layer.dense_dwdp_roots(kind.value)), (index, kind)
+            assert not any(name.startswith("block_sparse_moe.routed_experts") for name in moved)

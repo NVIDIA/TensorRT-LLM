@@ -47,7 +47,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
-                                          DSparkDecodingConfig,
+                                          DSparkDecodingConfig, DwdpConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -5739,3 +5739,57 @@ class TestContextServerShutdownSettings:
                            match="serve_graceful_shutdown_timeout_s"):
             TorchLlmArgs(model="/tmp/dummy_model",
                          serve_graceful_shutdown_timeout_s=timeout)
+
+
+@pytest.mark.cpu_only
+class TestDwdpConfigModes:
+    """DwdpConfig: expert DWDP, dense DWDP or both, and the settings that fit the choice."""
+
+    def test_the_defaults_keep_expert_dwdp_alone(self) -> None:
+        config = DwdpConfig()
+        assert (config.enable_experts, config.enable_dense,
+                config.copy_mode) == (True, False, None)
+
+    @pytest.mark.parametrize("fields", [
+        dict(enable_dense=True),
+        dict(enable_experts=False, enable_dense=True),
+        dict(enable_experts=False, enable_dense=True, copy_mode="gather"),
+        dict(contention_opt=True, copy_mode="batched"),
+    ],
+                             ids=[
+                                 "expert+dense", "dense-only",
+                                 "dense-only-gather", "contention-opt-batched"
+                             ])
+    def test_accepted_combinations(self, fields: dict) -> None:
+        DwdpConfig(**fields)
+
+    def test_nothing_to_distribute_is_rejected(self) -> None:
+        with pytest.raises(ValidationError,
+                           match="enable_experts and enable_dense are both"):
+            DwdpConfig(enable_experts=False)
+
+    @pytest.mark.parametrize("fields", [
+        dict(dwdp_size=4),
+        dict(num_groups=2),
+        dict(num_experts_per_worker=8, num_prefetch_experts=8),
+        dict(contention_opt=True),
+        dict(num_prefetch_slots=3),
+    ],
+                             ids=lambda fields: ",".join(fields))
+    def test_expert_fields_need_expert_dwdp(self, fields: dict) -> None:
+        """Without expert DWDP the expert fields keep their defaults."""
+        with pytest.raises(
+                ValidationError,
+                match=f"{next(iter(fields))}=.* configure expert DWDP, but "
+                "enable_experts=False turns it off"):
+            DwdpConfig(enable_experts=False, enable_dense=True, **fields)
+
+    @pytest.mark.parametrize("copy_mode", ["per_slice", "gather"])
+    def test_contention_opt_needs_batched_copies(self, copy_mode: str) -> None:
+        with pytest.raises(ValidationError,
+                           match="contention_opt=True selects batched copies"):
+            DwdpConfig(contention_opt=True, copy_mode=copy_mode)
+
+    def test_copy_mode_takes_the_three_transfers_only(self) -> None:
+        with pytest.raises(ValidationError, match="copy_mode"):
+            DwdpConfig(copy_mode="fast")

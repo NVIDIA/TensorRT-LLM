@@ -12,20 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests of the dense DWDP runtime protocol (``runtime.DenseDWDP``) beside expert DWDP.
+"""CPU tests of the dense DWDP runtime protocol (``runtime.DenseDWDP``), attached and standalone.
 
 A recording fake of the CUDA seam logs every event record, stream wait, copy launch and device
 synchronization in host order; a wait binds to the latest record of its event before it, as
 ``cudaStreamWaitEvent`` does, and a device synchronization orders everything after it behind
-everything before it.  The runtime runs on the fake through its ``ops`` seam; the real
+everything before it.  The runtime runs on the fake through its ``ops`` seam.  Attached, the real
 ``DWDPWeightManager``, with its ``PrefetchSchedule``, runs on it through patched ``torch.cuda``
-calls and shares the copy stream.  A driver calls them the way the executor loop
-(``DwdpManager.start_forward`` on the default stream), ``KimiLinearModel`` (H0-H3, on the
-execution stream) and ``ConfigurableMoE`` (``wait_and_bind``, ``finish_layer``) do, and logs the
-model's weight reads.  The tests check where the runtime records its events, the copy order on the
-shared copy stream, that the host synchronizes only to recover a forward abandoned inside a MoE
-layer and, with vector clocks over the log, that no copy into a dense or expert slot can overlap a
-read of that slot: a missing consume wait, fence, WAR barrier or synchronization fails them.
+calls and shares the copy stream, and the real ``DenseDwdpManager`` holds both.  A driver calls
+them the way the executor loop (``DwdpManager.start_forward``, or standalone
+``DenseDwdpManager.prefetch_first_layers``, on the default stream), ``KimiLinearModel`` (H0-H3, on
+the execution stream) and ``ConfigurableMoE`` (``wait_and_bind``, ``finish_layer``) do, and logs
+the model's weight reads.  The tests check where the runtime records its events, the copy order on
+the copy stream, that the host synchronizes only to recover a forward abandoned inside a MoE layer
+and, with vector clocks over the log, that no copy into a dense or expert slot can overlap a read
+of that slot: a missing consume wait, fence, WAR barrier or synchronization fails them.
 """
 
 from __future__ import annotations
@@ -42,17 +43,20 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.modules.dwdp.dense.manager import DenseDwdpManager
 from tensorrt_llm._torch.modules.dwdp.dense.runtime import DenseDWDP
 from tensorrt_llm._torch.modules.dwdp.dense.types import (
     EMPTY_TAG,
     RING_DEPTH,
     ROW_ALIGN,
+    DenseMode,
     SegmentKind,
     SlotSpec,
     allocate_slot_ring,
 )
 from tensorrt_llm._torch.modules.dwdp.weight_manager import DWDPWeightManager
 from tensorrt_llm._torch.pyexecutor.dwdp import DwdpManager
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -214,7 +218,7 @@ def happens_before(
 
 
 # ---------------------------------------------------------------------------
-# Driver: the executor loop, the model, ConfigurableMoE and DwdpManager around the runtime
+# Driver: the executor loop, the model, ConfigurableMoE and the managers around the runtime
 # ---------------------------------------------------------------------------
 
 
@@ -227,15 +231,17 @@ class LaunchError(Exception):
 
 
 class Driver:
-    """Calls the runtime and the weight manager in program order; logs reads and copy launches.
+    """Calls the managers and the runtime in program order; logs reads and copy launches.
 
     Every call is wrapped in a span keyed ``(forward, hook, layer)``; a ``mark`` entry opens it, so
     each log entry can be attributed to the call that made it.
 
     Args:
         segments: Enabled dense segments.
-        layers: Covered layers, which are also the expert DWDP MoE layers.
+        layers: Covered layers, which are also the expert DWDP MoE layers when attached.
         num_slots: Expert prefetch slots (``DwdpConfig.num_prefetch_slots``).
+        standalone: Dense DWDP without expert DWDP: no expert copies or reads, and the runtime
+            does not prefetch the next forward.
     """
 
     def __init__(
@@ -244,12 +250,14 @@ class Driver:
         *,
         layers: tuple[int, ...] = K3_LAYERS,
         num_slots: int = 2,
+        standalone: bool = False,
     ) -> None:
         self.ops = FakeOps()
         self.log = self.ops.log
         self.segments = segments
         self.layers = tuple(layers)
         self.num_slots = num_slots
+        self.standalone = standalone
         self.positions = {layer: position for position, layer in enumerate(self.layers)}
         self.forward_index = 0
         self.spans: dict[tuple[int, str, int | None], tuple[int, int]] = {}
@@ -258,24 +266,41 @@ class Driver:
         spec = {kind: SlotSpec(kind, RING_DEPTH[kind], ROW_ALIGN, 2) for kind in segments}
         slots = {kind: allocate_slot_ring(spec[kind], "cpu") for kind in segments}
         self.mark("construct", None)
-        self.runtime = DenseDWDP(self.layers, segments, slots, self.ops.copy, ops=self.ops)
+        self.runtime = DenseDWDP(
+            self.layers,
+            segments,
+            slots,
+            self.ops.copy,
+            prefetch_next_pass=not standalone,
+            ops=self.ops,
+        )
         self.runtime.set_launcher(self.launch_dense)
         self.span("commit", None, lambda: self.runtime.commit(None))
-        with self.cuda():
-            self.weight_manager = DWDPWeightManager(
-                weight_buffer=_SlotMap(self.layers, num_slots),
-                peer_views={},
-                peer_ranges=[(0, 1), (1, 2)],
-                moe_layer_indices=list(self.layers),
-                weight_names=["w"],
-                dwdp_rank=0,
-                dwdp_size=2,
-            )
-        # Nothing to release: no weight buffer, transport or device behind the fake.
-        self.weight_manager._released = True
-        self.manager = object.__new__(DwdpManager)
-        self.manager._weight_manager = self.weight_manager
-        self.manager._dense = self.runtime
+        if standalone:
+            mapping = Mapping(world_size=2, rank=0, tp_size=2, enable_attention_dp=True)
+            self.dense_manager = DenseDwdpManager(DenseMode.STANDALONE, mapping=mapping)
+            # What DenseDwdpManager.setup stores once setup_dense_dwdp commits.
+            self.dense_manager._dense = self.runtime
+            self.weight_manager = self.manager = None
+        else:
+            with self.cuda():
+                self.weight_manager = DWDPWeightManager(
+                    weight_buffer=_SlotMap(self.layers, num_slots),
+                    peer_views={},
+                    peer_ranges=[(0, 1), (1, 2)],
+                    moe_layer_indices=list(self.layers),
+                    weight_names=["w"],
+                    dwdp_rank=0,
+                    dwdp_size=2,
+                )
+            # Nothing to release: no weight buffer, transport or device behind the fake.
+            self.weight_manager._released = True
+            self.dense_manager = DenseDwdpManager(DenseMode.ATTACHED)
+            self.dense_manager.attach(self.runtime, expert=self.weight_manager)
+            # DwdpManager after setup(): the weight manager and the attached dense manager.
+            self.manager = object.__new__(DwdpManager)
+            self.manager._weight_manager = self.weight_manager
+            self.manager._dense_manager = self.dense_manager
         self.backend = nn.Module()
         self.backend.w = nn.Parameter(torch.empty(0), requires_grad=False)
         self.step_start = FakeEvent(self.ops, "executor")
@@ -342,13 +367,17 @@ class Driver:
     # -- executor loop, model and ConfigurableMoE ---------------------------------
 
     def start(self) -> None:
-        """The executor loop before a forward: ``DwdpManager.start_forward``, default stream."""
+        """The executor loop before a forward (``PyExecutor._prime_dwdp``), default stream."""
+        if self.standalone:
+            start = self.dense_manager.prefetch_first_layers
+        else:
+            start = self.manager.start_forward
         with self.cuda(), self.ops.stream(self.ops.default):
-            self.span("start", None, self.manager.start_forward)
+            self.span("start", None, start)
 
     def h0(self) -> None:
-        """The model's forward entry: ``DwdpManager.ensure_primed``."""
-        self.manager.ensure_primed()
+        """The model's forward entry: ``DenseDwdpManager.ensure_primed``."""
+        self.dense_manager.ensure_primed()
 
     def invalidate(self) -> None:
         """The executor after a control action: ``DwdpManager.invalidate_prefetch``."""
@@ -374,11 +403,13 @@ class Driver:
             self.span("H2", layer, lambda: runtime.attention_done(layer))
             if MOE in self.segments:
                 self.read(MOE.value, layer)  # the router and the latent down-projection
-            self.span("bind", layer, lambda: self.manager.wait_and_bind(self.backend, layer))
-            self.read(EXPERT, layer)
+            if not self.standalone:
+                self.span("bind", layer, lambda: self.manager.wait_and_bind(self.backend, layer))
+                self.read(EXPERT, layer)
             if stop == "finish":
                 raise Abort
-            self.span("finish", layer, lambda: self.manager.finish_layer(layer))
+            if not self.standalone:
+                self.span("finish", layer, lambda: self.manager.finish_layer(layer))
             if MOE in self.segments:
                 self.read(MOE.value, layer)  # the latent up-projection and the shared expert
             if stop == "H3":
@@ -822,6 +853,58 @@ def test_invalidate_prefetch_keeps_the_dense_copies() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Standalone: no expert DWDP, the dense manager primes every forward
+# ---------------------------------------------------------------------------
+
+
+@SEGMENT_SETS
+def test_standalone_keeps_the_per_pass_schedule(segments: tuple[SegmentKind, ...]) -> None:
+    """The executor's start primes ``L(1), L(2)``; H2 enqueues ``L(l + 2)``; nothing more."""
+    driver = Driver(segments, standalone=True)
+    runtime = driver.runtime
+    assert not runtime.prefetch_next_pass
+    for forward in range(2):
+        assert driver.forward()
+        assert driver.launches_in((forward, "start", None)) == [("L", 1), ("L", 2)]
+        assert driver.launches_in((forward, "H0", None)) == []
+        for layer in driver.layers:
+            expected = [("L", layer + 2)] if layer + 2 <= 92 else []
+            assert driver.launches_in((forward, "H2", layer)) == expected, (forward, layer)
+            if MOE in segments:
+                assert driver.launches_in((forward, "H3", layer)) == [], (forward, layer)
+        assert not runtime.primed and not runtime.forward_open
+    assert driver.launches(what=EXPERT) == []
+    copies = Counter(layer for _what, layer in driver.launches())
+    assert copies == Counter({layer: 2 for layer in driver.layers})
+    _check_steady(driver)
+
+
+@SEGMENT_SETS
+@pytest.mark.parametrize("recovery", ["executor", "model"])
+@pytest.mark.parametrize("position", [0, 1, 46, 91])
+@pytest.mark.parametrize("stop", ["H1", "H2", "H3"])
+def test_a_standalone_forward_recovers_after_an_abort(
+    segments: tuple[SegmentKind, ...], recovery: str, position: int, stop: str
+) -> None:
+    """H0 runs the WAR barrier and primes again; the executor's start leaves an open forward."""
+    driver = Driver(segments, standalone=True)
+    runtime = driver.runtime
+    assert driver.forward()
+    assert not driver.forward(stop_at=(stop, driver.layers[position]))
+    was_open = runtime.forward_open
+    assert driver.forward(start=recovery == "executor")
+    start, end = driver.spans[(2, "H0", None)]
+    if was_open:
+        assert driver.launches(start, end) == [("L", 1), ("L", 2)]
+        assert len(driver.records(start, end, "dense", driver.ops.compute)) == sum(
+            RING_DEPTH[kind] for kind in segments
+        )
+    assert not runtime.primed and not runtime.forward_open
+    assert driver.forward()
+    _check_steady(driver)
+
+
+# ---------------------------------------------------------------------------
 # Random sequences
 # ---------------------------------------------------------------------------
 
@@ -831,8 +914,12 @@ def _random_sequence(seed: int) -> str | None:
     rng = random.Random(seed)
     num_layers = rng.choice([1, 2, 3, 5, 8])
     segments = rng.choice([BOTH, (ATTN,)])
+    standalone = rng.random() < 0.25
     driver = Driver(
-        segments, layers=tuple(range(1, num_layers + 1)), num_slots=rng.choice([2, 3, 4])
+        segments,
+        layers=tuple(range(1, num_layers + 1)),
+        num_slots=rng.choice([2, 3, 4]),
+        standalone=standalone,
     )
     runtime = driver.runtime
     steps = []
@@ -849,8 +936,9 @@ def _random_sequence(seed: int) -> str | None:
             steps.append("start, then the forward fails before the model")
             driver.start()
         elif roll < 0.55:
-            steps.append("invalidate")
-            driver.invalidate()
+            if not standalone:
+                steps.append("invalidate")
+                driver.invalidate()
         elif roll < 0.62:
             steps.append(f"a launch of H0 fails, start={start}")
             driver.forward(start=start, fail_h0=True)
@@ -859,8 +947,8 @@ def _random_sequence(seed: int) -> str | None:
             demand_fetches = runtime.demand_fetches
             if not driver.forward(start=start):
                 return f"{steps}: the forward stopped"
-            if runtime.demand_fetches != demand_fetches or not runtime.primed:
-                return f"{steps}: demand fetch, or not primed after a complete forward"
+            if runtime.demand_fetches != demand_fetches or runtime.primed == standalone:
+                return f"{steps}: demand fetch, or primed state wrong after a complete forward"
     if runtime.war_fences:
         return f"{steps}: {runtime.war_fences} fences"
     try:
@@ -872,6 +960,7 @@ def _random_sequence(seed: int) -> str | None:
 
 def test_random_sequences_are_race_free() -> None:
     """Aborts at every point (also inside a fill or H0's priming), starts whose forward fails
-    before the model and invalidations, in random order: no race, fence or window error."""
+    before the model and invalidations, in random order, attached and standalone: no race, fence
+    or window error."""
     problems = {seed: problem for seed in range(200) if (problem := _random_sequence(seed))}
     assert problems == {}

@@ -14,7 +14,7 @@
 # limitations under the License.
 """CPU tests of the dense DWDP setup.
 
-Every rank of an ``N``-rank DWDP group is a thread that runs ``setup_dense_dwdp`` on its own copy
+Every rank of an ``N``-rank dense group is a thread that runs ``setup_dense_dwdp`` on its own copy
 of the toy Kimi-K3 decoder of ``test_dense_layout.py``.  The threads gather over
 ``StoreDwdpGroup`` on one in-process ``HashStore`` with every wait bounded, so a rank that skips or
 adds a collective fails the test instead of hanging it.  Each rank keeps its rows in the real
@@ -303,14 +303,17 @@ class RankSpec:
     ``fail`` names a store step that raises, or ``"commit"`` for the P6 memory reading after the
     originals are dropped; ``corrupt`` (4 or 5) flips a slot byte in that phase (see
     ``FakeLauncher``); ``perturb`` adds 1 to the first element of a decoder parameter.
+    ``attached`` passes the expert DWDP MoE layers (``moe_layers``); False sets up standalone.
     """
 
+    requested: bool = True
     strict: bool = False
     kinds: tuple[str, ...] = LAYER_KINDS
     free_bytes: int = PLENTY_FREE_BYTES
     fail: str | None = None
     corrupt: int | None = None
     perturb: str | None = None
+    attached: bool = True
 
 
 class Rank:
@@ -375,7 +378,9 @@ class Rank:
             store=store,
         )
         self.comm = CountingComm(group)
-        config = DenseConfig(enabled=True, min_bytes=TOY_MIN_BYTES, strict=self.spec.strict)
+        config = DenseConfig(
+            enabled=self.spec.requested, min_bytes=TOY_MIN_BYTES, strict=self.spec.strict
+        )
         try:
             self.result = setup_dense_dwdp(
                 self.model,
@@ -384,7 +389,7 @@ class Rank:
                 dwdp_rank=self.index,
                 dwdp_size=size,
                 device_id=0,
-                moe_layers=list(COVERED),
+                moe_layers=list(COVERED) if self.spec.attached else None,
                 config=config,
                 store_factory=self.store_factory,
                 ops=self.ops,
@@ -517,6 +522,20 @@ def make_group(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[list[RankS
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("attached", [True, False], ids=["attached", "standalone"])
+def test_only_attached_dense_dwdp_prefetches_the_next_forward(
+    make_group: Callable, attached: bool
+) -> None:
+    """With expert DWDP (``moe_layers``) the runtime gathers the next forward's first layers at
+    the end of a forward, beside the expert prefetch; standalone the dense manager primes them."""
+    group = make_group([RankSpec(attached=attached)] * 2).run()
+    group.assert_collectives(6)
+    for rank in group.ranks:
+        assert isinstance(rank.result, DenseDWDP), rank.trace
+        assert rank.result.layers == COVERED
+        assert rank.result.prefetch_next_pass is attached
+
+
 def _moved_paths() -> set[str]:
     """The module tensors setup repoints, by ``layers.<l>.<path>``."""
     return {
@@ -605,6 +624,10 @@ DISAGREEMENTS = {
     "weights": (
         {"perturb": "layers.4.block_sparse_moe.gate.weight"},
         r"#1 .*the dense weights differ across ranks: layers\.4 moe: ranks \[0, 1, 3\] vs rank 2$",
+    ),
+    "enable_dense": (
+        {"requested": False},
+        r"dense DWDP is enabled on ranks \[0, 1, 3\] and off on rank 2 of the DWDP group",
     ),
 }
 

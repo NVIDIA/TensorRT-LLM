@@ -19,10 +19,10 @@ Per covered layer ``l`` (``s_A`` and ``s_D`` are its slots in the attention and 
 =====  ==========================================  ==========================================
 Hook   Call site                                   Action
 =====  ==========================================  ==========================================
-H0     ``KimiLinearModel.forward`` entry           ``DwdpManager.ensure_primed()``: barrier
-                                                   after an abort, then ``L(1), L(2)`` unless
-                                                   already primed, then the expert
-                                                   ``start_forward``
+H0     ``KimiLinearModel.forward`` entry           ``DenseDwdpManager.ensure_primed()``:
+                                                   barrier after an abort, then ``L(1),
+                                                   L(2)`` unless already primed (with expert
+                                                   DWDP then the expert ``start_forward``)
 H1     decoder layer entry                         compute waits ``ready_A[s_A]`` and
                                                    ``ready_D[s_D]``
 H2     after the attention call                    record ``consume_A[s_A]``, then fill
@@ -32,20 +32,25 @@ H3     after the MoE block                         record ``consume_D[s_D]``, th
 All reads of ``A(l)`` happen between H1 and H2; all reads of ``D(l)`` between H1 and H3.  The fill
 at H2 and H3 enqueues, in layer order, each next layer whose target slots are free: empty, or
 holding a layer whose read window has closed.  Within a forward that is ``L(l + 2)`` at H2 of
-``l``.  The fill goes on into the first two layers of the next forward as the last layers free
-their slots, so a completed forward leaves the next one primed.  For Kimi-K3 (92 layers) the
-MoE-dense slots of layers 1 and 2 are those of layers 91 and 92, read until H3, so H3 of layers 91
-and 92 enqueue them (H2 does with the attention segment alone).  The fill never targets a slot
-that is unread or being read, so it never needs the fence.
+``l``.  The fill never targets a slot that is unread or being read, so it never needs the fence.
 
-Copies run on the expert DWDP copy stream, one FIFO.  Within a forward, with two expert prefetch
-slots, ``L(l)`` is enqueued right before ``E(l)`` (``... E(l+1), L(l+2), E(l+2), L(l+3) ...``):
-H2 of ``l - 2`` runs before the MoE of ``l - 2`` finishes and issues ``E(l)``.  The next forward's
-first two layers follow their expert copies when their MoE-dense slots free only at H3
-(``E(1), L(1), E(2), L(2)`` for Kimi-K3); the next forward reads them only after the gap between
-executor steps.  With more expert prefetch slots each expert copy is issued earlier, ahead of its
-layer's dense copy.  Between commit and release the runtime never synchronizes the host; every
-dependency is a stream wait on an event.
+With expert DWDP (``prefetch_next_pass``) the fill goes on into the first two layers of the next
+forward as the last layers free their slots, so a completed forward leaves the next one primed, as
+the expert prefetch does.  For Kimi-K3 (92 layers) the MoE-dense slots of layers 1 and 2 are those
+of layers 91 and 92, read until H3, so H3 of layers 91 and 92 enqueue them (H2 does with the
+attention segment alone).  The copies run on the expert DWDP copy stream, one FIFO.  Within a
+forward, with two expert prefetch slots, ``L(l)`` is enqueued right before ``E(l)`` (``... E(l+1),
+L(l+2), E(l+2), L(l+3) ...``): H2 of ``l - 2`` runs before the MoE of ``l - 2`` finishes and issues
+``E(l)``.  The next forward's first two layers follow their expert copies when their MoE-dense
+slots free only at H3 (``E(1), L(1), E(2), L(2)`` for Kimi-K3); the next forward reads them only
+after the gap between executor steps.  With more expert prefetch slots each expert copy is issued
+earlier, ahead of its layer's dense copy.
+
+Standalone, the copies run on the dense manager's own stream, ``... L(l+2), L(l+3) ...``, and the
+fill stops at the last layer: the next forward starts from the dense manager's priming.
+
+Between commit and release the runtime never synchronizes the host; every dependency is a stream
+wait on an event.
 """
 
 from __future__ import annotations
@@ -96,7 +101,10 @@ class _Phase(enum.Enum):
 
 
 class DenseDWDP:
-    """Slot rings, events and per-layer hooks of dense DWDP; owned by ``DwdpManager``.
+    """Slot rings, events and per-layer hooks of dense DWDP; owned by the dense manager.
+
+    The dense manager (``manager.DenseDwdpManager``) holds the committed runtime in both modes:
+    with expert DWDP ``DwdpManager`` attaches it, standalone the manager sets it up itself.
 
     State, per enabled segment and ring slot ``s``: ``ready[seg][s]`` (recorded on the copy stream
     after a gather, waited by compute: RAW), ``consume[seg][s]`` (recorded on the compute stream at
@@ -124,14 +132,14 @@ class DenseDWDP:
       window is not open.
     * I4 (fill): H2 and H3 enqueue layers in order, each only into slots that are empty or whose
       holder's read window has closed, so the fill never takes the fence: ``L(n)`` is enqueued at
-      H2 of the layer two positions before ``n``, and the first two layers of the next forward
-      once their slots free up at the end of this one.
+      H2 of the layer two positions before ``n`` and, with ``prefetch_next_pass``, the first two
+      layers of the next forward once their slots free up at the end of this one.
 
     Layers are addressed by position ``p`` among the covered layers: the slot is
     ``ring_slot(seg, p)`` in every forward, and the fill reaches ``layers[p + 2]`` at H2 of
     position ``p``.  For Kimi-K3 (layers 1..92) that is ``(l - 1) % 2``, ``(l - 1) % 3`` and
-    ``l + 2``; H3 of layers 91 and 92 enqueue layers 1 and 2 of the next forward (H2 of them with
-    the attention segment alone).
+    ``l + 2``; with ``prefetch_next_pass``, H3 of layers 91 and 92 enqueue layers 1 and 2 of the
+    next forward (H2 of them with the attention segment alone).
 
     Lifecycle: constructed in setup P2 (records every consume event once on the current stream),
     :meth:`set_launcher` in P3, :meth:`fetch_blocking` in P4 and P5, :meth:`commit` in P6.  The
@@ -144,11 +152,18 @@ class DenseDWDP:
     (:meth:`require_eager`) before they record or enqueue anything.
 
     Args:
-        layers: Covered layers, ascending; the same list as the expert DWDP MoE layers.
+        layers: Covered layers, ascending; with expert DWDP the same list as the expert DWDP MoE
+            layers.
         segments: Enabled segment kinds in canonical order (``ATTN`` first).
         slots: Ring per enabled segment, ``len(slots[seg]) == RING_DEPTH[seg]``; owned by the
             runtime once the constructor returns (if it raises, the caller keeps them).
-        copy_stream: The expert DWDP copy stream (``DWDPWeightManager.copy_stream``).
+        copy_stream: The copy stream: the expert DWDP copy stream with expert DWDP
+            (``DWDPWeightManager.copy_stream``), the dense manager's own stream standalone
+            (``manager.StandaloneTransfer.copy_stream``).
+        prefetch_next_pass: Whether the fill goes on into the first two layers of the next
+            forward, which then starts primed: with expert DWDP, whose prefetch does the same, so
+            those copies are not queued behind its next-pass copies.  Standalone, the dense
+            manager primes every forward.
         ops: CUDA seam; ``TorchCudaOps()`` if None.
         strict: Strict mode (``DenseConfig.strict``): demand fetches and fence fallbacks raise.
         store: Row store the launcher reads from; owned and released by the runtime once the
@@ -167,6 +182,7 @@ class DenseDWDP:
         slots: Mapping[SegmentKind, Sequence[SlotBuffer]],
         copy_stream: StreamLike,
         *,
+        prefetch_next_pass: bool,
         ops: DeviceOps | None = None,
         strict: bool = False,
         store: DenseShardStore | None = None,
@@ -175,7 +191,7 @@ class DenseDWDP:
         kinds = _segment_kinds(segments)
         rings = _slot_rings(kinds, slots)
         if copy_stream is None:
-            raise ValueError("dense DWDP needs the expert DWDP copy stream")
+            raise ValueError("dense DWDP needs a copy stream")
 
         self._ops: DeviceOps = TorchCudaOps() if ops is None else ops
         self._layers = covered
@@ -187,6 +203,7 @@ class DenseDWDP:
             for position in range(len(covered))
         )
         self._copy_stream = copy_stream
+        self._prefetch_next_pass = bool(prefetch_next_pass)
         self._strict = bool(strict)
         self._slots: dict[SegmentKind, tuple[SlotBuffer, ...]] = rings
         self._ready: dict[SegmentKind, tuple[EventLike, ...]] = {
@@ -208,7 +225,8 @@ class DenseDWDP:
         self._primed = False
         self._forward_open = False
         # Position of the next layer the fill enqueues, counted from the current forward's first
-        # covered layer; positions from len(layers) on are the next forward's first layers.
+        # covered layer; positions from len(layers) on are the next forward's first layers
+        # (prefetch_next_pass only).
         self._next_fill = 0
         # Forwards that ended before the fill reached the next forward's first layers.
         self._unprimed_passes = 0
@@ -222,7 +240,8 @@ class DenseDWDP:
         self._phase = _Phase.SETUP
         logger.debug(
             f"{LOG_PREFIX} runtime: {len(covered)} layers {covered[0]}..{covered[-1]}, "
-            f"segments {','.join(kind.value for kind in kinds)}, strict={int(self._strict)}"
+            f"segments {','.join(kind.value for kind in kinds)}, strict={int(self._strict)}, "
+            f"next-pass prefetch {'on' if self._prefetch_next_pass else 'off'}"
         )
 
     # ------------------------------------------------------------------
@@ -245,11 +264,16 @@ class DenseDWDP:
         return MappingProxyType(self._slots)
 
     @property
+    def prefetch_next_pass(self) -> bool:
+        """Whether the fill goes on into the first two layers of the next forward."""
+        return self._prefetch_next_pass
+
+    @property
     def primed(self) -> bool:
         """Whether ``L(first)`` and ``L(second)`` are enqueued for a forward that has not started.
 
-        Set by :meth:`mark_primed`, and by H3 of the last covered layer once the fill has enqueued
-        them; H1 of the first covered layer clears it.
+        Set by :meth:`mark_primed` and, with ``prefetch_next_pass``, by H3 of the last covered
+        layer once the fill has enqueued them; H1 of the first covered layer clears it.
         """
         return self._primed
 
@@ -384,7 +408,7 @@ class DenseDWDP:
         events they record in every forward.  Inside a CUDA graph capture those records and
         copies would go into the graph instead of running, and the host state would describe
         work that never ran; with multi-stream execution, reads would run on streams that no
-        event covers.  H0 (``DwdpManager.ensure_primed``) calls this before it records or
+        event covers.  H0 (``DenseDwdpManager.ensure_primed``) calls this before it records or
         enqueues anything, and H1 (:meth:`wait_layer`) before it waits: a refused hook records,
         enqueues and changes nothing, so the next eager forward finds the state the refused hook
         found.  Valid in every phase.
@@ -470,11 +494,11 @@ class DenseDWDP:
 
         With the MoE-dense segment enabled, closes the read window that H1 opened for
         ``D(layer)``: records ``consume[MOE][s]`` on the current stream and marks the slot
-        consumed.  Then the fill runs as at H2; near the end of a forward it enqueues the first
-        two layers of the next forward as their slots free up.  For the last layer it sets
-        ``forward_open`` False and ``primed`` True once both of them are enqueued (if not,
-        ``strict`` raises; otherwise a warning is logged and the next forward's priming enqueues
-        them).
+        consumed.  Then the fill runs as at H2; with ``prefetch_next_pass``, near the end of a
+        forward it enqueues the first two layers of the next forward as their slots free up.  For
+        the last layer it sets ``forward_open`` False and, with ``prefetch_next_pass``, ``primed``
+        True once both of them are enqueued (if not, ``strict`` raises; otherwise a warning is
+        logged and the next forward's priming enqueues them).
 
         Raises:
             DenseProtocolError: The MoE-dense slot is not tagged ``layer``, or its read window is
@@ -491,16 +515,17 @@ class DenseDWDP:
         if position == len(self._layers) - 1:
             self._forward_open = False
             self._next_fill = max(0, self._next_fill - len(self._layers))
-            self._finish_forward()
+            if self._prefetch_next_pass:
+                self._finish_forward()
 
     # ------------------------------------------------------------------
-    # Priming and recovery (driven by DwdpManager)
+    # Priming and recovery (driven by the dense manager)
     # ------------------------------------------------------------------
 
     def prefetch(self, layer: int) -> None:
         """Enqueue ``L(layer)`` (every enabled segment, one launch) on the copy stream.
 
-        Used by ``DwdpManager`` priming (``L(first), L(second)``, then :meth:`mark_primed`).
+        Used by the dense manager's priming (``L(first), L(second)``, then :meth:`mark_primed`).
         Same as ``_prefetch(layer, fence=False)``: a target slot whose holder's read window is
         open gets the fence, recorded on the current stream.  The model runs H1-H3 of every
         covered layer in order, so no window is open while ``forward_open`` is False: every
@@ -516,7 +541,7 @@ class DenseDWDP:
         self._prefetch(layer, fence=False)
 
     def mark_primed(self) -> None:
-        """Record that ``DwdpManager`` enqueued the first two layers; the fill goes on after them.
+        """Record that the dense manager enqueued the first two layers; the fill goes on after them.
 
         Raises:
             DenseProtocolError: Before :meth:`commit`; a forward is open (run
@@ -544,9 +569,9 @@ class DenseDWDP:
         model's H0), so later copies wait for every read the dead forward enqueued; then every tag
         ``EMPTY_TAG``, no read window open, every ``consumed`` True, ``primed`` and
         ``forward_open`` False, the fill at the first layer.  Copies the dead forward left on the
-        copy stream still run first (FIFO), and the next ready records follow them.  The expert
-        prefetch recovers on its own: ``DWDPWeightManager.start_forward`` restarts its sequence,
-        after a device synchronization if the dead forward left a MoE layer bound.
+        copy stream still run first (FIFO), and the next ready records follow them.  With expert
+        DWDP the expert prefetch recovers on its own: ``DWDPWeightManager.start_forward`` restarts
+        its sequence, after a device synchronization if the dead forward left a MoE layer bound.
 
         Raises:
             DenseProtocolError: Before :meth:`commit`.
@@ -614,8 +639,8 @@ class DenseDWDP:
         Order: ``ops.synchronize()`` -> detach the bindings (zero-size tensors) -> drop the
         launcher and its plans -> drop the slots -> ``store.release()`` (peer mappings and
         imports, then the local store).  Every step runs even if an earlier one fails; the first
-        error is raised at the end and later ones are logged.  ``DwdpManager.cleanup`` calls it
-        before the expert teardown.
+        error is raised at the end and later ones are logged.  The dense manager's ``cleanup``
+        calls it; with expert DWDP, ``DwdpManager.cleanup`` runs that before the expert teardown.
         """
         if self._phase is _Phase.RELEASED:
             return
@@ -743,12 +768,13 @@ class DenseDWDP:
     def _fill(self) -> None:
         """Enqueue, in layer order, each next layer whose target slots are all free.
 
-        Positions count from the current forward's first covered layer; the fill goes on into
-        the first two positions of the next forward, which take the slots of positions ``0`` and
-        ``1``.  It stops at the first position with a slot that is unread or being read.
+        Positions count from the current forward's first covered layer; with
+        ``prefetch_next_pass`` the fill goes on into the first two positions of the next forward,
+        which take the slots of positions ``0`` and ``1``.  It stops at the first position with a
+        slot that is unread or being read.
         """
         num_layers = len(self._layers)
-        limit = num_layers + min(2, num_layers)
+        limit = num_layers + min(2, num_layers) if self._prefetch_next_pass else num_layers
         while self._next_fill < limit:
             position = self._next_fill % num_layers
             if not all(self._slot_free(kind, slot) for kind, slot in self._targets[position]):
