@@ -127,6 +127,29 @@ def _run(pipe, latents, zero_noise=False):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "resolutions,num_frames,expected_shapes",
+    [
+        (None, None, [(704, 1280, 33), (704, 1280, 121)]),
+        ([(352, 640)], [17], [(352, 640, 17)]),
+    ],
+)
+def test_warmup_plan_uses_fixed_dmd_schedule(resolutions, num_frames, expected_shapes):
+    pipe = object.__new__(WanDMDPipeline)
+    pipe.is_wan22_5b = True
+    pipe.is_wan22_14b = False
+    pipe.vae_scale_factor_spatial = 16
+    pipe.transformer = mock.Mock(config=mock.Mock(patch_size=_PATCH_SIZE))
+    pipe.pipeline_config = mock.Mock(
+        compilation=mock.Mock(resolutions=resolutions, num_frames=num_frames)
+    )
+
+    shapes, steps = pipe.resolve_warmup_plan()
+
+    assert shapes == expected_shapes
+    assert steps == len(WanDMDPipeline.DMD_TIMESTEPS) == 3
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestDMDTimesteps:
     """sigma = t / 1000 for every step; tensor shape and call count correct."""
