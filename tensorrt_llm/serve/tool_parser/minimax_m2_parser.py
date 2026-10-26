@@ -185,6 +185,8 @@ class MiniMaxM2ToolParser(BaseToolParser):
             tc_start = current_text.find(self.bot_token)
             # Preserve any text before the tool call opening tag.
             prefix_text = current_text[:tc_start].strip() if tc_start > 0 else ""
+            # Drop the returned prefix so later increments do not re-emit it.
+            self._buffer = current_text[tc_start:]
             inner_text = current_text[tc_start + len(self.bot_token) :]
 
             # Find all complete invoke blocks

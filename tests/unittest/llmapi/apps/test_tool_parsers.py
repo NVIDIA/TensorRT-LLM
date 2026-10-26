@@ -3610,6 +3610,26 @@ class TestMiniMaxM2ToolParser:
         names = [c.name for c in result.calls if c.name]
         assert "get_weather" in names
 
+    def test_streaming_prefix_in_same_chunk_not_repeated(self, sample_tools):
+        """Test text sent with the tool token is streamed only once."""
+        parser = MiniMaxM2ToolParser()
+        chunks = [
+            "I'll check the weather in Paris for you.<minimax:tool_call>",
+            '<invoke name="get_weather">',
+            '<parameter name="location">Paris</parameter>',
+            '</invoke>',
+            '</minimax:tool_call>',
+        ]
+        normal_text = ""
+        names = []
+        for chunk in chunks:
+            result = parser.parse_streaming_increment(chunk, sample_tools)
+            normal_text += result.normal_text
+            names += [c.name for c in result.calls if c.name]
+
+        assert normal_text == "I'll check the weather in Paris for you."
+        assert names == ["get_weather"]
+
 
 # ============================================================================
 # Reasoning Parser Tests for Interleaved Thinking
