@@ -286,18 +286,36 @@ inputs to waveforms and refuses to start with it.
 ```python
 from transformers import WhisperFeatureExtractor
 
-from tensorrt_llm.llmapi import MultimodalConfig
+from tensorrt_llm.llmapi import LLM, KvCacheConfig, MultimodalConfig, SamplingParams, SchedulerConfig
 
-# ... the LLM settings from above, plus:
-#     multimodal_config=MultimodalConfig(audio_input_form="spectrogram"),
+
 extractor = WhisperFeatureExtractor.from_pretrained(model)
 mel = extractor(
     wave, sampling_rate=sample_rate, truncation=False, return_tensors="np"
 )["input_features"]
-result = llm.generate(
-    {"prompt": "", "multi_modal_data": {"audio": {"input_features": mel}}},
-    sampling_params=SamplingParams(max_tokens=96, temperature=0.0),
-)
+
+with LLM(
+    model=model,
+    backend="pytorch",
+    attn_backend="TRTLLM",
+    max_batch_size=4,
+    max_input_len=1500,
+    max_num_tokens=3000,
+    enable_chunked_prefill=False,
+    kv_cache_config=KvCacheConfig(
+        enable_block_reuse=False,
+        free_gpu_memory_fraction=0.8,
+        cross_kv_cache_fraction=0.5,
+    ),
+    scheduler_config=SchedulerConfig(use_python_scheduler=True),
+    multimodal_config=MultimodalConfig(audio_input_form="spectrogram"),
+) as llm:
+    result = llm.generate(
+        {"prompt": "", "multi_modal_data": {"audio": {"input_features": mel}}},
+        sampling_params=SamplingParams(max_tokens=96, temperature=0.0),
+        use_tqdm=False,
+    )
+    print(result.outputs[0].text)
 ```
 
 ### Select the language and task
