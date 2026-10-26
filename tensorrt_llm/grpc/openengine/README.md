@@ -51,6 +51,10 @@ unknown-version metadata uses the ordinary preparation path. The handoff contain
 bounded CPU metadata, not cross-process tensor handles; encoder disaggregation
 is a separate feature.
 
+Both workers must use matching model/tokenizer revisions and processor settings.
+Input, model, and processor-setting fingerprints detect mismatches; they do not
+authenticate caller-provided metadata or verify model weights.
+
 ### Disaggregated serving
 
 A context worker returns its handoff as a `PrefillReady` event carrying a

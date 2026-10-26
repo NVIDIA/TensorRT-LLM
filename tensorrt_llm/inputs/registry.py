@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import (Any, Callable, ClassVar, Dict, Iterator, List, Mapping,
-                    Protocol, Tuple, Type, TypeVar, Union)
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch

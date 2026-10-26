@@ -87,6 +87,7 @@ def _fixture():
     processor._config = SimpleNamespace(
         model_type="qwen2_vl", to_dict=lambda: {"model_type": "qwen2_vl"}
     )
+    processor._processor = None
     llm = SimpleNamespace(input_processor=processor, args=SimpleNamespace(max_seq_len=128))
     request = generation_pb2.GenerateRequest(
         request_id="prefill",
@@ -159,6 +160,51 @@ def test_prepared_decode_preserves_multimodal_cache_identity_and_item_layout():
         assert restored.multimodal_params.multimodal_input == identity
     finally:
         restored.multimodal_params.release_handles()
+
+
+@pytest.mark.parametrize("field", ["hash_width", "hash_type", "run_bounds", "position_bounds"])
+def test_prepared_decode_rejects_invalid_multimodal_layout(field):
+    llm, request, capture, _ = _fixture()
+    payload = json.loads(_decode_preparation(request, llm, capture))
+    identity = {
+        "multimodal_hashes": [[1] * 8],
+        "multimodal_positions": [1],
+        "multimodal_lengths": [2],
+    }
+    if field == "hash_width":
+        identity["multimodal_hashes"] = [[1] * 7]
+    elif field == "hash_type":
+        identity["multimodal_hashes"] = [["invalid"] * 8]
+    elif field == "position_bounds":
+        identity["multimodal_positions"] = [len(capture["prompt_token_ids"])]
+    else:
+        identity.update(
+            multimodal_item_run_cu_offsets=[0, 1],
+            multimodal_run_positions=[len(capture["prompt_token_ids"])],
+            multimodal_run_lengths=[2],
+        )
+    payload["multimodal_input"] = identity
+    _handoff(request, payload)
+    with pytest.raises(ValueError):
+        _prepared_decode_from_request(request, llm)
+
+
+@pytest.mark.parametrize("field", ["media_io", "image_processor"])
+def test_prepared_decode_rejects_different_processor_settings(monkeypatch, field):
+    llm, request, capture, _ = _fixture()
+    _handoff(request, _decode_preparation(request, llm, capture))
+    if field == "media_io":
+        monkeypatch.setattr(
+            llm.input_processor,
+            "get_preferred_media_io_kwargs",
+            lambda: {"image": {"format": "np"}},
+        )
+    else:
+        llm.input_processor._processor = SimpleNamespace(
+            image_processor=SimpleNamespace(to_dict=lambda: {"max_pixels": 1000000})
+        )
+    with pytest.raises(ValueError, match="model configuration"):
+        _prepared_decode_from_request(request, llm)
 
 
 @pytest.mark.parametrize(

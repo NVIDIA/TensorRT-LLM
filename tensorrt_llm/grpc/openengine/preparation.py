@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 from dataclasses import asdict
+from itertools import chain
 from typing import Any
 
 import numpy as np
@@ -24,16 +25,24 @@ def _input_digest(request: Any) -> str:
     digest = hashlib.sha256()
     kind = request.WhichOneof("input")
     data = request.prompt.encode() if kind == "prompt" else request.token_ids.SerializeToString()
-    for part in [kind.encode(), data, *(item.SerializeToString() for item in request.media)]:
+    for part in chain((kind.encode(), data), (item.SerializeToString() for item in request.media)):
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return digest.hexdigest()
 
 
 def _config_digest(llm: Any) -> str:
-    config = llm.input_processor.config.to_dict()
+    processor = llm.input_processor
+    config = processor.config.to_dict()
     config.pop("_name_or_path", None)
-    return hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode()).hexdigest()
+    image_processor = getattr(processor.processor, "image_processor", None)
+    identity = {
+        "model": config,
+        "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
+        "media_io": processor.get_preferred_media_io_kwargs(),
+        "image_processor": image_processor.to_dict() if image_processor is not None else None,
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _decode_preparation(
@@ -134,10 +143,22 @@ def _prepared_decode_from_request(request: Any, llm: Any) -> PreprocessedInputs 
         except (TypeError, RecursionError) as error:
             raise ValueError("invalid prepared multimodal identity fields") from error
         if any(
+            len(digest) != 8 or any(type(value) is not int for value in digest)
+            for digest in mm_input.multimodal_hashes
+        ):
+            raise ValueError("prepared multimodal hashes must contain eight int32 values")
+        if any(
             position + length > len(tokens)
             for position, length in zip(mm_input.multimodal_positions, mm_input.multimodal_lengths)
         ):
             raise ValueError("prepared multimodal identity exceeds the prompt")
+        if mm_input.multimodal_run_positions is not None and any(
+            position + length > len(tokens)
+            for position, length in zip(
+                mm_input.multimodal_run_positions, mm_input.multimodal_run_lengths
+            )
+        ):
+            raise ValueError("prepared multimodal runs exceed the prompt")
     params = MultimodalParams(multimodal_input=mm_input, multimodal_data=restored)
     try:
         params.to_handle("multimodal_data")
