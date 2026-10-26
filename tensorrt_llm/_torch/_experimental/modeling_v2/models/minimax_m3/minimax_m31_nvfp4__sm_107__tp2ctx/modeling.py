@@ -5220,14 +5220,6 @@ class ModelingV2MiniMaxM31Nvfp4Sm107Tp2Ctx(MiniMaxM3ForCausalLM):
     runtime_hooks = RuntimeHooks(
         disagg_draft_kv=True,
         late_compile_detect=True,
-        # The shared sm_107 paths the context role ran with (each keeps its own kill switch).
-        draft_kv_reserve_guard=True,
-        kv_gpu_prefetch=True,
-        context_token_array=True,
-        msa_prefill_fork=True,
-        proxy_ms_reuse=True,
-        context_onehot_index_fill=True,
-        dflash_host_ctx_alloc=True,
         msa=MsaRuntimePolicy(
             prefill_proxy_qo_tile=None if m31_disabled("TP2CTX_PROXY_Q128") else 128,
             prefill_proxy_kv_splits=None if m31_disabled("TP2CTX_PROXY_Q128") else 4,
