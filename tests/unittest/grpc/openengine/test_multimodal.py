@@ -12,9 +12,8 @@ import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from io import BytesIO
-
 from contextvars import ContextVar
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -366,6 +365,49 @@ def test_media_capability_accepts_a_registered_non_base_processor(monkeypatch):
     assert request_mapping.media_capabilities_for_model(llm).modalities == {"audio"}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["", "<|startoftranscript|><|fr|><|translate|><|notimestamps|>"])
+async def test_audio_text_prompt_survives_preparation_without_placeholders(monkeypatch, prompt):
+    import soundfile
+
+    config = _ImageConfig()
+    processor = _AudioInputProcessor(config)
+    processor.supports_token_ids_input = False
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda _, modality: modality == "audio"
+    )
+    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "get_placeholder", lambda *_: "")
+    llm = _ImageLlm(processor, config)
+    llm.args.reasoning_parser = None
+    llm.args.max_seq_len = 2048
+    inference = OpenEngineInferenceServicer(llm, "audio-model")
+    control = OpenEngineControlServicer(llm, "audio-model", inference)
+    info = await control.GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
+    assert info.supports_text_input is True
+    assert info.supports_token_ids_input is False
+    encoded = BytesIO()
+    soundfile.write(encoded, np.zeros(32), 16000, format="WAV")
+    request = generation_pb2.GenerateRequest(
+        request_id="audio-task-prompt",
+        model="audio-model",
+        prompt=prompt,
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                raw_bytes=encoded.getvalue(),
+                mime_type="audio/wav",
+            )
+        ],
+    )
+    responses = [response async for response in inference.Generate(request, FakeServicerContext())]
+    assert responses[-1].HasField("finished")
+    inputs = llm.generate_kwargs["inputs"]
+    assert inputs["prompt"] == prompt
+    samples, rate = inputs["multi_modal_data"]["audio"][0]
+    assert samples.shape == (32,) and rate == 16000
+    assert inference.active_request_count() == 0
+
+
 def test_media_capability_rejects_a_registered_non_callable_processor(monkeypatch):
     config = _ImageConfig()
     monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda *_args: True)
@@ -375,6 +417,7 @@ def test_media_capability_rejects_a_registered_non_callable_processor(monkeypatc
     )
 
     assert request_mapping.media_capabilities_for_model(llm).modalities == set()
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("disabled", [False, True])

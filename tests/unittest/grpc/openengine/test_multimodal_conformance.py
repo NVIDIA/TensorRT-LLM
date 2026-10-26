@@ -236,7 +236,10 @@ def whisper():
         engine.shutdown()
 
 
-def test_audio_capability_agrees_with_generate(whisper):
+@pytest.mark.parametrize(
+    "task_prompt", ["", "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"]
+)
+def test_audio_capability_agrees_with_generate(whisper, task_prompt):
     whisper, audio_path = whisper
     inference = OpenEngineInferenceServicer(whisper, WHISPER_MODEL_NAME)
     control = OpenEngineControlServicer(whisper, WHISPER_MODEL_NAME, inference)
@@ -256,7 +259,7 @@ def test_audio_capability_agrees_with_generate(whisper):
     request = generation_pb2.GenerateRequest(
         request_id="openengine-audio-conformance",
         model=WHISPER_MODEL_NAME,
-        prompt="",
+        prompt=task_prompt,
         sampling=generation_pb2.SamplingParams(temperature=0.0),
         stopping=generation_pb2.StoppingOptions(max_tokens=96),
         media=[
@@ -266,6 +269,20 @@ def test_audio_capability_agrees_with_generate(whisper):
             )
         ],
     )
+
+    token_request = generation_pb2.GenerateRequest()
+    token_request.CopyFrom(request)
+    token_request.request_id += "-token-input"
+    token_request.token_ids.CopyFrom(generation_pb2.TokenIds(ids=[1]))
+    token_context = FakeServicerContext()
+
+    async def reject_token_input():
+        return [response async for response in inference.Generate(token_request, token_context)]
+
+    with pytest.raises(AbortError):
+        asyncio.run(reject_token_input())
+    assert token_context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+    assert inference.active_request_count() == 0
 
     async def collect_audio():
         return [response async for response in inference.Generate(request, FakeServicerContext())]
@@ -284,4 +301,3 @@ def test_audio_capability_agrees_with_generate(whisper):
     finished = [response for response in responses if response.HasField("finished")]
     assert len(finished) == 1
     assert finished[0].usage.completion_tokens == len(token_ids)
-

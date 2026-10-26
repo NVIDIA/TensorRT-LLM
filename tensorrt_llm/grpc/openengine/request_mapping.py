@@ -586,7 +586,11 @@ _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
         reserves_decoded_bytes=True,
     ),
     generation_pb2.MODALITY_AUDIO: _MediaHandler(
-        "audio", _validate_audio_item, _audio_loader_factory, _decoded_audio_bytes, reserves_decoded_bytes=True
+        "audio",
+        _validate_audio_item,
+        _audio_loader_factory,
+        _decoded_audio_bytes,
+        reserves_decoded_bytes=True,
     ),
 }
 

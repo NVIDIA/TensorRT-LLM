@@ -21,8 +21,8 @@ import grpc
 import uvloop
 
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm.inputs.media_io import _close_aiohttp_session
 from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
+from tensorrt_llm.inputs.media_io import _close_aiohttp_session
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._frontend_processes import (
     FrontendStartupCancelled,
@@ -193,8 +193,12 @@ class OpenEngineServer:
                 await _close_aiohttp_session()
             finally:
                 await asyncio.gather(
-                    asyncio.to_thread(self._input_executor.shutdown, wait=True, cancel_futures=True),
-                    asyncio.to_thread(self._media_executor.shutdown, wait=True, cancel_futures=True),
+                    asyncio.to_thread(
+                        self._input_executor.shutdown, wait=True, cancel_futures=True
+                    ),
+                    asyncio.to_thread(
+                        self._media_executor.shutdown, wait=True, cancel_futures=True
+                    ),
                 )
         logger.info("OpenEngine server stopped")
 

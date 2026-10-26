@@ -30,8 +30,8 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     openengine_pb2_grpc,
     server_pb2,
 )
-from tensorrt_llm.inputs.media_io import _get_aiohttp_session
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
+from tensorrt_llm.inputs.media_io import _get_aiohttp_session  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
 # down only once its internal state is released, which happens after the event
@@ -43,8 +43,7 @@ pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 def test_format_bind_address_brackets_ipv6() -> None:
     """A bare IPv6 host is bracketed; IPv4 and already-bracketed hosts are not."""
-    from tensorrt_llm.inputs.media_io import _get_aiohttp_session
-from tensorrt_llm.grpc.openengine.server import _format_bind_address
+    from tensorrt_llm.grpc.openengine.server import _format_bind_address
 
     assert _format_bind_address("127.0.0.1", 8000) == "127.0.0.1:8000"
     assert _format_bind_address("::1", 8000) == "[::1]:8000"
@@ -167,8 +166,7 @@ def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> Non
 
 def test_is_loopback_classifies_bind_hosts() -> None:
     """The listener is unauthenticated, so a non-loopback bind must be flagged."""
-    from tensorrt_llm.inputs.media_io import _get_aiohttp_session
-from tensorrt_llm.grpc.openengine.server import _is_loopback
+    from tensorrt_llm.grpc.openengine.server import _is_loopback
 
     assert _is_loopback("127.0.0.1")
     assert _is_loopback("::1")
