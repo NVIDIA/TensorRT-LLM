@@ -149,18 +149,20 @@ def test_counter_prints_every_200_steps_even_without_candidates(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "switch,v2,reuse,want",
+    "switch,killed,v2,reuse,want",
     [
-        (True, True, True, "enabled"),
-        (False, True, True, "disabled (kill switch)"),
-        (True, False, True, "inactive (KV cache manager v1)"),
-        (True, True, False, "inactive (block reuse off)"),
+        (True, False, True, True, "enabled"),
+        (False, True, True, True, "disabled (kill switch)"),
+        (False, False, True, True, "inactive (the model does not opt in)"),
+        (True, False, False, True, "inactive (KV cache manager v1)"),
+        (True, False, True, False, "inactive (block reuse off)"),
     ],
 )
-def test_startup_line_once_with_state(monkeypatch, switch, v2, reuse, want):
+def test_startup_line_once_with_state(monkeypatch, switch, killed, v2, reuse, want):
     log = mock.Mock()
     monkeypatch.setattr(pe, "logger", log)
     monkeypatch.setattr(pe, "_KV_GPU_PREFETCH", switch)
+    monkeypatch.setattr(pe, "_KV_GPU_PREFETCH_KILLED", killed)
     ex = SimpleNamespace(
         dist=SimpleNamespace(rank=0),
         _is_kv_manager_v2=v2,
