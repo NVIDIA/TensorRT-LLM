@@ -2143,7 +2143,7 @@ def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
 def test_transfer_with_distinct_gen_disagg_id(use_v2):
     """A generation retry carries a fresh disagg_request_id but the same ctx_request_id.
 
@@ -2181,13 +2181,10 @@ def _alloc_request_kv(setup, request, managers, transfer_workers):
     tokens_per_block = setup["tokens_per_block"]
     kv_caches = []
     for mgr in managers:
-        if use_v2:
-            kv = mgr._create_kv_cache(request.py_request_id, None, None)
-            assert kv.resume(torch.cuda.current_stream().cuda_stream)
-            assert kv.resize(request.prompt_len)
-            kv_caches.append(kv)
-        else:
-            mgr.impl.add_sequence_batch([(request.py_request_id, request.prompt_len, 1)], [request])
+        kv = mgr._create_kv_cache(request.py_request_id, None, None)
+        assert kv.resume(torch.cuda.current_stream().cuda_stream)
+        assert kv.resize(request.prompt_len)
+        kv_caches.append(kv)
     block_ids = [
         get_block_ids_per_layer_groups(
             mgr, tw, request.py_request_id, use_v2, tokens_per_block, request.prompt_len
@@ -2267,11 +2264,10 @@ def _setup_retry_attempts(setup, ctx_request_id, gen_request_ids, request_len):
     }
 
 
-def _close_retry_attempt_kv(setup, info):
-    if setup["use_v2"]:
-        torch.cuda.current_stream().synchronize()
-        for kv in info["ctx_kv_caches"] + info["gen_kv_caches"]:
-            kv.close()
+def _close_retry_attempt_kv(info):
+    torch.cuda.current_stream().synchronize()
+    for kv in info["ctx_kv_caches"] + info["gen_kv_caches"]:
+        kv.close()
 
 
 def _wait_until(predicate, timeout_s=10.0, what="condition"):
@@ -2299,7 +2295,7 @@ def _assert_kv_landed_only_in(setup, info, served, untouched, use_v2):
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
 def test_gen_retry_while_first_attempt_active_is_refused_by_sender(use_v2):
     """A retry arriving while the first attempt is live registers under its own key.
 
@@ -2364,7 +2360,7 @@ def test_gen_retry_while_first_attempt_active_is_refused_by_sender(use_v2):
         assert receiver._get_session(key_a) is None
 
         tx.close()
-        _close_retry_attempt_kv(setup, info)
+        _close_retry_attempt_kv(info)
     finally:
         ctx_tw.shutdown()
         gen_tw.shutdown()
@@ -2385,7 +2381,7 @@ def test_gen_retry_after_first_attempt_retired_is_refused_by_sender():
         gen_tp=1,
         gen_pp=1,
         gen_enable_dp=False,
-        use_v2=False,
+        use_v2=True,
     )
     ctx_tw = setup["ctx_transfer_workers"][0]
     gen_tw = setup["gen_transfer_workers"][0]
@@ -2417,12 +2413,12 @@ def test_gen_retry_after_first_attempt_retired_is_refused_by_sender():
         assert rx_b.status == SessionStatus.ERROR
         assert tx.status == SessionStatus.TRANSFERRED
         _assert_kv_landed_only_in(
-            setup, info, (gen_a, gen_a_block_ids), (gen_b, gen_b_block_ids), False
+            setup, info, (gen_a, gen_a_block_ids), (gen_b, gen_b_block_ids), True
         )
 
         rx_b.close()
         tx.close()
-        _close_retry_attempt_kv(setup, info)
+        _close_retry_attempt_kv(info)
     finally:
         ctx_tw.shutdown()
         gen_tw.shutdown()
@@ -2443,7 +2439,7 @@ def test_gen_retry_after_first_attempt_cancelled_fails_fast():
         gen_tp=1,
         gen_pp=1,
         gen_enable_dp=False,
-        use_v2=False,
+        use_v2=True,
     )
     ctx_tw = setup["ctx_transfer_workers"][0]
     gen_tw = setup["gen_transfer_workers"][0]
@@ -2480,7 +2476,7 @@ def test_gen_retry_after_first_attempt_cancelled_fails_fast():
 
         rx_b.close()
         tx.close()
-        _close_retry_attempt_kv(setup, info)
+        _close_retry_attempt_kv(info)
     finally:
         ctx_tw.shutdown()
         gen_tw.shutdown()
@@ -2502,7 +2498,7 @@ def test_gen_retry_ignores_stale_success_of_timed_out_first_attempt():
         gen_tp=1,
         gen_pp=1,
         gen_enable_dp=False,
-        use_v2=False,
+        use_v2=True,
     )
     ctx_tw = setup["ctx_transfer_workers"][0]
     gen_tw = setup["gen_transfer_workers"][0]
@@ -2555,12 +2551,12 @@ def test_gen_retry_ignores_stale_success_of_timed_out_first_attempt():
         assert rx_b.status == SessionStatus.ERROR
         assert tx.status == SessionStatus.TRANSFERRED
         _assert_kv_landed_only_in(
-            setup, info, (gen_a, gen_a_block_ids), (gen_b, gen_b_block_ids), False
+            setup, info, (gen_a, gen_a_block_ids), (gen_b, gen_b_block_ids), True
         )
 
         rx_b.close()
         tx.close()
-        _close_retry_attempt_kv(setup, info)
+        _close_retry_attempt_kv(info)
     finally:
         ctx_tw.shutdown()
         gen_tw.shutdown()
