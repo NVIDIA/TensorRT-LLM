@@ -163,18 +163,16 @@ class PyTorchModelEngine(ModelEngine):
         )
         self._load_model(
             model_path=model_path,
-            llm_args=llm_args,
             model=model,
             checkpoint_loader=checkpoint_loader,
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
-        self._init_from_model(llm_args=llm_args, mapping=mapping)
+        self._init_from_model()
         self._size_cuda_graphs()
         backend_num_streams = self._compile_model(
             configured_encoder_max_num_tokens)
-        self._init_execution_services(spec_config=spec_config,
-                                      backend_num_streams=backend_num_streams)
+        self._init_execution_services(backend_num_streams)
 
     def _init_from_args(
         self,
@@ -288,7 +286,6 @@ class PyTorchModelEngine(ModelEngine):
         self,
         *,
         model_path: str,
-        llm_args: TorchLlmArgs,
         model: Optional[torch.nn.Module],
         checkpoint_loader: BaseCheckpointLoader,
         model_weights_memory_tag: Optional[str],
@@ -298,13 +295,13 @@ class PyTorchModelEngine(ModelEngine):
         self.moe_load_balancer: Optional[MoeLoadBalancer] = None
         self.model_loader: Optional[ModelLoader] = None
         if model is None:
-            lora_config: Optional[LoraConfig] = llm_args.lora_config
+            lora_config: Optional[LoraConfig] = self.llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
             self.model_loader = ModelLoader(
-                llm_args=llm_args,
+                llm_args=self.llm_args,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
-                sparse_attention_config=llm_args.sparse_attention_config,
+                sparse_attention_config=self.llm_args.sparse_attention_config,
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
@@ -320,8 +317,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model = model
         self._validate_breakable_cuda_graph_compatibility()
 
-    def _init_from_model(self, *, llm_args: TorchLlmArgs,
-                         mapping: Optional[Mapping]) -> None:
+    def _init_from_model(self) -> None:
         """Copy the loaded model's facts onto the engine, rewriting the requested
         capacity, encoder token budget and in-graph sampling flag from them,
         and leave the model in its final pre-compile form."""
@@ -343,19 +339,19 @@ class PyTorchModelEngine(ModelEngine):
             self.enable_in_graph_sampling = False
         pretrained_config = self.model.model_config.pretrained_config
         self.enable_overlap_headroom = should_enable_overlap_headroom(
-            mapping,
-            llm_args.disable_overlap_scheduler,
+            self.mapping,
+            self.llm_args.disable_overlap_scheduler,
             kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
-                llm_args.kv_cache_config,
+                self.llm_args.kv_cache_config,
                 self.max_beam_width,
-                enable_sleep=llm_args.sleep_config is not None),
+                enable_sleep=self.llm_args.sleep_config is not None),
             is_hybrid=is_hybrid_linear(pretrained_config),
             has_mrope_delta_cache=resolve_mrope_position_deltas_cache(
                 self.model) is not None)
         self.max_num_seq_slots = compute_max_num_sequences(
-            mapping,
+            self.mapping,
             self.batch_size,
-            llm_args.disable_overlap_scheduler,
+            self.llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self.enable_overlap_headroom,
         )
         # In case that some tests use stub models and override `_load_model`.
@@ -393,7 +389,7 @@ class PyTorchModelEngine(ModelEngine):
             self.mm_encoder_output_budget_bytes = mm_item_scheduler.output_budget_bytes
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
         if isinstance(self.model,
-                      MultimodalModelMixin) and mapping.is_first_pp_rank():
+                      MultimodalModelMixin) and self.mapping.is_first_pp_rank():
             multimodal_config = self.model.model_config.multimodal_config
             reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
                                     if self.model.encoder_cache_active else 0)
@@ -550,8 +546,7 @@ class PyTorchModelEngine(ModelEngine):
         return backend_num_streams
 
     def _init_execution_services(
-            self, *, spec_config: Optional[DecodingBaseConfig],
-            backend_num_streams: Optional[Backend.Streams]) -> None:
+            self, backend_num_streams: Optional[Backend.Streams]) -> None:
         """Build the attention backend, update the speculation config from the
         loaded model, and build the model caller and the runner around the
         compiled model."""
@@ -578,8 +573,8 @@ class PyTorchModelEngine(ModelEngine):
             update_spec_config_from_loaded_model(self.spec_config, self.model)
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             )
-            self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            self.max_draft_len = spec_config.max_draft_len
+            self.max_total_draft_tokens = self.spec_config.tokens_per_gen_step - 1
+            self.max_draft_len = self.spec_config.max_draft_len
         else:
             self.without_logits = False
             self.max_draft_len = 0
