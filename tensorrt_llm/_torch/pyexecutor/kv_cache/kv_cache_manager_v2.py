@@ -339,6 +339,8 @@ class KVCacheLayerSpec:
         if any(role in scale_roles for role in self.buffer_roles) and self.dtype != DataType.NVFP4:
             raise ValueError("block-scale roles require NVFP4 KV-cache dtype")
         if self.dtype == DataType.NVFP4:
+            if self.head_dim % 2 != 0:
+                raise ValueError(f"NVFP4 head_dim must be even, got {self.head_dim}")
             expected_scale_roles = {Role.KEY_BLOCK_SCALE}
             if Role.VALUE in self.buffer_roles:
                 expected_scale_roles.add(Role.VALUE_BLOCK_SCALE)
@@ -1258,6 +1260,31 @@ def _update_kv_cache_draft_token_location(
             "update_kv_cache_draft_token_location requires all local layers "
             f"in one KV pool, got pools {sorted(local_pool_ids)}"
         )
+        layer_specs = getattr(cache_manager, "layer_specs", None)
+        if layer_specs is not None:
+            if len({(layer.head_dim, layer.dtype) for layer in layer_specs}) != 1:
+                raise ValueError(
+                    "update_kv_cache_draft_token_location requires uniform head_dim and dtype "
+                    "for explicit layer specs"
+                )
+            if any(set(layer.buffer_roles) != {Role.KEY, Role.VALUE} for layer in layer_specs):
+                raise ValueError(
+                    "update_kv_cache_draft_token_location requires explicit layer specs "
+                    "with only KEY and VALUE buffers"
+                )
+            # The kernel advances each layer base by one contiguous K/V pair.
+            if any(
+                int(cache_manager.kv_cache_pool_mapping[layer_idx][1]) != layer_idx
+                for layer_idx in range(cache_manager.num_local_layers)
+            ):
+                raise ValueError(
+                    "update_kv_cache_draft_token_location requires explicit layers "
+                    "in contiguous local-layer order within the KV pool"
+                )
+            layer = layer_specs[0]
+            head_size_in_bytes = get_size_in_bytes(layer.head_dim, layer.dtype)
+        else:
+            head_size_in_bytes = int(cache_manager.head_dim * kv_cache_dtype_byte_size)
         pool_idx = local_pool_ids.pop()
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
             accepted_draft_token_offsets,
@@ -1268,7 +1295,7 @@ def _update_kv_cache_draft_token_location(
             # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
             # total so the C++ kernel computes correct strides and grid dims.
             cache_manager.num_kv_heads_per_layer[0],
-            int(cache_manager.head_dim * kv_cache_dtype_byte_size),
+            head_size_in_bytes,
             cache_manager.max_total_draft_tokens,
             max_attention_window,
             rewind_draft_token_separate_adjustments,
@@ -1499,13 +1526,22 @@ class KVCacheManagerV2(BaseResourceManager):
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
         self.layer_specs = tuple(layer_specs) if layer_specs is not None else None
+        if (
+            self.layer_specs is not None
+            and type(self)._extra_buffers_per_layer is not KVCacheManagerV2._extra_buffers_per_layer
+        ):
+            raise ValueError(
+                f"{type(self).__name__} does not support layer_specs with "
+                "an overridden _extra_buffers_per_layer."
+            )
+        if (
+            self.layer_specs is not None
+            and getattr(kv_cache_config, "mixed_precision_kv", None) is not None
+        ):
+            raise ValueError("layer_specs does not support mixed-precision KV cache.")
         self._init_mixed_precision(
             kv_cache_config, kwargs.get("pretrained_config"), max_seq_len, dtype
         )
-        if self.layer_specs is not None and self.low_precision_dtype is not None:
-            raise NotImplementedError(
-                "Mixed-precision retained-token pools do not yet support explicit KV-cache layer specs"
-            )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
@@ -1625,10 +1661,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     "all CP ranks, so publishing it requires a group-wide "
                     "protocol. Set kv_cache_config.enable_block_reuse=False."
                 )
-            if is_draft:
+            if is_draft or any(
+                layer.owner is KVCacheLayerOwner.DRAFT for layer in self.layer_specs or ()
+            ):
                 raise ValueError(
                     "KVCacheManagerV2 does not support a draft cache "
-                    "manager with helix context parallelism."
+                    "manager or draft-owned layers with helix context parallelism."
                 )
             if mapping.enable_attention_dp:
                 raise ValueError(
@@ -4110,18 +4148,33 @@ class KVCacheManagerV2(BaseResourceManager):
         return clamped
 
     def get_num_free_blocks(self) -> int:
-        # NOTE This method is used to get the number of blocks in the primary pool not the FREE blocks.
-        # However, since we only use this function when the kv cache manager is empty, so it is safe to do so.
-        #
-        # "Empty" means no request holds a cache. The guard page, when it is
-        # enabled, is held by a permanent reservation made at construction, not
-        # by a request, so it is excluded from the check and subtracted from
-        # the count: a caller sizing itself off this number must not plan to
-        # use the page the guard owns.
+        """Estimate warmup block capacity when only permanent reservations remain.
+
+        Explicit specs count independent one-block sequences across all required
+        GPU pools. Longer sequences and resume limits are checked during allocation.
+        """
         reserved = set(self.kv_cache_map) & _RESERVED_REQUEST_IDS
         assert not set(self.kv_cache_map) - reserved, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
+        if self.layer_specs is not None:
+            # Each lifecycle needs one slot per block. Coalesced layers share a
+            # lifecycle, while separate lifecycles can compete for the same pool.
+            slots_per_block: dict[int, int] = defaultdict(int)
+            for pool_id in self.impl.get_life_cycle_pool_group_indices(GPU_LEVEL):
+                slots_per_block[int(pool_id)] += 1
+
+            # Available slots already exclude the guard's permanent reservation.
+            stats = self._get_storage_statistics(GPU_LEVEL)
+            return min(
+                (
+                    int(stats[pool_id].available) // slot_count
+                    for pool_id, slot_count in slots_per_block.items()
+                ),
+                default=0,
+            )
+
+        # Legacy managers estimate primary-pool capacity from page indices.
         max_num_pages = max(
             [
                 self.impl.get_page_index_upper_bound(layer_id, Role.KEY)

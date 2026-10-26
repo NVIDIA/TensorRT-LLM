@@ -23,6 +23,7 @@ import yaml
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -63,15 +64,20 @@ def _creator(*, is_disagg, target, draft, tp_size=1):
     )
     creator._draft_config = draft
     creator._mapping = SimpleNamespace(
-        pp_size=1, cp_size=1, tp_size=tp_size, enable_attention_dp=False
+        pp_size=1,
+        cp_size=1,
+        tp_size=tp_size,
+        enable_attention_dp=False,
+        pp_layers=lambda num_layers: range(num_layers),
     )
     creator._llm_args = SimpleNamespace(attn_backend="TRTLLM", kv_cache_compression_config=None)
     creator._model_engine = SimpleNamespace(
-        model=SimpleNamespace(model_config=target), dtype=torch.bfloat16
+        model=SimpleNamespace(model_config=target, config=target.pretrained_config)
     )
     creator._kv_cache_manager_cls = KVCacheManagerV2
     creator._kv_cache_config = SimpleNamespace(max_attention_window=None)
     creator._unification_max_seq_len = 4096
+    creator._max_seq_len = 4096
     creator._is_disagg = is_disagg
     creator._get_draft_kv_model_config = lambda: draft
     return creator
@@ -82,7 +88,12 @@ def test_matching_draft_layout_unifies(is_disagg):
     target = _model_config(kv_heads=8, head_dim=128)
     draft = _model_config(kv_heads=8, head_dim=128)
 
-    assert _creator(is_disagg=is_disagg, target=target, draft=draft)._should_unify_dflash_kv_cache()
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+
+    assert creator._should_unify_dflash_kv_cache()
+    specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
+    assert [spec.global_layer_id for spec in specs] == [0, 1, 2, 3]
+    assert [spec.dtype for spec in specs] == [DataType.BF16] * 4
 
 
 def test_mismatched_draft_kv_heads_unify_only_in_aggregated_serving() -> None:
@@ -106,7 +117,11 @@ def test_fp8_target_with_bf16_draft_unifies(is_disagg: bool) -> None:
     target = _model_config(kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.FP8)
     draft = _model_config(kv_heads=8, head_dim=128)
 
-    assert _creator(is_disagg=is_disagg, target=target, draft=draft)._should_unify_dflash_kv_cache()
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+
+    assert creator._should_unify_dflash_kv_cache()
+    specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
+    assert [spec.dtype for spec in specs] == [DataType.FP8] * 2 + [DataType.BF16] * 2
 
 
 @pytest.mark.parametrize("is_disagg", [False, True])

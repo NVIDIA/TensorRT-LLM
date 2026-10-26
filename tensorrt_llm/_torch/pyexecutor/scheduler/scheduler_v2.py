@@ -264,6 +264,31 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
+        # `is True`: a manager without the flag reads as off.
+        self._swa_scratch_reuse = (
+            getattr(kv_cache_manager, "enable_swa_scratch_reuse", False) is True
+        )
+
+    def _pregrown_context_tokens(self, req: LlmRequest) -> int:
+        """KV capacity a context request holds past its position, left by a skipped forward.
+
+        Under SWA scratch reuse, blocks of the grown chunk outside its end's
+        window get no page; a shorter chunk would leave pages missing inside the
+        next chunk's window (an invalid page index), so it must replay exactly.
+        A suspended cache keeps its capacity, so it counts too.
+        """
+        if not self._swa_scratch_reuse:
+            return 0
+        kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return 0
+        grown = (
+            kv_cache.capacity
+            - self.kv_cache_manager.num_extra_kv_tokens
+            - req.context_current_position
+        )
+        return max(0, min(grown, req.context_remaining_length))
+
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
 
@@ -565,6 +590,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
+
+        # After any reordering: pre-grown requests go first so no other request
+        # takes the budget their replay needs (stable sort).
+        if self._swa_scratch_reuse:
+            pending_ctx = sorted(
+                pending_ctx,
+                key=lambda r: not (
+                    r.state_value == self._context_init_state_value
+                    and self._pregrown_context_tokens(r) > 0
+                ),
+            )
 
         for req in pending_ctx:
             if budget.requests_full:
@@ -1063,15 +1099,26 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
+        # Run exactly the pre-grown chunk, or wait for a pass with enough budget;
+        # a longer chunk would grow the capacity again before the history catches up.
+        pregrown = self._pregrown_context_tokens(req)
+        if pregrown > 0:
+            if chunk_size < pregrown:
+                return ScheduleAction.SKIP, 0, False
+            chunk_size = pregrown
+
         if chunk_size <= 0:
             # Out of token budget rather than out of pages, so releasing pages
             # would not help; the next iteration gets a fresh budget. Not
             # suspended either, to avoid pathological suspend/resume cycles.
             return ScheduleAction.SKIP, 0, False
 
-        chunk_size = self._align_chunk_to_mm_block(
-            req, chunk_size, remaining_budget, context_remaining
-        )
+        # A pre-grown chunk was MM-aligned from this same position when it was
+        # first sized, and either snap direction would break the exact replay.
+        if pregrown == 0:
+            chunk_size = self._align_chunk_to_mm_block(
+                req, chunk_size, remaining_budget, context_remaining
+            )
         # Alignment returns 0 when neither snap-up nor snap-down can preserve
         # bidirectional MM attention this iteration — defer the request rather
         # than schedule a chunk that would corrupt attention. Next iteration

@@ -3328,11 +3328,16 @@ class PeftCacheManager(BaseResourceManager):
                 # cached, we can safely remove both from the request.
                 request.remove_lora_tensors()
             elif request.lora_weights is None and request.py_lora_path:
+                # Load the adapter in the same checkpoint format that the
+                # request was admitted with, so every rank reads the same
+                # files that were validated at enqueue time.
+                ckpt_source = (request.py_lora_ckpt_source
+                               or self._lora_config.lora_ckpt_source)
                 self._lora_manager.load_from_ckpt(
                     [request.py_lora_path],
                     model_config=self._lora_model_config,
                     uids=[request.lora_task_id],
-                    ckpt_source=self._lora_config.lora_ckpt_source)
+                    ckpt_source=ckpt_source)
                 uid = request.lora_task_id
                 request.lora_weights = self._lora_manager.cpp_lora_weights[uid]
                 if request.lora_config is None:
