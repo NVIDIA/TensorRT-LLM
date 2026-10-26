@@ -8,6 +8,11 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Key Features and Enhancements
 
+- **DeepSeek-V4 generation on B200/GB200 (SM100) now runs on the PrimTS native sparse MLA FMHA by default.** The new `prims_ts_sparse_mla` FMHA library (a CuTe DSL kernel vendored from FlashInfer) serves the DeepSeek-V4 sparse MLA generation phase ahead of the TRTLLM-Gen path on SM100; it covers BF16 and FP8 KV caches, the fused inverse-RoPE + FP8 output epilogue, speculative decoding (MTP) rows and CUDA graph replay. SM103 (GB300), `fp8_ds_mla` and NVFP4 KV caches keep the TRTLLM-Gen path. Opt out with `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`.
+  - **First-launch compile cost.** The kernels are JIT-compiled by the CuTe DSL and cached on disk under the FlashInfer workspace. The first start on a host (or after a FlashInfer / CuTe DSL upgrade) compiles the kernel variants the deployment's generation row counts select during `LLM()` startup, about 5 to 10 minutes on B200 for DeepSeek-V4; later starts load the cache. Under `trtllm-llmapi-launch` and the default `LLM()` MPI session every rank has its own FlashInfer workspace (`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1`), so each rank compiles its own copy; set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to share one cache between the ranks of a host.
+  - **Warm-up controls.** `TLLM_PRIMTS_WARM_WORKERS` sets the compile subprocesses per rank (default 4, reduced so that the ranks on a host, counted from the model's parallel mapping, start at most 16 together; `0` compiles in-process), `TLLM_PRIMTS_WARM_TIMEOUT` bounds the wait for them (default 1800 s), and `TLLM_PRIMTS_WARM_STRICT=1` turns a worker failure into an error instead of an in-process retry. Each worker imports torch and the CuTe DSL and opens a CUDA context, so lower the worker count on nodes with little host memory.
+  - **`FLASHINFER_DISABLE_JIT=1`** now also refuses to compile these kernels (with the on-disk CuTe DSL cache enabled, its default): startup then fails on a variant missing from the cache instead of falling back to TRTLLM-Gen, so a deployment that sets it must pre-populate the cache (one start without the variable) or opt out of the library.
+
 ### Infrastructure Changes
 
 ### API Changes

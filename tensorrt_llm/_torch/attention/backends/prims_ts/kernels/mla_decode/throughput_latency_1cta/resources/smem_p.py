@@ -194,7 +194,10 @@ class SmemPResource(MlaResource):
     def _ordered_sequence_wait(self):
         """Wait for this P instance's ordered materialization turn."""
 
-        if cutlass.const_expr(self.cfg.use_clc_dynamic_persistent_scheduler == 1):
+        if cutlass.const_expr(
+            self.cfg.use_clc_dynamic_persistent_scheduler == 1
+            and self.cfg.num_insts_kv > 1
+        ):
             cute.arch.mbarrier_wait(
                 self._order_p01_barrier_ptr + self.inst_id,
                 self._order_p01_phase,
@@ -204,7 +207,10 @@ class SmemPResource(MlaResource):
     def _ordered_sequence_arrive(self):
         """Signal the peer P instance after materialization completes."""
 
-        if cutlass.const_expr(self.cfg.use_clc_dynamic_persistent_scheduler == 1):
+        if cutlass.const_expr(
+            self.cfg.use_clc_dynamic_persistent_scheduler == 1
+            and self.cfg.num_insts_kv > 1
+        ):
             signaling_id = 1 if self.inst_id == 0 else 0
             cute.arch.mbarrier_arrive(
                 self._order_p01_barrier_ptr + signaling_id,

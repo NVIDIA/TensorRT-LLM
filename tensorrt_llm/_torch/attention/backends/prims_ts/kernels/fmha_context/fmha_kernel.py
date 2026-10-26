@@ -137,6 +137,8 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any, Tuple
 
+import importlib
+
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
@@ -2821,6 +2823,9 @@ class FmhaTs:
             )
         validate_head_paired_head_ratio(head_paired=head_paired, h_r=h_r)
         if use_paged_kv:
+            # Import before task bodies enter staged GPU control flow. The
+            # helper module imports FmhaConfig, so it cannot load in resources.
+            importlib.import_module(f"{__package__}.helpers_paged")
             if num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
                 raise ValueError(
                     "paged context requires num_tokens_per_page in "
