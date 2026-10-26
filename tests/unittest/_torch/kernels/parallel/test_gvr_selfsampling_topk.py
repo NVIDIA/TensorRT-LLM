@@ -1128,16 +1128,147 @@ def test_selfsampling_varlen_regclus_k2048_short_rows():
     torch.cuda.synchronize()
     ref = _reference_varlen_indices(lg, kv, nn, 1, k)
     for r in range(4 * nn):
-        if 0 < int((ref[r] >= 0).sum()) < k:
+        valid = max(0, min(msl, int(kv[r // nn]) - nn + r % nn + 1))
+        if valid <= k:
             assert torch.equal(out[r], ref[r]), f"row {r} short-row identity mismatch"
-        elif (ref[r] >= 0).any():
+        else:
             row = lg[r]
             got = row[out[r].long().clamp_min(0)].sort().values
             want = row[ref[r].long().clamp_min(0)].sort().values
             assert torch.equal(got, want), f"row {r} value multiset mismatch"
             assert torch.equal(out[r] < 0, ref[r] < 0), f"row {r} pad mask mismatch"
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("b,n", [(1, 16399), (4, 65551), (8, 131071), (16, 32771)])
+@pytest.mark.parametrize("pattern", ["hidden_peak", "outlier", "equal", "ties", "infinities"])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_sampling_rescue(
+    k: int, b: int, n: int, pattern: str, deterministic: bool
+) -> None:
+    """Exact selection and stable tie membership across all cluster fragment geometries."""
+    npad = (n + 63) // 64 * 64
+    gen = torch.Generator().manual_seed(20261026 + n + k)
+    row = torch.randn(n, generator=gen)
+    if pattern == "hidden_peak":
+        row.fill_(1)
+        # High scores occupy positions outside both endpoint-inclusive block samplers.
+        sample_id = torch.arange(k)
+        for width in (32, 64):
+            positions = (sample_id // width) * (n - width) // (k // width - 1) + sample_id % width
+            row[positions] = 0
+    elif pattern == "outlier":
+        row[0] = row[-1] = 1e9
+    elif pattern == "equal":
+        row.fill_(1)
+    elif pattern == "ties":
+        row.fill_(1)
+        row[torch.randperm(n, generator=gen)[: k // 2]] = 2
+    else:
+        row[0::7] = float("inf")
+        row[1::7] = -float("inf")
+    logits = torch.full((b, npad), 3e38, dtype=torch.float32, device=_DEV)
+    logits[:, :n] = row.to(_DEV)
+    lengths = torch.full((b,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((b, k), -7, dtype=torch.int32, device=_DEV)
+    kwargs = {"max_seq_len": n, "deterministic": deterministic}
+    ss_host.run_varlen(logits, lengths, out, **kwargs)
+    torch.cuda.synchronize()
+    assert ss_host.route(b, n, npad, k, det=deterministic)["kernel"] == "reg_clus"
+    reference = torch.topk(logits[:, :n], k, dim=1).values
+    _check_exact(logits, out, n, reference)
+    first = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(logits, lengths, out, **kwargs)
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_exact(logits, out, n, reference)
+        if deterministic:
+            assert torch.equal(first, out), "rescue output order changed across graph replay"
+    if deterministic:
+        expected = torch.argsort(row, descending=True, stable=True)[:k].sort().values.to(_DEV)
+        assert torch.equal(out.long().sort(dim=1).values, expected.expand(b, -1))
+        ss_host.run_varlen(logits, lengths, out, sorting="ascending", **kwargs)
+        torch.cuda.synchronize()
+        assert torch.equal(out.long(), expected.expand(b, -1))
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("candidates", [16384, 16385])
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_rescue_candidate_limit(
+    k: int, candidates: int, tied: bool, deterministic: bool
+) -> None:
+    """Both sides of the rescue limit preserve strict winners and threshold ties."""
+    n, npad = 65551, 65600
+    logits = torch.full((1, npad), 3e38, dtype=torch.float32, device=_DEV)
+    logits[:, :n] = 0
+    logits[:, : k // 2] = 2
+    begin = (n - candidates) // 2
+    logits[:, begin : begin + candidates] = (
+        1 if tied else torch.linspace(1, 1.0001, candidates, device=_DEV)
+    )
+    lengths = torch.tensor([n], dtype=torch.int32, device=_DEV)
+    out = torch.full((1, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, lengths, out, max_seq_len=n, deterministic=deterministic)
+    torch.cuda.synchronize()
+    _check_exact(logits, out, n, logits[:, :n].topk(k).values)
+    if deterministic:
+        expected = torch.argsort(logits[:, :n], descending=True, stable=True)[:, :k]
+        assert torch.equal(out.long().sort(dim=1).values, expected.sort(dim=1).values)
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_rescue_mtp_short_rows(
+    k: int, compress_ratio: int, deterministic: bool
+) -> None:
+    """An MTP launch may mix rescued long rows, identity rows and empty windows."""
+    next_n, envelope = 4, 32771
+    npad = (envelope + 63) // 64 * 64
+    raw_lengths = [
+        0,
+        (k - 1) * compress_ratio,
+        k * compress_ratio + next_n - 1,
+        envelope * compress_ratio + next_n - 1,
+    ]
+    logits = torch.full((4 * next_n, npad), 3e38, dtype=torch.float32, device=_DEV)
+    valid_lengths = []
+    for row in range(4 * next_n):
+        valid = max(
+            0,
+            min(
+                envelope, (raw_lengths[row // next_n] - next_n + row % next_n + 1) // compress_ratio
+            ),
+        )
+        valid_lengths.append(valid)
+        logits[row, :valid] = 1
+    lengths = torch.tensor(raw_lengths, dtype=torch.int32, device=_DEV)
+    out = torch.full((4 * next_n, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        logits,
+        lengths,
+        out,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        max_seq_len=envelope * compress_ratio,
+        deterministic=deterministic,
+    )
+    torch.cuda.synchronize()
+    for row, valid in enumerate(valid_lengths):
+        if valid <= k:
+            assert torch.equal(out[row, :valid], torch.arange(valid, device=_DEV))
+            assert bool((out[row, valid:] == -1).all())
         else:
-            assert torch.equal(out[r], ref[r]), f"row {r} expected all -1"
+            _check_exact(
+                logits[row : row + 1], out[row : row + 1], valid, torch.ones((1, k), device=_DEV)
+            )
+            if deterministic:
+                assert torch.equal(out[row].sort().values, torch.arange(k, device=_DEV))
 
 
 def test_selfsampling_varlen_reg_parity_and_oracle():
