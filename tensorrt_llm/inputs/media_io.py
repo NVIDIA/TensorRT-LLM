@@ -176,6 +176,13 @@ _RESPONSE_CHUNK_BYTES = 1024 * 1024
 # Maximum number of redirects allowed for remote fetches.
 _MAX_REDIRECTS = 5
 
+# Maximum number of decoded audio samples (frames x channels) per audio input.
+# Compressed formats such as FLAC can expand a few hundred kilobytes into
+# gigabytes of samples, so the encoded size limit alone does not bound memory.
+# The limit admits every 16-bit PCM file within _MAX_RESPONSE_BYTES, which is
+# about 100 Mi samples, or 800 MiB as float64.
+_MAX_AUDIO_SAMPLES = _MAX_RESPONSE_BYTES // 2
+
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 # Opt-in switch relaxing the requirement that media URLs resolve to global
@@ -1092,6 +1099,24 @@ def _decode_base64_with_limit(data: str) -> bytes:
     return decoded
 
 
+def _read_audio_with_limit(source: Any) -> Tuple[np.ndarray, int]:
+    """Decode audio like ``soundfile.read`` with a cap on decoded samples.
+
+    Reads at most one frame beyond the limit, so a payload that decodes to more
+    than ``_MAX_AUDIO_SAMPLES`` samples is rejected before it is fully decoded.
+    """
+    with soundfile.SoundFile(source) as audio_file:
+        max_frames = _MAX_AUDIO_SAMPLES // max(audio_file.channels, 1)
+        data = audio_file.read(frames=max_frames + 1)
+        samplerate = audio_file.samplerate
+    if len(data) > max_frames:
+        raise ValueError(
+            f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+            f"(frames x channels), the maximum allowed."
+        )
+    return data, samplerate
+
+
 def _safe_read_local_file(location: str, *, max_bytes: int | None = None) -> bytes:
     """Read a local file, refusing anything that has no end.
 
@@ -1350,7 +1375,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
     def _read(self, source: Union[BytesIO, str]) -> Tuple[np.ndarray, int]:
         if self._decoded_memory_reserver is None:
-            return soundfile.read(source)
+            return _read_audio_with_limit(source)
 
         reservation = None
         try:
@@ -1360,6 +1385,11 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
                 frames, channels = audio.frames, audio.channels
                 if frames < 0 or channels < 1:
                     raise ValueError("invalid audio frame or channel count")
+                if frames * channels > _MAX_AUDIO_SAMPLES:
+                    raise ValueError(
+                        f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+                        f"(frames x channels), the maximum allowed."
+                    )
                 decoded_bytes = frames * channels * np.dtype(np.float64).itemsize
                 reservation = self._decoded_memory_reserver(decoded_bytes, decoded_bytes)
                 shape = (frames,) if channels == 1 else (frames, channels)
