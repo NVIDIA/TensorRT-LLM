@@ -319,11 +319,13 @@ installed by the shell's ``load_weights`` after the built-in loader
   ``ring_buddy.install(windows=1)``), with nothing replicated.
 * ``three_window_placement`` stacks a third ring window on them.
 * ``half_window_experts`` (tp 4) stacks the ring predecessor's upper expert half on
-  them, which the prologue's routed kernel places onto; only up to the
+  them, which the prologue's routed kernel places onto (and, on calls of 9..32 rows
+  that reach the routing method, ``ring_buddy_assign``'s half flow); only up to the
   ``max_batch_size`` of its capacity gate (``dispatch.CAPACITY_GATES``).
 * ``bf16_routed_experts`` gives the two BF16 layers' stacked calls unpacked
   routing (on the owner-only window as well).
-* ``hot_replicas`` (tep4 on sm_103 only) hooks the NVFP4 layers' expert and routing
+* ``hot_replicas`` (tep4, in a plan without ``half_window_experts``:
+  ``dispatch.YIELDS``) hooks the NVFP4 layers' expert and routing
   calls after the owner-window install; the copies themselves are gathered on the
   first forward of a deployment whose largest decode step (``max_batch_size`` times
   the verify width) reaches 33 rows (``HotReplicas.decide``), and ``DecodeTarget``
@@ -952,11 +954,20 @@ _TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
 #: decode steps on the tray's MNNVL two-shot; on decode steps of 9..1024 rows, the
 #: post-attention hop on its own one-shot transport; large context steps
 #: sequence-parallel over the tray; and the context steps' pre-attention prep in one launch.
+#: Its NVFP4 expert layers also hold their ring predecessor's upper expert half
+#: (``half_window_experts``): decode steps of at most 8 rows are placed by the
+#: prologue's routed kernel, those of 9..32 rows (two to four requests, behind the
+#: multi-request router GEMM and projection gathers) by ``ring_buddy_assign``'s half
+#: flow, both balancing the selected experts over the four ranks. As on sm107 the
+#: window costs 45 GiB of KV cache per rank and is carried only up to
+#: ``max_batch_size`` 8 (``dispatch.CAPACITY_GATES``); a plan carrying it leaves
+#: ``hot_replicas`` out (``dispatch.YIELDS``).
 _SM103_TEP4_PATHS = (
     _TEP4_PATHS
     | _SM103_TEP4_ONLY_PATHS
     | frozenset(
         {
+            "half_window_experts",
             "swa_paged_decode",
             "swa_block",
             "full_attention_split_kv",
