@@ -100,6 +100,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    Union,
 )
 
 import torch
@@ -430,6 +431,23 @@ def _read_fused_attn_res_max_tokens() -> int:
 _ATTN_RES_TOPOLOGY = _read_attn_res_topology()
 _FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
 
+KIMI_K3_MOE_TAIL_ADD_FOLD_ENV = "KIMI_K3_MOE_TAIL_ADD_FOLD"
+"""Set to ``1`` to fold a MoE layer's output additions into the next
+attention-residual kernel.
+
+A MoE layer ends with ``prefix_sum + (routed + shared)``, two elementwise
+kernels whose result is read first by the next attention-residual + RMSNorm.
+With this set, at token counts within ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``
+the layer hands the three tensors to that consumer, which passes the shared
+output as ``layer_residual_add2`` of ``trtllm::attn_res_add_rmsnorm_fwd``. The
+prefix sum it materializes is bitwise the one the two additions produce.
+Default ``0``.
+
+Read at import, so CUDA-graph capture and replay cannot disagree about it.
+"""
+
+_MOE_TAIL_ADD_FOLD_ENABLED = os.environ.get(KIMI_K3_MOE_TAIL_ADD_FOLD_ENV, "0") == "1"
+
 
 def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
     """Shape gate for the persistent kernel: H == 7168 and 2 <= N <= 9.
@@ -582,6 +600,7 @@ def _apply_attn_res_add_rmsnorm_fused(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    addend2: Optional[torch.Tensor] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Fuse ``prefix_sum + addend``, attention-residual, and trailing norm.
 
@@ -590,14 +609,22 @@ def _apply_attn_res_add_rmsnorm_fused(
     BF16-rounded prefix sum alongside the normalized attention-residual output,
     while avoiding a separate add launch and a re-read of the intermediate by
     attention-residual selection.
+
+    With ``addend2`` the prefix sum is ``prefix_sum + (addend + addend2)``,
+    rounded to BF16 after each addition exactly as the two tensor additions
+    are. Only the per-token kernel takes the second addend; where the
+    persistent kernel would run, this returns ``None`` so the caller adds
+    first and keeps the kernel it would otherwise have used.
     """
+    addends = (addend,) if addend2 is None else (addend, addend2)
     if (
         prefix_sum.dtype is not torch.bfloat16
-        or addend.dtype is not torch.bfloat16
         or not prefix_sum.is_cuda
-        or not addend.is_cuda
         or not block_residual.is_cuda
-        or prefix_sum.shape != addend.shape
+        or any(
+            t.dtype is not torch.bfloat16 or not t.is_cuda or t.shape != prefix_sum.shape
+            for t in addends
+        )
     ):
         return None
     M, H = prefix_sum.shape
@@ -605,6 +632,8 @@ def _apply_attn_res_add_rmsnorm_fused(
     N = K + 1
     # Same measured window as _apply_attn_res_rmsnorm_fused above.
     if _use_persistent_attn_res(M, H, N):
+        if addend2 is not None:
+            return None
         try:
             persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
         except (AttributeError, RuntimeError):
@@ -622,8 +651,9 @@ def _apply_attn_res_add_rmsnorm_fused(
         _note_attn_res_fusion("add+attn_res+norm/persistent", True, M, H, N)
         return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
 
+    site = "add+attn_res+norm" if addend2 is None else "add2+attn_res+norm"
     if M > _FUSED_ATTN_RES_MAX_TOKENS or H != 7168 or N > 12:
-        _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
+        _note_attn_res_fusion(site, False, M, H, N)
         return None
     try:
         attn_res_add_rmsnorm_op = torch.ops.trtllm.attn_res_add_rmsnorm_fwd
@@ -632,6 +662,9 @@ def _apply_attn_res_add_rmsnorm_fused(
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     addend_kernel = addend.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
+    add2_kwargs = {}
+    if addend2 is not None:
+        add2_kwargs["layer_residual_add2"] = addend2.reshape(M, 1, H).contiguous()
     updated_prefix_sum, output = attn_res_add_rmsnorm_op(
         layer_kernel,
         addend_kernel,
@@ -641,8 +674,9 @@ def _apply_attn_res_add_rmsnorm_fused(
         output_norm.weight.to(torch.bfloat16).contiguous(),
         float(norm.eps),
         _rms_norm_eps(output_norm),
+        **add2_kwargs,
     )
-    _note_attn_res_fusion("add+attn_res+norm", True, M, H, N)
+    _note_attn_res_fusion(site, True, M, H, N)
     return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
 
 
@@ -696,17 +730,55 @@ def _apply_attn_res_add_and_rmsnorm(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    addend2: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Add an attention output to the running residual, then select and norm."""
+    """Add a layer output to the running residual, then select and norm.
+
+    ``addend2`` makes the update ``prefix_sum + (addend + addend2)``, the tail
+    of a MoE layer whose routed and shared outputs are still separate.
+    """
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_add_rmsnorm_fused(
-            prefix_sum, addend, block_residual, proj, norm, output_norm
+            prefix_sum, addend, block_residual, proj, norm, output_norm, addend2
         )
         if fused is not None:
             return fused
-    updated_prefix_sum = prefix_sum + addend
+    updated_prefix_sum = prefix_sum + (addend if addend2 is None else addend + addend2)
     return updated_prefix_sum, _apply_attn_res_and_rmsnorm(
         updated_prefix_sum, block_residual, proj, norm, output_norm
+    )
+
+
+class _MoeTailPending(NamedTuple):
+    """A MoE layer's output whose additions into the prefix sum are deferred.
+
+    The layer's result is ``prefix + (routed + shared)``. Its only reader is
+    the next attention-residual (the next layer's, or the model's output one),
+    which folds both additions into its own kernel when that kernel is the
+    path it would take anyway; every other reader calls ``materialize``.
+    """
+
+    prefix: torch.Tensor
+    routed: torch.Tensor
+    shared: torch.Tensor
+
+    def materialize(self) -> torch.Tensor:
+        return self.prefix + (self.routed + self.shared)
+
+
+def _can_defer_moe_tail_add(
+    prefix: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor
+) -> bool:
+    """Whether the consumer's per-token fused kernel can take the deferred add."""
+    return (
+        _FUSED_ATTN_RES_ENABLED
+        and prefix.dim() == 2
+        and prefix.shape[0] <= _FUSED_ATTN_RES_MAX_TOKENS
+        and prefix.shape[1] == 7168
+        and all(
+            t.dtype is torch.bfloat16 and t.is_cuda and t.shape == prefix.shape
+            for t in (prefix, routed, shared)
+        )
     )
 
 
@@ -1661,8 +1733,14 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
-    def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
-        """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
+    def forward(
+        self, hidden_states: torch.Tensor, all_rank_num_tokens=None, return_parts: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """``hidden_states``: ``[num_tokens, hidden_size]`` bf16.
+
+        Returns ``routed + shared``, or the two outputs unsummed with
+        ``return_parts``.
+        """
         identity = hidden_states
         projected_input = None
         early_routed_in = None
@@ -1778,6 +1856,8 @@ class KimiK3MoERuntime(nn.Module):
                 ),
             )
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+        if return_parts:
+            return routed_out, shared_out
         return routed_out + shared_out
 
 
@@ -2032,12 +2112,17 @@ class KimiLinearDecoderLayer(nn.Module):
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
         capture: Optional[Tuple[Any, int]] = None,
-    ) -> Tuple[torch.Tensor, int]:
+        defer_moe_tail_add: bool = False,
+    ) -> Tuple[Union[torch.Tensor, _MoeTailPending], int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows.
+
+        With ``defer_moe_tail_add`` a MoE layer may return the prefix sum as a
+        ``_MoeTailPending``; ``hidden_states`` accepts one from the previous
+        layer and folds it into the pre-attention attn_res + RMSNorm.
 
         ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
         stream for the layer BEFORE this one: the aggregated stream for layer j
@@ -2046,6 +2131,9 @@ class KimiLinearDecoderLayer(nn.Module):
         possible because K3 asserts pp_size == 1 -- layer j+1 is always local.
         PP support would need a recompute at the rank boundary.
         """
+        pending = hidden_states if isinstance(hidden_states, _MoeTailPending) else None
+        if pending is not None and (capture is not None or num_snapshots == 0):
+            hidden_states, pending = pending.materialize(), None
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
 
@@ -2066,6 +2154,16 @@ class KimiLinearDecoderLayer(nn.Module):
             tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
             capture[0].maybe_capture_hidden_states(capture[1], tapped, None)
             hidden_states = self.input_layernorm(hidden_states)
+        elif pending is not None:
+            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                pending.prefix,
+                pending.routed,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                addend2=pending.shared,
+            )
         elif num_snapshots > 0:
             hidden_states = _apply_attn_res_and_rmsnorm(
                 prefix_sum,
@@ -2105,7 +2203,16 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
             )
-        if self.is_moe:
+        if self.is_moe and defer_moe_tail_add:
+            routed_out, shared_out = self.block_sparse_moe(
+                hidden_states,
+                getattr(attn_metadata, "all_rank_num_tokens", None),
+                return_parts=True,
+            )
+            if _can_defer_moe_tail_add(prefix_sum, routed_out, shared_out):
+                return _MoeTailPending(prefix_sum, routed_out, shared_out), num_snapshots
+            hidden_states = routed_out + shared_out
+        elif self.is_moe:
             hidden_states = self.block_sparse_moe(
                 hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
             )
@@ -2227,9 +2334,19 @@ class KimiLinearModel(DecoderModel):
                 and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
             ):
                 capture = (spec_metadata, self.layers[i - 1].layer_idx)
-            hidden_states, num_snapshots = layer(
-                hidden_states, block_residual, num_snapshots, attn_metadata, capture=capture
+            fold_kwargs = (
+                {"defer_moe_tail_add": True} if _MOE_TAIL_ADD_FOLD_ENABLED and layer.is_moe else {}
             )
+            hidden_states, num_snapshots = layer(
+                hidden_states,
+                block_residual,
+                num_snapshots,
+                attn_metadata,
+                capture=capture,
+                **fold_kwargs,
+            )
+
+        pending = hidden_states if isinstance(hidden_states, _MoeTailPending) else None
 
         # The last layer has no successor, so this one recompute is
         # unavoidable -- output-side score weights, matching SGLang's
@@ -2239,6 +2356,8 @@ class KimiLinearModel(DecoderModel):
         if spec_metadata is not None and len(self.layers) > 0:
             last = self.layers[-1]
             if capture_set is None or last.layer_idx in capture_set:
+                if pending is not None:
+                    hidden_states, pending = pending.materialize(), None
                 tail = (
                     _apply_attn_res(
                         hidden_states,
@@ -2251,6 +2370,16 @@ class KimiLinearModel(DecoderModel):
                 )
                 spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
+        if pending is not None:
+            return _apply_attn_res_add_and_rmsnorm(
+                pending.prefix,
+                pending.routed,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+                addend2=pending.shared,
+            )[1]
         return _apply_attn_res_and_rmsnorm(
             hidden_states,
             block_residual[:num_snapshots],
