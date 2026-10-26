@@ -2444,9 +2444,11 @@ def _build_v2_hybrid_with_mamba_layer(
     max_batch_size=4,
     num_mamba_layers=1,
     num_attention_layers=1,
+    num_draft_layers=0,
     num_kv_heads=4,
     mapping=None,
     spec_config=None,
+    pretrained_config=None,
     use_replay_state_update=False,
     enable_block_reuse=False,
     enable_partial_reuse=True,
@@ -2474,8 +2476,9 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_stats=False,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
-    mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
-    attn_mask = [False] * num_mamba_layers + [True] * num_attention_layers
+    # Draft layers of a combined speculative manager follow the model's layers in both masks.
+    mamba_mask = [True] * num_mamba_layers + [False] * (num_attention_layers + num_draft_layers)
+    attn_mask = [False] * num_mamba_layers + [True] * (num_attention_layers + num_draft_layers)
     if mapping is None:
         mapping = Mapping(
             world_size=1,
@@ -2516,7 +2519,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=num_attention_layers,
+        num_layers=num_attention_layers + num_draft_layers,
         num_kv_heads=num_kv_heads,
         head_dim=64,
         tokens_per_block=32,
@@ -2525,6 +2528,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mapping=mapping,
         spec_config=spec_config,
         layer_mask=attn_mask,
+        **({"pretrained_config": pretrained_config} if pretrained_config is not None else {}),
         vocab_size=1024,
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
@@ -2681,6 +2685,29 @@ def test_v2_hybrid_mixed_precision_appends_retained_group():
         # The leading (sink) and trailing (window) pages are always retained.
         assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
         assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_skips_appended_draft_layer():
+    """A draft layer appended to the hybrid manager's mask keeps a plain cache."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_dtype="mixed_nvfp4_float16",
+        kv_cache_overrides=dict(mixed_precision_first_n=32, mixed_precision_last_n=32),
+        spec_config=MTPDecodingConfig(max_draft_len=1),
+        num_draft_layers=1,
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    try:
+        # Layers 0 (recurrent), 1 (attention), 2 (draft): only layer 1 gets a twin, at 3.
+        assert mgr._first_spec_layer_id == 2
+        assert mgr.high_layers == {1: 3}
+        assert mgr.get_buffers(2).dtype == torch.float16
     finally:
         mgr.shutdown()
 

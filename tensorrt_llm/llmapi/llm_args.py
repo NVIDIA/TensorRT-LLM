@@ -7179,6 +7179,12 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "Mixed-precision KV is not supported together with a KV connector."
             )
+        sparse = self.sparse_attention_config
+        if sparse is not None and sparse.algorithm not in ("dsa",
+                                                           "deepseek_v4"):
+            raise ValueError(
+                "Mixed-precision KV supports the dsa and deepseek_v4 sparse "
+                f"attention algorithms; got {sparse.algorithm!r}.")
         if (self.kv_cache_compression_config is not None
                 or self.max_beam_width != 1):
             raise ValueError(

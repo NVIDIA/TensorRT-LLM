@@ -1070,6 +1070,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
         return False
 
+    def _has_native_nvfp4_pool(self, dtype: DataType) -> bool:
+        # The compressed pool is NVFP4 while the dtype handed to the base manager stays FP8.
+        return self._use_nvfp4_compress
+
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         if self.low_precision_dtype is None:
             return config

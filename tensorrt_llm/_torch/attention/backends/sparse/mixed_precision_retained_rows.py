@@ -253,11 +253,14 @@ def _retained_compressed_row_mask(
     request = request.clamp_(max=batch_size - 1)
     local = row - cu_new_comp_kv[request]
     position = start_pos[request] + local
-    block = torch.div(position, tokens_per_block, rounding_mode="floor").clamp_(
-        min=0, max=block_table.shape[1] - 1
-    )
-    page = block_table[request.clamp(max=block_table.shape[0] - 1), block]
-    return compressed_mask & (local < num_comp_tokens[request]) & (position >= 0) & (page >= 0)
+    block = torch.div(position, tokens_per_block, rounding_mode="floor")
+    # Blocks past the table's width are pages the twin never held.
+    in_table = (position >= 0) & (block < block_table.shape[1])
+    page = block_table[
+        request.clamp(max=block_table.shape[0] - 1),
+        block.clamp(min=0, max=block_table.shape[1] - 1),
+    ]
+    return compressed_mask & (local < num_comp_tokens[request]) & in_table & (page >= 0)
 
 
 def store_retained_compressed_rows(
