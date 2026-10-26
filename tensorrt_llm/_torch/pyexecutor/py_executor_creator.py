@@ -858,6 +858,17 @@ def _create_py_executor(
                 "tp_size=1 (disaggregated context worker) or "
                 "enable_attention_dp=True (aggregated serving), but got "
                 f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
+        # Only the CuteDSL MoE backends support DWDP (with NVFP4 weights), and
+        # AUTO resolves to none of them for the models DWDP serves. Without
+        # one, DWDP manages no MoE layer and every rank loads every expert
+        # before the launch fails.
+        if llm_args.moe_config.backend.upper() not in ("CUTEDSL",
+                                                       "CUTEDSL_FC12"):
+            raise ValueError(
+                "DWDP requires an MoE backend that supports it: set "
+                "moe_config.backend: CUTEDSL (or CUTEDSL_FC12) with an NVFP4 "
+                "checkpoint, but got "
+                f"moe_config.backend={llm_args.moe_config.backend!r}.")
         # The host issues the expert prefetch as the MoE layers run, and the
         # last layers of a pass already prefetch the next pass; a replayed
         # CUDA graph would bind buffer slots the host schedule does not track.

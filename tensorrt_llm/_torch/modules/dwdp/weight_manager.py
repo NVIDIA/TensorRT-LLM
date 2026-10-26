@@ -166,11 +166,12 @@ class DWDPWeightManager:
             peer_views: Mapping of (peer_rank, layer_idx, weight_name) to tensor
                 views into peer's MNNVL handle. These are IMMUTABLE — the source
                 GPU never writes to them during inference.
-            peer_ranges: Per-peer ``(local_start, local_end_capped)`` tuples
-                indexed by DWDP rank.  ``prefetch_layer`` resolves the owner of
-                a remote expert id with ``lookup_owner(expert_id, peer_ranges)``,
-                which handles non-uniform partition (tail-rank padding) and
-                redundancy (overlapping ranges) uniformly.
+            peer_ranges: Every rank's ``(start, end)`` in the expert partition,
+                indexed by DWDP rank (``ExpertPartition.peer_ranges``);
+                peer ``p``'s views have ``end - start`` rows.  ``prefetch_layer``
+                resolves the owner of a remote expert id with
+                ``lookup_owner(expert_id, peer_ranges)``, the lowest-rank owner
+                under redundancy (overlapping ranges).
             moe_layer_indices: Sorted list of decoder layer indices that are MoE
                 layers (e.g., layers 3..60 in a typical MoE model where the first
                 few layers are dense).
@@ -214,10 +215,9 @@ class DWDPWeightManager:
         self._dwdp_rank = dwdp_rank
         self._dwdp_size = dwdp_size
 
-        # Storage chunk size of every peer's MNNVL handle.  Uniform across
-        # ranks (Phase 1 made ``num_experts_per_worker`` the storage size for
-        # every rank) — the variability lives in the *valid* sub-range
-        # tracked by ``_peer_ranges``.
+        # The number of experts this rank stores.  Peers may store another
+        # number (e.g. one more or one fewer under the balanced partition):
+        # each peer's range is in ``_peer_ranges``, and its view has its rows.
         self._experts_per_rank = weight_buffer.local_end - weight_buffer.local_start
 
         # Dedicated CUDA stream for P2P copy operations.
@@ -294,7 +294,8 @@ class DWDPWeightManager:
             f"[DWDPWeightManager] Initialized: rank={dwdp_rank}/{dwdp_size}, "
             f"moe_layers={len(self._moe_layer_indices)}, "
             f"weights={self._weight_names}, "
-            f"experts_per_rank={self._experts_per_rank}, "
+            f"local_experts={self._experts_per_rank} "
+            f"[{weight_buffer.local_start}, {weight_buffer.local_end}), "
             f"contention_opt={contention_opt}, "
             f"copy_mode={copy_mode}, "
             f"gather={self._use_gather}, "

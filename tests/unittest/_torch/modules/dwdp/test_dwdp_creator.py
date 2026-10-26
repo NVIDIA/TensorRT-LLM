@@ -188,6 +188,7 @@ def _create(
     *,
     real_dense_manager: bool = False,
     copy_mode: str | None = None,
+    moe_backend: str = "CUTEDSL",
 ) -> tuple[list, object]:
     """Run ``create_py_executor`` with DWDP in ``mode``, start a forward of the executor it returns.
 
@@ -198,6 +199,7 @@ def _create(
         real_dense_manager: Standalone, the creator builds a real ``DenseDwdpManager``, whose
             setup only logs; the model engine logs the SM reserve it is built with.
         copy_mode: Standalone, ``dwdp_config.copy_mode``.
+        moe_backend: ``moe_config.backend``.
 
     Returns:
         The call log and the one DWDP manager created.
@@ -297,6 +299,7 @@ def _create(
         monkeypatch.setattr(py_executor_creator.torch.cuda, name, fake)
 
     llm_args = _make_llm_args()
+    llm_args.moe_config = SimpleNamespace(backend=moe_backend)
     if mode == "standalone":
         llm_args.dwdp_config = DwdpConfig(
             enable_experts=False, enable_dense=True, copy_mode=copy_mode
@@ -350,6 +353,17 @@ def test_only_the_serving_phase_gets_the_manager(
         expected.append(("executor", *given))
     start = "prefetch_first_layers" if mode == "standalone" else "start_forward"
     assert log == ["gate"] * (mode != "expert") + expected + [start]
+
+
+@pytest.mark.parametrize("backend", ["AUTO", "CUTLASS", "TRTLLM", "MEGAMOE_CUTEDSL"])
+@pytest.mark.parametrize("mode", ["expert", "attached"])
+def test_expert_dwdp_refuses_an_moe_backend_without_dwdp(
+    monkeypatch: pytest.MonkeyPatch, mode: str, backend: str
+) -> None:
+    """Only CUTEDSL and CUTEDSL_FC12 support DWDP, and AUTO resolves to neither for the models
+    DWDP serves: the launch is refused before the model is built, with the setting to use."""
+    with pytest.raises(ValueError, match="set moe_config.backend: CUTEDSL"):
+        _create(monkeypatch, mode, "estimated", moe_backend=backend)
 
 
 def test_a_standalone_gather_reserves_its_sms_before_the_model_is_built(

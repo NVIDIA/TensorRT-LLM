@@ -44,13 +44,14 @@ from .rendezvous import StoreDwdpGroup, dwdp_global_rank, store_rendezvous_enabl
 from .setup import setup_dwdp, teardown_dwdp
 from .specs import (
     EdgeInfo,
+    ExpertPartition,
     LayerWeightSpecs,
     MnnvlHandleSet,
     PageAlignedLayout,
     PeerRange,
     PeerRanges,
     WeightSpec,
-    compute_peer_ranges,
+    handle_geometry,
     lookup_owner,
 )
 from .transport import DWDPTransport
@@ -84,7 +85,8 @@ __all__ = [
     "PageAlignedLayout",
     "PeerRange",
     "PeerRanges",
-    "compute_peer_ranges",
+    "ExpertPartition",
+    "handle_geometry",
     "lookup_owner",
     # VMM utilities
     "align_up",

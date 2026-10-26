@@ -4241,6 +4241,8 @@ def test_nvfp4_streaming_stages_pre_quant_scales_for_finalization() -> None:
         rtol=0,
         atol=0,
     )
+    # DWDP setup compares the ranks' copies by the dtype the checkpoint stores the scale in.
+    assert module.fc31_act_scale_checkpoint_dtype == torch.float32
 
 
 @pytest.mark.cpu_only
