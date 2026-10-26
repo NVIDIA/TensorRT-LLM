@@ -235,6 +235,8 @@ class HostLists:
     multimodal_params_list: list[MultimodalParams] = field(default_factory=list)
     # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
     mrope_position_ids: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
+    # (token row, base position, scalar delta) for batched generation writes.
+    generation_mrope_positions: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
     mrope_delta_write_seq_slots: list[int] = field(default_factory=list)
     mrope_delta_read_seq_slots: list[int] = field(default_factory=list)
     # will contain previous batch indices of generation requests
@@ -1672,9 +1674,18 @@ class DecoderInputPreparer:
                     if mrope_position_delta is not None:
                         has_gen_mrope_delta = True
                         # NOTE: Expanding position_ids to 3D tensor who is using mrope
-                        gen_mrope_position_ids = (
-                            past_seen_token_num + mrope_position_delta
-                        ).expand(3, 1, 1)
+                        batch_mrope = (
+                            mrope_position_delta.is_cuda
+                            and mrope_position_delta.device
+                            == self._buffers.mrope_position_ids_cuda.device
+                            and mrope_position_delta.dtype == torch.int32
+                            and mrope_position_delta.numel() == 1
+                            and mrope_position_delta.ndim <= 3
+                        )
+                        if not batch_mrope:
+                            gen_mrope_position_ids = (
+                                past_seen_token_num + mrope_position_delta
+                            ).expand(3, 1, 1)
                         update_mrope_delta = (
                             request.py_seq_slot is not None
                             and not request.is_dummy
@@ -1698,9 +1709,14 @@ class DecoderInputPreparer:
                         for beam in range(beam_width):
                             # Locate this beam's single token in the flat array.
                             token_start = len(position_ids) - beam_width + beam
-                            mrope_position_ids.append(
-                                (token_start, token_start + 1, gen_mrope_position_ids)
-                            )
+                            if batch_mrope:
+                                host.lists.generation_mrope_positions.append(
+                                    (token_start, past_seen_token_num, mrope_position_delta)
+                                )
+                            else:
+                                mrope_position_ids.append(
+                                    (token_start, token_start + 1, gen_mrope_position_ids)
+                                )
                             mrope_delta_read_seq_slots.append(delta_read_seq_slot)
                     else:
                         # No MRoPE metadata for this request (text-only prompt
@@ -1984,6 +2000,19 @@ class DecoderInputPreparer:
                     segment = maybe_pin_memory(segment)
                 self._buffers.mrope_position_ids_cuda[:, :, start_idx:end_idx].copy_(
                     segment[:, :, : end_idx - start_idx], non_blocking=True
+                )
+            if host.lists.generation_mrope_positions:
+                rows, positions, deltas = zip(*host.lists.generation_mrope_positions)
+                indices_and_positions = torch.tensor(
+                    (rows, positions), dtype=torch.long, pin_memory=prefer_pinned()
+                ).to(device=self._buffers.mrope_position_ids_cuda.device, non_blocking=True)
+                generation_positions = torch.cat(
+                    [delta.reshape(1) for delta in deltas]
+                ) + indices_and_positions[1].to(dtype=torch.int32)
+                self._buffers.mrope_position_ids_cuda.index_copy_(
+                    2,
+                    indices_and_positions[0],
+                    generation_positions.view(1, 1, -1).expand(3, 1, -1),
                 )
         else:
             self._buffers.position_ids_cuda[:total_num_tokens].copy_(
@@ -2323,6 +2352,7 @@ class DecoderInputPreparer:
             and self.guided_decoder is None
             and not self._config.enable_attention_dp
             and not host.lists.mrope_position_ids
+            and not host.lists.generation_mrope_positions
             and not host.lists.mrope_delta_write_seq_slots
             and not host.lists.mrope_delta_read_seq_slots
             and not self.use_beam_search
