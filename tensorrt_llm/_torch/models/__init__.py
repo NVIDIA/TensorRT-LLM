@@ -32,6 +32,7 @@ __all__ = [
     "BertForSequenceClassification",
     "CLIPVisionModel",
     "Cohere2ForCausalLM",
+    "Cosmos3EdgeModel",
     "Cosmos3Model",
     "DeepseekV3ForCausalLM",
     "DeepseekV41ForCausalLM",
@@ -105,24 +106,40 @@ __all__ = [
 
 def __getattr__(name: str):
     module_name = MODEL_CLASS_TO_MODULE.get(name)
-    if module_name is None:
-        # Also resolve bare submodule access (models.modeling_llama,
-        # models.checkpoints, models.hf_parameter_utils, ...) so callers that
-        # relied on the previously-eager submodule attributes keep working.
+    if module_name is not None:
         try:
-            return importlib.import_module(f".{name}", __name__)
-        except ModuleNotFoundError as e:
-            # Only translate "no such submodule" into AttributeError; a
-            # ModuleNotFoundError raised *inside* an existing submodule
-            # (missing dependency) must propagate unchanged.
-            if e.name != f"{__name__}.{name}":
-                raise
-            raise AttributeError(
-                f"module {__name__!r} has no attribute {name!r}") from None
-    module = importlib.import_module(f".{module_name}", __name__)
-    attr = getattr(module, name)
-    globals()[name] = attr  # cache: subsequent access skips __getattr__
-    return attr
+            module = importlib.import_module(f".{module_name}", __name__)
+        except AttributeError as e:
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
+            raise ImportError(
+                f"cannot import {name!r} from {__name__!r}: importing "
+                f"{__name__}.{module_name} raised {e!r}",
+                name=__name__) from e
+        attr = getattr(module, name)
+        globals()[name] = attr  # cache: subsequent access skips __getattr__
+        return attr
+    # Also resolve bare submodule access (models.modeling_llama,
+    # models.checkpoints, models.hf_parameter_utils, ...) so callers that
+    # relied on the previously-eager submodule attributes keep working.
+    try:
+        return importlib.import_module(f".{name}", __name__)
+    except ModuleNotFoundError as e:
+        # Only translate "no such submodule" into AttributeError; a
+        # ModuleNotFoundError raised *inside* an existing submodule
+        # (missing dependency) must propagate unchanged.
+        if e.name != f"{__name__}.{name}":
+            raise
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}") from None
+    except AttributeError as e:
+        # Same as above: a bug inside the submodule, not a missing name.
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing "
+            f"{__name__}.{name} raised {e!r}",
+            name=__name__) from e
 
 
 def __dir__():

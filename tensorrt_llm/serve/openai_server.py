@@ -80,8 +80,7 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCountTokensResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
-from tensorrt_llm.serve.chat_tokenization import (
-    render_chat_request_for_tokenizer, tokenize_harmony_chat_request)
+from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
@@ -117,10 +116,11 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
-from tensorrt_llm.serve.render import (RenderResources, UnsupportedRenderError,
-                                       legacy_render_enabled,
+from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
+                                       UnsupportedRenderError,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
+                                       render_chat_for_length,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
@@ -1163,6 +1163,25 @@ class OpenAIServer(_VideoRoutesMixin):
             speculative_config=speculative_config,
             kv_cache_config=kv_cache_config if kv_cache_config else None,
         )
+
+    @staticmethod
+    def _attach_multimodal_data(
+            prompt: Dict[str, Any],
+            request: Any,
+            mm_data: Any,
+            mm_item_order: Optional[List[Any]] = None) -> None:
+        """Attach decoded media to the prompt dict handed to the engine.
+
+        When the request carried no ``prompt_token_ids``, ``prompt`` is the
+        chat template's output with one placeholder per media item already in
+        it, so ``chat_template_applied`` tells the input processor to use it
+        verbatim instead of rendering the template a second time.
+        """
+        prompt["multi_modal_data"] = mm_data
+        if request.prompt_token_ids is None:
+            prompt["chat_template_applied"] = True
+        if mm_item_order:
+            prompt["mm_item_order"] = mm_item_order
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
@@ -2356,15 +2375,14 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 mm_data, mm_embeddings = await mm_coroutines
             if mm_data:
-                prompt["multi_modal_data"] = mm_data
+                self._attach_multimodal_data(prompt, request, mm_data,
+                                             mm_item_order)
             if mm_embeddings:
                 prompt["multi_modal_embeddings"] = mm_embeddings
             if mm_data and mm_embeddings:
                 raise ValueError(
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
-            if mm_data and mm_item_order:
-                prompt["mm_item_order"] = mm_item_order
 
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
@@ -2570,25 +2588,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
 
-            def _count_estimate() -> int:
-                # The simplified renderer: used for requests the shared
-                # pipeline cannot render (media) and under
-                # TRTLLM_RENDER_LEGACY=1. Resolve the template the way
-                # openai_chat does, or a server started with --chat_template
-                # would count a prompt it never builds. getattr keeps this
-                # working for servers constructed without _init_llm, as the
-                # route tests do.
-                if chat_request.chat_template is None:
-                    chat_request.chat_template = getattr(
-                        self, "chat_template", None)
-                rendered = render_chat_request_for_tokenizer(
-                    chat_request, self.tokenizer)
-                # The renderer returns token ids when the template tokenizes
-                # for itself, and text otherwise; both are valid.
-                if isinstance(rendered, str):
-                    return len(self.tokenizer.encode(rendered))
-                return len(rendered)
-
             # Both the render and the encode are synchronous and both scale
             # with prompt size. Claude Code calls this before most turns with
             # the whole conversation attached, so running them inline would
@@ -2596,8 +2595,6 @@ class OpenAIServer(_VideoRoutesMixin):
             # request on this server -- for a full template render plus a
             # tokenizer pass. The chat path avoids this the same way.
             def _count() -> int:
-                if legacy_render_enabled():
-                    return _count_estimate()
                 # The count is over the prompt tokens the chat route would
                 # execute: same pipeline, same template, same tokenization.
                 resources = RenderResources.from_server(self)
@@ -2605,14 +2602,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     rendered = render_chat(chat_request,
                                            resources,
                                            tokenize=True)
-                except UnsupportedRenderError:
-                    return _count_estimate()
-                except RuntimeError:
-                    # Harmony cannot convert some messages (a tool without a
-                    # description); the count used to come from the template.
-                    if not resources.use_harmony:
-                        raise
-                    return _count_estimate()
+                except (UnsupportedRenderError, HarmonyConversionError):
+                    # Media, an own-processor model or an unconvertible Harmony
+                    # request: count the text, tools and template without the media.
+                    rendered = render_chat_for_length(chat_request, resources)
                 return len(rendered.token_ids)
 
             input_tokens = await asyncio.to_thread(_count)
@@ -2867,8 +2860,6 @@ class OpenAIServer(_VideoRoutesMixin):
             # Same pipeline as the chat route: the server template and the
             # model extension's tool serialization apply here too.
             render_resources = RenderResources.from_server(self)
-            if legacy_render_enabled():
-                render_resources = render_resources.legacy_view()
             tool_dicts = None if request.tools is None else [
                 render_resources.extension.serialize_tool(tool)
                 for tool in request.tools
@@ -2918,9 +2909,8 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_embeddings:
                 raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
-                prompt["multi_modal_data"] = mm_data
-                if mm_item_order:
-                    prompt["mm_item_order"] = mm_item_order
+                self._attach_multimodal_data(prompt, request, mm_data,
+                                             mm_item_order)
 
             promise = self.generator.generate_async(inputs=prompt, )
             asyncio.create_task(self.await_disconnected(raw_request, promise))

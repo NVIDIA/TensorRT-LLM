@@ -74,8 +74,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
                                                 UCompletionResponse)
-from tensorrt_llm.serve.render import (RenderResources, legacy_render_enabled,
-                                       render_conversation)
+from tensorrt_llm.serve.render import RenderResources, render_conversation
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
@@ -1210,8 +1209,6 @@ async def _create_input_tokens(
         hf_config=model_config,
         processor=processor,
         default_chat_template=chat_template)
-    if legacy_render_enabled():
-        render_resources = render_resources.legacy_view()
     tools_dict = [
         render_resources.extension.serialize_tool(tool)
         for tool in _get_chat_completion_function_tools(request.tools)

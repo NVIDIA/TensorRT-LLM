@@ -1777,10 +1777,12 @@ def test_beam_search_cba_reorders_stop_window():
         m.cache_indirection[0, b, :] = b
     m.cum_log_probs[0] = torch.tensor([-5.0, -1.0])
     # window rows distinguishable per beam
-    stop_window = torch.zeros((3, 1, K), dtype=torch.int32)
+    allocation = torch.zeros(2 * 3 * K, dtype=torch.int32)
+    stop_window = allocation[:3 * K].view(3, 1, K)
     stop_window[:, 0, 0] = 100
     stop_window[:, 0, 1] = 200
-    m.stop_past_tokens = stop_window
+    m.stop_words_metadata = torch.tensor([[allocation.data_ptr(), 0, 0, 3, K]],
+                                         dtype=torch.int64)
 
     # beam1 dominates: both slots descend from beam 1
     logits = torch.full((K, vocab), -50.0)
@@ -2015,7 +2017,8 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     assert request.py_beam_width == max(beam_width_array)
 
     # Exercise the real beam admission checks with unrelated cache, transport,
-    # token-range, sampler, and budget validation disabled in the executor stub.
+    # token-range, sampler, model, and budget validation disabled in the
+    # executor stub.
     executor = types.SimpleNamespace(
         _is_kv_manager_v2=True,
         max_beam_width=request.py_beam_width,
@@ -2024,6 +2027,7 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
         _configure_csa2_remote_tail=lambda _request: None,
         _validate_token_id_range=lambda _request: None,
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
+        model_engine=types.SimpleNamespace(model=None),
         _validate_request_budget=lambda _request: None,
     )
     validate = functools.partial(

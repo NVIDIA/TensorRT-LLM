@@ -27,7 +27,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Dict, Final, Generic, List, Optional, TypeAlias, TypeVar, cast
+from typing import Any, Dict, Generic, List, Optional, TypeAlias, TypeVar, cast
 
 import torch
 
@@ -179,6 +179,9 @@ class _SamplingGroup:
 class Sampler(ABC, Generic[GenericSampleState]):
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         pass
+
+    def release_request(self, request: LlmRequest) -> None:
+        """Release sampler-owned state before the request's slot is returned."""
 
     def get_cache_indirection(self) -> torch.Tensor | None:
         return None
@@ -497,9 +500,6 @@ class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTenso
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
-    DEFAULT_MAX_STOP_WORD_LENGTH: Final[int] = 20
-    DEFAULT_MAX_STOP_WORDS: Final[int] = 10
-
     SampleState = SampleStateTorch
 
     @override
@@ -660,8 +660,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # One row per sequence slot plus the scratch row (dummy_slot_row).
             self._slot_params = SlotSamplingParams(self.max_num_sequences + 1, device="cuda")
             self._finish_reasons_handler = FinishReasonsHandler(
-                max_stop_word_length=self.DEFAULT_MAX_STOP_WORD_LENGTH,
-                max_num_stop_words=self.DEFAULT_MAX_STOP_WORDS,
                 max_num_sequences=self.max_num_sequences,
                 max_beam_width=self.max_beam_width,
                 max_tokens=self.max_tokens,
@@ -1262,6 +1260,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # the done verdict computed there.
 
     @override
+    def release_request(self, request: LlmRequest) -> None:
+        self._finish_reasons_handler.release_request(request)
+
+    @override
     @nvtx_range("setup_sampler_step")
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         """Setup the sampler step for the requests
@@ -1325,7 +1327,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_lengths_cuda=max_lens_tensor_cuda,
             end_ids_cuda=end_ids_tensor_cuda,
             seq_slots_host=seq_slots_tensor_host,
-            all_sampling_requests=new_requests + scheduled_requests.generation_requests,
         )
 
         self._slot_params.admit(new_requests, seq_slots_tensor_cuda_long)
@@ -1901,6 +1902,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     )
                 )
             else:
+                stop_words_metadata_cuda: torch.Tensor | None = None
+                if self._finish_reasons_handler.has_stop_word_history:
+                    self._finish_reasons_handler.record_stop_word_stream()
+                    stop_words_metadata_cuda = (
+                        self._finish_reasons_handler.store.stop_words_metadata_cuda
+                    )
                 beam_step = BeamSearchStep.from_params(
                     group.beam_params, cuda_device, return_probs=group.needs_probs
                 )
@@ -1918,7 +1925,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                             ..., DEFAULT_STEP_IDX
                         ],
                         end_ids_cuda=self._finish_reasons_handler.store.end_ids_cuda,
-                        past_tokens_cuda=self._finish_reasons_handler.store.past_tokens_cuda,
+                        stop_words_metadata_cuda=stop_words_metadata_cuda,
                     ),
                 )
                 group_temperature_cuda = beam_step.temperature
