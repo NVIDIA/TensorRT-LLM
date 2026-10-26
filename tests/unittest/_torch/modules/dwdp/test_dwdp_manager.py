@@ -18,6 +18,7 @@ DwdpManager is a thin lifecycle layer that:
 - creates a DWDP MPI sub-communicator
 - owns the Single Source of Truth for registered MoE layer indices
 - forwards runtime calls to the DWDPWeightManager produced by setup_dwdp
+- owns the dense DWDP runtime: sets it up after setup_dwdp
 
 These tests mock out COMM_WORLD / dwdp_global_rank / setup_dwdp so the full
 lifecycle can be exercised on a single CPU without MPI / CUDA / MNNVL.
@@ -27,9 +28,12 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch.nn as nn
 
 from tensorrt_llm._torch.cute_dsl_utils import sm_reserve
 from tensorrt_llm._torch.distributed import MPIDist
+from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
+from tensorrt_llm._torch.modules.dwdp.dense.types import DenseSetupError
 from tensorrt_llm._torch.pyexecutor.dwdp import (
     DwdpManager,
     get_global_dwdp_manager,
@@ -40,11 +44,14 @@ from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
+_FAC = "tensorrt_llm._torch.pyexecutor.dwdp"
 
-def _make_config(dwdp_size: int = 2) -> DwdpConfig:
+
+def _make_config(dwdp_size: int = 2, num_groups: int = 1, enable_dense: bool = False) -> DwdpConfig:
     return DwdpConfig(
+        enable_dense=enable_dense,
         dwdp_size=dwdp_size,
-        num_groups=1,
+        num_groups=num_groups,
         num_experts_per_worker=4,
         num_prefetch_experts=4,
     )
@@ -74,6 +81,13 @@ def _configure_mock_comm_world(mock_comm_world, world_size: int = 1024):
     return sub_comm
 
 
+def _start(test: unittest.TestCase, patcher: object) -> MagicMock:
+    """Start ``patcher`` for the rest of ``test`` and return its mock."""
+    mock = patcher.start()
+    test.addCleanup(patcher.stop)
+    return mock
+
+
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.setup_dwdp")
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.dwdp_global_rank", return_value=0)
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.COMM_WORLD")
@@ -81,9 +95,13 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     def setUp(self):
         # Ensure no leftover global singleton from a prior test.
         set_global_dwdp_manager(None)
+        # Dense DWDP off: a model without dense roots, enable_dense unset.
+        _start(self, patch(f"{_FAC}.dense_roots_available", return_value=False))
+        self.setup_dense = _start(self, patch(f"{_FAC}.setup_dense_dwdp"))
 
     def tearDown(self):
         set_global_dwdp_manager(None)
+        self.setup_dense.assert_not_called()
 
     # ------------------------------------------------------------------
     # Construction
@@ -441,6 +459,142 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         backend = MagicMock()
         mgr.wait_and_bind(backend, 5)
         fake_wm.wait_and_bind.assert_called_once_with(backend, 5)
+
+
+class _DenseModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList()
+
+
+class TestDwdpManagerDenseSetup(unittest.TestCase):
+    """A DwdpManager over fakes, not entered unless a test enters it."""
+
+    LAYERS = [3, 5, 7]
+    #: Global rank 3 is DWDP rank 1 of group 1 on device 2: passing one for another shows.
+    GLOBAL_RANK, DWDP_RANK, DEVICE_ID = 3, 1, 2
+
+    def setUp(self) -> None:
+        set_global_dwdp_manager(None)
+        self.addCleanup(set_global_dwdp_manager, None)
+        self.log: list[tuple] = []
+        self.sub_comm = _configure_mock_comm_world(_start(self, patch(f"{_FAC}.COMM_WORLD")))
+        self.sub_comm.Free.side_effect = lambda: self.log.append(("group.Free",))
+        _start(self, patch(f"{_FAC}.dwdp_global_rank", return_value=self.GLOBAL_RANK))
+        _start(self, patch(f"{_FAC}.torch.cuda.current_device", return_value=self.DEVICE_ID))
+        self.weight_manager = object()  # what setup_dwdp returns
+        self.setup_dwdp = _start(
+            self, patch(f"{_FAC}.setup_dwdp", return_value=self.weight_manager)
+        )
+        teardown = patch(
+            f"{_FAC}.teardown_dwdp",
+            side_effect=lambda *_a, **_k: self.log.append(("teardown_dwdp",)),
+        )
+        _start(self, teardown)
+        self.roots_available = _start(
+            self, patch(f"{_FAC}.dense_roots_available", return_value=True)
+        )
+        self.setup_dense = _start(self, patch(f"{_FAC}.setup_dense_dwdp", return_value=None))
+        self.model = _DenseModel()
+        self.manager = self.new_manager()
+
+    def new_manager(self, enable_dense: bool = False) -> DwdpManager:
+        """A DwdpManager of DWDP rank ``DWDP_RANK`` with ``LAYERS`` registered in reverse order."""
+        mapping = _make_mapping(dwdp_rank=self.DWDP_RANK)
+        manager = DwdpManager(
+            config=_make_config(num_groups=2, enable_dense=enable_dense),
+            dist=MagicMock(spec=MPIDist),
+            mapping=mapping,
+        )
+        for layer in reversed(self.LAYERS):
+            manager.add_layer(layer)
+        return manager
+
+    def test_setup_runs_dense_setup_when_roots_are_available_but_not_requested(self) -> None:
+        """Collective #1 runs on every rank of a model with roots, requested or not.
+
+        It runs after the expert setup, once the model reference is kept, with this rank's
+        ``enable_dense``.
+        """
+        seen = []
+
+        def dense_setup(
+            model: nn.Module, weight_manager: object, comm: object, **kwargs: object
+        ) -> None:
+            seen.append((self.manager._model_ref(), self.manager._weight_manager))
+
+        self.setup_dense.side_effect = dense_setup
+        self.assertIs(self.manager.setup(self.model), self.weight_manager)
+
+        self.setup_dense.assert_called_once_with(
+            self.model,
+            self.weight_manager,
+            self.sub_comm,
+            dwdp_rank=self.DWDP_RANK,
+            dwdp_size=2,
+            device_id=self.DEVICE_ID,
+            moe_layers=[3, 5, 7],
+            config=DenseConfig(enabled=False),
+        )
+        self.assertEqual(seen, [(self.model, self.weight_manager)])
+        self.assertEqual(self.setup_dwdp.call_args.kwargs["device_id"], self.DEVICE_ID)
+        self.assertIsNone(self.manager.dense)
+
+    def test_a_model_without_roots_makes_no_dense_collective(self) -> None:
+        """A rank that asks for dense DWDP raises alone, after the expert setup.
+
+        A rank that does not ask serves expert DWDP alone.
+        """
+        self.roots_available.return_value = False
+        for enable_dense in (False, True):
+            with self.subTest(enable_dense=enable_dense):
+                manager = self.new_manager(enable_dense=enable_dense)
+                if enable_dense:
+                    with self.assertRaisesRegex(
+                        DenseSetupError,
+                        "_DenseModel do not provide dense_dwdp_roots.*set "
+                        "dwdp_config.enable_dense=False for this model",
+                    ):
+                        manager.setup(self.model)
+                else:
+                    self.assertIs(manager.setup(self.model), self.weight_manager)
+                self.assertIsNone(manager.dense)
+                manager.cleanup()
+        self.assertEqual(self.setup_dwdp.call_count, 2)
+        self.setup_dense.assert_not_called()
+        self.sub_comm.allgather.assert_not_called()
+
+    def test_dense_setup_error_propagates_and_cleanup_still_tears_down(self) -> None:
+        self.setup_dense.side_effect = DenseSetupError("dense setup abandoned")
+
+        with self.assertRaisesRegex(DenseSetupError, "dense setup abandoned"):
+            self.manager.setup(self.model)
+        self.assertIsNone(self.manager.dense)
+
+        self.manager.cleanup()
+
+        self.assertEqual(self.log, [("teardown_dwdp",), ("group.Free",)])
+
+    def test_more_than_two_expert_slots_are_logged_when_dense_dwdp_commits(self) -> None:
+        """With more than two expert prefetch slots each expert copy runs ahead of its layer's
+        dense copy on the shared copy stream; setup says so at INFO."""
+        info = _start(self, patch(f"{_FAC}.logger.info"))
+        for slots, committed in ((2, True), (3, False), (3, True)):
+            with self.subTest(slots=slots, committed=committed):
+                self.setup_dense.return_value = MagicMock() if committed else None
+                manager = self.new_manager()
+                manager.config = manager.config.model_copy(update={"num_prefetch_slots": slots})
+                info.reset_mock()
+                manager.setup(_DenseModel())
+                messages = [call.args[0] for call in info.call_args_list]
+                logged = [
+                    message
+                    for message in messages
+                    if f"{slots} expert prefetch slots: each expert copy runs ahead of its "
+                    "layer's dense copy" in message
+                ]
+                self.assertEqual(len(logged), int(slots > 2 and committed), messages)
 
 
 if __name__ == "__main__":

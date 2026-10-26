@@ -115,6 +115,7 @@ class _Harness:
         )
         self.mgr = object.__new__(DwdpManager)
         self.mgr._weight_manager = self.wm
+        self.mgr._dense = None  # expert DWDP alone
         self.backend = _Backend()
         self.compute_stream = torch.cuda.Stream()
         self.copies: List[int] = []
@@ -208,6 +209,10 @@ def _drive(h: _Harness, moe_delay: int, num_slots: int) -> None:
     for tensors in h.src.values():
         for t in tensors:
             t.add_(1000.0)
+    # The next pass's first copies run on this GPU's copy stream, which nothing orders after the
+    # updates on the source GPUs.
+    for device in {t.device for tensors in h.src.values() for t in tensors}:
+        torch.cuda.synchronize(device)
     weights = h.snapshot()
     h.mgr.invalidate_prefetch()
     h.run_pass(7, moe_delay, weights)
