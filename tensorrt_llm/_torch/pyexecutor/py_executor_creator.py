@@ -971,6 +971,7 @@ def _create_py_executor(
                 ):
                     # GuidedDecoder is applicable to non-speculative decoding and two-model speculative decoding.
                     guided_decoder = GuidedDecoder(**kwargs)
+                    model_engine.drop_greedy_only_outputs()
                 elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
                 ):
                     # CapturableGuidedDecoder is applicable to one-model speculative decoding.

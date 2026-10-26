@@ -39,10 +39,11 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from . import mxfp8_cute_pinned_tactics as _mxfp8_cute_pinned
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
-    from flashinfer import autotune as _flashinfer_autotune
+    from ..flashinfer_autotune_cache import autotune as _flashinfer_autotune
     from flashinfer import mm_mxfp8 as _flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
@@ -648,6 +649,12 @@ class MXFP8GemmRunner(TunableRunner):
         """Return the generic fallback followed by every compiled tactic."""
         return [-1, *range(self.mxfp8_gemm_runner.get_num_configs())]
 
+    def tactic_name(self, tactic: int) -> Optional[str]:
+        """The CUTLASS config of a native tactic; "fallback" for -1."""
+        if tactic == -1:
+            return "fallback"
+        return self.mxfp8_gemm_runner.get_config_name(int(tactic))
+
     @classmethod
     def sync_all_tactic_caches(cls, tuner: AutoTuner) -> None:
         """Register every profiled MXFP8 tactic in the native serving cache."""
@@ -802,6 +809,13 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
             backend = "cutlass"
             context = nullcontext()
         else:
+            # Above 32 rows on SM107, for a model that opts in: the pinned tuned tactic (bitwise the
+            # heuristic's output, faster); see mxfp8_cute_pinned_tactics. Otherwise, or with no entry:
+            # FlashInfer's heuristic config.
+            pinned = _mxfp8_cute_pinned.run(act, act_scale, weight,
+                                            weight_scale, self.output_dtype)
+            if pinned is not None:
+                return pinned
             # Skip FlashInfer's CuTeDSL config sweep; use its heuristic config.
             backend = "cute-dsl"
             context = _flashinfer_autotune(tune_mode=False,
@@ -847,6 +861,65 @@ def mxfp8_quantize_gemm_autotuned(
                        tactic=_choose_mxfp8_tactic(
                            _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,
                            gemm_inputs, tune))
+
+
+def mxfp8_gemm_autotuned(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    tune: bool = False,
+) -> torch.Tensor:
+    """The GEMM half of mxfp8_quantize_gemm_autotuned for an activation already in MXFP8.
+
+    Same runner, op key and tuning-cache entries as the decode-graph MXFP8 GEMM:
+    the tactic per token bucket comes from the AutoTuner (merged across ranks
+    when the runtime asks for it), never from a per-rank backend sweep.
+    """
+    gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
+    gemm_inputs = [act, act_scale, weight, weight_scale]
+    return gemm_runner(gemm_inputs,
+                       tactic=_choose_mxfp8_tactic(
+                           _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,
+                           gemm_inputs, tune))
+
+
+def flashinfer_mxfp8_gemm_cute_dsl(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    sweep_configs: bool,
+) -> torch.Tensor:
+    """FlashInfer's CuTeDSL MXFP8 GEMM for an activation its producer already quantized.
+
+    Unlike ``mxfp8_quantize_gemm_autotuned``, the backend is fixed rather than
+    chosen per token bucket: the AutoTuner profiles with the weight L2-resident,
+    where CUTLASS can edge out CuTeDSL, while a decode step streams it cold.
+
+    ``sweep_configs`` runs FlashInfer's own CuTeDSL config sweep: it profiles
+    the configs for this shape while ``flashinfer_mxfp8_autotune`` is active
+    (the warmup tuning pass) and replays the cached best one afterwards;
+    without it the heuristic config runs.
+    """
+    if sweep_configs:
+        from ..modules.linear import flashinfer_mxfp8_autotune_active
+        context = _flashinfer_autotune(
+            tune_mode=flashinfer_mxfp8_autotune_active())
+    else:
+        context = _flashinfer_autotune(tune_mode=False, skip_ops="mxfp8_gemm")
+    with context:
+        return _flashinfer_mm_mxfp8(
+            act,
+            weight.t(),
+            act_scale,
+            weight_scale,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend="cute-dsl",
+        )
 
 
 class FP4GemmRunner(TunableRunner):

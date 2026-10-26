@@ -1044,6 +1044,33 @@ def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
     return draft_len
 
 
+def disagg_gen_first_draft_tokens(ctx_draft_tokens, spec_config,
+                                  enable_spec_decode: bool,
+                                  max_total_draft_tokens: int):
+    """Draft tokens a generation-only request (received from the context
+    server) verifies on its first step, and whether its draft-probability row
+    must be the one-hot placeholder.
+
+    Without speculative decoding: the context server's tokens (None -> []).
+    Without rejection sampling: those tokens, or dummy zeros when there are
+    none (strict acceptance rejects a dummy unless the target samples it).
+    With rejection sampling: always dummy zeros verified against the one-hot
+    row at token 0. No proposal row was written on this server (the prefill
+    and any drafting ran on the context server), and a stale or uninitialized
+    row would accept the dummies or make chain_speculative_sampling emit an
+    out-of-range token id.
+
+    Returns ``(draft_tokens, needs_onehot_draft_probs)``.
+    """
+    if not enable_spec_decode:
+        return ([] if ctx_draft_tokens is None else ctx_draft_tokens), False
+    if getattr(spec_config, "use_rejection_sampling", False):
+        return [0] * max_total_draft_tokens, True
+    if not ctx_draft_tokens:
+        return [0] * max_total_draft_tokens, False
+    return ctx_draft_tokens, False
+
+
 def update_draft_len(model_engine: "ModelEngine",
                      scheduled_batch: "ScheduledRequests",
                      *,

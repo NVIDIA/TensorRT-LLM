@@ -44,6 +44,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..disaggregation.draft_kv import select_disagg_draft_kv_cache_manager
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
@@ -53,6 +54,7 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
+from ..speculative.spec_sampler_base import SpecSampler
 from ..utils import is_gdn_replay_enabled
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
@@ -77,6 +79,7 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
+from .runtime_hooks import runtime_hooks_of
 from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
@@ -825,6 +828,21 @@ def _derive_draft_max_attention_window(
     return None
 
 
+def _arm_kv_cache_opt_ins(hooks) -> None:
+    """Arm the process-wide KV-cache options ``hooks`` opt into, before any
+    cache sizing or allocation. All are off for a model that declares none."""
+    if hooks.draft_pool_fixes:
+        from .kv_cache import kv_cache_manager_v2
+        kv_cache_manager_v2.arm_draft_pool_fixes()
+    if hooks.draft_kv_reserve_guard:
+        from .kv_cache import kv_cache_manager_v2
+        kv_cache_manager_v2.arm_draft_kv_reserve_guard()
+    if hooks.msa_kv_cache_fixes:
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import \
+            cache_manager as msa_cache_manager
+        msa_cache_manager.arm_msa_kv_cache_fixes()
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -863,6 +881,7 @@ class KvCacheCreator:
     ):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
+        _arm_kv_cache_opt_ins(runtime_hooks_of(model_engine.model))
         self._mapping = mapping
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
@@ -4134,6 +4153,31 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
         "shortfall means one of them was re-derived from max_batch_size.")
 
 
+def engage_disagg_gen_init_window(model, draft_kv_cache_manager) -> bool:
+    """Size a disagg generation worker's gen-init draft mirrors for their window.
+
+    Only for a model that opts in (RuntimeHooks.disagg_draft_kv) with a separate V2 draft pool
+    and a drafter that can start from an empty window; every other model keeps the stock mirror
+    path. Without it a windowed standalone draft pool is resized for the whole prompt and fails
+    past its funding.
+    """
+    if draft_kv_cache_manager is None or not isinstance(draft_kv_cache_manager,
+                                                        KVCacheManagerV2):
+        return False
+    if not runtime_hooks_of(model).disagg_draft_kv:
+        return False
+    worker = getattr(model, "spec_worker", None)
+    if worker is None or not hasattr(worker, "seed_disagg_empty_window"):
+        return False
+    worker.engage_disagg_gen_init_window()
+    draft_kv_cache_manager.engage_disagg_gen_init_window(
+        worker.seed_disagg_empty_window)
+    logger.info(
+        "Disagg: gen-init draft mirrors hold the drafter window behind the prompt end"
+    )
+    return True
+
+
 def create_py_executor_instance(
     *,
     dist,
@@ -4511,9 +4555,33 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
-    kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+    # A standalone drafter's context window ships with the prompt KV only for a
+    # model that opts in (RuntimeHooks.disagg_draft_kv) and has a separate draft
+    # pool; every other model passes None and keeps the target-only transfer.
+    # The generation side's window sizing does not depend on the transfer (nor on
+    # its kill switch): it is engaged first.
+    disagg_draft_kv_cache_manager = None
+    if is_disagg:
+        engage_disagg_gen_init_window(
+            model_engine.model,
+            resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER))
+        disagg_draft_kv_cache_manager = select_disagg_draft_kv_cache_manager(
+            model_engine.model,
+            resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER))
+    if disagg_draft_kv_cache_manager is None:
+        kv_cache_transceiver = create_kv_cache_transceiver(
+            mapping, dist, kv_cache_manager, attention_type,
+            cache_transceiver_config, mamba_cache_manager)
+    else:
+        kv_cache_transceiver = create_kv_cache_transceiver(
+            mapping,
+            dist,
+            kv_cache_manager,
+            attention_type,
+            cache_transceiver_config,
+            mamba_cache_manager,
+            draft_kv_cache_manager=disagg_draft_kv_cache_manager,
+            draft_ctx_owner=model_engine.model.spec_worker)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
@@ -4626,7 +4694,18 @@ def instantiate_sampler(
     )
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
-        return get_spec_decoder(sampler_args, engine.spec_config)
+        sampler = get_spec_decoder(sampler_args, engine.spec_config)
+        runtime_hooks = runtime_hooks_of(engine.model)
+        if isinstance(sampler, SpecSampler):
+            if runtime_hooks.spec_step_fold is not None:
+                sampler.bind_spec_step_fold(runtime_hooks.spec_step_fold)
+            sampler.d2h_side_stream_copies = runtime_hooks.sampler_d2h_side_stream
+            sampler.static_slot_ids = runtime_hooks.spec_small_h2d
+            if runtime_hooks.sampler_d2h_side_stream:
+                logger.info(
+                    "[M3 host] spec sampler store copies on the D2H side stream"
+                )
+        return sampler
 
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine.

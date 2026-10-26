@@ -65,9 +65,10 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str) -> None:
+def run(entry: str, *, launcher_dir: Path | None = None) -> None:
     """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices."""
-    launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
+    directory = Path(__file__).resolve().parent if launcher_dir is None else launcher_dir.resolve()
+    launcher = directory / f"_{entry}_op_matrix.py"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
 
     # The ranks import tensorrt_llm absolutely, and a source checkout is not

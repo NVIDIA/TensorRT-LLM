@@ -430,6 +430,9 @@ public:
         int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize = -1,
         int32_t validIntermediateSize = -1) const;
 
+    //! The kernel names of config ``configIndex`` (its gemm1 and gemm2 kernels): a stable name for tactic caches.
+    [[nodiscard]] std::string getConfigName(int64_t configIndex) const;
+
 private:
     void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, moe::dev::convertsf::Data& convertSfData,
         moe::dev::activation::Data& activationData, moe::dev::finalize::Data& finalizeData);

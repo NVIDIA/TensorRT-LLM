@@ -27,7 +27,10 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import find_replicated_role_mismatch
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    find_replicated_role_mismatch,
+    find_replicated_size_mismatch,
+)
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -561,17 +564,27 @@ class AttentionPolicy:
         self_page_table: Optional[KVCachePageTable],
         peer_page_table: Optional[KVCachePageTable],
     ) -> None:
-        """Reject a peer whose PAGED groups declare different replicated roles.
+        """Reject a peer whose PAGED groups declare different replicated roles or sizes.
 
         Pool matching drops a view with no counterpart silently, so an
         index-key side cache the peer never declares would leave the receiver
-        holding zeroed state instead of raising. Raises ``ValueError``.
+        holding zeroed state instead of raising. A replicated view is copied
+        byte for byte, so one stored in another format on the peer (e.g. an
+        FP8 index-key cache against an NVFP4 one) is refused as well. Raises
+        ``ValueError``.
         """
         differing = find_replicated_role_mismatch(self_page_table, peer_page_table, CacheKind.PAGED)
         if differing:
             raise ValueError(
                 "AttentionPolicy.validate_peer_compatible: replicated roles differ on "
                 f"overlapping layers: {differing}"
+            )
+        resized = find_replicated_size_mismatch(self_page_table, peer_page_table, CacheKind.PAGED)
+        if resized:
+            raise ValueError(
+                "AttentionPolicy.validate_peer_compatible: replicated roles differ in "
+                "bytes per layer (role, layer, local, peer); both sides must store them "
+                f"in the same format (e.g. the same indexer_kv_dtype): {resized}"
             )
 
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:

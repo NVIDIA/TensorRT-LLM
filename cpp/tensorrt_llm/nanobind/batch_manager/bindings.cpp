@@ -26,6 +26,7 @@
 
 #include <ATen/ATen.h>
 #include <algorithm>
+#include <cstring>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/chrono.h>
@@ -363,7 +364,7 @@ void initBindings(nb::module_& m)
         .def(
             "__init__",
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
-                tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
+                tb::LlmRequest::SizeType32 max_new_tokens, nb::handle input_tokens_obj,
                 executor::SamplingConfig sampling_config, bool is_streaming,
                 std::optional<at::Tensor> prompt_embedding_table,
                 std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
@@ -404,6 +405,24 @@ void initBindings(nb::module_& m)
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
                 auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
+
+                // input_tokens: a 1-D contiguous int32 host ndarray is memcpy'd (no per-element
+                // PyLong cast, O(ISL) under the GIL); anything else uses the sequence cast.
+                std::vector<tb::LlmRequest::TokenIdType> input_tokens;
+                nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> input_tokens_arr;
+                if (nb::try_cast(input_tokens_obj, input_tokens_arr, /*convert=*/false))
+                {
+                    input_tokens.resize(input_tokens_arr.shape(0));
+                    if (input_tokens_arr.shape(0) > 0)
+                    {
+                        std::memcpy(
+                            input_tokens.data(), input_tokens_arr.data(), input_tokens_arr.shape(0) * sizeof(int32_t));
+                    }
+                }
+                else
+                {
+                    input_tokens = nb::cast<std::vector<tb::LlmRequest::TokenIdType>>(input_tokens_obj);
+                }
 
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes, multimodal_positions,

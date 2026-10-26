@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python extensions for executor requests."""
 
+import os
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -769,6 +770,20 @@ class PyResult:
         return self._encoder_output
 
 
+def _response_draft_ctx_state(request) -> Optional[List[int]]:
+    """Context-first disagg: the drafter window decision ``[ctx_len, ctx_base, ok]`` the context
+    worker's response carries to the generation request (DisaggregatedParams.draft_ctx_state).
+
+    Set by the KV transceiver's last-slice decision (``py_draft_ctx_aux``) before the response is
+    built; None for any other request.
+    """
+    draft_ctx = getattr(request, "py_draft_ctx_aux", None)
+    if draft_ctx is None or not getattr(request, "is_context_only_request",
+                                        False):
+        return None
+    return [int(draft_ctx[0]), int(draft_ctx[1]), 1 if draft_ctx[2] else 0]
+
+
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
@@ -797,6 +812,9 @@ class LlmResult:
         self.ctx_usage = None
         # Explicit context-to-generation remote-tail replay boundary.
         self.remote_tail_start: Optional[int] = None
+        # Context-first disagg: the standalone drafter's window decision [ctx_len, ctx_base, ok]
+        # for the generation request (disaggregation/draft_kv.py); never via opaque_state.
+        self.draft_ctx_state: Optional[List[int]] = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
@@ -1295,6 +1313,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         )
         if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
             llm_result.remote_tail_start = self.py_csa2_remote_tail_start
+        llm_result.draft_ctx_state = _response_draft_ctx_state(self)
         llm_result.cached_tokens = self.cached_tokens
         return LlmResponse(
             request_id=self.py_request_id
@@ -1511,6 +1530,33 @@ def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
     return state is None or state.progress is MultimodalEncoderProgress.READY
 
 
+# Hand the prompt tokens to LlmRequest as the executor request's int32 array (one copy each way) instead of a
+# list[int] round trip, O(ISL) Python objects under the GIL. A model opt-in (RuntimeHooks.context_token_array),
+# armed by the executor (arm_context_token_array): context-only requests (a disaggregated context server);
+# TRTLLM_M31_ENABLE_L1_TOKEN_ARRAY=1 extends it to every request type. Kill switch (wins):
+# TRTLLM_M31_DISABLE_L1_TOKEN_ARRAY=1.
+_L1_TOKEN_ARRAY = False
+_L1_ALL_REQUESTS = os.environ.get("TRTLLM_M31_ENABLE_L1_TOKEN_ARRAY",
+                                  "0") == "1"
+
+
+def arm_context_token_array() -> None:
+    """Take the int32 prompt-token path in this process (RuntimeHooks.context_token_array), unless killed."""
+    global _L1_TOKEN_ARRAY
+    _L1_TOKEN_ARRAY = os.environ.get("TRTLLM_M31_DISABLE_L1_TOKEN_ARRAY",
+                                     "0") != "1"
+
+
+def _l1_input_tokens(executor_request: ExecutorRequest):
+    """The executor request's prompt tokens for LlmRequest: its int32 array where the array path applies, else the
+    list."""
+    if (_L1_TOKEN_ARRAY and hasattr(executor_request, "input_token_ids_np")
+            and (_L1_ALL_REQUESTS or executor_request.request_type
+                 == tllm_executor.RequestType.REQUEST_TYPE_CONTEXT_ONLY)):
+        return executor_request.input_token_ids_np
+    return executor_request.input_token_ids
+
+
 def executor_request_to_llm_request(
         req_id: int,
         executor_request: ExecutorRequest,
@@ -1520,7 +1566,8 @@ def executor_request_to_llm_request(
         position_ids: Optional[List] = None) -> LlmRequest:
     sampling_config = executor_request.sampling_config
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    input_tokens = (input_token_ids if input_token_ids is not None else
+                    _l1_input_tokens(executor_request))
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     # Kept in its native list[list[int]] form, like py_bad_words. The
