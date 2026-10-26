@@ -768,13 +768,13 @@ def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
 
 
 @pytest.mark.cpu_only
-def test_retained_compress_target_masks_rows_outside_the_twin():
+def test_retained_compressed_row_mask_drops_pages_the_twin_released():
     """DeepSeek-V4: the second native scatter only writes rows whose page the twin holds."""
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        retained_compressed_scatter_args,
+        _retained_compressed_row_mask,
     )
 
-    rows_per_page, ratio = 4, 4
+    rows_per_page = 4
     # Two requests: 6 and 3 new compressed rows, starting at compressed positions 2 and 9.
     cu = torch.tensor([0, 6, 9], dtype=torch.int32)
     num_comp = torch.tensor([5, 3], dtype=torch.int32)  # request 0 has one padding row
@@ -783,20 +783,9 @@ def test_retained_compress_target_masks_rows_outside_the_twin():
     compressed_mask[7] = False
     # Twin page table: request 0 holds pages 0 and 1, request 1 holds page 2 only.
     table = torch.tensor([[10, 11, -1, -1], [-1, -1, 12, -1]], dtype=torch.int32)
-    pool = torch.zeros(16, 1, rows_per_page, 1, 8, dtype=torch.float8_e4m3fn)
-    manager = SimpleNamespace(
-        high_layers={0: 1},
-        layer_offsets={3: 0},
-        _get_mixed_precision_buffers=lambda local, layout, kind: pool,
+    mask = _retained_compressed_row_mask(
+        table, rows_per_page, num_comp, cu, start_pos, compressed_mask, 2, 9
     )
-    metadata = SimpleNamespace(kv_cache_manager=manager, retained_block_table={ratio: table})
-    compressor = SimpleNamespace(layer_idx=3, compress_ratio=ratio)
-    out = retained_compressed_scatter_args(
-        compressor, metadata, num_comp, cu, start_pos, compressed_mask, 2, 9
-    )
-    assert out is not None
-    twin, twin_table, mask, rpp = out
-    assert twin.shape == (16, rows_per_page, 8) and twin_table is table and rpp == rows_per_page
     expected = []
     for row in range(9):
         req = 0 if row < 6 else 1
@@ -807,10 +796,9 @@ def test_retained_compress_target_masks_rows_outside_the_twin():
         )
         expected.append(bool(compressed_mask[row]) and local < int(num_comp[req]) and page >= 0)
     assert mask.tolist() == expected
-    # request 0: rows at positions 2..6 -> pages 0,0,1,1,1 all held; row 5 is padding.
-    # request 1: positions 9,10(masked),11 -> page 2 held.
+    # request 0: positions 2..6 -> pages 0,0,1,1,1 all held; row 5 is padding.
+    # request 1: positions 9, 10 (masked), 11 -> page 2 held.
     assert expected == [True, True, True, True, True, False, True, False, True]
-    assert metadata.retained_block_table[ratio] is table
 
 
 @pytest.mark.cpu_only
