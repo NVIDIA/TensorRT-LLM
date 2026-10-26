@@ -1461,7 +1461,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
-    retained_dtype: Optional[DataType] = None
+    high_precision_dtype: Optional[DataType] = None
     # Set by each manager class that hosts retained-token twins; not inherited.
     _supports_mixed_precision_kv = True
     # Read by KvCacheCreator: a subclass that overrides the context
@@ -3535,7 +3535,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Local layer id -> layer id of its retained-token (high-precision) twin.
         self.high_layers: dict[int, int] = {}
         self.low_precision_dtype: Optional[DataType] = None
-        self.retained_dtype: Optional[DataType] = None
+        self.high_precision_dtype: Optional[DataType] = None
         self.first_n = self.last_n = 0
         # The engine's sequence capacity. KV estimation lowers self.max_seq_len
         # to fit the temporary cache; the attention staging copy is sized from
@@ -3555,9 +3555,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
-        self.retained_dtype = str_dtype_to_binding(mixed.high)
+        self.high_precision_dtype = str_dtype_to_binding(mixed.high)
         # Native NVFP4 pools (sparse MLA) stay the low-precision pool; twins use mixed.high.
-        if dtype != self.retained_dtype and dtype != DataType.NVFP4:
+        if dtype != self.high_precision_dtype and dtype != DataType.NVFP4:
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
@@ -3632,7 +3632,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.tokens_per_block
                 * self.num_kv_heads_per_layer[layer_id]
                 * self.head_dim_per_layer[layer_id],
-                self.retained_dtype,
+                self.high_precision_dtype,
             )
             buffers = [
                 BufferConfig(role=buffer.role, size=page_bytes)
@@ -3680,7 +3680,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 // self.num_kv_heads_per_layer[layer_offset]
             )
         else:
-            layer, dtype = self.high_layers[layer_offset], self.retained_dtype
+            layer, dtype = self.high_layers[layer_offset], self.high_precision_dtype
             width = self.head_dim_per_layer[layer_offset]
         address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
         shape = [

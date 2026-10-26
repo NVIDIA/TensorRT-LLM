@@ -1,0 +1,314 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Retained-token rows for sparse MLA backends whose history lives in a native NVFP4 pool.
+
+The KV append also writes each token's row into the manager's retained-token twin layer;
+after the backend's top-k gather, the rows the twin still holds replace the dequantized
+rows in its FP8 scratch. Twin page table: page >= 0 means retained.
+"""
+
+from typing import Optional
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _copy_kv_row(
+    src_ptr,
+    src_row,
+    dst_ptr,
+    dst_row,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
+    ROW_WIDTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < ROW_WIDTH
+    row = tl.load(src_ptr + src_row.to(tl.int64) * ROW_WIDTH + offsets, mask=mask, other=0.0)
+    if APPLY_SCALE:
+        # Per-tensor FP8 KV scale, as the native append kernel applies it.
+        row = row.to(tl.float32) * tl.load(scale_ptr)
+    tl.store(
+        dst_ptr + dst_row.to(tl.int64) * ROW_WIDTH + offsets,
+        row.to(dst_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+@triton.jit
+def _store_retained_rows_kernel(
+    rows_ptr,
+    request_ptr,
+    position_ptr,
+    block_table_ptr,
+    block_table_stride,
+    num_requests,
+    max_blocks,
+    kv_cache_ptr,
+    num_blocks,
+    tokens_per_block,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
+    ROW_WIDTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """One program per token: store its row at its position in the retained pool, if held."""
+    token = tl.program_id(0)
+    request = tl.load(request_ptr + token)
+    position = tl.load(position_ptr + token)
+    block = position // tokens_per_block
+    valid = (position >= 0) & (block < max_blocks) & (request >= 0) & (request < num_requests)
+    page = tl.load(block_table_ptr + request * block_table_stride + block, mask=valid, other=-1)
+    if (page >= 0) & (page < num_blocks):
+        slot = page.to(tl.int64) * tokens_per_block + position % tokens_per_block
+        _copy_kv_row(
+            rows_ptr, token, kv_cache_ptr, slot, scale_ptr, APPLY_SCALE, ROW_WIDTH, BLOCK_SIZE
+        )
+
+
+@triton.jit
+def _overlay_retained_rows_kernel(
+    topk_ptr,
+    topk_stride,
+    compact_ptr,
+    compact_stride,
+    request_ptr,
+    block_table_ptr,
+    block_table_stride,
+    num_requests,
+    max_blocks,
+    kv_cache_ptr,
+    num_blocks,
+    scratch_ptr,
+    scratch_rows,
+    tokens_per_block,
+    topk,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
+    ROW_WIDTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """One program per (query row, selected token): replace the scratch row if the twin holds it."""
+    pair = tl.program_id(0)
+    query = pair // topk
+    position = tl.load(topk_ptr + query.to(tl.int64) * topk_stride + pair % topk)
+    scratch_row = tl.load(compact_ptr + query.to(tl.int64) * compact_stride + pair % topk)
+    request = tl.load(request_ptr + query)
+    # Padded entries of the index tensors hold stale values; bound them like the backends do.
+    block = position // tokens_per_block
+    valid = (
+        (position >= 0) & (block < max_blocks) & (scratch_row >= 0) & (scratch_row < scratch_rows)
+    )
+    valid = valid & (request >= 0) & (request < num_requests)
+    if valid:
+        page = tl.load(block_table_ptr + request * block_table_stride + block)
+        if (page >= 0) & (page < num_blocks):
+            slot = page.to(tl.int64) * tokens_per_block + position % tokens_per_block
+            _copy_kv_row(
+                kv_cache_ptr,
+                slot,
+                scratch_ptr,
+                scratch_row,
+                scale_ptr,
+                APPLY_SCALE,
+                ROW_WIDTH,
+                BLOCK_SIZE,
+            )
+
+
+def _retained_block_table(metadata, owner) -> Optional[torch.Tensor]:
+    """Retained page table ``owner`` uses (one per compression ratio on DeepSeek-V4)."""
+    table = getattr(metadata, "retained_block_table", None)
+    if isinstance(table, dict):
+        table = table.get(getattr(owner, "compress_ratio", None))
+    return table
+
+
+def _retained_kv_cache(metadata, owner) -> Optional[torch.Tensor]:
+    """``[num_blocks, tokens_per_block, row]`` view of ``owner``'s retained pool, else None."""
+    if _retained_block_table(metadata, owner) is None:
+        return None
+    manager = metadata.kv_cache_manager
+    high_layers = getattr(manager, "high_layers", None)
+    if not high_layers:
+        return None
+    local = manager.layer_offsets.get(owner.layer_idx)
+    if local not in high_layers:
+        return None
+    # [blocks, kv_factor, tokens, heads, width] with one head and no value half.
+    pool = manager._get_mixed_precision_buffers(local, "NHD", "high")
+    return pool.view(pool.shape[0], pool.shape[2], -1)
+
+
+def _block_size(row_width: int) -> int:
+    return max(16, triton.next_power_of_2(row_width))
+
+
+def store_retained_rows(
+    metadata,
+    owner,
+    rows: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+) -> None:
+    """Store ``rows`` (RoPE applied) in ``owner``'s retained pool (FP8 pool: ``row * scale``)."""
+    kv_cache = _retained_kv_cache(metadata, owner)
+    if kv_cache is None:
+        return
+    rows = rows.reshape(rows.shape[0], -1)
+    if rows.shape[0] == 0:
+        return
+    if not rows.is_contiguous():
+        rows = rows.contiguous()
+    row_width = kv_cache.shape[-1]
+    assert rows.shape[1] == row_width, (rows.shape, row_width)
+    block_table = _retained_block_table(metadata, owner)
+    apply_scale = scale is not None and kv_cache.dtype == torch.float8_e4m3fn
+    _store_retained_rows_kernel[(rows.shape[0],)](
+        rows,
+        requests,
+        positions,
+        block_table,
+        block_table.stride(0),
+        block_table.shape[0],
+        block_table.shape[1],
+        kv_cache,
+        kv_cache.shape[0],
+        kv_cache.shape[1],
+        scale if apply_scale else kv_cache,
+        APPLY_SCALE=apply_scale,
+        ROW_WIDTH=row_width,
+        BLOCK_SIZE=_block_size(row_width),
+    )
+
+
+def store_retained_context_rows(attention, metadata, latent_cache: torch.Tensor) -> None:
+    """Context phase: the append kernel wrote the rotated k_pe back into ``latent_cache``."""
+    positions = getattr(metadata, "retained_context_positions", None)
+    if positions is None:
+        return
+    num_ctx = metadata.num_ctx_tokens
+    store_retained_rows(
+        metadata,
+        attention,
+        latent_cache[:num_ctx],
+        metadata.req_idx_per_token[:num_ctx],
+        positions,
+        attention.kv_scale_orig_quant,
+    )
+
+
+def store_retained_generation_rows(
+    attention, metadata, latent_cache: torch.Tensor, position_ids: torch.Tensor
+) -> None:
+    """Generation: rotate k_pe like the append kernel (the fused kernel leaves it unrotated)."""
+    if _retained_kv_cache(metadata, attention) is None:
+        return
+    rows = latent_cache.reshape(latent_cache.shape[0], -1)
+    num_rows = rows.shape[0]
+    if num_rows == 0:
+        return
+    assert position_ids is not None, "the retained-row store needs the generation positions"
+    # Generation tokens are the trailing positions whichever slice the caller passes.
+    positions = position_ids.reshape(-1)[-num_rows:]
+    num_ctx = metadata.num_ctx_tokens
+    rope_dim = attention.mla_params.qk_rope_head_dim
+    rotated = rows.float()
+    k_pe = rotated[:, -rope_dim:].view(num_rows, rope_dim // 2, 2)
+    cos_sin = attention.rotary_cos_sin.view(-1, rope_dim, 2)[positions.long(), : rope_dim // 2]
+    cos, sin = cos_sin[..., 0], cos_sin[..., 1]
+    x, y = k_pe[..., 0].clone(), k_pe[..., 1].clone()
+    k_pe[..., 0] = x * cos - y * sin
+    k_pe[..., 1] = y * cos + x * sin
+    store_retained_rows(
+        metadata,
+        attention,
+        # Round to the activation dtype first, like the append kernel.
+        rotated.to(rows.dtype),
+        metadata.req_idx_per_token[num_ctx : num_ctx + num_rows],
+        positions,
+        attention.kv_scale_orig_quant,
+    )
+
+
+def retained_compressed_scatter_args(
+    compressor,
+    metadata,
+    num_comp_tokens: torch.Tensor,
+    cu_new_comp_kv: torch.Tensor,
+    start_pos: torch.Tensor,
+    compressed_mask: torch.Tensor,
+    batch_size: int,
+    total_rows: int,
+):
+    """``(kv_cache, block_table, mask, tokens_per_block)`` for a second native compressor scatter.
+
+    The native scatter addresses pages straight from the table it is given, so the mask also
+    drops the rows whose page the twin does not hold (-1 in the table). Returns None without a twin.
+    """
+    kv_cache = _retained_kv_cache(metadata, compressor)
+    if kv_cache is None or total_rows == 0 or batch_size == 0:
+        return None
+    block_table = _retained_block_table(metadata, compressor)
+    tokens_per_block = kv_cache.shape[1]
+    row = torch.arange(total_rows, device=kv_cache.device, dtype=torch.int32)
+    request = torch.searchsorted(cu_new_comp_kv[1 : batch_size + 1], row, right=True)
+    request = request.clamp_(max=batch_size - 1)
+    local = row - cu_new_comp_kv[request]
+    position = start_pos[request] + local
+    block = torch.div(position, tokens_per_block, rounding_mode="floor").clamp_(
+        min=0, max=block_table.shape[1] - 1
+    )
+    page = block_table[request.clamp(max=block_table.shape[0] - 1), block]
+    mask = compressed_mask & (local < num_comp_tokens[request]) & (position >= 0) & (page >= 0)
+    return kv_cache, block_table, mask, tokens_per_block
+
+
+def overlay_retained_rows(
+    attention,
+    metadata,
+    topk_indices: torch.Tensor,
+    requests: torch.Tensor,
+    compact_indices: torch.Tensor,
+    scratch: torch.Tensor,
+) -> None:
+    """After the gather: copy the retained rows over the dequantized scratch rows.
+
+    ``topk_indices``: selected positions per query row (-1 = none); ``requests``: that row's
+    request; ``compact_indices``: the scratch row the gather used for each pair (-1 = none).
+    """
+    kv_cache = _retained_kv_cache(metadata, attention)
+    if kv_cache is None:
+        return
+    num_rows, topk = topk_indices.shape
+    if num_rows == 0 or topk == 0:
+        return
+    assert topk_indices.stride(1) == 1 and compact_indices.stride(1) == 1
+    row_width = kv_cache.shape[-1]
+    block_table = _retained_block_table(metadata, attention)
+    apply_scale = kv_cache.dtype != scratch.dtype
+    _overlay_retained_rows_kernel[(num_rows * topk,)](
+        topk_indices,
+        topk_indices.stride(0),
+        compact_indices,
+        compact_indices.stride(0),
+        requests,
+        block_table,
+        block_table.stride(0),
+        block_table.shape[0],
+        block_table.shape[1],
+        kv_cache,
+        kv_cache.shape[0],
+        scratch,
+        scratch.numel() // row_width,
+        kv_cache.shape[1],
+        topk,
+        attention.kv_scale_orig_quant if apply_scale else kv_cache,
+        APPLY_SCALE=apply_scale,
+        ROW_WIDTH=row_width,
+        BLOCK_SIZE=_block_size(row_width),
+    )

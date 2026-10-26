@@ -1111,13 +1111,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
         # Mixed-precision KV: retained-pool page table in block_table row order, -1 = not retained.
-        self.mixed_high_block_table = None
-        self.mixed_ctx_positions = None
+        self.retained_block_table = None
+        self.retained_context_positions = None
         if getattr(self.kv_cache_manager, "high_layers", None):
-            self.mixed_high_block_table = self.get_empty(
+            self.retained_block_table = self.get_empty(
                 self.cuda_graph_buffers,
                 [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
-                cache_name="mixed_high_block_table",
+                cache_name="retained_block_table",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
@@ -2094,7 +2094,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table[: self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True
         )
-        high_table = getattr(self, "mixed_high_block_table", None)
+        high_table = getattr(self, "retained_block_table", None)
         if high_table is not None and self.kv_cache_manager.high_layers:
             table = torch.full(
                 (self.num_seqs, max_blocks_used), -1, dtype=torch.int32, pin_memory=prefer_pinned()
@@ -2106,7 +2106,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
             high_table[: self.num_seqs, :max_blocks_used].copy_(table, non_blocking=True)
             # Absolute position of every context token, for the retained-row write.
-            self.mixed_ctx_positions = None
+            self.retained_context_positions = None
             if self.num_ctx_tokens > 0:
                 positions = torch.empty(
                     self.num_ctx_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
@@ -2121,7 +2121,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     ],
                     out=positions,
                 )
-                self.mixed_ctx_positions = positions.to(high_table.device, non_blocking=True)
+                self.retained_context_positions = positions.to(high_table.device, non_blocking=True)
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens

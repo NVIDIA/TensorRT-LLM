@@ -21,7 +21,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..mixed_precision_overlay import overlay_rows
+from ..mixed_precision_retained_rows import overlay_retained_rows
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -230,7 +230,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
                 metadata._cached_num_pool_tokens,
             )
-            overlay_rows(
+            overlay_retained_rows(
                 self, metadata, topk_indices, metadata._cached_req_idx_ctx, compact_indices, scratch
             )
             metadata.nvfp4_mla_context_fp8_scratch = scratch
@@ -263,7 +263,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
                 metadata._cached_num_pool_tokens,
             )
-            overlay_rows(
+            overlay_retained_rows(
                 self,
                 metadata,
                 topk_indices,
