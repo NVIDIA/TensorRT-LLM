@@ -34,7 +34,10 @@ enum class MpiTag : int
     kContextTransferUpdate = 1029,
 
     // NCCL window allocation host consensus.
-    kNcclWindowAllocation = 1030
+    kNcclWindowAllocation = 1030,
+
+    // NCCL communicator bootstrap.
+    kNcclUniqueId = 1031
 };
 
 } // namespace tensorrt_llm::mpi
