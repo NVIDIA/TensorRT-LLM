@@ -227,7 +227,8 @@ class SelectionOptions:
             "divide the machine by an allocation policy, each test landing "
             "on the smallest rung that holds it. A test needing more GPUs "
             "than the largest rung is deselected. No rung may exceed the "
-            "machine's GPUs per node",
+            "machine's GPUs per node. The record's profile keeps the ladder used, "
+            "so for this host it becomes local.json's",
         )
         group.addoption(
             "--selection-out-dir",
