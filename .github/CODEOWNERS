@@ -480,4 +480,4 @@
 /tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs
 
 # Uncomment only on release branches (e.g. release/0.19):
-# * @NVIDIA/trt-llm-release-branch-approval
+* @NVIDIA/trt-llm-release-branch-approval
