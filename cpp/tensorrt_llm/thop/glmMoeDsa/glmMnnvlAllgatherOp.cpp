@@ -15,9 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/kernels/glmMoeDsa/glmMnnvlAllgather.h"
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -37,9 +36,11 @@ at::Tensor glmMnnvlAllgather(
     at::Tensor const& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, int64_t group_size)
 {
     char const* op = "glm_mnnvl_allgather";
-    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    auto mcastMem = tensorrt_llm::runtime::getMcastDevMemBuffer(comm_buffer);
     TORCH_CHECK(mcastMem != nullptr, op, ": comm_buffer must be obtained from a McastGPUBuffer instance");
     TORCH_CHECK(mcastMem->isMapped(), op, ": the MNNVL workspace handles are not attached");
+    TORCH_CHECK(comm_buffer.data_ptr() == mcastMem->getUnicastPtr(mcastMem->getRank()), op,
+        ": comm_buffer must start at the local unicast allocation base");
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
     TORCH_CHECK(input.dim() >= 1, op, ": input must have at least one dimension");

@@ -516,13 +516,71 @@ def mnnvl_rejects_shifted_workspace(tensor_parallel_size: int,
                                                 None,
                                                 int(AllReduceFusionOp.RMS_NORM))
 
-    for workspace in (base, base.view(8, 8)):
-        with pytest.raises(RuntimeError,
-                           match="input must have at least 2 dimensions"):
-            invoke(workspace)
-    for workspace in (sliced, shifted_storage):
-        with pytest.raises(RuntimeError, match="local unicast allocation base"):
-            invoke(workspace)
+    def invoke_allgather(workspace: torch.Tensor) -> None:
+        torch.ops.trtllm.glm_mnnvl_allgather(input_tensor.float(), workspace,
+                                             flags, tensor_parallel_size)
+
+    def invoke_hist_topk(workspace: torch.Tensor) -> None:
+        torch.ops.trtllm.glm_dsa_hist_topk(input_tensor, flags, flags,
+                                           workspace, flags, 1,
+                                           tensor_parallel_size)
+
+    def invoke_hop(workspace: torch.Tensor) -> None:
+        rows = input_tensor.view(1, 8)
+        torch.ops.trtllm.glm_mnnvl_hop(rows, rows, norm_weight, 1e-5, workspace,
+                                       flags, False)
+
+    def invoke_draft(workspace: torch.Tensor) -> None:
+        torch.ops.trtllm.glm_draft_sample_glue(logits=input_tensor,
+                                               exchange_buffer=workspace,
+                                               exchange_flags=flags,
+                                               group_size=tensor_parallel_size,
+                                               draft_tokens=flags,
+                                               draft_step=0,
+                                               embed_table=None,
+                                               hidden=None,
+                                               enorm_weight=None,
+                                               hnorm_weight=None,
+                                               eps=1e-5,
+                                               col_lo=0,
+                                               col_hi=0,
+                                               glue_out=None,
+                                               positions_in=None,
+                                               positions_out=None,
+                                               gather_ids=None,
+                                               seq_lens=None,
+                                               fill_seq_lens=False,
+                                               kv_lens=None,
+                                               kv_update=0,
+                                               rewind_accepted=None,
+                                               draft_len=0,
+                                               block_offsets=None,
+                                               dsa_layout=[],
+                                               req_idx_per_token=None,
+                                               slot_mapping_fp8=None,
+                                               slot_mapping_scale=None,
+                                               gen_kv_indptr=None,
+                                               gen_cached_token_indptr=None,
+                                               accepted_tokens=None,
+                                               batch_indices=None,
+                                               num_accepted=None,
+                                               next_new_tokens=None)
+
+    # Each valid base reaches an independent argument check before any kernel launch.
+    for call, argument_error in (
+        (invoke, "input must have at least 2 dimensions"),
+        (invoke_allgather, "input must be BF16"),
+        (invoke_hist_topk, "logits must be a row-major FP32 matrix"),
+        (invoke_hop, "comm_buffer must be the"),
+        (invoke_draft, r"logits must be \[rows, vocab_shard\]"),
+    ):
+        for workspace in (base, base.view(8, 8)):
+            with pytest.raises(RuntimeError, match=argument_error):
+                call(workspace)
+        for workspace in (sliced, shifted_storage):
+            with pytest.raises(RuntimeError,
+                               match="local unicast allocation base"):
+                call(workspace)
     return True
 
 
