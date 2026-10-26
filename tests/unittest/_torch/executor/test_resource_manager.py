@@ -17,6 +17,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -26,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import binding_to_str_dtype
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -45,6 +48,16 @@ LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
+
+
+def _text_lora_model_config(model_config: ModelConfigCpp) -> LoraModelConfig:
+    return LoraModelConfig(
+        lora_target_modules=[],
+        trtllm_modules_to_hf_modules={},
+        hidden_size=model_config.hidden_size,
+        dtype=binding_to_str_dtype(model_config.data_type),
+        owner=DecoderLoraOwner(),
+    )
 
 
 def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
@@ -495,6 +508,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         self.assertTrue(peft_cache_manager.impl.enabled)
@@ -509,6 +523,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=self.create_peft_cache_config(),
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
             initial_data_type=torch.float8_e4m3fn,
         )
 
@@ -522,6 +537,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 0
@@ -540,6 +556,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         empty_context = []
@@ -556,6 +573,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 3
@@ -590,6 +608,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 0
@@ -1231,11 +1250,45 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
             execution_stream=execution_stream,
         )
 
         # The PeftCacheManager should be created successfully with the provided stream
         self.assertTrue(peft_cache_manager.impl.enabled)
+
+    def _reload_ckpt_source(self, server_ckpt_source, request_ckpt_source):
+        """Return the ckpt_source add_request_peft reloads an adapter with."""
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=self.create_peft_cache_config(),
+            lora_config=LoraConfig(lora_ckpt_source=server_ckpt_source),
+            model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
+        )
+        peft_cache_manager.impl = MagicMock()
+        peft_cache_manager.impl.is_task_cached.return_value = False
+        lora_manager = MagicMock()
+        lora_manager.cpp_lora_weights = {7: torch.zeros(1)}
+        lora_manager.cpp_lora_config = {7: torch.zeros(1)}
+        peft_cache_manager._lora_manager = lora_manager
+
+        request = self._create_request(request_id=0, task_id=7)
+        request.py_lora_path = "/path/to/adapter"
+        request.py_lora_ckpt_source = request_ckpt_source
+        peft_cache_manager.add_request_peft(request)
+
+        lora_manager.load_from_ckpt.assert_called_once()
+        return lora_manager.load_from_ckpt.call_args.kwargs["ckpt_source"]
+
+    def test_add_request_peft_reloads_with_request_ckpt_source(self):
+        """The engine-side reload uses the format the request was admitted with."""
+        self.assertEqual(self._reload_ckpt_source("nemo", "hf"), "hf")
+        self.assertEqual(self._reload_ckpt_source("hf", "nemo"), "nemo")
+
+    def test_add_request_peft_reload_defaults_to_config_ckpt_source(self):
+        """Without a per-request format, the reload uses the LoRA config's."""
+        self.assertEqual(self._reload_ckpt_source("nemo", None), "nemo")
+        self.assertEqual(self._reload_ckpt_source("hf", None), "hf")
 
 
 @pytest.mark.cpu_only

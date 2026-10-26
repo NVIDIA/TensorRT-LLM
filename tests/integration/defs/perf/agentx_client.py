@@ -69,6 +69,11 @@ DEFAULT_AIPERF_REF = (
     "@754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 )
 
+# aiperf's idle-connection keep-alive, in seconds. Must stay below the server's
+# own keep-alive timeout: trtllm-serve's is 5 s (TIMEOUT_KEEP_ALIVE in
+# tensorrt_llm/serve/openai_server.py).
+AIPERF_HTTP_KEEPALIVE_TIMEOUT_S = 4
+
 # aiperf's CLI/serialization/UI dependencies. The TRT-LLM container already
 # carries its ML stack (numpy/pandas/torch/huggingface-hub/aiohttp); installing
 # only this set has been verified to add packages without reinstalling the
@@ -218,8 +223,14 @@ def aiperf_is_usable() -> bool:
     return result.returncode == 0
 
 
-def post_one_token(url: str, model: str, timeout: float) -> "str | None":
-    """POST a 1-token non-streaming completion. Returns the body, or None on failure."""
+def post_one_token(
+    url: str, model: str, timeout: float, *, fail_on_client_error: bool = False
+) -> "str | None":
+    """POST one token, optionally raising with the reason for a rejected request.
+
+    Transport failures, server errors, and retryable HTTP 408/429 responses
+    return None. Heartbeats also ignore request rejections by default.
+    """
     payload = json.dumps(
         {
             "model": model,
@@ -237,6 +248,15 @@ def post_one_token(url: str, model: str, timeout: float) -> "str | None":
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode(errors="replace")
+    except urllib.error.HTTPError as error:
+        if fail_on_client_error and 400 <= error.code < 500 and error.code not in (408, 429):
+            with error:
+                body = error.read(2048).decode(errors="replace")
+            raise RuntimeError(
+                f"{req.full_url} rejected the 1-token readiness request: HTTP {error.code}: {body}"
+            ) from error
+        error.close()
+        return None
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
 
@@ -300,27 +320,25 @@ def ensure_aiperf(url: str, model: str) -> None:
 def verify_endpoint(url: str, model: str) -> None:
     """Prove the endpoint serves one real token before spending GPU-hours.
 
-    The harness has already waited for the disagg server, so this is a short
-    confirmation rather than the reference script's 5400 s poll. It exists
-    because a broken ctx->gen KV path answers /health perfectly well and only
-    fails once real traffic arrives -- an hour later, as a client-side error.
+    A healthy process may still reject inference requests or fail to generate.
+    This check applies to both aggregated and disaggregated servers. Permanent
+    request errors fail immediately with the response body; transient failures
+    retain the readiness retry budget.
     """
     timeout = _env_int("AGENTX_READY_TIMEOUT", 900)
     interval = _env_int("AGENTX_READY_INTERVAL", 15)
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        last = post_one_token(url, model, timeout=300)
+        last = post_one_token(url, model, timeout=300, fail_on_client_error=True)
         if last and '"choices"' in last:
-            _log("1-token completion OK -- the disagg path is live")
+            _log("1-token completion OK -- the inference endpoint is ready")
             return
         _log(f"not serving yet (response head: {str(last)[:200]})")
         time.sleep(interval)
     raise RuntimeError(
-        f"{url} could not complete ONE token within {timeout}s. This is a "
-        f"SERVER-side failure: inspect the ctx/gen worker logs and the disagg "
-        f"server log, not the client. Suspect the ctx->gen KV transfer "
-        f"(on GB300/NVL72 check UCX_TLS contains no 'rc'). "
+        f"{url} could not complete ONE token within {timeout}s. "
+        f"Inspect the inference server logs and readiness request failures. "
         f"Last response: {str(last)[:500]}"
     )
 
@@ -601,6 +619,12 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
     # Custom tokenizers (e.g. deepseek_v4) are loaded in aiperf's worker
     # processes, which do not inherit a CLI trust flag.
     os.environ["HF_HUB_TRUST_REMOTE_CODE"] = "1"
+    # trtllm-serve closes a connection that has been idle for its keep-alive
+    # timeout (5 s). aiperf keeps idle pooled connections for 300 s, so it can
+    # write a request into a connection the server is closing at that moment,
+    # which fails as ClientOSError "Connection reset by peer". Dropping idle
+    # connections on the client side first avoids that.
+    os.environ.setdefault("AIPERF_HTTP_KEEPALIVE_TIMEOUT", str(AIPERF_HTTP_KEEPALIVE_TIMEOUT_S))
 
     ensure_aiperf(url, args.model)
     verify_endpoint(url, args.model)

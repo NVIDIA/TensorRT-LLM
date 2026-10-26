@@ -239,15 +239,6 @@ class _Frontend:
 
 
 @pytest.fixture
-def media_pools():
-    with (
-        ThreadPoolExecutor(max_workers=2, thread_name_prefix="test_input") as input_pool,
-        ThreadPoolExecutor(max_workers=2, thread_name_prefix="test_media") as media_pool,
-    ):
-        yield input_pool, media_pool
-
-
-@pytest.fixture
 def image_llm(monkeypatch):
     _set_video_runtime_available(monkeypatch, True)
     config = _ImageConfig()
@@ -1434,7 +1425,7 @@ async def test_placeholder_mismatch_does_not_poison_hashing(
 @pytest.mark.parametrize("outcome", ["complete", "local_abort", "coordinator_abort", "rpc_cancel"])
 @pytest.mark.parametrize("modality", ["image", "video"])
 async def test_media_preprocessing_is_offloaded_and_abort_aware(
-    image_video_llm, monkeypatch, outcome, media_pools, modality
+    image_video_llm, monkeypatch, outcome, modality
 ):
     capability_llm = image_video_llm
     llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
@@ -1504,94 +1495,99 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(
     monkeypatch.setattr(request_mapping, "VideoMediaIO", _ImageIo)
     monkeypatch.setattr(llm, "preprocess", preprocess)
     monkeypatch.setattr(llm, "generate_async", generate_async)
-    frontend = _Frontend()
-    servicer = OpenEngineInferenceServicer(
-        llm,
-        model="image-model",
-        frontend=frontend,
-        input_executor=media_pools[0],
-        media_executor=media_pools[1],
-    )
-    request = generation_pb2.GenerateRequest(
-        request_id="preprocessing",
-        model="image-model",
-        prompt=f"<{modality}_1>",
-        media=[
-            generation_pb2.MediaItem(
-                modality=(
-                    generation_pb2.MODALITY_IMAGE
-                    if modality == "image"
-                    else generation_pb2.MODALITY_VIDEO
-                ),
-                raw_bytes=b"media",
-            )
-        ],
-    )
-    context = FakeServicerContext()
-
-    async def collect():
-        token = request_context.set("image-request")
-        try:
-            return [response async for response in servicer.Generate(request, context)]
-        finally:
-            request_context.reset(token)
-
-    task = asyncio.create_task(collect())
-    try:
-        await asyncio.wait_for(started.wait(), timeout=2)
-        text_request = generation_pb2.GenerateRequest(
-            request_id="concurrent-text", model="image-model", prompt="hello"
+    # Pools must close during the call phase, before pytest-threadleak's snapshot.
+    with (
+        ThreadPoolExecutor(max_workers=2, thread_name_prefix="test_input") as input_pool,
+        ThreadPoolExecutor(max_workers=2, thread_name_prefix="test_media") as media_pool,
+    ):
+        frontend = _Frontend()
+        servicer = OpenEngineInferenceServicer(
+            llm,
+            model="image-model",
+            frontend=frontend,
+            input_executor=input_pool,
+            media_executor=media_pool,
         )
+        request = generation_pb2.GenerateRequest(
+            request_id="preprocessing",
+            model="image-model",
+            prompt=f"<{modality}_1>",
+            media=[
+                generation_pb2.MediaItem(
+                    modality=(
+                        generation_pb2.MODALITY_IMAGE
+                        if modality == "image"
+                        else generation_pb2.MODALITY_VIDEO
+                    ),
+                    raw_bytes=b"media",
+                )
+            ],
+        )
+        context = FakeServicerContext()
 
-        async def collect_text():
-            return [
-                response
-                async for response in servicer.Generate(text_request, FakeServicerContext())
-            ]
+        async def collect():
+            token = request_context.set("image-request")
+            try:
+                return [response async for response in servicer.Generate(request, context)]
+            finally:
+                request_context.reset(token)
 
-        assert await asyncio.wait_for(collect_text(), timeout=1)
-        assert submitted == ["hello"]
-        if outcome == "complete":
-            release.set()
-            assert await asyncio.wait_for(task, timeout=2)
-            assert submitted[1] is preprocessed
-        elif outcome == "rpc_cancel":
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, timeout=1)
-            assert context.abort_code is None
-        else:
-            if outcome == "local_abort":
-                assert servicer.abort_request_by_id(request.request_id)
+        task = asyncio.create_task(collect())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            text_request = generation_pb2.GenerateRequest(
+                request_id="concurrent-text", model="image-model", prompt="hello"
+            )
+
+            async def collect_text():
+                return [
+                    response
+                    async for response in servicer.Generate(text_request, FakeServicerContext())
+                ]
+
+            assert await asyncio.wait_for(collect_text(), timeout=1)
+            assert submitted == ["hello"]
+            if outcome == "complete":
+                release.set()
+                assert await asyncio.wait_for(task, timeout=2)
+                assert submitted[1] is preprocessed
+            elif outcome == "rpc_cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+                assert context.abort_code is None
             else:
-                assert frontend.reservations[0].abort()
-            with pytest.raises(AbortError):
-                await asyncio.wait_for(task, timeout=1)
-            assert context.abort_code == grpc.StatusCode.CANCELLED
-    finally:
-        release.set()
-        await asyncio.wait_for(finished.wait(), timeout=2)
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+                if outcome == "local_abort":
+                    assert servicer.abort_request_by_id(request.request_id)
+                else:
+                    assert frontend.reservations[0].abort()
+                with pytest.raises(AbortError):
+                    await asyncio.wait_for(task, timeout=1)
+                assert context.abort_code == grpc.StatusCode.CANCELLED
+        finally:
+            release.set()
+            await asyncio.wait_for(finished.wait(), timeout=2)
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
-    if outcome != "complete":
-        await asyncio.wait_for(reclaimed.wait(), timeout=2)
-        gc.collect()
-        assert export_paths and not any(path.exists() for path in export_paths)
-    assert len(preprocess_calls) == 1
-    assert len(submitted) == (2 if outcome == "complete" else 1)
-    assert servicer.active_request_count() == 0
-    if outcome != "complete":
-        monkeypatch.setattr(llm, "preprocess", lambda *args: preprocessed)
-        responses = [
-            response async for response in servicer.Generate(request, FakeServicerContext())
-        ]
-        assert responses
-        assert submitted[-1] is preprocessed
-        assert len(submitted) == 2
+        if outcome != "complete":
+            await asyncio.wait_for(reclaimed.wait(), timeout=2)
+            gc.collect()
+            assert export_paths and not any(path.exists() for path in export_paths)
+        assert len(preprocess_calls) == 1
+        assert len(submitted) == (2 if outcome == "complete" else 1)
         assert servicer.active_request_count() == 0
-    assert all(reservation.released for reservation in frontend.reservations)
+        if outcome != "complete":
+            monkeypatch.setattr(llm, "preprocess", lambda *args: preprocessed)
+            responses = [
+                response async for response in servicer.Generate(request, FakeServicerContext())
+            ]
+            assert responses
+            assert submitted[-1] is preprocessed
+            assert len(submitted) == 2
+            assert servicer.active_request_count() == 0
+        assert all(reservation.released for reservation in frontend.reservations)
 
 
 @pytest.mark.asyncio

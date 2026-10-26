@@ -10,7 +10,10 @@ from typing import Any
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    AttentionRuntimeFeatures,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
@@ -62,11 +65,13 @@ class NoKVCacheRunner(ScheduledModelRunner):
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         self._model = model
         self._mapping = mapping
         self._dist = dist
         self._moe_load_balancer = moe_load_balancer
+        self._attention_runtime_features = attention_runtime_features
         self._buffers = InputBuffers.allocate(
             max_num_tokens=config.max_num_tokens,
             max_batch_size=config.max_batch_size,
@@ -81,7 +86,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
         )
         self._attn_metadata: AttentionMetadata | None = None
 
-    def setup_attn_metadata(self) -> AttentionMetadata:
+    def _setup_attn_metadata(self) -> AttentionMetadata:
         if self._attn_metadata is not None:
             return self._attn_metadata
 
@@ -91,7 +96,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
             max_num_tokens=self._config.max_num_tokens,
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
-            attention_runtime_features=self._config.attention_runtime_features,
+            attention_runtime_features=self._attention_runtime_features,
             mapping=self._mapping,
             cache_indirection=self._buffers.cache_indirection,
             kv_cache_manager=None,
@@ -100,14 +105,14 @@ class NoKVCacheRunner(ScheduledModelRunner):
         self._attn_metadata.kv_block_ids_per_seq = None
         return self._attn_metadata
 
-    def prepare_inputs(
+    def _prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
         *,
         resource_manager: ResourceManager,
     ) -> PreparedInputs:
         runner_config = self._config
-        attn_metadata = self.setup_attn_metadata()
+        attn_metadata = self._setup_attn_metadata()
 
         sequence_lengths = []
         input_ids = []
@@ -135,8 +140,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
                         request,
                         runner_config.mm_encoder_cache_enabled,
                     ),
-                    multimodal_data=request.py_multimodal_data,
-                    mm_item_order=getattr(request, "py_mm_item_order", None),
+                    multimodal_data=request.py_multimodal_params.multimodal_data,
                     input_ids_start_offset=context_start_idx,
                 )
                 multimodal_params.to_device(
@@ -290,7 +294,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
         del is_dummy
         batch = inputs.batch
         self._validate_resources(resource_manager)
-        prepared = self.prepare_inputs(batch, resource_manager=resource_manager)
+        prepared = self._prepare_inputs(batch, resource_manager=resource_manager)
         with MoeLoadBalancerIterContext(self._moe_load_balancer):
             return self._forward_step(
                 prepared.kwargs,
