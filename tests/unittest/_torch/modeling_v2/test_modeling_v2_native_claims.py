@@ -334,17 +334,20 @@ def test_stock_build_does_not_reference_a_family():
 
 
 def test_native_files_carry_the_license_header():
-    """The C++ license checker scans cpp/ only; this covers the families' csrc/."""
+    """The C++ license checker (jenkins/license_cpp.json, Apache) scans cpp/ only;
+    this holds the families' csrc/ to the same header: NVIDIA's copyright and the
+    Apache-2.0 license, as SPDX lines or the license text."""
     missing = []
     for _, _, csrc in _units():
         for path in [*_native_files(csrc), *csrc.glob("CMakeLists.txt")]:
-            head = path.read_text(errors="ignore")[:400]
-            if (
-                "SPDX-FileCopyrightText" not in head
-                or "SPDX-License-Identifier: Apache-2.0" not in head
-            ):
+            head = path.read_text(errors="ignore")[:1200]
+            apache = (
+                "SPDX-License-Identifier: Apache-2.0" in head
+                or "Apache License, Version 2.0" in head
+            )
+            if "NVIDIA CORPORATION" not in head or not apache:
                 missing.append(str(path.relative_to(_REPO)))
-    assert not missing, f"no NVIDIA SPDX header: {missing}"
+    assert not missing, f"no NVIDIA Apache-2.0 license header: {missing}"
 
 
 def test_stock_custom_ops_register_no_fakes_for_targets():
