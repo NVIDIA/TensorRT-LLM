@@ -129,6 +129,24 @@ def test_a_rejected_tool_is_named_by_its_place_not_its_name(client):
     assert len(response.content) < 1024
 
 
+def test_an_unknown_parameter_named_like_a_type_is_still_named(client):
+    """A client key is named even when it looks like a union member's tag."""
+    error = _error(client.post("/v1/chat/completions", json=_chat_body(Temperature=0.5, list=1)))
+    assert error["message"] == "Unknown parameter: 'Temperature'. Unknown parameter: 'list'."
+    assert error["param"] == "Temperature"
+
+
+def test_the_name_of_an_unknown_or_missing_parameter_is_kept():
+    errors = [
+        {"type": "missing", "loc": ("body", "tools", 0, "Function"), "msg": "m"},
+        {"type": "extra_forbidden", "loc": ("body", "body"), "msg": "x"},
+    ]
+    assert summarize_validation_errors(errors) == (
+        "Missing required parameter: 'tools.0.Function'. Unknown parameter: 'body'.",
+        "tools.0.Function",
+    )
+
+
 def test_body_that_is_not_json_has_no_parameter(client):
     error = _error(
         client.post(

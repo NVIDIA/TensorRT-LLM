@@ -396,11 +396,31 @@ def _is_union_member_tag(segment: Any) -> bool:
 
     Pydantic tags each member's errors with the member: a model or TypedDict
     by its class name, any other type by its schema name ('str',
-    'list[...]', 'function-after[...]'). Request field names are lowercase.
+    'list[...]', 'function-after[...]'). Request field names are lowercase,
+    but a key the client sent need not be; _union_member_tag_positions keeps
+    such a key.
     """
     return isinstance(segment,
                       str) and ("[" in segment or segment[:1].isupper()
                                 or segment in _SCALAR_MEMBER_TAGS)
+
+
+# Error types whose last location segment is a key the client sent or a field
+# the schema requires, never a union member.
+_KEY_NAMING_ERROR_TYPES = frozenset({"extra_forbidden", "missing"})
+
+
+def _union_member_tag_positions(error: Mapping[str, Any]) -> List[int]:
+    """Where an error's location names a union member rather than a field.
+
+    The last segment of an unknown or missing parameter is that parameter's
+    own name, whatever it looks like ('Temperature', 'list'), so it is never
+    taken for a member.
+    """
+    loc = tuple(error.get("loc", ()))
+    end = len(loc) - 1 if error.get("type") in _KEY_NAMING_ERROR_TYPES else len(
+        loc)
+    return [i for i in range(end) if _is_union_member_tag(loc[i])]
 
 
 def _matched_union_member_errors(
@@ -415,10 +435,9 @@ def _matched_union_member_errors(
     members_by_union: Dict[tuple, Dict[str, List[int]]] = {}
     for index, error in enumerate(errors):
         loc = tuple(error.get("loc", ()))
-        for depth, segment in enumerate(loc):
-            if _is_union_member_tag(segment):
-                members = members_by_union.setdefault(loc[:depth], {})
-                members.setdefault(segment, []).append(index)
+        for depth in _union_member_tag_positions(error):
+            members = members_by_union.setdefault(loc[:depth], {})
+            members.setdefault(loc[depth], []).append(index)
     dropped = set()
     for prefix, members in members_by_union.items():
         rejected = {
@@ -434,11 +453,14 @@ def _matched_union_member_errors(
     return [error for i, error in enumerate(errors) if i not in dropped]
 
 
-def _error_location(loc: Sequence[Any]) -> str:
+def _error_location(error: Mapping[str, Any]) -> str:
     """The dotted place of a validation error within the request body."""
+    loc = tuple(error.get("loc", ()))
+    member_tags = set(_union_member_tag_positions(error))
     segments = []
-    for segment in loc:
-        if segment == "body" or _is_union_member_tag(segment):
+    for index, segment in enumerate(loc):
+        # FastAPI prefixes body errors with "body"; any later "body" is a key.
+        if (index == 0 and segment == "body") or index in member_tags:
             continue
         text = str(segment)
         if len(text) > _MAX_LOCATION_SEGMENT_CHARS:
@@ -472,7 +494,7 @@ def summarize_validation_errors(errors: Sequence[Mapping[str, Any]],
     seen_locations = set()
     described = []
     for error in errors:
-        location = _error_location(error.get("loc", ()))
+        location = _error_location(error)
         if error.get("type") != "json_invalid":
             if location in seen_locations:
                 continue
