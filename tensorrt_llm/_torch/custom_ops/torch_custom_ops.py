@@ -1479,6 +1479,24 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                 tactic = (self.allowed_backends[0], -1)
 
         backend, sub_tactic = tactic
+        m = inputs[0].shape[0]
+        if (backend == "cuda_core" and m > CudaCoreNVFP4Runner.MAX_M_DIMENSION):
+            # Tuning buckets round M down to a power of two, so a cuda_core
+            # tactic tuned for M=16 is also selected for 16 < M < 32. The
+            # kernel only handles M <= MAX_M_DIMENSION, so use another
+            # allowed backend for larger M.
+            fallback_backends = [
+                b for b in self.allowed_backends if b != "cuda_core"
+            ]
+            if not fallback_backends:
+                raise ValueError(
+                    f"CUDA Core backend requires M <= "
+                    f"{CudaCoreNVFP4Runner.MAX_M_DIMENSION}, but got M={m}. "
+                    "Please add other backends to allowed_backends.")
+            backend = ("cutlass" if "cutlass" in fallback_backends else
+                       fallback_backends[0])
+            sub_tactic = -1
+
         if backend == "cuda_core":
             return CudaCoreNVFP4Runner(self.output_buffer_kind,
                                        self.output_dtype,
