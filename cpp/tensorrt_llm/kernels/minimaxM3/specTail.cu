@@ -43,6 +43,14 @@ namespace specTail
 namespace
 {
 constexpr int kVec = 8; // bf16 per 16-byte access
+// draft_input loads its constant norm weight row before the grid dependency wait (the same values, bit for bit). Taken
+// in the sm_107 device code only, whose callers are the sm_107 MiniMax-M3.1 targets; every other architecture loads the
+// row after the wait, with the normalization.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1070)
+constexpr bool kDraftInputPrewaitWeight = true;
+#else
+constexpr bool kDraftInputPrewaitWeight = false;
+#endif
 
 __device__ __forceinline__ float block_sum(float v, float* red)
 {
@@ -72,6 +80,20 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ float red[kThreads / 32];
     int const row = blockIdx.x;
     bool const is_hidden = blockIdx.y == 1;
+    // The norm weight row is constant (no grid of the step writes it): load it before the grid dependency wait, so
+    // after the wait only the dependent loads (the id / hidden row) remain ahead of the reduction. The same values and
+    // arithmetic.
+    __nv_bfloat16 const* const w = is_hidden ? w_hidden : w_embed;
+    uint4 wv[kIters];
+    if constexpr (kDraftInputPrewaitWeight)
+    {
+#pragma unroll
+        for (int it = 0; it < kIters; ++it)
+        {
+            int const c = (it * kThreads + threadIdx.x) * kVec;
+            wv[it] = c < H ? *reinterpret_cast<uint4 const*>(w + c) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
@@ -112,7 +134,6 @@ __global__ void __launch_bounds__(kThreads)
     asm volatile("griddepcontrol.launch_dependents;");
 #endif
     float const rs = rsqrtf(block_sum(ss, red) / H + (is_hidden ? eps_hidden : eps_embed));
-    __nv_bfloat16 const* w = is_hidden ? w_hidden : w_embed;
     __nv_bfloat16* dst = out + static_cast<long long>(row) * 2 * H + (is_hidden ? H : 0);
 #pragma unroll
     for (int it = 0; it < kIters; ++it)
@@ -120,8 +141,11 @@ __global__ void __launch_bounds__(kThreads)
         int const c = (it * kThreads + threadIdx.x) * kVec;
         if (c < H)
         {
-            uint4 const wr = *reinterpret_cast<uint4 const*>(w + c);
-            __nv_bfloat16 const* we = reinterpret_cast<__nv_bfloat16 const*>(&wr);
+            if constexpr (!kDraftInputPrewaitWeight)
+            {
+                wv[it] = *reinterpret_cast<uint4 const*>(w + c);
+            }
+            __nv_bfloat16 const* we = reinterpret_cast<__nv_bfloat16 const*>(&wv[it]);
             uint4 o;
             __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&o);
 #pragma unroll

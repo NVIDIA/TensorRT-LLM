@@ -82,6 +82,11 @@ INT_MAX = 2**31 - 1
 NEG_INF_BITS = -8388608  # 0xFF800000
 COPY_ROWS = 32  # rows per weight bulk copy (16 KB)
 SMEM_ROW_BUDGET = 400  # 200 KB of markov_w2 rows per CTA
+# S4STREAM: a CTA keeps at most SMEM_BLOCKS 8-row blocks per warp of its markov_w2 rows in shared memory; a CTA with
+# more rows (a shard past MAX_GRID x the budget, e.g. the M3.1 TP2 shard) reads the warp's remaining blocks from
+# global memory with the same dot (same words, FMA order and xor tree: the same sums). MAX_ROWS_PER_CTA bounds that.
+SMEM_BLOCKS = SMEM_ROW_BUDGET // (8 * 8)  # 6 blocks per warp = 384 rows per CTA
+MAX_ROWS_PER_CTA = 1024
 SMEM_BYTES = 227 * 1024
 
 
@@ -90,14 +95,15 @@ def rows_per_cta(shard: int, grid: int) -> int:
 
 
 def supports(shard: int, grid: int, block: int, batch: int) -> bool:
-    """Shapes the kernel runs: whole 8-row blocks for every warp (RC a multiple of 64), the CTA's markov_w2 rows
-    within the shared-memory budget, block <= 16, batch <= 16, an even entry count per exchange."""
+    """Shapes the kernel runs: whole 8-row blocks for every warp (RC a multiple of 64), at most MAX_ROWS_PER_CTA
+    rows per CTA (the part past the shared-memory budget streamed, see fits()), block <= 16, batch <= 16, an even
+    entry count per exchange."""
     if grid <= 0 or shard % grid != 0:
         return False
     rc = rows_per_cta(shard, grid)
     return (
         rc % (WARPS * BLOCK_ROWS) == 0
-        and rc <= SMEM_ROW_BUDGET
+        and rc <= MAX_ROWS_PER_CTA
         and smem_bytes(rc, batch) <= SMEM_BYTES
         and grid % 2 == 0
         and 0 < block <= MAX_BLOCK
@@ -105,10 +111,20 @@ def supports(shard: int, grid: int, block: int, batch: int) -> bool:
     )
 
 
+def fits(shard: int, grid: int) -> bool:
+    """Whether every markov_w2 row of the CTA stays in shared memory (no streamed blocks)."""
+    return grid > 0 and shard % grid == 0 and rows_per_cta(shard, grid) <= SMEM_ROW_BUDGET
+
+
+def smem_rows(rows: int) -> int:
+    """The CTA's markov_w2 rows held in shared memory (S4STREAM: SMEM_BLOCKS blocks per warp at most)."""
+    return min(rows, WARPS * SMEM_BLOCKS * BLOCK_ROWS) if rows > SMEM_ROW_BUDGET else rows
+
+
 def smem_bytes(rows: int, batch: int) -> int:
-    """Shared memory of a CTA: its markov_w2 rows, the markov_w1[prev] rows, the two [b][warp] reductions, the
-    barriers, flags and prev (with the allocator's alignment padding)."""
-    return rows * ROW_BYTES + batch * ROW_BYTES + 2 * batch * WARPS * 8 + 1024
+    """Shared memory of a CTA: its markov_w2 rows held in shared memory, the markov_w1[prev] rows, the two [b][warp]
+    reductions, the barriers, flags and prev (with the allocator's alignment padding)."""
+    return smem_rows(rows) * ROW_BYTES + batch * ROW_BYTES + 2 * batch * WARPS * 8 + 1024
 
 
 def buffer_words(block: int, batch: int, slots: int, grid: int) -> int:
@@ -300,6 +316,9 @@ def k3_markov_kernel(
 ):
     rows_per_warp = rows // WARPS
     blocks_per_warp = rows_per_warp // BLOCK_ROWS
+    # S4STREAM: the warp's first smem_blocks blocks are in shared memory, the rest are read from global memory.
+    smem_blocks = smem_rows(rows) // (WARPS * BLOCK_ROWS)
+    streamed = smem_blocks < blocks_per_warp
     entries = slots * grid  # (value, index) entries per (k, b)
     vectors = entries // 2  # 16-byte loads per (k, b)
     vec_per_thread = (vectors + THREADS - 1) // THREADS
@@ -311,7 +330,7 @@ def k3_markov_kernel(
     lane = tx % cutlass.Int32(32)
 
     s_w2 = cutlass.Array(
-        cutlass.Int32, rows * ROW_WORDS, space=cutlass.AddressSpace.smem, alignment=128
+        cutlass.Int32, smem_rows(rows) * ROW_WORDS, space=cutlass.AddressSpace.smem, alignment=128
     )
     # [b]: markov_w1[prev] of the position (one bulk copy per request, issued by the thread that learns prev).
     s_w1 = cutlass.Array(
@@ -339,18 +358,36 @@ def k3_markov_kernel(
     # The CTA's markov_w2 rows: a weight, loaded before the grid dependency.
     if warp == 0:
         if prims.elect_sync():
-            prims.mbarrier_arrive_expect_tx(s_mbar, rows * ROW_BYTES)
-            for c in cutlass.range_constexpr((rows + COPY_ROWS - 1) // COPY_ROWS):
-                n = min(COPY_ROWS, rows - c * COPY_ROWS)
-                prims.cp_async_bulk_shared_cluster_global(
-                    s_w2.subview(c * COPY_ROWS * ROW_WORDS),
-                    w2.subview(
-                        cta * cutlass.Int32(rows * ROW_WORDS)
-                        + cutlass.Int32(c * COPY_ROWS * ROW_WORDS)
-                    ),
-                    s_mbar,
-                    n * ROW_BYTES,
-                )
+            if cutlass.const_expr(not streamed):
+                prims.mbarrier_arrive_expect_tx(s_mbar, rows * ROW_BYTES)
+                for c in cutlass.range_constexpr((rows + COPY_ROWS - 1) // COPY_ROWS):
+                    n = min(COPY_ROWS, rows - c * COPY_ROWS)
+                    prims.cp_async_bulk_shared_cluster_global(
+                        s_w2.subview(c * COPY_ROWS * ROW_WORDS),
+                        w2.subview(
+                            cta * cutlass.Int32(rows * ROW_WORDS)
+                            + cutlass.Int32(c * COPY_ROWS * ROW_WORDS)
+                        ),
+                        s_mbar,
+                        n * ROW_BYTES,
+                    )
+            else:
+                # S4STREAM: each warp's first smem_blocks blocks (its rows [w RPW, w RPW + smem_blocks 8)) land at
+                # [w smem_blocks 8, ...) of shared memory.
+                per_warp = smem_blocks * BLOCK_ROWS
+                prims.mbarrier_arrive_expect_tx(s_mbar, WARPS * per_warp * ROW_BYTES)
+                for w in cutlass.range_constexpr(WARPS):
+                    for c in cutlass.range_constexpr((per_warp + COPY_ROWS - 1) // COPY_ROWS):
+                        n = min(COPY_ROWS, per_warp - c * COPY_ROWS)
+                        prims.cp_async_bulk_shared_cluster_global(
+                            s_w2.subview((w * per_warp + c * COPY_ROWS) * ROW_WORDS),
+                            w2.subview(
+                                cta * cutlass.Int32(rows * ROW_WORDS)
+                                + cutlass.Int32((w * rows_per_warp + c * COPY_ROWS) * ROW_WORDS)
+                            ),
+                            s_mbar,
+                            n * ROW_BYTES,
+                        )
         # Dependents wait for this whole grid before reading its outputs.
         prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
 
@@ -437,7 +474,18 @@ def k3_markov_kernel(
             best_value = cutlass.Int32(NEG_INF_BITS).bitcast(cutlass.Float32)
             best_index = cutlass.Int32(INT_MAX)
             for g in cutlass.range_constexpr(blocks_per_warp):
-                dot = _block_dot(s_w2, row0 + cutlass.Int32(g * BLOCK_ROWS), lane, w1f)
+                if cutlass.const_expr(not streamed):
+                    dot = _block_dot(s_w2, row0 + cutlass.Int32(g * BLOCK_ROWS), lane, w1f)
+                elif cutlass.const_expr(g < smem_blocks):
+                    dot = _block_dot(
+                        s_w2,
+                        warp * cutlass.Int32(smem_blocks * BLOCK_ROWS)
+                        + cutlass.Int32(g * BLOCK_ROWS),
+                        lane,
+                        w1f,
+                    )
+                else:  # S4STREAM: a streamed block, its rows read from global memory by the same dot
+                    dot = _block_dot(w2, shard_row0 + cutlass.Int32(g * BLOCK_ROWS), lane, w1f)
                 bias = _lo_f32(_pack_bf16x2(dot, dot))
                 # fp32_sum (default): the in-tree chain's arithmetic. Its logits are fp32 (LogitsProcessor's
                 # .float()) and the bf16 bias is widened, so the argmax compares the unrounded fp32 sum. Without

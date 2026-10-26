@@ -39,6 +39,17 @@ buffer of the prologue's own (``gdev``), while the previous graph may still run.
 ``prologue_done``, which the next upload waits for before it overwrites ``gdev``. The next fill of the pinned window
 waits for ``ghost_free``, which the upload records once it has read the window.
 
+With ``step_epoch`` (``RuntimeHooks.pack_step_epoch``, on top of ``in_graph``) the pack keeps one int64 device counter,
+``StepInputPack.epoch`` (``step_epoch()`` for the active pack), which the prologue's first scatter launch increments
+once per replay (program 0, before any other kernel of the graph runs). It is never reset: it starts at 0, advances once
+when the prologue kernel is compiled and then once per replay of any graph with the prologue, with or without a new pack
+to scatter, and not on an eager forward. A kernel later in the graph reads it after its programmatic-dependent-launch
+wait, so per-step device flags can be tagged with it instead of being cleared between steps.
+
+With ``prologue_op`` (``RuntimeHooks.pack_prologue_op``, on top of ``early_copy``) the prologue is the model's one
+launch, ``prologue_op(gdev, epoch, MAX_DESC)``, in place of the two scatter launches and the header fill: it writes the
+same bytes, zeroes the same header and increments the epoch the same once per replay (and once at warm-up).
+
 Every in-graph attribute has a class-level default (off), so a pack built without its ``__init__`` and every pack built
 with both flags off takes exactly the path above (``flush()`` and ``flush(in_graph=True)`` are then the same call).
 """
@@ -47,7 +58,7 @@ from __future__ import annotations
 
 import contextlib
 from contextvars import ContextVar
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 import torch
 import triton
@@ -79,12 +90,22 @@ def _parallel_scatter_kernel(
 
 
 # The in-graph prologue's scatter: no integer argument (the counts are read from the staged header and the grid is the
-# fixed MAX_DESC), so the two DEVICE_SRC variants its warm-up compiles serve every replay and every capture.
+# fixed MAX_DESC), so the variants its warm-up compiles serve every replay and every capture.
 @triton.jit
-def _graph_scatter_kernel(stage_u8, stage_i64, DEVICE_SRC: tl.constexpr, BLOCK: tl.constexpr):
+def _graph_scatter_kernel(
+    stage_u8,
+    stage_i64,
+    epoch,
+    DEVICE_SRC: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BUMP_EPOCH: tl.constexpr,
+):
     """Descriptor slot i of the host copies (``DEVICE_SRC`` False) or of the device copies, with the counts read from
-    the staged header; a slot past its count writes nothing."""
+    the staged header; a slot past its count writes nothing. ``BUMP_EPOCH``: program 0 also increments ``epoch[0]``."""
     i = tl.program_id(0)
+    if BUMP_EPOCH:
+        if i == 0:
+            tl.store(epoch, tl.load(epoch) + 1)
     num_h2d = tl.load(stage_i64)
     if DEVICE_SRC:
         count = tl.load(stage_i64 + 1)
@@ -147,6 +168,8 @@ class StepInputPack:
     parallel_scatter = False
     in_graph = False
     early_copy = False
+    prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None
+    epoch: Optional[torch.Tensor] = None
     # Engagement counters of this pack (one per engine and rank): packs the replay's prologue issued, packs issued
     # eagerly before a prologue graph (over the window or not order-free), and side-stream window uploads
     # (early_copy). Logged whenever the in-graph flushes (windows + fallbacks) reach a power of two.
@@ -160,6 +183,8 @@ class StepInputPack:
         parallel_scatter: bool = False,
         in_graph: bool = False,
         early_copy: bool = False,
+        step_epoch: bool = False,
+        prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None,
     ) -> None:
         # Only an opted-in pack needs the native scatter fake registration.
         from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import (  # noqa: F401
@@ -169,6 +194,14 @@ class StepInputPack:
         self.parallel_scatter = parallel_scatter
         self.in_graph = in_graph and parallel_scatter
         self.early_copy = early_copy and self.in_graph
+        # The model's one-launch prologue (see the module docstring); None: the scatter launches and the header fill.
+        self.prologue_op = prologue_op if self.early_copy else None
+        # The step epoch (see the module docstring); None without step_epoch.
+        self.epoch = (
+            torch.zeros(1, dtype=torch.int64, device=device)
+            if step_epoch and self.in_graph
+            else None
+        )
         if self.early_copy:
             # The prologue's own device window: an eager flush (self.dev) can never leave a header in it.
             self.gdev = torch.zeros(self.GRAPH_WINDOW, dtype=torch.uint8, device=device)
@@ -217,17 +250,27 @@ class StepInputPack:
         torch.cuda.synchronize(device)
 
     def _warm_up_graph_kernel(self) -> None:
-        """Compile both variants of the prologue's scatter now, not inside a capture (a zero-count header: it writes
-        nothing)."""
+        """Compile the prologue's scatter now (a zero-count header: it writes nothing)."""
         self.dev[: self.HEADER_BYTES].zero_()
-        self._launch_graph_scatter(self.dev)
+        if self.prologue_op is not None:
+            # The window it is captured with; its header is zero until the first upload.
+            self.prologue_op(self.gdev, self.epoch, self.MAX_DESC)
+        else:
+            self._launch_graph_scatter(self.dev)
         torch.cuda.synchronize(self.dev.device)
 
     def _launch_graph_scatter(self, window: torch.Tensor) -> None:
         stage_i64 = window.view(torch.int64)
         for device_src in (False, True):
+            bump = self.epoch is not None and not device_src
             _graph_scatter_kernel[(self.MAX_DESC,)](
-                window, stage_i64, DEVICE_SRC=device_src, BLOCK=256, num_warps=1
+                window,
+                stage_i64,
+                self.epoch if bump else stage_i64,
+                DEVICE_SRC=device_src,
+                BLOCK=256,
+                BUMP_EPOCH=bump,
+                num_warps=1,
             )
 
     def capture_prologue(self) -> bool:
@@ -237,9 +280,12 @@ class StepInputPack:
             return False
         if self.early_copy:
             torch.cuda.current_stream().wait_event(self.staged_ready)
-            self._launch_graph_scatter(self.gdev)
-            # Consumed: a replay with no new upload scatters nothing.
-            self.gdev[: self.HEADER_BYTES].zero_()
+            if self.prologue_op is not None:
+                self.prologue_op(self.gdev, self.epoch, self.MAX_DESC)
+            else:
+                self._launch_graph_scatter(self.gdev)
+                # Consumed: a replay with no new upload scatters nothing.
+                self.gdev[: self.HEADER_BYTES].zero_()
             self.prologue_done.record()
             return True
         self.dev[: self.GRAPH_WINDOW].copy_(self.ghost, non_blocking=True)
@@ -462,6 +508,13 @@ def flush(in_graph: bool = False) -> None:
     pack = _active.get()
     if pack is not None:
         pack.flush(in_graph=in_graph)
+
+
+def step_epoch() -> Optional[torch.Tensor]:
+    """The active pack's step epoch (an int64 [1] device tensor), or None when there is none (see the module
+    docstring)."""
+    pack = _active.get()
+    return pack.epoch if pack is not None else None
 
 
 def capture_prologue() -> Optional[StepInputPack]:

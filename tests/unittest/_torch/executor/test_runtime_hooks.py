@@ -34,6 +34,7 @@ def test_model_without_hooks_gets_the_all_off_default():
     assert not hooks.skip_unchanged_h2d
     assert not hooks.loop_on_execution_stream
     assert not hooks.merge_tuned_tactics_across_ranks
+    assert not hooks.persist_flashinfer_mxfp8_tactics
     assert not hooks.skip_greedy_rng_upload
     assert not hooks.pack_spec_rng_uploads
     assert hooks.spec_step_fold is None

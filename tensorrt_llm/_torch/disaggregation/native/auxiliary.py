@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from collections import deque, namedtuple
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -169,7 +169,17 @@ class AuxBufferBase(ABC):
 
 
 class AuxBuffer(AuxBufferBase):
-    def __init__(self, max_slot_num: int, beam_width: int, max_draft_len: int, device: str = "cpu"):
+    # Workers built without __init__ carry no drafter-context slot.
+    _draft_ctx_buffer: Optional[torch.Tensor] = None
+
+    def __init__(
+        self,
+        max_slot_num: int,
+        beam_width: int,
+        max_draft_len: int,
+        device: str = "cpu",
+        draft_ctx: bool = False,
+    ):
         # public constructor args remain the same, internals are private
         self._max_slot_num = int(max_slot_num)
         self._beam_width = int(beam_width)
@@ -199,36 +209,27 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer = torch.zeros(
             self._max_slot_num, 2, dtype=data_type, device=self._device
         )
+        buffers = [
+            self._first_tokens_buffer,
+            self._draft_tokens_buffer,
+            self._token_counts_buffer,
+            self._prompt_token_counts_buffer,
+        ]
+        # The context side's standalone-drafter (ctx_len, ctx_base, valid) per slot, only when
+        # the drafter context window ships (disaggregation/draft_kv.py); otherwise the layout is
+        # exactly the four buffers above. valid=0 means the window was not shipped for the
+        # request: the generation side's drafter starts empty.
+        if draft_ctx:
+            self._draft_ctx_buffer = torch.zeros(
+                self._max_slot_num, 3, dtype=data_type, device=self._device
+            )
+            buffers.append(self._draft_ctx_buffer)
 
         self._meta = AuxBufferMeta(
-            ptrs=np.array(
-                [
-                    self._first_tokens_buffer.data_ptr(),
-                    self._draft_tokens_buffer.data_ptr(),
-                    self._token_counts_buffer.data_ptr(),
-                    self._prompt_token_counts_buffer.data_ptr(),
-                ],
-                dtype=np.int64,
-            ),
-            size=np.array(
-                [
-                    self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
-                    self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
-                    self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
-                    self._prompt_token_counts_buffer.numel()
-                    * self._prompt_token_counts_buffer.element_size(),
-                ],
-                dtype=np.int64,
-            ),
+            ptrs=np.array([buf.data_ptr() for buf in buffers], dtype=np.int64),
+            size=np.array([buf.numel() * buf.element_size() for buf in buffers], dtype=np.int64),
             item_sizes=np.array(
-                [
-                    self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
-                    self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
-                    self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
-                    self._prompt_token_counts_buffer[0].numel()
-                    * self._prompt_token_counts_buffer.element_size(),
-                ],
-                dtype=np.int64,
+                [buf[0].numel() * buf.element_size() for buf in buffers], dtype=np.int64
             ),
             device=self._device,
         )
@@ -305,6 +306,13 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer[slot].copy_(
             torch.tensor([prompt_tokens, cached_tokens], dtype=torch.int32, device=self._device)
         )
+        if self._draft_ctx_buffer is not None:
+            ctx_len, ctx_base, valid = getattr(request, "py_draft_ctx_aux", None) or (0, 0, False)
+            self._draft_ctx_buffer[slot].copy_(
+                torch.tensor(
+                    [ctx_len, ctx_base, 1 if valid else 0], dtype=torch.int32, device=self._device
+                )
+            )
 
     @staticmethod
     def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int]:
@@ -335,3 +343,13 @@ class AuxBuffer(AuxBufferBase):
         first_gen_tokens, draft_tokens = self.get_slot_tokens(slot)
         prompt_tokens, cached_tokens = self._prompt_token_counts_buffer[slot].tolist()
         return first_gen_tokens, draft_tokens, (int(prompt_tokens), int(cached_tokens))
+
+    def get_slot_draft_ctx(self, slot: int) -> Optional[tuple[int, int, bool]]:
+        """The context side's drafter ``(ctx_len, ctx_base, valid)`` in the slot, or None when the
+        buffer has no drafter-context slot."""
+        if self._draft_ctx_buffer is None:
+            return None
+        if slot not in self._occupied_slots:
+            raise ValueError(f"Cannot read slot {slot}: slot is not currently allocated.")
+        ctx_len, ctx_base, valid = self._draft_ctx_buffer[slot].tolist()
+        return int(ctx_len), int(ctx_base), bool(valid)

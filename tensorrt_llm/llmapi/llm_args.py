@@ -1094,12 +1094,17 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
-    indexer_kv_dtype: Literal["bf16", "fp8"] = Field(
+    indexer_kv_dtype: Literal["bf16", "fp8", "nvfp4"] = Field(
         default="bf16",
         description=
         "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses "
         "unscaled E4M3 values with FP32 score accumulation and is supported only "
-        "by the MSA implementation.",
+        "by the MSA implementation. 'nvfp4' stores index-K as packed NVFP4 pages "
+        "(E2M1 with E4M3 16-element scales, no global scale; 72 bytes per token "
+        "instead of 128) with E4M3 index-Q: decode scores the pages directly, "
+        "prefill dequantizes them to E4M3 first. It is not exact against 'fp8' "
+        "(it changes which blocks are selected). MSA only; "
+        "TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK=1 falls back to 'fp8'.",
         status="prototype",
     )
     fuse_qkv_index_projection: bool = Field(
@@ -1109,8 +1114,8 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "is sharded with the KV heads and index-K is replicated. MSA batches "
         "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
         "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
-        "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
-        "or NVFP4 main KV cache.",
+        "requires the MSA implementation, indexer_kv_dtype='fp8' or 'nvfp4', "
+        "and an FP8 or NVFP4 main KV cache.",
         status="prototype",
     )
     num_attention_heads: Optional[int] = Field(
@@ -1137,25 +1142,43 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
     @model_validator(mode="after")
     def _validate_msa_configuration(self):
+        if self.indexer_kv_dtype == "nvfp4" and os.environ.get(
+                "TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK",
+                "0").strip().lower() in ("1", "true", "on", "yes"):
+            # Kill switch of the NVFP4 index-K opt-in: every component reads
+            # the configured dtype, so falling back here keeps them consistent.
+            logger.warning(
+                "[M3.1] AGG_NVFP4_INDEXK killed (TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK=1): "
+                "indexer_kv_dtype 'nvfp4' -> 'fp8'")
+            self.indexer_kv_dtype = "fp8"
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "
                 f"128, got {self.sparse_block_size}.")
-        if self.indexer_kv_dtype == "fp8" and self.implementation != "msa":
+        if self.indexer_kv_dtype in ("fp8",
+                                     "nvfp4") and self.implementation != "msa":
             raise ValueError(
-                "MiniMax-M3 indexer_kv_dtype='fp8' currently requires the "
-                "'msa' implementation.")
-        if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
-            raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
-                             "sparse_disable_index_value=True.")
+                f"MiniMax-M3 indexer_kv_dtype={self.indexer_kv_dtype!r} currently "
+                "requires the 'msa' implementation.")
+        if self.indexer_kv_dtype in (
+                "fp8", "nvfp4") and not self.sparse_disable_index_value:
+            raise ValueError(
+                f"MiniMax-M3 indexer_kv_dtype={self.indexer_kv_dtype!r} requires "
+                "sparse_disable_index_value=True.")
+        if self.indexer_kv_dtype == "nvfp4" and not self.fuse_qkv_index_projection:
+            raise ValueError(
+                "MiniMax-M3 indexer_kv_dtype='nvfp4' requires "
+                "fuse_qkv_index_projection=True (its index-K writer follows the "
+                "fused producer).")
         if self.fuse_qkv_index_projection and self.implementation != "msa":
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
                 "the 'msa' implementation.")
-        if self.fuse_qkv_index_projection and self.indexer_kv_dtype != "fp8":
+        if self.fuse_qkv_index_projection and self.indexer_kv_dtype not in (
+                "fp8", "nvfp4"):
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
-                "indexer_kv_dtype='fp8'.")
+                "indexer_kv_dtype='fp8' or 'nvfp4'.")
         return self
 
     def supports_backend(self, backend: str) -> bool:

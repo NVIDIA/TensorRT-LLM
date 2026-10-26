@@ -58,7 +58,7 @@ constexpr int kChainSpecMcMaxDraft = 32;
 //!      the last index with mass over the tiles the stock loop visits.
 //! Validated bitwise (tokens + counts) vs trtllm::chain_speculative_sampling on GB300, K7, vocab 200064, batch
 //! 1 / 2 / 4 / 8 x 5 cases (realistic, same, far, ties, onehot) x 64 seeds at ctasPerRow 4 / 8 / 16, eager and graph
-//! (microbenchmark): 31.2 vs 41.2 us per call at batch 1 with ctasPerRow 16.
+//! 31.2 vs 41.2 us per call at batch 1 with ctasPerRow 16.
 //!
 //! Compiled with the repo's default flags, as the stock kernel (only adds, max and compares on the probs; no
 //! --use_fast_math).
@@ -72,11 +72,26 @@ constexpr int kChainSpecMcMaxDraft = 32;
 //! the first launch and then reused as is: every launch leaves it ready for the next (arrival counters reset, the
 //! barrier generation only increases), so it is CUDA-graph safe without an init kernel. Launches that share one
 //! workspace must be stream-ordered.
+//! Slot-indexed draft rows (VR REJ_SLOTS): with rowIds set, request row r's draft distribution at position i is read at
+//! draftProbs + rowIds[r] * rowStride + i * posStride (a [slots, maxDraft, >= vocab] buffer) instead of the contiguous
+//! [batch, numDraft, vocab] layout; the same floats as the caller's gather, without the copy. rowIds null (the default)
+//! keeps the contiguous layout.
+struct ChainSpecMcDraftRows
+{
+    int64_t const* rowIds = nullptr;
+    int64_t rowStride = 0;
+    int64_t posStride = 0;
+};
+
 cudaError_t invokeChainSpecSamplingMc(speculative_decoding::ChainSpeculativeSamplingParams const& params,
-    int ctasPerRow, void* workspace, cudaStream_t stream);
+    int ctasPerRow, void* workspace, cudaStream_t stream, ChainSpecMcDraftRows const& rows = ChainSpecMcDraftRows{});
 
 //! Workspace bytes per request of invokeChainSpecSamplingMc.
 size_t chainSpecSamplingMcWorkspaceBytesPerRow();
+
+//! The kernel invokeChainSpecSamplingMc launches: 3 (REJ v3: staged chains, both tile variants before one row barrier,
+//! the same adds and order; the default) or 2 (the v2 kernel, with TRTLLM_M31_DISABLE_REJ_V3=1, read once per process).
+int chainSpecSamplingMcKernelVersion();
 
 } // namespace minimaxM31
 } // namespace kernels

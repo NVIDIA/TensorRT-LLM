@@ -33,8 +33,10 @@ namespace torch_ext
 //! output, with the redundant per-CTA selection and an optional programmatic dependent launch. workspace: a
 //! zero-initialized byte buffer of at least rows x minimax_m31_topp_renorm_det_v3_ws_bytes(), reused across calls;
 //! ctas_per_row divides 1024 and rows x ctas_per_row must not exceed the SM count when ctas_per_row > 1.
+//! list_path (V4) / wide_hist (K8): the one-sync list path and 8 privatized pass histograms; both bitwise the same.
+//! Both default to off, so a caller that does not pass them runs the v3 kernel unchanged.
 void minimaxM31ToppRenormDetV3(torch::Tensor const& probs, torch::Tensor const& topP, torch::Tensor& workspace,
-    torch::Tensor& out, int64_t ctasPerRow, bool pdl, bool candidateList)
+    torch::Tensor& out, int64_t ctasPerRow, bool pdl, bool candidateList, bool listPath, bool wideHist)
 {
     TORCH_CHECK(probs.is_cuda() && probs.scalar_type() == torch::kFloat32 && probs.dim() == 2 && probs.is_contiguous(),
         "minimax_m31_topp_renorm_det_v3: probs must be a contiguous 2-D float32 CUDA tensor");
@@ -65,10 +67,10 @@ void minimaxM31ToppRenormDetV3(torch::Tensor const& probs, torch::Tensor const& 
         return;
     }
     c10::cuda::CUDAGuard const deviceGuard{probs.device()};
-    auto const err
-        = tensorrt_llm::kernels::minimaxM31::invokeToppRenormDetV3(probs.data_ptr<float>(), out.data_ptr<float>(),
-            topP.data_ptr<float>(), static_cast<int>(rows), static_cast<int>(d), static_cast<int>(ctasPerRow),
-            workspace.data_ptr(), nullptr, pdl, candidateList, at::cuda::getCurrentCUDAStream(probs.get_device()));
+    auto const err = tensorrt_llm::kernels::minimaxM31::invokeToppRenormDetV3(probs.data_ptr<float>(),
+        out.data_ptr<float>(), topP.data_ptr<float>(), static_cast<int>(rows), static_cast<int>(d),
+        static_cast<int>(ctasPerRow), workspace.data_ptr(), nullptr, pdl, candidateList, listPath, wideHist,
+        at::cuda::getCurrentCUDAStream(probs.get_device()));
     TORCH_CHECK(err == cudaSuccess, "minimax_m31_topp_renorm_det_v3 launch failed: ", cudaGetErrorString(err));
 }
 
@@ -86,7 +88,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "minimax_m31_topp_renorm_det_v3(Tensor probs, Tensor top_p, Tensor(a!) workspace, Tensor(b!) out, "
-        "int ctas_per_row, bool pdl, bool candidate_list) -> ()");
+        "int ctas_per_row, bool pdl, bool candidate_list, bool list_path=False, bool wide_hist=False) -> ()");
     // No tensor arguments: a catch-all kernel (as moe_a2a_get_timeout), callable without a device.
     m.def(
         "minimax_m31_topp_renorm_det_v3_ws_bytes() -> int", &tensorrt_llm::torch_ext::minimaxM31ToppRenormDetV3WsBytes);

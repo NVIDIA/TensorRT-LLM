@@ -81,6 +81,9 @@ list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
 # Scope tcgen05 attention sources to their supported architectures.
 list(FILTER SRC_CU EXCLUDE REGEX
      "minimaxM3/(fusedDecodeAttn|attnMega|attnC1)\\.cu$")
+# The MiniMax-M3 sm_107 decode kernels are built as their own sm_107-only OBJECT
+# library below.
+list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107Tp[248]/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
@@ -121,6 +124,7 @@ set_source_files_properties(
   ${CMAKE_CURRENT_SOURCE_DIR}/minimaxM31/toppRenormDetSm103.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/minimaxM31/toppRenormDetV3Sm103.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/minimaxM31/softmaxMcSm103.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/minimaxM31/softmaxPathBSm107.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 
 # Preserve the historical architecture-scoped attention object library.
@@ -131,11 +135,43 @@ set_property(TARGET minimax_m3_attn_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET minimax_m3_attn_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 set_cuda_architectures(minimax_m3_attn_src 100 103)
 
+# MiniMax-M3 sm_107 decode kernels (minimaxM3Sm107Tp{2,4,8}/): written for
+# sm_107 only (PDL griddepcontrol, sm_10x-only PTX), so they are compiled for
+# the sm_10x entries of this build's architectures only. A build without an
+# sm_10x architecture compiles them for sm_107a: their torch ops link against
+# the host launchers, and only the sm_107 targets launch them.
+file(GLOB MINIMAX_M3_SM107_SRC minimaxM3Sm107Tp2/*.cu minimaxM3Sm107Tp4/*.cu
+     minimaxM3Sm107Tp8/*.cu)
+add_library(minimax_m3_sm107_src OBJECT ${MINIMAX_M3_SM107_SRC})
+set_property(TARGET minimax_m3_sm107_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                  ON)
+target_include_directories(
+  minimax_m3_sm107_src
+  PRIVATE
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+)
+target_link_libraries(minimax_m3_sm107_src PRIVATE trtllm_gen_fmha_interface)
+set(MINIMAX_M3_SM107_ARCHS ${CMAKE_CUDA_ARCHITECTURES})
+list(FILTER MINIMAX_M3_SM107_ARCHS INCLUDE REGEX "^10[0-9]")
+if(NOT MINIMAX_M3_SM107_ARCHS)
+  set(MINIMAX_M3_SM107_ARCHS 107a-real)
+endif()
+# SM107 SASS next to the family build: a family (100f) cubin is scheduled for
+# sm_100 and SM107 runs it as is; the LC2 / LC2-split kernels built for sm_107
+# are 3.6-3.9% faster, bit for bit. The driver prefers the exact-arch cubin.
+if(NOT "107a-real" IN_LIST MINIMAX_M3_SM107_ARCHS AND NOT "107f-real" IN_LIST
+                                                      MINIMAX_M3_SM107_ARCHS)
+  list(APPEND MINIMAX_M3_SM107_ARCHS 107f-real)
+endif()
+set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_ARCHITECTURES
+                                                  ${MINIMAX_M3_SM107_ARCHS})
+
 add_library(
   kernels_src STATIC
   ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
   $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>
-  $<TARGET_OBJECTS:minimax_m3_attn_src>)
+  $<TARGET_OBJECTS:minimax_m3_attn_src> $<TARGET_OBJECTS:minimax_m3_sm107_src>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(

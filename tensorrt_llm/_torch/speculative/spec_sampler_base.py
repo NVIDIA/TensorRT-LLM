@@ -31,7 +31,7 @@ from ..._utils import prefer_pinned
 from ...sampling_params import SamplingParams
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
-from ..pyexecutor.runtime_hooks import SpecStepFold
+from ..pyexecutor.runtime_hooks import SpecStepFold, hook_work
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
     AsyncWorkerMixin,
@@ -74,6 +74,11 @@ UNSUPPORTED_TOP_P_DECAY_MSG = (
     "Drop top_p_decay / top_p_min from the request, or disable "
     "speculative decoding."
 )
+UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG = (
+    "logits_processor (a logits post-processor callback) is not supported with one-model "
+    "speculative decoding. Drop logits_processor from the request, or disable speculative "
+    "decoding."
+)
 UNSUPPORTED_MIN_P_MSG = (
     "min_p requires 'advanced_sampling_mode: full' in the speculative decoding "
     "config when using one-model speculative decoding. Restore that default, "
@@ -114,6 +119,10 @@ def one_model_sampling_rejection_reason(
         return UNSUPPORTED_NO_REPEAT_NGRAM_MSG
     if sampling_params.embedding_bias is not None:
         return UNSUPPORTED_EMBEDDING_BIAS_MSG
+    # A per-request callback becomes py_logits_post_processors; the one-model path never
+    # calls it (a fused verify may not even materialize the full logits).
+    if sampling_params.logits_processor:
+        return UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG
     # The same predicate top_p_decay_active() delegates to, so "active" cannot
     # mean one thing here and another in the sampler.
     if SamplingParams.params_imply_top_p_decay_active(sampling_params.top_p_decay):
@@ -240,8 +249,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """Reject logits-side sampling features the one-model path cannot apply.
 
         TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
-        embedding_bias and top_p_decay by editing the target logits before
-        sampling. The one-model path has no logits-editing hook, so each is
+        embedding_bias, top_p_decay and logits post-processor callbacks by editing
+        the target logits before sampling. The one-model path has no logits-editing hook, so each is
         rejected here instead of being silently dropped.
 
         Each check gates on a non-neutral value rather than on presence, since a
@@ -260,6 +269,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             raise ValueError(UNSUPPORTED_NO_REPEAT_NGRAM_MSG)
         if getattr(request, "py_embedding_bias", None) is not None:
             raise ValueError(UNSUPPORTED_EMBEDDING_BIAS_MSG)
+        # The one-model sampler never calls a request's logits post-processors, and a fused
+        # verify (e.g. the MiniMax-M3 shard verify) does not even gather the full logits, so
+        # the callback would be skipped silently.
+        if getattr(request, "py_logits_post_processors", None):
+            raise ValueError(UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG)
         # Reuse the handler's own predicate so "active" cannot drift between paths.
         if top_p_decay_active(_request_get_sampling_params(request)):
             raise ValueError(UNSUPPORTED_TOP_P_DECAY_MSG)
@@ -379,6 +393,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
             return host, None
         verify_lens = self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+        hook_work("HOST_D2H_SIDE")
         with self._make_side_stream_copier() as copier:
             host = SampleStateTensorsSpec(
                 new_tokens=copier.stage_copy_to_host(self.store.new_tokens),
@@ -488,6 +503,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     ) -> None:
         """Store one step's worker outputs into the per-slot store."""
         if self.static_slot_ids:
+            hook_work("SMALL_H2D")
             slots = self._device_slot_ids(seq_slots)
         else:
             slots = torch.as_tensor(seq_slots, dtype=torch.long)

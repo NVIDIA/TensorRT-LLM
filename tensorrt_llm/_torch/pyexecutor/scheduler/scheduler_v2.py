@@ -579,6 +579,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
             if req.py_request_id in preempted_ids:
                 continue
+            # Its host-tier prefix is being copied to the GPU off the execution stream
+            # (PyExecutor._prefetch_context_prefixes_to_gpu); admit it when the hold ends.
+            hold = getattr(req, "py_kv_gpu_hold", 0)
+            if type(hold) is int and hold > 0:
+                continue
             remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
             if defer_remote_tail_context and remote_mode is not None:
                 continue

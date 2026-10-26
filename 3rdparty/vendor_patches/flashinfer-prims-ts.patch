@@ -1,3 +1,147 @@
+diff --git a/__init__.py b/__init__.py
+index e40d8ce0d41c48ad17099e097c64a70e1f6d7a4b..c49ad2fc908d8794105d7340d7614347db123c53 100644
+--- a/__init__.py
++++ b/__init__.py
+@@ -14,6 +14,8 @@
+ 
+ """Experimental task-scheduled attention entry points."""
+ 
++from . import _worktile_scope  # noqa: F401  (first: scopes task scheduling's WorkTileInfo rebind)
++
+ from .block_sparse import (
+     BlockSparsePagedTSWrapper,
+     BlockSparseTSWrapper,
+diff --git a/_block_sparse/compiler.py b/_block_sparse/compiler.py
+index 1a9d42857f94459f8d2bb8bb523080c0b6bf1ea7..d557504e26512148da732a891692e9c5ea295b90 100644
+--- a/_block_sparse/compiler.py
++++ b/_block_sparse/compiler.py
+@@ -14,6 +14,7 @@
+ 
+ """Compilation and caching for PrimTS block-sparse attention adapters."""
+ 
++from .._worktile_scope import with_scalar_work_tile_info
+ from collections.abc import Callable
+ import functools
+ 
+@@ -29,6 +30,7 @@ from .config import _BlockSparseCompileKey, _make_block_sparse_config
+ _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
+ 
+ 
++@with_scalar_work_tile_info
+ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
+     """Compile one contiguous or paged attention adapter for ``key``.
+ 
+diff --git a/_worktile_scope.py b/_worktile_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..45fd51f97d979d56aea3707176dc242f73116058
+--- /dev/null
++++ b/_worktile_scope.py
+@@ -0,0 +1,105 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Keep CuTe DSL task scheduling's WorkTileInfo rebind inside PrimTS.
++
++Importing ``cutlass.experimental.task_scheduling`` rebinds six attributes of CUTLASS'
++``WorkTileInfo`` (``__init__``, the two MLIR value hooks, ``tile_idx``, ``is_valid_tile`` and
++``update_from``) to a scalar three-axis form, for every kernel in the process. Kernels that
++subclass ``WorkTileInfo`` with a different tile shape (FA4's four-axis tile) then fail to trace.
++
++This module is imported first by the package. It snapshots the original attributes, imports
++the task scheduling resources (which apply the rebind) and snapshots the scalar set. Until a model
++calls ``arm()`` the rebind stays global, as before. Once armed, the originals are put back and
++``scalar_work_tile_info`` installs the scalar set only while a PrimTS kernel traces and compiles;
++compiled kernels do not call these Python methods. Nothing about the generated code changes.
++Kill switch: TRTLLM_PRIMS_TS_SCOPED_WORKTILE=0 makes ``arm()`` keep the global rebind.
++"""
++
++import contextlib
++import functools
++import os
++import sys
++import threading
++
++from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo as _WorkTileInfo
++
++_ATTRS = (
++    "__init__",
++    "__extract_mlir_values__",
++    "__new_from_mlir_values__",
++    "tile_idx",
++    "is_valid_tile",
++    "update_from",
++)
++_MISSING = object()
++_RESOURCES = "cutlass.experimental.task_scheduling.resources"
++
++
++def _snapshot() -> dict:
++    return {name: _WorkTileInfo.__dict__.get(name, _MISSING) for name in _ATTRS}
++
++
++def _install(attrs: dict) -> None:
++    for name, value in attrs.items():
++        if value is _MISSING:
++            if name in _WorkTileInfo.__dict__:
++                delattr(_WorkTileInfo, name)
++        else:
++            setattr(_WorkTileInfo, name, value)
++
++
++# Only scope the rebind when this module saw the originals, i.e. task scheduling was not imported
++# before PrimTS. Otherwise keep whatever is installed (the previous global behavior).
++_ORIGINAL = None if _RESOURCES in sys.modules else _snapshot()
++import cutlass.experimental.task_scheduling.resources  # noqa: E402,F401  (applies the scalar rebind)
++
++_SCALAR = _snapshot()
++SCOPED = False
++_LOCK = threading.RLock()
++_DEPTH = 0
++
++
++def arm() -> bool:
++    """Scope the rebind to PrimTS traces from now on (a model opt-in); returns whether it is scoped. Keeps the
++    global rebind when task scheduling was imported before PrimTS or TRTLLM_PRIMS_TS_SCOPED_WORKTILE=0."""
++    global SCOPED
++    with _LOCK:
++        if (
++            not SCOPED
++            and _ORIGINAL is not None
++            and _DEPTH == 0
++            and os.environ.get("TRTLLM_PRIMS_TS_SCOPED_WORKTILE", "1") != "0"
++        ):
++            SCOPED = True
++            _install(_ORIGINAL)
++    return SCOPED
++
++
++@contextlib.contextmanager
++def scalar_work_tile_info():
++    """Install the task scheduling WorkTileInfo form while a PrimTS kernel traces (re-entrant)."""
++    global _DEPTH
++    if not SCOPED:
++        yield
++        return
++    with _LOCK:
++        if _DEPTH == 0:
++            _install(_SCALAR)
++        _DEPTH += 1
++        try:
++            yield
++        finally:
++            _DEPTH -= 1
++            if _DEPTH == 0:
++                _install(_ORIGINAL)
++
++
++def with_scalar_work_tile_info(fn):
++    """Decorator form of ``scalar_work_tile_info`` for the PrimTS compile functions."""
++
++    @functools.wraps(fn)
++    def wrapper(*args, **kwargs):
++        with scalar_work_tile_info():
++            return fn(*args, **kwargs)
++
++    return wrapper
 diff --git a/block_sparse.py b/block_sparse.py
 index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea063f9e6e4 100644
 --- a/block_sparse.py
@@ -61,10 +205,18 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415450369df 100644
+index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..171c02224d12fd7d0481a7ba1d905fc8281b1ec4 100644
 --- a/context.py
 +++ b/context.py
-@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
+@@ -35,6 +35,7 @@ now; unlike the decode APIs, their ``@flashinfer_experimental_api`` decorators d
+ register trace templates.
+ """
+ 
++from ._worktile_scope import with_scalar_work_tile_info
+ from dataclasses import dataclass
+ import functools
+ import importlib.metadata
+@@ -46,7 +47,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
  
  import torch
  
@@ -73,7 +225,7 @@ index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415
  
  
  if TYPE_CHECKING:
-@@ -488,7 +488,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -488,7 +489,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -82,8 +234,24 @@ index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415
  
          require_cute_dsl_arch(device_index)
      return device_index
+@@ -1753,6 +1754,7 @@ def _paged_context_compile_spec(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def _get_compiled_context(
+     compile_spec: _ContextCompileSpec,
+ ):
+@@ -1973,6 +1975,7 @@ def _get_compiled_context(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def _get_compiled_paged_context(
+     compile_spec: _PagedContextCompileSpec,
+ ):
 diff --git a/decode.py b/decode.py
-index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa6d76a609 100644
+index 41479a386d72c27eb0df76107318dc09256aff06..d720bb765993e875789e443029996a012d12a4f0 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -91,7 +259,20 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -24,11 +25,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
+@@ -14,21 +15,22 @@
+ 
+ """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
+ 
++from ._worktile_scope import with_scalar_work_tile_info
+ from collections.abc import Callable, Sequence
++import dataclasses
+ from dataclasses import dataclass
+ import functools
+ import math
+ import numbers
+ import struct
++from pathlib import Path
+ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
  
  import torch
  
@@ -101,10 +282,12 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
 -    prims_ts_decode_wrapper_trace_dispatch,
 -)
 +from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
++
++from tensorrt_llm._torch import cute_aot
  
  from . import _q_token_kv_block_sparse_policy as _sparse_policy
  from ._block_sparse.common import _num_sparse_pattern_heads
-@@ -789,7 +786,7 @@ def _validate_runtime_device(device: torch.device) -> None:
+@@ -789,7 +791,7 @@ def _validate_runtime_device(device: torch.device) -> None:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -113,7 +296,138 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
  
          require_cute_dsl_arch(device_index)
  
-@@ -4046,7 +4043,7 @@ class BatchDecodePagedTSWrapper:
+@@ -1513,6 +1515,7 @@ def _make_decode_compile_spec(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def _get_compiled_decode(
+     compile_spec: _DecodeCompileSpec,
+ ):
+@@ -1906,67 +1909,79 @@ def _get_compiled_decode(
+             ),
+         )
+ 
++    # The device index does not change the compiled code: one shipped object serves every device.
++    aot_spec = dataclasses.replace(compile_spec, device_index=0)
+     with torch.cuda.device(device_index):
+-        compiled_main = cute.compile(
+-            main_tensor_adapter,
+-            q_fake,
+-            k_fake,
+-            v_fake,
+-            k_sf_fake,
+-            v_sf_fake,
+-            out_fake,
+-            seq_lens_fake,
+-            cu_seqlens_q_fake,
+-            block_table_fake,
+-            q_token_kv_block_sparse_page_memberships_fake,
+-            partial_o_fake,
+-            partial_stats_fake,
+-            counter_fake,
+-            attention_sinks_fake,
+-            Int64(1),
+-            Int64(1),
+-            Int64(1),
+-            Int64(1),
+-            Int64(1),
+-            Int64(1),
+-            Int64(1),
+-            Float32(1.0),
+-            Float32(1.0),
+-            direct_q1_fake,
+-            stream_fake,
+-            cfg,
+-            seq_len_q,
+-            num_qo_heads,
+-            num_kv_heads,
+-            head_dim,
+-            max_kv_len,
+-            max_active_clusters,
+-            static_full_split_prefix,
+-            static_native_uniform_kv,
+-            options=_COMPILE_OPTIONS,
+-        )
+-        compiled_reducer = None
+-        if cfg.use_separate_reduction_kernel:
+-            assert reduction_tensor_adapter is not None
+-            compiled_reducer = cute.compile(
+-                reduction_tensor_adapter,
++        compiled_main = cute_aot.compile_or_load(
++            f"prims_ts_decode.main {aot_spec!r}",
++            lambda: cute.compile(
++                main_tensor_adapter,
++                q_fake,
++                k_fake,
++                v_fake,
++                k_sf_fake,
++                v_sf_fake,
+                 out_fake,
+                 seq_lens_fake,
+                 cu_seqlens_q_fake,
++                block_table_fake,
++                q_token_kv_block_sparse_page_memberships_fake,
+                 partial_o_fake,
+                 partial_stats_fake,
++                counter_fake,
+                 attention_sinks_fake,
++                Int64(1),
++                Int64(1),
++                Int64(1),
++                Int64(1),
++                Int64(1),
++                Int64(1),
++                Int64(1),
+                 Float32(1.0),
+                 Float32(1.0),
+                 direct_q1_fake,
+                 stream_fake,
+                 cfg,
++                seq_len_q,
+                 num_qo_heads,
+                 num_kv_heads,
+                 head_dim,
+                 max_kv_len,
++                max_active_clusters,
+                 static_full_split_prefix,
++                static_native_uniform_kv,
+                 options=_COMPILE_OPTIONS,
++            ),
++            sources=_aot_sources(),
++            tvm_ffi=True,
++        )
++        compiled_reducer = None
++        if cfg.use_separate_reduction_kernel:
++            assert reduction_tensor_adapter is not None
++            compiled_reducer = cute_aot.compile_or_load(
++                f"prims_ts_decode.reducer {aot_spec!r}",
++                lambda: cute.compile(
++                    reduction_tensor_adapter,
++                    out_fake,
++                    seq_lens_fake,
++                    cu_seqlens_q_fake,
++                    partial_o_fake,
++                    partial_stats_fake,
++                    attention_sinks_fake,
++                    Float32(1.0),
++                    Float32(1.0),
++                    direct_q1_fake,
++                    stream_fake,
++                    cfg,
++                    num_qo_heads,
++                    num_kv_heads,
++                    head_dim,
++                    max_kv_len,
++                    static_full_split_prefix,
++                    options=_COMPILE_OPTIONS,
++                ),
++                sources=_aot_sources(),
++                tvm_ffi=True,
+             )
+ 
+     return compiled_main, compiled_reducer
+@@ -4046,7 +4061,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
@@ -122,7 +436,7 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
      def run(
          self,
          q: torch.Tensor,
-@@ -4228,7 +4225,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4228,7 +4243,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
@@ -131,8 +445,115 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
  def batch_decode_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
+@@ -4522,3 +4537,9 @@ __all__ = [
+     "validate_q_token_kv_block_sparse_group_size",
+     "prepare_prims_ts_batch_decode_with_kv_cache",
+ ]
++
++
++def _aot_sources():
++    """The Python files the PrimTS decode kernels are traced from: the ``sources`` of their shipped AOT objects."""
++    return cute_aot.py_files(str(Path(__file__).resolve().parent))
++
+diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
+index c4d1b5512f9209793e42ec12bc269ac612c4703f..c21b2c9f5ab8d4f52d02024dcba15fdb2d16f080 100644
+--- a/kernels/fmha_context/fmha_resources.py
++++ b/kernels/fmha_context/fmha_resources.py
+@@ -1200,8 +1200,6 @@ class GmemQKVResource(MemoryResource):
+                 if cutlass.const_expr(self.cfg.has_uniform_varlen):
+                     seqlen_k = Int32(self.cfg.uniform_seq_len_k)
+                 else:
+-                    from .helpers_paged import _load_runtime_seq_len_kv
+-
+                     seqlen_k = _load_runtime_seq_len_kv(
+                         self.seqlens_kv, self.max_seq_len_kv, batch_coord
+                     )
+@@ -1224,8 +1222,6 @@ class GmemQKVResource(MemoryResource):
+                     kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
+                     kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
+                 else:
+-                    from .helpers_paged import _load_block_table_row_bounds
+-
+                     kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
+                         Int32(self.block_table_row_stride),
+                         self.cfg,
+@@ -1301,13 +1297,9 @@ class GmemQKVResource(MemoryResource):
+             kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
+             kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
+         else:
+-            from .helpers_paged import _load_runtime_seq_len_kv
+-
+             cached_seqlen_kv = _load_runtime_seq_len_kv(
+                 self.seqlens_kv, self.max_seq_len_kv, batch_coord
+             )
+-            from .helpers_paged import _load_block_table_row_bounds
+-
+             kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
+                 Int32(self.block_table_row_stride),
+                 self.cfg,
+@@ -1744,8 +1736,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
+         kv_request_begin: Int32,
+         kv_page_idx_ub: Int32,
+     ) -> None:
+-        from .helpers_paged import _resolve_kv_tile_idx_context
+-
+         cfg = self.cfg
+         # Context's K/V tile index is kv_tile_start + loop_offset; for V the
+         # producer runs one tile ahead in TAIL, so reuse the same expression
+@@ -1836,8 +1826,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
+         tile_offset: cutlass.Constexpr[int] = 0,
+     ) -> cutlass.Array:
+         """Retain one tile's page IDs after its SMEM window is released."""
+-        from .helpers_paged import _resolve_kv_tile_idx_context
+-
+         tile_idx = _resolve_kv_tile_idx_context(
+             stage_info, kv_tile_start, tile_offset=tile_offset
+         )
+@@ -5798,3 +5786,14 @@ class GmemOResource(MemoryResource):
+                 prims.cp_async_bulk_commit_group()
+                 if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
+                     prims.cp_async_bulk_wait_group(0, read=True)
++
++
++# helpers_paged imports FmhaConfig from this module, so it is imported here,
++# after FmhaConfig is defined. The methods above call these helpers while being
++# traced inside the kernel's runtime loops, where the CuTe DSL rejects a first
++# import of a module; importing at module scope keeps those calls import-free.
++from .helpers_paged import (
++    _load_block_table_row_bounds,
++    _load_runtime_seq_len_kv,
++    _resolve_kv_tile_idx_context,
++)
+diff --git a/kernels/fmha_decode/block_sparse_inspect.py b/kernels/fmha_decode/block_sparse_inspect.py
+index 5728a7c6d373ddd694fa0c740dd01f672a65f648..e5f8de86571f54af313adcc0493bc65e4c9ce055 100644
+--- a/kernels/fmha_decode/block_sparse_inspect.py
++++ b/kernels/fmha_decode/block_sparse_inspect.py
+@@ -26,6 +26,7 @@ Both publish one validation status plus the maximum row width in one Int64
+ summary; no route payload is constructed.
+ """
+ 
++from ..._worktile_scope import with_scalar_work_tile_info
+ import functools
+ from collections.abc import Callable
+ 
+@@ -450,6 +451,7 @@ def _fake_compact(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def compile_block_sparse_inspection(
+     *,
+     device_index: int,
+@@ -495,6 +497,7 @@ def compile_block_sparse_inspection(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def compile_paged_block_sparse_metadata_inspection(
+     *,
+     device_index: int,
 diff --git a/mla_decode.py b/mla_decode.py
-index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..3d5fb159a3298d1edf72935b43d9a2eef74a1a4b 100644
+index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..0e82e5330728f78aa93709145382be5f2a015feb 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -140,7 +561,15 @@ index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..3d5fb159a3298d1edf72935b43d9a2ee
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -21,10 +22,9 @@ from typing import Any, Literal, Optional, cast
+@@ -14,6 +15,7 @@
+ 
+ """Task-scheduled paged MLA decode with a plan/run lifecycle."""
+ 
++from ._worktile_scope import with_scalar_work_tile_info
+ from collections.abc import Callable
+ from dataclasses import dataclass, field
+ import functools
+@@ -21,10 +23,9 @@ from typing import Any, Literal, Optional, cast
  
  import torch
  
@@ -152,7 +581,15 @@ index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..3d5fb159a3298d1edf72935b43d9a2ee
  )
  
  from .decode import (
-@@ -1576,7 +1576,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1044,6 +1045,7 @@ def _make_mla_decode_compile_spec(
+ 
+ 
+ @functools.cache
++@with_scalar_work_tile_info
+ def _get_compiled_mla_decode(
+     compile_spec: _MLADecodeCompileSpec,
+ ):
+@@ -1576,7 +1578,7 @@ class BatchMLADecodePagedTSWrapper:
              split_kv=int(dict(policy)["split_kv"]),
          )
  

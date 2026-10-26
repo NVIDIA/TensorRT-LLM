@@ -13,10 +13,18 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 
 from __future__ import annotations
 
+import atexit
 import functools
-from typing import TYPE_CHECKING, Optional
+import inspect
+import os
+import sys
+import time
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
+
+from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.logger import logger
 
 from .kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -99,6 +107,84 @@ def _cutedsl_score(
     return True
 
 
+_PLAN_TAKES_MAXSCORE_TILE: dict = {}
+
+
+def _plan_takes_maxscore_tile(plan) -> bool:
+    """Whether the loaded MSA fmha_sm100_plan accepts ``maxscore_qo_tile`` (decided once per function).
+
+    The public planner forwards ``**kwargs`` to its module's ``_fmha_sm100_plan_impl``, which is where the argument
+    is declared, so that signature is read too.
+    """
+    takes = _PLAN_TAKES_MAXSCORE_TILE.get(plan)
+    if takes is None:
+        takes = False
+        for fn in (plan, getattr(inspect.getmodule(plan), "_fmha_sm100_plan_impl", None)):
+            try:
+                if fn is not None and "maxscore_qo_tile" in inspect.signature(fn).parameters:
+                    takes = True
+                    break
+            except (TypeError, ValueError):
+                continue
+        _PLAN_TAKES_MAXSCORE_TILE[plan] = takes
+    return takes
+
+
+def proxy_plan_kwargs(
+    policy,
+    fmha_sm100,
+    qo_lens_cpu: torch.Tensor,
+    kv_lens_cpu: torch.Tensor,
+    rows: Optional[Tuple[int, int]],
+    page_size: int,
+) -> dict:
+    """Extra fmha_sm100_plan arguments for a prefill proxy plan over batch rows ``rows`` under
+    MsaRuntimePolicy.prefill_proxy_* (or {} for the plain plan). Shared by prepare()'s plan and the inline plan.
+
+    A span longer than 128 rows takes maxscore_qo_tile (and its splits) only where the loaded planner accepts it:
+    without the tile, splits alone leave the 160..15K-row proxy as slow as one split. A span of
+    at most 128 rows keeps the planner's own tile and takes only the split rule. Every choice gives the same score
+    table bits as the plain plan (0 differing scores in every config).
+    """
+    if policy is None or rows is None:
+        return {}
+    first, last = rows
+    if last <= first:
+        return {}
+    max_rows = int(qo_lens_cpu[first:last].max())
+    tile = policy.prefill_proxy_qo_tile
+    kwargs: dict = {}
+    if max_rows > 128:
+        if tile is None or not _plan_takes_maxscore_tile(fmha_sm100.fmha_sm100_plan):
+            return {}
+        kwargs["maxscore_qo_tile"] = tile
+        splits = policy.prefill_proxy_kv_splits or 1
+    else:
+        splits = 1
+    table = policy.prefill_proxy_kv_splits_by_rows
+    bucket = next((entry for entry in table if max_rows <= entry[0]), None) if table else None
+    if bucket is not None:
+        # The step's longest KV sets the floor; multi-request steps land within 3% of their best split this way.
+        _, top_split, min_pages = bucket
+        kv_pages = -(-int(kv_lens_cpu[first:last].max()) // page_size)
+        splits = top_split
+        while splits > 1 and kv_pages < min_pages * splits:
+            splits //= 2
+        logger.info_once(
+            f"AGG_PROXY_SPLITS taken: prefill proxy num_kv_splits {splits} (rows {max_rows}, kv pages {kv_pages})",
+            key=f"msa_agg_proxy_splits_{splits}",
+        )
+    if not kwargs and splits == 1:
+        return {}
+    kwargs["num_kv_splits"] = splits
+    if "maxscore_qo_tile" in kwargs:
+        logger.info_once(
+            f"AGG_PROXY_Q128 taken: prefill proxy plan maxscore_qo_tile {tile}, num_kv_splits {splits}",
+            key="msa_agg_proxy_qo_tile",
+        )
+    return kwargs
+
+
 def _proxy_max_score(
     idx_q: torch.Tensor,
     idx_k_paged: torch.Tensor,
@@ -109,8 +195,11 @@ def _proxy_max_score(
     kv_indices: torch.Tensor,
     sm_scale: float,
     causal: bool,
+    policy=None,
 ) -> torch.Tensor:
     """Run the fmha_sm100 MQA proxy pass and return the per-block max score.
+
+    ``policy`` (MsaRuntimePolicy) plans it under the same prefill proxy rule as prepare()'s plan (proxy_plan_kwargs).
 
     Follows MSA's two-call pattern: fmha_sm100_plan builds the plan with
     output_maxscore and num_kv_heads 1, then fmha_sm100 runs with output_o
@@ -140,7 +229,17 @@ def _proxy_max_score(
         page_size=page_size,
         output_maxscore=True,
         causal=causal,
-        num_kv_splits=1,
+        **{
+            "num_kv_splits": 1,
+            **proxy_plan_kwargs(
+                policy,
+                fmha_sm100,
+                qo_lens_cpu,
+                kv_lens_cpu,
+                (0, int(qo_lens_cpu.shape[0])),
+                page_size,
+            ),
+        },
     )
     _, max_score = fmha_sm100.fmha_sm100(
         idx_q,
@@ -153,6 +252,77 @@ def _proxy_max_score(
         sm_scale=sm_scale,
     )
     return max_score
+
+
+# Proxy oracle (MsaRuntimePolicy.prefill_proxy_oracle): every planned proxy span is re-scored under the plain plan
+# (num_kv_splits 1, the planner's tile) and must match it exactly; per-rank coverage goes to stderr every 30 s and at
+# exit (the final, partial interval included).
+_PROXY_ORACLE = {
+    "passes": 0,
+    "tokens": 0,
+    "entries": 0,
+    "pad_diff": 0,
+    "t_last": 0.0,
+    "atexit": False,
+}
+
+
+def _proxy_oracle_flush(final: bool = False) -> None:
+    st = _PROXY_ORACLE
+    print(
+        f"AGG_PROXY_ORACLE{'_FINAL' if final else ''} rank {mpi_rank()} passes {st['passes']} tokens {st['tokens']} "
+        f"score_entries {st['entries']} score_diff 0 table_diff 0 out_of_domain_diff {st['pad_diff']}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _proxy_oracle_record(scores, ref_scores, table, ref_table, n_valid_blocks) -> None:
+    """Compare one planned proxy span with the plain plan's; raise on any difference.
+
+    The score domain is each token's valid blocks (block < n_valid_blocks[token], the only entries the selector reads);
+    entries past it (padding / future blocks) are counted as out_of_domain_diff, not compared. The selected table is
+    compared whole (every token, KV head and top-k slot, -1 padding included).
+    """
+    st = _PROXY_ORACLE
+    if not st["atexit"]:
+        st["atexit"] = True
+        atexit.register(_proxy_oracle_flush, True)
+    rank = mpi_rank()
+    if scores.shape != ref_scores.shape or table.shape != ref_table.shape:
+        print(
+            f"AGG_PROXY_ORACLE REJECT rank {rank}: shape scores {tuple(scores.shape)} vs {tuple(ref_scores.shape)}, "
+            f"table {tuple(table.shape)} vs {tuple(ref_table.shape)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise RuntimeError("AGG_PROXY_ORACLE: planned proxy differs from the plain plan (shape)")
+    heads, blocks, tokens = scores.shape
+    nvb = n_valid_blocks.to(device=scores.device, dtype=torch.int64)[:tokens].clamp(0, blocks)
+    if int(nvb.shape[0]) != tokens:
+        raise RuntimeError(
+            f"AGG_PROXY_ORACLE: n_valid_blocks covers {int(nvb.shape[0])} of {tokens} tokens"
+        )
+    in_domain = torch.arange(blocks, device=scores.device)[None, :, None] < nvb[None, None, :]
+    diff = scores.contiguous().view(torch.int32) != ref_scores.contiguous().view(torch.int32)
+    score_diff = int((diff & in_domain).sum())
+    table_diff = int((table != ref_table).any(dim=-1).sum())
+    st["passes"] += 1
+    st["tokens"] += tokens
+    st["entries"] += int(nvb.sum()) * heads
+    st["pad_diff"] += int((diff & ~in_domain).sum())
+    if score_diff or table_diff:
+        print(
+            f"AGG_PROXY_ORACLE REJECT rank {rank}: score_diff {score_diff} table_rows_diff {table_diff} "
+            f"(heads {heads}, blocks {blocks}, tokens {tokens}, pass {st['passes']})",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise RuntimeError("AGG_PROXY_ORACLE: planned proxy differs from the plain plan")
+    now = time.monotonic()
+    if now - st["t_last"] >= 30.0:
+        st["t_last"] = now
+        _proxy_oracle_flush()
 
 
 def _combined_topk_table(
@@ -205,6 +375,12 @@ def _group_max_reduce(
     return max_score
 
 
+# The proxy writes every valid block and selection masks the rest. Reusing the
+# step buffer avoids allocating and filling it at each sparse layer.
+_PROXY_MS_REUSE = os.environ.get("TRTLLM_M31_DISABLE_PROXY_MS_REUSE", "0") != "1"
+_proxy_ms_step: Optional[tuple] = None  # (proxy_plan, tokens, max_score)
+
+
 class MsaIndexer:
     """Predictor submodule: proxy MQA scoring and top-k block selection.
 
@@ -215,6 +391,9 @@ class MsaIndexer:
 
     def __init__(self, config: "MiniMaxM3SparseConfig"):
         self.config = config
+        # A model's selector: (max_score_kv, n_valid_blocks, init_blocks, local_blocks) -> the head-major
+        # [total_q, num_kv_heads, topk] table of select_blocks_from_maxscore, or None to keep the built-in select.
+        self.selector_hook = None
 
     def select_blocks(
         self,
@@ -227,6 +406,8 @@ class MsaIndexer:
         kv_lens_cpu: Optional[torch.Tensor] = None,
         qo_offset_cpu: Optional[torch.Tensor] = None,
         proxy_plan: Optional[tuple] = None,
+        proxy_plan_ref: Optional[tuple] = None,
+        proxy_policy=None,
         max_score: Optional[torch.Tensor] = None,
         n_valid_blocks: Optional[torch.Tensor] = None,
         block_table: Optional[torch.Tensor] = None,
@@ -235,6 +416,7 @@ class MsaIndexer:
         require_cutedsl: bool = False,
         gen_token_first: int = 0,
         ctx_rows: int = 0,
+        gen_scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -260,7 +442,11 @@ class MsaIndexer:
         gen_first = int(gen_token_first)
 
         scored = False
-        if (
+        if gen_scores is not None:
+            # MIX_NVFP4_READER: the backend already scored the generation span from the NVFP4 pages.
+            max_score = gen_scores
+            scored = True
+        elif (
             max_score is not None
             and block_table is not None
             and seq_lens_cuda is not None
@@ -301,6 +487,7 @@ class MsaIndexer:
                 qo_offset_cpu=qo_offset_cpu,
                 kv_indices=kv_indices,
                 idx_sm_scale=idx_sm_scale,
+                policy=proxy_policy,
             )
 
         if n_valid_blocks is None:
@@ -314,24 +501,54 @@ class MsaIndexer:
 
         gen_table = self._select(max_score, n_valid_blocks[gen_first:])
         if gen_first == 0:
+            if not scored and proxy_plan_ref is not None and proxy_plan is not None:
+                ref_scores = self._proxy_scores(
+                    idx_q, idx_k_paged, proxy_plan=proxy_plan_ref, max_score=None,
+                    qo_lens_cpu=qo_lens_cpu, kv_lens_cpu=kv_lens_cpu, qo_offset_cpu=qo_offset_cpu,
+                    kv_indices=kv_indices, idx_sm_scale=idx_sm_scale,
+                )  # fmt: skip
+                _proxy_oracle_record(
+                    max_score,
+                    ref_scores,
+                    gen_table,
+                    self._select(ref_scores, n_valid_blocks),
+                    n_valid_blocks,
+                )
             return gen_table
         # The proxy scores the context prefix into its own buffer, under the
         # plan prepare() built over rows [0, ctx_rows). Context pages are the
         # prefix of the flattened page table, so kv_indices needs no slice.
-        ctx_table = self._select(
-            self._proxy_scores(
-                idx_q[:gen_first],
-                idx_k_paged,
-                proxy_plan=proxy_plan,
-                max_score=None,
-                qo_lens_cpu=None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
-                kv_lens_cpu=None if kv_lens_cpu is None else kv_lens_cpu[:ctx_rows],
-                qo_offset_cpu=None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
-                kv_indices=kv_indices,
-                idx_sm_scale=idx_sm_scale,
-            ),
-            n_valid_blocks[:gen_first],
+        ctx_lens = (
+            None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
+            None if kv_lens_cpu is None else kv_lens_cpu[:ctx_rows],
+            None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
         )
+        ctx_scores = self._proxy_scores(
+            idx_q[:gen_first],
+            idx_k_paged,
+            proxy_plan=proxy_plan,
+            max_score=None,
+            qo_lens_cpu=ctx_lens[0],
+            kv_lens_cpu=ctx_lens[1],
+            qo_offset_cpu=ctx_lens[2],
+            kv_indices=kv_indices,
+            idx_sm_scale=idx_sm_scale,
+            policy=proxy_policy,
+        )
+        ctx_table = self._select(ctx_scores, n_valid_blocks[:gen_first])
+        if proxy_plan_ref is not None and proxy_plan is not None:
+            ref_scores = self._proxy_scores(
+                idx_q[:gen_first], idx_k_paged, proxy_plan=proxy_plan_ref, max_score=None,
+                qo_lens_cpu=ctx_lens[0], kv_lens_cpu=ctx_lens[1], qo_offset_cpu=ctx_lens[2],
+                kv_indices=kv_indices, idx_sm_scale=idx_sm_scale,
+            )  # fmt: skip
+            _proxy_oracle_record(
+                ctx_scores,
+                ref_scores,
+                ctx_table,
+                self._select(ref_scores, n_valid_blocks[:gen_first]),
+                n_valid_blocks[:gen_first],
+            )
         return _combined_topk_table(ctx_table, gen_table, head_major=True)
 
     def _proxy_scores(
@@ -346,6 +563,7 @@ class MsaIndexer:
         qo_offset_cpu: Optional[torch.Tensor],
         kv_indices: torch.Tensor,
         idx_sm_scale: float,
+        policy=None,
     ) -> torch.Tensor:
         """Run the fmha_sm100 proxy pass over `idx_q` and return its max score.
 
@@ -362,8 +580,15 @@ class MsaIndexer:
                 kv_indices=kv_indices,
                 sm_scale=idx_sm_scale,
                 causal=True,
+                policy=policy,
             )
+        global _proxy_ms_step
         fmha_sm100 = require_msa_module()
+        tokens = int(idx_q.shape[0])
+        reuse = _PROXY_MS_REUSE and max_score is None
+        cached = _proxy_ms_step
+        if reuse and cached is not None and cached[0] is proxy_plan and cached[1] == tokens:
+            max_score = cached[2]
         _, scores = fmha_sm100.fmha_sm100(
             idx_q,
             idx_k_paged,
@@ -375,6 +600,8 @@ class MsaIndexer:
             max_score=max_score,
             sm_scale=idx_sm_scale,
         )
+        if reuse and scores is not None and scores.is_contiguous():
+            _proxy_ms_step = (proxy_plan, tokens, scores)
         return scores
 
     def _select(
@@ -388,8 +615,16 @@ class MsaIndexer:
         decode kernel reads the table head-major and takes every generation
         row, while fmha_sm100 reads whatever strides it is handed.
         """
+        max_score_kv = _group_max_reduce(max_score, self.config)
+        hook = self.selector_hook
+        if hook is not None:
+            table = hook(
+                max_score_kv, n_valid_blocks, self.config.init_blocks, self.config.local_blocks
+            )
+            if table is not None:
+                return table
         return select_blocks_from_maxscore(
-            _group_max_reduce(max_score, self.config),
+            max_score_kv,
             topk=MSA_REQUIRED_TOPK,
             n_valid_blocks=n_valid_blocks,
             init_blocks=self.config.init_blocks,

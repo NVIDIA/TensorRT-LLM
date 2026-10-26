@@ -39,10 +39,11 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from . import mxfp8_cute_pinned_tactics as _mxfp8_cute_pinned
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
-    from flashinfer import autotune as _flashinfer_autotune
+    from ..flashinfer_autotune_cache import autotune as _flashinfer_autotune
     from flashinfer import mm_mxfp8 as _flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
@@ -648,6 +649,12 @@ class MXFP8GemmRunner(TunableRunner):
         """Return the generic fallback followed by every compiled tactic."""
         return [-1, *range(self.mxfp8_gemm_runner.get_num_configs())]
 
+    def tactic_name(self, tactic: int) -> Optional[str]:
+        """The CUTLASS config of a native tactic; "fallback" for -1."""
+        if tactic == -1:
+            return "fallback"
+        return self.mxfp8_gemm_runner.get_config_name(int(tactic))
+
     @classmethod
     def sync_all_tactic_caches(cls, tuner: AutoTuner) -> None:
         """Register every profiled MXFP8 tactic in the native serving cache."""
@@ -802,6 +809,13 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
             backend = "cutlass"
             context = nullcontext()
         else:
+            # Above 32 rows on SM107, for a model that opts in: the pinned tuned tactic (bitwise the
+            # heuristic's output, faster); see mxfp8_cute_pinned_tactics. Otherwise, or with no entry:
+            # FlashInfer's heuristic config.
+            pinned = _mxfp8_cute_pinned.run(act, act_scale, weight,
+                                            weight_scale, self.output_dtype)
+            if pinned is not None:
+                return pinned
             # Skip FlashInfer's CuTeDSL config sweep; use its heuristic config.
             backend = "cute-dsl"
             context = _flashinfer_autotune(tune_mode=False,

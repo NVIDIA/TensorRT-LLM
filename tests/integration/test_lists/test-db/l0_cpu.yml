@@ -54,9 +54,10 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
-  # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
-  # compute capability, no device. The rest of unittest/_torch/modeling_v2 needs a GPU.
+  # modeling_v2 routing, routing-table claims and the MiniMax-M3.1 tactic pins: config shapes, a monkeypatched
+  # compute capability and stub runners, no device. The rest of unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
+  - unittest/_torch/modeling_v2/test_m31_pins.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
@@ -117,6 +118,8 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/test_cute_aot.py
+  - unittest/_torch/test_flashinfer_autotune_cache.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py

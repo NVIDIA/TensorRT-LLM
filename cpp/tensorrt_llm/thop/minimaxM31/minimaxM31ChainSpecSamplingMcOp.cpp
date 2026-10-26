@@ -114,10 +114,102 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM31ChainSpecSamplingMc(torch::Te
     return {outputTokenIds, outputNumTokens};
 }
 
+//! minimax_m31_chain_speculative_sampling_mc with slot-indexed draft rows (VR REJ_SLOTS): the draft distributions are
+//! draft_buf[slot_ids[r], :num_draft, :vocab] of the spec metadata's [slots, maxDraft, >= vocab] float32 buffer, read
+//! in place instead of from a gathered contiguous copy (the same floats, so bitwise the gathered call's results).
+//! slot_ids: int64 [batch] on the device; each must index a row of draft_buf (not checked on the host: the caller's
+//! gather would index the same rows).
+std::tuple<torch::Tensor, torch::Tensor> minimaxM31ChainSpecSamplingMcSlots(torch::Tensor const& draftBuf,
+    torch::Tensor const& slotIds, int64_t numDraft, torch::Tensor const& draftTokenIds,
+    torch::Tensor const& targetProbs, torch::Tensor const& seed, torch::Tensor const& offset, torch::Tensor& workspace,
+    int64_t ctasPerRow)
+{
+    TORCH_CHECK(draftBuf.dim() == 3 && draftBuf.is_cuda() && draftBuf.is_contiguous()
+            && draftBuf.scalar_type() == torch::kFloat32,
+        "minimax_m31_chain_speculative_sampling_mc_slots: draft_buf must be a contiguous float32 CUDA [slots, "
+        "maxDraft, "
+        "vocab_stride] tensor");
+    TORCH_CHECK(slotIds.dim() == 1 && slotIds.is_cuda() && slotIds.is_contiguous()
+            && slotIds.scalar_type() == torch::kInt64 && slotIds.get_device() == draftBuf.get_device(),
+        "minimax_m31_chain_speculative_sampling_mc_slots: slot_ids must be a contiguous int64 CUDA [batch] tensor");
+    TORCH_CHECK(targetProbs.dim() == 3, "minimax_m31_chain_speculative_sampling_mc_slots: target_probs must be 3-D");
+    auto const batchSize = slotIds.size(0);
+    auto const vocabSize = targetProbs.size(2);
+    TORCH_CHECK(
+        numDraft >= 0 && numDraft <= draftBuf.size(1) && vocabSize <= draftBuf.size(2) && draftBuf.size(2) % 4 == 0,
+        "minimax_m31_chain_speculative_sampling_mc_slots: num_draft / vocab exceed draft_buf (or its row is not a "
+        "multiple of 4 floats)");
+    TORCH_CHECK(draftTokenIds.dim() == 2 && draftTokenIds.size(0) == batchSize && draftTokenIds.size(1) == numDraft,
+        "minimax_m31_chain_speculative_sampling_mc_slots: draft_token_ids must be [batch, num_draft]");
+    TORCH_CHECK(targetProbs.size(0) == batchSize && targetProbs.size(1) == numDraft + 1,
+        "minimax_m31_chain_speculative_sampling_mc_slots: target_probs must be [batch, num_draft + 1, vocab]");
+    for (auto const* t : {&draftTokenIds, &targetProbs, &seed, &offset})
+    {
+        TORCH_CHECK(t->is_cuda() && t->is_contiguous() && t->get_device() == draftBuf.get_device(),
+            "minimax_m31_chain_speculative_sampling_mc_slots: inputs must be contiguous CUDA tensors on one device");
+    }
+    TORCH_CHECK(targetProbs.scalar_type() == torch::kFloat32 && draftTokenIds.scalar_type() == torch::kInt32
+            && seed.scalar_type() == torch::kInt64 && offset.scalar_type() == torch::kInt64 && seed.numel() == batchSize
+            && offset.numel() == batchSize,
+        "minimax_m31_chain_speculative_sampling_mc_slots: dtypes / counts as "
+        "minimax_m31_chain_speculative_sampling_mc");
+    TORCH_CHECK(vocabSize % 4 == 0 && vocabSize <= tensorrt_llm::kernels::minimaxM31::kChainSpecMcMaxVocab
+            && reinterpret_cast<uintptr_t>(draftBuf.data_ptr()) % 16 == 0
+            && reinterpret_cast<uintptr_t>(targetProbs.data_ptr()) % 16 == 0,
+        "minimax_m31_chain_speculative_sampling_mc_slots: 16-byte aligned probs, vocab divisible by 4, at most ",
+        tensorrt_llm::kernels::minimaxM31::kChainSpecMcMaxVocab);
+    TORCH_CHECK(batchSize <= 65535 && ctasPerRow >= 1 && ctasPerRow <= 1024 && 1024 % ctasPerRow == 0,
+        "minimax_m31_chain_speculative_sampling_mc_slots: batch <= 65535; ctas_per_row must divide 1024");
+    auto const wsBytesPerRow
+        = static_cast<int64_t>(tensorrt_llm::kernels::minimaxM31::chainSpecSamplingMcWorkspaceBytesPerRow());
+    TORCH_CHECK(workspace.is_cuda() && workspace.is_contiguous() && workspace.get_device() == draftBuf.get_device()
+            && reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 16 == 0
+            && workspace.numel() * workspace.element_size() >= wsBytesPerRow * batchSize,
+        "minimax_m31_chain_speculative_sampling_mc_slots: workspace too small or misaligned");
+
+    c10::cuda::CUDAGuard const deviceGuard{draftBuf.device()};
+    TORCH_CHECK(
+        ctasPerRow == 1 || batchSize * ctasPerRow <= at::cuda::getCurrentDeviceProperties()->multiProcessorCount,
+        "minimax_m31_chain_speculative_sampling_mc_slots: batch x ctas_per_row must not exceed the SM count");
+    auto outputTokenIds = torch::empty({batchSize, numDraft + 1}, draftTokenIds.options());
+    auto outputNumTokens = torch::empty({batchSize}, draftTokenIds.options());
+    if (batchSize == 0)
+    {
+        return {outputTokenIds, outputNumTokens};
+    }
+    tensorrt_llm::kernels::speculative_decoding::ChainSpeculativeSamplingParams params;
+    params.draftProbs = draftBuf.const_data_ptr<float>();
+    params.draftTokenIds = draftTokenIds.const_data_ptr<int32_t>();
+    params.targetProbs = targetProbs.const_data_ptr<float>();
+    params.seed = seed.const_data_ptr<int64_t>();
+    params.offset = offset.const_data_ptr<int64_t>();
+    params.outputTokenIds = outputTokenIds.data_ptr<int32_t>();
+    params.outputNumTokens = outputNumTokens.data_ptr<int32_t>();
+    params.batchSize = static_cast<int32_t>(batchSize);
+    params.numDraftTokens = static_cast<int32_t>(numDraft);
+    params.vocabSize = static_cast<int32_t>(vocabSize);
+    tensorrt_llm::kernels::minimaxM31::ChainSpecMcDraftRows rows;
+    rows.rowIds = slotIds.const_data_ptr<int64_t>();
+    rows.rowStride = draftBuf.stride(0);
+    rows.posStride = draftBuf.stride(1);
+    auto const err = tensorrt_llm::kernels::minimaxM31::invokeChainSpecSamplingMc(params, static_cast<int>(ctasPerRow),
+        workspace.data_ptr(), at::cuda::getCurrentCUDAStream(draftBuf.get_device()), rows);
+    TORCH_CHECK(
+        err == cudaSuccess, "minimax_m31_chain_speculative_sampling_mc_slots launch failed: ", cudaGetErrorString(err));
+    return {outputTokenIds, outputNumTokens};
+}
+
 //! Workspace bytes per request of minimax_m31_chain_speculative_sampling_mc.
 int64_t minimaxM31ChainSpecSamplingMcWsBytes()
 {
     return static_cast<int64_t>(tensorrt_llm::kernels::minimaxM31::chainSpecSamplingMcWorkspaceBytesPerRow());
+}
+
+//! The kernel minimax_m31_chain_speculative_sampling_mc launches: 3 (REJ v3, the default) or 2
+//! (TRTLLM_M31_DISABLE_REJ_V3=1).
+int64_t minimaxM31ChainSpecSamplingMcVersion()
+{
+    return static_cast<int64_t>(tensorrt_llm::kernels::minimaxM31::chainSpecSamplingMcKernelVersion());
 }
 
 } // namespace torch_ext
@@ -129,12 +221,20 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "minimax_m31_chain_speculative_sampling_mc(Tensor draft_probs, Tensor draft_token_ids, Tensor target_probs, "
         "Tensor seed, Tensor offset, Tensor(a!) workspace, int ctas_per_row) -> (Tensor, Tensor)");
+    m.def(
+        "minimax_m31_chain_speculative_sampling_mc_slots(Tensor draft_buf, Tensor slot_ids, int num_draft, "
+        "Tensor draft_token_ids, Tensor target_probs, Tensor seed, Tensor offset, Tensor(a!) workspace, "
+        "int ctas_per_row) -> (Tensor, Tensor)");
     // No tensor arguments: a catch-all kernel (as moe_a2a_get_timeout), callable without a device.
     m.def("minimax_m31_chain_speculative_sampling_mc_ws_bytes() -> int",
         &tensorrt_llm::torch_ext::minimaxM31ChainSpecSamplingMcWsBytes);
+    m.def("minimax_m31_chain_speculative_sampling_mc_version() -> int",
+        &tensorrt_llm::torch_ext::minimaxM31ChainSpecSamplingMcVersion);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("minimax_m31_chain_speculative_sampling_mc", &tensorrt_llm::torch_ext::minimaxM31ChainSpecSamplingMc);
+    m.impl("minimax_m31_chain_speculative_sampling_mc_slots",
+        &tensorrt_llm::torch_ext::minimaxM31ChainSpecSamplingMcSlots);
 }

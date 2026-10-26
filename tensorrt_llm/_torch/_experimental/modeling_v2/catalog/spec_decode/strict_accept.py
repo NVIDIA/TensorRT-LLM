@@ -319,7 +319,7 @@ class SpecStrictAccept(OpWrapper):
     the prefix of drafts equal to the target's tokens. No forced-acceptance override (the caller's).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -383,7 +383,7 @@ class SpecNextNewTokens(OpWrapper):
     ``accepted`` and ``next_draft`` (as ``torch.concat``).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     CELLS: tuple[Cell, ...] = (
         Cell(

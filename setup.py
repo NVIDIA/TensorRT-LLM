@@ -203,6 +203,8 @@ package_data += [
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',
     'usage/schemas/*.json',
+    '_torch/_experimental/modeling_v2/models/minimax_m3/m31_tuning/**/*.json',
+    '_torch/cute_aot_data/**/*.o',
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
