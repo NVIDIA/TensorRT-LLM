@@ -383,6 +383,7 @@ def _make_forward_only_engine(
     decoder.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = decoder.iter_states = {}
     decoder.forward_pass_callable = None
+    decoder.start_beam_histories_callable = None
     decoder._stage_in_graph_sampling = None
     decoder.moe_load_balancer = None
     engine._runner = decoder

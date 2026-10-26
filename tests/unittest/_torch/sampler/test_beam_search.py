@@ -2265,15 +2265,22 @@ def test_logits_processor_sees_beam_hypotheses(
     single_process: bool,
     with_cuda_graph_and_overlap: bool,
 ) -> None:
-    """Under beam search, logits processors get each live beam's real history."""
+    """Under beam search, logits processors get each live beam's real history.
+
+    With the overlap scheduler the forward pass of a step is launched before
+    the host has appended the previous step's tokens to the request, so the
+    histories a processor sees trail the beams by one token. They are still
+    each beam's own prefix, only one token shorter, and every token a beam
+    ends up with was allowed by the history the processor had at the time.
+    """
     if not single_process:
         pytest.skip("the processor's records stay in the worker process")
-    if with_cuda_graph_and_overlap:
-        pytest.skip("with the overlap scheduler, processors run a step behind")
+    lag = 1 if with_cuda_graph_and_overlap else 0
+    max_tokens = fixed_params["max_tokens"]
     prompt = input_prompts[0]
     processor = _HistoryCheckingProcessor(len(prompt), DummyConfig().vocab_size)
     sampling_params = SamplingParams(
-        max_tokens=fixed_params["max_tokens"],
+        max_tokens=max_tokens,
         n=fixed_params["max_beam_width"],
         best_of=fixed_params["max_beam_width"],
         use_beam_search=True,
@@ -2284,19 +2291,27 @@ def test_logits_processor_sees_beam_hypotheses(
     output = llm.generate(prompt, sampling_params)
     assert not isinstance(output, list)
 
+    def consistent(tokens: list[int]) -> bool:
+        # Token j was chosen at the step whose processor saw the first j - lag
+        # tokens of this hypothesis.
+        return all(token in processor.allowed(tokens[:max(j - lag, 0)])
+                   for j, token in enumerate(tokens))
+
     steps = processor.steps
-    assert len(steps) == fixed_params["max_tokens"]
+    assert len(steps) == max_tokens
     for previous, current in zip(steps, steps[1:]):
         for history in current:
-            parent = history[:-1]
-            assert parent in previous, (
+            assert not history or history[:-1] in previous, (
                 f"{history} does not extend any of the previous step's {previous}"
             )
-            assert history[-1] in processor.allowed(parent)
+            assert consistent(history)
     final = []
     for beam in output.outputs:
         assert beam.token_ids is not None
-        final.append(beam.token_ids[:-1])
+        assert consistent(list(beam.token_ids))
+        final.append(list(beam.token_ids)[:max_tokens - 1 - lag])
+    # The last step's histories are the returned beams minus the token that
+    # step chose, and minus one more under the overlap scheduler.
     assert sorted(final) == sorted(steps[-1])
 
 
