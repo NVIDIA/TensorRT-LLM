@@ -1313,13 +1313,20 @@ def _mx_e2e_cases() -> dict[str, dict[str, object]]:
         options = {keyword.arg: keyword.value for keyword in param.keywords}
         row = {keyword.arg: ast.literal_eval(keyword.value) for keyword in case.keywords}
         marks = options["marks"]
-        marks = marks.elts if isinstance(marks, ast.List) else [marks]
-        mark_args = {ast.unparse(mark.func): mark.args for mark in marks}
-        # Every row names its GPU count; a row may also require device memory.
+        marks = marks.elts if isinstance(marks, (ast.List, ast.Tuple)) else [marks]
+        # A bare mark such as `skip_no_hopper` is a name with no arguments.
+        mark_args = {
+            ast.unparse(mark.func if isinstance(mark, ast.Call) else mark): (
+                mark.args if isinstance(mark, ast.Call) else []
+            )
+            for mark in marks
+        }
+        # Every row names its GPU count; a row may also require device memory or SM90.
         assert len(mark_args) == len(marks)
         assert set(mark_args) <= {
             "pytest.mark.skip_less_device",
             "pytest.mark.skip_less_device_memory",
+            "skip_no_hopper",
         }
         row["min_devices"] = ast.literal_eval(mark_args["pytest.mark.skip_less_device"][0])
         case_id = ast.literal_eval(options["id"])
