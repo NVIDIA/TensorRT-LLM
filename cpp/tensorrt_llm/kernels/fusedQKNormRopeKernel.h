@@ -75,22 +75,27 @@ void launchMinimaxM3Fp8QKNormRopeKVInsert(void const* qkv_input, void* q_output,
 // MiniMax-M3 sparse producer for the packed [Q|K|V|index-Q|index-K]
 // projection. It uses a precomputed FP32 RoPE table, emits compact FP8 Q and
 // index-Q, and inserts main K/V plus index-K into their paged FP8 HND caches.
+// With index_k_nvfp4, index-K is stored as NVFP4-E (minimaxM3IndexKNvfp4.cuh)
+// in byte pages that start every index_page_stride bytes; index_token_stride
+// is then unused.
 void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
     void* kv_cache, void* index_k_cache, int const* out_cache_loc, int64_t kv_page_stride, int64_t kv_plane_stride,
     int64_t kv_head_stride, int64_t kv_token_stride, int64_t index_page_stride, int64_t index_token_stride,
-    int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
-    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
-    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream);
+    bool index_k_nvfp4, int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv,
+    int num_heads_index, int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight,
+    void const* index_q_weight, void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids,
+    cudaStream_t stream);
 
-// MiniMax-M3 sparse horizontal producer for an NVFP4 main KV cache.  Q,
-// index-Q, and index-K remain FP8.  Main K/V are quantized directly from the
-// normalized/RoPE registers into packed E2M1 data plus E4M3 SF16 scales.
+// MiniMax-M3 sparse horizontal producer for an NVFP4 main KV cache.  Q and
+// index-Q remain FP8, and index-K is stored as in the FP8-cache producer.
+// Main K/V are quantized directly from the normalized/RoPE registers into
+// packed E2M1 data plus E4M3 SF16 scales.
 void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
     void* kv_data_cache, void* kv_scale_cache, void* index_k_cache, int const* out_cache_loc,
     float const* kv_quant_scale, int64_t data_page_stride, int64_t data_plane_stride, int64_t data_head_stride,
     int64_t data_token_stride, int64_t scale_page_stride, int64_t scale_plane_stride, int64_t scale_head_stride,
-    int64_t index_page_stride, int64_t index_token_stride, int64_t num_pages, int page_size, int num_tokens,
-    int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps,
+    int64_t index_page_stride, int64_t index_token_stride, bool index_k_nvfp4, int64_t num_pages, int page_size,
+    int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps,
     void const* q_weight, void const* k_weight, void const* index_q_weight, void const* index_k_weight,
     float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream);
 

@@ -909,6 +909,416 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
     torch.testing.assert_close(bf16_metadata.cache[1, 0, 0], idx_k[1])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_msa_indexer_enforces_nvfp4_handoff_states() -> None:
+    """NVFP4-E index-K comes from a fused producer or the split producer path, nothing else.
+
+    A fused producer has stored the cache and emits E4M3 index-Q. The split path hands
+    over BF16 index-Q and live BF16 index-K: the K is quantized into the cache and Q is
+    rounded to E4M3 with saturation, as the fused producers emit it. Either way the
+    indexer gets the packed format, the page size and the E4M3 pages the proxy reads.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+        MiniMaxM3SparseConfig,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.index_k_nvfp4 import (
+        INDEX_K_NVFP4_PAGE_BYTES,
+        INDEX_K_NVFP4_SCALE_OFFSET,
+        index_k_nvfp4_quant_scatter,
+        quantize_index_k_nvfp4_reference,
+    )
+
+    config = MiniMaxM3SparseConfig(
+        num_q_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        num_index_heads=4,
+        sparse_index_dim=128,
+        block_size=128,
+        topk=16,
+    )
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.m3_config = config
+    attention.layer_idx = 3
+    attention.indexer_kv_dtype = "nvfp4"
+    captured = {}
+
+    class FakeIndexer:
+        def select_blocks(self, idx_q, idx_k_cache, **kwargs):
+            captured["idx_q"] = idx_q
+            captured["index_k_cache"] = idx_k_cache
+            captured["kwargs"] = kwargs
+            return torch.zeros(2, 4, 16, dtype=torch.int32, device="cuda")
+
+    attention.indexer = FakeIndexer()
+    proxy_pages = torch.empty(2, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda")
+
+    class FakeMetadata:
+        msa_decode_span = None
+        msa_prefill_proxy_plan = (False, 0, 2, {}, None)
+        msa_prefill_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
+        msa_prefill_proxy_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
+        msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
+        msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
+        msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
+        num_contexts = 2
+        num_generations = 0
+        kv_cache_manager = SimpleNamespace(tokens_per_block=128)
+
+        def __init__(self, dtype: torch.dtype) -> None:
+            if dtype == torch.uint8:
+                # Pages inside wider pool rows, like the cache manager's view.
+                pool = torch.zeros(2, 3 * INDEX_K_NVFP4_PAGE_BYTES, dtype=dtype, device="cuda")
+                self.cache = pool[:, :INDEX_K_NVFP4_PAGE_BYTES]
+            else:
+                self.cache = torch.zeros(2, 1, 128, 128, dtype=dtype, device="cuda")
+            self.msa_out_cache_loc = torch.tensor([0, 128 + 5], dtype=torch.int32, device="cuda")
+
+        def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
+            captured["write"] = (layer_idx, idx_k)
+            index_k_nvfp4_quant_scatter(
+                idx_k.reshape(idx_k.shape[0], -1), self.cache, self.msa_out_cache_loc
+            )
+
+        def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
+            return self.cache
+
+        def msa_proxy_index_k(self, layer_idx: int) -> torch.Tensor:
+            captured["proxy_layer"] = layer_idx
+            return proxy_pages
+
+    # Scaled past E4M3's range so the rounding has to saturate.
+    idx_q = 100 * torch.randn(2, 4 * 128, dtype=torch.bfloat16, device="cuda")
+    idx_k = torch.randn(2, 128, dtype=torch.bfloat16, device="cuda")
+    metadata = FakeMetadata(torch.uint8)
+    e4m3_q = idx_q.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+    result = attention.run_indexer(e4m3_q, None, metadata)
+    assert result.shape == (2, 4, 16)
+    assert captured["idx_q"].data_ptr() == e4m3_q.data_ptr()
+    assert captured["index_k_cache"] is metadata.cache
+    assert captured["kwargs"]["k_format"] == "nvfp4"
+    assert captured["kwargs"]["page_size"] == 128
+    assert captured["kwargs"]["proxy_idx_k"] is proxy_pages
+    assert captured["proxy_layer"] == 3
+    assert "write" not in captured
+
+    with pytest.raises(ValueError, match=r"requires E4M3 index-Q"):
+        attention.run_indexer(idx_q, None, metadata)
+    with pytest.raises(ValueError, match=r"NVFP4 indexer without a fused producer"):
+        attention.run_indexer(idx_q.float(), idx_k.float(), metadata)
+    with pytest.raises(ValueError, match=r"does not match indexer_kv_dtype"):
+        attention.run_indexer(e4m3_q, None, FakeMetadata(torch.float8_e4m3fn))
+
+    attention.run_indexer(idx_q, idx_k, metadata)
+    assert captured["write"][0] == 3
+    assert captured["idx_q"].dtype == torch.float8_e4m3fn
+    assert torch.equal(
+        captured["idx_q"].view(torch.uint8), e4m3_q.view(2, 4, 128).view(torch.uint8)
+    )
+    data, scales = quantize_index_k_nvfp4_reference(idx_k)
+    for page, row, token in ((0, 0, 0), (1, 5, 1)):
+        assert torch.equal(metadata.cache[page, 64 * row : 64 * row + 64], data[token])
+        scale_offset = INDEX_K_NVFP4_SCALE_OFFSET + 8 * row
+        assert torch.equal(metadata.cache[page, scale_offset : scale_offset + 8], scales[token])
+
+    del captured["write"]
+    attention.run_indexer(idx_q, idx_k, metadata, idx_k_prewritten=True)
+    assert "write" not in captured
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_msa_metadata_writes_and_dequantizes_nvfp4_index_k_pages() -> None:
+    """The metadata's NVFP4-E index-K writer and the proxy's E4M3 page copy."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.index_k_nvfp4 import (
+        INDEX_K_NVFP4_PAGE_BYTES,
+        dequantize_index_k_nvfp4_reference,
+        quantize_index_k_nvfp4_reference,
+    )
+
+    num_pages = 4
+    pool = torch.zeros(num_pages, 2 * INDEX_K_NVFP4_PAGE_BYTES, dtype=torch.uint8, device="cuda")
+    cache = pool[:, :INDEX_K_NVFP4_PAGE_BYTES]
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = SimpleNamespace(
+        indexer_kv_dtype="nvfp4", get_index_k_buffer=lambda layer_idx: cache
+    )
+    # Two live tokens and a padded row, whose slot is -1.
+    metadata.msa_out_cache_loc = torch.tensor(
+        [3, 2 * 128 + 7, -1], dtype=torch.int32, device="cuda"
+    )
+    idx_k = torch.randn(3, 1, 128, dtype=torch.bfloat16, device="cuda")
+
+    metadata.msa_write_idx_k(5, idx_k)
+
+    data, scales = quantize_index_k_nvfp4_reference(idx_k[:2, 0])
+    written = torch.zeros_like(cache)
+    for token, (page, row) in enumerate(((0, 3), (2, 7))):
+        written[page, 64 * row : 64 * row + 64] = data[token]
+        written[page, 8192 + 8 * row : 8192 + 8 * row + 8] = scales[token]
+    assert torch.equal(cache, written)
+    assert not pool[:, INDEX_K_NVFP4_PAGE_BYTES:].any()
+
+    # No workspace staged: BF16/FP8 caches and steps without proxy rows read the cache.
+    assert metadata.msa_proxy_index_k(5) is None
+    page_ids = torch.tensor([2, 0, 2], dtype=torch.int32, device="cuda")
+    metadata._msa_index_k_workspace = torch.empty(
+        3, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    metadata._msa_index_k_workspace_pages = page_ids
+    workspace = metadata.msa_proxy_index_k(5)
+    assert workspace is metadata._msa_index_k_workspace
+    pages = cache[page_ids.long()]
+    expected = dequantize_index_k_nvfp4_reference(
+        pages[:, :8192].view(3, 128, 64), pages[:, 8192:].view(3, 128, 8)
+    )
+    assert torch.equal(workspace[:, 0].float(), expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("segmented", [False, True])
+@pytest.mark.parametrize("indexer_kv_dtype", ["fp8", "nvfp4"])
+def test_step_plans_score_nvfp4_context_pages_from_an_e4m3_workspace(
+    monkeypatch: pytest.MonkeyPatch, indexer_kv_dtype: str, segmented: bool
+) -> None:
+    """fmha_sm100 cannot read NVFP4-E index-K, so its plan addresses an E4M3 copy.
+
+    The copy holds the proxy rows' pages in msa_kv_indices order, so the plan,
+    segmented or not, reads workspace page i where it would read msa_kv_indices[i].
+    FP8 and BF16 caches are read in place.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    handed = {}
+
+    def fake_segmented_proxy_plan(fmha_sm100, qo_lens_cpu, qo_offset_cpu, **kwargs):
+        handed["kv_indices"] = kwargs["kv_indices"]
+        return (("segmented",), kwargs["kv_indices"].flip(0)) if segmented else None
+
+    monkeypatch.setattr(
+        msa_backend,
+        "require_msa_module",
+        lambda: SimpleNamespace(fmha_sm100_plan=lambda qo_lens, kv_lens, **kwargs: kwargs),
+    )
+    monkeypatch.setattr(msa_backend, "segmented_proxy_plan", fake_segmented_proxy_plan)
+    monkeypatch.setattr(msa_backend, "_cache_device", lambda metadata: torch.device("cpu"))
+    # Two context rows over 3 + 1 pages ahead of two generation rows.
+    metadata = _span_metadata(num_contexts=2, qo_lens=(7, 5, 1, 1), kv_lens=(300, 5, 40, 33))
+    metadata._set_decode_span()
+    metadata._msa_fields_ready = True
+    metadata._msa_params = SimpleNamespace(
+        sharded_index_head_count=lambda mapping: 4,
+        sharded_head_counts=lambda mapping: (8, 2),
+        topk=16,
+    )
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=128, dtype=DataType.NVFP4, indexer_kv_dtype=indexer_kv_dtype
+    )
+    metadata.msa_kv_indices = torch.arange(100, 110, dtype=torch.int32)
+
+    metadata._build_step_plans()
+
+    if indexer_kv_dtype == "fp8":
+        assert metadata._msa_index_k_workspace is None
+        assert handed["kv_indices"] is metadata.msa_kv_indices
+        expected_table = metadata.msa_kv_indices
+    else:
+        workspace = metadata._msa_index_k_workspace
+        assert workspace.shape == (4, 1, 128, 128)
+        assert workspace.dtype == torch.float8_e4m3fn
+        assert torch.equal(metadata._msa_index_k_workspace_pages, metadata.msa_kv_indices[:4])
+        assert torch.equal(handed["kv_indices"], torch.arange(4, dtype=torch.int32))
+        expected_table = handed["kv_indices"]
+    if segmented:
+        assert metadata.msa_prefill_proxy_plan == ("segmented",)
+        expected_table = expected_table.flip(0)
+    assert torch.equal(metadata.msa_prefill_proxy_kv_indices, expected_table)
+
+    # A pure-decode step has no proxy rows and so no workspace.
+    decode = _span_metadata()
+    decode._set_decode_span()
+    decode._msa_fields_ready = True
+    decode._msa_params = metadata._msa_params
+    decode.kv_cache_manager = metadata.kv_cache_manager
+    decode._msa_index_k_workspace = torch.empty(0)
+    decode.max_num_sequences = 2
+    monkeypatch.setattr(decode, "_ensure_msa_decode_scratch_buffers", lambda **kwargs: None)
+    decode.msa_n_valid_blocks = torch.empty(8, dtype=torch.int32)
+    decode._build_step_plans()
+    assert decode._msa_index_k_workspace is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("main_kv_nvfp4", [False, True])
+def test_write_layer_caches_routes_nvfp4_index_k_to_its_own_writer(
+    monkeypatch: pytest.MonkeyPatch, main_kv_nvfp4: bool
+) -> None:
+    """NVFP4-E index-K is quantized by its own writer; the fused K/V writers get none."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_scatter
+
+    calls = {}
+
+    def fused(k_view, v_view, idx_cache, out_cache_loc, k, v, idx_k):
+        calls["fused"] = (idx_cache, idx_k)
+        return True
+
+    def fused_nvfp4(k_data, v_data, k_scale, v_scale, idx_cache, out_cache_loc, k, v, idx_k, scale):
+        calls["fused_nvfp4"] = (idx_cache, idx_k)
+        return True
+
+    monkeypatch.setattr(msa_scatter, "fused_write_layer_caches", fused)
+    monkeypatch.setattr(msa_scatter, "fused_write_layer_caches_nvfp4", fused_nvfp4)
+    buffers = torch.zeros(2, 2, 1, 128, 128)
+
+    class FakeMetadata:
+        kv_cache_manager = SimpleNamespace(
+            is_nvfp4_layer=lambda layer_idx: main_kv_nvfp4,
+            get_buffers=lambda layer_idx, kv_layout: buffers,
+            get_block_scale_buffers=lambda layer_idx, kv_layout: buffers,
+        )
+        msa_out_cache_loc = torch.arange(3, dtype=torch.int32)
+
+        def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
+            calls["index"] = (layer_idx, idx_k)
+
+        def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
+            raise AssertionError("the K/V writers must not get the NVFP4-E index-K cache")
+
+    attention = SimpleNamespace(layer_idx=6, indexer_kv_dtype="nvfp4")
+    k, v, idx_k = torch.zeros(3, 128), torch.zeros(3, 128), torch.ones(3, 128)
+
+    MiniMaxM3MsaSparseAttention.write_layer_caches(
+        attention, k, v, idx_k, FakeMetadata(), kv_scale_orig_quant=torch.ones(1)
+    )
+
+    assert calls["index"][0] == 6 and calls["index"][1] is idx_k
+    assert calls["fused_nvfp4" if main_kv_nvfp4 else "fused"] == (None, None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_nvfp4_index_k_selects_what_an_fp8_cache_of_its_values_selects() -> None:
+    """Scoring NVFP4-E index-K must not change any selection.
+
+    Every NVFP4-E value is an E4M3 value, so an FP8 cache holding the dequantized
+    pages is the same index-K. On a mixed step the context rows score an E4M3 copy
+    of their pages with the same fmha_sm100 proxy, so their blocks are bitwise the
+    FP8 cache's; the generation rows score the packed pages with the CuTe DSL kernel,
+    whose products are exact, so their scores match up to summation order.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+        MiniMaxM3SparseConfig,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.index_k_nvfp4 import (
+        INDEX_K_NVFP4_PAGE_BYTES,
+        dequantize_index_k_nvfp4_reference,
+        index_k_nvfp4_dequant_pages,
+        index_k_nvfp4_quant_scatter,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+        build_kv_page_indices,
+        msa_package_available,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import (
+        MsaIndexer,
+        cutedsl_score_runner,
+    )
+    from tensorrt_llm._utils import get_sm_version
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA submodule) required")
+    if get_sm_version() not in (100, 103) or cutedsl_score_runner() is None:
+        pytest.skip("the CuTe DSL indexer scorer requires SM100/SM103")
+
+    page_size, dim, num_heads, query_len = 128, 128, 4, 4
+    # Two context rows (one with a cached prefix) ahead of two speculative-verify rows.
+    qo_lens = torch.tensor([200, 64, query_len, query_len], dtype=torch.int32)
+    kv_lens = torch.tensor([700, 300, 1000, 513], dtype=torch.int32)
+    qo_offset = kv_lens - qo_lens
+    pages_per_row = (kv_lens + page_size - 1) // page_size
+    num_pages = int(pages_per_row.sum()) + 3
+    generator = torch.Generator().manual_seed(7)
+    physical = torch.randperm(num_pages, generator=generator).to(torch.int32)
+    max_pages = int(pages_per_row.max())
+    block_ids = torch.zeros(4, max_pages, dtype=torch.int32)
+    first = 0
+    for row, count in enumerate(pages_per_row.tolist()):
+        block_ids[row, :count] = physical[first : first + count]
+        first += count
+    kv_indices = build_kv_page_indices(block_ids, kv_lens, page_size).cuda()
+
+    # Index-K for every slot, with a per-row scale spread; pages inside wider rows.
+    keys = torch.randn(num_pages * page_size, dim, generator=generator)
+    keys *= torch.exp2(torch.randint(-3, 3, (num_pages * page_size, 1), generator=generator))
+    pool = torch.zeros(num_pages, 2 * INDEX_K_NVFP4_PAGE_BYTES, dtype=torch.uint8, device="cuda")
+    nvfp4_cache = pool[:, :INDEX_K_NVFP4_PAGE_BYTES]
+    slots = torch.arange(num_pages * page_size, dtype=torch.int32, device="cuda")
+    index_k_nvfp4_quant_scatter(keys.to(torch.bfloat16).cuda(), nvfp4_cache, slots)
+    fp8_cache = (
+        dequantize_index_k_nvfp4_reference(
+            nvfp4_cache[:, :8192].reshape(num_pages, page_size, 64),
+            nvfp4_cache[:, 8192:INDEX_K_NVFP4_PAGE_BYTES].reshape(num_pages, page_size, 8),
+        )
+        .to(torch.float8_e4m3fn)
+        .unsqueeze(1)
+    )
+
+    total_q = int(qo_lens.sum())
+    idx_q = torch.randn(total_q, num_heads, dim, generator=generator).to(torch.float8_e4m3fn).cuda()
+    gen_first, ctx_rows = int(qo_lens[:2].sum()), 2
+    config = MiniMaxM3SparseConfig(
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim=dim,
+        num_index_heads=num_heads,
+        sparse_index_dim=dim,
+        block_size=page_size,
+        topk=16,
+        local_blocks=1,
+    )
+    indexer = MsaIndexer(config)
+    common = dict(
+        idx_sm_scale=dim**-0.5,
+        qo_lens_cpu=qo_lens,
+        kv_lens_cpu=kv_lens,
+        qo_offset_cpu=qo_offset,
+        proxy_plan=None,
+        block_table=block_ids[ctx_rows:].cuda(),
+        seq_lens_cuda=kv_lens[ctx_rows:].cuda(),
+        decode_query_len=query_len,
+        require_cutedsl=True,
+        gen_token_first=gen_first,
+        ctx_rows=ctx_rows,
+    )
+    num_gen = total_q - gen_first
+    fp8_scores = torch.zeros(num_heads, 16, num_gen, device="cuda")
+    fp8_table = indexer.select_blocks(
+        idx_q, fp8_cache, kv_indices=kv_indices, max_score=fp8_scores, **common
+    )
+
+    num_ctx_pages = int(pages_per_row[:ctx_rows].sum())
+    workspace = torch.empty(
+        num_ctx_pages, 1, page_size, dim, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    index_k_nvfp4_dequant_pages(nvfp4_cache, kv_indices[:num_ctx_pages].contiguous(), workspace)
+    nvfp4_scores = torch.zeros_like(fp8_scores)
+    nvfp4_table = indexer.select_blocks(
+        idx_q,
+        nvfp4_cache,
+        kv_indices=torch.arange(num_ctx_pages, dtype=torch.int32, device="cuda"),
+        max_score=nvfp4_scores,
+        k_format="nvfp4",
+        page_size=page_size,
+        proxy_idx_k=workspace,
+        **common,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(nvfp4_table[:gen_first], fp8_table[:gen_first])
+    torch.testing.assert_close(nvfp4_scores, fp8_scores, rtol=1e-5, atol=1e-5)
+    assert torch.equal(nvfp4_table[gen_first:], fp8_table[gen_first:])
+
+
 @pytest.mark.parametrize(
     (
         "num_contexts",
@@ -2074,7 +2484,9 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
 
 
 @pytest.mark.parametrize("nvfp4", [True, False])
-@pytest.mark.parametrize("sparse,indexer_dtype", [(True, "fp8"), (True, "bf16"), (False, "fp8")])
+@pytest.mark.parametrize(
+    "sparse,indexer_dtype", [(True, "fp8"), (True, "bf16"), (True, "nvfp4"), (False, "fp8")]
+)
 def test_msa_attention_core_owns_the_cache_write(
     sparse: bool, indexer_dtype: str, nvfp4: bool
 ) -> None:

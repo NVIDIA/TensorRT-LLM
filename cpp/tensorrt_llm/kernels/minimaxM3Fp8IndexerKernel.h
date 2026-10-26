@@ -44,11 +44,14 @@ namespace kernels
 //! \param pageStride Distance in E4M3 elements between cache pages.
 //! \param tokenStride Distance in E4M3 elements between tokens in a page.
 //! \param pageSize Number of token slots per cache page.
+//! \param kCacheNvfp4 Store K as NVFP4-E instead (minimaxM3IndexKNvfp4.cuh): `kCache`
+//! is then a byte cache whose pages start every `pageStride` bytes and hold
+//! `pageSize` = 128 tokens; `tokenStride` is unused.
 //! \param numPages Number of addressable pages in `kCache`.
 void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* qOut, void* kCache, int const* outCacheLoc,
-    int64_t pageStride, int64_t tokenStride, int pageSize, int64_t numPages, int numTokens, int numHeadsQ, int headDim,
-    int rotaryDim, float eps, void const* qWeight, void const* kWeight, float base, int const* positionIds,
-    cudaStream_t stream);
+    int64_t pageStride, int64_t tokenStride, int pageSize, bool kCacheNvfp4, int64_t numPages, int numTokens,
+    int numHeadsQ, int headDim, int rotaryDim, float eps, void const* qWeight, void const* kWeight, float base,
+    int const* positionIds, cudaStream_t stream);
 
 } // namespace kernels
 

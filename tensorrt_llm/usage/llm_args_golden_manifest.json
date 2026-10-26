@@ -1477,7 +1477,8 @@
     {
       "allowed_values": [
         "bf16",
-        "fp8"
+        "fp8",
+        "nvfp4"
       ],
       "capture_policy": "literal",
       "kind": "categorical",

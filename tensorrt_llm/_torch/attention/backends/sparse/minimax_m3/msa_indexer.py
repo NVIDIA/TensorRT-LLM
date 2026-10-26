@@ -59,6 +59,8 @@ def _cutedsl_score(
     block_table: torch.Tensor,
     seq_lens_cuda: torch.Tensor,
     decode_query_len: int,
+    page_size: Optional[int] = None,
+    k_format: Optional[str] = None,
 ) -> bool:
     """Try to fill `max_score` with the CuTe DSL scorer; report whether it ran.
 
@@ -72,34 +74,46 @@ def _cutedsl_score(
     selector reads only [0, n_valid_blocks[token])), which is bounded by that
     same count for every token including the shorter ones in a multi-token
     speculative step. So every entry the selector reads has just been written.
+
+    `k_format` None means index-K is paged [num_pages, 1, page_size, head_dim]
+    in index Q's dtype, which `page_size` defaults to; "nvfp4" means packed
+    NVFP4-E pages, uint8 [num_pages, page_stride], scored with E4M3 index Q,
+    whose caller passes `page_size`.
     """
     runner = cutedsl_score_runner()
     if runner is None:
         return False
 
     total_q, num_index_heads, head_dim = idx_q.shape
-    page_size = int(idx_k_paged.shape[2])
+    if page_size is None:
+        page_size = int(idx_k_paged.shape[2])
     if not runner.is_supported(
         q_dtype=idx_q.dtype,
         num_heads=num_index_heads,
         head_dim=head_dim,
         page_size=page_size,
         max_decode_query_len=decode_query_len,
+        k_format=k_format,
     ):
         return False
-    if idx_k_paged.dtype != idx_q.dtype or max_score.shape[2] != total_q:
+    if max_score.shape[2] != total_q:
         return False
+    if k_format is None:
+        if idx_k_paged.dtype != idx_q.dtype:
+            return False
+        # The kernel wants MQA index-K as [num_pages, page_size, head_dim]; the
+        # squeeze is zero-copy and keeps the pool's real per-page stride, which
+        # the TMA descriptor reads at runtime.
+        idx_k_paged = idx_k_paged.squeeze(1)
 
-    # The kernel wants MQA index-K as [num_pages, page_size, head_dim]; the
-    # squeeze is zero-copy and keeps the pool's real per-page stride, which the
-    # TMA descriptor reads at runtime.
     torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
         idx_q,
-        idx_k_paged.squeeze(1),
+        idx_k_paged,
         block_table,
         seq_lens_cuda,
         max_score.transpose(1, 2),
         decode_query_len,
+        k_format,
     )
     return True
 
@@ -382,6 +396,9 @@ class MsaIndexer:
         require_cutedsl: bool = False,
         gen_token_first: int = 0,
         ctx_rows: int = 0,
+        k_format: Optional[str] = None,
+        page_size: Optional[int] = None,
+        proxy_idx_k: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -402,8 +419,17 @@ class MsaIndexer:
         are 0 on a pure-decode step. The halves score into separate buffers,
         since fmha_sm100 writes a contiguous [heads, k_tiles, tokens] block and
         cannot fill a slice of the scorer's, then their tables are joined.
+
+        `k_format` is idx_k_paged's format for the CuTe DSL scorer (see
+        _cutedsl_score). A packed "nvfp4" cache has no token axis to read
+        `page_size` from, and fmha_sm100 cannot read it: the caller passes the
+        page size and, wherever the proxy runs, `proxy_idx_k`, the E4M3 pages
+        `kv_indices` addresses in its place.
         """
-        page_size = int(idx_k_paged.shape[2])
+        if page_size is None:
+            page_size = int(idx_k_paged.shape[2])
+        if proxy_idx_k is None and k_format is None:
+            proxy_idx_k = idx_k_paged
         gen_first = int(gen_token_first)
 
         scored = False
@@ -423,6 +449,8 @@ class MsaIndexer:
                 block_table=block_table,
                 seq_lens_cuda=seq_lens_cuda,
                 decode_query_len=decode_query_len,
+                page_size=page_size,
+                k_format=k_format,
             )
 
         if require_cutedsl and not scored:
@@ -440,7 +468,7 @@ class MsaIndexer:
             gen_first = 0
             max_score = self._proxy_scores(
                 idx_q,
-                idx_k_paged,
+                proxy_idx_k,
                 proxy_plan=proxy_plan,
                 max_score=max_score,
                 qo_lens_cpu=qo_lens_cpu,
@@ -468,7 +496,7 @@ class MsaIndexer:
         ctx_table = self._select(
             self._proxy_scores(
                 idx_q[:gen_first],
-                idx_k_paged,
+                proxy_idx_k,
                 proxy_plan=proxy_plan,
                 max_score=None,
                 qo_lens_cpu=None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
@@ -484,7 +512,7 @@ class MsaIndexer:
     def _proxy_scores(
         self,
         idx_q: torch.Tensor,
-        idx_k_paged: torch.Tensor,
+        idx_k_paged: Optional[torch.Tensor],
         *,
         proxy_plan: Optional[tuple],
         max_score: Optional[torch.Tensor],
@@ -498,7 +526,14 @@ class MsaIndexer:
 
         Uses the prebuilt plan when prepare() supplied one, and plans inline
         from the host lengths otherwise (standalone callers that skip prepare).
+        `idx_k_paged` is None when the cache is in a format fmha_sm100 cannot
+        read and no E4M3 copy of its pages was supplied.
         """
+        if idx_k_paged is None:
+            raise ValueError(
+                "The fmha_sm100 proxy cannot read a packed index-K cache; "
+                "select_blocks needs proxy_idx_k, the E4M3 pages kv_indices addresses."
+            )
         if proxy_plan is None:
             return _proxy_max_score(
                 idx_q,

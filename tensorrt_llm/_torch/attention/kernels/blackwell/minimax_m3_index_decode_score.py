@@ -25,12 +25,16 @@ Differences from upstream:
   blackwell.utils rather than cute.arch.
 * Compilation and caching live in the trtllm::cute_dsl_minimax_m3_index_decode_score
   runner, matching the other CuTe DSL ops in this tree.
+* k_format="nvfp4" scores a packed NVFP4 index-K cache (see IndexDecodeScoreKernel).
 """
 
 import cutlass
 from cuda.bindings.driver import CUstream
-from cutlass import Float8E4M3FN, Float16, Float32, Int64, Uint32, cute
+from cutlass import Float8E4M3FN, Float16, Float32, Int64, Uint8, Uint32, cute
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
@@ -42,6 +46,83 @@ from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL, griddepcontrol_wait
 
 __all__ = ["IndexDecodeScoreKernel"]
+
+
+def _u32x_from_asm(out, count: int, *, loc=None, ip=None) -> cute.TensorSSA:
+    """Return the ``count`` i32 fields of an inline-asm struct result as Uint32."""
+    vec = vector.from_elements(
+        ir.VectorType.get([count], T.i32(), loc=loc),
+        [llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip) for i in range(count)],
+        loc=loc,
+        ip=ip,
+    )
+    return cute.TensorSSA(vec, count, Uint32)
+
+
+@dsl_user_op
+def _e4m3x4_gather_to_fp16x4(
+    word_a: Uint32, word_b: Uint32, selector: Uint32, *, loc=None, ip=None
+):
+    """Pick four E4M3 bytes out of two words with prmt and convert them to two f16x2 words."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [
+            word_a.ir_value(loc=loc, ip=ip),
+            word_b.ir_value(loc=loc, ip=ip),
+            selector.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b32 p;\n\t"
+        ".reg .b16 lo, hi;\n\t"
+        "prmt.b32 p, $2, $3, $4;\n\t"
+        "mov.b32 {lo, hi}, p;\n\t"
+        "cvt.rn.f16x2.e4m3x2 $0, lo;\n\t"
+        "cvt.rn.f16x2.e4m3x2 $1, hi;\n\t"
+        "}\n",
+        "=r,=r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return _u32x_from_asm(out, 2, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _e2m1x8_to_fp16x8_scaled(codes: Uint32, scales: Uint32, half: int, *, loc=None, ip=None):
+    """Dequantize eight E2M1 codes (two per byte, low nibble first) to four f16x2 words.
+
+    The scale is half ``half`` of the f16x2 ``scales``, an E4M3 value. An
+    E2M1 x E4M3 product has at most 5 significant bits and lies in
+    [2^-10, 2688], so both the conversion and the multiply are exact in F16.
+    """
+    s_half = "{s0, s0}" if half == 0 else "{s1, s1}"
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [codes.ir_value(loc=loc, ip=ip), scales.ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b8 b0, b1, b2, b3;\n\t"
+        ".reg .b16 s0, s1;\n\t"
+        ".reg .b32 s, h0, h1, h2, h3;\n\t"
+        "mov.b32 {b0, b1, b2, b3}, $4;\n\t"
+        "mov.b32 {s0, s1}, $5;\n\t"
+        f"mov.b32 s, {s_half};\n\t"
+        "cvt.rn.f16x2.e2m1x2 h0, b0;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h1, b1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h2, b2;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h3, b3;\n\t"
+        "mul.rn.f16x2 $0, h0, s;\n\t"
+        "mul.rn.f16x2 $1, h1, s;\n\t"
+        "mul.rn.f16x2 $2, h2, s;\n\t"
+        "mul.rn.f16x2 $3, h3, s;\n\t"
+        "}\n",
+        "=r,=r,=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return _u32x_from_asm(out, 4, loc=loc, ip=ip)
 
 
 @cute.jit
@@ -75,11 +156,21 @@ class IndexDecodeScoreKernel:
     s, s + split_k, s + 2 * split_k, ... of request b and writes each block's
     score directly, so no cross-CTA reduction is needed. CTAs whose split_id
     exceeds the request's block count exit immediately.
+
+    k_format selects how index-K is stored:
+
+    * None: [num_pages, BLOCK_K, head_dim] in the dtype of Q.
+    * "nvfp4": a uint8 [num_pages, page_stride] cache of NVFP4 pages. A page
+      holds BLOCK_K rows of head_dim / 2 bytes of E2M1 codes (the low nibble is
+      the even dim), then BLOCK_K rows of head_dim / 16 E4M3 scales, one per 16
+      dims. Q must be FP8. K is dequantized to F16 in registers, which is
+      exact, so the scores equal FP32 q . dequant(k) up to summation order.
     """
 
     BLOCK_K = 128
     BAR_MMA = 1
     num_stages = 2
+    NVFP4_SCALE_GROUP = 16
 
     def __init__(
         self,
@@ -88,12 +179,31 @@ class IndexDecodeScoreKernel:
         max_decode_query_len: int,
         split_k: int,
         head_dim: int = 128,
+        k_format: str | None = None,
     ):
         self.dtype = dtype
         self.num_heads = num_heads
         self.max_decode_query_len = max_decode_query_len
         self.split_k = split_k
         self.head_dim = head_dim
+        self.k_format = k_format
+        if k_format == "nvfp4":
+            # The register mapping below assumes one 128-B Q row and 64-B K rows.
+            assert dtype is Float8E4M3FN and head_dim == 128
+        else:
+            assert k_format is None, f"unsupported k_format {k_format!r}"
+
+    def _nvfp4_row_bytes(self) -> int:
+        return self.head_dim // 2
+
+    def _nvfp4_scale_row_bytes(self) -> int:
+        return self.head_dim // self.NVFP4_SCALE_GROUP
+
+    def _k_page_bytes(self) -> int:
+        """Bytes one K page brings into SMEM, i.e. the TMA expect-tx count."""
+        if self.k_format == "nvfp4":
+            return self.BLOCK_K * (self._nvfp4_row_bytes() + self._nvfp4_scale_row_bytes())
+        return self.BLOCK_K * self.head_dim * (self.dtype.width // 8)
 
     def _swizzle_elems(self) -> int:
         """Elements spanned by one 128-byte swizzle atom."""
@@ -112,20 +222,37 @@ class IndexDecodeScoreKernel:
 
     def _sk_layout(self):
         """Composed SMEM layout for the pipelined K tiles."""
+        block_k = self.BLOCK_K
+        if self.k_format == "nvfp4":
+            # 64-B code rows take the 64-B swizzle, which keeps the 8-row
+            # ldmatrix phases bank-conflict free.
+            row_bytes = self._nvfp4_row_bytes()
+            layout = cute.make_layout(
+                (1, block_k, row_bytes, self.num_stages),
+                stride=(0, row_bytes, 1, block_k * row_bytes),
+            )
+            return cute.make_composed_layout(cute.make_swizzle(2, 4, 3), 0, layout)
         elems = self._swizzle_elems()
         head_dim = self.head_dim
-        block_k = self.BLOCK_K
         layout = cute.make_layout(
             (1, block_k, (elems, head_dim // elems), self.num_stages),
             stride=(0, elems, (1, block_k * elems), block_k * head_dim),
         )
         return cute.make_composed_layout(cute.make_swizzle(3, 4, 3), 0, layout)
 
+    def _sk_scale_layout(self):
+        """SMEM layout for the pipelined NVFP4 scale blocks, loaded as 128-B rows."""
+        block_bytes = self.BLOCK_K * self._nvfp4_scale_row_bytes()
+        return cute.make_layout(
+            (1, block_bytes // 128, 128, self.num_stages),
+            stride=(0, 128, 1, block_bytes),
+        )
+
     @cute.jit
     def __call__(
         self,
         gQ: cute.Tensor,  # [bs * runtime_decode_query_len, num_heads, head_dim]
-        gK_cache: cute.Tensor,  # [num_pages, page_size, head_dim]
+        gK_cache: cute.Tensor,  # [num_pages, page_size, head_dim]; nvfp4: [num_pages, page_stride]
         block_table: cute.Tensor,  # [bs, max_pages]
         score: cute.Tensor,  # [num_heads, bs * runtime_decode_query_len, max_pages]
         seq_lens: cute.Tensor,  # [bs]
@@ -150,18 +277,44 @@ class IndexDecodeScoreKernel:
             self._sq_layout(),
             (MAX_DQL, num_heads, head_dim),
         )
-        k_tma_atom, k_tma_tensor = cpasync.make_tiled_tma_atom(
-            tma_g2s,
-            cute.logical_divide(gK_cache, (None, None, elems)),
-            self._sk_layout(),
-            (1, self.BLOCK_K, head_dim),
-        )
+        if cutlass.const_expr(self.k_format == "nvfp4"):
+            # Codes and scales are two boxes of the same page.
+            row_bytes = self._nvfp4_row_bytes()
+            num_pages = gK_cache.shape[0]
+            page_stride = gK_cache.stride[0]
+            gK_codes = cute.make_tensor(
+                gK_cache.iterator,
+                cute.make_layout(
+                    (num_pages, self.BLOCK_K, row_bytes), stride=(page_stride, row_bytes, 1)
+                ),
+            )
+            scale_rows = self.BLOCK_K * self._nvfp4_scale_row_bytes() // 128
+            gK_scales = cute.make_tensor(
+                gK_cache.iterator + self.BLOCK_K * row_bytes,
+                cute.make_layout((num_pages, scale_rows, 128), stride=(page_stride, 128, 1)),
+            )
+            k_tma_atom, k_tma_tensor = cpasync.make_tiled_tma_atom(
+                tma_g2s, gK_codes, self._sk_layout(), (1, self.BLOCK_K, row_bytes)
+            )
+            ks_tma_atom, ks_tma_tensor = cpasync.make_tiled_tma_atom(
+                tma_g2s, gK_scales, self._sk_scale_layout(), (1, scale_rows, 128)
+            )
+        else:
+            k_tma_atom, k_tma_tensor = cpasync.make_tiled_tma_atom(
+                tma_g2s,
+                cute.logical_divide(gK_cache, (None, None, elems)),
+                self._sk_layout(),
+                (1, self.BLOCK_K, head_dim),
+            )
+            ks_tma_atom, ks_tma_tensor = None, None
 
         self.kernel(
             q_tma_atom,
             q_tma_tensor,
             k_tma_atom,
             k_tma_tensor,
+            ks_tma_atom,
+            ks_tma_tensor,
             block_table,
             score,
             seq_lens,
@@ -175,6 +328,8 @@ class IndexDecodeScoreKernel:
         q_tma_tensor: cute.Tensor,
         k_tma_atom: cute.CopyAtom,
         k_tma_tensor: cute.Tensor,
+        ks_tma_atom: cute.CopyAtom | None,
+        ks_tma_tensor: cute.Tensor | None,
         block_table: cute.Tensor,
         score: cute.Tensor,
         seq_lens: cute.Tensor,
@@ -191,6 +346,7 @@ class IndexDecodeScoreKernel:
         BLOCK_K = self.BLOCK_K
         head_dim = self.head_dim
         dtype = self.dtype
+        nvfp4 = self.k_format == "nvfp4"
         MMA_N = 8
         num_stages = self.num_stages
         Q_TILES = cute.ceil_div(BLOCK_Q, MMA_N)
@@ -200,15 +356,28 @@ class IndexDecodeScoreKernel:
         sk_layout = self._sk_layout()
 
         smem = SmemAllocator()
-        sK = smem.allocate_tensor(
-            dtype,
-            sk_layout.outer,
-            byte_alignment=128,
-            swizzle=sk_layout.inner,
-        )[0, None, None, None]
         # sQ aliases the first K stage: Q is consumed into registers before the
         # first K tile is needed, so the two never overlap in time.
-        sQ_tma = cute.make_tensor(sK[None, None, 0].iterator, layout=sq_layout.outer)
+        if cutlass.const_expr(nvfp4):
+            # Q and the K codes swizzle differently, so both views are built on
+            # the raw stage buffer.
+            k_stages = smem.allocate(cute.cosize(sk_layout.outer), byte_alignment=1024)
+            sK = cute.make_tensor(
+                cute.recast_ptr(k_stages, sk_layout.inner, dtype=Uint8), sk_layout.outer
+            )[0, None, None, None]
+            sQ_tma = cute.make_tensor(
+                cute.recast_ptr(k_stages, sq_layout.inner, dtype=dtype), sq_layout.outer
+            )
+            sK_scales = smem.allocate_tensor(Uint8, self._sk_scale_layout(), byte_alignment=128)
+            sK_scales = sK_scales[0, None, None, None]
+        else:
+            sK = smem.allocate_tensor(
+                dtype,
+                sk_layout.outer,
+                byte_alignment=128,
+                swizzle=sk_layout.inner,
+            )[0, None, None, None]
+            sQ_tma = cute.make_tensor(sK[None, None, 0].iterator, layout=sq_layout.outer)
         # TMA sees Q as (query, head, dim) while ldmatrix consumes a flattened Q
         # column mode. The target profile keeps the rank-2 view even for
         # degenerate shapes such as MAX_DQL == 1.
@@ -235,6 +404,8 @@ class IndexDecodeScoreKernel:
         elif warp_id == 1:
             cpasync.prefetch_descriptor(q_tma_atom)
             cpasync.prefetch_descriptor(k_tma_atom)
+            if cutlass.const_expr(nvfp4):
+                cpasync.prefetch_descriptor(ks_tma_atom)
         cute.arch.sync_threads()
 
         # No explicit launch_dependents: the only consumer is the block selector,
@@ -280,7 +451,7 @@ class IndexDecodeScoreKernel:
 
                     cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, tma_parity)
                     with cute.arch.elect_one():
-                        K_size = BLOCK_K * head_dim * (dtype.width // 8)
+                        K_size = self._k_page_bytes()
                         cute.arch.mbarrier_arrive_and_expect_tx(k_mbar, K_size)
                     simple_tma_copy(
                         k_tma_atom,
@@ -289,6 +460,14 @@ class IndexDecodeScoreKernel:
                         k_mbar,
                         cache_policy=EVICT_FIRST,
                     )
+                    if cutlass.const_expr(nvfp4):
+                        simple_tma_copy(
+                            ks_tma_atom,
+                            ks_tma_tensor[page_id, None, None],
+                            sK_scales[None, None, tma_stage],
+                            k_mbar,
+                            cache_policy=EVICT_FIRST,
+                        )
 
                     tma_stage = (tma_stage + 1) % num_stages
                     if tma_stage == 0:
@@ -296,39 +475,81 @@ class IndexDecodeScoreKernel:
 
             else:
                 # MMA warps; each handles K[32, head_dim] @ Q[BLOCK_Q, head_dim].T
-                sK_warp = cute.local_tile(sK, (32, head_dim, num_stages), (warp_id, 0, 0))
                 q_start = seqlen - decode_query_len
-
-                elems = 128 // dtype.width  # 16B
-                MMA_K = 32 * 8 // dtype.width  # 32B
-
-                # Pre-compute ldmatrix addresses.
-                # sK loads a [16 x 16B] tile:
-                #   ((16, (16B, 2), 1), (32 / 16, head_dim / 32B, num_stages))
-                # sQ loads an [8 x 32B] tile:
-                #   ((8, (16B, 4)), (BLOCK_Q / MMA_N, head_dim / 64B))
-                sK_ldsm = cute.zipped_divide(sK_warp, (16, cute.make_layout((elems, 2)), 1))
-                sQ_ldsm = cute.zipped_divide(sQ, (MMA_N, cute.make_layout((elems, 4))))
-
-                # sK: (16B, (32 / 16, head_dim / 32B, num_stages))
-                # sQ: (16B, (BLOCK_Q / MMA_N, head_dim / 64B))
-                sK_ldsm = sK_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
-                sQ_ldsm = sQ_ldsm[(lane_id % MMA_N, (None, lane_id // 8)), None]
-
-                ldsm_op = warp.LdMatrix8x8x16bOp(num_matrices=4)
-                ldsm_atom = cute.make_copy_atom(ldsm_op, dtype)
-
-                rQ = cute.make_rmem_tensor(
-                    ((elems // 2, 2), head_dim // (MMA_K * 2), Q_TILES), dtype
-                )
-                rK = cute.make_rmem_tensor((elems, 2, head_dim // MMA_K), dtype)
                 rC = cute.make_rmem_tensor((4, 2, Q_TILES), Float32)
+
+                if cutlass.const_expr(nvfp4):
+                    # One ldmatrix x4 reads 16 rows x 32 B of codes, so lane t
+                    # of each quad gets dims [8t, 8t + 8) of a 32-dim span,
+                    # all under one scale. Rest: (32 / 16, head_dim / 64, stage).
+                    sK_warp = cute.local_tile(sK, (32, head_dim // 2, num_stages), (warp_id, 0, 0))
+                    sK_ldsm = cute.zipped_divide(sK_warp, (16, cute.make_layout((16, 2)), 1))
+                    sK_ldsm = sK_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
+                    ldsm_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(num_matrices=4), Uint8)
+                    rK = cute.make_rmem_tensor((16, 2, head_dim // 64), Uint8)
+
+                    # (scale byte, K row, stage); a lane needs rows g, g + 8,
+                    # g + 16 and g + 24 of its warp's 32, g = lane // 4.
+                    scale_bytes = self._nvfp4_scale_row_bytes()
+                    sK_scale_rows = cute.make_tensor(
+                        sK_scales.iterator,
+                        cute.make_layout(
+                            (scale_bytes, BLOCK_K, num_stages),
+                            stride=(1, scale_bytes, BLOCK_K * scale_bytes),
+                        ),
+                    )
+                    rK_scales = cute.make_rmem_tensor((scale_bytes, 4), Uint8)
+                    # Each 4-byte scale word covers a 64-dim step; the lane's
+                    # two 32-dim spans use its bytes t // 2 and t // 2 + 2, of
+                    # rows g and g + 8 (prmt bytes 0-3 and 4-7).
+                    scale_selector = Uint32(0x6420 + 0x1111 * (lane_id % 4 // 2))
+                    rA = cute.make_rmem_tensor(8, Float16)
+                    rA_u32 = cute.recast_tensor(rA, Uint32)
+                else:
+                    sK_warp = cute.local_tile(sK, (32, head_dim, num_stages), (warp_id, 0, 0))
+
+                    elems = 128 // dtype.width  # 16B
+                    MMA_K = 32 * 8 // dtype.width  # 32B
+
+                    # Pre-compute ldmatrix addresses.
+                    # sK loads a [16 x 16B] tile:
+                    #   ((16, (16B, 2), 1), (32 / 16, head_dim / 32B, num_stages))
+                    # sQ loads an [8 x 32B] tile:
+                    #   ((8, (16B, 4)), (BLOCK_Q / MMA_N, head_dim / 64B))
+                    sK_ldsm = cute.zipped_divide(sK_warp, (16, cute.make_layout((elems, 2)), 1))
+                    sQ_ldsm = cute.zipped_divide(sQ, (MMA_N, cute.make_layout((elems, 4))))
+
+                    # sK: (16B, (32 / 16, head_dim / 32B, num_stages))
+                    # sQ: (16B, (BLOCK_Q / MMA_N, head_dim / 64B))
+                    sK_ldsm = sK_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
+                    sQ_ldsm = sQ_ldsm[(lane_id % MMA_N, (None, lane_id // 8)), None]
+
+                    ldsm_op = warp.LdMatrix8x8x16bOp(num_matrices=4)
+                    ldsm_atom = cute.make_copy_atom(ldsm_op, dtype)
+
+                    rQ = cute.make_rmem_tensor(
+                        ((elems // 2, 2), head_dim // (MMA_K * 2), Q_TILES), dtype
+                    )
+                    rK = cute.make_rmem_tensor((elems, 2, head_dim // MMA_K), dtype)
 
                 if warp_id == 0:
                     cute.arch.mbarrier_wait(tma_full_mbar, 0)
                 cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
-                for q in cutlass.range_constexpr(Q_TILES):
-                    cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
+                if cutlass.const_expr(nvfp4):
+                    # The B fragments must follow the K dim order of the A
+                    # fragments: lane t of each quad takes dims [8t, 8t + 8) of
+                    # each 32-dim span of Q row lane // 4.
+                    sQ_lanes = cute.zipped_divide(sQ, (MMA_N, 8))
+                    rQ = cute.make_rmem_tensor((8, head_dim // 32, Q_TILES), dtype)
+                    for q in cutlass.range_constexpr(Q_TILES):
+                        for s in cutlass.range_constexpr(head_dim // 32):
+                            cute.autovec_copy(
+                                sQ_lanes[(lane_id // 4, None), (q, 4 * s + lane_id % 4)],
+                                rQ[None, s, q],
+                            )
+                else:
+                    for q in cutlass.range_constexpr(Q_TILES):
+                        cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
                 cute.arch.mbarrier_arrive(tma_empty_mbar)
 
                 tma_stage = 1 % self.num_stages
@@ -336,7 +557,17 @@ class IndexDecodeScoreKernel:
                 if tma_stage == 0:
                     tma_parity ^= 1
 
-                if cutlass.const_expr(dtype is Float8E4M3FN):
+                if cutlass.const_expr(nvfp4):
+                    # (f16, half h, span, Q tile): half h of a lane's 8 dims of
+                    # a span is the B fragment of that span's MMA h.
+                    rQ_f16 = cute.make_rmem_tensor((4, 2, head_dim // 32, Q_TILES), Float16)
+                    rQ_u32 = cute.recast_tensor(rQ, Uint32)
+                    rQ_f16_u32 = cute.recast_tensor(rQ_f16, Uint32)
+                    for i in cutlass.range_constexpr(cute.size(rQ_u32)):
+                        converted = fp8x4_to_fp16x4(rQ_u32[i])
+                        rQ_f16_u32[i * 2] = converted[0]
+                        rQ_f16_u32[i * 2 + 1] = converted[1]
+                elif cutlass.const_expr(dtype is Float8E4M3FN):
                     rQ_f16 = cute.make_rmem_tensor((4, head_dim // MMA_K, Q_TILES, 2), Float16)
                     q_lower, q_upper = _fp8_to_f16_mma_fragments(rQ)
                     rQ_f16[None, None, None, 0].store(q_lower.load())
@@ -349,48 +580,98 @@ class IndexDecodeScoreKernel:
                         cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, tma_parity)
                     cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
 
-                    for k in cutlass.range_constexpr(head_dim // MMA_K):
-                        cute.copy(
-                            ldsm_atom,
-                            sK_ldsm[None, (None, k, tma_stage)],
-                            rK[None, None, k],
-                        )
-                        for m in cutlass.range_constexpr(2):
-                            if cutlass.const_expr(dtype is Float8E4M3FN):
-                                rK_lower, rK_upper = _fp8_to_f16_mma_fragments(rK[None, m, k])
-                                for n in cutlass.range_constexpr(Q_TILES):
-                                    rC[None, m, n] = mma_sync(
-                                        rK_lower,
-                                        rQ_f16[None, k, n, 0],
-                                        rC[None, m, n],
+                    if cutlass.const_expr(nvfp4):
+                        for kk in cutlass.range_constexpr(head_dim // 64):
+                            cute.copy(
+                                ldsm_atom,
+                                sK_ldsm[None, (None, kk, tma_stage)],
+                                rK[None, None, kk],
+                            )
+                        for i in cutlass.range_constexpr(4):
+                            cute.autovec_copy(
+                                sK_scale_rows[None, warp_id * 32 + i * 8 + lane_id // 4, tma_stage],
+                                rK_scales[None, i],
+                            )
+                        # (register, m, kk): register r holds row g + 8 (r % 2)
+                        # of row group m, span 2 kk + r // 2.
+                        rK_u32 = cute.recast_tensor(rK, Uint32)
+                        # (word kk, row g + 8i)
+                        rK_scales_u32 = cute.recast_tensor(rK_scales, Uint32)
+                        for kk in cutlass.range_constexpr(head_dim // 64):
+                            for m in cutlass.range_constexpr(2):
+                                # (span 2 kk, span 2 kk + 1) scales of rows g, g + 8.
+                                scales = _e4m3x4_gather_to_fp16x4(
+                                    rK_scales_u32[kk, 2 * m],
+                                    rK_scales_u32[kk, 2 * m + 1],
+                                    scale_selector,
+                                )
+                                for c in cutlass.range_constexpr(2):
+                                    k_g = _e2m1x8_to_fp16x8_scaled(
+                                        rK_u32[2 * c, m, kk], scales[0], c
                                     )
-                                    rC[None, m, n] = mma_sync(
-                                        rK_upper,
-                                        rQ_f16[None, k, n, 1],
-                                        rC[None, m, n],
+                                    k_g8 = _e2m1x8_to_fp16x8_scaled(
+                                        rK_u32[2 * c + 1, m, kk], scales[1], c
                                     )
-                            else:
-                                for n in cutlass.range_constexpr(Q_TILES):
-                                    rC[None, m, n] = mma_sync(
-                                        rK[None, m, k],
-                                        rQ[(None, k % 2), k // 2, n],
-                                        rC[None, m, n],
-                                    )
+                                    for h in cutlass.range_constexpr(2):
+                                        rA_u32[0] = k_g[2 * h]
+                                        rA_u32[1] = k_g8[2 * h]
+                                        rA_u32[2] = k_g[2 * h + 1]
+                                        rA_u32[3] = k_g8[2 * h + 1]
+                                        for n in cutlass.range_constexpr(Q_TILES):
+                                            rC[None, m, n] = mma_sync(
+                                                rA,
+                                                rQ_f16[None, h, 2 * kk + c, n],
+                                                rC[None, m, n],
+                                            )
+                    else:
+                        for k in cutlass.range_constexpr(head_dim // MMA_K):
+                            cute.copy(
+                                ldsm_atom,
+                                sK_ldsm[None, (None, k, tma_stage)],
+                                rK[None, None, k],
+                            )
+                            for m in cutlass.range_constexpr(2):
+                                if cutlass.const_expr(dtype is Float8E4M3FN):
+                                    rK_lower, rK_upper = _fp8_to_f16_mma_fragments(rK[None, m, k])
+                                    for n in cutlass.range_constexpr(Q_TILES):
+                                        rC[None, m, n] = mma_sync(
+                                            rK_lower,
+                                            rQ_f16[None, k, n, 0],
+                                            rC[None, m, n],
+                                        )
+                                        rC[None, m, n] = mma_sync(
+                                            rK_upper,
+                                            rQ_f16[None, k, n, 1],
+                                            rC[None, m, n],
+                                        )
+                                else:
+                                    for n in cutlass.range_constexpr(Q_TILES):
+                                        rC[None, m, n] = mma_sync(
+                                            rK[None, m, k],
+                                            rQ[(None, k % 2), k // 2, n],
+                                            rC[None, m, n],
+                                        )
 
                     cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                     k_start = block_id * BLOCK_K + warp_id * 32
 
-                    for q in cutlass.range_constexpr(Q_TILES):
-                        for i in cutlass.range_constexpr(4):
-                            for j in cutlass.range_constexpr(2):
-                                col = q * 8 + (lane_id % 4) * 2 + j
-                                q_local_pos = col % MAX_DQL
-                                q_pos = q_start + q_local_pos
-                                k_pos = k_start + i * 8 + lane_id // 4
-                                rC[q * 8 + i * 2 + j] = (
-                                    rC[q * 8 + i * 2 + j] if q_pos >= k_pos else float("-inf")
-                                )
+                    # NVFP4 scoring is ALU-bound, so it skips the mask when all
+                    # of this warp's keys precede the first query.
+                    mask_causal = True
+                    if cutlass.const_expr(nvfp4):
+                        mask_causal = k_start + 31 > q_start
+                    if mask_causal:
+                        for q in cutlass.range_constexpr(Q_TILES):
+                            for i in cutlass.range_constexpr(4):
+                                for j in cutlass.range_constexpr(2):
+                                    col = q * 8 + (lane_id % 4) * 2 + j
+                                    q_local_pos = col % MAX_DQL
+                                    q_pos = q_start + q_local_pos
+                                    k_pos = k_start + i * 8 + lane_id // 4
+                                    rC[q * 8 + i * 2 + j] = (
+                                        rC[q * 8 + i * 2 + j] if q_pos >= k_pos else float("-inf")
+                                    )
 
                     for q in cutlass.range_constexpr(Q_TILES):
                         # Thread-local reduction along the BLOCK_K dim.

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/minimaxM3IndexKNvfp4.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -46,6 +47,8 @@ __device__ __forceinline__ __nv_fp8_e4m3 bf16RoundedToFp8(float value)
     return __nv_fp8_e4m3(__bfloat162float(__float2bfloat16_rn(value)));
 }
 
+// kNvfp4KCache stores K as NVFP4-E pages instead of E4M3 HND pages.
+template <bool kNvfp4KCache>
 __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __nv_fp8_e4m3* q_out,
     __nv_fp8_e4m3* k_cache, int const* out_cache_loc, int64_t page_stride, int64_t token_stride, int page_size,
     int64_t num_pages, int num_tokens, int num_heads_q, float eps, __nv_bfloat16 const* q_weight,
@@ -155,6 +158,12 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
             return;
         }
         int const within_page = slot % page_size;
+        if constexpr (kNvfp4KCache)
+        {
+            minimaxM3StoreNvfp4EIndexK(elements,
+                reinterpret_cast<uint8_t*>(k_cache) + static_cast<int64_t>(page) * page_stride, within_page, lane_id);
+            return;
+        }
         output = k_cache + static_cast<int64_t>(page) * page_stride + static_cast<int64_t>(within_page) * token_stride
             + lane_id * kElemsPerThread;
     }
@@ -164,13 +173,14 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
 } // namespace
 
 void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* qOut, void* kCache, int const* outCacheLoc,
-    int64_t pageStride, int64_t tokenStride, int pageSize, int64_t numPages, int numTokens, int numHeadsQ, int headDim,
-    int rotaryDim, float eps, void const* qWeight, void const* kWeight, float base, int const* positionIds,
-    cudaStream_t stream)
+    int64_t pageStride, int64_t tokenStride, int pageSize, bool kCacheNvfp4, int64_t numPages, int numTokens,
+    int numHeadsQ, int headDim, int rotaryDim, float eps, void const* qWeight, void const* kWeight, float base,
+    int const* positionIds, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(headDim == kHeadDim, "MiniMax-M3 FP8 indexer requires head_dim=128");
     TLLM_CHECK_WITH_INFO(rotaryDim == kRotaryDim, "MiniMax-M3 FP8 indexer requires rotary_dim=64");
     TLLM_CHECK_WITH_INFO(numHeadsQ > 0, "MiniMax-M3 FP8 indexer requires at least one query head");
+    TLLM_CHECK_WITH_INFO(!kCacheNvfp4 || pageSize == 128, "MiniMax-M3 NVFP4 index-K cache requires page_size=128");
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
@@ -178,7 +188,9 @@ void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* qOut, void* kCach
     int64_t const gridSize64 = common::divUp(totalWarps, static_cast<int64_t>(kWarpsPerBlock));
     TLLM_CHECK_WITH_INFO(gridSize64 <= std::numeric_limits<int>::max(), "MiniMax-M3 FP8 indexer grid is too large");
     int const gridSize = static_cast<int>(gridSize64);
-    minimaxM3Fp8IndexerQKNormRopeKernel<<<gridSize, kBlockSize, 0, stream>>>(static_cast<__nv_bfloat16 const*>(qk),
+    auto* const kernel
+        = kCacheNvfp4 ? &minimaxM3Fp8IndexerQKNormRopeKernel<true> : &minimaxM3Fp8IndexerQKNormRopeKernel<false>;
+    kernel<<<gridSize, kBlockSize, 0, stream>>>(static_cast<__nv_bfloat16 const*>(qk),
         static_cast<__nv_fp8_e4m3*>(qOut), static_cast<__nv_fp8_e4m3*>(kCache), outCacheLoc, pageStride, tokenStride,
         pageSize, numPages, numTokens, numHeadsQ, eps, static_cast<__nv_bfloat16 const*>(qWeight),
         static_cast<__nv_bfloat16 const*>(kWeight), base, positionIds);
