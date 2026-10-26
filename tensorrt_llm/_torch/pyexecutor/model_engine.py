@@ -4,7 +4,6 @@
 import functools
 import math
 import os
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
@@ -79,30 +78,6 @@ from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
-
-class ModelEngine(ABC):
-
-    @abstractmethod
-    def get_max_num_sequences(self) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def forward(self,
-                scheduled_requests: ScheduledRequests,
-                resource_manager: Optional[ResourceManager],
-                new_tensors_device: Optional[SampleStateTensors],
-                cache_indirection_buffer: Optional[torch.Tensor] = None):
-        raise NotImplementedError
-
-    def warmup(self, resource_manager: Optional[ResourceManager]) -> None:
-        """
-        This method is called after runtime resources are initialized. The
-        resource manager is absent for drivers that allocate none. Override to
-        perform warmup actions: instantiating CUDA graphs, torch.compile, etc.
-        """
-        return
-
-
 # Refit only needs the compile wrapper removed before weights are loaded: the
 # wrapper inserts "_orig_mod" into every parameter path, and load_weights()
 # matches checkpoint tensors by dotted path (modeling_utils.py:1141-1160). With
@@ -136,7 +111,7 @@ def _configure_deep_gemm_pdl() -> None:
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 
-class PyTorchModelEngine(ModelEngine):
+class PyTorchModelEngine:
 
     def __init__(
         self,
