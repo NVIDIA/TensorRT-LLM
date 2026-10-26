@@ -49,6 +49,7 @@ from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.prefix_token_cache import int32_bytes
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import (ConversationMessage,
                                        async_apply_chat_template)
@@ -2378,10 +2379,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 if (request.disaggregated_params is not None and
                         request.disaggregated_params.return_prompt_token_ids_b64
                         and response.prompt_token_ids is not None):
-                    import numpy as np
+                    # A prefix-cache hit already holds these ids as int32.
                     response.prompt_token_ids_b64 = base64.b64encode(
-                        np.asarray(response.prompt_token_ids,
-                                   dtype=np.int32).tobytes()).decode("ascii")
+                        int32_bytes(response.prompt_token_ids)).decode("ascii")
                     response.prompt_token_ids = None
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:

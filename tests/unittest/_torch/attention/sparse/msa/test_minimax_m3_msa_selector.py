@@ -201,7 +201,9 @@ def test_fused_selector_head_major_output_through_msa_q2k_consumer():
     if not msa_package_available():
         pytest.skip("fmha_sm100 (MSA) not importable")
 
-    from fmha_sm100.sparse_fmha_adapter import _convert_kv_block_indexes_to_q2k
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100.sparse_fmha_adapter import (
+        _convert_kv_block_indexes_to_q2k,
+    )
 
     total_q, num_kv_heads, num_blocks = 7, 4, 96
     scores = torch.randn(num_kv_heads, num_blocks, total_q, device="cuda")

@@ -15,6 +15,7 @@
 
 """Task-scheduled paged MLA decode with a plan/run lifecycle."""
 
+from ._worktile_scope import with_scalar_work_tile_info
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import functools
@@ -1044,6 +1045,7 @@ def _make_mla_decode_compile_spec(
 
 
 @functools.cache
+@with_scalar_work_tile_info
 def _get_compiled_mla_decode(
     compile_spec: _MLADecodeCompileSpec,
 ):

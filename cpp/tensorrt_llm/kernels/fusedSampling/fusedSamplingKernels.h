@@ -21,6 +21,10 @@
 
 namespace tensorrt_llm
 {
+//! Philox subsequences from here up hold per-row streams. A shared seed/offset makes the row
+//! index the subsequence, which never reaches them.
+constexpr uint64_t kPerRowSubsequenceBase = 1ull << 63;
+
 namespace kernels
 {
 

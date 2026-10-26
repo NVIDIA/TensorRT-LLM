@@ -23,6 +23,9 @@ l0_dgx_b200:
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
+  # MiniMax-M3.1 TP2 two-rank natives: bitwise to the stock one-shot all-reduce chains.
+  - unittest/_torch/multi_gpu/test_minimax_m31_f3_ar_prepushed.py
+  - unittest/_torch/multi_gpu/test_minimax_m31_s2_moe_tail.py
   # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]

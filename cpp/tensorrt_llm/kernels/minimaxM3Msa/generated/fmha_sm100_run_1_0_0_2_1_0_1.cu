@@ -1,0 +1,231 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+// SPDX-License-Identifier: MIT
+
+// Auto-generated per-variant FMHA run binding: 1_0_0_2_1_0_1
+#include "fmha_sm100_params.h"
+#include "tvm_ffi_utils.h"
+#include <climits>
+#include <cmath>
+#include <cstdlib>
+
+using tvm::ffi::Optional;
+
+// Forward-declare the variant kernel function (defined in the inst .cu file)
+extern cudaError_t fmha_sm100_1_0_0_2_1_0_1(const FMHACutlassSM100Params& p);
+
+void FMHAVariantRun_1_0_0_2_1_0_1(ffi::TensorView workspace_buffer, ffi::TensorView q, ffi::TensorView k,
+                    ffi::TensorView v, ffi::TensorView qo_segment_lens,
+                    ffi::TensorView kv_segment_lens,
+                    ffi::TensorView qo_segment_offsets,
+                    ffi::TensorView kv_segment_offsets,
+                    ffi::TensorView packed_work_range,
+                    ffi::TensorView packed_work_info,
+                    Optional<ffi::TensorView> maybe_o,
+                    double sm_scale, double scale_q, double scale_k, double scale_v,
+                    double o_scale, int64_t max_qo_len,
+                    Optional<ffi::TensorView> maybe_qo_offsets,
+                    int64_t num_kv_splits,
+                    Optional<ffi::TensorView> maybe_kv_tile_begin_indices,
+                    Optional<ffi::TensorView> maybe_kv_tile_end_indices,
+                    Optional<ffi::TensorView> maybe_kv_split_indices,
+                    Optional<ffi::TensorView> maybe_workspace_o,
+                    Optional<ffi::TensorView> maybe_workspace_lse,
+                    Optional<ffi::TensorView> maybe_num_kv_splits_per_row,
+                    int64_t qo_tile_size,
+                    Optional<ffi::TensorView> maybe_kv_indices,
+                    Optional<ffi::TensorView> maybe_kv_page_indptr,
+                    Optional<ffi::TensorView> maybe_max_score,
+                    int64_t max_k_tiles,
+                    Optional<ffi::TensorView> maybe_kv_block_indexes,
+                    int64_t pack_factor,
+                    bool qo_len_uniform,
+                    int64_t stream_ptr) {
+  bool is_paged = maybe_kv_indices.has_value();
+  int head_dim_qk = q.size(2);
+  int head_dim_vo = is_paged ? v.size(3) : v.size(2);
+  int num_qo_heads = q.size(1);
+  int num_kv_heads = k.size(1);
+  int page_size = is_paged ? k.size(2) : 0;
+
+  void* o_ptr = maybe_o.has_value() ? maybe_o.value().data_ptr() : nullptr;
+  float* max_score_ptr = maybe_max_score.has_value()
+                             ? static_cast<float*>(maybe_max_score.value().data_ptr())
+                             : nullptr;
+  int* kv_block_indexes_ptr = maybe_kv_block_indexes.has_value()
+                                  ? static_cast<int*>(maybe_kv_block_indexes.value().data_ptr())
+                                  : nullptr;
+
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
+  FMHACutlassSM100Params params;
+  params.workspace_buffer_ptr = workspace_buffer.data_ptr();
+  params.q_ptr = q.data_ptr();
+  params.k_ptr = k.data_ptr();
+  params.v_ptr = v.data_ptr();
+  params.qo_segment_lens_ptr = static_cast<int*>(qo_segment_lens.data_ptr());
+  params.kv_segment_lens_ptr = static_cast<int*>(kv_segment_lens.data_ptr());
+  params.qo_segment_offsets_ptr = static_cast<int*>(qo_segment_offsets.data_ptr());
+  params.kv_segment_offsets_ptr = static_cast<int*>(kv_segment_offsets.data_ptr());
+  params.packed_work_range_ptr = static_cast<uint64_t*>(packed_work_range.data_ptr());
+  params.packed_work_info_ptr = static_cast<uint64_t*>(packed_work_info.data_ptr());
+  params.o_ptr = o_ptr;
+  params.mask_mode_code = 1;  // causal only
+  params.sm_scale = sm_scale;
+  params.scale_q = scale_q;
+  params.scale_k = scale_k;
+  params.scale_v = scale_v;
+  params.o_scale = o_scale;
+  params.num_qo_heads = num_qo_heads;
+  params.num_kv_heads = num_kv_heads;
+  params.head_dim_qk = head_dim_qk;
+  params.head_dim_vo = head_dim_vo;
+  params.q_stride_n = q.stride(0);
+  params.q_stride_h = q.stride(1);
+  params.k_stride_n = k.stride(0);
+  params.k_stride_h = k.stride(1);
+  params.v_stride_n = v.stride(0);
+  params.v_stride_h = v.stride(1);
+  params.batch_size = qo_segment_lens.size(0);
+  params.total_qo_len = q.size(0);
+  params.total_kv_len = is_paged ? 0 : k.size(0);
+  params.max_qo_len = static_cast<int>(max_qo_len);
+  params.qo_offsets_ptr = maybe_qo_offsets.has_value()
+                              ? static_cast<int*>(maybe_qo_offsets.value().data_ptr())
+                              : nullptr;
+  params.stream = stream;
+  params.num_kv_splits = static_cast<int>(num_kv_splits);
+  params.kv_tile_begin_ptr = maybe_kv_tile_begin_indices.has_value()
+                                 ? static_cast<int*>(maybe_kv_tile_begin_indices.value().data_ptr())
+                                 : nullptr;
+  params.kv_tile_end_ptr = maybe_kv_tile_end_indices.has_value()
+                               ? static_cast<int*>(maybe_kv_tile_end_indices.value().data_ptr())
+                               : nullptr;
+  params.kv_split_ptr = maybe_kv_split_indices.has_value()
+                            ? static_cast<int*>(maybe_kv_split_indices.value().data_ptr())
+                            : nullptr;
+  params.workspace_o_ptr = maybe_workspace_o.has_value()
+                               ? maybe_workspace_o.value().data_ptr()
+                               : nullptr;
+  params.workspace_lse_ptr = maybe_workspace_lse.has_value()
+                                     ? static_cast<float*>(maybe_workspace_lse.value().data_ptr())
+                                     : nullptr;
+  params.num_kv_splits_per_row_ptr = maybe_num_kv_splits_per_row.has_value()
+                                         ? static_cast<int*>(maybe_num_kv_splits_per_row.value().data_ptr())
+                                         : nullptr;
+  params.kv_indices_ptr = maybe_kv_indices.has_value()
+                              ? static_cast<int*>(maybe_kv_indices.value().data_ptr())
+                              : nullptr;
+  params.kv_page_indptr_ptr = maybe_kv_page_indptr.has_value()
+                                  ? static_cast<int*>(maybe_kv_page_indptr.value().data_ptr())
+                                  : nullptr;
+  params.total_page_num = is_paged ? k.size(0) : 0;
+  params.max_score_ptr = max_score_ptr;
+  params.max_k_tiles = static_cast<int>(max_k_tiles);
+  params.kv_block_indexes_ptr = kv_block_indexes_ptr;
+  params.kv_block_num = 0;
+  if (maybe_kv_block_indexes.has_value()) {
+    auto const selector = maybe_kv_block_indexes.value();
+    CHECK_CUDA(selector);
+    CHECK_DEVICE(selector, q);
+    CHECK_INPUT_TYPE(selector, dl_int32);
+    CHECK_DIM(3, selector);
+    TVM_FFI_ICHECK_EQ(selector.size(0), q.size(0));
+    TVM_FFI_ICHECK_EQ(selector.size(1), num_kv_heads);
+    TVM_FFI_ICHECK_GT(selector.size(2), 0);
+    TVM_FFI_ICHECK_LE(selector.size(2), INT_MAX);
+    for (int dim = 0; dim < 3; ++dim) {
+      TVM_FFI_ICHECK_GE(selector.stride(dim), 0);
+    }
+    params.kv_block_num = static_cast<int>(selector.size(2));
+    params.kv_block_stride_n = selector.stride(0);
+    params.kv_block_stride_h = selector.stride(1);
+    params.kv_block_stride_b = selector.stride(2);
+  }
+
+  params.pack_factor = static_cast<int>(pack_factor);
+  params.num_ctas = static_cast<int>(packed_work_range.size(0));
+  if (pack_factor > 1) {
+    params.q_stride_n_original = q.stride(0);
+    params.q_stride_h_original = q.stride(1);
+    params.h_r_original = num_qo_heads / num_kv_heads;
+    int packed_num_qo_heads = num_qo_heads / static_cast<int>(pack_factor);
+    params.num_qo_heads = packed_num_qo_heads;
+    params.total_qo_len = q.size(0) * static_cast<int>(pack_factor);
+    params.q_stride_n = packed_num_qo_heads * head_dim_qk;
+    params.q_stride_h = head_dim_qk;
+
+    // Pack GQA: direct max_score unpack
+    // Activate when max_score is in unpacked shape (size(0) > packed num_qo_heads).
+    if (maybe_max_score.has_value()
+        && static_cast<int>(maybe_max_score.value().size(0)) > packed_num_qo_heads) {
+      params.max_score_direct_ptr = max_score_ptr;
+      params.total_qo_len_orig = static_cast<int>(maybe_max_score.value().size(2));
+    }
+
+    // Pack GQA: direct O unpack
+    // Activated only when caller explicitly opts in (via Python flag) AND O is in unpacked shape.
+    // Caller-allocated unpacked-shape O without opt-in (e.g. legacy bench) MUST go through
+    // the original packed-write + Python _unpack_gqa_o path to keep semantics correct.
+    if (pack_factor > 1
+        && maybe_o.has_value()
+        && static_cast<int>(maybe_o.value().size(1)) > packed_num_qo_heads) {
+      params.o_direct_ptr = o_ptr;
+      params.num_qo_heads_orig = static_cast<int>(maybe_o.value().size(1));
+      params.o_ptr = nullptr;  // skip TMA descriptor for O
+
+      // TMA fused direct-O unpack eligibility:
+      //   1. qo_len uniform across batches (per-CTA tile shape constant)
+      //   2. FMHA_DISABLE_TMA_DIRECT_O env var not set (A/B testing knob)
+      // If ineligible, epilogue falls back to vec16 software scatter loop.
+      static const bool tma_direct_o_disabled =
+          (std::getenv("FMHA_DISABLE_TMA_DIRECT_O") != nullptr);
+      params.tma_direct_o_enabled = qo_len_uniform && !tma_direct_o_disabled
+                                    && (params.max_qo_len > 0);
+      // total_qo_len_orig: unpacked tensor's leading dim
+      // (already set if max_score present; ensure consistent if not)
+      if (params.total_qo_len_orig == 0) {
+        params.total_qo_len_orig =
+            static_cast<int>(maybe_o.value().size(0));
+      }
+    }
+  }
+
+#ifdef FMHA_GMEM_BOUNDS_CHECK
+  params.gmem_bounds.packed_work_range_size = static_cast<int>(packed_work_range.size(0));
+  params.gmem_bounds.packed_work_info_size = static_cast<int>(packed_work_info.size(0));
+  params.gmem_bounds.qo_segment_offsets_size = static_cast<int>(qo_segment_offsets.size(0));
+  params.gmem_bounds.kv_segment_offsets_size = static_cast<int>(kv_segment_offsets.size(0));
+  params.gmem_bounds.segment_lens_size = static_cast<int>(qo_segment_lens.size(0));
+  params.gmem_bounds.kv_page_indptr_size = maybe_kv_page_indptr.has_value()
+      ? static_cast<int>(maybe_kv_page_indptr.value().size(0)) : 0;
+  params.gmem_bounds.kv_indices_size = maybe_kv_indices.has_value()
+      ? static_cast<int>(maybe_kv_indices.value().size(0)) : 0;
+  params.gmem_bounds.max_score_numel = maybe_max_score.has_value()
+      ? static_cast<int>(maybe_max_score.value().size(0)
+                         * maybe_max_score.value().size(1)
+                         * maybe_max_score.value().size(2)) : 0;
+  // A sliced head-major view can span more storage than its logical numel.
+  // TensorView::data_ptr() already includes the view's storage offset.
+  params.gmem_bounds.kv_block_indexes_span = 0;
+  if (maybe_kv_block_indexes.has_value()) {
+    auto const selector = maybe_kv_block_indexes.value();
+    if (selector.size(0) > 0 && selector.size(1) > 0) {
+      params.gmem_bounds.kv_block_indexes_span =
+          (selector.size(0) - 1) * params.kv_block_stride_n
+          + (selector.size(1) - 1) * params.kv_block_stride_h
+          + (selector.size(2) - 1) * params.kv_block_stride_b + 1;
+    }
+  }
+  params.gmem_bounds.split_kv_size = maybe_kv_tile_begin_indices.has_value()
+      ? static_cast<int>(maybe_kv_tile_begin_indices.value().size(0)) : 0;
+  params.gmem_bounds.qo_offsets_size = maybe_qo_offsets.has_value()
+      ? static_cast<int>(maybe_qo_offsets.value().size(0)) : 0;
+#endif
+
+  cudaError_t status = fmha_sm100_1_0_0_2_1_0_1(params);
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "FMHA variant 1_0_0_2_1_0_1 failed: " << cudaGetErrorString(status);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_1_0_0_2_1_0_1, FMHAVariantRun_1_0_0_2_1_0_1);

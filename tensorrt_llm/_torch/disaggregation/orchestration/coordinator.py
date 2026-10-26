@@ -69,6 +69,21 @@ def attach_ctx_usage(request: LlmRequest, response) -> None:
         response.result.ctx_usage = disagg_params.ctx_usage
 
 
+class _ReceiveReadyEvents:
+    """The readiness events of one receive destination that spans two pools (the target's and a
+    standalone drafter's): ready only once every one has completed."""
+
+    def __init__(self, events: List["torch.cuda.Event"]) -> None:
+        self._events = events
+
+    def query(self) -> bool:
+        return all(event.query() for event in self._events)
+
+    def synchronize(self) -> None:
+        for event in self._events:
+            event.synchronize()
+
+
 class DisaggTransferCoordinator:
     """Disagg transfer entry points used by every executor loop variant.
 
@@ -82,6 +97,7 @@ class DisaggTransferCoordinator:
     # Class-level default, so a coordinator assembled without ``__init__``
     # keeps the blocking receive fence.
     _defer_unready_gen_receives = False
+    _draft_kv_cache_manager = None
 
     def __init__(
         self,
@@ -350,6 +366,7 @@ class DisaggTransferCoordinator:
         # does not block this thread on them; publication polls them instead.
         fences = self._take_receive_fences(admitted) if defer_unready else {}
         self._effects.prepare_gen_resources(admitted)
+        self._merge_draft_receive_fences(admitted, fences, defer_unready)
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -395,6 +412,35 @@ class DisaggTransferCoordinator:
         if take is None:
             return {}
         return {req.py_request_id: take(req) for req in requests}
+
+    def _merge_draft_receive_fences(
+        self,
+        requests: List[LlmRequest],
+        fences: Dict[int, Optional["torch.cuda.Event"]],
+        defer_unready: bool,
+    ) -> None:
+        """Fold the draft pool's readiness events into the receive fences.
+
+        Only a draft pool that receives the drafter context window records one, during
+        ``prepare_gen_resources``. Deferred publication then polls both events; otherwise the
+        executor waits here, as the target pool's event is waited on in ``prepare_resources``.
+        """
+        manager = self._draft_kv_cache_manager
+        if not getattr(manager, "_disagg_draft_kv_receive", False):
+            return
+        for req in requests:
+            draft_ready = manager.take_disagg_receive_ready(req)
+            if draft_ready is None:
+                continue
+            if not defer_unready:
+                draft_ready.synchronize()
+                continue
+            target_ready = fences.get(req.py_request_id)
+            fences[req.py_request_id] = (
+                draft_ready
+                if target_ready is None
+                else _ReceiveReadyEvents([target_ready, draft_ready])
+            )
 
     def _publish_ready_gen_receives(self) -> None:
         """Start the asynchronous receive of each waiting request whose

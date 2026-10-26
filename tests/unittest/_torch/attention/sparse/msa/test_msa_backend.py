@@ -134,7 +134,9 @@ def test_msa_import_preserves_cute_compile_option_selection() -> None:
     import cutlass.cute as cute
 
     original_compile = cute.compile
-    from fmha_sm100.cute import interface as sparse_interface
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100.cute import (
+        interface as sparse_interface,
+    )
 
     del sparse_interface
     assert cute.compile is original_compile
@@ -570,7 +572,9 @@ def test_msa_paged_kv_preserves_tma_compatible_outer_stride() -> None:
     if not msa_package_available():
         pytest.skip("fmha_sm100 (MSA) not importable")
 
-    from fmha_sm100.cute import interface as sparse_interface
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100.cute import (
+        interface as sparse_interface,
+    )
 
     pages, roles, heads, page_size, head_dim = 5, 2, 2, 128, 128
     pool = torch.empty(
@@ -612,7 +616,9 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
     if not msa_package_available():
         pytest.skip("fmha_sm100 (MSA) not importable")
 
-    from fmha_sm100.cute import interface as sparse_interface
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100.cute import (
+        interface as sparse_interface,
+    )
 
     pages, heads, page_size, head_dim = 5, 2, 128, 128
     outer_stride = heads * page_size * head_dim + 1

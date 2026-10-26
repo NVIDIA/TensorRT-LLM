@@ -9235,8 +9235,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, q_dtype: torch.dtype, num_heads: int,
-                     max_decode_query_len: int, head_dim: int):
-            key = (q_dtype, num_heads, max_decode_query_len, head_dim)
+                     max_decode_query_len: int, head_dim: int, split_k: int):
+            key = (q_dtype, num_heads, max_decode_query_len, head_dim, split_k)
             if key in cls.kernel_cache:
                 return
 
@@ -9283,7 +9283,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cute_dtype,
                 num_heads,
                 max_decode_query_len,
-                cls.SPLIT_K,
+                split_k,
                 head_dim,
             )
             cls.kernel_cache[key] = cute.compile(
@@ -9308,8 +9308,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             score: torch.Tensor,
             max_decode_query_len: int,
+            split_k: int = SPLIT_K,
         ) -> None:
             """Score one decode step, compiling the kernel on first use.
+
+            ``split_k`` is the number of CTAs per request; each block is scored
+            by exactly one of them, so the scores do not depend on it.
 
             The compile allocates, so it must not land inside a CUDA graph
             capture. It does not: CUDAGraphRunner.capture runs eager warmup
@@ -9317,10 +9321,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             captures will replay.
             """
             _, num_heads, head_dim = idx_q.shape
-            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim)
+            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim,
+                   split_k)
             if key not in cls.kernel_cache:
                 cls._compile(idx_q.dtype, num_heads, max_decode_query_len,
-                             head_dim)
+                             head_dim, split_k)
             cls.kernel_cache[key](idx_q, index_k_cache, block_table, score,
                                   seq_lens)
 
@@ -9334,6 +9339,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        split_k: int = 256,
     ) -> None:
         """Write per-block max index scores for one decode step, in place.
 
@@ -9352,6 +9358,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 passed without a copy.
             max_decode_query_len: compile-time bound on decode_query_len;
                 num_index_heads * max_decode_query_len must not exceed 32.
+            split_k: CTAs per request (compile-time); each walks blocks
+                split, split + split_k, ... The scores do not depend on it.
         """
         if not is_sm_100f():
             raise ValueError(
@@ -9376,6 +9384,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens,
             score,
             max_decode_query_len,
+            split_k,
         )
 
     @torch.library.register_fake(
@@ -9387,6 +9396,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        split_k: int = 256,
     ) -> None:
         return None
 

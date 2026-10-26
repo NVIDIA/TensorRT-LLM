@@ -1,5 +1,9 @@
 name: msa
-description: MiniMax Sparse Attention (fmha_sm100) kernels for SM100 sparse attention
+description: MiniMax Sparse Attention (fmha_sm100) kernels for SM100 sparse attention, vendored from oss-components/msa and vllm-project/MSA (MIT)
 source: fetched
 directory_matches:
 - fmha_sm100
+- msa_kernels
+- msa_fmha_sm100
+- prefill_bf16x
+- fmha_sm100_q8kv8

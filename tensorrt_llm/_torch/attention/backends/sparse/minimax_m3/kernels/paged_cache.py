@@ -8,6 +8,54 @@ from typing import Literal
 
 import torch
 
+# fp8_e4m3_saturate: E4M3 casts saturated to +-448, the bits the CUDA FP8 writers produce (__NV_SATFINITE /
+# cvt.rn.satfinite); NaN stays NaN. Where torch's own E4M3 cast already saturates (c10's float8_e4m3fn conversion,
+# shared by its CPU and CUDA kernels) the cast alone is used: an explicit clamp would add a kernel per cast for the same
+# bytes. A torch whose cast does not saturate gets the clamp.
+# Kill: FP8_SATURATE = False (the plain cast, whatever it does).
+# SHARED_FP8_SATURATE: whether the E4M3 cache writes below and the dense-decode query cast use it. Off unless a model
+# opts in (RuntimeHooks.fp8_saturating_casts, armed by the executor through arm_fp8_saturation): the plain cast.
+FP8_SATURATE = True
+SHARED_FP8_SATURATE = False
+_E4M3_MAX = 448.0
+
+
+def _cast_saturates() -> bool:
+    """Whether this torch's E4M3 cast maps every out-of-range value, infinities included, to +-448."""
+    probe = torch.tensor([449.0, 463.0, 464.0, 1e4, float("inf"), -464.0, -float("inf")])
+    want = torch.tensor([448.0, 448.0, 448.0, 448.0, 448.0, -448.0, -448.0])
+    return torch.equal(probe.to(torch.float8_e4m3fn).float(), want)
+
+
+# Probed once at import on the CPU, so no CUDA work runs here (nor later inside a graph capture).
+_CAST_SATURATES = _cast_saturates()
+
+
+def fp8_e4m3_saturate(values: torch.Tensor) -> torch.Tensor:
+    """``values`` as float8_e4m3fn, saturated to +-448 (bitwise the plain cast for every finite in-range value).
+    Values already in float8_e4m3fn are returned as they are (they are finite by construction or already NaN)."""
+    if values.dtype == torch.float8_e4m3fn:
+        return values
+    if FP8_SATURATE and not _CAST_SATURATES:
+        values = values.clamp(-_E4M3_MAX, _E4M3_MAX)
+    return values.to(torch.float8_e4m3fn)
+
+
+def arm_fp8_saturation() -> None:
+    """Saturate the E4M3 cache writes and the dense-decode query cast in this process
+    (RuntimeHooks.fp8_saturating_casts)."""
+    global SHARED_FP8_SATURATE
+    SHARED_FP8_SATURATE = True
+
+
+def to_e4m3(values: torch.Tensor) -> torch.Tensor:
+    """``values`` as float8_e4m3fn: saturated when armed (SHARED_FP8_SATURATE), else the plain cast."""
+    return fp8_e4m3_saturate(values) if SHARED_FP8_SATURATE else values.to(torch.float8_e4m3fn)
+
+
+def _to_cache_dtype(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return to_e4m3(values) if dtype == torch.float8_e4m3fn else values.to(dtype)
+
 
 def write_kv_slots(
     cache: torch.Tensor,
@@ -60,11 +108,11 @@ def write_kv_slots(
             if layout == "HND":
                 # Advanced indices on dims 0 and 2 broadcast to [num_tokens] and
                 # move front, giving a [num_tokens, num_heads, channel] target.
-                cache[page, :, within, :] = values.to(cache.dtype)
+                cache[page, :, within, :] = _to_cache_dtype(values, cache.dtype)
             else:
-                cache[page, within] = values.to(cache.dtype)
+                cache[page, within] = _to_cache_dtype(values, cache.dtype)
         else:
-            cache.index_copy_(0, out_cache_loc.to(torch.long), values.to(cache.dtype))
+            cache.index_copy_(0, out_cache_loc.to(torch.long), _to_cache_dtype(values, cache.dtype))
 
 
 __all__ = ["write_kv_slots"]

@@ -33,6 +33,8 @@ from ..logger import logger
 
 __all__ = [
     "PrefixTokenCache",
+    "TokenIdList",
+    "int32_bytes",
     "PrefixTokenCacheConfig",
     "create_prefix_token_cache",
 ]
@@ -48,6 +50,63 @@ LOG_EVERY_REQUESTS = 1000
 # text has that probe at the same position. The probe must be longer than any
 # suffix the chat template appends after the last message.
 PROBE_CHARS = 256
+# A hit splices into an int32 array (the cached prefix is copied as one block, only
+# the tail is converted) and that array is cached as is, instead of building the
+# full id list and converting it back to an array. Kill switch for the old path.
+_ARRAY_SPLICE = os.environ.get("TRTLLM_M31_DISABLE_PTC_ARRAY_SPLICE", "0") != "1"
+# A spliced hit returns a TokenIdList that keeps its int32 array, so a context-only
+# reply can serialize the prompt ids without converting the list back. Kill switch.
+_INT32_IDS = os.environ.get("TRTLLM_M31_DISABLE_PTC_INT32_REPLY", "0") != "1"
+
+
+class TokenIdList(list):
+    """A list of token ids that also holds the same ids as an int32 array.
+
+    ``int32`` is the array while the list is unchanged: every list mutation sets it to
+    None first, so a reader that finds it can use it as the ids' int32 form (see
+    ``int32_bytes``). Pickles, copies and deep-copies as a plain list.
+    """
+
+    __slots__ = ("int32",)
+
+    def __reduce_ex__(self, protocol):
+        return (list, (), None, iter(self))
+
+
+def _dropping_int32(name):
+    method = getattr(list, name)
+
+    def mutate(self, *args, **kwargs):
+        self.int32 = None
+        return method(self, *args, **kwargs)
+
+    mutate.__name__ = mutate.__qualname__ = name
+    return mutate
+
+
+for _name in (
+    "__setitem__",
+    "__delitem__",
+    "__iadd__",
+    "__imul__",
+    "append",
+    "extend",
+    "insert",
+    "pop",
+    "remove",
+    "reverse",
+    "sort",
+    "clear",
+):
+    setattr(TokenIdList, _name, _dropping_int32(_name))
+
+
+def int32_bytes(ids: Sequence[int]) -> bytes:
+    """``ids`` as int32 bytes: a ``TokenIdList``'s own array when it still holds one, else converted."""
+    buf = getattr(ids, "int32", None)
+    if buf is not None and len(buf) == len(ids):
+        return buf.tobytes()
+    return array("i", ids).tobytes()
 
 
 class OffsetTokenizer(Protocol):
@@ -168,11 +227,20 @@ class PrefixTokenCache:
     def _encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
         found = self._lookup(text)
         ids = None
+        stored = None
         if found is not None:
             eid, entry = found
             tail_ids, tail_offsets = self._tokenize(tokenizer, text[entry.split_char :])
             if self._resynced(entry, tail_ids):
-                ids = entry.ids[: entry.split_token].tolist() + list(tail_ids)
+                if _ARRAY_SPLICE:
+                    stored = entry.ids[: entry.split_token]
+                    stored.extend(tail_ids)
+                    ids = stored.tolist()
+                    if _INT32_IDS:
+                        ids = TokenIdList(ids)
+                        ids.int32 = stored
+                else:
+                    ids = entry.ids[: entry.split_token].tolist() + list(tail_ids)
                 base_token, base_char = entry.split_token, entry.split_char
         if ids is None:
             tail_ids, tail_offsets = self._tokenize(tokenizer, text)
@@ -193,7 +261,9 @@ class PrefixTokenCache:
             if found is not None:
                 self._remove(found[0])
             if split_token > 0 and tail_index >= 0:
-                self._insert(text, ids, split_token, base_char + tail_offsets[tail_index][0])
+                self._insert(
+                    text, ids, split_token, base_char + tail_offsets[tail_index][0], stored
+                )
             report = (self.hits + self.misses) % LOG_EVERY_REQUESTS == 0
             summary = self.summary() if report else None
         if summary is not None:
@@ -241,14 +311,27 @@ class PrefixTokenCache:
             # splice from; _remove() on it is a no-op.
         return best
 
-    def _insert(self, text: str, ids: Sequence[int], split_token: int, split_char: int) -> None:
-        """Caller holds the lock."""
+    def _insert(
+        self,
+        text: str,
+        ids: Sequence[int],
+        split_token: int,
+        split_char: int,
+        stored: array | None = None,
+    ) -> None:
+        """Caller holds the lock. ``stored``, when given, is ``ids`` as an int32 array already."""
         key = self._bucket_key(text)
         bucket = self._buckets.setdefault(key, {})
         if any(entry.text == text for entry in bucket.values()):
             return  # concurrent misses on the same prompt
         eid, self._next_id = self._next_id, self._next_id + 1
-        entry = _Entry(text, array("i", ids), split_token, split_char, text[-PROBE_CHARS:])
+        entry = _Entry(
+            text,
+            stored if stored is not None else array("i", ids),
+            split_token,
+            split_char,
+            text[-PROBE_CHARS:],
+        )
         self._entries[eid] = entry
         bucket[eid] = entry
         self._total_chars += len(text)

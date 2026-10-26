@@ -780,6 +780,15 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
     return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
 
+std::string Runner::getConfigName(int64_t configIndex) const
+{
+    TLLM_CHECK_WITH_INFO(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+        "MoE config index %ld is out of range [0, %zu).", static_cast<long>(configIndex), mPassingConfigs.size());
+    auto const& config = mPassingConfigs[configIndex];
+    return mPermuteGemm1.getKernelNameFromConfigIndex(static_cast<int32_t>(config.gemm1Config)) + " | "
+        + mGemm2.getKernelNameFromConfigIndex(static_cast<int32_t>(config.gemm2Config));
+}
+
 std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {

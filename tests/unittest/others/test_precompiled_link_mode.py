@@ -52,8 +52,6 @@ def build_tree(tmp_path, monkeypatch):
     source = tmp_path / "built-checkout"
     (source / "tensorrt_llm" / "libs").mkdir(parents=True)
     (source / "tensorrt_llm" / "libs" / "libtensorrt_llm.so").write_text("so")
-    (source / "3rdparty" / "fmha_sm100").mkdir(parents=True)
-    (source / "3rdparty" / "fmha_sm100" / "__init__.py").write_text("")
 
     destination = tmp_path / "checkout"
     destination.mkdir()
@@ -82,33 +80,6 @@ def test_link_mode_symlinks_the_artifacts(extract_from_precompiled, build_tree, 
     lib = Path("tensorrt_llm/libs/libtensorrt_llm.so")
     assert lib.is_symlink()
     assert Path(os.readlink(lib)) == (build_tree / "tensorrt_llm" / "libs" / "libtensorrt_llm.so")
-    fmha = Path("3rdparty/fmha_sm100")
-    assert fmha.is_symlink()
-    assert Path(os.readlink(fmha)) == build_tree / "3rdparty" / "fmha_sm100"
-
-
-def test_link_mode_keeps_an_existing_fmha_symlink(extract_from_precompiled, build_tree, tmp_path):
-    """A link already pointing at this source is left untouched."""
-    Path("3rdparty").mkdir()
-    os.symlink(build_tree / "3rdparty" / "fmha_sm100", "3rdparty/fmha_sm100")
-
-    _run(extract_from_precompiled, build_tree, tmp_path, link=True)
-
-    assert Path(os.readlink("3rdparty/fmha_sm100")) == build_tree / "3rdparty" / "fmha_sm100"
-
-
-def test_link_mode_relinks_fmha_when_the_source_changed(
-    extract_from_precompiled, build_tree, tmp_path
-):
-    """A link to a different source is repointed, not kept stale."""
-    other = tmp_path / "other-fmha"
-    other.mkdir()
-    Path("3rdparty").mkdir()
-    os.symlink(other, "3rdparty/fmha_sm100")
-
-    _run(extract_from_precompiled, build_tree, tmp_path, link=True)
-
-    assert Path(os.readlink("3rdparty/fmha_sm100")) == build_tree / "3rdparty" / "fmha_sm100"
 
 
 def test_link_mode_rejects_the_current_checkout(extract_from_precompiled, build_tree, tmp_path):
@@ -135,9 +106,6 @@ def test_copy_mode_is_unchanged(extract_from_precompiled, build_tree, tmp_path):
     lib = Path("tensorrt_llm/libs/libtensorrt_llm.so")
     assert lib.is_file() and not lib.is_symlink()
     assert lib.read_text() == "so"
-    fmha = Path("3rdparty/fmha_sm100")
-    assert fmha.is_dir() and not fmha.is_symlink()
-    assert (fmha / "__init__.py").is_file()
 
 
 def test_link_mode_rejects_a_wheel(extract_from_precompiled, build_tree, tmp_path):
@@ -152,7 +120,7 @@ def test_link_mode_rejects_a_wheel(extract_from_precompiled, build_tree, tmp_pat
 
 
 def test_wheel_extracts_embedded_nccl_ep(extract_from_precompiled, tmp_path, monkeypatch):
-    """Wheel inputs stage NCCL-EP below 3rdparty for repackaging."""
+    """Wheel inputs stage NCCL-EP below 3rdparty for repackaging; an older wheel's top-level MSA package is not."""
     import zipfile
 
     checkout = tmp_path / "checkout"
@@ -173,6 +141,7 @@ def test_wheel_extracts_embedded_nccl_ep(extract_from_precompiled, tmp_path, mon
     assert not (package_root / "stale").exists()
     assert (package_root / "nccl" / "ep" / "lib" / "libnccl_ep.so").read_text() == "ep"
     assert (package_root / "nccl" / "_extensions" / "bindings" / "binding.so").is_file()
+    assert not (checkout / "3rdparty" / "fmha_sm100").exists()
 
 
 # --------------------------------------------------------------------------
@@ -252,3 +221,18 @@ def test_skew_check_is_skipped_outside_a_repo(warn_on_build_skew, monkeypatch, c
     warn_on_build_skew("/src")
 
     assert "Cannot check for build skew" in capfd.readouterr().out
+
+
+def test_vendored_msa_sources_stay_source_owned():
+    skip = _load("should_skip_precompiled_package_data")
+    msa = "tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/"
+    for tracked in (
+        "fmha_sm100/csrc/include/plan.cuh",
+        "fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu",
+        "fmha_sm100/LICENSE",
+        "prefill_bf16x/NOTICE",
+    ):
+        assert skip(msa + tracked), tracked
+    # The CUTLASS headers build_wheel.py stages are build output, so they still come from the wheel.
+    assert not skip(msa + "fmha_sm100/cutlass/include/cutlass/cutlass.h")
+    assert not skip("tensorrt_llm/libs/libtensorrt_llm.so")

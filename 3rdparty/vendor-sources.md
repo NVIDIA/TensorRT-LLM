@@ -298,6 +298,28 @@ notices and follow [the Python third-party process](py-thirdparty.md) or
 files retain their upstream copyright headers. Add an NVIDIA header only to
 files that TensorRT-LLM modifies.
 
+## MSA
+
+The `msa-fmha-sm100` entry selects the MiniMax sparse attention kernels under
+`python/fmha_sm100` of `oss-components/msa` (MIT, Copyright (c) 2026 MiniMax) and
+materializes them at `tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/fmha_sm100`. The selection leaves out the upstream CUTLASS
+submodule (TensorRT-LLM supplies CUTLASS), benchmarks and tests. Its persistent
+patch contains the upstream LICENSE and NOTICE, the strided paged-KV change,
+the MiniMax-M3.1 kernel changes not yet upstream, and the TensorRT-LLM
+integration: `jit.py` loads the modules that
+`cpp/tensorrt_llm/kernels/minimaxM3Msa` builds ahead of time from
+`tensorrt_llm/libs/msa_fmha_sm100` and never compiles at run time.
+
+The `msa-prefill-bf16x` and `msa-q8kv8-indexer` entries take MiniMax-M3.1 kernels
+from vllm-project/MSA (`dev`, MIT, Copyright (c) 2026 MiniMax): the Q8KV4 sparse
+prefill forward as `msa_kernels/prefill_bf16x` (patched into the BF16X / E4M3X
+forward the MiniMax-M3.1 context path serves) and the Q8KV4 / Q8KV8 CuTe DSL index
+scorers as `msa_kernels/fmha_sm100_q8kv8`. `q8kv4_indexer_decode.py` is Apache-2.0
+(vLLM project contributors); its patch hunk is marked in the file. Each tree keeps
+the upstream LICENSE and NOTICE beside it. The E4M3X forward is built ahead of
+time against CUTLASS 4.8 from the private `cutlass_msa` fetch, which only that
+build rule includes.
+
 ## PrimTS
 
 The `flashinfer-prims-ts` entry selects the complete Python tree under
