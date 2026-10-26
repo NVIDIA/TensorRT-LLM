@@ -16,48 +16,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 def _register_fake():
 
-    @torch.library.register_fake("trtllm::moe_rebalance_halo_r")
-    def _(
-        routes: torch.Tensor,
-        out_slots: torch.Tensor,
-        out_ids: torch.Tensor,
-        out_owners: torch.Tensor,
-        peer_bases: torch.Tensor,
-        status: torch.Tensor,
-        partial: torch.Tensor,
-        route_aux: torch.Tensor,
-        grid_sync: torch.Tensor,
-        plan: torch.Tensor,
-        route_prefix: torch.Tensor,
-        ready_flags_ptr: int,
-        ep: int,
-        experts: int,
-        helpers: int,
-        send_count: int,
-        send_weight: int,
-        local_rank: int,
-        route_capacity: int,
-        ctas: int,
-        spin_ns: int,
-        valid_route_count: int,
-    ) -> None:
+    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_submit")
+    def _(handle: int, routes: torch.Tensor, spin_ns: int) -> None:
         return None
 
-    @torch.library.register_fake("trtllm::moe_rebalance_relay")
-    def _(
-        plan: torch.Tensor,
-        source_table: torch.Tensor,
-        destination_table: torch.Tensor,
-        plane_bytes: torch.Tensor,
-        status: torch.Tensor,
-        completed_ctas: torch.Tensor,
-        launch_count: torch.Tensor,
-        ready_flag_mc_ptr: int,
-        ep: int,
-        experts: int,
-        local_rank: int,
-        ctas: int,
-    ) -> None:
+    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_wait_routes")
+    def _(handle: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_release")
+    def _(handle: int, completion_event: int) -> None:
         return None
 
     @torch.library.register_fake("trtllm::allreduce")

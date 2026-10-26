@@ -3,6 +3,8 @@
 """CPU contract tests of the HALO-R planner reference and its group selection."""
 
 import random
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -15,6 +17,8 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
 )
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
     HALO_R_SEND_COUNT,
+    HALO_R_SPIN_BUDGET_NS,
+    HaloRSlotSchedulerGroup,
     validate_halo_r_geometry,
 )
 
@@ -218,3 +222,140 @@ def test_reference_plan_words_have_the_kernel_layout():
     assert len(words) == 2 + 6 * 384
     assert words[:2] == [7, 1]
     assert words[2 + 2 * 384] == (1 << 1) | (1 << 4) | (1 << 5)
+
+
+_HALO_R_OP_SOURCE = (
+    Path(__file__).resolve().parents[4]
+    / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloROp.cpp"
+)
+
+
+def _halo_r_op_parameters(name):
+    """Parameter names of a registered moe_rebalance_halo_r operator schema."""
+    op_source = _HALO_R_OP_SOURCE.read_text()
+    schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op_source.split("m.def(")[1:]]
+    schema = next(text for text in schemas if text.startswith(f"{name}("))
+    parameters = re.fullmatch(rf"{name}\((.*)\) -> \(\)", schema).group(1)
+    return [parameter.split()[-1] for parameter in parameters.split(",")]
+
+
+def test_per_layer_ops_take_the_context_handle():
+    # The context binds every shared argument; a custom-class argument would
+    # cost microseconds of dispatch per call.
+    assert _halo_r_op_parameters("moe_rebalance_halo_r_submit") == ["handle", "routes", "spin_ns"]
+    assert _halo_r_op_parameters("moe_rebalance_halo_r_wait_routes") == ["handle"]
+    assert _halo_r_op_parameters("moe_rebalance_halo_r_release") == [
+        "handle",
+        "completion_event",
+    ]
+
+
+class _FakeRoutes:
+    """Just enough of a CUDA int32 [tokens, topk] tensor for the host checks."""
+
+    ndim = 2
+
+    def __init__(self, fake_torch, tokens, topk):
+        self.shape = (tokens, topk)
+        self.dtype = fake_torch.int32
+        self.device = "cuda:0"
+
+    def is_contiguous(self):
+        return True
+
+
+class _FakeSlots(_FakeRoutes):
+    def __getitem__(self, index):
+        return ("slots", index)
+
+
+def _fake_torch(calls, main_handle=11):
+    def op(name):
+        return lambda *args: calls.append((name, *args))
+
+    fake = SimpleNamespace(int32=object())
+    fake.Tensor = _FakeRoutes
+    fake.cuda = SimpleNamespace(
+        current_device=lambda: 0,
+        current_stream=lambda device: SimpleNamespace(cuda_stream=main_handle, priority=0),
+    )
+    fake.ops = SimpleNamespace(
+        trtllm=SimpleNamespace(
+            moe_rebalance_halo_r_submit=op("submit"),
+            moe_rebalance_halo_r_wait_routes=op("wait_routes"),
+            moe_rebalance_halo_r_release=op("release"),
+        )
+    )
+    return fake
+
+
+def _bound_group(fake_torch, handle=0x1234):
+    """A group past construction: bound to a native context with ``handle``."""
+    group = HaloRSlotSchedulerGroup.__new__(HaloRSlotSchedulerGroup)
+    group.device = 0
+    group.topk = 2
+    group.max_tokens_per_rank = 8
+    group.copy_stream = SimpleNamespace(priority=-1)
+    group.physical_slot_ids = _FakeSlots(fake_torch, 8, 2)
+    group.plan_calls = 0
+    group._handle = handle
+    group._copy_handle = 22
+    group._closed = False
+    group._validated_streams = set()
+    group._call_stream_handle = None
+    group._pending_tokens = None
+    group._routes_waited = False
+    group._planned = False
+    group._part = None
+    return group
+
+
+def test_layer_call_makes_one_native_call_per_step(monkeypatch):
+    calls = []
+    fake_torch = _fake_torch(calls)
+    monkeypatch.setattr(halo_r_planner, "torch", fake_torch)
+    group = _bound_group(fake_torch)
+    routes = _FakeRoutes(fake_torch, 5, 2)
+
+    slots, generation = group.plan(routes)
+    group.finish()
+
+    assert (slots, generation) == (("slots", slice(None, 5)), 1)
+    # The native calls carry the whole fork/join; no event, stream or driver
+    # call is made from Python.
+    assert calls == [
+        ("submit", 0x1234, routes, HALO_R_SPIN_BUDGET_NS),
+        ("wait_routes", 0x1234),
+        ("release", 0x1234, 0),
+    ]
+
+
+def test_deferred_route_wait_is_enqueued_once_and_release_takes_the_event(monkeypatch):
+    calls = []
+    fake_torch = _fake_torch(calls)
+    monkeypatch.setattr(halo_r_planner, "torch", fake_torch)
+    group = _bound_group(fake_torch)
+    routes = _FakeRoutes(fake_torch, 0, 2)
+
+    part = group.plan_schedule(routes)
+    group.plan_finish(part, defer_wait=True)
+    assert [call[0] for call in calls] == ["submit"]
+    group.wait_for_routes()
+    group.wait_for_routes()
+    group.finish(SimpleNamespace(cuda_event=0x99))
+
+    assert calls[1:] == [("wait_routes", 0x1234), ("release", 0x1234, 0x99)]
+    with pytest.raises(ValueError, match="CUDA event"):
+        group.plan(routes)
+        group.finish(SimpleNamespace(cuda_event=0))
+
+
+def test_layer_call_rejects_the_copy_stream(monkeypatch):
+    calls = []
+    fake_torch = _fake_torch(calls, main_handle=22)
+    monkeypatch.setattr(halo_r_planner, "torch", fake_torch)
+    group = _bound_group(fake_torch)
+
+    with pytest.raises(RuntimeError, match="distinct from the higher-priority COPY"):
+        group.plan(_FakeRoutes(fake_torch, 1, 2))
+    assert calls == []
