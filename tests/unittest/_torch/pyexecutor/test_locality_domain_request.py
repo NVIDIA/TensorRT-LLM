@@ -82,3 +82,33 @@ def test_placement_alternates_domains_when_ids_advance_in_even_steps():
         KVCacheManagerV2.pick_locality_domain(manager, request_id) for request_id in (0, 2, 4, 6)
     ]
     assert picks == [0, 1, 0, 1]
+
+
+def _placer(matches, load=(0, 0)):
+    return SimpleNamespace(
+        num_locality_domains=2,
+        enable_block_reuse=True,
+        tokens_per_block=32,
+        _next_locality_domain=0,
+        _locality_domain_load=list(load),
+        _prefix_match_per_domain=lambda *args: list(matches),
+    )
+
+
+def test_placement_follows_the_domain_holding_the_prompt_prefix():
+    manager = _placer(matches=(0, 96))
+    tokens = list(range(128))
+    assert KVCacheManagerV2.pick_locality_domain(manager, 0, tokens) == 1
+    assert KVCacheManagerV2.pick_locality_domain(manager, 1, tokens) == 1
+
+
+def test_placement_round_robins_without_a_full_block_match():
+    manager = _placer(matches=(0, 31))
+    picks = [KVCacheManagerV2.pick_locality_domain(manager, i, list(range(64))) for i in range(4)]
+    assert picks == [0, 1, 0, 1]
+
+
+def test_placement_does_not_pile_a_hot_prefix_onto_a_loaded_domain():
+    # Domain 1 already holds 30 more live requests than domain 0, past max(8, total // 4).
+    manager = _placer(matches=(0, 96), load=(10, 40))
+    assert KVCacheManagerV2.pick_locality_domain(manager, 0, list(range(128))) == 0
