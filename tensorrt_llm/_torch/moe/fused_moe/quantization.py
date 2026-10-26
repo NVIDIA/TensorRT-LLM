@@ -4428,10 +4428,13 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                     ) from error
         if rebound:
             self.setup_quant_scales(module)
-        norm_const = getattr(module, "fc1_norm_const", None)
-        if (norm_const is not None
-                and arena.home_experts < norm_const.data.shape[0]):
-            norm_const.data[int(arena.home_experts):].fill_(1.0)
+        # Arena pages start zeroed. Restore the create-time value of the
+        # per-expert scalars on every row, so an expert whose checkpoint leaves
+        # them unset computes as it does without the load balancer.
+        for name in ("fc31_alpha", "fc2_alpha", "fc1_norm_const"):
+            plane = getattr(module, name, None)
+            if plane is not None:
+                plane.data.fill_(1.0)
         self.assert_live_weight_aliases(module, arena)
 
     # -----------------------------------------------------------------

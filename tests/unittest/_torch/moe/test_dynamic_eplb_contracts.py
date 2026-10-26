@@ -2812,3 +2812,75 @@ def test_standard_load_balancer_finalizer_releases_it_as_on_main():
     manager.__del__()
     assert calls == ["shutdown"]
     manager.is_shutdown = True
+
+
+class _FakePlane:
+    """Stand-in for an arena alias: records fills, passes the layout checks."""
+
+    is_cuda = True
+    dtype = "float32"
+
+    def __init__(self, name, address, fills):
+        self.name = name
+        self.shape = (6,)
+        self._address = address
+        self._fills = fills
+
+    def stride(self):
+        return (1,)
+
+    def data_ptr(self):
+        return self._address
+
+    def fill_(self, value):
+        self._fills.append((self.name, value))
+
+
+def test_live_plane_binding_restores_per_expert_scalar_defaults():
+    names = (
+        "mega_fc1_weight",
+        "mega_fc1_weight_sf",
+        "mega_fc2_weight",
+        "mega_fc2_weight_sf",
+        "fc31_alpha",
+        "fc2_alpha",
+        "fc1_norm_const",
+    )
+    fills = []
+    aliases = [_FakePlane(name, 0x1000 + index, fills) for index, name in enumerate(names)]
+    arena = SimpleNamespace(
+        bundle="bundle",
+        plane_names=names,
+        local_plane_views=aliases,
+        tekit_alias_views=aliases,
+        home_experts=4,
+    )
+    method_cls = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/quantization.py",
+        "NVFP4MegaMoECuteDslMethod",
+        {"_bind_live_weight_planes"},
+        {"torch": SimpleNamespace(nn=SimpleNamespace(Parameter=None))},
+    )
+    method = method_cls()
+    method.live_weight_plane_spec = lambda module: SimpleNamespace(
+        planes=[SimpleNamespace(name=name) for name in names]
+    )
+    arena.bundle = method.live_weight_plane_spec(None)
+    method.assert_live_weight_aliases = lambda module, bound: None
+    module = SimpleNamespace(
+        **{
+            name: SimpleNamespace(
+                is_meta=False, shape=(6,), stride=lambda: (1,), dtype="float32", data=None
+            )
+            for name in names
+        }
+    )
+
+    method._bind_live_weight_planes(module, arena)
+
+    # The arena starts zeroed; an expert the checkpoint leaves unset must keep
+    # the create-time scalars (1.0) instead of silently computing zeros.
+    assert sorted(fills) == sorted(
+        [("fc31_alpha", 1.0), ("fc2_alpha", 1.0), ("fc1_norm_const", 1.0)]
+    )
+    assert all(getattr(module, name).data is alias for name, alias in zip(names, aliases))
