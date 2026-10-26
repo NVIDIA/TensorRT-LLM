@@ -68,7 +68,6 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDe
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
     is_megamoe_cute_dsl_runtime_available,
 )
-from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import trtllm_gen_leaves_in_resolution_order
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -126,15 +125,12 @@ def find_backend_class(
     """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
     ``CUTLASS``, ``TRTLLM``, ``MARLIN``, ``CUTEDSL`` and ``CUTE_DSL_B12X`` are
-    not one class each but sets of leaves keyed by quant (and, for TRTLLM-Gen,
-    provider), so each needs ``quant_algo``. CUTLASS publishes
-    ``fp8_block_scales`` twice, once per SM family, so for that format the leaf
-    is the one this device runs.
-    TRTLLM-Gen prefers the native leaf for that format and falls back to the
-    FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
-    unquantized format: bf16 has no native leaf, only
-    ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
-    exists and wins, so only bf16 tests are exercising a FlashInfer class.
+    not one class each but sets of leaves keyed by quant, so each needs
+    ``quant_algo``. CUTLASS publishes ``fp8_block_scales`` twice, once per SM
+    family, so for that format the leaf is the one this device runs.
+    TRTLLM-Gen has one leaf per format: native for every quantized one, and
+    ``FlashinferTrtllmGenBf16Impl`` for the unquantized one, so only bf16 tests
+    are exercising a FlashInfer class.
 
     Absence is returned rather than raised so that a parameter generator can
     tell it apart from a real failure: catching the exception instead would let
@@ -178,19 +174,13 @@ def find_backend_classes(
 ) -> tuple[type[MoE], ...]:
     """The classes a resolution walk would try, in its order; empty if none.
 
-    A tuple and not one class because ``TRTLLM`` is a provider pair, and
-    ``IMPL_PRIORITY`` ranks each FlashInfer leaf ahead of its native sibling:
-    resolution falls through to the native one when the FlashInfer leaf
-    rejects -- a missing wheel, an unmet shape -- and not only when it is
-    absent. A caller asking whether a case is *supported* has to ask the same
-    way, or it skips cases the layer under test goes on to serve.
-
-    For CUTLASS ``fp8_block_scales`` these are the SM90 and SM120 leaves.
+    A tuple and not one class because CUTLASS publishes ``fp8_block_scales``
+    twice, as the SM90 and SM120 leaves, and resolution asks each. A caller
+    asking whether a case is *supported* has to ask the same way, or it skips
+    cases the layer under test goes on to serve.
 
     :func:`find_backend_class` stays for callers that want to name one class.
     """
-    if backend_type is MoeBackendType.TRTLLM:
-        return trtllm_gen_leaves_in_resolution_order(quant_algo)
     if backend_type is MoeBackendType.CUTLASS:
         return cutlass_leaves_in_resolution_order(quant_algo)
     cls = find_backend_class(backend_type, quant_algo)
@@ -415,11 +405,6 @@ def should_skip_trtllm(
             return (
                 "TRTLLMGenFusedMoE BF16 path requires hidden_size and intermediate_size "
                 f"to be multiples of 128 (got h={hidden_size}, i={intermediate_size})."
-            )
-        if comm_method == "NVLINK_TWO_SIDED" and top_k % 8 != 0:
-            return (
-                "TRTLLMGenFusedMoE BF16 path with NVLinkTwoSidedFlashinfer requires "
-                f"top_k to be a multiple of 8 for 16-byte row alignment (got top_k={top_k})."
             )
         if moe_tp_size > 1:
             if intermediate_size % moe_tp_size != 0:
@@ -1199,9 +1184,9 @@ def get_quick_skip_reason(
 
     try:
         # Every candidate a run would try, in resolution's order, because
-        # resolution falls through to the native leaf when the FlashInfer one
-        # rejects. Asking a single pre-picked class would skip cases the layer
-        # under test goes on to serve.
+        # resolution falls through to the next leaf publishing the format when
+        # one rejects. Asking a single pre-picked class would skip cases the
+        # layer under test goes on to serve.
         candidates = find_backend_classes(backend_type, quant_algo)
         if not candidates:
             # No leaf of this family publishes the format. Asked as a query,
@@ -1268,9 +1253,6 @@ def get_quick_skip_reason(
             if verdict.eligible:
                 reason = None
                 break
-            # The last candidate's reason, not the first: without the opt-in
-            # flag every FlashInfer leaf rejects for the flag alone, which says
-            # nothing about why the case is unsupported.
             reason = f"{verdict.reject_reason.value}: {verdict.detail}"
         if reason is not None:
             return reason

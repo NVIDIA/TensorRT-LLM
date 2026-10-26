@@ -37,7 +37,6 @@ from ..impl_contract import (
     MoERejectReason,
     check_quant_matches_identity,
 )
-from ..impl_environment import MoEDep, MoEEnvFlag
 from ..interface import _reject
 
 
@@ -97,53 +96,6 @@ def check_trtllm_gen_capabilities(
     return None
 
 
-def check_flashinfer_provider(cls: type, p: MoEProblem, d: MoEDeployment) -> MoEEligibility | None:
-    """Gates that separate the FlashInfer provider from the ``trtllm`` one.
-
-    Only the quantized leaves come through here. The unquantized one is
-    FlashInfer-exclusive and reached without the opt-in flag, so it states its
-    own dependency gate instead.
-    """
-    if not d.env.has_dep(MoEDep.FLASHINFER):
-        return _reject(MoERejectReason.DEP_MISSING, f"{cls.__name__} requires the FlashInfer wheel")
-
-    # Opt-in, not a capability: the trtllm provider serves these formats too,
-    # so routing traffic here without being asked would change which kernel a
-    # previously-working deployment runs.
-    if d.env.env_flag(MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER) != "1":
-        return _reject(
-            MoERejectReason.PATH_NOT_ENABLED,
-            f"{cls.__name__} is opt-in; set "
-            f"{MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER.value}=1 to select the "
-            f"FlashInfer provider for quantized TRTLLM-Gen",
-        )
-
-    # SiTu is a native TRTLLM-Gen cubin and is absent from FlashInfer's
-    # activation enum; Relu2 has no FlashInfer path either.
-    if p.activation_type in (ActivationType.SiTu, ActivationType.Relu2):
-        return _reject(
-            MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{cls.__name__} does not implement {p.activation} "
-            f"(FlashInfer's activation enum has no such kernel)",
-        )
-
-    # These two fuse routing in a form only the native runner accepts. Matched
-    # on the algorithm the problem carries, not on the value handed to the C++
-    # kernels: a method no kernel implements borrows a recognized encoding
-    # there, and matching on the borrowed one would reject a method this gate
-    # has nothing against.
-    if p.routing_method_type is not None and p.routing_method_type.name in (
-        "DeepSeekV3",
-        "Default",
-    ):
-        return _reject(
-            MoERejectReason.ROUTING_UNSUPPORTED,
-            f"{cls.__name__} does not implement {p.routing} routing",
-        )
-
-    return None
-
-
 def check_flashinfer_shard_alignment(
     cls: type,
     p: MoEProblem,
@@ -152,7 +104,7 @@ def check_flashinfer_shard_alignment(
     weight_alignment: int,
     input_hidden_alignment: int | None = None,
 ) -> MoEEligibility | None:
-    """Per-rank shard alignment the FlashInfer kernels need, or ``None``.
+    """Per-rank shard alignment the FlashInfer bf16 kernels need, or ``None``.
 
     Two distinct spellings of "does not apply": an absent shape on ``p`` means
     the caller did not say, so abstain; an ``input_hidden_alignment`` of
@@ -198,18 +150,12 @@ def check_no_expert_bias(cls: type, p: MoEProblem) -> MoEEligibility | None:
     ``capabilities.supports_expert_bias`` is declared once for the whole
     family, and ``create_moe`` reads it against the class resolution already
     picked -- so a leaf that answered only there would be chosen and then
-    refuse, instead of standing aside for a sibling that can serve.
+    refuse, instead of standing aside for a backend that can serve.
 
     A gate rather than only the ``_check_configs`` assert for the same reason:
-    some leaves reaching here have a sibling on the other provider that does
-    take a bias, and standing aside during selection is what lets it be
-    tried; for the rest it is the difference between a structured verdict
-    and an assert after resolution has committed.
-
-    Its own function rather than a line inside
-    :func:`check_mxfp4_flashinfer_shape`, because a leaf whose shape gate is
-    conditional still has to answer about bias unconditionally, and one copy
-    of the rule keeps every leaf giving the same reason.
+    standing aside during selection is what lets the fallback be tried, and it
+    is the difference between a structured verdict and an assert after
+    resolution has committed.
     """
     if p.bias:
         return _reject(
@@ -241,61 +187,20 @@ def check_no_activation_constants(cls: type, p: MoEProblem) -> MoEEligibility | 
     return None
 
 
-def check_mxfp4_flashinfer_shape(
-    cls: type,
-    p: MoEProblem,
-    d: MoEDeployment,
-    *,
-    weight_alignment: int,
-    input_hidden_alignment: int,
-) -> MoEEligibility | None:
-    """The quantized FlashInfer leaves' shape gate: no bias, then alignment.
-
-    Bundled rather than folded into
-    :func:`check_flashinfer_shard_alignment`, because the unquantized leaf
-    shares the alignment rule but answers about bias through
-    ``swiglu_gptoss_style``.
-    """
-    bias_verdict = check_no_expert_bias(cls, p)
-    if bias_verdict is not None:
-        return bias_verdict
-    return check_flashinfer_shard_alignment(
-        cls,
-        p,
-        d,
-        weight_alignment=weight_alignment,
-        input_hidden_alignment=input_hidden_alignment,
-    )
-
-
-def nvfp4_needs_padded_method(activation_type: ActivationType, has_alpha_constant: bool) -> bool:
-    """Whether NVFP4 needs the padded quant method rather than the base one.
-
-    One definition read from two sides -- ``can_implement`` asks it of the
-    problem, ``_get_quant_method`` of the instance -- so that a configuration
-    cannot be admitted by one and laid out by the other.
-    """
-    return has_alpha_constant or activation_type in (
-        ActivationType.SiTu,
-        ActivationType.Relu2,
-        ActivationType.Silu,
-    )
-
-
 def check_trtllm_gen_leaf(
-    cls: type, p: MoEProblem, d: MoEDeployment, *provider_gates: MoEEligibility | None
+    cls: type, p: MoEProblem, d: MoEDeployment, *leaf_gates: MoEEligibility | None
 ) -> MoEEligibility:
-    """Compose one leaf's verdict: identity, shared capability, then provider.
+    """Compose one leaf's verdict: identity, shared capability, then its own.
 
-    First rejection wins, in a fixed order so that two leaves differing only in
-    provider give the same reason for a problem neither can serve.
-    ``provider_gates`` are already-evaluated verdicts, not callables: the gates
+    First rejection wins, in a fixed order so that every leaf gives the
+    family-wide reason before its own for a problem neither can serve.
+    ``leaf_gates`` are already-evaluated verdicts, not callables: the gates
     are pure, so there is nothing to defer.
     """
     for verdict in (
         check_quant_matches_identity(cls, p),
         check_trtllm_gen_capabilities(cls, p, d),
-        *provider_gates,
+        *leaf_gates,
     ):
         if verdict is not None:
             return verdict

@@ -29,9 +29,9 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
         PROVIDER_TRTLLM, "nvfp4", "TRTLLM-Gen batched-GEMM cubins over NVFP4, SM100 family."
     )
 
-    #: The group-16 fused SiTu cubins exist for this format, but only the
-    #: native op backend calls them, so eligibility is per leaf and not on
-    #: ``TRTLLMGenNvfp4Base`` (which the FlashInfer leaf shares).
+    #: The group-16 fused SiTu cubins. Declared on the leaf rather than on
+    #: ``TRTLLMGenNvfp4Base``: reaching them also takes the native op backend,
+    #: which is a property of this identity, not of the format.
     supports_situ = True
 
     @classmethod

@@ -95,11 +95,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     identity_quant_of,
     normalize_quant,
 )
-from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
-    MoEDep,
-    MoEEnvFlag,
-    override_moe_environment,
-)
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep, override_moe_environment
 from tensorrt_llm._torch.moe.fused_moe.impl_identity import (
     MOE_IMPL_REGISTRY,
     MoEImplDescriptor,
@@ -124,12 +120,10 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod, RoutingMethodType
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     FlashinferTrtllmGenBf16Impl,
-    FlashinferTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
-    trtllm_gen_leaves_in_resolution_order,
+    find_trtllm_gen_leaf,
 )
-from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.eligibility import check_flashinfer_provider
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -511,16 +505,15 @@ def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged()
 # =====================================================================
 # TRTLLM-Gen implementation identity
 # =====================================================================
-# Eleven identities over one abstract parent that holds the shared
-# ``__init__``, ``create_weights`` and input preparation. Most formats have a
-# native and a FlashInfer leaf that differ only in provider, so these tests
-# cover which provider a request lands on, and which leaves decline a routing,
-# bias, activation constant or epilogue their cubins do not run.
+# Seven identities over one abstract parent that holds the shared
+# ``__init__``, ``create_weights`` and input preparation, one per format. These
+# tests cover which leaf a request lands on, and which leaves decline a bias,
+# activation constant or epilogue their cubins do not run.
 
 # The full grid, written out rather than generated, so a leaf that silently
 # stops registering fails here instead of shrinking a computed expectation.
-# Six native leaves; the FlashInfer wheel serves five of the seven formats --
-# it has no fp8/fp4-activation runner, and it alone has the unquantized one.
+# Six native leaves for the quantized formats; the FlashInfer wheel serves only
+# the unquantized one, which TRT-LLM's own cubins do not cover.
 _TRTLLM_GEN_IDS = (
     "trtllm.trtllm_gen.fused_moe.nvfp4",
     "trtllm.trtllm_gen.fused_moe.fp8_block_scales",
@@ -528,28 +521,16 @@ _TRTLLM_GEN_IDS = (
     "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
     "trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8",
     "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8",
-    "flashinfer.trtllm_gen.fused_moe.nvfp4",
-    "flashinfer.trtllm_gen.fused_moe.fp8_block_scales",
-    "flashinfer.trtllm_gen.fused_moe.w4a16_mxfp4",
-    "flashinfer.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
     "flashinfer.trtllm_gen.fused_moe.none",
 )
 
 
-def _trtllm_gen_environment(
-    *, sm: int = 100, flashinfer: bool = False, use_flashinfer_flag: bool = False
-) -> MoEEnvironment:
-    """An SM100 host, with the FlashInfer wheel and its opt-in flag optional."""
+def _trtllm_gen_environment(*, sm: int = 100, flashinfer: bool = False) -> MoEEnvironment:
+    """An SM100 host, with the FlashInfer wheel optional."""
     deps = []
     if flashinfer:
         deps = [MoEDep.FLASHINFER.value, MoEDep.FLASHINFER_BF16_MOE.value]
-    return MoEEnvironment(
-        sm=sm,
-        available_deps=tuple(sorted(deps)),
-        env_flags=(
-            (MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER.value, "1" if use_flashinfer_flag else "0"),
-        ),
-    )
+    return MoEEnvironment(sm=sm, available_deps=tuple(sorted(deps)))
 
 
 def _single_rank_deployment(env: MoEEnvironment) -> MoEDeployment:
@@ -571,8 +552,8 @@ def _trtllm_gen_model_config(quant_algo=QuantAlgo.NVFP4):
     return cfg
 
 
-def test_trtllm_gen_registers_exactly_eleven_identities():
-    """The grid is the deliverable: eleven addressable ids, no more, no fewer."""
+def test_trtllm_gen_registers_exactly_seven_identities():
+    """The grid is the deliverable: seven addressable ids, no more, no fewer."""
     registered = sorted(
         identity.canonical()
         for identity in MOE_IMPL_REGISTRY.identities()
@@ -586,7 +567,7 @@ def test_trtllm_gen_identity_round_trips_through_registry(impl_id):
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     assert impl is not None
     # Declared on the leaf itself, not inherited from the parent: an inherited
-    # descriptor would give eleven classes one identity.
+    # descriptor would give seven classes one identity.
     assert "descriptor" in vars(impl)
     assert impl.descriptor.identity.canonical() == impl_id
     assert not impl.__abstractmethods__
@@ -616,7 +597,7 @@ def test_trtllm_gen_leaf_provider_agrees_with_its_identity(impl_id):
 
 @pytest.mark.parametrize("impl_id", _TRTLLM_GEN_IDS)
 def test_trtllm_gen_leaf_admits_only_its_own_format(impl_id):
-    """Two leaves differing only in provider still admit one format each."""
+    """Each leaf admits its own format and no other."""
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     quant = impl.descriptor.identity.quant
     other = "nvfp4" if quant != "nvfp4" else "w4a16_mxfp4"
@@ -649,20 +630,11 @@ def test_every_trtllm_gen_leaf_descends_from_the_surviving_name():
         assert issubclass(impl, TRTLLMGenFusedMoE)
 
 
-def test_trtllm_literal_picks_the_native_leaf_without_the_opt_in_flag():
-    """The default provider must not move just because FlashInfer is installed."""
+def test_trtllm_literal_picks_the_native_leaf_with_flashinfer_installed():
+    """A quantized format stays on the native leaf when FlashInfer is present."""
     with override_moe_environment(_trtllm_gen_environment(flashinfer=True)):
         report = resolve_moe_impl(_trtllm_gen_model_config())
     assert impl_class_for(report) is TrtllmTrtllmGenNvfp4Impl
-
-
-def test_trtllm_literal_moves_to_flashinfer_under_the_opt_in_flag():
-    """The old ``_check_flashinfer_backend_support`` switch, now in selection."""
-    with override_moe_environment(
-        _trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)
-    ):
-        report = resolve_moe_impl(_trtllm_gen_model_config())
-    assert impl_class_for(report).provider == "flashinfer"
 
 
 def test_deepseek_v4_routing_is_its_own_problem_but_keeps_v3s_kernel_encoding():
@@ -686,50 +658,9 @@ def test_deepseek_v4_routing_is_its_own_problem_but_keeps_v3s_kernel_encoding():
     assert canonical_routing(routing) == RoutingMethodType.DeepSeekV4.name
 
 
-@pytest.mark.parametrize(
-    "routing,fused_by_the_native_runner",
-    [
-        ("DeepSeekV3", True),
-        ("Default", True),
-        ("DeepSeekV4", False),
-        ("Renormalize", False),
-    ],
-)
-def test_flashinfer_provider_turns_down_only_the_routing_it_cannot_fuse(
-    routing, fused_by_the_native_runner
-):
-    """The routing half of the old ``_check_flashinfer_backend_support``.
-
-    It has to name the algorithm rather than the kernel encoding: V4 shares
-    V3's encoding while sharing none of the fused routing this gate objects
-    to, and the provider serves it.
-    """
-    verdict = check_flashinfer_provider(
-        FlashinferTrtllmGenNvfp4Impl,
-        MoEProblem(quant="NVFP4", dtype_act=torch.bfloat16, routing=routing),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)),
-    )
-
-    if fused_by_the_native_runner:
-        assert verdict is not None
-        assert verdict.reject_reason is MoERejectReason.ROUTING_UNSUPPORTED
-    else:
-        assert verdict is None
-
-
-def test_pinned_flashinfer_leaf_is_turned_down_when_not_opted_in():
-    """A pin fails hard, and says it was a policy call rather than a capability."""
-    with override_moe_environment(_trtllm_gen_environment(flashinfer=True)):
-        report = resolve_moe_impl(
-            _trtllm_gen_model_config(), impl_id="flashinfer.trtllm_gen.fused_moe.nvfp4"
-        )
-    assert report.winner is None
-    assert [rejection.reason for rejection in report.rejected] == [MoERejectReason.PATH_NOT_ENABLED]
-
-
 def test_flashinfer_leaves_report_dep_missing_without_the_wheel():
     """On a host with no FlashInfer, every FlashInfer leaf declines for that reason."""
-    deployment = _single_rank_deployment(_trtllm_gen_environment(use_flashinfer_flag=True))
+    deployment = _single_rank_deployment(_trtllm_gen_environment())
     for impl_id in _TRTLLM_GEN_IDS:
         impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
         if impl.provider != "flashinfer":
@@ -746,46 +677,11 @@ def test_flashinfer_leaves_report_dep_missing_without_the_wheel():
         assert verdict.reject_reason is MoERejectReason.DEP_MISSING
 
 
-@pytest.mark.parametrize(
-    "activation_constants",
-    [frozenset(), frozenset({"alpha"})],
-    ids=["unpadded_method", "padded_method"],
-)
-def test_flashinfer_nvfp4_declines_expert_bias_under_either_quant_method(activation_constants):
-    """Bias is a provider capability, so the shape gate cannot be its only home.
-
-    Which quant method this leaf picks depends on the activation constants,
-    and only one of the two goes through the shape gate. A bias answered there
-    alone is answered for half the problems, and the other half reaches an
-    ``__init__`` assert after resolution already named a winner.
-
-    Distinct from ``swiglu_gptoss_style``: that is the bias-plus-alpha-beta
-    package, and neither case here declares it.
-    """
-    verdict = FlashinferTrtllmGenNvfp4Impl.can_implement(
-        MoEProblem(
-            quant="NVFP4",
-            dtype_act=torch.bfloat16,
-            bias=True,
-            activation_constants=activation_constants,
-        ),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)),
-    )
-
-    assert not verdict.eligible
-    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
-
-
-# The leaves whose runner reads no expert bias. Three because the FlashInfer
-# provider passes none for any quantized format, three because the fp8/fp4
-# activation cubins take none on either provider, and the unquantized one
-# because its FlashInfer runner is the same.
+# The leaves whose runner reads no expert bias: two because the fp8/fp4
+# activation cubins take none, and the unquantized one because its FlashInfer
+# runner takes none either.
 _NO_EXPERT_BIAS_IDS = (
-    "flashinfer.trtllm_gen.fused_moe.nvfp4",
-    "flashinfer.trtllm_gen.fused_moe.w4a16_mxfp4",
-    "flashinfer.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
     "trtllm.trtllm_gen.fused_moe.fp8_block_scales",
-    "flashinfer.trtllm_gen.fused_moe.fp8_block_scales",
     "trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8",
     "flashinfer.trtllm_gen.fused_moe.none",
 )
@@ -798,7 +694,7 @@ def test_trtllm_gen_leaves_without_a_bias_runner_decline_during_selection(impl_i
     ``capabilities.supports_expert_bias`` is one declaration shared by the
     whole family, and ``create_moe`` reads it against the class resolution
     already picked -- so a leaf answering only there is chosen and then
-    refuses, with no chance for a sibling that can serve to be tried instead.
+    refuses, with no chance for a backend that can serve to be tried instead.
 
     Distinct from ``swiglu_gptoss_style``, which is the bias-plus-alpha-beta
     package: none of these problems declares it, and a checkpoint can carry a
@@ -812,7 +708,7 @@ def test_trtllm_gen_leaves_without_a_bias_runner_decline_during_selection(impl_i
             dtype_act=torch.bfloat16,
             bias=True,
         ),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)),
+        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True)),
     )
 
     assert not verdict.eligible
@@ -861,7 +757,7 @@ def test_leaves_without_constant_support_decline_during_selection(impl, constant
             dtype_act=torch.bfloat16,
             activation_constants=frozenset({constant}),
         ),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)),
+        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True)),
     )
 
     assert not verdict.eligible
@@ -885,22 +781,16 @@ def test_nvfp4_leaves_admit_the_calibration_aliases(alias):
     assert verdict.eligible, verdict.detail
 
 
-def test_resolution_order_lists_flashinfer_before_its_native_sibling():
-    """Filtering callers need resolution's order, not a lookup's.
+def test_trtllm_gen_lookup_finds_the_one_leaf_per_format():
+    """Each format has exactly one leaf, on whichever provider serves it.
 
-    ``IMPL_PRIORITY`` ranks each FlashInfer leaf ahead of its native sibling
-    and the opt-in flag is what makes the FlashInfer ones reject, so a caller
-    asking "would a run serve this?" has to walk both and fall through on a
-    rejection. Provider-exclusive formats yield the one leaf that exists.
+    The quantized formats land on the native provider and the unquantized one
+    on FlashInfer; a format no leaf publishes is an ordinary ``None``.
     """
-    assert trtllm_gen_leaves_in_resolution_order(QuantAlgo.NVFP4) == (
-        FlashinferTrtllmGenNvfp4Impl,
-        TrtllmTrtllmGenNvfp4Impl,
-    )
-    assert trtllm_gen_leaves_in_resolution_order(None) == (FlashinferTrtllmGenBf16Impl,)
-    assert trtllm_gen_leaves_in_resolution_order(QuantAlgo.W4A8_NVFP4_FP8) == (
-        TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
-    )
+    assert find_trtllm_gen_leaf(QuantAlgo.NVFP4) is TrtllmTrtllmGenNvfp4Impl
+    assert find_trtllm_gen_leaf(QuantAlgo.W4A8_NVFP4_FP8) is TrtllmTrtllmGenW4a8Nvfp4Fp8Impl
+    assert find_trtllm_gen_leaf(None) is FlashinferTrtllmGenBf16Impl
+    assert find_trtllm_gen_leaf(QuantAlgo.W8A16) is None
 
 
 # The two native leaves whose cubin family has a fused SiTu FC1 epilogue:
@@ -924,9 +814,8 @@ def test_trtllm_gen_situ_admitted_only_by_the_leaves_with_a_fused_cubin(impl_id)
     raises, which reads as a crash rather than as a format that was never
     eligible.
 
-    The FlashInfer leaves are turned down here even for the two capable
-    formats: SiTu is a native TRTLLM-Gen cubin and is absent from FlashInfer's
-    activation enum.
+    The FlashInfer bf16 leaf is turned down too: SiTu is a native TRTLLM-Gen
+    cubin and is absent from FlashInfer's activation enum.
     """
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     quant = impl.descriptor.identity.quant
@@ -936,7 +825,7 @@ def test_trtllm_gen_situ_admitted_only_by_the_leaves_with_a_fused_cubin(impl_id)
             dtype_act=torch.bfloat16,
             activation="SiTu",
         ),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)),
+        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True)),
     )
     if impl_id in _SITU_CAPABLE_IDS:
         assert verdict.eligible, verdict.detail
@@ -2652,7 +2541,6 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
         "AllGatherReduceScatter",
         "NVLinkOneSided",
         "NVLinkTwoSided",
-        "NVLinkTwoSidedFlashinfer",
         "NcclEP",
         "DeepEP",
         "DeepEPLowLatency",
@@ -2668,7 +2556,6 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
         num_slots=4,
         routing_method=SimpleNamespace(experts_per_token=1),
         expert_size_per_partition=2,
-        use_flashinfer=False,
         hidden_size=128,
         communication_method=method if force_source == "model" else None,
     )
