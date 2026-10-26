@@ -309,16 +309,42 @@ def test_no_op_probing():
     assert not offenders, f"op probing in {offenders}"
 
 
+def _is_docstring_or_future(node: ast.stmt) -> bool:
+    docstring = isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+    future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
+    return docstring or future
+
+
 def test_family_packages_have_no_side_effects():
-    """Native code loads per target; a family package that imported anything
-    would load it for every target of the family, or for none of them."""
-    for init in [_MODELS / "__init__.py", *sorted(_MODELS.glob("*/__init__.py"))]:
-        body = ast.parse(init.read_text()).body
-        for node in body:
-            docstring = isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
-            future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
-            assert docstring or future, (
+    """Native code loads per target, when ``route`` imports the target.
+
+    ``models/__init__.py`` imports only the families' routing modules, a family
+    package holds a docstring only, and a routing module imports a target only
+    inside ``route``. Anything else would load a target's native code on every
+    resolve, or for every target of the family.
+    """
+    for node in ast.parse((_MODELS / "__init__.py").read_text()).body:
+        routing_import = (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 1
+            and node.module is not None
+            and "." not in node.module
+            and [alias.name for alias in node.names] == ["routing"]
+        )
+        assert _is_docstring_or_future(node) or routing_import, (
+            f"{(_MODELS / '__init__.py').relative_to(_REPO)}:{node.lineno} -- "
+            "models/__init__.py imports the families' routing modules and nothing else"
+        )
+    for init in sorted(_MODELS.glob("*/__init__.py")):
+        for node in ast.parse(init.read_text()).body:
+            assert _is_docstring_or_future(node), (
                 f"{init.relative_to(_REPO)}:{node.lineno} -- a family package holds a docstring only"
+            )
+    for routing in sorted(_MODELS.glob("*/routing.py")):
+        for node in ast.parse(routing.read_text()).body:
+            assert not (isinstance(node, ast.ImportFrom) and node.level == 1), (
+                f"{routing.relative_to(_REPO)}:{node.lineno} -- imports .{node.module} at "
+                "module level; a routing module imports a target only inside route"
             )
 
 
@@ -395,7 +421,12 @@ def test_accuracy_entries_name_a_family():
 def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
     """The loader and CBTS compute directory, namespace and architecture
     coverage in Python; the build computes them in modeling_v2.cmake."""
-    names = ["fixture", "minimax_m3", "scale_add__sm_10x__default", "r1_0528_nvfp4__sm_10x__default"]
+    names = [
+        "fixture",
+        "minimax_m3",
+        "scale_add__sm_10x__default",
+        "r1_0528_nvfp4__sm_10x__default",
+    ]
     script = tmp_path / "probe.cmake"
     lines = [f'include("{_CMAKE_MODULE}")']
     for name in names:

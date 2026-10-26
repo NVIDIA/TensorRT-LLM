@@ -345,9 +345,9 @@ carve-out is needed.
 
 Outward fallback: not needed, and by design rather than by accident.
 Nothing beyond the resolver module is imported unless `LLM(modeling_v2=...)`
-is on — the model loader calls `modeling_v2_resolve`, which returns
-immediately when the switch is off, and the routing modules are imported
-lazily behind it. The callers outside the subtree,
+is on — the model loader calls `modeling_v2_resolve_on_all_ranks`, which
+returns immediately when the switch is off, and the routing modules are
+imported lazily behind it. The callers outside the subtree,
 `tensorrt_llm/_torch/pyexecutor/model_loader.py` (decides) and
 `tensorrt_llm/_torch/models/modeling_auto.py` (reads the decision off
 `ModelConfig`), are deliberately left unclaimed: a change to the shared

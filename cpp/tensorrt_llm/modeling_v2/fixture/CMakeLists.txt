@@ -15,12 +15,12 @@
 # the License.
 #
 
-# Temporary infrastructure fixture, not a model: one target with one op, so
-# that CI drives the whole native path -- build, packaging, load,
-# built_targets(), fake op, GPU op. Remove this family (with its Python package
-# and tests) once a family with native code has GPU unit tests that run in CI.
-# It is built for 100f only, the B300 its GPU test runs on, to keep the
-# library it adds to every wheel small.
+# Temporary infrastructure fixture, not a model: one target with one op, so that
+# CI drives the whole native path -- build, packaging, load, built_targets(),
+# fake op, GPU op. Remove this family (with its Python package and tests) once a
+# family with native code has GPU unit tests that run in CI. It is built for
+# 100f only, the B300 its GPU test runs on, to keep the library it adds to every
+# wheel small.
 add_modeling_v2_family(fixture)
 
 add_modeling_v2_target(
