@@ -292,6 +292,48 @@ def test_batched_message_is_named_after_the_engine_request():
     assert re.fullmatch(r"msg_7_[0-9a-f]{16}", message["id"])
 
 
+class _FixedPromptTokenizer:
+    """Renders every conversation to one fixed prompt."""
+
+    def __init__(self):
+        self.tokenizer = self
+        self.vocab_size = 1024
+        self.name_or_path = None
+
+    def apply_chat_template(self, *args, **kwargs) -> str:
+        return "<rendered>"
+
+    def encode(self, text, **kwargs):
+        return [1, 2, 3]
+
+
+def test_nonstream_message_takes_the_id_the_real_chat_route_notes(tmp_path):
+    """Through the real openai_chat: the chat completion's id has no request id in it."""
+    from .openai_server_stub import make_stub_openai_server
+
+    def generate_async(**kwargs):
+        return SimpleNamespace(request_id=42, prompt_token_ids=[1, 2, 3])
+
+    server = make_stub_openai_server(
+        tmp_path,
+        MODEL,
+        SimpleNamespace(model_type="llama", vocab_size=1024),
+        generate_async,
+        tokenizer=_FixedPromptTokenizer(),
+    )
+    server.await_disconnected = AsyncMock()
+    server._create_chat_response = AsyncMock(return_value=_chat_response())
+    app = FastAPI()
+    _anthropic_validation_handler(app)
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+
+    response = TestClient(app).post("/v1/messages", json=_request())
+
+    assert response.status_code == 200, response.text
+    assert _chat_response().id == "chatcmpl-route-test"
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", response.json()["id"])
+
+
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
 def test_messages_route_reframes_streaming_response(server_kind):
     client, backend = _make_route_client(server_kind, _streaming_chat_response())
