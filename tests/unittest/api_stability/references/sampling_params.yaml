@@ -22,6 +22,10 @@ methods:
         annotation: Optional[int]
         default: null
         status: prototype
+      watermarking:
+        annotation: Optional[bool]
+        default: null
+        status: prototype
       logprobs_mode:
         annotation: LogprobMode
         default: LogprobMode.RAW
