@@ -89,3 +89,56 @@ def test_change_selects_its_node(tmp_path: Path, changed: str, selected: set[str
     result = _rule(tmp_path).apply(PRInputs(changed_files=[f"{_SRC}/{changed}"], diffs={}))
     kept = {entry for waives in result.block_filters[("l0_b300", 0)].values() for entry in waives}
     assert kept == selected | {f"{_UNIT}/test_modeling_v2_claims.py"}
+
+
+@pytest.mark.parametrize(
+    ("changed", "selected"),
+    (
+        pytest.param(
+            "models/fam/a/ops/norm/fused.py",
+            {f"{_UNIT}/models/fam/test_shared.py", f"{_UNIT}/models/fam/a/test_a.py"},
+            id="target-change-keeps-its-family-test-file",
+        ),
+        pytest.param(
+            "models/fam/routing.py",
+            {f"{_UNIT}/models/fam/test_shared.py", f"{_UNIT}/models/fam/a/test_a.py"},
+            id="family-change-keeps-the-family-test-file",
+        ),
+        pytest.param(
+            "models/other/c/modeling.py",
+            {f"{_UNIT}/models/other/test_o.py"},
+            id="other-family-change-leaves-the-family-test-file",
+        ),
+    ),
+)
+def test_family_test_file_belongs_to_every_node_under_it(
+    tmp_path: Path, changed: str, selected: set[str]
+) -> None:
+    rule = _rule(tmp_path)
+    rule.yaml_index.blocks = [
+        Block(
+            "l0_cpu",
+            0,
+            {},
+            [
+                f"{_UNIT}/test_modeling_v2_claims.py",
+                f"{_UNIT}/models/fam/test_shared.py",
+                f"{_UNIT}/models/fam/a/test_a.py",
+                f"{_UNIT}/models/other/test_o.py",
+            ],
+        )
+    ]
+    result = rule.apply(PRInputs(changed_files=[f"{_SRC}/{changed}"], diffs={}))
+    kept = {entry for waives in result.block_filters[("l0_cpu", 0)].values() for entry in waives}
+    assert kept == selected | {f"{_UNIT}/test_modeling_v2_claims.py"}
+
+
+def test_family_test_file_does_not_displace_the_covering_entry(tmp_path: Path) -> None:
+    rule = _rule(tmp_path)
+    rule.yaml_index.blocks = [
+        Block("l0_b300", 0, {}, [f"{_UNIT}/models/fam/test_shared.py", f"{_UNIT}/models/fam"])
+    ]
+    changed = f"{_SRC}/models/fam/a/ops/norm/fused.py"
+    result = rule.apply(PRInputs(changed_files=[changed], diffs={}))
+    kept = {entry for waives in result.block_filters[("l0_b300", 0)].values() for entry in waives}
+    assert kept == {f"{_UNIT}/models/fam/test_shared.py", f"{_UNIT}/models/fam"}

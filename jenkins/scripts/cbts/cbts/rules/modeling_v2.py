@@ -45,7 +45,9 @@ whole (claims, routing, contracts), so any change keeps them.
 A unit test prefix that no entry of a block sits at or under keeps the
 longest entry of that block that covers it instead: a family is one
 directory entry, and a change to one of its targets runs the family's
-unit tests. Whenever the tree on disk cannot answer -- a node directory
+unit tests. A test file listed at a directory above a node -- a family's
+own test file -- belongs to every node under that directory, so a change
+to any of them keeps it. Whenever the tree on disk cannot answer -- a node directory
 deleted with its `routing.py` -- the file falls back to the wider
 selection.
 
@@ -143,6 +145,20 @@ def _is_whole_tree_test(target: str) -> bool:
     return target.startswith(f"{_UNIT_ROOT}/") and "/" not in rest and rest.endswith(".py")
 
 
+def _is_ancestor_file(target: str, prefix: str) -> bool:
+    """A test file in a directory below the models root that holds `prefix`.
+
+    A test file at a family (or an intermediate) directory belongs to every
+    node under it, so a change to any of those nodes runs it.
+    """
+    parent, _, name = target.split("::")[0].rpartition("/")
+    return (
+        name.endswith(".py")
+        and parent.startswith(f"{_UNIT_ROOT}/models/")
+        and _target_in_filter_subtree(prefix, parent)
+    )
+
+
 def _is_perf_sanity_stem(stem: str) -> bool:
     """True for perf-sanity yaml stems (`l0_*_perf_sanity*`)."""
     return "perf_sanity" in stem
@@ -152,7 +168,9 @@ def _kept_entries(entries: list[str], prefixes: set[str]) -> list[str]:
     """The entries of one block that `prefixes` select.
 
     An entry is kept when it sits at or under a prefix. A prefix with no such
-    entry in the block keeps the longest entry that covers it instead.
+    entry in the block keeps the longest entry that covers it instead. A test
+    file in a directory above a prefix is kept as well; it does not count as
+    sitting under the prefix, so it never displaces the covering entry.
     """
     targets = {entry: _entry_target(entry) for entry in entries}
     kept = {e for e, t in targets.items() if _is_whole_tree_test(t)}
@@ -162,6 +180,7 @@ def _kept_entries(entries: list[str], prefixes: set[str]) -> list[str]:
             covering = [e for e, t in targets.items() if _target_in_filter_subtree(prefix, t)]
             under = {max(covering, key=lambda e: len(targets[e]))} if covering else set()
         kept |= under
+        kept |= {e for e, t in targets.items() if _is_ancestor_file(t, prefix)}
     return [e for e in entries if e in kept]
 
 
