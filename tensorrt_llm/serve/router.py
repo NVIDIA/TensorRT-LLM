@@ -377,9 +377,10 @@ class Router(ABC):
         """
 
     async def _after_servers_updated(self):
-        """Called after a server list change once its new servers are prepared, with the lock held.
+        """Called after a server list change and the preparation attempts of its new servers, with the lock held.
 
-        Override in subclasses that hold requests waiting for a server.
+        Override in subclasses that hold requests waiting for a server. As in routing, a server stays eligible when
+        its preparation fails.
         """
 
     @property
