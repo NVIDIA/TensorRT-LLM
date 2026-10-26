@@ -774,7 +774,22 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "flow_shift": ExtraParamSchema(
         type="float",
         default=None,
-        description="Optional scheduler flow shift override. Uses the Cosmos3 mode default when omitted.",
+        description=(
+            "Optional scheduler flow shift override. Uses the Cosmos3 mode default when "
+            "omitted. Applies to the shifted-linear flow grids; it has no effect on the "
+            "Karras grid (an error with sigma_grid='karras', a warning otherwise)."
+        ),
+    ),
+    "sigma_grid": ExtraParamSchema(
+        type="Literal['karras', 'native', 'diffusers']",
+        default=None,
+        description=(
+            "Sigma grid for base (non-distilled) checkpoints. 'karras': the checkpoint's "
+            "Karras levels; 'native': the Cosmos framework's shifted-linear flow grid; "
+            "'diffusers': the Diffusers UniPC shifted-linear flow grid. Both linear grids "
+            "use flow_shift, or the mode default when it is omitted. Unset keeps each "
+            "mode's existing grid. Rejected for distilled checkpoints."
+        ),
     ),
     "action_mode": ExtraParamSchema(
         type="Literal['policy', 'forward_dynamics', 'inverse_dynamics']",

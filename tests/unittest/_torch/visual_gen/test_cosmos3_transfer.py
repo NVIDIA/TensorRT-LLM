@@ -219,7 +219,7 @@ class StubSamplingPolicy:
         self.flow_shift_calls.append(target_shift)
         return StubScheduler()
 
-    def set_timesteps(self, scheduler, num_inference_steps, device=None):
+    def set_timesteps(self, scheduler, num_inference_steps, device=None, grid=None):
         self.set_timesteps_calls.append(num_inference_steps)
         if self.is_distilled:
             scheduler.set_timesteps(sigmas=list(self.fixed_sigmas), device=device)

@@ -265,3 +265,42 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --output_path inverse_video.safetensors \
     --action_output_path inverse_action.json
 ```
+
+## Sampling schedule
+
+Each mode samples with the sigma grid it has always used unless the request
+selects one. On Nano and Super, T2V, I2V and T2I use the checkpoint's Karras
+grid, and V2V and transfer use the Diffusers shifted-linear flow grid. Edge uses
+its checkpoint-declared linear flow grid in every mode. `extra_params.sigma_grid`
+selects a grid explicitly for base (non-distilled) checkpoints:
+
+| `sigma_grid` | Grid | `flow_shift` |
+|---|---|---|
+| `"karras"` | The checkpoint's Karras levels | Not used; an explicit value is rejected |
+| `"native"` | The Cosmos framework's shifted-linear flow grid | Used; mode default when omitted |
+| `"diffusers"` | The Diffusers UniPC shifted-linear flow grid | Used; mode default when omitted |
+
+Selecting a linear grid does not change the shift: pass `flow_shift` with it.
+To sample the way the Cosmos framework does, request its grid and shift
+explicitly; the examples below select that schedule, they do not change any
+default:
+
+```bash
+# Video modes (T2V, I2V, V2V, transfer): the framework's video schedule
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/t2v.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --extra_params '{"sigma_grid": "native", "flow_shift": 10.0}'
+
+# T2I: the framework's image schedule
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/t2i.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --output_path output.png \
+    --extra_params '{"sigma_grid": "native", "flow_shift": 3.0}'
+```
+
+Distilled 4-step checkpoints sample a fixed schedule from the checkpoint and
+reject `sigma_grid`; omit both `sigma_grid` and `flow_shift` for them. A
+`flow_shift` sent without `sigma_grid` to a mode that samples the Karras grid has
+no effect, and the server logs a warning.
