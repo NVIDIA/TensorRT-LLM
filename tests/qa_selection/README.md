@@ -109,7 +109,7 @@ qa_selection/
 ## Acceptance tests
 
 ```bash
-pytest tests/qa_selection/tests      # 70 tests, no wheel
+pytest tests/qa_selection/tests      # 66 tests, no wheel
 ```
 
 Each test states a command line and the answer expected back, derived from the production
@@ -125,7 +125,7 @@ the suite in a `docker --gpus all` and then a `docker --runtime=runc` container,
 | **Before collection** | A machine and a ladder are the whole command; without a machine, this host is the target | AC-4 [`test_options.py`](tests/test_options.py) (5), [`test_local_machine.py`](tests/test_local_machine.py) (2), [`test_unprobed_host.py`](tests/test_unprobed_host.py) (2), [`test_saved_profile.py`](tests/test_saved_profile.py) (9) |
 | **During collection** | The target decides, never the collecting host, so a named machine needs no GPU: its architecture, wherever the mark sits, and its largest rung as the GPU count; a test above that rung is deselected with one reason | AC-1 [`test_arch.py`](tests/test_arch.py) (7), AC-2 [`test_gpu_count.py`](tests/test_gpu_count.py) (7), AC-5 [`test_largest_rung.py`](tests/test_largest_rung.py) (4), [`test_named_machine.py`](tests/test_named_machine.py) (1) |
 | **After collection** | Each kept test is in exactly one list, its smallest rung's, the record carries the profile, and the terminal explains the run | AC-3 [`test_ladder.py`](tests/test_ladder.py) (6), AC-7 [`test_summary.py`](tests/test_summary.py) (5), [`test_named_machine.py`](tests/test_named_machine.py) (1), [`test_local_machine.py`](tests/test_local_machine.py) (1) |
-| **Catalogue** | Each profile holds its machine's measured facts, and its ladder ends at the node; a run without `--ladder` uses it | [`test_profiles.py`](tests/test_profiles.py) (19) |
+| **Catalogue** | The catalogue is the six cluster machines, and each ladder ends at the node; a run without `--ladder` uses it | [`test_profiles.py`](tests/test_profiles.py) (11), [`test_options.py`](tests/test_options.py) (4) |
 
 ## Config
 
