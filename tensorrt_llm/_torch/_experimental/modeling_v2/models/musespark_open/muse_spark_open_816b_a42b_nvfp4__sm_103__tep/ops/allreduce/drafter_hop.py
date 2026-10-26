@@ -72,6 +72,31 @@ area is reset). There is no device-side buffer index: graph replays and eager
 calls interleave freely, and a GEMM captured into a graph can store into a
 fixed area.
 
+Wide workspace (``max_rows`` above 8, fast path ``wide_drafter_hops``): the same kernel on
+drafter blocks of up to ``WIDE_MAX_ROWS`` rows (several requests' blocks; the convolution's
+tap-1 mask is per block, ``row % block``), with one slab per rank of the group and ``areas``
+receive areas used in site order modulo ``areas`` -- a divisor of ``sites`` of at least 3, so
+every window of ``areas`` consecutive calls (across forwards too) names distinct areas and
+the reset argument above holds with ``areas`` in place of ``sites``. A call resets the rows of
+the previous area that the previous call can have written: all ``max_rows`` at site 0 (the
+previous forward may have had any row count), at every other site the larger of its own row
+count and the previous call's (a forward's calls share one row count when served).
+
+Progress: a wide call launches ``CLUSTER * rows`` CTAs of 128 threads. A cluster publishes its
+row before it polls, and polls only the slots of rows ``t`` and ``t - 1`` of its column slice,
+which only the clusters of rows ``t`` and ``t - 1`` of the peers write. No other compute
+stream of the step is live during the drafter forward (the ``context_kv_fork`` side stream
+joins the main stream before the drafter's first hop), so no kernel of this rank holds an SM
+the hop's clusters wait for. Up to 32 rows (32 clusters = 256 CTAs) every cluster of the call
+is resident together on a GB300 (at most two 128-thread CTAs per SM), so progress needs no
+dispatch order. Above that (sm103's served 56 rows are 448 CTAs on 152 SMs, sm107's served 64
+rows are 512 CTAs on 212 SMs, and the qualification tests' 64..256 rows) not every cluster
+need be resident at once, and progress
+also relies on CTAs dispatched in grid order on every rank (the assumption the built-in MNNVL
+all-reduce kernels and ``post_attn_hop_wide`` make, which CUDA does not guarantee): the
+lowest-indexed unfinished cluster is then resident on every rank once every lower one has
+finished, so it publishes and finishes.
+
 Ordering contract: calls on one workspace must be issued in site order
 ``0, 1, ..., sites - 1, 0, ...`` on every rank, serialized on one stream (graph
 replay included), and every kernel launched with programmatic dependent launch
@@ -109,6 +134,33 @@ _LAUNCH_PDL = True
 HIDDEN = 8192
 #: Rows of a drafter block the transport is sized for (K + 1 at K = 7).
 MAX_ROWS = 8
+#: Rows of a wide workspace: the drafter blocks of up to 32 requests at K = 7.
+WIDE_MAX_ROWS = 256
+#: Rows of the served wide workspace (``wide_drafter_hops``) per compute capability
+#: (``wide_served_rows``). sm103: the drafter blocks of 2..7 requests at K = 7, where the
+#: one-shot hop is faster than the built-in all-reduce, convolution and add-RMSNorm on
+#: GB300 (at 8 requests the two tie; above, the built-in two-shot all-reduce wins). sm107:
+#: the blocks of 2..8 requests; on Rubin the one-shot hop is still the faster one at 64 rows
+#: and the slower one from 128 rows on.
+WIDE_SERVED_ROWS_BY_SM: dict[tuple[int, int], int] = {(10, 3): 56, (10, 7): 64}
+
+
+def wide_served_rows(capability: Optional[Tuple[int, int]] = None) -> int:
+    """The served wide workspace's rows on ``capability`` (this process's device when None).
+
+    Raises:
+        ValueError: on a device ``WIDE_SERVED_ROWS_BY_SM`` does not list.
+    """
+    key = tuple(torch.cuda.get_device_capability() if capability is None else capability)
+    rows = WIDE_SERVED_ROWS_BY_SM.get(key)
+    if rows is None:
+        raise ValueError(
+            f"drafter_hop: no served wide rows for SM {key} "
+            f"(supported: {sorted(WIDE_SERVED_ROWS_BY_SM)})"
+        )
+    return rows
+
+
 #: Largest tensor-parallel group; slots are laid out for it whatever the group size.
 MAX_RANKS = 8
 #: BF16 values per thread.
@@ -293,6 +345,24 @@ if HAS_CUTE_DSL:
         )
         return Uint32(result)
 
+    @dsl_user_op
+    def _globaltimer(*, loc=None, ip=None):
+        """The global nanosecond timer (bounded-poll variant only)."""
+        result = _asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", loc, ip)
+        return Int64(result)
+
+    @dsl_user_op
+    def _trap_if(expired, *, loc=None, ip=None):
+        """Abort this rank's context when ``expired`` is non-zero (bounded-poll variant only)."""
+        _asm(
+            None,
+            [_u32(expired, loc, ip)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $0, 0;\n@p trap;\n}",
+            "r",
+            loc,
+            ip,
+        )
+
     # ---- arithmetic: one PTX instruction each, as the replaced kernels run them ----
 
     def _f32_asm(text, operands, loc, ip):
@@ -424,12 +494,27 @@ if HAS_CUTE_DSL:
     class _DrafterHopKernel:
         """All-reduce + DFlash 2 finish convolution + flashinfer add + RMSNorm, one row per cluster."""
 
-        def __init__(self, ranks: int, eps: float, pdl: bool, early_trigger: bool, direct: bool):
+        def __init__(
+            self,
+            ranks: int,
+            eps: float,
+            pdl: bool,
+            early_trigger: bool,
+            direct: bool,
+            max_rows: int = MAX_ROWS,
+            timeout_ns: int = 0,
+        ):
             self.ranks = ranks
             self.eps = float(eps)
             self.pdl = pdl
             self.early_trigger = early_trigger
             self.direct = direct
+            # Rows of one slab (one source rank's rows of an area) and its bytes.
+            self.max_rows = int(max_rows)
+            self.slab_bytes = self.max_rows * ROW_BYTES
+            # 0: the polls spin without a bound (served); else a poll still stale after this
+            # many nanoseconds executes ``trap`` (qualification builds).
+            self.timeout_ns = int(timeout_ns)
 
         @cute.jit
         def __call__(
@@ -449,6 +534,7 @@ if HAS_CUTE_DSL:
             delta_row: Int32,
             delta_tap: Int32,
             dry: Int32,
+            reset_rows: Int32,
             stream: cuda.CUstream,
         ):
             self.kernel(
@@ -467,6 +553,7 @@ if HAS_CUTE_DSL:
                 delta_row,
                 delta_tap,
                 dry,
+                reset_rows,
             ).launch(
                 grid=[rows * CLUSTER, 1, 1],
                 block=[THREADS, 1, 1],
@@ -494,6 +581,7 @@ if HAS_CUTE_DSL:
             delta_row: Int32,
             delta_tap: Int32,
             dry: Int32,
+            reset_rows: Int32,
         ):
             tid = cute.arch.thread_idx()[0]
             lane = tid % 32
@@ -548,7 +636,7 @@ if HAS_CUTE_DSL:
                     # Publish this rank's partial row into its slot on every rank
                     # (one store to the multicast address reaches every member).
                     _store_x4(
-                        mcast + Int64(rank) * SLAB_BYTES + slot_offset,
+                        mcast + Int64(rank) * self.slab_bytes + slot_offset,
                         own[0],
                         own[1],
                         own[2],
@@ -556,20 +644,36 @@ if HAS_CUTE_DSL:
                     )
                 # Retire the previous site's area: every row, every slot this
                 # rank polls (rows t, t + rows, ... of this CTA's columns).
-                for i in cutlass.range_constexpr(MAX_ROWS):
-                    reset_row = row + i * rows
-                    in_area = Uint32(reset_row < MAX_ROWS)
-                    for p in cutlass.range_constexpr(self.ranks):
-                        reset_on = Uint32(1)
-                        if cutlass.const_expr(not self.direct):
-                            reset_on = Uint32(rank != p)
-                        _reset_x4(
-                            previous
-                            + Int64(p) * SLAB_BYTES
-                            + Int64(reset_row) * ROW_BYTES
-                            + slot_bytes,
-                            in_area & reset_on,
-                        )
+                if cutlass.const_expr(self.max_rows == MAX_ROWS):
+                    for i in cutlass.range_constexpr(MAX_ROWS):
+                        reset_row = row + i * rows
+                        in_area = Uint32(reset_row < MAX_ROWS)
+                        for p in cutlass.range_constexpr(self.ranks):
+                            reset_on = Uint32(1)
+                            if cutlass.const_expr(not self.direct):
+                                reset_on = Uint32(rank != p)
+                            _reset_x4(
+                                previous
+                                + Int64(p) * self.slab_bytes
+                                + Int64(reset_row) * ROW_BYTES
+                                + slot_bytes,
+                                in_area & reset_on,
+                            )
+                else:
+                    # A wide area: the rows the previous call can have written
+                    # (``reset_rows``), rows t, t + rows, ... of this CTA's columns.
+                    for reset_row in cutlass.range(row, reset_rows, rows, unroll=1):
+                        for p in cutlass.range_constexpr(self.ranks):
+                            reset_on = Uint32(1)
+                            if cutlass.const_expr(not self.direct):
+                                reset_on = Uint32(rank != p)
+                            _reset_x4(
+                                previous
+                                + Int64(p) * self.slab_bytes
+                                + Int64(reset_row) * ROW_BYTES
+                                + slot_bytes,
+                                reset_on,
+                            )
                 r = _load_x4(residual + row_offset)
                 group = Int64(column // GROUP_SIZE)
                 delta_address = delta + (Int64(row) * Int64(delta_row) + group) * 2
@@ -592,7 +696,7 @@ if HAS_CUTE_DSL:
                             on = on & has_prev
                         mine = own if half == 0 else own_prev
                         v0, v1, v2, v3 = _poll_x4(
-                            receive_row + Int64(p) * SLAB_BYTES - half * ROW_BYTES,
+                            receive_row + Int64(p) * self.slab_bytes - half * ROW_BYTES,
                             on,
                             mine[0],
                             mine[1],
@@ -605,13 +709,16 @@ if HAS_CUTE_DSL:
                         values[slot, 3] = v3
                         enabled[slot] = on
                         stale = stale | _stale_bit(v0, v1, v2, v3, on << Uint32(slot))
+                start = Int64(0)
+                if cutlass.const_expr(self.timeout_ns > 0):
+                    start = _globaltimer()
                 while stale != Uint32(0):
                     polled = stale
                     for half in cutlass.range_constexpr(2):
                         for p in cutlass.range_constexpr(self.ranks):
                             slot = half * self.ranks + p
                             v0, v1, v2, v3 = _poll_x4(
-                                receive_row + Int64(p) * SLAB_BYTES - half * ROW_BYTES,
+                                receive_row + Int64(p) * self.slab_bytes - half * ROW_BYTES,
                                 (polled >> Uint32(slot)) & Uint32(1),
                                 values[slot, 0],
                                 values[slot, 1],
@@ -631,6 +738,9 @@ if HAS_CUTE_DSL:
                             values[slot, 3],
                             enabled[slot] << Uint32(slot),
                         )
+                    if cutlass.const_expr(self.timeout_ns > 0):
+                        elapsed = _globaltimer() - start
+                        _trap_if(Uint32((stale != Uint32(0)) & (elapsed > Int64(self.timeout_ns))))
                 # Early trigger: past the last transport access.
                 if cutlass.const_expr(self.pdl and self.early_trigger):
                     cute.arch.griddepcontrol_launch_dependents()
@@ -718,9 +828,16 @@ if HAS_CUTE_DSL:
 
     @functools.lru_cache(maxsize=64)
     def _compiled_kernel(
-        device_index: int, ranks: int, eps: float, pdl: bool, early_trigger: bool, direct: bool
+        device_index: int,
+        ranks: int,
+        eps: float,
+        pdl: bool,
+        early_trigger: bool,
+        direct: bool,
+        max_rows: int = MAX_ROWS,
+        timeout_ns: int = 0,
     ):
-        kernel = _DrafterHopKernel(ranks, eps, pdl, early_trigger, direct)
+        kernel = _DrafterHopKernel(ranks, eps, pdl, early_trigger, direct, max_rows, timeout_ns)
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             return cute.compile(
@@ -732,6 +849,7 @@ if HAS_CUTE_DSL:
                 Int32(0),
                 Int32(0),
                 Int32(1),
+                Int32(max_rows),
                 stream,
                 options="--enable-tvm-ffi",
             )
@@ -759,6 +877,13 @@ class DrafterHopWorkspace:
     use; construction checks that each is on this device, contiguous and
     16-byte aligned.
 
+    ``max_rows`` above ``MAX_ROWS`` builds a wide workspace (module docstring): one slab per
+    rank of the group, ``areas`` receive areas (default: the smallest divisor of ``sites`` of
+    at least 3), multicast publication only.
+
+    ``timeout_ns`` > 0 builds the bounded-poll variant for qualification: a poll still stale
+    after that long executes ``trap`` (aborting this rank's context) instead of spinning.
+
     Construction is collective over the group (the ``pre_wait`` check, fabric
     allocation, sentinel fill, compilation and a dry launch per ``eps``) and
     either succeeds on every rank or raises on every rank.
@@ -773,6 +898,9 @@ class DrafterHopWorkspace:
         early_trigger: bool = False,
         direct: bool = False,
         pre_wait: Sequence[torch.Tensor] = (),
+        max_rows: int = MAX_ROWS,
+        areas: Optional[int] = None,
+        timeout_ns: int = 0,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -791,10 +919,33 @@ class DrafterHopWorkspace:
             raise ValueError(f"the fused drafter hop serves 4 or 8 ranks, got {self.ranks}")
         if self.sites < MIN_SITES:
             raise ValueError(f"the fused drafter hop needs at least {MIN_SITES} sites")
+        self.max_rows = int(max_rows)
+        self.wide = self.max_rows > MAX_ROWS
+        self.timeout_ns = int(timeout_ns)
+        #: Rows of the last call issued (the reset bound of the next one inside a forward).
+        self._last_rows = self.max_rows
+        if self.wide:
+            if self.direct:
+                raise ValueError(
+                    "a wide drafter hop workspace publishes through the multicast only"
+                )
+            if not MAX_ROWS < self.max_rows <= WIDE_MAX_ROWS:
+                raise ValueError(f"a wide workspace takes {MAX_ROWS + 1}..{WIDE_MAX_ROWS} rows")
+            if areas is None:
+                areas = next(a for a in range(MIN_SITES, self.sites + 1) if self.sites % a == 0)
+            if areas < MIN_SITES or self.sites % areas:
+                raise ValueError(
+                    f"areas must divide the {self.sites} sites and be at least {MIN_SITES}"
+                )
+            self.areas = int(areas)
+            self.area_bytes = self.ranks * self.max_rows * ROW_BYTES
+        else:
+            self.areas = self.sites
+            self.area_bytes = AREA_BYTES
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
         self._kernels = {}
         self._comm = _get_mnnvl_workspace_comm(mapping)
-        size = self.sites * AREA_BYTES
+        size = self.areas * self.area_bytes
         error: Optional[BaseException] = None
         try:
             if not HAS_CUTE_DSL:
@@ -879,10 +1030,17 @@ class DrafterHopWorkspace:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(f"drafter hop variant eps={eps} was not built before graph capture")
         compiled = _compiled_kernel(
-            self.device.index, self.ranks, eps, self.pdl, self.early_trigger, self.direct
+            self.device.index,
+            self.ranks,
+            eps,
+            self.pdl,
+            self.early_trigger,
+            self.direct,
+            self.max_rows,
+            self.timeout_ns,
         )
         dummy = self._uc_base
-        compiled(*([dummy] * 9), 1, self.rank, 8, 0, 0, 1, self._stream())
+        compiled(*([dummy] * 9), 1, self.rank, 8, 0, 0, 1, self.max_rows, self._stream())
         self._kernels[eps] = compiled
         return compiled
 
@@ -890,7 +1048,11 @@ class DrafterHopWorkspace:
         return cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
 
     def _area(self, base: int, site: int) -> int:
-        return base + (site % self.sites) * AREA_BYTES
+        return base + (site % self.areas) * self.area_bytes
+
+    def nbytes(self) -> int:
+        """Fabric memory this rank holds for the transport."""
+        return self.areas * self.area_bytes
 
     def direct_output(self, site: int, rows: int) -> torch.Tensor:
         """This rank's slot of ``site``'s area through the multicast address, ``[rows, HIDDEN]`` BF16.
@@ -899,7 +1061,7 @@ class DrafterHopWorkspace:
         output here (every element once, its final value), and the hop then
         reads it from every rank's receive area.
         """
-        if not self.direct:
+        if not self.direct or self.wide:
             raise RuntimeError("direct_output is only for a direct (poll-only) workspace")
         start = (site % self.sites) * AREA_BYTES + self.rank * SLAB_BYTES
         flat = self._mc.view(torch.bfloat16)
@@ -928,6 +1090,11 @@ class DrafterHopWorkspace:
             )
         compiled = self._kernel(float(eps))
         output = torch.empty_like(residual)
+        # The rows of the previous area its call can have written: any row count before the
+        # first site of a forward (the last forward that ran may not be the last one issued
+        # here: a capture that failed, a graph replayed after eager forwards), else the
+        # previous call's (wide areas only).
+        reset_rows = self.max_rows if site % self.sites == 0 else max(rows, self._last_rows)
         compiled(
             0 if partial is None else partial.data_ptr(),
             residual.data_ptr(),
@@ -944,9 +1111,11 @@ class DrafterHopWorkspace:
             delta.stride(0),
             delta.stride(1),
             0,
+            reset_rows,
             self._stream(),
         )
         self.next_site = (site + 1) % self.sites
+        self._last_rows = rows
         return output
 
 
@@ -957,6 +1126,7 @@ def hop_takes(
     base: torch.Tensor,
     weight: torch.Tensor,
     block_size: int,
+    max_rows: int = MAX_ROWS,
 ) -> bool:
     """Whether the hop computes this call: rows, dtypes, shapes and devices only.
 
@@ -964,7 +1134,7 @@ def hop_takes(
     (``rows`` is the drafter block's row count), which is what lets a caller
     choose between this collective and the built-in all-reduce.
     """
-    if not 1 <= rows <= MAX_ROWS or block_size < 1:
+    if not 1 <= rows <= max_rows or block_size < 1:
         return False
     if any(t.dtype != torch.bfloat16 for t in (residual, delta, base, weight)):
         return False
@@ -1038,11 +1208,11 @@ class DrafterHop(OpWrapper):
         workspace: DrafterHopWorkspace,
     ) -> torch.Tensor:
         rows = residual.shape[0] if residual.dim() == 2 else 0
-        if not hop_takes(rows, residual, delta, base, weight, block_size) or not hop_layout_ok(
-            partial, residual, delta, base, weight
-        ):
+        if not hop_takes(
+            rows, residual, delta, base, weight, block_size, workspace.max_rows
+        ) or not hop_layout_ok(partial, residual, delta, base, weight):
             raise ValueError(
-                "drafter_hop takes BF16 [1..8, 8192] partial / residual, [rows, 2, 512] "
+                f"drafter_hop takes BF16 [1..{workspace.max_rows}, 8192] partial / residual, [rows, 2, 512] "
                 "coefficients with unit inner stride, a contiguous [2, 8192] base kernel and an "
                 "8192 weight, 16-byte aligned"
             )

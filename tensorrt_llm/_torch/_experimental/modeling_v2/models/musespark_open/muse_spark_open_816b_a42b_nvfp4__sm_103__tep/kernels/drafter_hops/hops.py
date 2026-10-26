@@ -18,6 +18,11 @@ The site order (``2 * layer`` after ``o_proj``, ``2 * layer + 1`` after
 ``down_proj``) is the same on every rank and every forward; a forward takes
 the fused hops at all its sites or at none, decided on the block's row count
 (``DrafterHopCall.takes``), which every rank shares.
+
+With ``wide_drafter_hops`` (``install_wide``) a forward of ``MAX_ROWS + 1`` ..
+``wide_served_rows()`` rows (the blocks of several requests at K = 7, per device in
+``WIDE_SERVED_ROWS_BY_SM``) takes the same hops on a second, wide workspace; a forward of at
+most ``MAX_ROWS`` rows keeps the first one.
 """
 
 from __future__ import annotations
@@ -46,18 +51,29 @@ class DrafterHopCall:
 
     def __init__(self, workspace: "_hop.DrafterHopWorkspace") -> None:
         self.workspace = workspace
+        #: The wide workspace (``wide_drafter_hops``), or None.
+        self.wide: Optional["_hop.DrafterHopWorkspace"] = None
+        #: The workspace of the forward ``takes`` admitted last.
+        self.active = workspace
         #: Hops issued by this rank (a test counts them to see a forward took the fused path).
         self.calls = 0
 
     def takes(self, rows: int, block_size: int, dtype: torch.dtype) -> bool:
-        """Whether a forward of ``rows`` rows runs every site on the fused hop. Rank-uniform."""
-        if dtype != torch.bfloat16 or not 1 <= rows <= _hop.MAX_ROWS or block_size < 1:
+        """Whether a forward of ``rows`` rows runs every site on the fused hop, and on which
+        workspace. Rank-uniform."""
+        if dtype != torch.bfloat16 or block_size < 1 or rows < 1:
             return False
-        return True
+        if rows <= _hop.MAX_ROWS:
+            self.active = self.workspace
+            return True
+        if self.wide is not None and rows <= self.wide.max_rows:
+            self.active = self.wide
+            return True
+        return False
 
     def begin_forward(self) -> None:
         """A drafter forward starts; its hops name the sites from 0 (see the workspace's)."""
-        self.workspace.begin_forward()
+        self.active.begin_forward()
 
     def _site(self, site, partial, residual, coefficients, conv, norm, block_size):
         # ``coefficients`` is what ``prepare`` returned for ``finish``: [rows, taps, groups].
@@ -80,7 +96,7 @@ class DrafterHopCall:
             norm.weight,
             norm.variance_epsilon,
             block_size,
-            self.workspace,
+            self.active,
         )
 
     def attention(
@@ -353,3 +369,42 @@ def install(draft_model: Optional[nn.Module], mapping=None) -> None:
     draft_model._drafter_hop = DrafterHopCall(workspace)
     _hop.log_once_enabled(2 * len(layers), False, early)
     logger.info("[musespark_open] drafter_hops: fused drafter hops installed")
+
+
+def install_wide(draft_model: Optional[nn.Module], mapping=None) -> None:
+    """``wide_drafter_hops``: the fused hops also on drafter forwards of ``MAX_ROWS + 1`` ..
+    ``wide_served_rows()`` rows of this device, on a wide workspace of their own. Collective;
+    after ``install``.
+
+    The calls the wide hops replace are the same three kernels per site as at 8 rows (the
+    MNNVL one-shot all-reduce ``request_mnnvl`` gave every row projection on one tray, the
+    finish convolution, flashinfer's fused add + RMSNorm); the hop reproduces them per row,
+    and the tap-1 mask per block (``row % block``). Idempotent.
+
+    Raises:
+        ValueError: when ``drafter_hops`` is not installed on this drafter.
+    """
+    if not installed(draft_model):
+        raise ValueError("[musespark_open] wide_drafter_hops needs drafter_hops installed first")
+    call: DrafterHopCall = draft_model._drafter_hop
+    if call.wide is not None:
+        return
+    narrow = call.workspace
+    layers = draft_model.model.layers
+    norms = [layer.post_attention_layernorm for layer in layers]
+    norms += [layer.input_layernorm for layer in layers[1:]] + [draft_model.model.norm]
+    eps = sorted({float(norm.variance_epsilon) for norm in norms})
+    rows = _hop.wide_served_rows()
+    call.wide = _hop.DrafterHopWorkspace(
+        layers[0].self_attn.o_proj.mapping,
+        sites=narrow.sites,
+        eps=eps,
+        early_trigger=narrow.early_trigger,
+        pre_wait=[tensor for _, tensor in pre_wait_operands(draft_model)],
+        max_rows=rows,
+    )
+    logger.info(
+        f"[musespark_open] wide_drafter_hops: fused drafter hops on forwards of {_hop.MAX_ROWS + 1}.."
+        f"{rows} rows ({call.wide.areas} areas, "
+        f"{call.wide.nbytes() / 2**20:.1f} MiB of fabric memory on this rank)"
+    )
