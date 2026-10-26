@@ -404,12 +404,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
                 f"{self.indexer_kv_dtype!r}."
             )
-        from .kernels import msa_v1_indexer
-
-        # TRTLLM_M3_MSA_V1_INDEXER adds an NVFP4 mirror of the E4M3 index-K to each
-        # INDEX_KEY page for the MSA-v1 q8kv4 decode indexer (see msa_v1_indexer).
-        self.index_k_nvfp4_mirror = self.indexer_kv_dtype == "fp8" and msa_v1_indexer.is_enabled()
-        self._index_k_nvfp4: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         super().__init__(*args, **kwargs)
         self._unchanged_copies: dict[int, _UnchangedCopy] = {}
 
@@ -451,25 +445,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         for layer_idx in self.sparse_layer_ids:
             if layer_idx not in self.layer_offsets:
                 continue
-            if self.index_k_nvfp4_mirror:
-                raw = super().get_index_k_buffer(
-                    layer_idx,
-                    num_heads=1,
-                    head_dim=msa_v1_indexer.MIRRORED_BYTES_PER_TOKEN,
-                    dtype=torch.uint8,
-                    kv_layout=kv_layout,
-                )
-                fp8_view, data_view, scale_view = msa_v1_indexer.split_mirrored_index_k(raw)
-                self._index_k_buffers[layer_idx] = fp8_view
-                self._index_k_nvfp4[layer_idx] = (data_view, scale_view)
-            else:
-                self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
-                    layer_idx,
-                    num_heads=1,
-                    head_dim=self.sparse_index_dim,
-                    dtype=torch_dtype,
-                    kv_layout=kv_layout,
-                )
+            self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
+                layer_idx,
+                num_heads=1,
+                head_dim=self.sparse_index_dim,
+                dtype=torch_dtype,
+                kv_layout=kv_layout,
+            )
             if layer_idx not in self.disable_index_value_layer_ids:
                 self._index_v_buffers[layer_idx] = torch.zeros(
                     (num_total_slots, 1, self.sparse_index_dim),
@@ -524,10 +506,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if data_role == Role.INDEX_KEY:
             if not has_index_k:
                 return 0
-            if self.index_k_nvfp4_mirror:
-                from .kernels.msa_v1_indexer import MIRRORED_BYTES_PER_TOKEN
-
-                return MIRRORED_BYTES_PER_TOKEN
             index_dtype = self._torch_dtype_for_index_cache()
             index_elem_bytes = torch.empty(0, dtype=index_dtype, device="cpu").element_size()
             return self.sparse_index_dim * index_elem_bytes
@@ -785,13 +763,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         read tensors, without entering the C++ pool-address accessors.
         """
         return self._index_k_buffers.get(layer_idx)
-
-    def get_index_k_nvfp4_buffers(
-        self, layer_idx: int
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Return the NVFP4 index-K mirror (data [pages, 128, 64] uint8, scales [pages, 128, 8]
-        E4M3) of a sparse layer, or None when TRTLLM_M3_MSA_V1_INDEXER is off."""
-        return self._index_k_nvfp4.get(layer_idx)
 
     def get_index_v_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:
         """Plain-tensor index-V cache for non-disabled sparse layers."""
