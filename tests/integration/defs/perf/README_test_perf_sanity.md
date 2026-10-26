@@ -626,17 +626,22 @@ Each disagg test line in the test-db file follows one of these formats:
 
 ```yaml
 # gen_only test:
-- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-{config_base_name}] TIMEOUT (120)
+- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-{config_base_name}] TIMEOUT ({minutes})
 
 # e2e test:
-- perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{config_base_name}] TIMEOUT (120)
+- perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{config_base_name}] TIMEOUT ({minutes})
 
 # ctx_only test (placed in aggregated test-db files, not disagg ones):
-- perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-{config_base_name}] TIMEOUT (120)
+- perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-{config_base_name}] TIMEOUT ({minutes})
 ```
 
 - If the test line already exists but is **commented out** (prefixed with `# `), remove the `# ` prefix.
 - If the test line does not exist, add it to the `tests` list.
+- Set `TIMEOUT` from the case's measured runtime: the slowest passing run plus 25%
+  (at least 15 minutes), rounded up to a multiple of 5 and no lower than 30 minutes.
+  Take the slowest run from CI (`l_e2e_time_ms` in the `test_info` index) or, for a new
+  case, from its validation run. A fixed large value hides a hang for hours, and the
+  sbatch session also has to hold the install and launch.
 - Count the total number of **active (uncommented) tests** in the file — you will need this count for Step 5.
 
 ### Step 5: Update `jenkins/L0_Test.groovy`
@@ -678,7 +683,7 @@ Checking the existing `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_c
 2. From config: `gpus_per_node=4`, `ctx_tp=1`, `gen_tp=4`, `num_ctx=1`, `num_gen=1`
 3. Nodes per ctx = `ceil(1/4)=1`, nodes per gen = `ceil(4/4)=1`, total nodes = 2, total GPUs = 8
 4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
-5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (90)`; do not add a duplicate. Uncomment it only if it has been disabled.
+5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (30)`; do not add a duplicate. Uncomment it only if it has been disabled.
 6. Recount the active tests after any edits.
 7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `testCount` to that count, preserving it if unchanged.
 8. Check `waives.txt` for the exact test ID before enabling the test.

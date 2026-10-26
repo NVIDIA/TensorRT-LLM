@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, CuteDslFusedMoE, CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
     SimpleActivation,
@@ -35,7 +35,19 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     activation_constant_names,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    cutedsl_grouped_gemm_leaf,
+    find_cutedsl_grouped_gemm_leaf,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+    cutlass_leaf,
+    cutlass_leaves_in_resolution_order,
+    find_cutlass_leaf,
+)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import find_marlin_leaf, marlin_leaf
@@ -95,9 +107,15 @@ def get_backend_class(
         # Reuse the family's raising lookup for its message, which lists what
         # *is* registered rather than only naming what is missing.
         raising_lookup = {
+            MoeBackendType.CUTLASS: cutlass_leaf,
             MoeBackendType.TRTLLM: trtllm_gen_leaf,
             MoeBackendType.MARLIN: marlin_leaf,
-        }[backend_type]
+            MoeBackendType.CUTEDSL: cutedsl_grouped_gemm_leaf,
+        }.get(backend_type)
+        if raising_lookup is None:
+            raise ValueError(
+                f"{backend_type.value} has no implementation serving quant_algo={quant_algo} here"
+            )
         return raising_lookup(quant_algo)
     return backend_class
 
@@ -107,34 +125,50 @@ def find_backend_class(
 ) -> type[MoE] | None:
     """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
-    ``TRTLLM`` and ``MARLIN`` are not one class each but sets of leaves keyed by
-    quant (and, for TRTLLM-Gen, provider), so both need ``quant_algo``.
+    ``CUTLASS``, ``TRTLLM``, ``MARLIN``, ``CUTEDSL`` and ``CUTE_DSL_B12X`` are
+    not one class each but sets of leaves keyed by quant (and, for TRTLLM-Gen,
+    provider), so each needs ``quant_algo``. CUTLASS publishes
+    ``fp8_block_scales`` twice, once per SM family, so for that format the leaf
+    is the one this device runs.
     TRTLLM-Gen prefers the native leaf for that format and falls back to the
     FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
     unquantized format: bf16 has no native leaf, only
     ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
     exists and wins, so only bf16 tests are exercising a FlashInfer class.
-    Marlin has a single provider, so its lookup is keyed by quant alone.
 
     Absence is returned rather than raised so that a parameter generator can
     tell it apart from a real failure: catching the exception instead would let
     a leaf that got unregistered read as a combination nobody meant to run, and
     the sweep would go green by shrinking.
     """
+    if backend_type is MoeBackendType.CUTLASS:
+        return find_cutlass_leaf(quant_algo)
     if backend_type is MoeBackendType.TRTLLM:
         return find_trtllm_gen_leaf(quant_algo)
     if backend_type is MoeBackendType.MARLIN:
         return find_marlin_leaf(quant_algo)
+    if backend_type is MoeBackendType.CUTEDSL:
+        return find_cutedsl_grouped_gemm_leaf(quant_algo)
+    if backend_type is MoeBackendType.CUTE_DSL_B12X:
+        # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
+        # W4A16_NVFP4 never leaves the b12x kernel. Compared after
+        # canonical_quant, as the leaves' can_implement sees the format.
+        quant = canonical_quant(quant_algo)
+        return next(
+            (
+                leaf
+                for leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE)
+                if canonical_quant(leaf.b12x_quant_algo) == quant
+            ),
+            None,
+        )
 
     backend_class_map = {
-        MoeBackendType.CUTLASS: CutlassFusedMoE,
-        MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
         MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
-        MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -151,10 +185,14 @@ def find_backend_classes(
     absent. A caller asking whether a case is *supported* has to ask the same
     way, or it skips cases the layer under test goes on to serve.
 
+    For CUTLASS ``fp8_block_scales`` these are the SM90 and SM120 leaves.
+
     :func:`find_backend_class` stays for callers that want to name one class.
     """
     if backend_type is MoeBackendType.TRTLLM:
         return trtllm_gen_leaves_in_resolution_order(quant_algo)
+    if backend_type is MoeBackendType.CUTLASS:
+        return cutlass_leaves_in_resolution_order(quant_algo)
     cls = find_backend_class(backend_type, quant_algo)
     return () if cls is None else (cls,)
 
@@ -1302,12 +1340,11 @@ def get_quick_skip_reason(
         # under test goes on to serve.
         candidates = find_backend_classes(backend_type, quant_algo)
         if not candidates:
-            # No leaf publishes this (provider, quant) pair, which is the same
-            # verdict the single TRTLLM-Gen ``can_implement`` used to return as
-            # QUANT_UNSUPPORTED. Asked as a query, so any other failure in the
-            # lookup still raises instead of being reported as a skip.
+            # No leaf of this family publishes the format. Asked as a query,
+            # so any other failure in the lookup still raises instead of being
+            # reported as a skip.
             quant = normalize_quant(canonical_quant(quant_algo))
-            return f"no TRTLLM-Gen implementation for quant={quant}"
+            return f"no {backend_type.value} implementation for quant={quant}"
         is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
         # Eligibility reads *which* constants an activation carries, not just
         # its kind: a backend declaring ``limit=UNSUPPORTED`` serves unclamped

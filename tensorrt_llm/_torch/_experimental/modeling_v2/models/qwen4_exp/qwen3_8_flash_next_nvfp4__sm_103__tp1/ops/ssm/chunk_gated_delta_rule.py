@@ -27,10 +27,9 @@ from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as _chu
 
 #: This checkpoint's Gated DeltaNet geometry at tp1.
 NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM = 16, 48, 128, 128
-#: Largest slot count the cache manager was seen to allocate the recurrent pool
-#: at for this checkpoint (10, 35, 366, 368, 396, 399, 432, 461 over twelve
-#: runtime-value dumps; the batch never above 32). The target passes the
-#: layer's whole pool unsliced.
+#: A recurrent-pool slot count of a full-size engine run. The kernels address a slot by
+#: its index alone, so a pool of another size (a bf16 pool holds more slots in the same
+#: memory) takes the same path. The target passes the layer's whole pool unsliced.
 ENGINE_SLOTS = 461
 
 
@@ -74,75 +73,24 @@ class ChunkGatedDeltaRule(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: seqlens (packed with cu_seqlens) or batch/num_tokens (no
-    # cu_seqlens); initial: "indexed" (a `slots`-row pool, `indices` or arange)
-    # | "positional" | None; output: None | "buffer" | "window" (wide[:, 50:146]
-    # of a 200-token buffer); output_final_state; scale; normalize_qk (False
-    # with l2norm feeds raw q/k).
+    # spec: seqlens (packed with cu_seqlens); the initial state is the
+    # `ENGINE_SLOTS`-row pool at `indices`, written in place; pool_dtype (fp32 |
+    # bf16); output: None | "buffer" (a fresh `output=` tensor).
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"target prefill call, 461-slot pool, seqlens {list(s)}",
-                spec=dict(
-                    seqlens=s, initial="indexed", slots=ENGINE_SLOTS, indices=_engine_slots(len(s))
-                ),
-            )
-            for s in ((1,), (64,), (200, 37, 91), (1024,))
-        )
-        + (
-            Cell(
-                why="461-slot pool, output= buffer (the stock mixer's call)",
-                spec=dict(
-                    seqlens=(200, 37, 91),
-                    initial="indexed",
-                    slots=ENGINE_SLOTS,
-                    indices=_engine_slots(3),
-                    output="buffer",
-                ),
+        Cell(
+            why="fp32 pool (a verify step's context rows), 461 slots, output= buffer",
+            spec=dict(seqlens=(200, 37, 91), indices=_engine_slots(3), output="buffer"),
+        ),
+        Cell(
+            why="bf16 pool, 461-slot pool, seqlens [1024]",
+            spec=dict(seqlens=(1024,), indices=_engine_slots(1), pool_dtype=torch.bfloat16),
+        ),
+        Cell(
+            why="bf16 pool, mixed step: a context and four 1-token rows [200, 1, 1, 1, 1]",
+            spec=dict(
+                seqlens=(200, 1, 1, 1, 1), indices=_engine_slots(5), pool_dtype=torch.bfloat16
             ),
-        )
-        + tuple(
-            Cell(
-                why=f"indexed, seqlens {list(s)}, {len(s) + 3}-slot pool, output= buffer",
-                spec=dict(seqlens=s, initial="indexed", slots=len(s) + 3, output="buffer"),
-            )
-            for s in ((1,), (8,), (64,), (137,), (128, 64), (200, 37, 91), (8, 8, 8), (1024,))
-        )
-        + tuple(
-            Cell(
-                why=f"positional initial state, final state out, {list(s)}",
-                spec=dict(seqlens=s, initial="positional", output_final_state=True),
-            )
-            for s in ((96, 48), (333,))
-        )
-        + (
-            Cell(
-                why="initial_state None: zero start",
-                spec=dict(seqlens=(77,), initial=None, output_final_state=True),
-            ),
-            Cell(
-                why="use_qk_l2norm_in_kernel on raw q/k",
-                spec=dict(
-                    seqlens=(100,),
-                    initial=None,
-                    output_final_state=True,
-                    l2norm=True,
-                    normalize_qk=False,
-                ),
-            ),
-            Cell(
-                why="no cu_seqlens: two equal-length rows",
-                spec=dict(batch=2, num_tokens=96, initial="positional", output_final_state=True),
-            ),
-            Cell(
-                why="explicit scale 0.05 replaces the default",
-                spec=dict(seqlens=(80,), initial=None, scale=0.05),
-            ),
-            Cell(
-                why="output= a token-window slice of a wider buffer",
-                spec=dict(seqlens=(96,), initial="positional", output="window"),
-            ),
-        )
+        ),
     )
 
     note = """
@@ -150,17 +98,23 @@ class ChunkGatedDeltaRule(OpWrapper):
 
     Call site (`_gdn_block`): `(q, k, v, g, beta, None, ssm_states, si_all,
     True, False, qsl_long, False, None)` after `fused_gdn_post_conv` (q/k
-    already normalized) -- the layer's whole fp32 pool `[slots, 48, 128, 128]`,
-    int32 slots, int64 `cu_seqlens`; the MTP-verify context half passes the
-    `si_p` / `qsl_long_p` prefixes. Certified at small pools and at 461 slots;
-    at 461 output and state are bitwise identical to a 6-slot pool with the
-    same slot content.
+    already normalized) -- the layer's whole pool `[slots, 48, 128, 128]`, fp32
+    or bf16 as `mamba_ssm_cache_dtype` allocated it, int32 slots, int64
+    `cu_seqlens`; the MTP-verify context half passes the `si_p` / `qsl_long_p`
+    prefixes, and a mixed batch's one-token decode rows ride in the same call.
+    Certified at 461 slots: three ragged context rows over an fp32 pool into
+    an `output=` buffer, one 1024-token sequence over a bf16 pool, and a
+    mixed step (a context and four one-token rows) over a bf16 pool.
+
+    Over a bf16 pool the initial state is read as fp32 and the final state is stored
+    rounded once to bf16, once per call and sequence; the accumulation is unchanged.
 
     The first indexed in-place call for an autotune key in a process is as correct as a
     warm one: the state kernel's autotuner snapshots and restores the indexed state slots
-    its benchmark launches write (`chunk_delta_h.py`, `_save_autotune_state`). Certified
-    in a fresh interpreter at this geometry and at 5 / 20 heads. The positional path
-    never aliased its state.
+    its benchmark launches write (`chunk_delta_h.py`, `_save_autotune_state`). The key
+    includes the pool dtype, so a bf16 pool has its own. Certified in a fresh interpreter
+    at this geometry over a bf16 pool (the fp32 pool's key takes the same snapshot and
+    restore). The positional path never aliased its state.
 
     Loud, from the callable: fp32 or mixed-dtype q/k/v, a 2-D `beta`,
     `q.shape[0] != 1` with `cu_seqlens`, a sequence-count mismatch of indices
@@ -170,12 +124,16 @@ class ChunkGatedDeltaRule(OpWrapper):
     by the caller or the in-kernel flag (raw q/k with the flag off return
     finite values ~1e25). `head_first` is pinned False.
 
-    Sequence lengths are unconstrained: 1..1024, off and on the 64 boundary,
-    mixed ragged, all correct. Memory: a `[B, NT, H, K, V]` per-chunk state
-    scratch in `q.dtype`, 24 MiB per 1024 tokens here. Deterministic.
+    Sequence lengths are unconstrained: certified at 1, 37, 91, 200 and 1024,
+    off and on the 64 boundary, mixed ragged. Memory: a `[B, NT, H, K, V]`
+    per-chunk state scratch in `q.dtype`, 24 MiB per 1024 tokens here.
+    Deterministic.
 
-    Not certified: the FlashInfer sibling, fp16 (accepted), bf16 `g`/`beta`/
-    pool, `K = 256` (accepted, unmeasured), empty `T` or zero-length spans.
+    Not certified: the FlashInfer sibling, fp16 (accepted), bf16 `g`/`beta`, an
+    fp16 pool, `K = 256` (accepted, unmeasured), empty `T` or zero-length spans,
+    and what the target never passes: `initial_state=None` or a positional
+    initial state, `output_final_state`, `use_qk_l2norm_in_kernel`, an explicit
+    `scale`, no `cu_seqlens`.
 
     Hard limits
       K  state kernel asserts K <= 256 (read, not probed)
