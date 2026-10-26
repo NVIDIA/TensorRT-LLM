@@ -2459,6 +2459,8 @@ class KVCacheManagerV2(BaseResourceManager):
             mock_localization=os.environ.get("TRT_LLM_MOCK_LOCALIZATION_SUPPORT") == "1",
         )
         self._next_locality_domain = 0
+        # Live KV caches per locality domain, the load that prefix-aware placement balances against.
+        self._locality_domain_load = [0] * self.num_locality_domains
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
@@ -4633,15 +4635,33 @@ class KVCacheManagerV2(BaseResourceManager):
         value = getattr(getattr(self, "impl", None), "num_locality_domains", 1)
         return value if isinstance(value, int) else 1
 
-    def pick_locality_domain(self, request_id: int) -> int | None:
-        """Default locality domain placement for newly-created requests.
+    def pick_locality_domain(
+        self,
+        request_id: int,
+        input_tokens: Sequence[int] | None = None,
+        lora_task_id: int | None = None,
+        cache_salt: str | None = None,
+    ) -> int | None:
+        """Locality domain placement for a newly-created request.
 
-        Round-robin over arrival order. Request ids are not used: ids that
-        advance in even steps (a parent and its child per request, or
-        round-robin disagg ids) would otherwise pin every request to one domain.
+        Prefixes are reused only within a domain, so a request goes to the domain
+        holding the longest cached prefix of its prompt when that match covers at
+        least one block and the domain is not already carrying clearly more live
+        requests than the others. Otherwise placement is round-robin over arrival
+        order. Request ids are not used: ids that advance in even steps (a parent
+        and its child per request, or round-robin disagg ids) would otherwise pin
+        every request to one domain.
         """
         if self.num_locality_domains <= 1:
             return None
+        if input_tokens is not None and self.enable_block_reuse:
+            matches = self._prefix_match_per_domain(input_tokens, lora_task_id, cache_salt)
+            best = max(range(self.num_locality_domains), key=matches.__getitem__)
+            load = self._locality_domain_load
+            if matches[best] >= self.tokens_per_block and load[best] - min(load) <= max(
+                8, sum(load) // 4
+            ):
+                return best
         locality_domain_id = self._next_locality_domain
         self._next_locality_domain = (locality_domain_id + 1) % self.num_locality_domains
         return locality_domain_id
@@ -7278,6 +7298,8 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.discard_pending_stats()
         if self._sharing is not None:
             self._sharing._on_free(request_id, kv_cache)
+        if self.num_locality_domains > 1:
+            self._locality_domain_load[kv_cache.locality_domain_id] -= 1
         kv_cache.close()
         self.impl.clear_stats_excluded(request_id)
         if request_id in self._early_freed_index_requests:
@@ -8427,6 +8449,8 @@ class KVCacheManagerV2(BaseResourceManager):
             **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
+        if locality_domain_id is not None:
+            self._locality_domain_load[locality_domain_id] += 1
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)
         if is_dummy:
@@ -8455,21 +8479,30 @@ class KVCacheManagerV2(BaseResourceManager):
             return 0
         if len(input_tokens) == 0:
             return 0
+        # The router has no request yet, so no domain: blocks are keyed per
+        # domain and placement sends the request to the best-matching one.
+        return max(self._prefix_match_per_domain(input_tokens, lora_task_id, cache_salt))
+
+    def _prefix_match_per_domain(
+        self, input_tokens, lora_task_id=None, cache_salt=None
+    ) -> list[int]:
+        """Cached prefix length of *input_tokens* in each locality domain (one entry if not localized)."""
+        if not self.enable_block_reuse or len(input_tokens) == 0:
+            return [0] * max(1, self.num_locality_domains)
         reuse_salt = self._derive_reuse_salt(cache_salt)
         if self.num_locality_domains <= 1:
-            return self.impl.probe_reuse(
-                ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
-                input_tokens,
-            )
-        # The router has no request yet, so no domain: blocks are keyed per
-        # domain and the request may land in any of them.
-        return max(
+            return [
+                self.impl.probe_reuse(
+                    ReuseScope(lora_id=lora_task_id, salt=reuse_salt), input_tokens
+                )
+            ]
+        return [
             self.impl.probe_reuse(
                 ReuseScope(lora_id=lora_task_id, salt=reuse_salt, locality_domain_id=domain),
                 input_tokens,
             )
             for domain in range(self.num_locality_domains)
-        )
+        ]
 
     def probe_first_new_block_key(self, req: LlmRequest) -> bytes | None:
         """Key of the first block whose pages *req* would commit, or None.

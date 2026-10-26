@@ -124,6 +124,9 @@ def _bare_wrapper(impl) -> KVCacheManagerV2:
     wrapper.enable_block_reuse = True
     wrapper.can_evict = True
     wrapper.kv_cache_map = {}
+    wrapper.tokens_per_block = impl.tokens_per_block
+    wrapper._next_locality_domain = 0
+    wrapper._locality_domain_load = [0, 0]
     return wrapper
 
 
@@ -166,6 +169,12 @@ class TestWrapperScopesCarryTheDomain(unittest.TestCase):
     def test_probe_first_new_block_key_uses_the_domain(self) -> None:
         self.wrapper.probe_first_new_block_key(_request(3, 1))
         self.assertEqual([s.locality_domain_id for s in self.impl.scopes], [1])
+
+    def test_placement_sends_a_request_to_the_domain_holding_its_prefix(self) -> None:
+        # Round-robin would start at domain 0, so place another request first to move it to 1.
+        self.assertEqual(self.wrapper.pick_locality_domain(1), 0)
+        self.assertEqual(self.wrapper.pick_locality_domain(2, self.tokens), 0)
+        self.assertEqual(self.wrapper.pick_locality_domain(3, [10**6 + t for t in self.tokens]), 1)
 
     def test_prefetch_builds_a_domain_scope(self) -> None:
         self.wrapper.prefetch_for_context_tokens([_request(4, 1), _request(5, 0)])
