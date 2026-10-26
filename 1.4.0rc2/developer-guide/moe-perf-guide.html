@@ -1,0 +1,1547 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>MoE Performance Guide &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+
+
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/moe-perf-guide';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="MoE Perf Dashboard" href="moe-perf-dashboard.html" />
+    <link rel="prev" title="TensorRT LLM Benchmarking" href="perf-benchmarking.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.4.0rc2" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 current active has-children"><a aria-current="page" class="current reference internal" href="#">MoE Performance Guide</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="telemetry.html">Telemetry</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">MoE Performance Guide</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="moe-performance-guide">
+<span id="moe-perf-guide"></span><h1>MoE Performance Guide<a class="headerlink" href="#moe-performance-guide" title="Link to this heading">#</a></h1>
+<section id="moe-architecture">
+<h2>MoE Architecture<a class="headerlink" href="#moe-architecture" title="Link to this heading">#</a></h2>
+<p>An MoE module contains <code class="docutils literal notranslate"><span class="pre">num_experts</span></code> experts and a router that selects <code class="docutils literal notranslate"><span class="pre">top_k</span></code> of them for each token. To accelerate LLM execution, a multi-GPU deployment usually partitions these experts across ranks, which makes each rank hold only part of them. The module therefore additionally pays for a <strong>dispatch</strong> (send each token to the rank that owns its target expert) and a <strong>combine</strong> (bring the results back).</p>
+<p>The consequence is that MoE execution time is usually <em>not</em> decided by the expert GEMM alone, but by the combination of <strong>how the experts are partitioned</strong>, <strong>how the tokens are exchanged</strong>, and <strong>which kernel implementation runs the GEMM</strong>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>                    <span class="n">hidden</span> <span class="n">states</span>
+                          <span class="o">|</span>
+                <span class="o">+-------------------+</span>
+                <span class="o">|</span>   <span class="n">Router</span> <span class="p">(</span><span class="n">top_k</span><span class="p">)</span>  <span class="o">|</span>
+                <span class="o">+-------------------+</span>
+                          <span class="o">|</span>
+                <span class="o">+-------------------+</span>
+                <span class="o">|</span>     <span class="n">Dispatch</span>      <span class="o">|</span> <span class="o">&lt;---</span> <span class="n">Communication</span>
+                <span class="o">+-------------------+</span>
+                          <span class="o">|</span>
+                <span class="o">+-------------------+</span>
+                <span class="o">|</span>    <span class="n">Expert</span> <span class="n">GEMM</span>    <span class="o">|</span> <span class="o">&lt;---</span> <span class="n">Backend</span>
+                <span class="o">+-------------------+</span>
+                          <span class="o">|</span>
+                <span class="o">+-------------------+</span>
+                <span class="o">|</span>      <span class="n">Combine</span>      <span class="o">|</span> <span class="o">&lt;---</span> <span class="n">Communication</span>
+                <span class="o">+-------------------+</span>
+                          <span class="o">|</span>
+                        <span class="n">output</span>
+
+     <span class="n">Parallelism</span> <span class="n">decides</span> <span class="n">which</span> <span class="n">experts</span> <span class="n">each</span> <span class="n">rank</span> <span class="n">owns</span><span class="p">,</span>
+     <span class="ow">and</span> <span class="n">therefore</span> <span class="n">how</span> <span class="n">much</span> <span class="n">there</span> <span class="ow">is</span> <span class="n">to</span> <span class="n">dispatch</span> <span class="ow">and</span> <span class="n">to</span> <span class="n">compute</span><span class="o">.</span>
+</pre></div>
+</div>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Option</p></th>
+<th class="head"><p>What it controls</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Parallelism</strong></p></td>
+<td><p>How experts are sharded across GPUs: EP (expert parallelism, split by expert) vs TP (tensor parallelism, split inside every expert).</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Communication</strong></p></td>
+<td><p>Which path implements dispatch / combine.</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Backend</strong></p></td>
+<td><p>Which kernel implementation runs the expert GEMM. Each one supports a different set of quantization formats and GPU architectures.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The three can be combined in many ways, and no single combination is always the best one. The right choice changes with the world size and with the number of tokens in flight, which is why prefill and decode of the same deployment often need different answers. It also changes with the quantization format, with the GPU architecture, and with whether expert parallelism stays inside one NVLink domain. The large number of options, together with the many factors they depend on, makes it difficult to find the best MoE configuration for a given deployment.</p>
+<p>This guide aims to help you reach a high level of MoE performance in practice. It first gives a recommended configuration for a given platform, model, quantization, world size and workload. If you want to push the performance of a specific workload further, it then shows how to benchmark it yourself. Finally, it introduces the advanced techniques that are available when the recommended configuration is not enough.</p>
+<section id="configuration-options">
+<h3>Configuration Options<a class="headerlink" href="#configuration-options" title="Link to this heading">#</a></h3>
+<section id="parallelism">
+<h4>Parallelism<a class="headerlink" href="#parallelism" title="Link to this heading">#</a></h4>
+<p>The parallelism scheme determines the communication volume and the computation each GPU performs, and therefore the execution efficiency of the MoE module. It also depends on how the attention module is parallelized, and that in turn is decided by whether the deployment targets low latency or high throughput.</p>
+<p>The parallelism scheme of MoE is expressed as a combination of <code class="docutils literal notranslate"><span class="pre">moe_ep_size</span></code> (experts partitioned across ranks) and <code class="docutils literal notranslate"><span class="pre">moe_tp_size</span></code> (every rank holds a shard of every expert), with <code class="docutils literal notranslate"><span class="pre">moe_ep_size</span> <span class="pre">*</span> <span class="pre">moe_tp_size</span> <span class="pre">=</span> <span class="pre">world_size</span></code>.</p>
+<p>The equations and recommendations in this guide assume <code class="docutils literal notranslate"><span class="pre">pp_size</span> <span class="pre">=</span> <span class="pre">1</span></code> and <code class="docutils literal notranslate"><span class="pre">cp_size</span> <span class="pre">=</span> <span class="pre">1</span></code>. Pipeline-parallel deployments are not covered; they must use the stage-local MoE group size instead of deployment-wide <code class="docutils literal notranslate"><span class="pre">world_size</span></code>.</p>
+<p><img alt="Expert parallel vs tensor parallel vs hybrid, 4 experts on 4 ranks" src="../_images/moe-parallelism.png" /></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Scheme</p></th>
+<th class="head"><p>Token-expert assignments per rank (balanced routing)</p></th>
+<th class="head"><p>Per-rank GEMM <code class="docutils literal notranslate"><span class="pre">N</span></code></p></th>
+<th class="head"><p>Communication</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Expert Parallelism (EP)</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">*</span> <span class="pre">top_k</span> <span class="pre">/</span> <span class="pre">ep_size</span></code></p></td>
+<td><p>full <code class="docutils literal notranslate"><span class="pre">intermediate_size</span></code></p></td>
+<td><p>dispatch + combine of activations</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Tensor Parallelism (TP)</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">*</span> <span class="pre">top_k</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">intermediate_size</span> <span class="pre">/</span> <span class="pre">tp_size</span></code></p></td>
+<td><p>AllReduce of outputs, no cross-rank dispatch</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>hybrid (EP+TP)</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">*</span> <span class="pre">top_k</span> <span class="pre">/</span> <span class="pre">ep_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">intermediate_size</span> <span class="pre">/</span> <span class="pre">tp_size</span></code></p></td>
+<td><p>both, at reduced scale each</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Here, <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> counts unique input tokens globally across the MoE parallel group, without counting TP replicas. Each token contributes <code class="docutils literal notranslate"><span class="pre">top_k</span></code> token-expert assignments. The table sums these assignments over all experts on a rank, and an individual expert’s average GEMM <code class="docutils literal notranslate"><span class="pre">M</span></code> is <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">*</span> <span class="pre">top_k</span> <span class="pre">/</span> <span class="pre">num_experts</span></code> under balanced routing.</p>
+<p>EP keeps each rank’s GEMM full-width and does redundant work on no token, but pays the routing exchange and becomes load-sensitive when the router is skewed. TP still performs router/top-k selection, but needs no cross-rank token dispatch. It stays efficient when there are too few tokens to fill an EP dispatch, although every rank redundantly reads every token and each expert’s GEMM gets narrower as <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> grows.</p>
+<p>The scheme is notated together with the attention parallelism:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Notation</p></th>
+<th class="head"><p>Attention</p></th>
+<th class="head"><p>MoE</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DEP</span></code></p></td>
+<td><p>DP</p></td>
+<td><p>expert parallelism</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TEP</span></code></p></td>
+<td><p>TP</p></td>
+<td><p>expert parallelism</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DTP</span></code></p></td>
+<td><p>DP</p></td>
+<td><p>tensor parallelism</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TTP&lt;k&gt;EP&lt;m&gt;</span></code></p></td>
+<td><p>TP</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">moe_tp_size=k</span></code>, <code class="docutils literal notranslate"><span class="pre">moe_ep_size=m</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="communication">
+<h4>Communication<a class="headerlink" href="#communication" title="Link to this heading">#</a></h4>
+<p>Under expert parallel every rank holds only part of the experts, so a token whose target expert lives elsewhere has to be dispatched there. Each MoE forward therefore sends every token to the ranks owning its <code class="docutils literal notranslate"><span class="pre">top_k</span></code> experts and brings the partial results back. These are the <em>Dispatch</em> and <em>Combine</em> in the diagram above.</p>
+<p>TensorRT-LLM provides several implementations of this exchange. They differ in the physical link (NVLink inside a domain, or the network across it), how the data is moved (one-sided writes into the peer’s memory, or a two-sided handshake), and whether tokens are routed at all. The best communication choice varies with specific workload and deployment environment.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Strategy</p></th>
+<th class="head"><p>Mechanism</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NVLINK_ONE_SIDED</span></code></p></td>
+<td><p>One-sided writes into a symmetric MNNVL workspace</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NVLINK_TWO_SIDED</span></code></p></td>
+<td><p>Two-sided alltoall over MNNVL</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DEEPEP</span></code></p></td>
+<td><p>DeepEP normal-mode kernels over the network</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DEEPEPLOWLATENCY</span></code></p></td>
+<td><p>DeepEP low-latency kernels over the network</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NCCL_EP</span></code></p></td>
+<td><p>NCCL-EP 0.2 low-latency rank-major exchange, BF16, FP8 QDQ, or NVFP4 dispatch</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ALLGATHER</span></code></p></td>
+<td><p>AllGather the tokens, ReduceScatter the outputs</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<div><p>The <code class="docutils literal notranslate"><span class="pre">MEGAMOE</span></code> backends fuse dispatch and combine into the expert GEMM kernel over a symmetric memory heap, writing straight into a peer’s buffer with no host-side exchange, which forces the communication to <code class="docutils literal notranslate"><span class="pre">NONE</span></code>.</p>
+</div></blockquote>
+<section id="how-to-assign-a-communication-strategy">
+<h5>How to assign a communication strategy?<a class="headerlink" href="#how-to-assign-a-communication-strategy" title="Link to this heading">#</a></h5>
+<p>By default TensorRT-LLM picks the strategy itself (<code class="docutils literal notranslate"><span class="pre">AUTO</span></code>). The choice is made from the maximum shapes rather than the live token count.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Default selection (`AUTO`)
+│
+├─ backend == MEGAMOE_*, or DWDP enabled     → NONE
+│     (the fused path owns the exchange)
+├─ attention TP, or dp_size == 1             → NONE
+│     (nothing to dispatch)
+├─ moe_tp_size != 1                          → ALLGATHER
+│     (an alltoall cannot serve MoE TP)
+├─ TRTLLM_FORCE_COMM_METHOD set              → that method
+│     (forced: no fallback if it fails to initialize)
+│
+└─ else, try in order — keep the first that initializes on this platform
+       │
+       ├─ NVLINK_ONE_SIDED     needs MNNVL, and moe_ep_size == world_size
+       │
+       ├─ num_experts % moe_ep_size != 0     → ALLGATHER
+       │     (candidates below are skipped when not divisible)
+       │
+       ├─ NVLINK_TWO_SIDED     needs MNNVL
+       ├─ NCCL_EP              needs NCCL-EP 0.2+, BF16 activations
+       ├─ DEEPEP               needs BF16 activations
+       ├─ DEEPEPLOWLATENCY     needs BF16 activations, top_k &lt;= 16
+       │
+       └─ ALLGATHER            final fallback
+</pre></div>
+</div>
+<p>To override the default, set <code class="docutils literal notranslate"><span class="pre">TRTLLM_FORCE_COMM_METHOD</span></code> on every rank:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_FORCE_COMM_METHOD</span><span class="o">=</span>DEEPEPLOWLATENCY<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>trtllm-serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span>--tp_size<span class="w"> </span><span class="m">16</span><span class="w"> </span>--ep_size<span class="w"> </span><span class="m">16</span><span class="w"> </span>--enable_attention_dp<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>config.yaml
+</pre></div>
+</div>
+<p>The value must be one of the strategy names in the table above.</p>
+<p>Implementation Notes: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md"><code class="docutils literal notranslate"><span class="pre">MOE_DEVELOPER_GUIDE.md</span></code></a>.</p>
+</section>
+</section>
+<section id="backend">
+<h4>Backend<a class="headerlink" href="#backend" title="Link to this heading">#</a></h4>
+<p>TensorRT-LLM provides many MoE implementations, differing in supported quantization formats, target GPU architecture, and expert-GEMM scheduling. This is the <em>Expert GEMM</em> box in the diagram above.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Backend</p></th>
+<th class="head"><p>GPU arch</p></th>
+<th class="head"><p>Quantization</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>SM80+</p></td>
+<td><p>unquantized, FP8 QDQ, FP8 block-scale, NVFP4, W4A16_NVFP4, W4A8_AWQ, W8A16, MXFP4, MXFP8</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>SM100 / SM103</p></td>
+<td><p>NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 (a separate FlashInfer path)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<td><p>SM100 / SM103 / SM107, SM120 / SM121 (CUTLASS prefill / FlashInfer decode)</p></td>
+<td><p>NVFP4, BF16 (SM107), W4A16_NVFP4 (SM120 / SM121)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL_FC12</span></code></p></td>
+<td><p>SM107</p></td>
+<td><p>NVFP4</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DEEPGEMM</span></code></p></td>
+<td><p>SM100 / SM103 / SM107</p></td>
+<td><p>FP8 block-scale</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DENSEGEMM</span></code></p></td>
+<td><p>SM100 / SM103</p></td>
+<td><p>NVFP4</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code></p></td>
+<td><p>SM100 / SM103 / SM107</p></td>
+<td><p>NVFP4</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MEGAMOE_DEEPGEMM</span></code></p></td>
+<td><p>SM100 / SM103</p></td>
+<td><p>W4A8_MXFP4_MXFP8</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MARLIN</span></code></p></td>
+<td><p>SM89 – SM99</p></td>
+<td><p>NVFP4, W4A16_NVFP4 (BF16 activations)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON</span></code> (Deprecated)</p></td>
+<td><p>SM90 (GPT-OSS)</p></td>
+<td><p>BF16, FP8 QDQ, W4A16_MXFP4, W4A8_MXFP4_FP8</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="how-to-assign-a-backend">
+<h5>How to assign a backend?<a class="headerlink" href="#how-to-assign-a-backend" title="Link to this heading">#</a></h5>
+<p>Set <code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code> in the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> config yaml:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span><span class="w">          </span><span class="c1"># AUTO (default), CUTLASS, CUTEDSL, CUTEDSL_FC12, TRTLLM, DEEPGEMM,</span>
+<span class="w">                           </span><span class="c1"># DENSEGEMM, MEGAMOE_CUTEDSL, MEGAMOE_DEEPGEMM, MARLIN, ...</span>
+</pre></div>
+</div>
+<p>The <em>Backend Capability Matrix</em> and <em>Quantization Support</em> tables: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md"><code class="docutils literal notranslate"><span class="pre">MOE_DEVELOPER_GUIDE.md</span></code></a>.</p>
+</section>
+</section>
+</section>
+<section id="terminology">
+<h3>Terminology<a class="headerlink" href="#terminology" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">world_size</span></code></strong>: number of ranks (GPUs) the model is served on.</p></li>
+<li><p><strong>NVLink domain</strong>: the set of GPUs reachable over NVLink. GB300 (NVL72) forms one domain of up to 72 GPUs, so EP crosses the domain only when <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&gt;</span> <span class="pre">72</span></code>. B300 forms one domain per 8-GPU node, so EP crosses the domain when <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&gt;</span> <span class="pre">8</span></code> and falls back to the slower network.</p></li>
+<li><p><strong>prefill / decode</strong>: prefill processes the whole prompt at once (large GEMM <code class="docutils literal notranslate"><span class="pre">M</span></code>, compute bound), decode produces one token per request per step (small <code class="docutils literal notranslate"><span class="pre">M</span></code>, communication and memory bound). The two phases usually need different configurations.</p></li>
+</ul>
+</section>
+</section>
+<section id="recommended-configuration">
+<h2>Recommended Configuration<a class="headerlink" href="#recommended-configuration" title="Link to this heading">#</a></h2>
+<p>To provide recommended MoE configurations, we use the following two derived variables.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">activated_tokens_per_rank</span> <span class="pre">=</span> <span class="pre">num_tokens</span> <span class="pre">*</span> <span class="pre">top_k</span> <span class="pre">/</span> <span class="pre">world_size</span></code> (pure EP, <code class="docutils literal notranslate"><span class="pre">moe_tp_size</span> <span class="pre">=</span> <span class="pre">1</span></code>)
+This is the total number of token-expert assignments processed by one rank, summed across its local experts. The per-rank workload is not determined by batch size alone: it also depends on <code class="docutils literal notranslate"><span class="pre">top_k</span></code> and <code class="docutils literal notranslate"><span class="pre">world_size</span></code>. Folding both in provides a unified threshold for the actual per-rank workload across models and batch sizes.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dispatch_KB</span> <span class="pre">=</span> <span class="pre">activated_tokens_per_rank</span> <span class="pre">*</span> <span class="pre">hidden_size</span> <span class="pre">*</span> <span class="pre">bytes_per_elem</span> <span class="pre">/</span> <span class="pre">1024</span></code>
+This quantifies the communication volume between ranks as a byte count (<code class="docutils literal notranslate"><span class="pre">bytes_per_elem</span></code> is 0.5 for NVFP4 and 1.0 for W4A8_MXFP4_MXFP8), providing a unified threshold for selecting the communication method.</p></li>
+</ul>
+<section id="decision-tree">
+<h3>Decision Tree<a class="headerlink" href="#decision-tree" title="Link to this heading">#</a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>═════════════════ STEP1: Parallelism ═════════════════
+
+Parallelism
+│
+└─ MoE Module                                        →  EP
+
+
+═════════════════ STEP2: Backend ═════════════════
+
+Backend
+│
+├─ SM90  (Hopper: H100 / H200)
+│      │
+│      ├─ gpt-oss  → CUTLASS/TRITON
+│      └─ else     → CUTLASS
+│
+├─ SM120 / SM121  (RTX PRO 6000 Blackwell / DGX Spark)
+│      │
+│      ├─ NVFP4, tokens per rank &lt; 64, ep_size==1, no attention DP  → CUTEDSL
+│      └─ else                                                      → CUTLASS
+│
+└─ SM100 / SM103  (B300 / GB300)
+       │
+       ├─ attention TP                                          → TRTLLM
+       │
+       └─ attention DP
+              │
+              ├─ GB300 with world_size &lt;= 72, or B300 with world_size &lt;= 8
+              │  (EP within one NVLink domain)
+              │      │
+              │      ├─ NVFP4
+              │      │      ├─ decode (CUDA graph on)
+              │      │      │      ├─ activated_tokens_per_rank &lt;= 512
+              │      │      │      │      ├─ world_size &lt;= 8      → TRTLLM
+              │      │      │      │      └─ else                 → CUTEDSL
+              │      │      │      └─ else                        → MEGAMOE_CUTEDSL
+              │      │      │
+              │      │      └─ prefill (CUDA graph off)
+              │      │             ├─ activated_tokens_per_rank &lt;= 16384
+              │      │             │                              → TRTLLM
+              │      │             └─ else                        → MEGAMOE_CUTEDSL
+              │      │
+              │      └─ W4A8_MXFP4_MXFP8                          → MEGAMOE_DEEPGEMM
+              │
+              └─ B300 with world_size &gt; 8
+                 (EP crosses the NVLink domain)
+                        ├─ NVFP4             → CUTEDSL
+                        └─ W4A8_MXFP4_MXFP8  → TRTLLM
+
+
+═════════════════ STEP3: Communication ═════════════════
+
+Communication
+│
+├─ EP crosses the NVLink domain
+│  (B300 with world_size &gt; 8)
+│      │
+│      ├─ dispatch_KB &lt;= 8192  (~8 MB per rank)
+│      │      ├─ DEEPEPLOWLATENCY supported  → DEEPEPLOWLATENCY
+│      │      └─ else                        → AUTO
+│      │
+│      └─ else                               → ALLGATHER
+│
+└─ else                                      → AUTO
+</pre></div>
+</div>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code> is the default: leave <code class="docutils literal notranslate"><span class="pre">TRTLLM_FORCE_COMM_METHOD</span></code> unset and TensorRT-LLM
+selects the strategy itself.</p>
+</div></blockquote>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">DEEPEPLOWLATENCY</span> <span class="pre">supported</span></code>: <code class="docutils literal notranslate"><span class="pre">hidden_size</span></code> in
+<code class="docutils literal notranslate"><span class="pre">{2048,</span> <span class="pre">2560,</span> <span class="pre">3584,</span> <span class="pre">4096,</span> <span class="pre">5120,</span> <span class="pre">6144,</span> <span class="pre">7168}</span></code> and <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">&lt;=</span> <span class="pre">16</span></code>.</p>
+</div></blockquote>
+<blockquote>
+<div><p><strong>Notes</strong></p>
+<ul class="simple">
+<li><p>The tree is an empirical summary from <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> sweeps on TensorRT-LLM <code class="docutils literal notranslate"><span class="pre">v1.3.0rc26</span></code> (<code class="docutils literal notranslate"><span class="pre">21dc97fbc8</span></code>, 2026-09-13).</p></li>
+<li><p>Coverage: GB300 / B300, typical workloads of key models (DeepSeek-V4-Pro, GLM-5, Kimi-K2, Kimi-K3, Qwen3.8) on the MoE Perf Dashboard, module-level <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> with perfect routing and <code class="docutils literal notranslate"><span class="pre">--use_low_precision_moe_combine</span></code>. GB300 is covered only through <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&lt;=</span> <span class="pre">72</span></code>; larger GB300 deployments (EP crossing the NVLink domain) were not benchmarked.</p></li>
+<li><p>Perfect routing assigns tokens evenly across experts. Relative rankings of backends and communication strategies hold under this configuration, but a real router can be skewed, so absolute latency can differ from what the deployment sees.</p></li>
+<li><p>The decision tree is a fit to those sweeps, and may not be optimal for a specific workload. Meanwhile, results can become outdated as kernels and autotuning change. To push performance further, test the options yourself with <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code>, as described in <em>Tuning a Specific Workload</em>.</p></li>
+</ul>
+</div></blockquote>
+</section>
+<section id="hints-for-making-the-choice">
+<h3>Hints for Making the Choice<a class="headerlink" href="#hints-for-making-the-choice" title="Link to this heading">#</a></h3>
+<section id="impacts-of-each-option">
+<h4>Impacts of Each Option<a class="headerlink" href="#impacts-of-each-option" title="Link to this heading">#</a></h4>
+<p><strong>Parallelism</strong> decides how much work lands on each rank. Under expert parallelism a rank holds a subset of the experts, so a token has to be dispatched to whichever rank owns its target expert. A hybrid TP x EP layout splits every expert as well, which shrinks the dispatch, at the cost of a narrower GEMM on each rank and of every rank having to read every token.</p>
+<p><strong>Communication</strong> sets how the dispatch and the combine are carried out. The tokens can be written straight into the peer’s memory with no handshake, exchanged after a two-sided handshake, sent out over the network, or not routed at all, which means broadcasting every token to every rank and reducing the outputs back afterwards.</p>
+<p><strong>Backend</strong> governs how the expert GEMM runs. The implementations differ in how their kernels are tuned, some picking parameters from the problem shape and some using a fixed configuration. The MegaMoE backends are the special case as they fold the exchange into the GEMM kernel and move data while they compute.</p>
+</section>
+<section id="a-uniform-view-for-three-options">
+<h4>A Uniform View for Three Options<a class="headerlink" href="#a-uniform-view-for-three-options" title="Link to this heading">#</a></h4>
+<p>All three options switch for the same reason. Every configuration pays two kinds of cost, and the number of tokens in flight decides which one dominates.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>          <span class="n">fixed</span> <span class="n">cost</span>                                  <span class="n">data</span> <span class="n">volume</span>
+   <span class="n">kernel</span> <span class="n">launches</span><span class="p">,</span> <span class="n">cross</span><span class="o">-</span><span class="n">rank</span>                 <span class="nb">bytes</span> <span class="n">to</span> <span class="n">dispatch</span> <span class="ow">and</span>
+   <span class="n">synchronisation</span><span class="p">,</span> <span class="n">handshakes</span><span class="p">,</span>                <span class="n">combine</span><span class="p">,</span> <span class="n">FLOPs</span> <span class="n">the</span>
+   <span class="n">peers</span> <span class="n">to</span> <span class="n">coordinate</span> <span class="k">with</span>                    <span class="n">expert</span> <span class="n">GEMM</span> <span class="n">runs</span>
+          <span class="o">|</span>                                             <span class="o">|</span>
+          <span class="o">+----------------</span> <span class="n">threshold</span> <span class="o">------------------+</span>
+          <span class="o">|</span>                                             <span class="o">|</span>
+   <span class="n">dominates</span> <span class="n">when</span> <span class="n">few</span> <span class="n">tokens</span>                    <span class="n">dominates</span> <span class="n">when</span> <span class="n">many</span>
+   <span class="n">are</span> <span class="ow">in</span> <span class="n">flight</span>                                <span class="n">tokens</span> <span class="n">are</span> <span class="ow">in</span> <span class="n">flight</span>
+</pre></div>
+</div>
+</section>
+<section id="rationale-behind-each-threshold">
+<h4>Rationale Behind Each Threshold<a class="headerlink" href="#rationale-behind-each-threshold" title="Link to this heading">#</a></h4>
+<p><strong>The MoE layout is always expert parallelism.</strong> Under attention DP, expert parallelism is always the optimum at every workload point in the sweep. Under attention TP, a hybrid TP x EP layout can be slightly better at small token counts, but the gain is small (0.3% at the median and 4% at the 90th percentile). A deployment that is squeezing the last few percent out of a low-latency configuration should still measure <code class="docutils literal notranslate"><span class="pre">TP&lt;k&gt;EP&lt;m&gt;</span></code>.</p>
+<p><strong>The fused path is not always the best choice.</strong> The fused scheme carries a fixed setup cost: three cross-rank NVLink barriers inside the kernel, plus metadata preparation whose cost follows the token bucket size rather than the number of tokens actually present. With few tokens in flight that cost exceeds the overlapped dispatch and combine cost, and fusion only takes off once the workload is large enough for the cost to be amortised and for the overlap to repay it. The threshold <code class="docutils literal notranslate"><span class="pre">activated_tokens_per_rank</span> <span class="pre">=</span> <span class="pre">512</span></code> with CUDA graph on is derived from the <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> sweep over typical workloads.</p>
+<p><strong>We prefer <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> over <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> when <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&lt;=</span> <span class="pre">8</span></code>.</strong> A small world size leaves many experts on each rank (<code class="docutils literal notranslate"><span class="pre">num_experts</span> <span class="pre">/</span> <span class="pre">world_size</span></code> can be 32 to 224), so the grouped GEMM has many groups with a small <code class="docutils literal notranslate"><span class="pre">M</span></code> dimension. In these cases, TRTLLM-Gen’s tuned kernels fit that shape better than the generic CuteDSL grouped GEMM.</p>
+<p><strong>The crossover moves out much further with CUDA graph off.</strong> A CUDA graph replays a recorded launch sequence and reduces the kernel launch overhead during forward. Without CUDA graph, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> drives its whole MoE from one host-side call that issues its kernels internally, while the fused path is a chain of separate host-side steps, including quantize, staging copies, the fused kernel, and a separate top-k reduce, each carrying its own dispatch and tactic lookup. With CUDA graph off, the host overhead dominates the execution of the MoE module. The fused path’s expert-GEMM advantage therefore stays out of the comparison until <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>’s GPU work has grown past that dispatch cost, which moves the crossover point much further out. In a disaggregated deployment, CUDA graph off maps to the prefill phase.</p>
+<p><strong>Attention TP always uses <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>.</strong> Attention TP is a low-latency choice, and the MoE forward never gets a large batch: across the disaggregated-serving workloads behind this guide, attention TP appears only in the decode phase and <code class="docutils literal notranslate"><span class="pre">activated_tokens_per_rank</span></code> never exceeds 64. <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> does overtake <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> once the expert GEMM becomes compute bound, but that only happens above roughly 24576 activated tokens per rank, which attention TP does not reach in a disaggregated deployment.</p>
+</section>
+<section id="impacts-of-crossing-the-nvlink-domain">
+<h4>Impacts of Crossing the NVLink Domain<a class="headerlink" href="#impacts-of-crossing-the-nvlink-domain" title="Link to this heading">#</a></h4>
+<p>An NVL72 system keeps up to 72 GPUs in one domain, while B300 keeps 8 per node. Once expert parallelism extends beyond that, the tokens go over the network, where per-GPU bandwidth drops. The same bytes then cost close to twenty times more, which moves every crossover earlier and is why the cross-domain branch switches on absolute dispatch bytes (<code class="docutils literal notranslate"><span class="pre">dispatch_KB</span></code>) rather than on a token count (<code class="docutils literal notranslate"><span class="pre">activated_tokens_per_rank</span></code>).</p>
+<blockquote>
+<div><p>The thresholds above were obtained from sweeps over typical workloads on key models, all measured with <code class="docutils literal notranslate"><span class="pre">--use_low_precision_moe_combine</span></code> enabled. This flag speeds up <code class="docutils literal notranslate"><span class="pre">NVLINK_ONE_SIDED</span></code> by about 4% while leaving the fused <code class="docutils literal notranslate"><span class="pre">NONE</span></code> path untouched.</p>
+</div></blockquote>
+</section>
+</section>
+<section id="typical-deployment-scenarios">
+<h3>Typical Deployment Scenarios<a class="headerlink" href="#typical-deployment-scenarios" title="Link to this heading">#</a></h3>
+<section id="low-latency">
+<h4>Low Latency<a class="headerlink" href="#low-latency" title="Link to this heading">#</a></h4>
+<p>Optimize for the smallest possible per-step latency at low concurrency, accepting lower GPU utilization.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Attention</p></td>
+<td><p>TP</p></td>
+</tr>
+<tr class="row-odd"><td><p>MoE parallelism</p></td>
+<td><p>EP</p></td>
+</tr>
+<tr class="row-even"><td><p>Backend</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> on SM100 / SM103</p></td>
+</tr>
+<tr class="row-odd"><td><p>Communication</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">NONE</span></code> (attention TP needs no dispatch)</p></td>
+</tr>
+<tr class="row-even"><td><p>CUDA graph</p></td>
+<td><p>On</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The MoE forward here is launch-bound, not compute-bound: <code class="docutils literal notranslate"><span class="pre">activated_tokens_per_rank</span></code> stays small. Every fixed cost is therefore fully exposed. If you are chasing the last few percent, measure the hybrid <code class="docutils literal notranslate"><span class="pre">TP&lt;k&gt;EP&lt;m&gt;</span></code> layouts as well, under attention TP they can edge out pure EP at small token counts.</p>
+</section>
+<section id="high-throughput">
+<h4>High Throughput<a class="headerlink" href="#high-throughput" title="Link to this heading">#</a></h4>
+<p>Optimize for aggregate throughput at high concurrency, accepting higher per-request latency.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Attention</p></td>
+<td><p>DP</p></td>
+</tr>
+<tr class="row-odd"><td><p>MoE parallelism</p></td>
+<td><p>EP, typically wide</p></td>
+</tr>
+<tr class="row-even"><td><p>Backend</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code> (NVFP4) / <code class="docutils literal notranslate"><span class="pre">MEGAMOE_DEEPGEMM</span></code> (W4A8_MXFP4_MXFP8)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Communication</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">NONE</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>CUDA graph</p></td>
+<td><p>On for decode, off for prefill</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Attention DP accumulates tokens per rank as concurrency grows. Fusion is for that case: the MoE module has enough work to benefit from overlapping dispatch and combine with the GEMM operations. It is also important to keep expert parallelism inside one NVLink domain if you can.</p>
+</section>
+<section id="disaggregated-serving">
+<h4>Disaggregated Serving<a class="headerlink" href="#disaggregated-serving" title="Link to this heading">#</a></h4>
+<p>In a disaggregated deployment the two phases are separate services and should be configured separately rather than compromised into one profile:</p>
+<ul class="simple">
+<li><p><strong>Prefill / context servers</strong>: large <code class="docutils literal notranslate"><span class="pre">M</span></code>, compute bound, CUDA graph off. Follow the CUDA-graph-off branch of the tree (crossover at <code class="docutils literal notranslate"><span class="pre">activated_tokens_per_rank</span> <span class="pre">=</span> <span class="pre">16384</span></code>). This is also the only phase where DWDP applies.</p></li>
+<li><p><strong>Decode / generation servers</strong>: small <code class="docutils literal notranslate"><span class="pre">M</span></code> per step, communication and memory bound, CUDA graph on. Follow the CUDA-graph-on branch (crossover at 512). This is the phase where EPLB pays off, since expert imbalance shows up as a straggler on every step.</p></li>
+</ul>
+</section>
+</section>
+</section>
+<section id="tuning-a-specific-workload">
+<h2>Tuning a Specific Workload<a class="headerlink" href="#tuning-a-specific-workload" title="Link to this heading">#</a></h2>
+<p>The decision trees give a general configuration that works well across a wide range of deployments. For a specific workload and world size, searching the whole configuration space can find a better one.</p>
+<p><code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> runs the MoE module on its own, without deploying the full model. With the model, quantization, world size and token counts fixed, <code class="docutils literal notranslate"><span class="pre">--search</span> <span class="pre">full</span></code> expands backend, communication, parallel layout, and CUDA Graph. This includes layouts the decision trees do not select, such as MoE TP and the even-split hybrid <code class="docutils literal notranslate"><span class="pre">(D|T)TP&lt;k&gt;EP&lt;m&gt;</span></code> modes. It can be executed as:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">PYTHONPATH</span><span class="o">=</span>tests/microbenchmarks:<span class="si">${</span><span class="nv">PYTHONPATH</span><span class="k">:-</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+mpirun<span class="w"> </span>--allow-run-as-root<span class="w"> </span>--oversubscribe<span class="w"> </span>--bind-to<span class="w"> </span>none<span class="w"> </span>--map-by<span class="w"> </span>slot<span class="w"> </span>-np<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>python3<span class="w"> </span>-m<span class="w"> </span>bench_moe<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--world_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>deepseek_v4_pro<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--quant<span class="w"> </span>NVFP4<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--search<span class="w"> </span>full<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--balanced_total_num_tokens<span class="w"> </span><span class="m">256</span><span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--use_low_precision_moe_combine<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output_file<span class="w"> </span>out/deepseek_v4_pro_ws8.json
+</pre></div>
+</div>
+<p>This writes <code class="docutils literal notranslate"><span class="pre">out/deepseek_v4_pro_ws8.json</span></code> and <code class="docutils literal notranslate"><span class="pre">out/deepseek_v4_pro_ws8.analysis.xlsx</span></code>. If attention parallelism is already decided, pin <code class="docutils literal notranslate"><span class="pre">--parallel_mode</span> <span class="pre">DEP</span></code> or <code class="docutils literal notranslate"><span class="pre">TEP</span></code> and <code class="docutils literal notranslate"><span class="pre">--search</span> <span class="pre">backend</span> <span class="pre">comm</span></code> instead.</p>
+<p>The JSON has <code class="docutils literal notranslate"><span class="pre">results</span></code> (one object per candidate) and <code class="docutils literal notranslate"><span class="pre">rankings</span></code> grouped by <code class="docutils literal notranslate"><span class="pre">(num_tokens,</span> <span class="pre">parallel_mode)</span></code>. Start at <code class="docutils literal notranslate"><span class="pre">rankings</span></code>: <code class="docutils literal notranslate"><span class="pre">best</span></code> is the <code class="docutils literal notranslate"><span class="pre">status=success</span></code> candidate with the lowest <code class="docutils literal notranslate"><span class="pre">score_ms</span></code> in that group.</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"num_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"parallel_mode"</span><span class="p">:</span><span class="w"> </span><span class="s2">"DEP"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"best"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"backend"</span><span class="p">:</span><span class="w"> </span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"comm_method"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVLinkOneSided"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"cuda_graph"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"score_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.85</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"success"</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">score_ms</span></code> is the trimmed mean of per-iteration slowest-rank forward times; lower is better. In the workbook, <code class="docutils literal notranslate"><span class="pre">best_by_workload</span></code> lists those winners and <code class="docutils literal notranslate"><span class="pre">all_results</span></code> is the full table. Take the <code class="docutils literal notranslate"><span class="pre">DEP</span></code> or <code class="docutils literal notranslate"><span class="pre">TEP</span></code> group that matches the serving job. CUDA Graph on/off share that group, so if the job pins Graph (on for decode, off for prefill), filter <code class="docutils literal notranslate"><span class="pre">cuda_graph</span></code> in <code class="docutils literal notranslate"><span class="pre">all_results</span></code>. Set the winner with <code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code> and <code class="docutils literal notranslate"><span class="pre">TRTLLM_FORCE_COMM_METHOD</span></code> as in <em>Configuration Options</em>.</p>
+<p>Search axes and further recipes: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/microbenchmarks/bench_moe/BENCH_MOE_USER_GUIDE.md"><code class="docutils literal notranslate"><span class="pre">BENCH_MOE_USER_GUIDE.md</span></code></a>.</p>
+<p>One thing to know before trusting a <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> ranking: it has been cross-validated against end-to-end disaggregated serving, detailed in <em>Appendix</em>.</p>
+</section>
+<section id="advanced-techniques">
+<h2>Advanced Techniques<a class="headerlink" href="#advanced-techniques" title="Link to this heading">#</a></h2>
+<p>The two techniques below go beyond picking a configuration: they change how experts are placed or how their weights move, and each targets a cost that the options above cannot remove.</p>
+<section id="expert-parallelism-load-balancer-eplb">
+<h3>Expert Parallelism Load Balancer (EPLB)<a class="headerlink" href="#expert-parallelism-load-balancer-eplb" title="Link to this heading">#</a></h3>
+<p>Expert Parallelism Load Balancer (EPLB), introduced in <a class="reference external" href="https://arxiv.org/abs/2412.19437">DeepSeek-V3</a>, is proposed to remove the straggler effect caused by uneven expert activation under large-scale expert parallelism, where the ranks holding the most-activated experts dominate the latency of the whole module while the rest idle. It replicates hot experts and packs the resulting slots onto ranks so that the expected load is even, deriving the assignment from measured routing statistics.</p>
+<p>It is recommended to enable EPLB on MoE models when expert parallelism is large (<code class="docutils literal notranslate"><span class="pre">ep_size</span></code> typically <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">8</span></code>), the MoE is a significant fraction of runtime, and ranks are imbalanced. This setting usually corresponds to the decode phase of a disaggregated deployment.</p>
+<p>EPLB can use an offline plan or recompute the placement online. Offline EPLB is suitable when the traffic pattern is known and stable. Online EPLB is for production when the traffic mix can drift, because hot experts differ across datasets and requests. The online path follows that drift without regenerating a placement. The cost is a full host copy of the experts, background weight-update threads, and platform requirements (GDRCopy, huge pages). At small per-GPU batches, the statistics and update work may not hide behind the MoE GEMMs.</p>
+<p>Usage: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/wide_ep/ep_load_balancer/README.md"><code class="docutils literal notranslate"><span class="pre">examples/wide_ep/ep_load_balancer/README.md</span></code></a>.</p>
+</section>
+<section id="distributed-weight-data-parallelism-dwdp">
+<h3>Distributed Weight Data Parallelism (DWDP)<a class="headerlink" href="#distributed-weight-data-parallelism-dwdp" title="Link to this heading">#</a></h3>
+<p><a class="reference external" href="https://doi.org/10.48550/arXiv.2604.01621">Distributed Weight Data Parallelism (DWDP)</a> targets layer-wise synchronization and token-exchange overhead in the prefill phase, where differences in sequence lengths and KV-cache hits can leave workers waiting for the slowest rank. DWDP keeps a resident subset of experts on each worker and asynchronously prefetches the remaining expert weights from its NVLink peers. Each worker computes on its own tokens, replacing synchronized token dispatch/combine with weight transfers that overlap with computation.</p>
+<p>DWDP can be applied to the prefill phase of a serving system when the context batch is large enough for computation to hide the weight prefetch. Decode typically has too little computation to hide these transfers, so generation keeps the normal EP dispatch. Experimental cost of DWDP is a TTFT regression, from a lower service rate on the context stage, plus extra prefetch memory: each rank stores only its local experts, but adds a double-buffered region of about two layers of remote experts. DWDP cannot run on the same MoE path as EPLB. A disaggregated deployment can use DWDP on context servers and EPLB on generation servers.</p>
+<p>Usage: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/dwdp/README.md"><code class="docutils literal notranslate"><span class="pre">examples/dwdp/README.md</span></code></a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md">blog19</a>.</p>
+</section>
+</section>
+<section id="appendix">
+<h2>Appendix<a class="headerlink" href="#appendix" title="Link to this heading">#</a></h2>
+<section id="moe-perf-dashboard">
+<h3>MoE Perf Dashboard<a class="headerlink" href="#moe-perf-dashboard" title="Link to this heading">#</a></h3>
+<p>The <strong>MoE Perf Dashboard</strong> publishes MoE performance of typical workloads on key models. The recommended configuration in this guide is summarized from these sweeps. Browse it at <a class="reference internal" href="moe-perf-dashboard.html"><span class="std std-doc">MoE Perf Dashboard</span></a>.</p>
+<p>Covered Models with MoE Configuration:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">num_experts</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">top_k</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">hidden_size</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">intermediate_size</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>DeepSeek-V4-Pro</p></td>
+<td><p>384</p></td>
+<td><p>6</p></td>
+<td><p>7168</p></td>
+<td><p>3072</p></td>
+</tr>
+<tr class="row-odd"><td><p>GLM-5</p></td>
+<td><p>256</p></td>
+<td><p>8</p></td>
+<td><p>6144</p></td>
+<td><p>2048</p></td>
+</tr>
+<tr class="row-even"><td><p>Kimi-K2</p></td>
+<td><p>384</p></td>
+<td><p>8</p></td>
+<td><p>7168</p></td>
+<td><p>2048</p></td>
+</tr>
+<tr class="row-odd"><td><p>Kimi-K3</p></td>
+<td><p>896</p></td>
+<td><p>16</p></td>
+<td><p>3584</p></td>
+<td><p>3072</p></td>
+</tr>
+<tr class="row-even"><td><p>Qwen3.8</p></td>
+<td><p>512</p></td>
+<td><p>10</p></td>
+<td><p>8192</p></td>
+<td><p>2048</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="cross-validation-of-microbenchmark-with-end-to-end-performance">
+<h3>Cross Validation of Microbenchmark with End-to-end Performance<a class="headerlink" href="#cross-validation-of-microbenchmark-with-end-to-end-performance" title="Link to this heading">#</a></h3>
+<p>The microbenchmark ranks MoE configurations by module latency, without serving the full model. This ranking is validated against disaggregated serving.</p>
+<section id="baseline-the-pareto-serving-configuration">
+<h4>Baseline: the Pareto serving configuration<a class="headerlink" href="#baseline-the-pareto-serving-configuration" title="Link to this heading">#</a></h4>
+<p>The <strong>baseline</strong> is the MoE configuration on the <strong>Pareto Curve</strong> of the <a class="reference external" href="https://inferencex.com">InferenceX</a> Dashboard. The curve comes from InferenceX’s public benchmark (fixed ISL/OSL, sweeping concurrency and parallelism), and each point is Pareto-optimal for system throughput and per-user interactivity (<code class="docutils literal notranslate"><span class="pre">tps_per_user</span></code>).</p>
+<p>These configurations are published in <a class="reference external" href="https://github.com/SemiAnalysisAI/InferenceX">InferenceX</a>:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://inferencex.com">Dashboard</a>: each point’s tooltip shows the recipe (model, framework, precision, parallelism, ISL/OSL, concurrency) and a link to the GitHub Actions run.</p></li>
+<li><p><a class="reference external" href="https://github.com/SemiAnalysisAI/InferenceX/blob/main/inferencex-e2e/configs/nvidia-master.yaml"><code class="docutils literal notranslate"><span class="pre">nvidia-master.yaml</span></code></a>: lists the disagg topology (<code class="docutils literal notranslate"><span class="pre">num-worker</span></code>, <code class="docutils literal notranslate"><span class="pre">tp</span></code>, <code class="docutils literal notranslate"><span class="pre">ep</span></code>, <code class="docutils literal notranslate"><span class="pre">dp-attn</span></code>, ISL/OSL, concurrency) and the <code class="docutils literal notranslate"><span class="pre">CONFIG_FILE</span></code> path.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/srt-slurm"><code class="docutils literal notranslate"><span class="pre">NVIDIA/srt-slurm</span></code></a>: the <code class="docutils literal notranslate"><span class="pre">CONFIG_FILE</span></code> YAML holds the serving configuration (<code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code>, EP/TP, CUDA Graph, batch, MTP), for example <a class="reference external" href="https://github.com/NVIDIA/srt-slurm/blob/sa-submission-q2-2026/recipes/trtllm/gb300-fp4/1k1k/mtp/ctx1_gen4_tep8_batch1_eplb0_mtp3.yaml"><code class="docutils literal notranslate"><span class="pre">ctx1_gen4_tep8_batch1_eplb0_mtp3.yaml</span></code></a>.</p></li>
+</ul>
+</section>
+<section id="how-a-pareto-point-is-compared-to-bench-moe-microbenchmark">
+<h4>How a Pareto point is compared to <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> microbenchmark?<a class="headerlink" href="#how-a-pareto-point-is-compared-to-bench-moe-microbenchmark" title="Link to this heading">#</a></h4>
+<p>Each serving case <code class="docutils literal notranslate"><span class="pre">(ISL,</span> <span class="pre">OSL,</span> <span class="pre">instance</span> <span class="pre">layout,</span> <span class="pre">batch,</span> <span class="pre">MTP,</span> <span class="pre">concurrency)</span></code> is mapped to a <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> shape: the same model configuration, quantization, hardware, world size, <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> of the MoE forward, and CUDA Graph on or off. Candidates with the same deployed attention parallelism (DP or TP) are then ranked by module latency (<code class="docutils literal notranslate"><span class="pre">score_ms</span></code>, lower is better).</p>
+<p>The deployed MoE config is compared with that best <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> candidate and labeled <strong>Match</strong> if they are the same, <strong>Mismatch</strong> otherwise. Each Mismatch is evaluated in disaggregated serving with both the Pareto-curve configuration and the <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> candidate, and compared on <code class="docutils literal notranslate"><span class="pre">tps_per_user</span></code> (tokens per second per user).</p>
+<ul class="simple">
+<li><p><strong>Improvement</strong>: the <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> candidate raises <code class="docutils literal notranslate"><span class="pre">tps_per_user</span></code> by more than 3%.</p></li>
+<li><p><strong>Flat</strong>: the change is within ±3%.</p></li>
+<li><p><strong>Regression</strong>: the <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> candidate lowers <code class="docutils literal notranslate"><span class="pre">tps_per_user</span></code> by more than 3%.</p></li>
+</ul>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model</p></th>
+<th class="head"><p>Hardware</p></th>
+<th class="head"><p>Match</p></th>
+<th class="head"><p>Mismatch</p></th>
+<th class="head"><p>Improvement</p></th>
+<th class="head"><p>Flat</p></th>
+<th class="head"><p>Regression</p></th>
+<th class="head"><p>Regression after Perfect Routing</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>DeepSeek-V4-Pro</p></td>
+<td><p>GB300</p></td>
+<td><p>92/108 (85.19%, prefill 54/54, decode 38/54)</p></td>
+<td><p>16/108</p></td>
+<td><p>9/16</p></td>
+<td><p>6/16</p></td>
+<td><p>1/16</p></td>
+<td><p>0/16</p></td>
+</tr>
+<tr class="row-odd"><td><p>Kimi-K2</p></td>
+<td><p>GB200</p></td>
+<td><p>33/50 (66%, prefill 25/25, decode 8/25)</p></td>
+<td><p>17/50</p></td>
+<td><p>4/17</p></td>
+<td><p>10/17</p></td>
+<td><p>3/17</p></td>
+<td><p>0/17</p></td>
+</tr>
+<tr class="row-even"><td><p>Kimi-K2</p></td>
+<td><p>GB300</p></td>
+<td><p>35/50 (70%, prefill 25/25, decode 10/25)</p></td>
+<td><p>15/50</p></td>
+<td><p>1/15</p></td>
+<td><p>13/15</p></td>
+<td><p>1/15</p></td>
+<td><p>0/15</p></td>
+</tr>
+<tr class="row-odd"><td><p>GLM-5</p></td>
+<td><p>GB200</p></td>
+<td><p>75/92 (81.52%, prefill 43/46, decode 32/46)</p></td>
+<td><p>17/92</p></td>
+<td><p>3/17</p></td>
+<td><p>13/17</p></td>
+<td><p>1/17</p></td>
+<td><p>0/17</p></td>
+</tr>
+<tr class="row-even"><td><p>GLM-5</p></td>
+<td><p>GB300</p></td>
+<td><p>36/90 (40.00%, prefill 1/45, decode 35/45)</p></td>
+<td><p>54/90</p></td>
+<td><p>5/54</p></td>
+<td><p>49/54</p></td>
+<td><p>0/54</p></td>
+<td><p>0/54</p></td>
+</tr>
+<tr class="row-odd"><td><p>DeepSeek-R1</p></td>
+<td><p>GB200</p></td>
+<td><p>92/104 (88.46%, prefill 49/52, decode 43/52)</p></td>
+<td><p>12/104</p></td>
+<td><p>5/12</p></td>
+<td><p>7/12</p></td>
+<td><p>0/12</p></td>
+<td><p>0/12</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Regression cases are re-run with <strong>perfect routing</strong> (balanced expert load). They go to zero in the table, indicating the end-to-end gap came from router skew, as <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> ranks under balanced expert load.</p>
+<div class="toctree-wrapper compound">
+</div>
+</section>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="perf-benchmarking.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">TensorRT LLM Benchmarking</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="moe-perf-dashboard.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">MoE Perf Dashboard</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-architecture">MoE Architecture</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-options">Configuration Options</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#parallelism">Parallelism</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-assign-a-communication-strategy">How to assign a communication strategy?</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#backend">Backend</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-assign-a-backend">How to assign a backend?</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#terminology">Terminology</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#recommended-configuration">Recommended Configuration</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#decision-tree">Decision Tree</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hints-for-making-the-choice">Hints for Making the Choice</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#impacts-of-each-option">Impacts of Each Option</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#a-uniform-view-for-three-options">A Uniform View for Three Options</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#rationale-behind-each-threshold">Rationale Behind Each Threshold</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#impacts-of-crossing-the-nvlink-domain">Impacts of Crossing the NVLink Domain</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#typical-deployment-scenarios">Typical Deployment Scenarios</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#low-latency">Low Latency</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#high-throughput">High Throughput</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#disaggregated-serving">Disaggregated Serving</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tuning-a-specific-workload">Tuning a Specific Workload</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-techniques">Advanced Techniques</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallelism-load-balancer-eplb">Expert Parallelism Load Balancer (EPLB)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#distributed-weight-data-parallelism-dwdp">Distributed Weight Data Parallelism (DWDP)</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#appendix">Appendix</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-perf-dashboard">MoE Perf Dashboard</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-validation-of-microbenchmark-with-end-to-end-performance">Cross Validation of Microbenchmark with End-to-end Performance</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#baseline-the-pareto-serving-configuration">Baseline: the Pareto serving configuration</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#how-a-pareto-point-is-compared-to-bench-moe-microbenchmark">How a Pareto point is compared to <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> microbenchmark?</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on October 26, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
