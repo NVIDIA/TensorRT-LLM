@@ -156,15 +156,16 @@ class PagePool:
                     handle = create_local_handle(self._page_size, device_id)
                     handles.append(handle)
                 except Exception as e:
-                    # Cleanup on failure
-                    for h in handles:
-                        release_handle(h)
-                    for prev_handles in self._page_handles:
-                        for h in prev_handles:
-                            release_handle(h)
+                    # Release every page made so far exactly once, here, as release() does: a
+                    # page that fails to release is logged, so the others are still released and
+                    # this allocation error stays the one raised; release() also marks the pool
+                    # released, so __del__ does not release the handles again once the driver
+                    # may have reused their values.
+                    self._page_handles.append(handles)
+                    self.release()
                     raise RuntimeError(
                         f"Failed to allocate page {page_idx} in slot {slot_idx}: {e}"
-                    )
+                    ) from e
             self._page_handles.append(handles)
             logger.debug(
                 f"[PagePool] Allocated {num_pages} pages ({self._page_size} B each) "

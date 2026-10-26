@@ -85,6 +85,37 @@ def _release_during_rollback(resource, what: str) -> None:
         )
 
 
+def _refuse_reserved_storages(
+    local_params: Dict[Tuple[int, str], torch.Tensor], reserved_storages: frozenset[int]
+) -> None:
+    """Refuse expert weights whose storage another owner holds, before the transport takes them.
+
+    The transport copies each weight into its own handle and then frees the weight's storage.
+    ``DwdpManager.setup`` reserves the slots of the committed attached dense DWDP runtime: a
+    weight there is a view dense DWDP repointed into a slot, which happens only when a dense
+    root reaches a routed-expert weight.  The transport would then take the slot's bytes for the
+    experts and free the slot under the dense runtime.
+
+    Raises:
+        RuntimeError: Expert weights live in reserved storages; the message lists them.
+    """
+    if not reserved_storages:
+        return
+    taken = [
+        f"layers.{layer}.{name}"
+        for (layer, name), tensor in sorted(local_params.items(), key=lambda item: item[0])
+        if tensor.untyped_storage().data_ptr() in reserved_storages
+    ]
+    if taken:
+        listed = ", ".join(taken[:8]) + (f" and {len(taken) - 8} more" if len(taken) > 8 else "")
+        raise RuntimeError(
+            f"[DWDP Setup] Expert weights in reserved storage, which the transport would free: "
+            f"{listed}. They are views of the committed dense DWDP slots: dense DWDP moved them, "
+            f"so the decoder layers' dense_dwdp_roots (or dense_dwdp_attr_allow) reach the routed "
+            f"experts, which expert DWDP owns."
+        )
+
+
 def setup_dwdp(
     model: nn.Module,
     mapping,
@@ -97,6 +128,8 @@ def setup_dwdp(
     contention_opt: bool = False,
     repeated_layer_indices: Sequence[int] = (),
     copy_mode: Optional[str] = None,
+    copy_stream: Optional[torch.cuda.Stream] = None,
+    reserved_storages: frozenset[int] = frozenset(),
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -135,6 +168,14 @@ def setup_dwdp(
             times in a row within a forward pass (``DwdpManager.add_repeated_layer``).
         copy_mode: The prefetch transfer (``DwdpConfig.copy_mode``); None keeps
             the selection by ``contention_opt`` and ``TRTLLM_DWDP_PREFETCH_GATHER``.
+        copy_stream: The weight manager's copy stream (``DWDPWeightManager``
+            creates one if None); ``DwdpManager.setup`` passes the stream
+            attached dense DWDP was set up with.  A cached manager keeps its own.
+        reserved_storages: ``untyped_storage().data_ptr()`` of storages that
+            another owner holds, which the transport must not take over:
+            ``DwdpManager.setup`` passes the slots of the committed attached
+            dense DWDP runtime.  An expert weight in one of them raises a
+            RuntimeError before the transport starts.
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
@@ -174,6 +215,7 @@ def setup_dwdp(
 
     # 1. Collect MoE params (SSOT: iterate passed layer_indices only)
     local_params, weight_names = collect_moe_params(model, layer_indices)
+    _refuse_reserved_storages(local_params, reserved_storages)
     logger.info(
         f"[DWDP Setup] Collected params from {len(layer_indices)} MoE layers, "
         f"weight_names={weight_names}"
@@ -254,6 +296,12 @@ def setup_dwdp(
     logger.info(
         f"[DWDP Setup] Weight buffer created successfully ({num_prefetch_slots} prefetch slots)."
     )
+    free_mem, total_mem = torch.cuda.mem_get_info(device_id)
+    logger.info(
+        f"[DWDP Setup] GPU {device_id} memory after weight buffer: "
+        f"free={free_mem / (1024**3):.2f}GB / total={total_mem / (1024**3):.2f}GB "
+        f"(used={((total_mem - free_mem) / (1024**3)):.2f}GB)"
+    )
 
     # 6. Fill edge bytes
     logger.info("[DWDP Setup] Filling page-alignment edge bytes...")
@@ -286,6 +334,7 @@ def setup_dwdp(
             contention_opt=contention_opt,
             repeated_layer_indices=repeated_layer_indices,
             copy_mode=copy_mode,
+            copy_stream=copy_stream,
         )
     except BaseException:
         _release_during_rollback(weight_buffer, "weight buffer")

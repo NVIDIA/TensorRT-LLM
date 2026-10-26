@@ -20,14 +20,15 @@ The model's dense hooks reach dense DWDP only through the manager that
 does not depend on ``DwdpManager``.
 
 * Attached (``DenseMode.ATTACHED``, with expert DWDP).  ``DwdpManager`` creates and registers the
-  manager, runs ``setup_dense_dwdp`` over the DWDP group with the expert weight manager as the
-  transfer, and hands the committed runtime over with :meth:`DenseDwdpManager.attach`, together
-  with the expert weight manager.  The runtime gathers the next forward's first layers at the end
-  of a forward, beside the expert prefetch.  When they are not in flight, priming enqueues
-  ``L(first), L(second)`` and then starts the expert prefetch, so its ``E(first), E(second)``
-  follow them on the shared copy stream; after an aborted forward H0 runs the dense WAR barrier
-  first, and the expert prefetch restarts its own sequence.  ``DwdpManager.cleanup`` releases
-  dense before the expert teardown; this manager never releases the weight manager.
+  manager, runs ``setup_dense_dwdp`` over the DWDP group before the expert DWDP setup allocates its
+  prefetch ring, on a transfer whose copy stream the expert weight manager then adopts, and hands
+  the committed runtime over with :meth:`DenseDwdpManager.attach`, together with the expert
+  weight manager.  The runtime gathers the next forward's first layers at the end of a forward,
+  beside the expert prefetch.  When they are not in flight, priming enqueues ``L(first),
+  L(second)`` and then starts the expert prefetch, so its ``E(first), E(second)`` follow them on
+  the shared copy stream; after an aborted forward H0 runs the dense WAR barrier first, and the
+  expert prefetch restarts its own sequence.  ``DwdpManager.cleanup`` releases dense before the
+  expert teardown; this manager never releases the weight manager.
 * Standalone (``DenseMode.STANDALONE``, an attention-DP instance with ``tp_size > 1`` and no
   expert DWDP).  The executor creator creates and registers the manager before the model is
   built and calls :meth:`DenseDwdpManager.setup` once the weights are loaded.  Setup runs over an

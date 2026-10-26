@@ -158,8 +158,8 @@ class DenseDWDP:
         slots: Ring per enabled segment, ``len(slots[seg]) == RING_DEPTH[seg]``; owned by the
             runtime once the constructor returns (if it raises, the caller keeps them).
         copy_stream: The copy stream: the expert DWDP copy stream with expert DWDP
-            (``DWDPWeightManager.copy_stream``), the dense manager's own stream standalone
-            (``manager.StandaloneTransfer.copy_stream``).
+            (``DwdpManager.setup`` creates it for dense setup and hands it to the weight manager),
+            the dense manager's own stream standalone (``manager.StandaloneTransfer.copy_stream``).
         prefetch_next_pass: Whether the fill goes on into the first two layers of the next
             forward, which then starts primed: with expert DWDP, whose prefetch does the same, so
             those copies are not queued behind its next-pass copies.  Standalone, the dense

@@ -367,9 +367,10 @@ def batched_copies(plan: LayerCopyPlan, *, slice_bytes: int = BATCH_SLICE_BYTES)
 def select_copy_mode(*, use_gather: bool, use_batched: bool) -> CopyMode:
     """The dense transfer from a transfer's two flags: gather, else batched, else per-slice.
 
-    With expert DWDP the flags are the expert DWDP weight manager's, so the dense transfer follows
-    the expert one; standalone they are ``manager.StandaloneTransfer``'s, which
-    ``DwdpConfig.copy_mode`` picks.
+    With expert DWDP the flags are those of the expert DWDP prefetch (``DwdpManager``'s attached
+    transfer computes them as the weight manager does), so the dense transfer follows the expert
+    one; standalone they are ``manager.StandaloneTransfer``'s, which ``DwdpConfig.copy_mode``
+    picks.
     """
     if use_gather:
         return CopyMode.GATHER

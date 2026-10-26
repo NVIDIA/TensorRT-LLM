@@ -253,6 +253,48 @@ class TestDWDPPrefetchPipeline:
         with pytest.raises(KeyError):
             self.manager.finish_layer(4)
 
+    def test_a_given_copy_stream_on_the_buffer_device_is_used_and_none_is_created(self) -> None:
+        kwargs = dict(
+            weight_buffer=self.weight_buffer,
+            peer_views={},
+            peer_ranges=[(0, 2), (2, 4)],
+            moe_layer_indices=LAYERS,
+            weight_names=["gate_up_proj", "down_proj"],
+            dwdp_rank=0,
+            dwdp_size=2,
+        )
+        other = _Stream("other", self.log)
+        other.device = torch.device("cuda", 1)
+        with pytest.raises(
+            ValueError, match="copy_stream is on cuda:1, the weight buffer on cuda:0"
+        ):
+            DWDPWeightManager(**kwargs, copy_stream=other)
+
+        given = _Stream("given", self.log)
+        given.device = torch.device("cuda", 0)
+        names = [f"prefetch{slot}" for slot in range(self.num_slots)]
+        names += [f"consume{slot}" for slot in range(self.num_slots)]
+        events = iter([_Event(name, self.log) for name in names])
+        module = "tensorrt_llm._torch.modules.dwdp.weight_manager.torch.cuda"
+        with patch(f"{module}.Stream") as new_stream:
+            with patch(f"{module}.Event", side_effect=lambda: next(events)):
+                manager = DWDPWeightManager(**kwargs, copy_stream=given)
+        manager._released = True
+        new_stream.assert_not_called()
+        assert manager.copy_stream is given
+        self.log.clear()
+        manager.start_forward()
+        # Every copy waits for its slot's consume event and records its prefetch event on it.
+        assert self.log == [
+            entry
+            for slot in range(self.num_slots)
+            for entry in (
+                ("wait", "given", f"consume{slot}"),
+                ("copy", LAYERS[slot]),
+                ("record", f"prefetch{slot}", "given"),
+            )
+        ]
+
 
 class TestDWDPPrefetchPipelineRepeatedLayer(TestDWDPPrefetchPipeline):
     """The last MoE layer runs three times per pass, like the one-model MTP-Eagle layer."""
