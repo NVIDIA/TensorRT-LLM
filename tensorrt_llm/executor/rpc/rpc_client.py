@@ -22,6 +22,8 @@ from ..ipc import ZeroMqQueue
 from .rpc_common import (RPCCancelled, RPCParams, RPCRequest, RPCResponse,
                          RPCStreamingError, RPCTimeout)
 
+_CLOSE_CHECK_INTERVAL_SECONDS = 0.5
+
 
 class RemoteCall:
     """Helper class to enable chained remote call syntax like client.method().remote()"""
@@ -548,8 +550,15 @@ class RPCClient:
                 raise RPCCancelled("RPC client closed")
             future = asyncio.run_coroutine_threadsafe(
                 self._call_async(method_name, *args, **kwargs), self._loop)
-        result = future.result()
-        return result
+        while True:
+            try:
+                return future.result(timeout=_CLOSE_CHECK_INTERVAL_SECONDS)
+            except concurrent.futures.TimeoutError:
+                if future.done():
+                    return future.result()
+                if self._closed and not self._loop.is_running():
+                    future.cancel()
+                    raise RPCCancelled("RPC client closed")
 
     def _call_future(self, name: str, *args,
                      **kwargs) -> concurrent.futures.Future:
@@ -592,6 +601,8 @@ class RPCClient:
 
         # Register queue with lock to ensure thread-safe access
         with self._streaming_queues_lock:
+            if self._closed:
+                raise RPCCancelled("RPC client closed")
             self._streaming_queues[request_id] = queue
             #logger_debug(f"[{datetime.now().isoformat()}] Registered streaming queue for request_id={request_id}")
 
@@ -617,15 +628,21 @@ class RPCClient:
                 f"[client][{datetime.now().isoformat()}] Streaming request sent successfully: {req.method_name}, request_id={req.request_id}"
             )
 
-        send_future = asyncio.run_coroutine_threadsafe(
-            _send_streaming_request(request), self._loop)
-
-        # Wait until the request is actually on the wire before entering the
-        # user-visible streaming loop. We wrap the concurrent.futures.Future so
-        # we can await it in the caller's asyncio context.
-        await asyncio.wrap_future(send_future)
-
+        send_future = None
         try:
+            with self._call_lock:
+                if self._closed:
+                    raise RPCCancelled("RPC client closed")
+                send_future = asyncio.run_coroutine_threadsafe(
+                    _send_streaming_request(request), self._loop)
+            sent = asyncio.wrap_future(send_future)
+            # Closing can stop the RPC loop while the transport send is pending.
+            while not sent.done():
+                await asyncio.wait((sent, ),
+                                   timeout=_CLOSE_CHECK_INTERVAL_SECONDS)
+                if self._closed:
+                    raise RPCCancelled("RPC client closed")
+            await sent
             logger_debug(
                 f"[client] [{datetime.now().isoformat()}] Starting to read streaming responses for request_id={request_id}"
             )
@@ -661,6 +678,8 @@ class RPCClient:
             raise RPCTimeout(
                 f"Streaming request '{name}' timed out after {timeout}s")
         finally:
+            if send_future is not None:
+                send_future.cancel()
             # Clean up
             with self._streaming_queues_lock:
                 self._streaming_queues.pop(request_id, None)

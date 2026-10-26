@@ -319,6 +319,23 @@ async def _lifecycle() -> None:
     from tensorrt_llm.grpc.openengine.metrics import OpenEngineMetrics
 
     llm = SimpleNamespace(args=_args(), get_stats=lambda timeout: [])
+    resolve = socket.getaddrinfo
+
+    def ipv6_first(host, *args, **kwargs):
+        addresses = resolve(host, *args, **kwargs)
+        if host == "localhost":
+            addresses.sort(key=lambda address: address[0] != socket.AF_INET6)
+        return addresses
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(socket, "getaddrinfo", ipv6_first)
+        localhost = OpenEngineMetrics(llm, "test-model", "localhost", 0, True)
+        try:
+            await localhost.start()
+            await _scrape(localhost.port)  # Scrape over IPv4 even with IPv6-first DNS.
+        finally:
+            await localhost.stop()
+            await localhost.wait_for_collection()
     if socket.has_ipv6:
         try:
             ipv6_socket = socket.create_server(("::1", 0), family=socket.AF_INET6)
@@ -435,7 +452,18 @@ async def _rpc_shutdown() -> None:
     from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
     from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 
-    for mode in ("deadline", "rpc_deadline", "sync", "future", "async", "queued"):
+    for mode in (
+        "deadline",
+        "rpc_deadline",
+        "sync",
+        "future",
+        "async",
+        "queued",
+        "send_sync",
+        "send_future",
+        "send_stream",
+        "stream_admission",
+    ):
         entered, release = threading.Event(), threading.Event()
 
         class App:
@@ -451,6 +479,29 @@ async def _rpc_shutdown() -> None:
         client = RPCClient(server.address, hmac_key=server.hmac_key, num_workers=1)
         proxy = SimpleNamespace(rpc_client=client)
         try:
+            if mode == "stream_admission":
+                from tensorrt_llm.executor.rpc import rpc_client
+
+                class ClosingQueue(rpc_client.AsyncQueue):
+                    def __init__(self):
+                        super().__init__()
+                        client.close()
+
+                with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(rpc_client, "AsyncQueue", ClosingQueue)
+                    stream = client.never_stream().remote_streaming()
+                    with pytest.raises(RPCCancelled):
+                        await asyncio.wait_for(stream.__anext__(), 3)
+                assert not client._streaming_queues
+                continue
+            if mode.startswith("send_"):
+
+                async def blocked_send(request):
+                    entered.set()
+                    while not release.is_set():
+                        await asyncio.sleep(0.01)
+
+                client._client_socket.put_async = blocked_send
             if mode == "queued":
                 # Hold the sole worker until close has stopped the RPC loop.
                 blocker = client._executor.submit(release.wait)
@@ -468,11 +519,14 @@ async def _rpc_shutdown() -> None:
                 with pytest.raises(RPCCancelled):
                     GenerationExecutorProxy.get_stats(proxy, timeout=0.1)
                 continue
-            if mode == "async":
+            if mode == "send_stream":
+                stream = client.never_stream().remote_streaming()
+                read = asyncio.create_task(stream.__anext__())
+            elif mode == "async":
                 read = asyncio.create_task(
                     client.fetch_stats_wait_async(timeout=0.1).remote_async()
                 )
-            elif mode == "future":
+            elif mode in ("future", "send_future"):
                 read = asyncio.wrap_future(
                     client.fetch_stats_wait_async(timeout=0.1).remote_future()
                 )
@@ -495,9 +549,26 @@ async def _rpc_shutdown() -> None:
                 await asyncio.wait_for(asyncio.to_thread(client.close), 3)
                 with pytest.raises(RPCCancelled):
                     await asyncio.wait_for(read, 3)
+                assert not client._streaming_queues
         finally:
             release.set()
             await asyncio.to_thread(client.close)
+            if mode.startswith("send_"):
+                # Drain cancellation callbacks queued after the deliberately stopped loop.
+                async def drain_cancelled_sends():
+                    pending = asyncio.all_tasks() - {asyncio.current_task()}
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                drain_thread = threading.Thread(target=client._loop.run_forever)
+                drain_thread.start()
+                await asyncio.wrap_future(
+                    asyncio.run_coroutine_threadsafe(drain_cancelled_sends(), client._loop)
+                )
+                client._loop.call_soon_threadsafe(client._loop.stop)
+                await asyncio.to_thread(drain_thread.join, 3)
+                client._loop.close()
             await asyncio.to_thread(server.shutdown)
 
 
