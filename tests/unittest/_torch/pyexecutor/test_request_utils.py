@@ -1005,9 +1005,12 @@ def test_py_objects_carry_the_batched_logits_processor_flag():
     py_request_objects = broadcaster._collect_py_objects(items)
 
     assert ("py_apply_batched_logits_processor", {2: True}) in py_request_objects
-    attach_py_objects_to_requests(items, py_request_objects)
-    assert not hasattr(items[0].request, "py_apply_batched_logits_processor")
-    assert items[1].request.py_apply_batched_logits_processor is True
+    # Receiving ranks rebuild the requests without the flag; attaching the
+    # broadcast objects must restore it on request 2 only.
+    received = [_make_broadcast_item(1), _make_broadcast_item(2)]
+    attach_py_objects_to_requests(received, py_request_objects)
+    assert not hasattr(received[0].request, "py_apply_batched_logits_processor")
+    assert received[1].request.py_apply_batched_logits_processor is True
 
 
 def test_single_round_non_root_receives_payload_or_nothing():
