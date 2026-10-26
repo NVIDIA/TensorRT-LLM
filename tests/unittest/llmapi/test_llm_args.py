@@ -52,11 +52,9 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
                                           EncodeCudaGraphConfig,
-                                          ExecutorMemoryType,
-                                          ExtendedRuntimePerfKnobConfig,
-                                          KvCacheConfig, MambaStateConfig,
-                                          MoeConfig, MTPDecodingConfig,
-                                          MultimodalConfig,
+                                          ExecutorMemoryType, KvCacheConfig,
+                                          MambaStateConfig, MoeConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           NGramDecodingConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
@@ -77,6 +75,27 @@ from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 
 from .test_llm import llama_model_path
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("type_name",
+                         ["BatchingType", "ExtendedRuntimePerfKnobConfig"])
+def test_retired_executor_types(type_name: str) -> None:
+    from tensorrt_llm.llmapi import llm_utils, serialization
+
+    for module in (tle, public_llmapi, llm_args_mod, llm_utils):
+        assert not hasattr(module, type_name)
+        assert type_name not in getattr(module, "__all__", ())
+    assert type_name not in serialization.BASE_EXAMPLE_CLASSES[
+        "tensorrt_llm.bindings.executor"]
+
+    legacy_pickle = f"ctensorrt_llm.bindings.executor\n{type_name}\n.".encode()
+    with pytest.raises(ValueError, match=f"{type_name} is not allowed"):
+        serialization.loads(legacy_pickle,
+                            approved_imports=serialization.BASE_EXAMPLE_CLASSES)
+
+    policy = CapacitySchedulerPolicy.STATIC_BATCH
+    assert policy._to_pybind() == tle.CapacitySchedulerPolicy.STATIC_BATCH
 
 
 @pytest.mark.cpu_only
@@ -3375,21 +3394,6 @@ class TestStrictBaseModelArbitraryArgs:
             KvCacheConfig(enable_block_reuse=True,
                           non_existent_field="should_fail")
         assert "non_existent_field" in str(exc_info.value)
-
-    def test_extended_runtime_perf_knob_config_arbitrary_args(self):
-        """Test that ExtendedRuntimePerfKnobConfig rejects arbitrary arguments."""
-        # Valid arguments should work
-        config = ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                               cuda_graph_mode=False)
-        assert config.multi_block_mode == True
-        assert config.cuda_graph_mode == False
-
-        # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
-            ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                          bogus_setting="should_fail")
-        assert "bogus_setting" in str(exc_info.value)
 
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""
