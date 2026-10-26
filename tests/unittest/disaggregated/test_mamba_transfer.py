@@ -29,13 +29,19 @@ os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 # working interface (e.g. eth0), and without the pin UCX tries every
 # interface and dies on unbindable ones (rdma_vf_rail0 IPv6 bind failure).
 
+from pages_test_utils import buf, group, head_major, pages, pool, replicated, sectioned
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.page_mapping import (
+    RankPages,
+    plan_transfers,
+    receiver_extra_bytes,
+    validate_peer_compatible,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.config_utils import Qwen4ExpPLECacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
@@ -206,36 +212,60 @@ def _create_transceivers(tp, managers, config, enable_attention_dp=False):
     return results
 
 
-def _create_managers(
-    tp,
-    max_batch_size=MAX_BATCH_SIZE,
-    enable_attention_dp=False,
-    use_v2=True,
-    conv_state_layout="x_b_c",
-    with_ple=False,
-):
-    """Create Mamba hybrid cache managers for all TP ranks (PP=1).
+def _create_manager(manager_cls, mapping, max_batch_size=MAX_BATCH_SIZE, **manager_kwargs):
+    """Create one Mamba hybrid cache manager.
 
     Layer 0 is a dummy attention layer required by page table infrastructure.
     Layers 1..NUM_MAMBA_LAYERS are mamba layers under test.
     """
+    return manager_cls(
+        mamba_d_state=MAMBA_D_STATE,
+        mamba_d_conv=MAMBA_D_CONV,
+        mamba_num_heads=MAMBA_NUM_HEADS,
+        mamba_n_groups=MAMBA_N_GROUPS,
+        mamba_head_dim=MAMBA_HEAD_DIM,
+        mamba_num_layers=NUM_MAMBA_LAYERS,
+        mamba_layer_mask=_MAMBA_MASK,
+        mamba_cache_dtype=torch.float32,
+        mamba_ssm_cache_dtype=torch.float32,
+        # dummy attention layer (page table scaffolding)
+        kv_cache_config=KvCacheConfig(
+            max_tokens=256 * max_batch_size,
+            enable_block_reuse=False,
+            event_buffer_max_size=0,
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=1,
+        layer_mask=_ATTN_MASK,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=8,
+        max_seq_len=256,
+        max_batch_size=max_batch_size,
+        mapping=mapping,
+        dtype=DataType.FLOAT,
+        **manager_kwargs,
+    )
+
+
+def _create_managers(
+    tp,
+    max_batch_size=MAX_BATCH_SIZE,
+    enable_attention_dp=False,
+    conv_state_layout="x_b_c",
+    with_ple=False,
+):
+    """Create V2 Mamba hybrid cache managers for all TP ranks (PP=1)."""
     managers = []
     for rank in range(tp):
         mapping = Mapping(
             world_size=tp, rank=rank, tp_size=tp, pp_size=1, enable_attention_dp=enable_attention_dp
         )
-        manager_cls = MambaHybridCacheManagerV2 if use_v2 else MixedMambaHybridCacheManager
-        manager_kwargs = (
-            {
-                "is_disagg": True,
-                "conv_state_layout": conv_state_layout,
-            }
-            if use_v2
-            else {}
-        )
+        manager_kwargs = {
+            "is_disagg": True,
+            "conv_state_layout": conv_state_layout,
+        }
         if with_ple:
-            if not use_v2:
-                raise ValueError("PLE state requires the V2 cache manager")
             manager_kwargs["qwen4_exp_ple_cache_params"] = Qwen4ExpPLECacheParams(
                 ple_layer_mask=[False, False, True, False, False],
                 num_ple_layers=1,
@@ -244,145 +274,92 @@ def _create_managers(
                 ngram_context_len=2,
                 conv_state_dtype=torch.float32,
             )
-        mgr = manager_cls(
-            mamba_d_state=MAMBA_D_STATE,
-            mamba_d_conv=MAMBA_D_CONV,
-            mamba_num_heads=MAMBA_NUM_HEADS,
-            mamba_n_groups=MAMBA_N_GROUPS,
-            mamba_head_dim=MAMBA_HEAD_DIM,
-            mamba_num_layers=NUM_MAMBA_LAYERS,
-            mamba_layer_mask=_MAMBA_MASK,
-            mamba_cache_dtype=torch.float32,
-            mamba_ssm_cache_dtype=torch.float32,
-            # dummy attention layer (page table scaffolding)
-            kv_cache_config=KvCacheConfig(
-                max_tokens=256 * max_batch_size,
-                enable_block_reuse=False,
-                event_buffer_max_size=0,
-            ),
-            kv_cache_type=CacheTypeCpp.SELF,
-            num_layers=1,
-            layer_mask=_ATTN_MASK,
-            num_kv_heads=4,
-            head_dim=64,
-            tokens_per_block=8,
-            max_seq_len=256,
-            max_batch_size=max_batch_size,
-            mapping=mapping,
-            dtype=DataType.FLOAT,
-            **manager_kwargs,
+        managers.append(
+            _create_manager(
+                MambaHybridCacheManagerV2,
+                mapping,
+                max_batch_size=max_batch_size,
+                **manager_kwargs,
+            )
         )
-        managers.append(mgr)
     return managers
 
 
 def _mamba_layer_ids(manager):
-    if isinstance(manager, MambaHybridCacheManagerV2):
-        return manager.mamba_layer_offsets
-    return manager._impl.mamba_layer_offsets
+    return manager.mamba_layer_offsets
 
 
 def _mamba_state_slot(manager, request_id):
-    if isinstance(manager, MambaHybridCacheManagerV2):
-        return manager._request_id_to_state_index[request_id]
-    return manager.mamba_cache_index[request_id]
+    return manager._request_id_to_state_index[request_id]
 
 
 def _zero_mamba_states(manager):
     for layer_idx in _mamba_layer_ids(manager):
         manager.get_conv_states(layer_idx).zero_()
         manager.get_ssm_states(layer_idx).zero_()
-    if isinstance(manager, MambaHybridCacheManagerV2):
-        for state in manager._ple_conv_states.values():
-            state.zero_()
-        for state in manager._ple_ngram_contexts.values():
-            state.zero_()
+    for state in manager._ple_conv_states.values():
+        state.zero_()
+    for state in manager._ple_ngram_contexts.values():
+        state.zero_()
+
+
+_CONV_ROLE = "conv_state"
+_SSM_ROLE = "ssm_state"
+_SIDE_ROLE = "ple_ngram_context"
+
+
+def _state_pages(
+    *,
+    conv_section_bytes,
+    ssm_bytes: int,
+    bytes_per_head: int,
+    side_bytes=None,
+    layers=(1, 2),
+) -> RankPages:
+    """One mamba state layer group: conv / SSM state for ``layers``, side state on the last layer.
+
+    Each role sits in its own pool whose slot holds the role of every layer back to back, the way
+    ``KVCacheManagerV2`` coalesces equal-size buffers of one life cycle. Conv state is sectioned
+    (each section sharded on its own), SSM state head-major, and the side state replicated.
+    """
+    conv_bytes = sum(conv_section_bytes)
+    pools = [
+        pool(base=0xA000, slot_bytes=conv_bytes * len(layers), num_slots=8),
+        pool(base=0xB0000, slot_bytes=ssm_bytes * len(layers), num_slots=8),
+    ]
+    buffers = []
+    for local_layer, layer in enumerate(layers):
+        buffers.append(
+            buf(0, layer, _CONV_ROLE, local_layer * conv_bytes, sectioned(conv_section_bytes))
+        )
+        buffers.append(
+            buf(
+                1,
+                layer,
+                _SSM_ROLE,
+                local_layer * ssm_bytes,
+                head_major(ssm_bytes, ssm_bytes // bytes_per_head),
+            )
+        )
+    if side_bytes is not None:
+        pools.append(pool(base=0xC0000, slot_bytes=side_bytes, num_slots=8))
+        buffers.append(buf(2, layers[-1], _SIDE_ROLE, 0, replicated(side_bytes)))
+    return pages(pools, [group("state", buffers)])
 
 
 def test_mamba_receiver_payload_bytes_matched_tp():
-    """mamba_receiver_payload_bytes returns correct size for matched-TP page tables."""
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-        mamba_receiver_payload_bytes,
-    )
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
-        KVCachePageTable,
-        LocalLayer,
-        MambaLayerGroup,
-        MapperKind,
-        PhysicalPool,
-        PhysicalPoolGroup,
-        PoolView,
-    )
-
+    """receiver_extra_bytes returns the recurrent-state size for matched-TP pages."""
     conv_slot_bytes = 1024
     ssm_slot_bytes = 2048
     side_slot_bytes = 128
-    sorted_lids = [0, 1]
-
-    conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=8)
-    ssm_pool = PhysicalPool(base_address=0xB000, slot_bytes=ssm_slot_bytes, num_slots=8)
-    pool_views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=conv_slot_bytes,
-            section_bytes=[512, 256, 256],
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array(
-                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=ssm_slot_bytes,
-            bytes_per_head=64,
-        ),
-        PoolView(
-            pool_idx=2,
-            buffer_entries=np.array([(1, 0, side_slot_bytes)], dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=frozenset({"ple_ngram_context"}),
-            mapper_kind=MapperKind.REPLICATED,
-            bytes_per_layer=side_slot_bytes,
-        ),
-    ]
-    local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=1),
-        LocalLayer(local_layer_id=1, global_layer_id=2),
-    ]
-
-    mlg = MambaLayerGroup(
-        pool_group_idx=1,
-        local_layers=local_layers,
-        pool_views=pool_views,
-    )
-    pt = KVCachePageTable(
-        tokens_per_block=8,
-        layer_groups=[mlg],
-        pool_groups=[
-            PhysicalPoolGroup(pools=[]),  # idx 0 placeholder
-            PhysicalPoolGroup(
-                pools=[
-                    conv_pool,
-                    ssm_pool,
-                    PhysicalPool(
-                        base_address=0xC000,
-                        slot_bytes=side_slot_bytes,
-                        num_slots=8,
-                    ),
-                ]
-            ),
-        ],
+    pt = _state_pages(
+        conv_section_bytes=[512, 256, 256],
+        ssm_bytes=ssm_slot_bytes,
+        bytes_per_head=64,
+        side_bytes=side_slot_bytes,
     )
 
-    got = mamba_receiver_payload_bytes(sender_page_table=pt, receiver_page_table=pt, dst_slot=3)
+    got = receiver_extra_bytes(pt, pt, [np.array([3], dtype=np.int64)])
     # Standard state covers both layers; the side role exists only on layer 2.
     assert got == 2 * (conv_slot_bytes + ssm_slot_bytes) + side_slot_bytes
 
@@ -402,112 +379,39 @@ def _make_rank_info(*, tp_size: int, tp_rank: int = 0) -> RankInfo:
     )
 
 
-def _make_side_state_page_table(*, include_side: bool = True):
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
-        KVCachePageTable,
-        LocalLayer,
-        MambaLayerGroup,
-        MapperKind,
-        PhysicalPool,
-        PhysicalPoolGroup,
-        PoolView,
-    )
-
-    local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=1),
-        LocalLayer(local_layer_id=1, global_layer_id=2),
-    ]
-    pools = [
-        PhysicalPool(base_address=1000, slot_bytes=16, num_slots=4),
-        PhysicalPool(base_address=2000, slot_bytes=16, num_slots=4),
-    ]
-    views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array([(0, 0, 16), (1, 16, 16)], dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=16,
-            section_bytes=[4, 4, 8],
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array([(0, 0, 16), (1, 16, 16)], dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=16,
-            bytes_per_head=16,
-        ),
-    ]
-    if include_side:
-        pools.append(PhysicalPool(base_address=3000, slot_bytes=8, num_slots=4))
-        views.append(
-            PoolView(
-                pool_idx=2,
-                buffer_entries=np.array([(1, 0, 8)], dtype=BUFFER_ENTRY_DTYPE),
-                pool_role=frozenset({"ple_ngram_context"}),
-                mapper_kind=MapperKind.REPLICATED,
-                bytes_per_layer=8,
-            )
-        )
-    return KVCachePageTable(
-        tokens_per_block=8,
-        layer_groups=[
-            MambaLayerGroup(
-                pool_group_idx=0,
-                local_layers=local_layers,
-                pool_views=views,
-            )
-        ],
-        pool_groups=[PhysicalPoolGroup(pools=pools)],
+def _make_side_state_pages(*, include_side: bool = True, side_bytes: int = 8):
+    return _state_pages(
+        conv_section_bytes=[4, 4, 8],
+        ssm_bytes=16,
+        bytes_per_head=16,
+        side_bytes=side_bytes if include_side else None,
     )
 
 
 def test_mamba_policy_rejects_incompatible_replicated_side_state():
     rank_info = _make_rank_info(tp_size=1)
-    pt_with_side = _make_side_state_page_table()
-    pt_without_side = _make_side_state_page_table(include_side=False)
+    pt_with_side = _make_side_state_pages()
+    pt_without_side = _make_side_state_pages(include_side=False)
 
-    # Replicated recurrent state is validated by MambaPolicy; the attention
-    # policy only looks at PAGED groups and must not reject this pair.
-    with pytest.raises(ValueError, match="differ on overlapping layers"):
-        peer.MambaPolicy.validate_peer_compatible(
-            rank_info, rank_info, pt_with_side, pt_without_side
-        )
-    AttentionPolicy.validate_peer_compatible(pt_with_side, pt_without_side)
+    # A replicated role held on only one side of a shared layer would leave the receiver with
+    # zeroed state, so the peer is rejected rather than the role silently skipped.
+    with pytest.raises(ValueError, match="replicated roles differ on overlapping layers"):
+        validate_peer_compatible(rank_info, rank_info, pt_with_side, pt_without_side)
 
     # Same roles but a different per-layer size is rejected up front.
-    pt_wider_side = _make_side_state_page_table()
-    side_view = pt_wider_side.layer_groups[0].pool_views[2]
-    side_view.buffer_entries = np.array([(1, 0, 16)], dtype=side_view.buffer_entries.dtype)
-    side_view.bytes_per_layer = 16
+    pt_wider_side = _make_side_state_pages(side_bytes=16)
     with pytest.raises(ValueError, match="replicated state size differs"):
-        peer.MambaPolicy.validate_peer_compatible(rank_info, rank_info, pt_with_side, pt_wider_side)
+        validate_peer_compatible(rank_info, rank_info, pt_with_side, pt_wider_side)
 
-    # REPLICATED state under the STATE life cycle uses the per-layer-pointer
-    # head-match mapper and requires equal per-layer sizes.
-    state_lg = pt_with_side.layer_groups[0]
-    common = dict(
-        peer_ri=rank_info,
-        mapper_kind=peer.MapperKind.REPLICATED,
-        self_layer_offsets=np.array([0], dtype=np.int64),
-        peer_layer_offsets=np.array([0], dtype=np.int64),
-        src_layer_off=0,
-        dst_layer_off=0,
-        self_lg=state_lg,
-        peer_lg=state_lg,
-    )
-    with pytest.raises(ValueError, match="Replicated state size differs"):
-        peer.MambaPolicy(rank_info).build_mapper(
-            self_bytes_per_layer=8, peer_bytes_per_layer=16, **common
-        )
-    mapper = peer.MambaPolicy(rank_info).build_mapper(
-        self_bytes_per_layer=8, peer_bytes_per_layer=8, **common
-    )
-    assert isinstance(mapper, peer.MambaHeadMatchMapper)
+    # REPLICATED state under the STATE life cycle moves whole per layer and
+    # requires equal per-layer sizes.
+    with pytest.raises(ValueError, match="cache region size mismatch"):
+        plan_transfers(rank_info, rank_info, pt_with_side, pt_wider_side)
+    groups = plan_transfers(rank_info, rank_info, pt_with_side, pt_with_side)
+    side_pool = (0, 2)
+    (side_group,) = [g for g in groups if g.self_pool == side_pool]
+    assert side_group.peer_pool == side_pool
+    assert side_group.plan.runs == [(0, 0, 8)]
 
 
 # ---------------------------------------------------------------------------
@@ -663,7 +567,8 @@ def _write_ple_ground_truth_to_ctx(managers, request_ids):
 # Main test logic
 # ---------------------------------------------------------------------------
 def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
-    mgr = _create_managers(1, max_batch_size=1, enable_attention_dp=True, use_v2=False)[0]
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1, enable_attention_dp=True)
+    mgr = _create_manager(MixedMambaHybridCacheManager, mapping, max_batch_size=1)
     try:
         req = LlmRequest(
             request_id=100,
@@ -694,7 +599,6 @@ def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
 def run_mamba_transfer_test(
     ctx_tp: int,
     gen_tp: int,
-    use_v2: bool = True,
     conv_state_layout: str = "x_b_c",
     with_ple: bool = False,
 ):
@@ -702,13 +606,11 @@ def run_mamba_transfer_test(
     # -- 1. Create managers, zero mamba caches --
     ctx_mgrs = _create_managers(
         ctx_tp,
-        use_v2=use_v2,
         conv_state_layout=conv_state_layout,
         with_ple=with_ple,
     )
     gen_mgrs = _create_managers(
         gen_tp,
-        use_v2=use_v2,
         conv_state_layout=conv_state_layout,
         with_ple=with_ple,
     )
@@ -844,7 +746,6 @@ def run_mamba_transfer_test(
                 ),
             )
 
-    # Only the V2 manager owns PLE state.
     if with_ple:
         for gen_rank, manager in enumerate(gen_mgrs):
             for req_idx, request_id in enumerate(gen_rids):
@@ -904,7 +805,6 @@ def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout):
     run_mamba_transfer_test(
         ctx_tp,
         gen_tp,
-        use_v2=True,
         conv_state_layout=conv_state_layout,
     )
 
@@ -912,4 +812,4 @@ def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout):
 @pytest.mark.timeout(180)
 def test_v2_mamba_transfer_with_replicated_ple_state():
     """Transfer PLE state once while standard Mamba state contracts from TP2 to TP1."""
-    run_mamba_transfer_test(2, 1, use_v2=True, with_ple=True)
+    run_mamba_transfer_test(2, 1, with_ple=True)

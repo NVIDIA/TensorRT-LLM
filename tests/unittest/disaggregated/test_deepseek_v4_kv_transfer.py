@@ -41,8 +41,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
 )
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -143,16 +142,15 @@ def _init_pool_data(
     initialized_devices = set()
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
-        page_table = KVRegionExtractorV1(mgr).page_table
+        rank_pages = RankPages.of_manager(mgr)
 
-        # Collect unique pools (deduplicate by base_address)
+        # Collect unique pools (deduplicate by base address)
         unique_pools: Dict[int, int] = {}
-        for lg_idx, lg in enumerate(page_table.layer_groups):
-            for pv in lg.pool_views:
-                pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                key = pool.base_address
-                if key not in unique_pools or get_pool_bytes(pool) > unique_pools[key]:
-                    unique_pools[key] = get_pool_bytes(pool)
+        for pool in rank_pages.pools:
+            key = pool.base
+            pool_bytes = pool.slot_bytes * pool.num_slots
+            if key not in unique_pools or pool_bytes > unique_pools[key]:
+                unique_pools[key] = pool_bytes
 
         # Use HALF (2 bytes) as element type - divides all pool sizes evenly
         elem_bytes = 2  # sizeof(half)

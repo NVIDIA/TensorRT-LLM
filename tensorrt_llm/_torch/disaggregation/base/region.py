@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import IntFlag, auto
-from typing import List, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import numpy as np
 
@@ -39,13 +38,6 @@ class MemRegionGroup(NamedTuple):
     bytes_per_region: int
 
 
-class DataLayout(IntFlag):
-    """Possible orders for storing data in memory."""
-
-    HND = auto()  # (head, seq_len, dim)
-    NHD = auto()  # (seq_len, head, dim)
-
-
 @dataclass(frozen=True)
 class RegionSpec:
     """
@@ -73,22 +65,6 @@ class SpecRegion(NamedTuple):
 
     memory: MemRegion | MemRegionGroup
     spec: RegionSpec = None
-
-
-class RegionExtractorBase(ABC):
-    """
-    Interface for extracting region descriptors from some backing store.
-    """
-
-    @abstractmethod
-    def extract(self, region_ids: Optional[np.ndarray] = None) -> List[SpecRegion]:
-        """
-        Args:
-            region_ids: (Optional) np.ndarray of integer region identifiers to extract.
-        Returns:
-            List of Regions for corresponding regions.
-        """
-        ...
 
 
 class SpecRegionPair(NamedTuple):

@@ -13,17 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import List, Optional
 
 import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 
 @dataclass
@@ -45,48 +42,36 @@ class RankInfo:
     cp_rank: int = 0
     device_id: int = 0
 
-    attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
-    page_table: Optional[KVCachePageTable] = None
+    pages: Optional[RankPages] = None
     bounded_replay_on_generation: bool = False
 
     @property
     def tp_size_per_dp_group(self) -> int:
-        if self.attention is None:
-            return self.tp_size
-        return self.tp_size // self.dp_size if self.attention.enable_attention_dp else self.tp_size
+        """Tensor-parallel ranks of one data-parallel group: one under attention data parallelism,
+        as the rank's page layout says, all of them otherwise."""
+        if self.pages is not None and self.pages.layout.topology.attention_dp:
+            return self.tp_size // self.dp_size
+        return self.tp_size
 
     def to_bytes(self) -> bytes:
-        data = asdict(self)
-        data["attention"] = self.attention.to_dict() if self.attention is not None else None
+        # Pages hold read-only mappings, which asdict cannot copy; they serialize themselves.
+        data = asdict(replace(self, pages=None))
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
-        data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
+        data["pages"] = self.pages.to_dict() if self.pages is not None else None
         return msgpack.packb(data)
 
     @classmethod
     def from_kv_cache_manager(
         cls,
         instance_name: str,
-        kv_cache_manager: KVCacheManager,
+        kv_cache_manager: KVCacheManagerV2,
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
     ) -> "RankInfo":
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
-        # Keep AttentionInfo on attention-free PP stages so it can still carry
-        # the attention-DP topology used by Mamba transfers.  A zero head count
-        # means that this rank has no local attention cache; AttentionPolicy
-        # must not perform head-ratio arithmetic for such ranks.
-        kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
-        # Eight is the smallest element count guaranteed to occupy whole bytes
-        # for every supported sub-byte cache dtype (including NVFP4).
-        bytes_for_eight_elements = get_size_in_bytes(8, kvm.dtype)
-        element_bytes = (
-            bytes_for_eight_elements // 8
-            if bytes_for_eight_elements % 8 == 0
-            else bytes_for_eight_elements / 8
-        )
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -103,26 +88,16 @@ class RankInfo:
             sender_endpoints=[],
             self_endpoint="",
             transfer_engine_info=bytes(),
-            attention=AttentionInfo(
-                kv_heads_per_rank=kv_heads_per_rank,
-                tokens_per_block=kvm.tokens_per_block,
-                dims_per_head=kvm.head_dim,
-                element_bytes=element_bytes,
-                enable_attention_dp=enable_attention_dp,
-                is_mla=kvm.kv_factor == 1,
-            ),
             aux_meta=aux_buffer_meta,
-            page_table=build_page_table_from_manager(kvm),
+            pages=RankPages.of_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
         )
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
-        if unpacked.get("attention") is not None:
-            unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
-        if unpacked.get("page_table") is not None:
-            unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
+        if unpacked.get("pages") is not None:
+            unpacked["pages"] = RankPages.from_dict(unpacked["pages"])
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
         return cls(**unpacked)

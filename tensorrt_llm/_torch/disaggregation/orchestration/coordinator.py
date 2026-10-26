@@ -486,7 +486,7 @@ class DisaggTransferCoordinator:
         """Start async KV sends for finished context-only requests."""
         # Do not send more chunks after an in-flight cancellation.
         cancel_pending_ids = set(self._registry.canceled_request_ids())
-        bridge_enabled = getattr(self._transceiver, "_fp4_mla_bridge_enabled", False) is True
+        bridge_enabled = getattr(self._transceiver, "_ownership_bridge_enabled", False) is True
         for req in requests:
             if not req.is_context_only_request or req.is_finished_due_to_cancellation:
                 continue

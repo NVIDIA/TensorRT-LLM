@@ -20,8 +20,8 @@ tells them apart.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Protocol, Set, Tuple, Union, runtime_checkable
+from dataclasses import dataclass
+from typing import FrozenSet, List, Optional, Protocol, Tuple, Union, runtime_checkable
 
 import numpy as np
 
@@ -57,6 +57,8 @@ class Chunk:
     ``token_range`` is the span this piece moves, not a claim that every layer group covers it: a
     recurrent-state group carries one slot rather than a span, and a windowed group's table is
     mostly holes.
+
+    Layer group ``g`` is layer group ``g`` of the rank's pages (``page_mapping.RankPages``).
     """
 
     block_ids_per_layer_groups: List[np.ndarray]
@@ -75,7 +77,8 @@ class Chunk:
     Cannot be derived from ``token_range``: a windowed or recurrent-state group never fills the
     span, so comparing against the full length lies."""
 
-    excluded_pool_views: Set[Tuple[int, int]] = field(default_factory=set)
+    excluded_buffers: FrozenSet[Tuple[int, int]] = frozenset()
+    """``(layer group, buffer)`` of local buffers this request does not move (``page_mapping``)."""
 
     def __post_init__(self):
         if len(self.kind_per_layer_group) != len(self.block_ids_per_layer_groups):

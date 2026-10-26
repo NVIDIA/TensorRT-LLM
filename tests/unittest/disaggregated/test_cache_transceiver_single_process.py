@@ -17,7 +17,7 @@
 
 Uses threading + ThreadSafeDistributed to create KvCacheTransceiverV2 instances
 in a single process. Validates KV cache transfer correctness across different
-TP/PP/DP/MLA/sliding-window configurations for V2 cache managers.
+TP/PP/DP/MLA/sliding-window configurations.
 """
 
 import gc
@@ -46,8 +46,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
+from tensorrt_llm._torch.disaggregation.base import CacheKind
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -77,7 +77,9 @@ REQUEST_LENGTHS = [30, 60, 80]
 
 def test_assert_disagg_history_declared_passes_when_contract_met():
     req = SimpleNamespace(py_request_id=7, prompt_len=17)
-    cache_manager = SimpleNamespace(get_history_length=lambda r: 17)
+    cache_manager = SimpleNamespace(
+        get_transfer_length=lambda r: r.prompt_len, get_history_length=lambda r: 17
+    )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = cache_manager
 
@@ -91,7 +93,9 @@ def test_assert_disagg_history_declared_passes_when_contract_met():
 
 def test_assert_disagg_history_declared_raises_on_contract_violation():
     req = SimpleNamespace(py_request_id=7, prompt_len=17)
-    cache_manager = SimpleNamespace(get_history_length=lambda r: 0)
+    cache_manager = SimpleNamespace(
+        get_transfer_length=lambda r: r.prompt_len, get_history_length=lambda r: 0
+    )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = cache_manager
 
@@ -102,7 +106,9 @@ def test_assert_disagg_history_declared_raises_on_contract_violation():
 def test_assert_disagg_history_declared_noops_when_cache_released():
     """If the cache was released (e.g., cancelled mid-transfer), skip the check."""
     req = SimpleNamespace(py_request_id=7, prompt_len=17)
-    cache_manager = SimpleNamespace(get_history_length=lambda r: None)
+    cache_manager = SimpleNamespace(
+        get_transfer_length=lambda r: r.prompt_len, get_history_length=lambda r: None
+    )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = cache_manager
 
@@ -132,16 +138,6 @@ def _pp_rank_of_layer(layer_idx: int, num_layers: int, pp_size: int) -> int:
         if layer_idx < cumulative:
             return pp_rank
     raise ValueError(f"layer_idx {layer_idx} out of range for num_layers={num_layers}")
-
-
-def _pp_layer_start(pp_rank: int, num_layers: int, pp_size: int) -> int:
-    """Return the global layer index of the first layer on *pp_rank*."""
-    start = 0
-    for r, count in enumerate(_get_layers_per_pp(num_layers, pp_size)):
-        if r == pp_rank:
-            return start
-        start += count
-    raise ValueError(f"pp_rank {pp_rank} out of range for pp_size={pp_size}")
 
 
 @dataclass
@@ -330,11 +326,10 @@ def _get_ctx_seed(
 def _create_cache_manager(
     mapping: Mapping,
     is_mla: bool,
-    use_v2: bool,
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
-) -> "KVCacheManagerV2":
+) -> KVCacheManagerV2:
     """Create a KVCacheManagerV2 for the given mapping."""
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     cache_type = CacheTypeCpp.SELFKONLY if is_mla else CacheTypeCpp.SELF
@@ -366,7 +361,6 @@ def _create_managers_for_instance(
     pp: int,
     enable_dp: bool,
     is_mla: bool,
-    use_v2: bool,
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
@@ -398,7 +392,6 @@ def _create_managers_for_instance(
                     _create_cache_manager(
                         mapping,
                         is_mla,
-                        use_v2,
                         max_attention_window_vec,
                         num_layers,
                         max_batch_size,
@@ -410,29 +403,26 @@ def _create_managers_for_instance(
 # ---------------------------------------------------------------------------
 # Pool Data Initialization
 # ---------------------------------------------------------------------------
-
-
-def _init_pool_data_v2(
+def _init_pool_data(
     managers: List[KVCacheManagerV2],
     tp: int,
     is_mla: bool,
     fill_random: bool = True,
     seed_base: int = 1000,
 ):
-    """Initialize pool data for V2 managers."""
+    """Initialize pool data: random for ctx, zeros for gen."""
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
         tp_rank = rank % tp
-        page_table = KVRegionExtractorV1(mgr).page_table
+        rank_pages = RankPages.of_manager(mgr)
 
         unique_pools: Dict[int, int] = {}
-        for pg in page_table.pool_groups:
-            for pool_desc in pg.pools:
-                key = pool_desc.base_address
-                pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
-                if key not in unique_pools or pool_bytes > unique_pools[key]:
-                    unique_pools[key] = pool_bytes
+        for pool in rank_pages.pools:
+            key = pool.base
+            pool_bytes = pool.slot_bytes * pool.num_slots
+            if key not in unique_pools or pool_bytes > unique_pools[key]:
+                unique_pools[key] = pool_bytes
 
         element_bytes = get_size_in_bytes(1, mgr.dtype)
         for pool_base_ptr, pool_size in unique_pools.items():
@@ -452,11 +442,6 @@ def _init_pool_data_v2(
                 pool_tensor.copy_(random_values)
             else:
                 pool_tensor.zero_()
-
-
-def _init_pool_data(managers, tp, is_mla, use_v2, fill_random=True, seed_base=1000):
-    """Initialize V2 pool data for every rank."""
-    _init_pool_data_v2(managers, tp, is_mla, fill_random, seed_base)
 
 
 # ---------------------------------------------------------------------------
@@ -509,12 +494,11 @@ def _add_sequence(
     mgr,
     request_id: int,
     prompt_len: int,
-    use_v2: bool,
     *,
     is_generation: bool = False,
     scratch_tokens: int = 0,
 ):
-    """Add a sequence to the cache manager. Returns kv_cache for V2 (needed for cleanup).
+    """Add a sequence to the cache manager. Returns the kv_cache (needed for cleanup).
 
     scratch_tokens > 0 (generation side only) sizes the cache to
     prompt_len + scratch_tokens with history_length still prompt_len -- exactly
@@ -640,9 +624,7 @@ def create_instance_transceivers(
 # ---------------------------------------------------------------------------
 # Verification helpers
 # ---------------------------------------------------------------------------
-def _get_block_data_for_layer(
-    mgr, request_id, layer_idx, use_v2, expected_valid=None, drop_tail_blocks=0
-):
+def _get_block_data_for_layer(mgr, request_id, layer_idx, expected_valid=None, drop_tail_blocks=0):
     """Get block data for a specific layer and request in HND layout.
 
     Returns tensor of shape [num_blocks, kv_factor, num_kv_heads_per_rank, tokens_per_block, head_dim].
@@ -682,7 +664,6 @@ def _gather_full_layer_data(
     pp: int,
     request_id: int,
     layer_idx: int,
-    use_v2: bool,
     num_kv_heads: int,
     expected_valid: Optional[int] = None,
     enable_dp: bool = False,
@@ -704,14 +685,14 @@ def _gather_full_layer_data(
         tp_rank = req_idx % tp
         rank = pp_rank * tp + tp_rank
         return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
+            managers[rank], request_id, layer_idx, expected_valid, drop_tail_blocks
         )
 
     if is_replicated:
         # All TP ranks have identical data; take from tp_rank=0
         rank = pp_rank * tp + 0
         return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
+            managers[rank], request_id, layer_idx, expected_valid, drop_tail_blocks
         )
 
     # Gather from all TP ranks and concat along kv_heads dim.
@@ -721,7 +702,7 @@ def _gather_full_layer_data(
     for tp_rank in range(tp):
         rank = pp_rank * tp + tp_rank
         data = _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
+            managers[rank], request_id, layer_idx, expected_valid, drop_tail_blocks
         )
         if data is not None:
             tp_data.append(data)
@@ -735,25 +716,23 @@ def _get_layer_to_window_size(
     managers: List,
     tp: int,
     pp: int,
-    use_v2: bool,
-    num_layers: int = NUM_LAYERS,
 ) -> Dict[int, Optional[int]]:
-    """Build a mapping from global layer_id to its sliding_window_size.
+    """Build a mapping from global layer_id to its sliding window size.
 
-    For V2 managers, extracts from page_table.layer_group_metas.
-
-    Aggregates from all PP ranks since each rank only handles a subset of layers.
+    Read from the kept window of each paged layer group of the rank's pages. Aggregates
+    from all PP ranks since each rank only handles a subset of layers.
     """
     layer_to_window: Dict[int, Optional[int]] = {}
 
     # Get one manager per PP rank (tp_rank=0 for each pp_rank)
     for pp_rank in range(pp):
         manager = managers[pp_rank * tp]
-
-        page_table = KVRegionExtractorV1(manager).page_table
-        for lg in page_table.layer_groups:
-            for layer_id in get_global_layer_ids(lg):
-                layer_to_window[layer_id] = lg.sliding_window_size
+        rank_pages = RankPages.of_manager(manager)
+        for g in range(rank_pages.num_layer_groups):
+            if rank_pages.kind(g) != CacheKind.PAGED:
+                continue
+            for layer_id in rank_pages.group(g).layers:
+                layer_to_window[layer_id] = rank_pages.group(g).kept_window
 
     return layer_to_window
 
@@ -771,7 +750,6 @@ def verify_all_requests(
     ctx_request_ids: List[int],
     gen_request_ids: List[int],
     is_mla: bool,
-    use_v2: bool,
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     gen_scratch_tokens: int = 0,
@@ -786,7 +764,7 @@ def verify_all_requests(
 
     # Build layer_to_window_size mapping from ctx_managers
     # Aggregate from all PP ranks since each rank only handles a subset of layers
-    layer_to_window = _get_layer_to_window_size(ctx_managers, ctx_tp, ctx_pp, use_v2, num_layers)
+    layer_to_window = _get_layer_to_window_size(ctx_managers, ctx_tp, ctx_pp)
 
     for req_idx, req_len in enumerate(request_lengths):
         ctx_rid = ctx_request_ids[req_idx]
@@ -816,7 +794,6 @@ def verify_all_requests(
                 ctx_pp,
                 ctx_rid,
                 layer_idx,
-                use_v2,
                 num_kv_heads,
                 expected_valid,
                 ctx_enable_dp,
@@ -830,7 +807,6 @@ def verify_all_requests(
                 gen_pp,
                 gen_rid,
                 layer_idx,
-                use_v2,
                 num_kv_heads,
                 expected_valid,
                 gen_enable_dp,
@@ -882,7 +858,7 @@ def verify_all_requests_helix(
     """
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     # ctx side is cp_size=1: rank 0 holds the whole global block list.
-    layer_to_window = _get_layer_to_window_size(ctx_managers, 1, 1, True, num_layers)
+    layer_to_window = _get_layer_to_window_size(ctx_managers, 1, 1)
 
     for req_idx, req_len in enumerate(request_lengths):
         ctx_rid = ctx_request_ids[req_idx]
@@ -898,15 +874,13 @@ def verify_all_requests_helix(
 
             # ctx: the full (global) transferred block set, positional order.
             ctx_full = _get_block_data_for_layer(
-                ctx_managers[0], ctx_rid, layer_idx, True, expected_valid
+                ctx_managers[0], ctx_rid, layer_idx, expected_valid
             )
             if ctx_full is None:
                 continue
 
             for cp_rank in range(gen_cp):
-                gen_full = _get_block_data_for_layer(
-                    gen_managers[cp_rank], gen_rid, layer_idx, True
-                )
+                gen_full = _get_block_data_for_layer(gen_managers[cp_rank], gen_rid, layer_idx)
                 # Ledger stride: rank r owns global blocks [r::cp_size].
                 expected = ctx_full[cp_rank::gen_cp]
                 # The gen ledger rounds capacity up to whole ledger blocks, so a
@@ -960,7 +934,6 @@ def run_transfer_test(
     ctx_enable_dp: bool,
     gen_enable_dp: bool,
     is_mla: bool,
-    use_v2: bool,
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     request_lengths: Optional[List[int]] = None,
@@ -1000,7 +973,6 @@ def run_transfer_test(
         ctx_pp,
         ctx_enable_dp,
         is_mla,
-        use_v2,
         max_attention_window_vec,
         num_layers,
         max_batch_size,
@@ -1010,7 +982,6 @@ def run_transfer_test(
         gen_pp,
         gen_enable_dp,
         is_mla,
-        use_v2,
         max_attention_window_vec,
         num_layers,
         max_batch_size,
@@ -1018,10 +989,10 @@ def run_transfer_test(
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
-    _init_pool_data(ctx_managers, ctx_tp, is_mla, use_v2, fill_random=True, seed_base=1000)
+    _init_pool_data(ctx_managers, ctx_tp, is_mla, fill_random=True, seed_base=1000)
     # Gen pools start zeroed; gen_cp folds into the TP stride so per-rank pool
     # seeding stays a no-op (fill_random=False ignores the seed anyway).
-    _init_pool_data(gen_managers, gen_tp * gen_cp, is_mla, use_v2, fill_random=False)
+    _init_pool_data(gen_managers, gen_tp * gen_cp, is_mla, fill_random=False)
 
     # 3. Create KvCacheTransceiverV2 instances (threaded init)
     config = CacheTransceiverConfig(
@@ -1155,20 +1126,17 @@ def run_transfer_test(
                     gen_managers[rank],
                     req.py_request_id,
                     resize_len,
-                    use_v2,
                     is_generation=True,
                     scratch_tokens=gen_scratch_tokens,
                 )
-                if kv is not None:
-                    gen_kv_caches[rank].append(kv)
+                gen_kv_caches[rank].append(kv)
                 gen_tcs[rank].request_and_receive_async(req)
 
         # 6. ctx send after
         for rank in range(ctx_world):
             for req_idx, req in ctx_handle_map[rank]:
-                kv = _add_sequence(ctx_managers[rank], req.py_request_id, req.prompt_len, use_v2)
-                if kv is not None:
-                    ctx_kv_caches[rank].append(kv)
+                kv = _add_sequence(ctx_managers[rank], req.py_request_id, req.prompt_len)
+                ctx_kv_caches[rank].append(kv)
                 ctx_tcs[rank].respond_and_send_async(req)
 
         # 7. Wait for completion (threaded, dist calls inside)
@@ -1204,7 +1172,6 @@ def run_transfer_test(
                 ctx_request_ids=ctx_request_ids,
                 gen_request_ids=gen_request_ids,
                 is_mla=is_mla,
-                use_v2=use_v2,
                 max_attention_window_vec=max_attention_window_vec,
                 num_layers=num_layers,
                 gen_scratch_tokens=gen_scratch_tokens,
@@ -1365,7 +1332,6 @@ UNEVEN_PP_CONFIGS = [
     [w[0] for w in WINDOW_CONFIGS],
     ids=[w[1] for w in WINDOW_CONFIGS],
 )
-@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
 @pytest.mark.parametrize("gen_scratch_tokens", [0, TOKENS_PER_BLOCK], ids=["spec_off", "spec_on"])
 def test_cache_transceiver(
     ctx_tp,
@@ -1376,10 +1342,9 @@ def test_cache_transceiver(
     gen_enable_dp,
     is_mla,
     max_attention_window_vec,
-    use_v2,
     gen_scratch_tokens,
 ):
-    """Test KvCacheTransceiverV2 with V2 cache managers.
+    """Test KvCacheTransceiverV2 with KVCacheManagerV2.
 
     The ``gen_scratch_tokens`` dimension (id ``spec_off`` / ``spec_on``) adds a
     speculative-decoding tail: the generation cache is sized
@@ -1391,13 +1356,11 @@ def test_cache_transceiver(
     the prompt blocks the receiver needs; a count-based slice would let the
     surplus shift or drop a live prompt block.
     """
-    # Speculative scratch materialisation (resize past history_length) is V2-only
-
     print(
         f"\nRunning transfer test: "
         f"ctx_tp={ctx_tp} ctx_pp={ctx_pp} gen_tp={gen_tp} gen_pp={gen_pp} "
         f"ctx_dp={ctx_enable_dp} gen_dp={gen_enable_dp} "
-        f"mla={is_mla} v2={use_v2} window={max_attention_window_vec} "
+        f"mla={is_mla} window={max_attention_window_vec} "
         f"scratch={gen_scratch_tokens}"
     )
 
@@ -1409,7 +1372,6 @@ def test_cache_transceiver(
         ctx_enable_dp=ctx_enable_dp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=use_v2,
         max_attention_window_vec=max_attention_window_vec,
         gen_scratch_tokens=gen_scratch_tokens,
     )
@@ -1428,7 +1390,6 @@ def test_cache_transceiver(
     [w[0] for w in WINDOW_CONFIGS],
     ids=[w[1] for w in WINDOW_CONFIGS],
 )
-@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
 def test_cache_transceiver_uneven_pp(
     ctx_tp,
     ctx_pp,
@@ -1439,7 +1400,6 @@ def test_cache_transceiver_uneven_pp(
     is_mla,
     num_layers,
     max_attention_window_vec,
-    use_v2,
 ):
     """Test KvCacheTransceiverV2 with uneven layers-per-PP-rank.
 
@@ -1452,7 +1412,7 @@ def test_cache_transceiver_uneven_pp(
         f"\nRunning uneven PP transfer test: "
         f"ctx_tp={ctx_tp} ctx_pp={ctx_pp} gen_tp={gen_tp} gen_pp={gen_pp} "
         f"ctx_dp={ctx_enable_dp} gen_dp={gen_enable_dp} "
-        f"mla={is_mla} v2={use_v2} num_layers={num_layers} "
+        f"mla={is_mla} num_layers={num_layers} "
         f"window={max_attention_window_vec} "
         f"layers_per_pp(ctx)={_get_layers_per_pp(num_layers, ctx_pp)} "
         f"layers_per_pp(gen)={_get_layers_per_pp(num_layers, gen_pp)}"
@@ -1466,7 +1426,6 @@ def test_cache_transceiver_uneven_pp(
         ctx_enable_dp=ctx_enable_dp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=use_v2,
         max_attention_window_vec=max_attention_window_vec,
         num_layers=num_layers,
     )
@@ -1506,7 +1465,6 @@ def test_cache_transceiver_helix_cp(gen_cp, is_mla):
         ctx_enable_dp=False,
         gen_enable_dp=False,
         is_mla=is_mla,
-        use_v2=True,
         max_attention_window_vec=None,
         gen_cp=gen_cp,
     )
@@ -1547,7 +1505,6 @@ BOUNDARY_CONFIGS = [
     [w[0] for w in WINDOW_CONFIGS],
     ids=[w[1] for w in WINDOW_CONFIGS],
 )
-@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
 def test_cache_transceiver_boundary_lengths(
     ctx_tp,
     ctx_pp,
@@ -1557,7 +1514,6 @@ def test_cache_transceiver_boundary_lengths(
     gen_enable_dp,
     is_mla,
     max_attention_window_vec,
-    use_v2,
 ):
     """Test KvCacheTransceiverV2 with boundary request lengths.
 
@@ -1568,7 +1524,7 @@ def test_cache_transceiver_boundary_lengths(
         f"\nRunning boundary transfer test: "
         f"ctx_tp={ctx_tp} ctx_pp={ctx_pp} gen_tp={gen_tp} gen_pp={gen_pp} "
         f"ctx_dp={ctx_enable_dp} gen_dp={gen_enable_dp} "
-        f"mla={is_mla} v2={use_v2} window={max_attention_window_vec}"
+        f"mla={is_mla} window={max_attention_window_vec}"
     )
 
     run_transfer_test(
@@ -1579,7 +1535,6 @@ def test_cache_transceiver_boundary_lengths(
         ctx_enable_dp=ctx_enable_dp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=use_v2,
         max_attention_window_vec=max_attention_window_vec,
         request_lengths=BOUNDARY_REQUEST_LENGTHS,
     )
@@ -1595,12 +1550,11 @@ def test_cache_transceiver_boundary_lengths(
         "gen_tp",
         "gen_pp",
         "is_mla",
-        "use_v2",
     ),
     [
-        pytest.param(1, 1, 1, 1, False, True, id="v2_mha"),
-        pytest.param(2, 1, 2, 1, True, True, id="v2_mla_tp2"),
-        pytest.param(2, 1, 1, 2, False, True, id="v2_ctx_tp2_gen_pp2"),
+        pytest.param(1, 1, 1, 1, False, id="v2_mha"),
+        pytest.param(2, 1, 2, 1, True, id="v2_mla_tp2"),
+        pytest.param(2, 1, 1, 2, False, id="v2_ctx_tp2_gen_pp2"),
     ],
 )
 def test_python_nixl_cache_transceiver_uses_cpp_bounce(
@@ -1609,7 +1563,6 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     gen_tp: int,
     gen_pp: int,
     is_mla: bool,
-    use_v2: bool,
 ) -> None:
     """Exercise C++ bounce v2 through representative Python NIXL transceiver paths.
 
@@ -1632,7 +1585,11 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         ctx_enable_dp=False,
         gen_enable_dp=False,
         is_mla=is_mla,
-        use_v2=use_v2,
         request_lengths=[30, 60],
         expect_cpp_bounce=True,
     )
+
+
+if __name__ == "__main__":
+    # Quick smoke test
+    run_transfer_test(1, 1, 1, 1, False, False, False)

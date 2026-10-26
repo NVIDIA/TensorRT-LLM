@@ -32,11 +32,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-    KVRegionExtractorV1,
-    build_page_table_from_manager,
-)
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
     Nvfp4ColdPageQuantizationCompression,
 )
@@ -1926,26 +1922,24 @@ class TestDeepseekV4CacheManager:
         )
 
         try:
-            page_table = build_page_table_from_manager(cache_manager)
-            saw_pool_view = False
-            for layer_group in page_table.layer_groups:
-                for pool_view in layer_group.pool_views:
-                    saw_pool_view = True
-                    # All DSv4 pools publish per-layer buffer_entries (INDEXED);
-                    # the FLAT layout is reserved for the DSA (DeepSeek v3.2)
-                    # indexer K cache pool.
-                    assert pool_view.mapper_kind == MapperKind.INDEXED
-                    # pool_role carries the manager-native role-name strings,
-                    # which are all DSv4 attention-type names like
+            pages = RankPages.of_manager(cache_manager)
+            saw_buffer = False
+            for g in range(pages.num_layer_groups):
+                for buffer in pages.buffers(g):
+                    saw_buffer = True
+                    # Every transferred DSv4 cache is head-major: one segment
+                    # whose heads split across ranks.
+                    (segment,) = buffer.segments
+                    assert segment.split_axis == "head" and segment.axes[0][0] == "head"
+                    # Roles are the manager-native role-name strings, which
+                    # are all DSv4 attention-type names like
                     # "deepseek_v4_swa", "deepseek_v4_compress", etc.
-                    assert pool_view.pool_role
-                    for role_name in pool_view.pool_role:
-                        assert role_name.startswith("deepseek_v4_"), role_name
-            assert saw_pool_view
+                    assert buffer.role.startswith("deepseek_v4_"), buffer.role
+            assert saw_buffer
         finally:
             cache_manager.shutdown()
 
-    def test_disagg_pool_mapping_prefers_exact_pool_view_layer_set(self):
+    def test_disagg_transfer_groups_pair_layer_groups_of_the_same_layers(self):
         ctx_cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1969,13 +1963,16 @@ class TestDeepseekV4CacheManager:
         try:
             ctx_rank_info = RankInfo.from_kv_cache_manager("ctx", ctx_cache_manager, 0)
             gen_rank_info = RankInfo.from_kv_cache_manager("gen", gen_cache_manager, 0)
-            registrar = PeerRegistrar(gen_rank_info, KVRegionExtractorV1(gen_cache_manager))
+            registrar = PeerRegistrar(gen_rank_info)
             registrar.register("ctx", 0, ctx_rank_info)
 
-            pool_mapping = registrar.get_pool_mapping(ctx_rank_info)
-            assert pool_mapping
-            for self_pool_key, peer_pool_key in pool_mapping.items():
-                registrar.get_kv_map(ctx_rank_info, self_pool_key, peer_pool_key)
+            groups = registrar.transfer_groups(ctx_rank_info)
+            assert groups
+            for group in groups:
+                assert not group.plan.is_empty
+                self_layers = registrar.self_pages.group(group.self_layer_group).layers
+                peer_layers = ctx_rank_info.pages.group(group.peer_layer_group).layers
+                assert sorted(self_layers) == sorted(peer_layers), group
         finally:
             ctx_cache_manager.shutdown()
             gen_cache_manager.shutdown()

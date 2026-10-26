@@ -44,7 +44,7 @@ from .core import BounceTransport, Disposition, Settlement, TransferContext
 from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+    from tensorrt_llm._torch.disaggregation.page_mapping import RankPages
 
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
@@ -118,7 +118,7 @@ class VmmBounceTransport(BounceTransport):
         self._block_bytes_per_group = list(block_bytes_per_group)
         # Size gates below which bounce is skipped: coalescing only pays off once the transfer is
         # large enough to beat the gather+scatter overhead (see config.DEFAULT_MIN_BYTES for the
-        # rationale). min_bytes applies to payloads carrying recurrent (mamba/KDA) state;
+        # rationale). min_bytes applies to payloads carrying recurrent state;
         # min_blocks applies to plain-KV payloads (see the gate in reserve()).
         self._min_bytes = min_bytes
         self._min_blocks = min_blocks
@@ -246,8 +246,8 @@ class VmmBounceTransport(BounceTransport):
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
-        to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
-        ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
+        to the same coalesced write (recurrent state, sized by the receiver via
+        ``page_mapping.receiver_extra_bytes``); the region must cover it or the write would overrun into the
         neighboring slot."""
         total = 0
         has_state_group = False
@@ -265,7 +265,7 @@ class VmmBounceTransport(BounceTransport):
                     warn_key="kv-bounce-unknown-slot-size",
                 )
             if not self._block_bytes_per_group[g]:
-                # This group holds recurrent state (mamba/KDA), not paged KV blocks;
+                # This group holds recurrent state, not paged KV blocks;
                 # its size is accounted for by extra_bytes below, not per-block math.
                 has_state_group = True
                 continue
@@ -273,22 +273,22 @@ class VmmBounceTransport(BounceTransport):
         if has_state_group and num_writers > 1:
             # Fan-in with recurrent-state groups is unsafe: each writer may
             # append its own state fragments (different PP stages hold different
-            # mamba layers), and the representative extra_bytes (computed from
+            # recurrent layers), and the representative extra_bytes (computed from
             # one sender's page table) may not reflect all participating senders.
             # Even when extra_bytes == 0 (e.g. the representative rank has no
-            # mamba overlap), another PP sender may still contribute state bytes
+            # recurrent-layer overlap), another PP sender may still contribute state bytes
             # that were not reserved in the bounce region.
             return self._skip_bounce(
                 f"fan-in across {num_writers} senders with STATE groups present; the "
                 f"equal split cannot account for per-writer state fragments",
-                warn_key="kv-bounce-mamba-fanin",
+                warn_key="kv-bounce-state-fanin",
             )
         total += int(extra_bytes)
         if total <= 0:
             return self._skip_bounce(
                 f"computed transfer size {total} <= 0", warn_key="kv-bounce-nonpositive-size"
             )
-        # Which size gate applies depends on the payload. Payloads carrying recurrent (mamba/KDA)
+        # Which size gate applies depends on the payload. Payloads carrying recurrent
         # state gate on BYTES: the cost the gate guards (falling back to the slow per-fragment
         # path) scales with bytes, and a block count is meaningless for the non-paged state (the
         # Kimi-K3 regression: a 433 MiB transfer of 67 small blocks plus KDA state failed a
@@ -561,14 +561,14 @@ class NoBounceTransport(BounceTransport):
         pass
 
 
-def create_bounce(agent, cfg, *, device_id: int, page_table) -> BounceTransport:
+def create_bounce(agent, cfg, *, device_id: int, pages) -> BounceTransport:
     """Build the real transport from the config, or the disabled one when bounce is off, it cannot
     fit, or the fabric allocation races."""
     if cfg is None:
         return NoBounceTransport()
     try:
         transport = VmmBounceTransport.from_config(
-            agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(page_table)
+            agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(pages)
         )
         return transport if transport is not None else NoBounceTransport()
     except (
@@ -622,28 +622,14 @@ def decode_result_tail(message):
     return None, None, None
 
 
-def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
-    """Return transferred bytes per cache block for each layer group.
+def block_bytes_per_group(pages: RankPages) -> list[int | None]:
+    """Return transferred bytes per cache block for each layer group of the rank's pages.
 
-    All distinct physical pools exposed by an attention group contribute to its
-    transfer size. Multiple logical views of the same physical pool contribute
-    only once. Non-attention groups retain a ``None`` placeholder so the result
-    remains aligned with receive-request layer-group indices.
+    A paged group counts every physical pool its slots span once; a group sized per request instead
+    (recurrent state, see ``receiver_extra_bytes``) keeps a ``None`` placeholder so the result stays
+    aligned with receive-request layer-group indices.
     """
-    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+    from tensorrt_llm._torch.disaggregation.page_mapping import bounce_unit_bytes_per_layer_group
 
-    assert page_table is not None
-    out: list[int | None] = []
-    for lg_idx, lg in enumerate(page_table.layer_groups):
-        if lg.kind != CacheKind.PAGED:
-            out.append(None)
-            continue
-        pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}
-        out.append(
-            sum(
-                int(get_physical_pool(page_table, lg_idx, pool_idx).slot_bytes)
-                for pool_idx in pool_indices
-            )
-        )
-    return out
+    assert pages is not None
+    return bounce_unit_bytes_per_layer_group(pages)

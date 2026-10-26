@@ -42,8 +42,10 @@ Python-transceiver configurations:
 - An initialized MPI executor world with `MPI_THREAD_MULTIPLE`; non-MPI launchers
   and mixed-version peers are not qualified by the containment implementation.
 
-The code gates are `_validate_fp4_mla_bridge_profile` and
-`KvCacheTransceiverV2._validate_bridge_req` in
+The code gates are `requires_physical_ownership` in
+[ownership.py](../../../tensorrt_llm/_torch/disaggregation/page_mapping/ownership.py)
+(asked by the transceiver through `page_mapping.requires_physical_ownership`, which reads
+the cache manager's layout) and `KvCacheTransceiverV2._validate_bridge_req` in
 [transceiver.py](../../../tensorrt_llm/_torch/disaggregation/transceiver.py).
 Matching participants and global ID uniqueness remain operator obligations;
 the validators do not negotiate or prove them. Selecting the profile is not

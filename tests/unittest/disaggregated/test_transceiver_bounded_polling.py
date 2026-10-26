@@ -800,7 +800,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
 
     Returns the TransferWorkerConfig it wired.
     """
-    worker = SimpleNamespace(page_table=None)
+    worker = SimpleNamespace(pages=None)
     worker_constructor = Mock(return_value=worker)
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.TransferWorker",
@@ -866,7 +866,7 @@ def test_transceiver_activates_fail_stop_only_for_ownership_bridge(
 
     monkeypatch.setattr(
         transceiver_module,
-        "_validate_fp4_mla_bridge_profile",
+        "requires_physical_ownership",
         lambda *_args: ownership_enabled,
     )
     communicator = Mock()

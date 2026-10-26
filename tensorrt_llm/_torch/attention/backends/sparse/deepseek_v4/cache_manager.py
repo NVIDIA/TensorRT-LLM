@@ -27,8 +27,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
+    Role,
     _fill_kv_pages,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Segment
+from tensorrt_llm._torch.pyexecutor.kv_cache.role_layout import head_major, replicated
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1477,9 +1480,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # _build_cache_config, so their buffer sizes are only placeholders.
         return 1
 
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+    def get_buffer_layout(
+        self, layer_id: int, role: DataRole, size: int, tokens: int
+    ) -> tuple[Segment, ...]:
+        """Every DeepSeek-V4 cache is head-major, index-K aside; the storage-only NVFP4 alignment
+        pages hold no state and lay out as one block."""
+        if role in self._disagg_ignored_roles or role == Role.INDEX_KEY:
+            return replicated(size)
+        return head_major(size, self.get_kv_heads(layer_id)[0])
+
+    def get_untransferred_roles(self) -> frozenset[str]:
         """Exclude storage-only NVFP4 alignment pages from KV transfer."""
-        return self._disagg_ignored_roles
+        return frozenset(str(role) for role in self._disagg_ignored_roles)
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """

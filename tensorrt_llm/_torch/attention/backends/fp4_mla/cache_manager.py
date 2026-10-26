@@ -9,9 +9,10 @@ from typing import TYPE_CHECKING, Iterable, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_bf16_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Segment
+from tensorrt_llm._torch.pyexecutor.kv_cache.role_layout import replicated, token_major
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.logger import logger
@@ -212,12 +213,11 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_mla_v_packed_pool_base",
             "get_mla_v_packed_page_offset",
             "get_fp4_mla_hp_pool",
-            "get_disagg_role_mapper_kinds",
-            "get_disagg_ignored_roles",
+            "get_buffer_layout",
+            "get_untransferred_roles",
             "rebuild_disagg_imported_cache",
             "_model_layers_and_tails",
-            "get_disagg_global_layer_ids",
-            "get_model_layer_ids",
+            "get_layer_ids",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
         )
@@ -932,16 +932,18 @@ class Fp4MlaV2CacheLayoutPolicy:
             ),
         ).permute(1, 0, 2, 3)
 
-    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
-        return {
-            Role.ALL: MapperKind.NHD,
-            Role.MLA_HP_TAIL: MapperKind.REPLICATED,
-        }
+    def get_buffer_layout(
+        self, layer_id: int, role: DataRole, size: int, tokens: int
+    ) -> tuple[Segment, ...]:
+        """Token-major latents; the high-precision tail is the same on every rank."""
+        if role == Role.MLA_HP_TAIL:
+            return replicated(size)
+        return token_major(size, tokens, self.get_kv_heads(layer_id)[0])
 
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        # V scales and packed V derive from K and K scales; the generation
-        # worker rebuilds them locally in rebuild_disagg_imported_cache.
-        return frozenset((Role.MLA_V_SCALE, Role.MLA_V_PACKED))
+    def get_untransferred_roles(self) -> frozenset[str]:
+        """V scales and packed V derive from K and K scales, so the generation worker rebuilds them
+        locally in rebuild_disagg_imported_cache instead of receiving them."""
+        return frozenset((str(Role.MLA_V_SCALE), str(Role.MLA_V_PACKED)))
 
     def rebuild_disagg_imported_cache(self, requests: Iterable["LlmRequest"]) -> None:
         """Rebuild the derived V sidecars of requests whose prompt KV was imported."""
@@ -980,16 +982,15 @@ class Fp4MlaV2CacheLayoutPolicy:
                 raise ValueError(f"Unknown FP4 MLA V2 internal layer {internal_layer}.")
         return result
 
-    def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
-        return [
-            2 * model_layer + int(tail)
-            for model_layer, tail in self._model_layers_and_tails(layer_group_id)
-        ]
-
-    def get_model_layer_ids(self, layer_group_id: int) -> list[int]:
-        """The model layer of each internal layer of the layer group; a tail layer belongs to the
-        model layer whose high-precision tail it holds."""
-        return [model_layer for model_layer, _ in self._model_layers_and_tails(layer_group_id)]
+    def get_layer_ids(self) -> dict[int, tuple[int, int]]:
+        """A tail layer belongs to the model layer whose high-precision tail it holds; its global
+        id follows that layer's: ``2 * model_layer + 1``."""
+        layer_ids = {}
+        for layer_group_id, internal_ids in enumerate(self.impl.layer_grouping):
+            pairs = self._model_layers_and_tails(layer_group_id)
+            for internal_layer, (model_layer, tail) in zip(internal_ids, pairs):
+                layer_ids[int(internal_layer)] = (2 * model_layer + int(tail), model_layer)
+        return layer_ids
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[list[int], list[Optional[int]]]:
         fp4_local_layers = self._fp4_mla_local_layer_indices()

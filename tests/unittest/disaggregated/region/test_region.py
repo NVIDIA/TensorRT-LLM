@@ -1,11 +1,6 @@
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base.region import (
-    DataLayout,
-    IndexRange,
-    KVRegionSpec,
-    RegionSpec,
-)
+from tensorrt_llm._torch.disaggregation.base.region import IndexRange, KVRegionSpec, RegionSpec
 
 pytestmark = pytest.mark.cpu_only
 
@@ -38,12 +33,6 @@ def test_index_range_invalid_non_int():
 def test_index_range_invalid_end_before_start():
     with pytest.raises(ValueError, match="end must be >= start"):
         IndexRange(start=10, end=5)
-
-
-def test_data_layout_flags():
-    assert DataLayout.HND == 1
-    assert DataLayout.NHD == 2
-    assert DataLayout.HND != DataLayout.NHD
 
 
 def test_region_spec_construction():

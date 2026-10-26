@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import collections.abc
 import dataclasses
-import enum
 import numbers
 import types
 from collections.abc import Sequence
@@ -27,13 +26,16 @@ from dataclasses import dataclass, field
 from typing import Literal, Mapping
 
 __all__ = [
+    "GRID_DIMENSIONS",
+    "KIND_DEFAULTS",
     "BufferDesc",
     "LayerGroupDesc",
-    "MapperKind",
     "PageLayout",
     "RankTopology",
-    "RoleLayout",
+    "Segment",
     "ShardDesc",
+    "grid_position",
+    "held_span",
     "replica_ranks",
 ]
 
@@ -55,77 +57,109 @@ def _frozen(mapping: dict) -> Mapping:
 _NO_ENTRIES: Mapping = _frozen({})
 
 
-class MapperKind(enum.IntEnum):
-    """How a role's bytes split across its layer group's grid of ranks (``LayerGroupDesc``).
-
-    Attributes:
-        INDEXED: Head-major layout; a head range is one contiguous byte range.
-        HND: Alias of INDEXED for the [head, token, dimension] layout.
-        REPLICATED: Identical bytes on every tensor-parallel rank.
-        NHD: Token-major [token, head, dimension] layout; a head range is a slice within every
-            token.
-        SECTIONED: Consecutive byte sections, each sharded independently, such as recurrent
-            convolution state.
-
-    Raises:
-        ValueError: If constructed from a value that names no mapper kind."""
-
-    INDEXED = 0
-    HND = INDEXED
-    REPLICATED = 1
-    NHD = 2
-    SECTIONED = 3
-
-
 @dataclass(frozen=True)
-class RoleLayout:
-    """Resharding geometry of one role; both fields None means no declared head axis.
+class Segment:
+    """A run of a buffer's bytes and how it splits across its layer group's grid of ranks.
+
+    A buffer is its segments back to back. ``axes`` lists the segment's dimensions on this rank,
+    outer to inner, as ``(name, extent)``; dimensions inside ``split_axis`` may be left out, since
+    they only make up the bytes of one unit of it. ``split_axis`` names the dimension sharded over
+    the layer group's grid of ranks (see ``LayerGroupDesc``), or is None when every rank of the grid
+    holds the same bytes.
+
+    Examples, with ``h`` heads on this rank and ``t`` tokens per page::
+
+        head-major K:   Segment(n, (("head", h),), "head")
+        token-major K:  Segment(n, (("token", t), ("head", h)), "head")
+        conv x | B | C: one Segment(s, (("byte", s),), "byte") per section of s bytes
+        index-K:        Segment(n)
 
     Attributes:
-        section_bytes: Byte sizes of consecutive sections for a SECTIONED role, normalized to a
-            tuple. When given, their sum must equal the buffer's size.
-        bytes_per_head: Total bytes for one rank-local head, derived as size/head count for
-            attention INDEXED/NHD roles. NHD offsets remain token-major, not one contiguous head
-            slice. For other INDEXED roles, size must be divisible by this value; the quotient is
-            the per-rank head count.
+        nbytes: Positive byte size of the segment.
+        axes: Dimensions outer to inner, normalized to a tuple of (name, positive extent) pairs.
+        split_axis: Name of the sharded dimension, one of ``axes``; None when not sharded.
 
     Raises:
-        ValueError: If a section size or bytes_per_head is not a positive integer, including a
-            boolean. BufferDesc checks that the geometry fits its size."""
+        ValueError: If nbytes or an extent is not a positive integer or is a boolean, axis names
+            repeat, split_axis names no axis, or the axes up to split_axis do not divide nbytes
+            into whole units."""
 
-    section_bytes: tuple[int, ...] | None = None
-    bytes_per_head: int | None = None
+    nbytes: int
+    axes: tuple[tuple[str, int], ...] = ()
+    split_axis: str | None = None
 
     def __post_init__(self) -> None:
-        if self.section_bytes is not None:
-            object.__setattr__(
-                self,
-                "section_bytes",
-                tuple(_integer(n, "section size", 1) for n in self.section_bytes),
+        object.__setattr__(self, "nbytes", _integer(self.nbytes, "segment size", 1))
+        axes = tuple(
+            (str(name), _integer(extent, f"extent of axis {name!r}", 1))
+            for name, extent in self.axes
+        )
+        object.__setattr__(self, "axes", axes)
+        names = [name for name, _ in axes]
+        if len(set(names)) != len(names):
+            raise ValueError(f"axis names repeat: {names}")
+        if self.split_axis is None:
+            return
+        object.__setattr__(self, "split_axis", str(self.split_axis))
+        if self.split_axis not in names:
+            raise ValueError(f"split axis {self.split_axis!r} is not one of the axes {names}")
+        if self.nbytes % (self.rows * self.split_extent):
+            raise ValueError(
+                f"{self.nbytes} bytes is not a whole number of {self.rows} x {self.split_extent} "
+                f"units of axis {self.split_axis!r}"
             )
-        if self.bytes_per_head is not None:
-            object.__setattr__(
-                self, "bytes_per_head", _integer(self.bytes_per_head, "bytes_per_head", 1)
-            )
+
+    @property
+    def split_extent(self) -> int | None:
+        """The extent of ``split_axis`` on this rank, or None when not sharded."""
+        if self.split_axis is None:
+            return None
+        return dict(self.axes)[self.split_axis]
+
+    @property
+    def rows(self) -> int:
+        """How many times the split axis repeats within the segment: the product of the extents
+        outside it, 1 when it is outermost or the segment is not sharded."""
+        if self.split_axis is None:
+            return 1
+        rows = 1
+        for name, extent in self.axes:
+            if name == self.split_axis:
+                return rows
+            rows *= extent
+        return rows
+
+    @property
+    def unit_bytes(self) -> int:
+        """Bytes of one unit of the split axis within one row; the whole segment when not
+        sharded."""
+        if self.split_axis is None:
+            return self.nbytes
+        return self.nbytes // (self.rows * self.split_extent)
 
     @classmethod
     def unchecked(
-        cls, section_bytes: tuple[int, ...] | None = None, bytes_per_head: int | None = None
-    ) -> RoleLayout:
-        """The constructor's role layout of these values, without its checks and conversions;
-        see ``PageLayout.unchecked``."""
-        layout = object.__new__(cls)
-        layout.__dict__.update(section_bytes=section_bytes, bytes_per_head=bytes_per_head)
-        return layout
+        cls,
+        nbytes: int,
+        axes: tuple[tuple[str, int], ...] = (),
+        split_axis: str | None = None,
+    ) -> Segment:
+        """The constructor's segment of these values, without its checks and conversions; see
+        ``PageLayout.unchecked``."""
+        segment = object.__new__(cls)
+        segment.__dict__.update(nbytes=nbytes, axes=axes, split_axis=split_axis)
+        return segment
 
 
-def _check_size(geometry: RoleLayout, size: int) -> None:
-    if geometry.section_bytes is not None and sum(geometry.section_bytes) != size:
-        raise ValueError(f"sections {geometry.section_bytes} do not sum to {size} bytes")
-    if geometry.bytes_per_head is not None and size % geometry.bytes_per_head:
-        raise ValueError(
-            f"{size} bytes is not a whole number of {geometry.bytes_per_head}-byte heads"
-        )
+def _check_segments(segments: tuple[Segment, ...], size: int) -> None:
+    if not segments:
+        raise ValueError("a buffer has at least one segment")
+    for segment in segments:
+        if not isinstance(segment, Segment):
+            raise ValueError(f"segments must be Segment values, got {segment!r}")
+    total = sum(segment.nbytes for segment in segments)
+    if total != size:
+        raise ValueError(f"segments of {total} bytes do not make up a {size}-byte buffer")
 
 
 @dataclass(frozen=True)
@@ -160,6 +194,63 @@ class ShardDesc:
         return shard
 
 
+GRID_DIMENSIONS = ("tp", "cp")
+"""Parallel dimensions a layer group's grid may name, in this order: "tp" is the tensor-parallel
+ranks of one attention data-parallel group, "cp" the context-parallel ranks. Every grid starts
+with "tp"; ranks along a dimension a grid leaves out hold the same bytes, unless the group's blocks
+split by context-parallel rank (``blocks_by_cp``)."""
+
+KIND_DEFAULTS = {
+    "attention": (("tp",), "block", True),
+    "state": (("tp", "cp"), "slot", False),
+}
+"""kind -> the (grid, unit, blocks_by_cp) a layer group of that kind defaults to."""
+
+
+def _group_traits(
+    kind: str, grid: tuple[str, ...] | None, unit: str | None, blocks_by_cp: bool | None
+) -> tuple[tuple[str, ...], str, bool]:
+    if kind not in KIND_DEFAULTS:
+        raise ValueError(f"kind must be one of {sorted(KIND_DEFAULTS)}, got {kind!r}")
+    default_grid, default_unit, default_blocks_by_cp = KIND_DEFAULTS[kind]
+    grid = default_grid if grid is None else tuple(str(d) for d in grid)
+    if not grid or grid != GRID_DIMENSIONS[: len(grid)]:
+        raise ValueError(f"grid must be a leading part of {GRID_DIMENSIONS}, got {grid}")
+    unit = default_unit if unit is None else str(unit)
+    if unit not in ("block", "slot"):
+        raise ValueError(f'unit must be "block" or "slot", got {unit!r}')
+    if blocks_by_cp is None:
+        blocks_by_cp = default_blocks_by_cp and unit == "block"
+    if blocks_by_cp and unit != "block":
+        raise ValueError("only blocks split by context-parallel rank; a slot unit is never split")
+    return grid, unit, bool(blocks_by_cp)
+
+
+def held_span(units: int, size: int, rank: int, total: int) -> tuple[int, int]:
+    """The half-open range of a ``total``-unit axis that rank ``rank`` of ``size`` holds, ``units``
+    long from ``rank * total // size``. Ranks hold consecutive ranges in rank order; when
+    ``units * size`` exceeds ``total``, several ranks hold the same range."""
+    start = rank * total // size
+    return start, start + units
+
+
+def grid_position(topology: RankTopology, grid: Sequence[str]) -> tuple[int, int]:
+    """``(size, rank)`` of this rank in the grid that ``grid`` names: the ranks of each dimension,
+    outer to inner, one flat rank with the last dimension minor. Under attention data parallelism
+    every rank serves its own requests and holds its buffers whole: the grid is this rank alone."""
+    if topology.attention_dp:
+        return 1, 0
+    size, rank = 1, 0
+    for dimension in grid:
+        n, r = (
+            (topology.tp_size, topology.tp_rank)
+            if dimension == "tp"
+            else (topology.cp_size, topology.cp_rank)
+        )
+        size, rank = size * n, rank * n + r
+    return size, rank
+
+
 @dataclass(frozen=True)
 class LayerGroupDesc:
     """One local layer group's windows, pools, global layers and content shard.
@@ -167,15 +258,14 @@ class LayerGroupDesc:
     A block held only by the kept window may remain unwritten without preventing
     resumption when it lies outside the read window.
 
-    A group's transferred buffers split over one grid of ranks, set by its kind:
-    attention groups over the tensor-parallel ranks of one attention data-parallel
-    group; state groups over the tensor-parallel ranks, over none under attention
-    data parallelism, and over tensor times context ranks, context-minor, under
-    Helix. ``shard`` is this rank's share; each buffer's ``mapper`` and
-    ``geometry`` say how it splits.
+    A group's split buffers spread over the grid of ranks ``grid`` names
+    (``grid_position``); each buffer's ``segments`` say how it splits, and ``shard``
+    is this rank's share. A request's units in the group are ``unit``: blocks by
+    ordinal, each of ``tokens_per_page`` tokens, or one slot per request.
 
     Attributes:
-        kind: "attention" for attention KV data, or "state" for recurrent state.
+        kind: "attention" for attention KV data, or "state" for recurrent state; a label for
+            readers, which the fields below default from.
         kept_window: Positive number of tokens whose blocks the manager retains; None means full
             attention.
         num_sink_blocks: Non-negative number of sink blocks retained by the manager.
@@ -187,12 +277,21 @@ class LayerGroupDesc:
         model_layers: The model layer each of ``layers`` belongs to, in the same order, normalized
             to a tuple; None gives ``layers`` themselves. Layer ids numbering several caches of one
             model layer apart, such as one per attention type, all name that model layer.
+        grid: The parallel dimensions the group's split buffers spread over, outer to inner, from
+            ``GRID_DIMENSIONS``, which it starts; normalized to a tuple. Defaults to ``("tp",)`` for attention and
+            ``("tp", "cp")`` for state.
+        unit: "block" when a request's units are blocks by ordinal, "slot" when a request holds
+            one slot. Defaults to "block" for attention and "slot" for state.
+        blocks_by_cp: Whether, under Helix, context-parallel rank ``r`` holds blocks
+            ``r::cp_size`` of the request, each rank its own pages. Defaults to True for "block"
+            units; always False for "slot" units.
 
     Raises:
         ValueError: If an index, layer id or model layer is not a non-negative integer, a window is
             not a positive integer, any such value is a boolean, read_window exceeds kept_window or
-            is given when kept_window is None, or model_layers does not name one model layer per
-            layer."""
+            is given when kept_window is None, model_layers does not name one model layer per
+            layer, grid is not a leading part of ``GRID_DIMENSIONS``, unit is
+            neither "block" nor "slot", or blocks_by_cp is set for "slot" units."""
 
     kind: Literal["attention", "state"]
     kept_window: int | None
@@ -202,8 +301,15 @@ class LayerGroupDesc:
     shard: ShardDesc = ShardDesc()
     read_window: int | None = None
     model_layers: tuple[int, ...] | None = None
+    grid: tuple[str, ...] | None = None
+    unit: Literal["block", "slot"] | None = None
+    blocks_by_cp: bool | None = None
 
     def __post_init__(self) -> None:
+        grid, unit, blocks_by_cp = _group_traits(self.kind, self.grid, self.unit, self.blocks_by_cp)
+        object.__setattr__(self, "grid", grid)
+        object.__setattr__(self, "unit", unit)
+        object.__setattr__(self, "blocks_by_cp", blocks_by_cp)
         if self.kept_window is not None:
             object.__setattr__(self, "kept_window", _integer(self.kept_window, "kept_window", 1))
         object.__setattr__(
@@ -244,10 +350,15 @@ class LayerGroupDesc:
         shard: ShardDesc = ShardDesc(),
         read_window: int | None = None,
         model_layers: tuple[int, ...] | None = None,
+        grid: tuple[str, ...] | None = None,
+        unit: Literal["block", "slot"] | None = None,
+        blocks_by_cp: bool | None = None,
     ) -> LayerGroupDesc:
         """The constructor's layer group of these values, without its checks and conversions; a
-        read window of None still defaults to the kept window, and model layers of None to the
-        layers. See ``PageLayout.unchecked``."""
+        read window of None still defaults to the kept window, model layers of None to the
+        layers, and grid, unit and blocks_by_cp of None to the kind's. See
+        ``PageLayout.unchecked``."""
+        default_grid, default_unit, default_blocks_by_cp = KIND_DEFAULTS[kind]
         group = object.__new__(cls)
         group.__dict__.update(
             kind=kind,
@@ -258,6 +369,9 @@ class LayerGroupDesc:
             shard=shard,
             read_window=kept_window if read_window is None else read_window,
             model_layers=layers if model_layers is None else model_layers,
+            grid=default_grid if grid is None else grid,
+            unit=default_unit if unit is None else unit,
+            blocks_by_cp=default_blocks_by_cp if blocks_by_cp is None else blocks_by_cp,
         )
         return group
 
@@ -273,9 +387,9 @@ class BufferDesc:
         pool_index: Non-negative pool index within pool_group.
         slot_offset: Non-negative byte offset within that pool's slot.
         size: Positive byte size of the buffer.
-        mapper: How this role's bytes split across tensor-parallel ranks.
-        geometry: RoleLayout; declared section sizes must sum to size, and declared bytes per head
-            must divide size.
+        segments: The buffer's bytes as consecutive segments, each saying how it splits across
+            the layer group's grid of ranks; normalized to a tuple whose sizes sum to size.
+            Defaults to one segment of the whole buffer that every rank holds alike.
         transferred: Whether peers transfer this role. False marks local-only buffers, which still
             accompany copies of whole slots.
         expansion: Positive number of sub-pages within one page, each of
@@ -284,8 +398,7 @@ class BufferDesc:
 
     Raises:
         ValueError: If an index is not a non-negative integer, size or expansion is not a positive
-            integer, any such value is a boolean, mapper names no mapper kind, geometry is not a
-            RoleLayout, or geometry does not fit size."""
+            integer, any such value is a boolean, or the segments do not make up size."""
 
     layer: int
     role: str
@@ -293,8 +406,7 @@ class BufferDesc:
     pool_index: int
     slot_offset: int
     size: int
-    mapper: MapperKind = MapperKind.INDEXED
-    geometry: RoleLayout = RoleLayout()
+    segments: tuple[Segment, ...] = ()
     transferred: bool = True
     expansion: int = 1
 
@@ -304,10 +416,9 @@ class BufferDesc:
         object.__setattr__(self, "size", _integer(self.size, "size", 1))
         object.__setattr__(self, "expansion", _integer(self.expansion, "expansion", 1))
         object.__setattr__(self, "role", str(self.role))
-        object.__setattr__(self, "mapper", MapperKind(_integer(self.mapper, "mapper")))
-        if not isinstance(self.geometry, RoleLayout):
-            raise ValueError(f"geometry must be a role layout, got {self.geometry!r}")
-        _check_size(self.geometry, self.size)
+        segments = tuple(self.segments) or (Segment(self.size),)
+        _check_segments(segments, self.size)
+        object.__setattr__(self, "segments", segments)
 
     @classmethod
     def unchecked(
@@ -318,8 +429,7 @@ class BufferDesc:
         pool_index: int,
         slot_offset: int,
         size: int,
-        mapper: MapperKind = MapperKind.INDEXED,
-        geometry: RoleLayout = RoleLayout(),
+        segments: tuple[Segment, ...] = (),
         transferred: bool = True,
         expansion: int = 1,
     ) -> BufferDesc:
@@ -333,8 +443,7 @@ class BufferDesc:
             pool_index=pool_index,
             slot_offset=slot_offset,
             size=size,
-            mapper=mapper,
-            geometry=geometry,
+            segments=segments,
             transferred=transferred,
             expansion=expansion,
         )
@@ -559,28 +668,24 @@ def _same_group(layout: PageLayout, desc: LayerGroupDesc) -> LayerGroupDesc | No
 def _attention_head_ranges(
     layout: PageLayout, desc: LayerGroupDesc
 ) -> tuple[tuple[int, str, int, int], ...] | None:
-    """The transferred nonreplicated buffers' head ranges, or None without their geometry."""
-    if desc.kind != "attention":
-        return None
-    topology = layout.topology
-    tp_size = 1 if topology.attention_dp else topology.tp_size
-    tp_rank = 0 if topology.attention_dp else topology.tp_rank
+    """The transferred nonreplicated buffers' head ranges, or None without their geometry: total
+    heads of each layer and buffers split by head alone."""
+    size, rank = grid_position(layout.topology, desc.grid)
     ranges = []
     for buffer in layout.buffers:
         if (
             buffer.pool_group != desc.pool_group
             or buffer.layer not in desc.layers
             or not buffer.transferred
-            or buffer.mapper is MapperKind.REPLICATED
+            or all(segment.split_axis is None for segment in buffer.segments)
         ):
             continue
         total = layout.total_kv_heads_by_layer.get(buffer.layer)
-        head_bytes = buffer.geometry.bytes_per_head
-        if not total or head_bytes is None:
+        (segment, *rest) = buffer.segments
+        if not total or rest or segment.split_axis != "head":
             return None
-        ranges.append(
-            (buffer.layer, buffer.role, tp_rank * total // tp_size, buffer.size // head_bytes)
-        )
+        start, _ = held_span(segment.split_extent, size, rank, total)
+        ranges.append((buffer.layer, buffer.role, start, segment.split_extent))
     return tuple(sorted(ranges)) if ranges else None
 
 
@@ -595,8 +700,8 @@ def replica_ranks(
     ``rank``, read from every rank's published layout.
 
     Ranks hold the same bytes of a layer group when they serve the same requests (the same
-    attention data-parallel rank); hold the same pages (under Helix an attention group's pages split
-    by context-parallel rank, while a state group's rows do not); hold the same layers, in a layer
+    attention data-parallel rank); hold the same pages (under Helix a group whose blocks split by
+    context-parallel rank, ``blocks_by_cp``, holds other pages on each); hold the same layers, in a layer
     group of the same kind; and hold the same share of the group's content: a replicated buffer is
     the same on every such rank. Other buffers match when their published content shards are equal,
     or when every transferred buffer's head range is equal. Per-buffer head ranges also recognize
@@ -618,7 +723,7 @@ def replica_ranks(
     layout = ranks[rank]
     desc = layout.layer_groups[group]
     topology = layout.topology
-    paged_by_context = desc.kind == "attention"
+    paged_by_context = desc.blocks_by_cp
     head_ranges = None if replicated else _attention_head_ranges(layout, desc)
     out = []
     for other_rank in range(len(ranks)):

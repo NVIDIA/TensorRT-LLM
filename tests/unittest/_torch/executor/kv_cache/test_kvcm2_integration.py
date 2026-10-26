@@ -2767,20 +2767,26 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     assert cold_group.stats.secondary_peak_evictable_num_blocks == 5
 
 
-def test_disagg_role_mapper_kinds_default_to_indexed():
-    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+def test_layout_hooks_default_to_plain_attention():
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Segment
 
     manager = object.__new__(KVCacheManagerV2)
+    manager.impl = SimpleNamespace(layer_grouping=[[0, 1]])
+    manager.pp_layers = [4, 5]
+    manager.num_kv_heads_per_layer = [4, 4]
 
     # K/V default to the TRTLLM head-major layout; the index-key side cache
-    # defaults to REPLICATED (every shipped index-K — DSA V1, MiniMax M3 —
+    # is the same on every rank (every shipped index-K — DSA, MiniMax M3 —
     # is TP-replicated). The INDEX_KEY entry is inert unless a subclass
     # registers such buffers.
-    assert manager.get_disagg_role_mapper_kinds() == {
-        Role.ALL: MapperKind.INDEXED,
-        Role.INDEX_KEY: MapperKind.REPLICATED,
-    }
+    assert manager.get_buffer_layout(0, Role.KEY, 64, 8) == (Segment(64, (("head", 4),), "head"),)
+    assert manager.get_buffer_layout(0, Role.INDEX_KEY, 64, 8) == (Segment(64),)
+    # A role the manager does not create is an error, never laid out by a guess.
+    with pytest.raises(ValueError, match="declares no layout for role"):
+        manager.get_buffer_layout(0, "conv_state", 64, 8)
+    assert manager.get_untransferred_roles() == frozenset()
+    assert manager.get_layer_ids() == {0: (4, 4), 1: (5, 5)}
 
 
 def _index_mapper_capacity_for(

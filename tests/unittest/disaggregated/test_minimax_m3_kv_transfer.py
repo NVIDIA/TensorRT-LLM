@@ -20,9 +20,9 @@ MiniMax M3 cache managers and validates both ordinary K/V and the
 replicated INDEX_KEY cache. V2 storage coalesces buffers purely by (life
 cycle, size), so at TP degrees where K == V == INDEX_KEY bytes per block the
 index-K cache shares the K/V pool and the slot interleaves per layer; at
-other degrees it gets its own pool. The disagg page-table builder splits each
-pool into per-mapper-kind views, so both layouts (and transfers between them)
-are exercised by the topology matrix below.
+other degrees it gets its own pool. The disagg page layout describes each
+buffer by its own segments wherever it sits in the slot, so both layouts (and
+transfers between them) are exercised by the topology matrix below.
 """
 
 from collections.abc import Sequence
@@ -35,10 +35,9 @@ import torch
 
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages, replicated
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Segment
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -86,29 +85,20 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
     ]
 
 
-def test_v2_disagg_role_mapper_kind_defaults() -> None:
-    manager = object.__new__(KVCacheManagerV2)
-
-    assert manager.get_disagg_role_mapper_kinds() == {
-        Role.ALL: MapperKind.INDEXED,
-        Role.INDEX_KEY: MapperKind.REPLICATED,
-    }
-
-
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "implementation,cache_dtype,expected_main_mapper",
+    "implementation,cache_dtype,expected_main_layout",
     [
-        ("triton", DataType.BF16, MapperKind.HND),
-        ("msa", DataType.BF16, MapperKind.HND),
-        ("triton", DataType.NVFP4, MapperKind.NHD),
+        ("triton", DataType.BF16, "HND"),
+        ("msa", DataType.BF16, "HND"),
+        ("triton", DataType.NVFP4, "NHD"),
     ],
 )
-def test_minimax_disagg_role_mapper_kinds(
+def test_minimax_role_layouts(
     monkeypatch: pytest.MonkeyPatch,
     implementation: str,
     cache_dtype: DataType,
-    expected_main_mapper: MapperKind,
+    expected_main_layout: str,
 ) -> None:
     def fake_base_init(self: KVCacheManagerV2, *args: Any, **kwargs: Any) -> None:
         self.is_disagg = kwargs.get("is_disagg", False)
@@ -116,6 +106,15 @@ def test_minimax_disagg_role_mapper_kinds(
         self.layer_offsets = {}
         self.max_batch_size = 1
         self.max_seq_len = 1
+        self.num_kv_heads_per_layer = [2]
+        self.pp_layers = [0]
+
+    # Two heads of 8 bytes over 4 tokens: head-major splits whole heads, token-major splits
+    # the heads within each token.
+    main_segments = {
+        "HND": (Segment(64, (("head", 2),), "head"),),
+        "NHD": (Segment(64, (("token", 4), ("head", 2)), "head"),),
+    }
 
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     manager = MiniMaxM3KVCacheManagerV2(
@@ -129,10 +128,10 @@ def test_minimax_disagg_role_mapper_kinds(
         ),
     )
 
-    assert manager.get_disagg_role_mapper_kinds() == {
-        Role.ALL: expected_main_mapper,
-        Role.INDEX_KEY: MapperKind.REPLICATED,
-    }
+    assert manager._main_kv_layout == expected_main_layout
+    assert manager._main_kv_layout_name() == expected_main_layout
+    assert manager.get_buffer_layout(0, Role.KEY, 64, 4) == main_segments[expected_main_layout]
+    assert manager.get_buffer_layout(0, Role.INDEX_KEY, 64, 4) == (Segment(64),)
     if implementation == "triton":
         fp8_manager = MiniMaxM3KVCacheManagerV2(
             num_layers=0,
@@ -143,7 +142,7 @@ def test_minimax_disagg_role_mapper_kinds(
                 implementation="triton", indexer_kv_dtype="bf16"
             ),
         )
-        assert fp8_manager.get_disagg_role_mapper_kinds()[Role.ALL] == MapperKind.NHD
+        assert fp8_manager.get_buffer_layout(0, Role.KEY, 64, 4) == main_segments["NHD"]
         assert fp8_manager._dense_native_layer_ids == ()
 
 
@@ -234,41 +233,75 @@ def _create_manager(
     )
 
 
+def _buffers_by_role(rank_pages: RankPages, layer_group: int, role) -> dict:
+    """``{global layer: buffer}`` of one role in a layer group."""
+    return {
+        buffer.layer: buffer
+        for buffer in rank_pages.buffers(layer_group)
+        if buffer.role == str(role)
+    }
+
+
+def _pool_of(buffer) -> tuple[int, int]:
+    return (buffer.pool_group, buffer.pool_index)
+
+
 def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
-    """Pool composition varies with TP; the view scheme must not.
+    """Pool composition varies with TP; the buffer layouts must not.
 
     TP=2 makes kv_heads_per_rank == 1, so K == V == INDEX_KEY bytes per
     block and V2 coalesces all three into one pool whose slot interleaves
-    the sparse layer's index-K between K/V regions (non-uniform layer
+    the sparse layer's index-K between K/V buffers (non-uniform layer
     stride). TP=1 doubles K/V, so index-K gets its own pool and strides are
-    uniform. Both layouts must yield the same two per-class views.
+    uniform. Both layouts must yield head-sharded K/V and replicated index-K
+    buffers.
     """
-    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-        build_page_table_from_manager,
-    )
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
+
+    def check_declarations(rank_pages):
+        assert rank_pages.group(0).kind == "attention"
+        keys = _buffers_by_role(rank_pages, 0, Role.KEY)
+        values = _buffers_by_role(rank_pages, 0, Role.VALUE)
+        index_keys = _buffers_by_role(rank_pages, 0, Role.INDEX_KEY)
+        assert {(b.layer, b.role) for b in rank_pages.buffers(0)} == (
+            {(layer, str(Role.KEY)) for layer in range(NUM_LAYERS)}
+            | {(layer, str(Role.VALUE)) for layer in range(NUM_LAYERS)}
+            | {(1, str(Role.INDEX_KEY))}
+        )
+        for buffer in list(keys.values()) + list(values.values()):
+            # HND: one head-major segment per K/V buffer.
+            assert not replicated(buffer)
+            (segment,) = buffer.segments
+            assert tuple(name for name, _ in segment.axes) == ("head",)
+            assert segment.split_axis == "head"
+        assert all(replicated(buffer) for buffer in index_keys.values())
+        return keys, values, index_keys
 
     # --- TP=2: coalesced, interleaved slot ---
     manager = _create_manager(
         Mapping(world_size=2, rank=0, tp_size=2, pp_size=1), DataType.BF16, sparse_layers=[1]
     )
     try:
-        lg = build_page_table_from_manager(manager).layer_groups[0]
-        assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
-        idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
-        assert kv_view.pool_role == frozenset({str(Role.KEY), str(Role.VALUE)})
-        assert idx_view.pool_role == frozenset({str(Role.INDEX_KEY)})
-        # Coalesced: both views address the same physical pool.
-        assert kv_view.pool_idx == idx_view.pool_idx
-        starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
-        unit = bytes_per_layer // 2  # one K or V buffer per block
+        rank_pages = RankPages.of_manager(manager)
+        keys, values, index_keys = check_declarations(rank_pages)
+        # Coalesced: every buffer addresses the same physical pool.
+        assert len({_pool_of(buffer) for buffer in rank_pages.buffers(0)}) == 1
+        unit = keys[0].size  # one K or V buffer per block
         # Slot: L0K L0V L1K L1V L1IDX L2K L2V L3K L3V — the sparse layer's
         # index-K makes the K/V layer stride non-uniform.
-        assert starts == {0: 0, 1: 2 * unit, 2: 5 * unit, 3: 7 * unit}
-        idx_starts, idx_bytes_per_layer = get_layer_byte_ranges(idx_view)
-        assert idx_starts == {1: 4 * unit}
-        assert idx_bytes_per_layer == unit
+        assert {layer: b.slot_offset for layer, b in keys.items()} == {
+            0: 0,
+            1: 2 * unit,
+            2: 5 * unit,
+            3: 7 * unit,
+        }
+        assert {layer: b.slot_offset for layer, b in values.items()} == {
+            0: unit,
+            1: 3 * unit,
+            2: 6 * unit,
+            3: 8 * unit,
+        }
+        assert {layer: b.slot_offset for layer, b in index_keys.items()} == {1: 4 * unit}
+        assert index_keys[1].size == unit
     finally:
         manager.shutdown()
 
@@ -277,13 +310,18 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
         Mapping(world_size=1, rank=0, tp_size=1, pp_size=1), DataType.BF16, sparse_layers=[1]
     )
     try:
-        lg = build_page_table_from_manager(manager).layer_groups[0]
-        assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
-        idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
-        assert kv_view.pool_idx != idx_view.pool_idx
-        starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
-        assert starts == {i: i * bytes_per_layer for i in range(NUM_LAYERS)}
+        rank_pages = RankPages.of_manager(manager)
+        keys, values, index_keys = check_declarations(rank_pages)
+        kv_pools = {_pool_of(buffer) for buffer in list(keys.values()) + list(values.values())}
+        assert len(kv_pools) == 1
+        assert _pool_of(index_keys[1]) not in kv_pools
+        unit = keys[0].size
+        assert {layer: b.slot_offset for layer, b in keys.items()} == {
+            layer: 2 * layer * unit for layer in range(NUM_LAYERS)
+        }
+        assert {layer: b.slot_offset for layer, b in values.items()} == {
+            layer: (2 * layer + 1) * unit for layer in range(NUM_LAYERS)
+        }
     finally:
         manager.shutdown()
 
@@ -314,13 +352,11 @@ def _create_managers(
 
 
 def _zero_physical_pools(manager: MiniMaxM3KVCacheManagerV2) -> None:
-    page_table = KVRegionExtractorV1(manager).page_table
     unique_pools = {}
-    for pool_group in page_table.pool_groups:
-        for pool in pool_group.pools:
-            unique_pools[pool.base_address] = max(
-                unique_pools.get(pool.base_address, 0), get_pool_bytes(pool)
-            )
+    for pool in RankPages.of_manager(manager).pools:
+        unique_pools[pool.base] = max(
+            unique_pools.get(pool.base, 0), pool.slot_bytes * pool.num_slots
+        )
     for base_address, size in unique_pools.items():
         tensor = convert_to_torch_tensor(TensorWrapper(base_address, DataType.INT8, [size]))
         tensor.zero_()
@@ -331,34 +367,31 @@ def _get_nvfp4_scale_view(
 ) -> torch.Tensor | None:
     if not manager.is_nvfp4_layer(layer_idx):
         return None
-    page_table = KVRegionExtractorV1(manager).page_table
-    local_layer_id = manager.layer_offsets[layer_idx]
+    rank_pages = RankPages.of_manager(manager)
+    global_layer = manager.get_layer_ids()[manager.layer_offsets[layer_idx]][0]
     scale_roles = frozenset({"key_block_scale", "value_block_scale"})
-    for layer_group_id, layer_group in enumerate(page_table.layer_groups):
-        for pool_view in getattr(layer_group, "pool_views", ()):
-            # Scale buffers land in their own pool (smaller size class), so
-            # selecting the pool by role set suffices; every entry for the
-            # layer inside that pool is a scale buffer.
-            if not (pool_view.pool_role & scale_roles):
-                continue
-            matching_entries = [
-                entry
-                for entry in pool_view.buffer_entries
-                if int(entry["local_layer_id"]) == local_layer_id
-            ]
-            if not matching_entries:
-                continue
-            pool = get_physical_pool(page_table, layer_group_id, pool_view.pool_idx)
-            raw_slots = convert_to_torch_tensor(
-                TensorWrapper(
-                    pool.base_address,
-                    DataType.INT8,
-                    [pool.num_slots, pool.slot_bytes],
-                )
+    for layer_group in range(rank_pages.num_layer_groups):
+        # Scale buffers land in their own pool (smaller size class), next to each other in the
+        # layer's slot, so one byte range of that pool covers both of the layer's scale roles.
+        matching_buffers = [
+            buffer
+            for buffer in rank_pages.buffers(layer_group)
+            if buffer.role in scale_roles and buffer.layer == global_layer
+        ]
+        if not matching_buffers:
+            continue
+        (pool_key,) = {_pool_of(buffer) for buffer in matching_buffers}
+        pool = rank_pages.pool(pool_key)
+        raw_slots = convert_to_torch_tensor(
+            TensorWrapper(
+                pool.base,
+                DataType.INT8,
+                [pool.num_slots, pool.slot_bytes],
             )
-            start = min(int(entry["offset"]) for entry in matching_entries)
-            end = max(int(entry["offset"] + entry["size"]) for entry in matching_entries)
-            return raw_slots[:, start:end]
+        )
+        start = min(buffer.slot_offset for buffer in matching_buffers)
+        end = max(buffer.slot_offset + buffer.size for buffer in matching_buffers)
+        return raw_slots[:, start:end]
     raise AssertionError(f"missing NVFP4 scale view for layer {layer_idx}")
 
 
@@ -367,12 +400,12 @@ def _fill_position_dependent(
     *,
     layer_idx: int,
     first_global_head: int,
-    layout: MapperKind,
+    layout: str,
 ) -> None:
     """Fill an NHD or HND cache view with exact position-dependent integers."""
     block = torch.arange(tensor.shape[0], device=tensor.device)[:, None, None, None, None]
     role = torch.arange(tensor.shape[1], device=tensor.device)[None, :, None, None, None]
-    if layout == MapperKind.HND:
+    if layout == "HND":
         head = (first_global_head + torch.arange(tensor.shape[2], device=tensor.device))[
             None, None, :, None, None
         ]
@@ -399,7 +432,7 @@ def _as_nvfp4_scale_tensor(
     bytes_per_token_head = HEAD_DIM // 16
     page_shape = (
         (local_heads, TOKENS_PER_BLOCK, bytes_per_token_head)
-        if manager._main_kv_mapper_kind == MapperKind.HND
+        if manager._main_kv_layout_name() == "HND"
         else (TOKENS_PER_BLOCK, local_heads, bytes_per_token_head)
     )
     return scale_view.view(
@@ -478,7 +511,7 @@ def _initialize_cache(
                 kv,
                 layer_idx=layer_idx,
                 first_global_head=first_global_head,
-                layout=manager._main_kv_mapper_kind,
+                layout=manager._main_kv_layout_name(),
             )
 
             index_key = manager.get_index_k_buffer(
@@ -490,7 +523,7 @@ def _initialize_cache(
                     index_tensor,
                     layer_idx=layer_idx,
                     first_global_head=0,
-                    layout=manager._main_kv_mapper_kind,
+                    layout=manager._main_kv_layout_name(),
                 )
 
             scale_tensor = _as_nvfp4_scale_tensor(manager, layer_idx)
@@ -499,7 +532,7 @@ def _initialize_cache(
                     scale_tensor,
                     layer_idx=layer_idx,
                     first_global_head=first_global_head,
-                    layout=manager._main_kv_mapper_kind,
+                    layout=manager._main_kv_layout_name(),
                 )
 
 
@@ -532,7 +565,7 @@ def _verify_cache(
                 gen_kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())[
                     gen_indices
                 ]
-                head_axis = 2 if manager._main_kv_mapper_kind == MapperKind.HND else 3
+                head_axis = 2 if manager._main_kv_layout_name() == "HND" else 3
                 local_heads = gen_kv.shape[head_axis]
                 first_global_head = _first_global_head(manager)
                 for kv_idx in range(2):
@@ -552,7 +585,7 @@ def _verify_cache(
                         ctx_kv = ctx_manager.get_buffers(
                             layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
                         )
-                        if manager._main_kv_mapper_kind == MapperKind.HND:
+                        if manager._main_kv_layout_name() == "HND":
                             actual = gen_kv[:, kv_idx, local_head, :, :]
                             expected = ctx_kv[ctx_indices, kv_idx, ctx_local_head, :, :]
                         else:
@@ -601,7 +634,7 @@ def _verify_cache(
                         )
                         ctx_scales = _as_nvfp4_scale_tensor(ctx_manager, layer_idx)
                         assert ctx_scales is not None
-                        if manager._main_kv_mapper_kind == MapperKind.HND:
+                        if manager._main_kv_layout_name() == "HND":
                             actual = gen_scales[gen_indices, :, local_head, :, :]
                             expected = ctx_scales[ctx_indices, :, ctx_local_head, :, :]
                         else:

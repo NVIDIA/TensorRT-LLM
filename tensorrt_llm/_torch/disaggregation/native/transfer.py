@@ -67,11 +67,6 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 )
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-    MambaPolicy,
-    mamba_receiver_payload_bytes,
-)
 from tensorrt_llm._torch.disaggregation.native.ownership import (
     PhysicalOperationState as _PhysicalOperationState,  # noqa: F401 -- native diagnostic alias
 )
@@ -87,9 +82,15 @@ from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, per
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.disaggregation.page_mapping import (
+    PairContext,
+    RankPages,
+    has_replicated_buffers,
+    memory_registration_descs,
+    pair_units,
+    receiver_extra_bytes,
+    validate_peer_compatible,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
@@ -1303,33 +1304,6 @@ class Sender(SenderBase):
                 f"AUX send perf logging failed for request {write_meta.unique_rid}: {error}"
             )
 
-    @staticmethod
-    def _pair_ordinals(
-        src_block_ids: np.ndarray,
-        dst_block_ids: np.ndarray,
-        dst_start_block: int = 0,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Pair src/dst positional block tables ordinal by ordinal.
-
-        Both tables are indexed by block ordinal (see Chunk); an entry is -1
-        where that side has nothing to offer/accept. A block moves only where
-        both sides hold it, so a sender that has not evicted yet, a receiver
-        that already reused a prefix, a receiver with a wider speculative
-        window, or a sender chunk that blanks everything outside its range all
-        fall out of the same intersection without any per-case arithmetic.
-        Ordinals below ``dst_start_block`` are excluded as well.
-        """
-        if src_block_ids.size != dst_block_ids.size:
-            raise ValueError(
-                f"positional block tables differ in length: src={src_block_ids.size} "
-                f"dst={dst_block_ids.size}; both sides must span the same prompt"
-            )
-        mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
-        if dst_start_block > 0:
-            mask[:dst_start_block] = False
-        idx = np.flatnonzero(mask)
-        return src_block_ids[idx], dst_block_ids[idx]
-
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -1363,65 +1337,39 @@ class Sender(SenderBase):
         # For 48k+ items this avoids many small allocations in the hot loop.
         size_specs: list[tuple[int, int]] = []
         dst_device_id = peer_ri.device_id
-        extractor = self._registrar.self_extractor
-        peer_extractor = self._registrar.peer_extractor(
-            peer_ri.instance_name, peer_ri.instance_rank
-        )
-        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
         dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
         src_block_ids_per_groups = task._chunk.block_ids_per_layer_groups
 
-        # Aggregate fragments from all matching pools using numpy concatenation.
-        # Send ownership is per pool: replicated pools elect one fan-in
-        # owner, sharded pools keep head-duplication routing.
-        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            if (self_lg, self_pi) in task._chunk.excluded_pool_views:
+        # Aggregate fragments from every transfer group using numpy concatenation.
+        # Send ownership is per group: ranks holding identical bytes elect one
+        # sender, ranks holding a unique shard always send. Each layer group's unit
+        # pairs the two sides' units (blocks by ordinal, a recurrent state slot
+        # once); every unit is addressed by its slot base.
+        pages = self._registrar.self_pages
+        paired_units: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+        for group in self._registrar.transfer_groups(peer_ri, task._chunk.excluded_buffers):
+            if not self._registrar.owns(group, peer_ri):
                 continue
-            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
+            layer_groups = (group.self_layer_group, group.peer_layer_group)
+            units = paired_units.get(layer_groups)
+            if units is None:
+                units = pair_units(
+                    src_block_ids_per_groups[group.self_layer_group],
+                    dst_block_ids_per_groups[group.peer_layer_group],
+                    PairContext(
+                        self_ri=self_ri,
+                        peer_ri=peer_ri,
+                        group=pages.group(group.self_layer_group),
+                        dst_start_token=req_info.dst_start_token,
+                    ),
+                )
+                paired_units[layer_groups] = units
+            src_units, dst_units = units
+            if src_units.size == 0:
                 continue
-
-            lg_info = extractor.page_table.layer_groups[self_lg]
-            src_block_ids = src_block_ids_per_groups[self_lg]
-            dst_block_ids = dst_block_ids_per_groups[peer_lg]
-
-            # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
-            if lg_info.kind == CacheKind.STATE:
-                if src_block_ids.size == 0 or dst_block_ids.size == 0:
-                    continue
-                if not MambaPolicy.is_paired(self._registrar.self_rank_info, peer_ri):
-                    continue
-                src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
-                dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
-            else:
-                src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
-                dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
-                    # Helix: the receiver owns global blocks [cp_rank::cp_size]
-                    # (same protocol as partition_context_for_helix), so its
-                    # table is the strided subset of ours; block reuse is
-                    # rejected under helix.
-                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
-                tpb = extractor.page_table.tokens_per_block
-                dst_start_block = (
-                    req_info.dst_start_token // tpb if req_info.dst_start_token is not None else 0
-                )
-                # Both tables are positional (index == block ordinal, -1 == not
-                # held), so pairing is a plain intersection: SWA eviction, prefix
-                # reuse, and pipelined chunk bounds are all already encoded as
-                # holes by whichever side owns that state.
-                src_block_ids, dst_block_ids = Sender._pair_ordinals(
-                    src_block_ids, dst_block_ids, dst_start_block=dst_start_block
-                )
-                if src_block_ids.size == 0:
-                    continue
-                src_region = extractor.extract(src_block_ids, self_lg, self_pi)
-                dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
-
-            # Map and collect fragments (same for all layer types)
-            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-            region_pair = mapper.map(src_region, dst_region)
-            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
-            for rp in region_pairs:
+            src_region = pages.slots(group.self_pool, src_units)
+            dst_region = peer_ri.pages.slots(group.peer_pool, dst_units)
+            for rp in group.plan.map(src_region, dst_region):
                 src_frag_parts.append(rp.src.memory.ptrs)
                 dst_frag_parts.append(rp.dst.memory.ptrs)
                 size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
@@ -2163,11 +2111,14 @@ class TxSession(TxSessionBase):
         for info in req_infos:
             self._sender._send_aux_result_to_receiver(info, AgentResult.FAILED)
 
-    def pack_aux(self, request: LlmRequest) -> None:
-        """Fill the aux buffer slot with token data from the given request."""
+    def pack_aux(self, request: LlmRequest, with_tokens: bool = True) -> None:
+        """Fill the aux buffer slot with token data from the given request.
+
+        ``with_tokens=False`` sends no first / draft tokens (the context side generated none).
+        """
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
         assert self.aux_slot is not None, "No aux_slot set for this session"
-        self._aux_buffer.fill_slot(self.aux_slot, request)
+        self._aux_buffer.fill_slot(self.aux_slot, request, with_tokens=with_tokens)
 
     def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?"""
@@ -2760,12 +2711,14 @@ class Receiver(ReceiverBase):
     def _fanin_bounce_safe(
         overlap: PeerOverlap,
         peer_ri: RankInfo,
-        receiver_page_table: Optional[KVCachePageTable],
+        receiver_pages: Optional[RankPages],
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
           * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
             expected_transfers, so the live writers overflow their slots;
+          * the writers are not several context-parallel ranks -- for a group whose grid leaves
+            out "cp" they hold the same bytes and one elected rank sends;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
@@ -2775,36 +2728,23 @@ class Receiver(ReceiverBase):
         the mismatched case, so this only needs the count to split evenly."""
         if overlap.duplicate_head_factor != 1:
             return False
+        if peer_ri.cp_size > 1 and overlap.overlap_cp_size > 1:
+            # Context-parallel senders may hold the same bytes, of which one elected rank sends.
+            return False
         if overlap.overlap_pp_size > 1:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
             if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
                 return False
-        # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
+        # Replicated buffers (e.g. index-key caches) are sent by one elected
         # fan-in owner only, so with multiple writers their contributions
         # differ in size and the equal split is invalid. Inspect both endpoints:
-        # a masked PP stage may advertise no replicated view even though another
-        # stage owns one that is visible in the receiver's page table.
-        if len(overlap.ranks) > 1:
-            for page_table in (peer_ri.page_table, receiver_page_table):
-                if page_table is None:
-                    continue
-                for layer_group in page_table.layer_groups:
-                    for pool_view in getattr(layer_group, "pool_views", ()):
-                        if pool_view.mapper_kind == MapperKind.REPLICATED:
-                            return False
+        # a masked PP stage may advertise no replicated buffer even though another
+        # stage owns one that is visible in the receiver's pages.
+        if len(overlap.ranks) > 1 and (
+            has_replicated_buffers(peer_ri.pages) or has_replicated_buffers(receiver_pages)
+        ):
+            return False
         return True
-
-    def _get_mamba_slot(self, req_info: RecvReqInfo) -> Optional[int]:
-        """Extract the mamba slot index from block_ids_per_layer_groups, or None."""
-        pt = self._registrar.self_extractor.page_table
-        if pt is None:
-            return None
-        for lg_idx, lg in enumerate(pt.layer_groups):
-            if lg.kind == CacheKind.STATE:
-                block_ids = req_info.block_ids_per_layer_groups[lg_idx]
-                if block_ids.size > 0:
-                    return int(block_ids[0])
-        return None
 
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
@@ -2882,22 +2822,21 @@ class Receiver(ReceiverBase):
             and self._fanin_bounce_safe(
                 topo_overlap,
                 peer_infos,
-                self._registrar.self_extractor.page_table,
+                self._registrar.self_pages,
             )
         )
-        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks,
-        # so the bounce region must be sized for those bytes too.
+        # Units outside the per-ordinal sizing (recurrent state slots) ride the SAME coalesced
+        # write as the KV blocks, so the bounce region must be sized for those bytes too.
         extra_bytes = 0
-        mamba_dst_slot = self._get_mamba_slot(receiver_req)
-        if mamba_dst_slot is not None:
-            if peer_infos.page_table is None:
-                allow_bounce = False  # cannot size the recurrent-state payload
+        receiver_pages = self._registrar.self_pages
+        if receiver_pages is not None:
+            sized = receiver_extra_bytes(
+                peer_infos.pages, receiver_pages, receiver_req.block_ids_per_layer_groups
+            )
+            if sized is None:
+                allow_bounce = False  # cannot size the payload without the sender's pages
             else:
-                extra_bytes = mamba_receiver_payload_bytes(
-                    sender_page_table=peer_infos.page_table,
-                    receiver_page_table=self._registrar.self_extractor.page_table,
-                    dst_slot=mamba_dst_slot,
-                )
+                extra_bytes = sized
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes
         )
@@ -3014,15 +2953,11 @@ class Receiver(ReceiverBase):
             # fail, and cached so later requests fail fast.
             try:
                 self._registrar.validate_bounded_replay_compatible(sender_info)
-                MambaPolicy.validate_peer_compatible(
+                validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
-                    self._registrar.self_extractor.page_table,
-                    sender_info.page_table,
-                )
-                AttentionPolicy.validate_peer_compatible(
-                    self._registrar.self_extractor.page_table,
-                    sender_info.page_table,
+                    self._registrar.self_pages,
+                    sender_info.pages,
                 )
             except ValueError as e:
                 msg = (
@@ -4224,8 +4159,7 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManagerV2):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
-        self._kv_extractor = KVRegionExtractorV1(kvm)
-        self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
+        self._peer_registrar = PeerRegistrar(self._rank_info)
 
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)
@@ -4262,7 +4196,7 @@ class TransferWorker:
                 self._agent,
                 self._config.bounce,
                 device_id=self._config.device_id,
-                page_table=self._rank_info.page_table,
+                pages=self._rank_info.pages,
             )
             # The bounce object owns its own NIXL descriptors (deregistered by Transport.close in
             # shutdown), so they are NOT added to _registered_mem — single-source to avoid a
@@ -4292,10 +4226,8 @@ class TransferWorker:
             raise
 
     def _register_kv_cache(self):
-        assert self._rank_info.page_table is not None
-        memory_descs = get_unique_pool_memory_descs(
-            self._rank_info.page_table, self._rank_info.device_id
-        )
+        assert self._rank_info.pages is not None
+        memory_descs = memory_registration_descs(self._rank_info.pages, self._rank_info.device_id)
         if memory_descs:
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
             self._agent.register_memory(reg_memory_desc)
@@ -4327,9 +4259,9 @@ class TransferWorker:
         return self._sender.endpoint
 
     @property
-    def page_table(self):
+    def pages(self):
         assert self._rank_info is not None
-        return self._rank_info.page_table
+        return self._rank_info.pages
 
     def shutdown(self):
         if getattr(self, "_shutdown", False):

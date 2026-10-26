@@ -26,7 +26,6 @@ import numpy as np
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
-import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
@@ -39,6 +38,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Receiver,
     RxSession,
 )
+from tensorrt_llm._torch.disaggregation.page_mapping import ownership as _ownership
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
@@ -602,7 +602,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     }
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(side_effect=lambda _peer, dp_rank: overlaps[dp_rank]),
-        self_extractor=SimpleNamespace(page_table=None),
+        self_pages=None,
         self_rank_info=SimpleNamespace(
             cp_size=1,
             instance_name="gen",
@@ -612,7 +612,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={rank: f"tcp://sender-{rank}" for rank in range(4)},
-            page_table=None,
+            pages=None,
             dp_size=2,
             cp_size=1,
         )
@@ -698,13 +698,13 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     )
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
-        self_extractor=SimpleNamespace(page_table=None),
+        self_pages=None,
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={0: "tcp://sender-0", 1: "tcp://sender-1"},
-            page_table=None,
+            pages=None,
             cp_size=1,
             dp_size=1,
         )
@@ -871,18 +871,17 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     overlap = SimpleNamespace(ranks=[0])
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
-        self_extractor=SimpleNamespace(page_table=None),
+        self_pages=None,
         self_rank_info=SimpleNamespace(cp_size=1),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={0: "tcp://sender-0"},
-            page_table=None,
+            pages=None,
             tp_size=1,
             pp_size=1,
             cp_size=1,
             dp_size=1,
-            attention=None,
         )
     )
 
@@ -1460,7 +1459,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
         set_kv_cache_transfer_start=lambda _timestamp: None,
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._fp4_mla_bridge_enabled = True
+    transceiver._ownership_bridge_enabled = True
     transceiver._enable_pipelined_transfer = False
     transceiver._ever_had_send_session = False
     transceiver._ctx_need_tp_sync = False
@@ -1542,7 +1541,7 @@ def test_bridge_rejection_releases_only_without_physical_owner(
         state=LlmRequestState.CONTEXT_INIT,
     )
     transceiver = SimpleNamespace(
-        _fp4_mla_bridge_enabled=bridge_enabled,
+        _ownership_bridge_enabled=bridge_enabled,
         has_retired_send_session=lambda _req: False,
         respond_and_send_async=lambda req: setattr(
             req, "state", LlmRequestState.DISAGG_TRANS_ERROR
@@ -2379,19 +2378,19 @@ def test_fp4_mla_bridge_uses_production_cache_layout(
         kv_cache_bounce_size_mb=0,
         enable_pipelined_transfer=False,
     )
-    profile = (mapping, manager, config)
+    profile = (manager, mapping, config)
 
-    bridge_env = transceiver_mod._FP4_MLA_OWNERSHIP_BRIDGE_ENV
-    monkeypatch.setattr(transceiver_mod, "use_pure_python_transfer_agent", lambda: False)
+    bridge_env = _ownership.OWNERSHIP_BRIDGE_ENV
+    monkeypatch.setattr(_ownership, "use_pure_python_transfer_agent", lambda: False)
     monkeypatch.delenv(bridge_env, raising=False)
     monkeypatch.delenv("TRTLLM_DISAGG_NO_RETRY", raising=False)
     monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.delenv("TRTLLM_DISAGG_LAYERWISE", raising=False)
-    assert not transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+    assert not _ownership.requires_physical_ownership(*profile)
     monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
-    assert not transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+    assert not _ownership.requires_physical_ownership(*profile)
     monkeypatch.setenv(bridge_env, "1")
-    assert transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+    assert _ownership.requires_physical_ownership(*profile)
 
     for attribute, value in (
         ("is_disagg", False),
@@ -2401,21 +2400,21 @@ def test_fp4_mla_bridge_uses_production_cache_layout(
         with monkeypatch.context() as patch:
             patch.setattr(manager, attribute, value)
             with pytest.raises(ValueError, match="FP4 MLA lifecycle bridge requires"):
-                transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+                _ownership.requires_physical_ownership(*profile)
     with monkeypatch.context() as patch:
         patch.setattr(mapping, "enable_attention_dp", False)
         with pytest.raises(ValueError, match="no-retry ADP"):
-            transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+            _ownership.requires_physical_ownership(*profile)
 
     with monkeypatch.context() as patch:
         patch.setattr(config, "enable_pipelined_transfer", True)
         with pytest.raises(ValueError, match="monolithic"):
-            transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+            _ownership.requires_physical_ownership(*profile)
 
     with monkeypatch.context() as patch:
-        patch.setattr(transceiver_mod, "use_pure_python_transfer_agent", lambda: True)
+        patch.setattr(_ownership, "use_pure_python_transfer_agent", lambda: True)
         with pytest.raises(ValueError, match=r"C\+\+ NIXL agent binding"):
-            transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+            _ownership.requires_physical_ownership(*profile)
 
     for target, attribute, value in (
         (config, "kv_transfer_timeout_ms", None),
@@ -2426,7 +2425,7 @@ def test_fp4_mla_bridge_uses_production_cache_layout(
         with monkeypatch.context() as patch:
             patch.setattr(target, attribute, value)
             with pytest.raises(ValueError, match="FP4 MLA lifecycle bridge requires"):
-                transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+                _ownership.requires_physical_ownership(*profile)
 
     for variable in (
         "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP",
@@ -2435,7 +2434,7 @@ def test_fp4_mla_bridge_uses_production_cache_layout(
         with monkeypatch.context() as patch:
             patch.setenv(variable, "1")
             with pytest.raises(ValueError, match="FP4 MLA lifecycle bridge requires"):
-                transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+                _ownership.requires_physical_ownership(*profile)
 
 
 @pytest.mark.cpu_only
@@ -2453,7 +2452,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
         set_kv_cache_transfer_start=lambda _timestamp: None,
     )
     sender = object.__new__(KvCacheTransceiverV2)
-    sender._fp4_mla_bridge_enabled = True
+    sender._ownership_bridge_enabled = True
     sender._enable_pipelined_transfer = False
     sender._send_reqs = {}
 
@@ -2485,7 +2484,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
         set_kv_cache_transfer_start=lambda _timestamp: None,
     )
     receiver = object.__new__(KvCacheTransceiverV2)
-    receiver._fp4_mla_bridge_enabled = True
+    receiver._ownership_bridge_enabled = True
     receiver._recv_sessions = {}
     receiver._recv_reqs = {}
     receiver._kv_size_rank_factor = 1
@@ -2512,7 +2511,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
 @pytest.mark.cpu_only
 def test_fp4_mla_bridge_rejects_requests_outside_qualified_protocol() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._fp4_mla_bridge_enabled = True
+    transceiver._ownership_bridge_enabled = True
     valid = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
         disagg_request_id=1,

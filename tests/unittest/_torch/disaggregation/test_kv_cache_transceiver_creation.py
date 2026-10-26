@@ -27,7 +27,6 @@ import pytest
 
 from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
@@ -102,10 +101,9 @@ def test_direct_python_transceiver_rejects_v1_before_resource_setup(
     worker.assert_not_called()
 
 
-@pytest.mark.parametrize("factory", [build_page_table_from_manager, create_cache_reuse_adapter])
-def test_python_transfer_resources_reject_v1_manager(factory) -> None:
+def test_python_transfer_resources_reject_v1_manager() -> None:
     with pytest.raises(ValueError, match="requires KVCacheManagerV2; V1 is unsupported"):
-        factory(object.__new__(KVCacheManager))
+        create_cache_reuse_adapter(object.__new__(KVCacheManager))
 
 
 def test_python_runtime_accepts_v2_manager(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -8,17 +8,13 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import (
-    MAMBA_CONV_ROLE,
-    MAMBA_SSM_ROLE,
-    AttentionLayerGroup,
-    MambaLayerGroup,
-)
+from tensorrt_llm._torch.disaggregation.base import CacheKind
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -1181,8 +1177,6 @@ def test_v2_disagg_gen_init_without_local_mamba_layers_keeps_complete_blocks():
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
-    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {123: 7}
@@ -1190,11 +1184,10 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
     # Provide a mamba layer group so _create_chunk places the slot ID
-    mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
-    transceiver._page_table = SimpleNamespace(layer_groups=[mamba_lg])
+    transceiver._pages = SimpleNamespace(num_layer_groups=1, kind=lambda g: CacheKind.STATE)
     request = SimpleNamespace(
         is_generation_only_request=False,
         prompt_len=0,
@@ -3663,11 +3656,11 @@ def test_v2_hybrid_swa_scratch_keeps_ssm_placeholder_rows():
 def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
     mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, num_mamba_layers=2)
     try:
-        page_table = build_page_table_from_manager(mgr)
+        pages = RankPages.of_manager(mgr)
 
-        assert len(page_table.layer_groups) == len(mgr.impl.layer_grouping)
-        assert isinstance(page_table.layer_groups[0], MambaLayerGroup)
-        assert isinstance(page_table.layer_groups[1], AttentionLayerGroup)
+        assert pages.num_layer_groups == len(mgr.impl.layer_grouping)
+        assert pages.kind(0) == CacheKind.STATE
+        assert pages.kind(1) == CacheKind.PAGED
 
         requests = mgr.add_dummy_requests([123], token_nums=[64], is_gen=False)
         assert len(requests) == 1
@@ -3686,16 +3679,18 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         conv_state_layout="q_k_v",
     )
     try:
-        page_table = build_page_table_from_manager(mgr)
-        mamba_group = page_table.layer_groups[0]
+        pages = RankPages.of_manager(mgr)
 
-        assert isinstance(mamba_group, MambaLayerGroup)
+        assert pages.kind(0) == CacheKind.STATE
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
-        conv_view = next(pv for pv in mamba_group.pool_views if pv.pool_role == MAMBA_CONV_ROLE)
-        assert conv_view.section_bytes == [
-            dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
-        ]
+        conv_buffers = [b for b in pages.buffers(0) if b.role == MambaRole.CONV_STATE]
+        assert conv_buffers
+        for conv in conv_buffers:
+            assert all(segment.split_axis == "byte" for segment in conv.segments)
+            assert [segment.nbytes for segment in conv.segments] == [
+                dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
+            ]
         assert mgr.conv_section_dims == [8, 8, 32]
     finally:
         mgr.shutdown()
@@ -3812,7 +3807,7 @@ def test_v2_kda_draft_records_replace_the_replay_caches(kda_replay_num_spec):
             "kda_state_tok",
         }
         # A KVCM state buffer of the SSM layers, kept out of disaggregated transfers like the other replay buffers.
-        assert DataRole("kda_state_tok") in mgr.get_disagg_ignored_roles()
+        assert "kda_state_tok" in mgr.get_untransferred_roles()
         assert len(mgr.kda_state_tok) == 2
         for layer_idx in range(2):
             layer_cache = mgr.mamba_layer_cache(layer_idx)
@@ -4586,7 +4581,7 @@ def test_v2_kda_replay_buffers_are_kvcm_state_buffers():
         assert mgr._mamba_state_bytes_per_slot() == (
             2 * (mgr.ssm_bytes + mgr.conv_bytes) + 2 * layer_bytes + 16
         )
-        ignored = {str(role) for role in mgr.get_disagg_ignored_roles()}
+        ignored = mgr.get_untransferred_roles()
         assert replay_roles | {"prev_num_accepted_tokens"} <= ignored
     finally:
         mgr.shutdown()
@@ -4736,9 +4731,7 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg):
         if ctx_only:
             assert mgr.get_intermediate_ssm_states(0) is None
             assert mgr.get_intermediate_conv_states(0) is None
-            assert not mgr.get_disagg_ignored_roles() & {
-                DataRole(name) for name in _KDA_REPLAY_FIELDS
-            }
+            assert not mgr.get_untransferred_roles() & set(_KDA_REPLAY_FIELDS)
             mgr.update_mamba_states(
                 SimpleNamespace(num_seqs=1, num_contexts=1),
                 torch.ones(1, device="cuda", dtype=torch.int32),
@@ -4834,11 +4827,11 @@ def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
 def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
     """A context server without replay caches and a generation server with them describe the same transferable
     recurrent state, and the generation server seeds its replay caches from the transferred conv state."""
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-        MambaPolicy,
-        mamba_receiver_payload_bytes,
-    )
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+    from tensorrt_llm._torch.disaggregation.page_mapping import (
+        receiver_extra_bytes,
+        validate_peer_compatible,
+    )
 
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     ctx = _build_kda_replay_manager(is_disagg=True)
@@ -4850,16 +4843,27 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
             _run_v2_hybrid_context(mgr, _make_v2_conversation_request(101, [1, 2], "transfer"))
         src_slot = ctx.get_state_indices([101])[0]
         dst_slot = gen.get_state_indices([101])[0]
-        src_table = build_page_table_from_manager(ctx)
-        dst_table = build_page_table_from_manager(gen)
+        src_pages = RankPages.of_manager(ctx)
+        dst_pages = RankPages.of_manager(gen)
         src_rank = RankInfo.from_kv_cache_manager("ctx", ctx, device_id=0)
         dst_rank = RankInfo.from_kv_cache_manager("gen", gen, device_id=0)
-        MambaPolicy.validate_peer_compatible(src_rank, dst_rank, src_table, dst_table)
-        src_group = next(g for g in src_table.layer_groups if isinstance(g, MambaLayerGroup))
-        dst_group = next(g for g in dst_table.layer_groups if isinstance(g, MambaLayerGroup))
-        for group in (src_group, dst_group):
-            assert {pv.pool_role for pv in group.pool_views} == {MAMBA_CONV_ROLE, MAMBA_SSM_ROLE}
-        assert mamba_receiver_payload_bytes(src_table, dst_table, dst_slot) == sum(
+        validate_peer_compatible(src_rank, dst_rank, src_pages, dst_pages)
+        for pages in (src_pages, dst_pages):
+            state = next(
+                g for g in range(pages.num_layer_groups) if pages.kind(g) == CacheKind.STATE
+            )
+            # The replay buffers keep their places in the slot but never travel.
+            assert {b.role for b in pages.buffers(state)} == {
+                MambaRole.CONV_STATE,
+                MambaRole.SSM_STATE,
+            }
+        dst_units = [
+            np.array([dst_slot], dtype=np.int64)
+            if dst_pages.kind(g) == CacheKind.STATE
+            else np.empty(0, dtype=np.int64)
+            for g in range(dst_pages.num_layer_groups)
+        ]
+        assert receiver_extra_bytes(src_pages, dst_pages, dst_units) == sum(
             gen.mamba_layer_cache(i).conv[dst_slot].numel() * 2
             + gen.mamba_layer_cache(i).temporal[dst_slot].numel() * 4
             for i in range(2)

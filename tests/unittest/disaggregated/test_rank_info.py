@@ -13,16 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from pages_test_utils import pages
 
 from tensorrt_llm import bindings
-from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages, ShardGrid, shard_grid
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_builder import _topology, kv_dtype
 
 pytestmark = pytest.mark.cpu_only
 
@@ -101,9 +103,8 @@ def test_rank_info_roundtrip_with_aux_meta():
     assert restored.aux_meta.device == "cpu"
 
 
-def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> None:
-    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
-    mapping = SimpleNamespace(
+def _mapping(**overrides) -> SimpleNamespace:
+    fields = dict(
         rank=0,
         tp_size=1,
         tp_rank=0,
@@ -114,19 +115,21 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
         cp_rank=0,
         enable_attention_dp=False,
     )
-    manager = SimpleNamespace(
-        mapping=mapping,
-        num_kv_heads_per_layer=[0, 8, 0],
-        pp_layers=[0, 1, 2],
-        tokens_per_block=32,
-        head_dim=128,
-        dtype=bindings.DataType.HALF,
-        kv_factor=2,
-    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _pages_of_topology(manager) -> RankPages:
+    """The pages of a manager holding no layer group: only its place among the ranks."""
+    return pages([], [], topology=_topology(manager))
+
+
+def test_from_kv_cache_manager_carries_bounded_replay(monkeypatch) -> None:
+    monkeypatch.setattr(RankPages, "of_manager", staticmethod(lambda _manager: None))
+    manager = SimpleNamespace(mapping=_mapping(), pp_layers=[0, 1, 2])
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
-
-    assert info.attention.kv_heads_per_rank == 8
+    assert info.layer_num_per_pp == [3]
     assert info.bounded_replay_on_generation is False
 
     manager.bounded_replay_on_generation = True
@@ -137,69 +140,51 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
 def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
-    mapping = SimpleNamespace(
-        rank=1,
-        tp_size=2,
-        tp_rank=1,
-        pp_size=1,
-        pp_rank=0,
-        dp_size=1,
-        cp_size=1,
-        cp_rank=0,
-        enable_attention_dp=True,
-    )
+    monkeypatch.setattr(RankPages, "of_manager", staticmethod(_pages_of_topology))
     manager = SimpleNamespace(
-        mapping=mapping,
-        num_kv_heads_per_layer=[0, 0],
+        mapping=_mapping(rank=1, tp_size=2, tp_rank=1, enable_attention_dp=True),
         pp_layers=[0, 1],
-        tokens_per_block=32,
-        head_dim=128,
-        dtype=bindings.DataType.HALF,
-        kv_factor=2,
     )
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
-    assert info.attention is not None
-    assert info.attention.kv_heads_per_rank == 0
-    assert info.attention.enable_attention_dp
-    assert MambaPolicy._mamba_tp(info) == (1, 0)
+    assert (info.dp_size, info.dp_rank) == (2, 1)
+    assert info.pages.layout.topology.attention_dp
+    assert info.tp_size_per_dp_group == 1
+    assert shard_grid(("tp", "cp"), info) == ShardGrid(size=1, rank=0)
+    restored = RankInfo.from_bytes(info.to_bytes())
+    assert restored.tp_size_per_dp_group == 1
+
+    manager.mapping = _mapping(rank=1, tp_size=2, tp_rank=1)
+    info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+    assert info.tp_size_per_dp_group == 2
+    assert shard_grid(("tp", "cp"), info) == ShardGrid(size=2, rank=1)
 
 
 @pytest.mark.parametrize(
-    ("dtype", "expected_element_bytes", "expected_type"),
-    [(bindings.DataType.NVFP4, 0.5, float), (bindings.DataType.HALF, 2, int)],
+    ("dtype", "expected_name"),
+    [(bindings.DataType.NVFP4, "NVFP4"), (bindings.DataType.HALF, "HALF")],
 )
-def test_rank_info_represents_cache_element_bytes(
-    monkeypatch, dtype, expected_element_bytes, expected_type
-):
-    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _manager: None)
-    manager = SimpleNamespace(
-        mapping=SimpleNamespace(
-            rank=0,
-            tp_size=2,
-            tp_rank=0,
-            pp_size=1,
-            pp_rank=0,
-            dp_size=1,
-            cp_size=1,
-            cp_rank=0,
-            enable_attention_dp=False,
-        ),
-        pp_layers=[0],
-        num_kv_heads_per_layer=[4],
-        tokens_per_block=64,
-        head_dim=128,
-        dtype=dtype,
-        kv_factor=2,
+def test_rank_info_carries_cache_dtype(dtype, expected_name):
+    manager = SimpleNamespace(dtype=dtype)
+    assert kv_dtype(manager) == expected_name
+    rank_pages = pages([], [])
+    rank_pages = RankPages(
+        dataclasses.replace(rank_pages.layout, dtype=kv_dtype(manager)), rank_pages.pools
+    )
+    rank_info = RankInfo(
+        instance_name="ctx",
+        instance_rank=0,
+        tp_size=2,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[1],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+        pages=rank_pages,
     )
 
-    rank_info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
-
-    assert rank_info.attention.element_bytes == expected_element_bytes
-    assert isinstance(rank_info.attention.element_bytes, expected_type)
-
     restored = RankInfo.from_bytes(rank_info.to_bytes())
-    assert restored.attention.element_bytes == expected_element_bytes
-    assert isinstance(restored.attention.element_bytes, expected_type)
+    assert restored.pages.layout.dtype == expected_name

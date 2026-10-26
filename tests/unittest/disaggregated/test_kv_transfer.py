@@ -53,12 +53,14 @@ except ImportError as e:
     TRANSFER_AGENT_BINDING_IMPORT_ERROR = e
 else:
     TRANSFER_AGENT_BINDING_IMPORT_ERROR = None
+from pages_test_utils import group, pages
+
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -245,6 +247,17 @@ def test_session_status_enum():
 # ---------------------------------------------------------------------------
 
 
+def _paged_pages(
+    tokens_per_block: int, num_layer_groups: int = 1, window: Optional[int] = None
+) -> RankPages:
+    """Pages of ``num_layer_groups`` paged attention layer groups, each keeping ``window`` tokens."""
+    return pages(
+        [],
+        [group("attention", window=window) for _ in range(num_layer_groups)],
+        tokens_per_page=tokens_per_block,
+    )
+
+
 def _valid(table) -> np.ndarray:
     """Slots a positional block table actually holds (drops the -1 holes)."""
     table = np.asarray(table, dtype=np.int64)
@@ -276,9 +289,7 @@ def _send_prefill_chunks(
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
-    transceiver._page_table.layer_groups = [
-        SimpleNamespace(sliding_window_size=None) for _ in all_block_ids
-    ]
+    transceiver._pages = _paged_pages(tokens_per_block, num_layer_groups=len(all_block_ids))
     transceiver._send_reqs = {}
 
     prompt_len = total_blocks * tokens_per_block
@@ -340,7 +351,7 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
-    transceiver._page_table.layer_groups = [SimpleNamespace(sliding_window_size=None)]
+    transceiver._pages = _paged_pages(tokens_per_block)
     transceiver._send_reqs = {}
     # A full-attention group keeps the whole prompt resident from block 0, so
     # _describe_local describes every block regardless of prefill progress.
@@ -385,32 +396,30 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
         np.arange(16, dtype=np.int64),
         np.arange(9, 13, dtype=np.int64),
     ],
-    ids=["full_prompt_allocation", "v2_incremental_allocation"],
+    ids=["full_prompt_allocation", "incremental_allocation"],
 )
 def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
-    """A partial SWA chunk is deferred for both cache-manager allocation strategies."""
+    """A partial SWA chunk is deferred for both block-table allocation shapes."""
     tokens_per_block = 8
     prompt_blocks = 16
     window_blocks = 4
 
-    layer_group = SimpleNamespace(
-        kind=CacheKind.PAGED, sliding_window_size=window_blocks * tokens_per_block
-    )
-
-    def _unexpected_get_block_ids(req, idx, lg):
+    def _unexpected_get_block_ids(req, idx):
         raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
+        get_cached_token_count_per_layer_group=lambda req, num_layer_groups: [0] * num_layer_groups,
         get_block_ids=_unexpected_get_block_ids,
-        get_block_ordinals=lambda req, idx, lg: source_block_ids,
+        get_block_ordinals=lambda req, idx: source_block_ids,
     )
-    transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
+    transceiver._pages = _paged_pages(tokens_per_block, window=window_blocks * tokens_per_block)
     transceiver._kv_cache_manager = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         num_extra_kv_tokens=0,
+        get_transfer_length=lambda req: req.prompt_len,
+        get_untransferred_buffers=lambda req: frozenset(),
     )
     transceiver._send_reqs = {}
 
@@ -423,8 +432,6 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     req.py_last_context_chunk = (11 * tokens_per_block, 13 * tokens_per_block)
     req.context_remaining_length = 3 * tokens_per_block
     req.is_generation_only_request = False
-    req.py_csa2_remote_tail_start = None
-    req.py_csa2_remote_tail_split = None
 
     extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
 
@@ -515,13 +522,11 @@ def create_transfer_worker_setup(
     gen_pp: int,
     gen_enable_dp: bool,
     is_mla: bool = False,
-    use_v2: bool = True,
     max_attention_window_vec: Optional[List[int]] = None,
 ):
-    """Helper function to set up transfer workers for testing.
+    """Helper function to set up KVCacheManagerV2 transfer workers for testing.
 
     Args:
-        use_v2: Use KVCacheManagerV2 for Python KV transfers.
         max_attention_window_vec: List of window sizes, e.g. [max_seq_len] or [max_seq_len, small_window].
     """
     ctx_mappings = []
@@ -601,18 +606,17 @@ def create_transfer_worker_setup(
             dtype=dtype,
             vocab_size=vocab_size,
         )
-        # V2: Initialize pools using page_table
+        # Initialize the device pools of the rank's pages
         random_seed = 0 if is_mla else None
-        page_table = KVRegionExtractorV1(ctx_kv_cache_manager).page_table
+        rank_pages = RankPages.of_manager(ctx_kv_cache_manager)
 
-        # Collect unique pools (deduplicate by base_address)
-        unique_pools = {}  # base_address -> pool_bytes
-        for pg in page_table.pool_groups:
-            for pool_desc in pg.pools:
-                key = pool_desc.base_address
-                pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
-                if key not in unique_pools or pool_bytes > unique_pools[key]:
-                    unique_pools[key] = pool_bytes
+        # Collect unique pools (deduplicate by base address)
+        unique_pools = {}  # base address -> pool_bytes
+        for pool in rank_pages.pools:
+            key = pool.base
+            pool_bytes = pool.slot_bytes * pool.num_slots
+            if key not in unique_pools or pool_bytes > unique_pools[key]:
+                unique_pools[key] = pool_bytes
 
         # Initialize each unique pool with random data
         element_bytes = get_size_in_bytes(1, ctx_kv_cache_manager.dtype)
@@ -686,14 +690,13 @@ def create_transfer_worker_setup(
             vocab_size=vocab_size,
         )
         # Initialize gen pool to zeros to verify transfer correctness
-        gen_page_table = KVRegionExtractorV1(gen_kv_cache_manager).page_table
+        gen_rank_pages = RankPages.of_manager(gen_kv_cache_manager)
         gen_unique_pools = {}
-        for pg in gen_page_table.pool_groups:
-            for pool_desc in pg.pools:
-                key = pool_desc.base_address
-                pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
-                if key not in gen_unique_pools or pool_bytes > gen_unique_pools[key]:
-                    gen_unique_pools[key] = pool_bytes
+        for pool in gen_rank_pages.pools:
+            key = pool.base
+            pool_bytes = pool.slot_bytes * pool.num_slots
+            if key not in gen_unique_pools or pool_bytes > gen_unique_pools[key]:
+                gen_unique_pools[key] = pool_bytes
         gen_element_bytes = get_size_in_bytes(1, gen_kv_cache_manager.dtype)
         for pool_base_ptr, pool_size in gen_unique_pools.items():
             pool_size_elements = pool_size // gen_element_bytes
@@ -740,7 +743,6 @@ def create_transfer_worker_setup(
         "gen_pp": gen_pp,
         "gen_enable_dp": gen_enable_dp,
         "is_mla": is_mla,
-        "use_v2": use_v2,
         "num_layers": num_layers,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
@@ -754,10 +756,9 @@ def get_block_data(
     kv_cache_manager,
     block_ids: List[int],
     layer_group_id: int,
-    use_v2: bool,
     request_id: Optional[int] = None,
 ) -> torch.Tensor:
-    """Retrieve V2 block data.
+    """Block data of one KVCacheManagerV2 life cycle (layer group).
 
     ``block_ids`` may be a positional table with -1 holes; only held slots are read.
     """
@@ -800,21 +801,21 @@ def get_block_ids_per_layer_groups(
     kv_cache_manager,
     transfer_worker,
     request_id: int,
-    use_v2: bool,
     tokens_per_block: int,
     prompt_len: int,
 ) -> List[np.ndarray]:
-    """Positional block table per layer group, straight from the cache manager.
+    """Positional block table per layer group (life cycle), straight from the cache manager.
 
     Entry i is the pool slot for block ordinal i or -1 (SWA-evicted / unbound),
     fitted to ceil(prompt_len / tpb) entries -- the same shape
     KvCacheTransceiverV2._describe_local produces.
     """
-    page_table = transfer_worker._rank_info.page_table
+    rank_pages = transfer_worker._rank_info.pages
     prompt_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
     tables: List[np.ndarray] = []
 
-    for group_id, group_meta in enumerate(page_table.layer_groups):
+    # The layer group index is the V2 life-cycle id.
+    for group_id in range(rank_pages.num_layer_groups):
         ordinals = list(
             kv_cache_manager.kv_cache_map[request_id].get_aggregated_page_indices(
                 group_id, valid_only=False
@@ -845,7 +846,6 @@ def add_and_verify_request(
     gen_pp = setup["gen_pp"]
     gen_enable_dp = setup["gen_enable_dp"]
     is_mla = setup["is_mla"]
-    use_v2 = setup["use_v2"]
     num_kv_heads = setup["num_kv_heads"]
     head_dim = setup["head_dim"]
     tokens_per_block = setup["tokens_per_block"]
@@ -897,7 +897,7 @@ def add_and_verify_request(
     ]
 
     # Add sequence to ctx KV cache managers
-    ctx_kv_caches = []  # V2: Store kv_cache objects for cleanup
+    ctx_kv_caches = []  # Store kv_cache objects for cleanup
     for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
         kv_cache = ctx_kv_cache_manager._create_kv_cache(ctx_request.py_request_id, None, None)
         success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
@@ -936,7 +936,6 @@ def add_and_verify_request(
             ctx_kv_cache_manager,
             ctx_transfer_worker,
             ctx_request.py_request_id,
-            use_v2,
             tokens_per_block,
             ctx_request.prompt_len,
         )
@@ -950,7 +949,6 @@ def add_and_verify_request(
             gen_kv_cache_manager,
             gen_transfer_worker,
             gen_request.py_request_id,
-            use_v2,
             tokens_per_block,
             gen_request.prompt_len,
         )
@@ -1072,18 +1070,12 @@ def add_and_verify_request(
         valid_gen_tp = 1
 
     # Per-layer-group verification
-    def get_layers_in_group_per_pp(kv_cache_managers, pp_size, tp_size, group_id, is_v2):
+    def get_layers_in_group_per_pp(kv_cache_managers, pp_size, tp_size, group_id):
         """Get the number of layers in a group for each PP rank."""
         layers_per_pp = []
         for pp_rank in range(pp_size):
             mgr = kv_cache_managers[pp_rank * tp_size]
-            if is_v2:
-                layers_per_pp.append(len(mgr.impl.layer_grouping[group_id]))
-            else:
-                window_to_layers = mgr._get_window_size_to_layers()
-                sorted_windows = sorted(window_to_layers.keys(), key=lambda x: (x is None, x))
-                window_size = sorted_windows[group_id]
-                layers_per_pp.append(len(window_to_layers[window_size]))
+            layers_per_pp.append(len(mgr.impl.layer_grouping[group_id]))
         return layers_per_pp
 
     for layer_group_id in range(num_layer_groups):
@@ -1093,20 +1085,20 @@ def add_and_verify_request(
 
         # Get data using unified get_block_data function
         ctx_block_datas = [
-            get_block_data(mgr, bids, layer_group_id, use_v2, ctx_request.py_request_id)
+            get_block_data(mgr, bids, layer_group_id, ctx_request.py_request_id)
             for mgr, bids in zip(valid_ctx_kv_cache_managers, ctx_group_block_ids)
         ]
         gen_block_datas = [
-            get_block_data(mgr, bids, layer_group_id, use_v2, gen_request.py_request_id)
+            get_block_data(mgr, bids, layer_group_id, gen_request.py_request_id)
             for mgr, bids in zip(valid_gen_kv_cache_managers, gen_group_block_ids)
         ]
 
         # Get layers per PP rank for this group
         ctx_layers_per_pp = get_layers_in_group_per_pp(
-            valid_ctx_kv_cache_managers, ctx_pp, valid_ctx_tp, layer_group_id, use_v2
+            valid_ctx_kv_cache_managers, ctx_pp, valid_ctx_tp, layer_group_id
         )
         gen_layers_per_pp = get_layers_in_group_per_pp(
-            valid_gen_kv_cache_managers, gen_pp, valid_gen_tp, layer_group_id, use_v2
+            valid_gen_kv_cache_managers, gen_pp, valid_gen_tp, layer_group_id
         )
 
         ctx_layers_in_group = sum(ctx_layers_per_pp)
@@ -1190,7 +1182,7 @@ def add_and_verify_request(
     for sender_session in sender_sessions:
         sender_session.close()
 
-    # V2: Close kv_caches to release slots
+    # Close kv_caches to release slots
     torch.cuda.current_stream().synchronize()
     for kv_cache in ctx_kv_caches:
         kv_cache.close()
@@ -1243,7 +1235,6 @@ def test_transfer_worker_v2(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
         gen_pp=gen_pp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=True,
     )
 
     request_len = setup["request_len"]
@@ -1279,7 +1270,6 @@ def test_transfer_worker_v2_with_window(
         gen_pp=gen_pp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=True,
         max_attention_window_vec=max_attention_window_vec,
     )
 
@@ -1295,13 +1285,12 @@ def test_transfer_worker_v2_with_window(
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
 @pytest.mark.parametrize(
     "chunk_size_blocks",
     [None, 2],
     ids=["single_slice", "sender_chunked"],
 )
-def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
+def test_transfer_with_gen_prefix_offset(chunk_size_blocks):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx offers every ordinal of the prompt,
@@ -1321,7 +1310,6 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         gen_tp=1,
         gen_pp=1,
         gen_enable_dp=False,
-        use_v2=use_v2,
     )
 
     ctx_tw = setup["ctx_transfer_workers"][0]
@@ -1375,10 +1363,10 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
 
     # Get block IDs
     ctx_block_ids = get_block_ids_per_layer_groups(
-        ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block, request_len
+        ctx_mgr, ctx_tw, 0, tokens_per_block, request_len
     )
     gen_block_ids = get_block_ids_per_layer_groups(
-        gen_mgr, gen_tw, 1, use_v2, tokens_per_block, request_len
+        gen_mgr, gen_tw, 1, tokens_per_block, request_len
     )
 
     # Gen already holds the reused prefix: mask those ordinals so the sender
@@ -1430,8 +1418,8 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
             ctx_suffix_bids = ctx_block_ids[lg_id][prefix_blocks:]
             gen_suffix_bids = gen_suffix_block_ids[lg_id][prefix_blocks:]
 
-            ctx_data = get_block_data(ctx_mgr, ctx_suffix_bids, lg_id, use_v2, 0)
-            gen_data = get_block_data(gen_mgr, gen_suffix_bids, lg_id, use_v2, 1)
+            ctx_data = get_block_data(ctx_mgr, ctx_suffix_bids, lg_id, 0)
+            gen_data = get_block_data(gen_mgr, gen_suffix_bids, lg_id, 1)
             assert ctx_data.equal(gen_data), (
                 f"Layer group {lg_id}: suffix block data mismatch after prefix-offset transfer"
             )
@@ -1545,11 +1533,12 @@ def test_session_cancel_after_send():
         # transitions only.  Pass an empty block-id list per layer group so we
         # avoid depending on KVCacheManager's sequence-management API (which
         # changed shape across versions).
-        page_table = ctx_transfer_worker._rank_info.page_table
-        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+        rank_pages = ctx_transfer_worker._rank_info.pages
+        num_groups = rank_pages.num_layer_groups
+        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in range(num_groups)]
         kv_slice = Chunk(
             block_ids_per_layer_groups=block_ids_per_groups,
-            kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+            kind_per_layer_group=[rank_pages.kind(g) for g in range(num_groups)],
             token_range=TokenRange(start=0, end=ctx_request.prompt_len),
             is_last=True,
         )
@@ -1573,7 +1562,6 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
     gen_transfer_workers = setup["gen_transfer_workers"]
     gen_kv_cache_managers = setup["gen_kv_cache_managers"]
     ctx_info_endpoint = setup["ctx_info_endpoint"]
-    use_v2 = setup["use_v2"]
     tokens_per_block = setup["tokens_per_block"]
 
     sampling_params = SamplingParams()
@@ -1623,13 +1611,13 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
 
     ctx_block_ids = [
         get_block_ids_per_layer_groups(
-            mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block, request_len
+            mgr, tw, ctx_request.py_request_id, tokens_per_block, request_len
         )
         for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers, strict=True)
     ]
     gen_block_ids = [
         get_block_ids_per_layer_groups(
-            mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block, request_len
+            mgr, tw, gen_request.py_request_id, tokens_per_block, request_len
         )
         for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers, strict=True)
     ]
@@ -1648,7 +1636,6 @@ def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessi
     """Shared verification and cleanup for chunked transfer tests."""
     ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
     gen_kv_cache_managers = setup["gen_kv_cache_managers"]
-    use_v2 = setup["use_v2"]
 
     ctx_block_ids = ctx_info["ctx_block_ids"]
     gen_block_ids = ctx_info["gen_block_ids"]
@@ -1661,11 +1648,11 @@ def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessi
     num_layer_groups = len(ctx_block_ids[0])
     for lg_id in range(num_layer_groups):
         ctx_data = [
-            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["ctx_request"].py_request_id)
+            get_block_data(mgr, bids[lg_id], lg_id, ctx_info["ctx_request"].py_request_id)
             for mgr, bids in zip(ctx_kv_cache_managers, ctx_block_ids, strict=True)
         ]
         gen_data = [
-            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["gen_request"].py_request_id)
+            get_block_data(mgr, bids[lg_id], lg_id, ctx_info["gen_request"].py_request_id)
             for mgr, bids in zip(gen_kv_cache_managers, gen_block_ids, strict=True)
         ]
         for c, g in zip(ctx_data, gen_data, strict=True):
@@ -1792,11 +1779,12 @@ def test_session_has_transferring_tasks_false():
         assert not tx_session.has_transferring_tasks()
 
         # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
-        page_table = ctx_transfer_worker._rank_info.page_table
-        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+        rank_pages = ctx_transfer_worker._rank_info.pages
+        num_groups = rank_pages.num_layer_groups
+        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in range(num_groups)]
         kv_slice = Chunk(
             block_ids_per_layer_groups=block_ids_per_groups,
-            kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+            kind_per_layer_group=[rank_pages.kind(g) for g in range(num_groups)],
             token_range=TokenRange(start=0, end=ctx_request.prompt_len),
             is_last=True,
         )
@@ -1878,10 +1866,11 @@ def test_incompatible_peer_fails_only_affected_requests(
 
     # dispatch_task fails at peer validation, before any block transfer, so
     # empty per-layer-group block lists suffice (no KV sequence needed).
-    page_table = gen_tw._rank_info.page_table
+    rank_pages = gen_tw._rank_info.pages
+    num_groups = rank_pages.num_layer_groups
     empty_slice = Chunk(
-        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
-        kind_per_layer_group=[CacheKind.PAGED],
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in range(num_groups)],
+        kind_per_layer_group=[rank_pages.kind(g) for g in range(num_groups)],
         token_range=TokenRange(start=0, end=0),
         is_last=True,
     )
@@ -1894,7 +1883,7 @@ def test_incompatible_peer_fails_only_affected_requests(
 
     try:
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(transfer_mod.MambaPolicy, "validate_peer_compatible", staticmethod(raiser))
+            mp.setattr(transfer_mod, "validate_peer_compatible", raiser)
 
             # (a) First request to the incompatible peer: receive() must not
             # raise; the session fails with the diagnostic preserved.
@@ -1988,25 +1977,25 @@ def add_and_verify_pipelined_request(
 
 
 PIPELINED_TEST_CONFIGS = [
-    (1, 1, False, 1, 1, False, False, True, "v2_tp1_pp1_pipelined"),
-    (2, 1, False, 2, 1, False, False, True, "v2_tp2_pp1_pipelined"),
+    (1, 1, False, 1, 1, False, False, "v2_tp1_pp1_pipelined"),
+    (2, 1, False, 2, 1, False, False, "v2_tp2_pp1_pipelined"),
 ]
 
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize(
-    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,use_v2",
-    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in PIPELINED_TEST_CONFIGS],
-    ids=[c[8] for c in PIPELINED_TEST_CONFIGS],
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in PIPELINED_TEST_CONFIGS],
+    ids=[c[7] for c in PIPELINED_TEST_CONFIGS],
 )
 def test_transfer_worker_pipelined(
-    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla
 ):
-    """Test pipelined transfer with chunks sent incrementally."""
+    """Test pipelined transfer: chunks sent incrementally."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     tensorrt_llm.logger.set_level("info")
-    logger.info("Test V2 transfer worker with pipelined transfer")
+    logger.info("Test transfer worker V2 with pipelined transfer")
 
     setup = create_transfer_worker_setup(
         ctx_tp=ctx_tp,
@@ -2016,7 +2005,6 @@ def test_transfer_worker_pipelined(
         gen_pp=gen_pp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=use_v2,
     )
 
     request_len = setup["request_len"]
@@ -2036,12 +2024,12 @@ def test_transfer_worker_pipelined(
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize(
-    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,use_v2",
-    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in PIPELINED_TEST_CONFIGS],
-    ids=[c[8] for c in PIPELINED_TEST_CONFIGS],
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in PIPELINED_TEST_CONFIGS],
+    ids=[c[7] for c in PIPELINED_TEST_CONFIGS],
 )
 def test_transfer_worker_pipelined_ctx_prefix_reuse(
-    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla
 ):
     """Pipelined transfer includes the context-side reused prefix."""
     if not torch.cuda.is_available():
@@ -2056,7 +2044,6 @@ def test_transfer_worker_pipelined_ctx_prefix_reuse(
         gen_pp=gen_pp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=use_v2,
     )
 
     request_len = setup["request_len"]
@@ -2083,12 +2070,12 @@ def test_transfer_worker_pipelined_ctx_prefix_reuse(
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize(
-    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,use_v2",
-    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in PIPELINED_TEST_CONFIGS],
-    ids=[c[8] for c in PIPELINED_TEST_CONFIGS],
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in PIPELINED_TEST_CONFIGS],
+    ids=[c[7] for c in PIPELINED_TEST_CONFIGS],
 )
 def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
-    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla
 ):
     """Unaligned chunk boundaries still transfer each block once."""
     if not torch.cuda.is_available():
@@ -2103,7 +2090,6 @@ def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
         gen_pp=gen_pp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=use_v2,
     )
 
     # Long enough for several interior boundaries, each landing one token into a block.

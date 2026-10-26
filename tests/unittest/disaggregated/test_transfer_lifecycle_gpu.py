@@ -359,10 +359,10 @@ def _new_request(role: str, request_id: int, unique_id: int, endpoint: str) -> L
 
 
 def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[torch.Tensor]:
-    """View actual allocated GPU regions using the production page extractor.
+    """View actual allocated GPU regions through the production page layout.
 
     Args:
-        transceiver: Real transceiver owning the page table and extractor.
+        transceiver: Real transceiver owning the rank's pages.
         request: Allocated request whose complete transfer extent is inspected.
 
     Returns:
@@ -374,25 +374,25 @@ def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[tor
     from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 
     chunk = transceiver._create_chunk(request)
-    extractor = transceiver._transfer_worker._peer_registrar.self_extractor
+    rank_pages = transceiver._transfer_worker._peer_registrar.self_pages
     result = []
     seen = set()
     roles = set()
-    for group, blocks in enumerate(chunk.block_ids_per_layer_groups):
-        for pool in range(len(extractor.page_table.layer_groups[group].pool_views)):
-            memory = extractor.extract(blocks, group, pool).memory
-            view = extractor.page_table.layer_groups[group].pool_views[pool]
-            assert len(memory.ptrs) > 0 and len(view.buffer_entries) > 0
-            roles.update(view.pool_role)
+    for group_index, blocks in enumerate(chunk.block_ids_per_layer_groups):
+        buffers = rank_pages.buffers(group_index)
+        assert len(buffers) > 0
+        for buffer in buffers:
+            memory = rank_pages.slots((buffer.pool_group, buffer.pool_index), blocks).memory
+            assert len(memory.ptrs) > 0
+            roles.add(buffer.role)
             for pointer in memory.ptrs:
-                for entry in view.buffer_entries:
-                    key = (int(pointer) + int(entry["offset"]), int(entry["size"]))
-                    assert key[0] > 0 and key[1] > 0, "allocated role extent must be nonempty"
-                    if key not in seen:
-                        seen.add(key)
-                        result.append(
-                            convert_to_torch_tensor(TensorWrapper(key[0], torch.uint8, [key[1]]))
-                        )
+                key = (int(pointer) + buffer.slot_offset, buffer.size)
+                assert key[0] > 0 and key[1] > 0, "allocated role extent must be nonempty"
+                if key not in seen:
+                    seen.add(key)
+                    result.append(
+                        convert_to_torch_tensor(TensorWrapper(key[0], torch.uint8, [key[1]]))
+                    )
     assert roles == {str(Role.KEY), str(Role.KEY_BLOCK_SCALE)}
     assert len(result) == 2, "one allocated block must expose both key and block-scale storage"
     return result
@@ -473,7 +473,7 @@ def _worker(args: argparse.Namespace) -> None:
         ),
     )
     worker = transceiver._transfer_worker
-    assert transceiver._fp4_mla_bridge_enabled
+    assert transceiver._ownership_bridge_enabled
     assert isinstance(worker._agent, BindingsNixlTransferAgent)
     assert not worker._agent.bounce_enabled
     assert {registration.type for registration in worker._registered_mem} == {"VRAM", "DRAM"}

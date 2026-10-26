@@ -217,7 +217,7 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
         ValueError: Already attached; CROSS cache; non-Helix context parallelism; model windows or
             recurrent state under Helix; model sparse buffers (``is_sparse``), whose pages can live
             in host memory; a non-REQUIRED attention group without a window; inconsistent groups,
-            configs or declarations, or a missing ``Role.ALL`` mapper declaration; no pages to
+            configs or declarations, or a role the manager declares no layout for; no pages to
             stage; ``max_bytes`` below one local fetch; a malformed region, or two of one memory
             kind that overlap; or scope over 65535 bytes. Unmarked sparse-attention buffers are not
             rejected as sparse.

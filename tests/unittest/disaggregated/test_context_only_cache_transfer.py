@@ -16,10 +16,8 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
+from tensorrt_llm._torch.disaggregation.page_mapping import RankPages, match_buffers, replicated
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
@@ -81,7 +79,7 @@ def _request(request_id: int, length: int, source: bool) -> LlmRequest:
 def _slice(manager: CSA2CacheManager, request: LlmRequest):
     transceiver = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
-    transceiver._page_table = KVRegionExtractorV1(manager).page_table
+    transceiver._pages = RankPages.of_manager(manager)
     transceiver._reuse_adapter = create_cache_reuse_adapter(manager)
     return transceiver._create_chunk(request)
 
@@ -160,7 +158,7 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
                 "generation", target, torch.cuda.current_device()
             ).to_bytes()
         )
-        registrar = PeerRegistrar(source_info, KVRegionExtractorV1(source))
+        registrar = PeerRegistrar(source_info)
         for info, dp_rank in ((source_info, source_dp_rank), (target_info, target_dp_rank)):
             assert info.instance_rank == info.tp_rank == info.dp_rank == (dp_rank or 0)
             assert info.tp_size == info.dp_size == (4 if dp_rank is not None else 1)
@@ -170,25 +168,22 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         assert registrar.get_peer_overlap(target_info, target_info.dp_rank).ranks == [
             target_info.instance_rank
         ]
-        receiver_registrar = PeerRegistrar(target_info, KVRegionExtractorV1(target))
+        receiver_registrar = PeerRegistrar(target_info)
         assert receiver_registrar.get_peer_overlap(source_info, source_info.dp_rank).ranks == [
             source_info.instance_rank
         ]
-        pool_mapping = registrar.get_pool_mapping(target_info)
+        buffer_mapping = match_buffers(source_info.pages, target_info.pages)
         matched_global_ids = set()
-        for (src_group, src_view), (dst_group, dst_view) in pool_mapping.items():
-            source_group = source_info.page_table.layer_groups[src_group]
-            target_group = target_info.page_table.layer_groups[dst_group]
-            assert source_group.pool_views[src_view].mapper_kind == MapperKind.REPLICATED
-            assert target_group.pool_views[dst_view].mapper_kind == MapperKind.REPLICATED
-            source_ids = set(
-                get_pool_view_global_layer_ids(source_group.pool_views[src_view], source_group)
+        for (src_layer_group, src_buffer), (dst_layer_group, dst_buffer) in buffer_mapping.items():
+            source_buffer = source_info.pages.buffers(src_layer_group)[src_buffer]
+            target_buffer = target_info.pages.buffers(dst_layer_group)[dst_buffer]
+            assert replicated(source_buffer)
+            assert replicated(target_buffer)
+            assert (source_buffer.layer, source_buffer.role) == (
+                target_buffer.layer,
+                target_buffer.role,
             )
-            target_ids = set(
-                get_pool_view_global_layer_ids(target_group.pool_views[dst_view], target_group)
-            )
-            assert source_ids == target_ids
-            matched_global_ids.update(source_ids)
+            matched_global_ids.add(source_buffer.layer)
         expected_global_ids = {
             layer * 3 + kind.value for layer, kind in source._layer_attn_to_layer_id
         }
@@ -202,8 +197,10 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         )
 
         source_slice, target_slice = _slice(source, source_request), _slice(target, target_request)
-        assert source_slice.excluded_pool_views == set()
-        assert len(target_slice.excluded_pool_views) == 20
+        # The decoder SWA caches from the split layer on are rebuilt by generation: the source
+        # holds none of them, the target holds all 20 and leaves them out.
+        assert source_slice.excluded_buffers == frozenset()
+        assert len(target_slice.excluded_buffers) == 20
         sender = Sender.__new__(Sender)
         sender._registrar = registrar
         task = SimpleNamespace(

@@ -32,8 +32,9 @@ from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Segment
+from tensorrt_llm._torch.pyexecutor.kv_cache.role_layout import head_major, replicated, token_major
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -282,7 +283,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     :meth:`_prepare_page_table_tensor`.
     """
 
-    _main_kv_mapper_kind = MapperKind.HND
+    _main_kv_layout = "HND"
     _main_kv_view_layout = "NHD"
     _dense_native_layer_ids: Tuple[int, ...] = ()
     # Virtual attention-op pools for dense target and shared draft layers:
@@ -315,7 +316,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._main_kv_view_layout = "HND" if implementation == "msa" else "NHD"
         native_dense_cache = kwargs.get("dtype") not in (DataType.FP8, DataType.NVFP4)
         if implementation == "triton" and not native_dense_cache:
-            self._main_kv_mapper_kind = MapperKind.NHD
+            self._main_kv_layout = "NHD"
 
         if sparse_index_dim is None:
             sparse_index_dim = getattr(sparse_attention_config, "sparse_index_dim", None)
@@ -688,16 +689,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             if layer_id in self.layer_offsets
         }
 
-    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
-        """Declare the backend's main K/V layout and replicated index-K."""
-        return {
-            Role.ALL: self._main_kv_mapper_kind,
-            Role.INDEX_KEY: MapperKind.REPLICATED,
-        }
+    def get_buffer_layout(
+        self, layer_id: int, role: DataRole, size: int, tokens: int
+    ) -> tuple[Segment, ...]:
+        """The backend's main K/V layout; index-K stays the same on every rank."""
+        if role == Role.INDEX_KEY:
+            return replicated(size)
+        heads = self.get_kv_heads(layer_id)[0]
+        if self._main_kv_layout == "HND":
+            return head_major(size, heads)
+        if self._main_kv_layout == "NHD":
+            return token_major(size, tokens, heads)
+        raise ValueError(f"unknown K/V layout {self._main_kv_layout!r}")
 
     def _main_kv_layout_name(self) -> str:
-        """Return the tensor-view layout name for the selected mapper kind."""
-        return "HND" if self._main_kv_mapper_kind == MapperKind.HND else "NHD"
+        """Return the tensor-view layout name the main K/V pages are written in."""
+        return self._main_kv_layout
 
     def _compute_num_total_slots(self) -> int:
         """Total token slots across all blocks in the main K pool.

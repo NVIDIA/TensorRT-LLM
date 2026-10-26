@@ -237,7 +237,7 @@ class BounceTransport(ABC):
         extra_bytes: int = 0,
     ) -> bool:
         """Reserve a region and record its address for the senders. False falls back to per-fragment.
-        ``extra_bytes`` sizes the sender's non-paged payload (mamba/KDA recurrent state) that rides
+        ``extra_bytes`` sizes the sender's non-paged payload (recurrent state) that rides
         the same coalesced write as the KV blocks."""
 
     @abstractmethod

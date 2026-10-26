@@ -12,21 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for CacheReuseAdapter, the positional _create_chunk, and Sender ordinal pairing."""
+"""Tests for CacheReuseAdapter, the positional _create_chunk, and attention ordinal pairing."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from pages_test_utils import group, pages
 
-from tensorrt_llm._torch.disaggregation.native.transfer import Sender
+from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
+from tensorrt_llm._torch.disaggregation.page_mapping.units import pair_ordinals
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV2,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,8 +37,17 @@ def _arr(values):
     return np.array(values, dtype=np.int64)
 
 
+def _layer_group(window=None):
+    """A paged attention layer group without buffers: _create_chunk reads only its kind."""
+    return group("attention", window=window)
+
+
+def _pages(layer_groups, tokens_per_block):
+    return pages([], layer_groups, tokens_per_page=tokens_per_block)
+
+
 # ---------------------------------------------------------------------------
-# Sender._pair_ordinals: the whole alignment protocol is one intersection.
+# pair_ordinals (paged layer groups): the whole alignment protocol is one intersection.
 # ---------------------------------------------------------------------------
 
 
@@ -49,40 +60,38 @@ class TestPairOrdinals:
     """
 
     def test_identity(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, 12]), _arr([20, 21, 22]))
+        src, dst = pair_ordinals(_arr([10, 11, 12]), _arr([20, 21, 22]))
         np.testing.assert_array_equal(src, [10, 11, 12])
         np.testing.assert_array_equal(dst, [20, 21, 22])
 
     def test_receiver_prefix_reuse_is_a_dst_hole(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, 12, 13]), _arr([-1, -1, 22, 23]))
+        src, dst = pair_ordinals(_arr([10, 11, 12, 13]), _arr([-1, -1, 22, 23]))
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 
     def test_sender_chunk_bounds_are_src_holes(self):
-        src, dst = Sender._pair_ordinals(_arr([-1, 11, 12, -1]), _arr([20, 21, 22, 23]))
+        src, dst = pair_ordinals(_arr([-1, 11, 12, -1]), _arr([20, 21, 22, 23]))
         np.testing.assert_array_equal(src, [11, 12])
         np.testing.assert_array_equal(dst, [21, 22])
 
     def test_holes_on_both_sides_take_the_intersection(self):
-        src, dst = Sender._pair_ordinals(_arr([10, -1, 12, 13]), _arr([-1, 21, 22, -1]))
+        src, dst = pair_ordinals(_arr([10, -1, 12, 13]), _arr([-1, 21, 22, -1]))
         np.testing.assert_array_equal(src, [12])
         np.testing.assert_array_equal(dst, [22])
 
     def test_no_overlap_is_empty(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, -1]), _arr([-1, -1, 22]))
+        src, dst = pair_ordinals(_arr([10, 11, -1]), _arr([-1, -1, 22]))
         assert src.size == 0
         assert dst.size == 0
 
     def test_dst_start_block_masks_the_head(self):
-        src, dst = Sender._pair_ordinals(
-            _arr([10, 11, 12, 13]), _arr([20, 21, 22, 23]), dst_start_block=2
-        )
+        src, dst = pair_ordinals(_arr([10, 11, 12, 13]), _arr([20, 21, 22, 23]), dst_start_block=2)
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 
     def test_length_mismatch_raises(self):
         with pytest.raises(ValueError, match="differ in length"):
-            Sender._pair_ordinals(_arr([10, 11]), _arr([20, 21, 22]))
+            pair_ordinals(_arr([10, 11]), _arr([20, 21, 22]))
 
     def test_sender_not_yet_evicted_but_receiver_has(self):
         # Regression (DeepSeek-V4 SWA, prompt_len == 2 blocks, window == 1
@@ -90,14 +99,14 @@ class TestPairOrdinals:
         # advanced, while gen pre-declared history_length=prompt_len and never
         # allocated ordinal 0. Pairing by ordinal copies X1 -> G1; the old
         # length-based suffix arithmetic copied X0 -> G1.
-        src, dst = Sender._pair_ordinals(_arr([100, 101]), _arr([-1, 201]))
+        src, dst = pair_ordinals(_arr([100, 101]), _arr([-1, 201]))
         np.testing.assert_array_equal(src, [101])
         np.testing.assert_array_equal(dst, [201])
 
     def test_receiver_with_wider_speculative_window(self):
         # Only gen runs spec decoding, so its SWA window keeps one more block.
         # That block has no source; it simply is not written.
-        src, dst = Sender._pair_ordinals(_arr([-1, -1, 12, 13]), _arr([-1, 21, 22, 23]))
+        src, dst = pair_ordinals(_arr([-1, -1, 12, 13]), _arr([-1, 21, 22, 23]))
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 
@@ -116,24 +125,22 @@ def _build_transceiver_for_kv_slice(
     sliding_window_size=None,
     cached_tokens: int = 0,
     is_generation_only: bool = False,
+    manager_class: type = KVCacheManagerV2,
 ):
     """Stub a KvCacheTransceiverV2 so _create_chunk runs without dist setup.
 
     Wires only the attributes the method touches:
-      - reuse adapter: tokens_per_block, per-layer-group cached count, ordinals
-      - page table:    layer groups
+      - reuse adapter: tokens_per_block, per-layer group cached count, ordinals
+      - pages:         one paged layer group
+      - cache manager: a ``manager_class`` instance, whose hooks give the transfer length and
+                       the buffers the request leaves out
 
     `block_ids` is beam-0's stale-stripped chain (valid window followed by any
     speculative / ctx first-token over-hang). The adapter's positional table is
-    modeled by prepending the manager-reported SWA holes, as V2 reports
-    them via valid_only=False.
+    modeled by prepending the manager-reported SWA holes, as V2 reports them via
+    valid_only=False.
     """
-    layer_group = AttentionLayerGroup(
-        pool_group_idx=0,
-        kv_head_num_per_rank=1,
-        sliding_window_size=sliding_window_size,
-        local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
-    )
+    layer_group = _layer_group(sliding_window_size)
     total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
     if block_ids is None:
         block_ids = np.arange(total_blocks, dtype=np.int64)
@@ -144,8 +151,8 @@ def _build_transceiver_for_kv_slice(
     # the stale (out-of-window) front is reported as -1 holes, followed by the
     # valid window blocks, the speculative/scratch tail, and the ctx
     # first-token over-hang. `block_ids` here is the stale-stripped chain, so
-    # prepend the -1 holes, as V2 reports via valid_only=False.
-    def get_block_ordinals(req, idx, lg):
+    # prepend the -1 holes. (V2 reports it directly via valid_only=False.)
+    def get_block_ordinals(req, idx):
         transfer_len = getattr(req, "py_csa2_remote_tail_start", None)
         if transfer_len is None:
             transfer_len = prompt_len
@@ -156,18 +163,17 @@ def _build_transceiver_for_kv_slice(
 
     reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_layer_group=lambda req, layer_groups: (
-            [cached_tokens] * len(layer_groups)
-        ),
-        get_block_ids=lambda req, idx, lg: block_ids,
+        get_cached_token_count_per_layer_group=lambda req, num_layer_groups: [cached_tokens]
+        * num_layer_groups,
+        get_block_ids=lambda req, idx: block_ids,
         get_block_ordinals=get_block_ordinals,
     )
-    page_table = SimpleNamespace(layer_groups=[layer_group])
-    cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
+    cache_manager = object.__new__(manager_class)
+    cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = reuse_adapter
-    transceiver._page_table = page_table
+    transceiver._pages = _pages([layer_group], tokens_per_block)
     transceiver._kv_cache_manager = cache_manager
 
     req = SimpleNamespace(
@@ -186,13 +192,9 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     transceiver, req = _build_transceiver_for_kv_slice(
         0, 257, tokens_per_block=128, is_generation_only=True
     )
-    # Native lifecycle IDs, not physical pool IDs, index reuse_status. Two
-    # distinct window groups can share a physical pool without sharing reuse.
-    groups = [
-        AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1),
-        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=128),
-        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=128),
-    ]
+    # Native lifecycle IDs (layer group indices), not physical pool IDs, index reuse_status.
+    # Two distinct window layer groups can share a physical pool without sharing reuse.
+    layer_groups = [_layer_group(), _layer_group(window=128), _layer_group(window=128)]
     pages = [[10, 11, 12], [-1, 21, 22], [-1, 31, 32]]
     cache = SimpleNamespace(
         num_committed_tokens=256,
@@ -208,8 +210,8 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     )
     adapter = _CacheReuseAdapterV2(manager)
     transceiver._reuse_adapter = adapter
-    transceiver._page_table.layer_groups = groups
-    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [
+    transceiver._pages = _pages(layer_groups, 128)
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups)) == [
         256,
         256 if encoder_hit else 0,
         0,
@@ -223,14 +225,14 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     # A later commit must not make newly allocated, unreceived pages look like
     # an admission-time prefix hit.
     cache.num_committed_tokens = 384
-    assert adapter.get_cached_token_count_per_layer_group(req, groups)[0] == 256
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups))[0] == 256
     cache.reuse_status[1].complete = False  # manager declined an available OPTIONAL group
-    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [256, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups)) == [256, 0, 0]
     manager.enable_block_reuse = False
-    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups)) == [0, 0, 0]
     manager.enable_block_reuse = True
     manager.kv_cache_map.clear()
-    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(layer_groups)) == [0, 0, 0]
 
 
 class TestCreateKvSliceBlockSpan:
@@ -499,6 +501,7 @@ class TestKvSliceProperty:
                 block_ids=block_ids,
                 sliding_window_size=128,
                 is_generation_only=mode == "destination",
+                manager_class=CSA2CacheManager,
             )
             req.py_csa2_remote_tail_mode = mode
             req.py_csa2_remote_tail_start = remote_tail_start
@@ -529,6 +532,7 @@ class TestKvSliceProperty:
             block_ids=[100],
             sliding_window_size=window,
             is_generation_only=mode == "destination",
+            manager_class=CSA2CacheManager,
         )
         req.py_csa2_remote_tail_mode = mode
         req.py_csa2_remote_tail_start = 0
@@ -540,7 +544,7 @@ class TestKvSliceProperty:
 
 
 # ---------------------------------------------------------------------------
-# CacheReuseAdapter.get_cached_token_count_per_layer_group: SWA clamp.
+# CacheReuseAdapter.get_cached_token_count_per_layer_group: raw reuse-hit scalar.
 # ---------------------------------------------------------------------------
 
 
@@ -563,11 +567,14 @@ class _StubAdapter(CacheReuseAdapter):
     def _global_cached_token_count(self, req):  # noqa: ARG002
         return self._scalar
 
-    def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
+    def get_block_ids(self, req, group_idx):  # noqa: ARG002
         return np.array([], dtype=np.int64)
 
-    def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
+    def get_block_ordinals(self, req, group_idx):  # noqa: ARG002
         return np.array([], dtype=np.int64)
+
+    def get_state_slot(self, req, group_idx):  # noqa: ARG002
+        return -1
 
     def commit_blocks_for_reuse(self, req):  # noqa: ARG002
         pass
@@ -578,16 +585,12 @@ class _FakeReq:
         self.prompt_len = prompt_len
 
 
-def _lg(window=None):
-    return AttentionLayerGroup(
-        pool_group_idx=0,
-        sliding_window_size=window,
-        local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
-    )
-
-
 class TestAdapterBlockOrdinals:
-    """V2 positional block ordinals preserve stale and unbound slots as holes."""
+    """get_block_ordinals on the real V2 adapter.
+
+    The positional table is index==ordinal with -1 holes for stale/unbound
+    blocks; V2 reports the holes directly via valid_only=False.
+    """
 
     def test_v2_reports_stale_as_holes_via_valid_only_false(self):
         class _KvCache:
@@ -609,50 +612,60 @@ class TestAdapterBlockOrdinals:
         req = _FakeReq(prompt_len=7)
         req.py_request_id = 7
         req.py_beam_width = 1
-        ordinals = _CacheReuseAdapterV2(mgr).get_block_ordinals(req, 0, _lg(window=512))
+        ordinals = _CacheReuseAdapterV2(mgr).get_block_ordinals(req, 0)
         np.testing.assert_array_equal(ordinals, [-1, -1, 12, 13])
         # Must request the positional view (holes kept), not the compact one.
         assert mgr.kv_cache_map[7].valid_only is False
 
 
+class TestAdapterStateSlot:
+    """get_state_slot on the real V2 adapter: the cache's own slot of the group."""
+
+    def test_v2_reads_the_slot_from_the_cache(self):
+        class _KvCache:
+            def get_ssm_block_base_index(self, group_idx):
+                return {1: 5, 2: -1}[group_idx]
+
+        class _V2Mgr:
+            # A stale per-request record the adapter must not read.
+            _request_id_to_state_index = {7: 9}
+
+            def __init__(self):
+                self.kv_cache_map = {7: _KvCache()}
+
+        req = _FakeReq(prompt_len=7)
+        req.py_request_id = 7
+        adapter = _CacheReuseAdapterV2(_V2Mgr())
+        assert adapter.get_state_slot(req, 1) == 5
+        assert adapter.get_state_slot(req, 2) == -1
+
+
 class TestAdapterPerLayerGroup:
-    """Per-layer cached prefix: adapter reports only the reuse-hit scalar."""
+    """Per-layer-group cached prefix: adapter reports only the reuse-hit scalar."""
 
     TPB = 8
 
     def test_reuse_disabled(self):
         ad = _StubAdapter(scalar=128, tpb=self.TPB, enabled=False)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [0, 0]
 
     def test_zero_scalar(self):
         ad = _StubAdapter(scalar=0, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [0, 0]
 
-    def test_full_attn_passthrough(self):
+    def test_passthrough(self):
         ad = _StubAdapter(scalar=64, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg()])
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [64, 64]
 
-    def test_swa_passthrough_above_stale(self):
-        ad = _StubAdapter(scalar=24, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), [_lg(window=16)])
-        assert out == [24]
-
-    def test_swa_passthrough_below_stale(self):
-        # The adapter returns the raw scalar; masking it into the positional
-        # table (where it may fall inside the SWA holes anyway) is
+    def test_one_entry_per_layer_group(self):
+        # The adapter returns the raw scalar for every layer group; masking it into the
+        # positional table (where it may fall inside SWA holes anyway) is
         # _create_chunk's job.
         ad = _StubAdapter(scalar=8, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), [_lg(window=16)])
-        assert out == [8]
-
-    def test_mixed_groups(self):
-        ad = _StubAdapter(scalar=8, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(
-            _FakeReq(32), [_lg(), _lg(window=16), _lg(window=32)]
-        )
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), 3)
         assert out == [8, 8, 8]
 
 

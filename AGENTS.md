@@ -106,6 +106,7 @@ HuggingFace Model → LLM API → PyTorch Executor
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/PAGE_LAYOUT_DEVELOPER_GUIDE.md` | How a `KVCacheManagerV2` describes its pages (`get_page_layout` and its hooks) for the native P/D transfer and the lender - **read before adding a cache or changing how one is transferred** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns

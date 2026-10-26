@@ -14,17 +14,17 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.host_staging import copy_host_to_device
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     GPU_LEVEL,
     KVCacheManagerV2,
-    Role,
     _estimate_full_attn_size_per_token,
     _estimate_swa_cache_size,
     _fill_kv_pages,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Segment
+from tensorrt_llm._torch.pyexecutor.kv_cache.role_layout import replicated
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -1097,43 +1097,34 @@ class CSA2CacheManager(KVCacheManagerV2):
             for size, window in zip(sizes, windows)
         )
 
-    def get_disagg_role_mapper_kinds(self):
-        return {
-            Role.ALL: MapperKind.REPLICATED,
-            **{role.role: MapperKind.REPLICATED for role in CSA2CacheRole},
-        }
+    def get_buffer_layout(
+        self, layer_id: int, role: DataRole, size: int, tokens: int
+    ) -> tuple[Segment, ...]:
+        """Every CSA2 cache holds the same bytes on every rank."""
+        return replicated(size)
 
-    def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole):
-        """Keep remote-tail SWA independently selectable in the transfer layout."""
-        if not self.bounded_replay_on_generation or role != CSA2CacheRole.SWA.role:
-            return None
-        return int(layer_id)
+    def get_transfer_length(self, request: LlmRequest) -> int:
+        """Under remote-tail replay, only the prefix before the replayed tail moves."""
+        start = getattr(request, "py_csa2_remote_tail_start", None)
+        return request.prompt_len if start is None else start
 
-    def remote_tail_excluded_pool_views(self, page_table, split_layer: int):
-        """Return decoder/draft SWA views that generation rebuilds locally."""
-        excluded = set()
-        for group_idx, group in enumerate(page_table.layer_groups):
-            for pool_idx, view in enumerate(group.pool_views):
-                identities = {
-                    identity
-                    for entry in view.buffer_entries
-                    for (layer_id, role), identity in self._physical_roles.items()
-                    if layer_id == LayerId(int(entry["local_layer_id"]))
-                    and str(role) in view.pool_role
-                }
-                if not identities:
-                    continue
-                transfer = {
-                    cache_role != CSA2CacheRole.SWA or model_layer < split_layer
-                    for model_layer, _ratio, cache_role in identities
-                }
-                if len(transfer) != 1:
-                    raise ValueError(
-                        f"CSA2 pool view ({group_idx}, {pool_idx}) mixes encoder and decoder state"
-                    )
-                if not transfer.pop():
-                    excluded.add((group_idx, pool_idx))
-        return excluded
+    def sends_first_tokens(self, request: LlmRequest) -> bool:
+        """A remote-tail source has not generated the first tokens; the generation server
+        replays the tail and produces them."""
+        return getattr(request, "py_csa2_remote_tail_mode", None) != "source"
+
+    def get_untransferred_buffers(self, request: LlmRequest) -> frozenset[tuple[int, str]]:
+        """Under remote-tail replay, the decoder and draft SWA caches from the split layer on,
+        which generation rebuilds locally."""
+        split_layer = getattr(request, "py_csa2_remote_tail_split", None)
+        if split_layer is None:
+            return frozenset()
+        layer_ids = self.get_layer_ids()
+        return frozenset(
+            (layer_ids[int(layer_id)][0], str(role))
+            for (layer_id, role), (model_layer, _ratio, cache_role) in self._physical_roles.items()
+            if cache_role == CSA2CacheRole.SWA and model_layer >= split_layer
+        )
 
     def _fill_fresh_kv_pages(self, request_id: int) -> None:
         """Fill actual CSA2 buffers without treating model IDs as physical IDs.
