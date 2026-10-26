@@ -165,6 +165,27 @@ Still on old path (standalone, with embedded communication):
 
 Communication strategies are auto-selected at runtime by `CommunicationFactory` based on hardware and configuration. Skipped for `FUSED_COMM` backends. See `communication_factory.py` for selection logic and `base.py` for the `Communication` ABC.
 
+The SM107 Push-Combine strategy (`NVLinkOneSidedTilePushCombine`,
+`nvlink_one_sided_tile_nvfp4_push.py`) is an opt-in external communication
+method selected with `TRTLLM_FORCE_COMM_METHOD=PUSH_COMBINE`; it is never
+auto-selected. It reuses the stock NVLinkOneSided dispatch and replaces the
+combine: every expert rank quantizes its BF16 MoE output to tile-wise packed
+NVFP4 records and pushes them into the owning rank's workspace (K1), a fused
+control kernel publishes/gates readiness (K23), and the owner top-k reduces the
+landed records to BF16 (K4). It requires BF16 activations with hidden size
+7168 and top-k 8 (DeepSeek-R1/V3 MoE shapes), EP in {2, 4, 8, 16, 32}, and no
+EPLB or `use_low_precision_moe_combine`. The kernels use sm_107a-only PTX, so
+they are built into a separate Torch extension, `tensorrt_llm/libs/tile_push_comm_ops.so`,
+which the normal CMake/wheel build produces whenever SM107 is targeted
+(`scripts/build_wheel.py -a "107-real"`). `TRTLLM_TILE_PUSH_COMBINE_DSO` can
+override the DSO path. PDL follows the common `TRTLLM_ENABLE_PDL` policy.
+Optional, bitwise-identical speedups (all default off): `TRTLLM_PUSH_D0_FOLD=1`
+folds the dispatch-tail generation open into the combine's K23 launch,
+`TRTLLM_PUSH_K4_V2=1` selects a lighter K4 for EP >= 4, and
+`TRTLLM_PUSH_K23_PDL=1` launches K23 with PDL. `TRTLLM_PUSH_K23_DEADLINE=1`
+(or `TRTLLM_PUSH_K23_DEADLINE_CYCLES=N`) makes the K23 gate trap with a
+diagnostic instead of spinning forever when a peer never publishes.
+
 ### MegaMoE (`fused_moe/mega_moe/`)
 
 | File | Role |
@@ -193,6 +214,7 @@ supported GPU with a CUDA 13 Cutlass DSL runtime is available.
 |------|-------|--------|
 | `test_moe_backend.py` | Backend unit tests (`run_moe`, `can_implement`) | Active |
 | `test_moe_module.py` | ConfigurableMoE integration tests (Backend × Comm × EPLB) | Active |
+| `test_push_combine_*.py` | Push-Combine EP/ABI/loader/scheduler contracts (host-only) | Active |
 | `test_fused_moe.py` | Legacy MoE tests | Being replaced, do NOT add new tests here |
 | `test_moe.py` | Legacy TRTLLM backend tests | Being replaced, do NOT add new tests here |
 

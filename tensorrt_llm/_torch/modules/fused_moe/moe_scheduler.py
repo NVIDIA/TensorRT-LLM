@@ -47,12 +47,20 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
+from .communication import (
+    DeepEP,
+    DeepEPLowLatency,
+    NcclEP,
+    NVLinkOneSided,
+    NVLinkOneSidedTilePushCombine,
+    NVLinkTwoSided,
+)
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -640,6 +648,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 8: Communication combine ==========
         if moe.comm is not None:
+            self._align_ep_peers_while_tuning()
             if moe.enable_dummy_allreduce:
                 moe.dummy_allreduce()
             all_rank_max_num_tokens = max(all_rank_num_tokens)
@@ -817,6 +826,20 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         outputs = torch.cat(outputs_list)
         return outputs
+
+    def _align_ep_peers_while_tuning(self) -> None:
+        """Host-align EP peers before a Push-Combine combine while autotuning.
+
+        Distributed autotuning profiles tactics per rank, so peers reach the
+        combine with arbitrary skew. Push-Combine's consumer gate spins on the
+        device until every producer has published, so only while tuning a host
+        barrier keeps the peers aligned instead of parking GPUs in that spin.
+        """
+        if not isinstance(self.moe.comm, NVLinkOneSidedTilePushCombine):
+            return
+        tuner = AutoTuner.get()
+        if tuner.is_tuning_mode and tuner._dist is not None:
+            tuner._dist.barrier()
 
     # ------------------------------------------------------------------
     # Backend run_moe inputs (external-comm only)

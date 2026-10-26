@@ -168,6 +168,7 @@ if on_windows:
 else:
     package_data = [
         'libs/libtensorrt_llm.so',
+        'libs/tile_push_comm_ops.so',
         'libs/libth_common.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',

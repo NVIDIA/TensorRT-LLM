@@ -89,6 +89,7 @@ from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
 from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
 from .finish_reasons import FinishReasonsHandler
+from .greedy_bf16 import bf16_argmax_last_dim, bf16_argmax_supported, greedy_bf16_logits_enabled
 from .logprobs import (
     LogProbsState,
     LogProbsStateList,
@@ -2782,7 +2783,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         tokens into the output buffer. All operations are in-place.
         """
         # Simple argmax for greedy sampling
-        next_tokens = torch.argmax(logits_cuda, dim=-1).to(dtype=new_tokens_cuda.dtype)
+        if greedy_bf16_logits_enabled() and bf16_argmax_supported(logits_cuda):
+            # TRTLLM_GREEDY_BF16_LOGITS: BF16 logits (BF16 -> FP32 is exact, so
+            # the index equals torch.argmax over the FP32 copy).
+            next_tokens = bf16_argmax_last_dim(logits_cuda).to(dtype=new_tokens_cuda.dtype)
+        else:
+            next_tokens = torch.argmax(logits_cuda, dim=-1).to(dtype=new_tokens_cuda.dtype)
 
         # Apply draft-to-target token translation if present (for Eagle3)
         if d2t is not None:
@@ -3807,6 +3813,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             raw_logits_cuda,
             num_context_logits_prefix_sum=num_context_logits_prefix_sum,
         )
+        if greedy_bf16_logits_enabled() and logits_cuda.dtype != torch.float32:
+            # TRTLLM_GREEDY_BF16_LOGITS: only the stable greedy path above reads
+            # BF16 logits; every other path samples from the FP32 copy, as before.
+            logits_cuda = logits_cuda.float()
         return_log_probs = self._return_log_probs(sampling_requests)
         if return_log_probs:
             self._prepare_log_probs(sampling_requests)

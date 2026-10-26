@@ -212,6 +212,40 @@ class RMSNorm(nn.Module):
         else:
             return hidden_states
 
+    def runs_flashinfer_cute_fused_add(self, device: torch.device) -> bool:
+        """Whether forward(x, residual) runs FlashInfer's CuTe DSL fused_add_rmsnorm on ``device`` (the reference
+        that forward_with_nvfp4_output reproduces bit for bit)."""
+        if (self.nvfp4_scale is not None or self.return_hp_output
+                or self.use_gemma or self.use_cuda_tile
+                or not IS_FLASHINFER_AVAILABLE or is_nvfp4_marlin_enabled()):
+            return False
+        import flashinfer.norm as flashinfer_norm
+        use_cuda_norm = getattr(flashinfer_norm, "_use_cuda_norm", None)
+        if use_cuda_norm is None:
+            return False
+        return not use_cuda_norm(device)
+
+    def forward_with_nvfp4_output(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        global_scale: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """forward(hidden_states, residual) bit for bit, plus the NVFP4 of the normalized BF16 output.
+
+        Returns ``(hidden_states, residual, fp4, sf)``: the same two tensors updated in place (as FlashInfer's
+        fused add-RMSNorm does) and the bytes ``fp4_quantize(hidden_states, global_scale, 16, False, False)``
+        returns for them (``fp4`` [M, H / 2] uint8, ``sf`` [M * H / 16] uint8, linear layout). Callers check
+        runs_flashinfer_cute_fused_add() and
+        cute_dsl_kernels.flashinfer_fused_add_rmsnorm_nvfp4.fused_add_rmsnorm_nvfp4_supported() first.
+        """
+        from ..custom_ops.flashinfer_custom_ops import \
+            flashinfer_fused_add_rmsnorm_nvfp4
+        fp4, sf = flashinfer_fused_add_rmsnorm_nvfp4(hidden_states, residual,
+                                                     self.weight, global_scale,
+                                                     self.variance_epsilon)
+        return hidden_states, residual, fp4, sf
+
     def _ws_kernel_eligible(self, hidden_states: torch.Tensor,
                             residual: Optional[torch.Tensor]) -> bool:
         """Whether the warp-specialized fused_add_rms_norm_quant kernel should

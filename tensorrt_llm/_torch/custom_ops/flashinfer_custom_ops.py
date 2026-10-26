@@ -1,3 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Tuple
+
 import torch
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -62,6 +79,38 @@ if IS_FLASHINFER_AVAILABLE:
                           weight,
                           eps,
                           enable_pdl=get_env_enable_pdl())
+
+    # FlashInfer's fused add-RMSNorm (CuTe DSL path) that also returns the NVFP4 of its BF16 output, the bytes
+    # fp4_quantize(input, global_scale, 16, False, False) returns (linear scale factors). Used only behind
+    # TRTLLM_MOE_ENTRY_NORM_NVFP4=1 (models/modeling_deepseekv3.py).
+    @torch.library.custom_op("trtllm::flashinfer_fused_add_rmsnorm_nvfp4",
+                             mutates_args=("input", "residual"))
+    def flashinfer_fused_add_rmsnorm_nvfp4(
+            input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+            global_scale: torch.Tensor,
+            eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        from flashinfer.utils import device_support_pdl
+
+        from ..cute_dsl_kernels.flashinfer_fused_add_rmsnorm_nvfp4 import \
+            fused_add_rmsnorm_nvfp4_cute
+
+        # as flashinfer.norm.fused_add_rmsnorm resolves enable_pdl
+        enable_pdl = bool(get_env_enable_pdl()
+                          and device_support_pdl(input.device))
+        return fused_add_rmsnorm_nvfp4_cute(input,
+                                            residual,
+                                            weight,
+                                            global_scale,
+                                            eps,
+                                            enable_pdl=enable_pdl)
+
+    @flashinfer_fused_add_rmsnorm_nvfp4.register_fake
+    def _(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+          global_scale: torch.Tensor,
+          eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        return (input.new_empty((m, k // 2), dtype=torch.uint8),
+                input.new_empty((m * (k // 16), ), dtype=torch.uint8))
 
     @torch.library.custom_op("trtllm::flashinfer_fused_add_rmsnorm_quant",
                              mutates_args=("out", "residual"))

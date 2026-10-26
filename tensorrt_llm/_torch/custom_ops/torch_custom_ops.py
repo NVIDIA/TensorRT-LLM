@@ -45,11 +45,12 @@ if IS_FLASHINFER_AVAILABLE:
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
-                     fp4_scale_infer_shape,
+from ..utils import (ActivationType, autotune_extra_token_buckets,
+                     deep_gemm_jit_warmup_buckets, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
+                     get_last_power_of_2_or_extra_num_tokens_buckets,
                      is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
-                     mxfp8_scale_infer_shape)
+                     last_positive_power_of_2_or_extra, mxfp8_scale_infer_shape)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
@@ -994,10 +995,15 @@ def _(
 
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
+    # TRTLLM_AUTOTUNE_EXTRA_TOKEN_BUCKETS (utils.py): also tune and look up these
+    # exact M values (read at import).
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ),
+            0, 0, get_last_power_of_2_or_extra_num_tokens_buckets
+            if autotune_extra_token_buckets() else
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2_or_extra
+            if autotune_extra_token_buckets() else last_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )

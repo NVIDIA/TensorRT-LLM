@@ -1495,6 +1495,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fp4_mla_generation_lengths_num_seqs = -1
         self.fp4_mla_generation_lengths_num_contexts = -1
         self._fp4_mla_generation_lengths_capture_recorded = False
+        # The CuTeDSL longest-KV-first order is derived from these lengths.
+        self._fp4_mla_lpt_order_valid = False
+        self._fp4_mla_lpt_capture_recorded = False
 
     def _configure_fp4_mla_page_metadata(self, kv_lens: torch.Tensor) -> None:
         """Configure fixed-stride device page metadata."""
@@ -3453,6 +3456,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         quant_scale_qkv: Optional[torch.Tensor] = None,
         q_rope_applied: bool = False,
         fuse_fp4_q_quant: bool = False,
+        fp4_q_prefix_external: bool = False,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -3474,6 +3478,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_done_elsewhere (bool): Run the Q half only; the KV half already ran, hoisted onto an aux stream. Mutually exclusive with kv_only. With both halves done, do not call this at all.
             quant_scale_qkv (torch.Tensor): Non-None means q_nope in quant_q_buffer is already FP8, so the kernel drops the q_nope quantize rows from its grid.
             fuse_fp4_q_quant (bool): Quantize Q in the fused FP4 RoPE/cache update.
+            fp4_q_prefix_external (bool): bmm_q already wrote the FP4 Q prefix
+                (TRTLLM_MLA_NVFP4_EPILOGUE bit 2, fp4_mla_bmm_q_fp4_prefix); the fused
+                FP4 update then writes only the Q RoPE tails, K and the latent.
         """
 
         assert self.is_mla_enable and self.mla_params is not None
@@ -3490,8 +3497,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 latent_cache,
                 metadata,
                 fuse_q_quant=fuse_fp4_q_quant,
+                q_prefix_external=fp4_q_prefix_external,
             )
             return
+        if fp4_q_prefix_external:
+            raise RuntimeError(
+                "An external FP4 Q prefix needs the FP4 MLA KV cache path.")
 
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
@@ -3561,6 +3572,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         *,
         fuse_q_quant: bool = False,
+        q_prefix_external: bool = False,
     ) -> None:
         """Apply fused generation RoPE, Q quantization, and cache update."""
         assert self.kv_lora_rank is not None
@@ -3613,6 +3625,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             q_quant_input=fused_q,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=helix_is_inactive_rank,
+            q_prefix_external=q_prefix_external,
         )
         if not hp_pool_updated:
             raise RuntimeError(

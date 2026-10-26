@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import atexit
 import functools
 import math
+import os
+import threading
+import time
 import weakref
 from typing import Dict, Optional, cast
 
@@ -22,9 +26,10 @@ import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, maybe_pin_memory
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ..attention_backend import (
@@ -62,7 +67,7 @@ from .attention import (
     _helix_zero_kv_mask,
     extract_extra_attrs,
 )
-from .linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
+from .linear import Linear, NVFP4LinearMethod, TensorParallelMode, is_static_nvfp4_input_eligible
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
@@ -166,6 +171,181 @@ def mla_custom_op_inplace(
 
 
 maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except ValueError:
+        return default
+
+
+# NVFP4-out epilogues for the absorbed-MLA generation BMMs (Rubin SM107, BF16 W_UK/W_UV, FP4 MLA KV; default 0 =
+# off; set on the generation role only). The absorbed bmm_o / bmm_q become a CuTe DSL batched GEMM
+# (cute_dsl_kernels/rubin/dense_gemm_nvfp4_out.py) whose epilogue writes the NVFP4 bytes the BF16 GEMM + the
+# consumer's quantizer would have produced, so the BF16 round trip and the standalone quantizer go:
+#   bit 1: bmm_o writes o_proj's NVFP4 input (packed E2M1 [tokens, heads * v_head_dim / 2] + 128x4-swizzled E4M3
+#          scales, fp4_quantize's bytes); pure-generation batches of >= TRTLLM_MLA_NVFP4_EPILOGUE_MIN_TOKENS.
+#   bit 2: bmm_q writes the FP4 MLA Q prefix (attention_backend/fp4_mla.fp4_mla_bmm_q_fp4_prefix) and the fused
+#          RoPE/Q/KV launch drops its Q-prefix programs; one token per sequence, >= ..._MIN_TOKENS_Q tokens.
+#   bit 4: with bit 2, that RoPE/Q-tail/KV launch (now independent of bmm_q) runs beside bmm_q on the aux stream.
+# TRTLLM_MLA_NVFP4_EPILOGUE_VERIFY (verification only): recompute the BF16-path bytes and count mismatches;
+# 1 = eager forwards only, logged per call (synchronizes); 2 = every forward incl. CUDA-graph replays, counted on
+# the device without host syncs (VerifyMismatchCounter) and logged by a host thread.
+MLA_NVFP4_EPILOGUE = _env_int("TRTLLM_MLA_NVFP4_EPILOGUE", 0)
+MLA_NVFP4_EPILOGUE_MIN_TOKENS = max(_env_int("TRTLLM_MLA_NVFP4_EPILOGUE_MIN_TOKENS", 1), 1)
+MLA_NVFP4_EPILOGUE_MIN_TOKENS_Q = max(_env_int("TRTLLM_MLA_NVFP4_EPILOGUE_MIN_TOKENS_Q", 16), 1)
+MLA_NVFP4_EPILOGUE_VERIFY = _env_int("TRTLLM_MLA_NVFP4_EPILOGUE_VERIFY", 0)
+_MLA_NVFP4_EPILOGUE_VERIFY_STATS: Dict[str, Dict[str, int]] = {}
+if MLA_NVFP4_EPILOGUE:
+    logger.info(
+        f"[TRTLLM_MLA_NVFP4_EPILOGUE] gate {MLA_NVFP4_EPILOGUE}: bmm_o -> o_proj NVFP4 input "
+        f"{bool(MLA_NVFP4_EPILOGUE & 1)} (min tokens {MLA_NVFP4_EPILOGUE_MIN_TOKENS}), bmm_q -> FP4 Q prefix "
+        f"{bool(MLA_NVFP4_EPILOGUE & 2)} (min tokens {MLA_NVFP4_EPILOGUE_MIN_TOKENS_Q}), RoPE beside bmm_q "
+        f"{(MLA_NVFP4_EPILOGUE & 6) == 6}, verify {MLA_NVFP4_EPILOGUE_VERIFY}"
+    )
+
+
+def _mla_nvfp4_epilogue_verify_record(
+    kind: str, tokens: int, mismatches: Dict[str, torch.Tensor]
+) -> None:
+    """Accumulate TRTLLM_MLA_NVFP4_EPILOGUE_VERIFY=1 counts (eager; synchronizes); log the first calls, every bad
+    one and every 1024th."""
+    counts = {k: int(v) for k, v in mismatches.items()}
+    stats = _MLA_NVFP4_EPILOGUE_VERIFY_STATS.setdefault(
+        kind, {"calls": 0, "tokens": 0, "bad_calls": 0, "mismatches": 0}
+    )
+    bad = sum(counts.values())
+    stats["calls"] += 1
+    stats["tokens"] += tokens
+    stats["mismatches"] += bad
+    stats["bad_calls"] += int(bad > 0)
+    if stats["calls"] <= 3 or (bad and stats["bad_calls"] <= 10) or stats["calls"] % 1024 == 0:
+        logger.info(
+            f"[TRTLLM_MLA_NVFP4_EPILOGUE] VERIFY {kind}: call {stats['calls']} tokens {tokens} "
+            f"mismatches {counts}; total calls {stats['calls']} tokens {stats['tokens']} "
+            f"bad calls {stats['bad_calls']} mismatched bytes {stats['mismatches']}"
+        )
+
+
+class VerifyMismatchCounter:
+    """Device-side mismatch counters that also work inside CUDA graphs (verification modes only).
+
+    ``add`` accumulates 0-d device counts and the number of checks into a device tensor and copies it to pinned
+    host memory with a (capturable) async copy, so every replay of a captured graph updates the host copy without
+    a host sync. A daemon thread logs the host copy every ``period`` seconds when it changed, and once at exit.
+    Counters are created on first use, which must be an eager forward (the warmup before graph capture).
+    """
+
+    _instances: list = []
+    _reporter: Optional[threading.Thread] = None
+    _lock = threading.Lock()
+
+    def __init__(self, tag: str, fields: tuple, period: float = 30.0):
+        self.tag = tag
+        self.fields = tuple(fields)
+        self.device = torch.zeros(len(self.fields) + 1, dtype=torch.int64, device="cuda")
+        self.host = maybe_pin_memory(torch.zeros(len(self.fields) + 1, dtype=torch.int64))
+        self._last = None
+        with VerifyMismatchCounter._lock:
+            VerifyMismatchCounter._instances.append(self)
+            if VerifyMismatchCounter._reporter is None:
+                VerifyMismatchCounter._reporter = threading.Thread(
+                    target=VerifyMismatchCounter._report_loop, args=(period,), daemon=True
+                )
+                VerifyMismatchCounter._reporter.start()
+                atexit.register(VerifyMismatchCounter.report_all, True)
+
+    def add(self, mismatches: Dict[str, torch.Tensor]) -> None:
+        for i, field in enumerate(self.fields):
+            self.device[i : i + 1].add_(mismatches[field].reshape(1).to(torch.int64))
+        self.device[-1:].add_(1)
+        if self.host.is_pinned():  # a pageable D2H copy cannot be captured
+            self.host.copy_(self.device, non_blocking=True)
+
+    def report(self, final: bool = False) -> None:
+        values = self.host.tolist()  # pinned host memory: no CUDA call
+        if values != self._last or final:
+            self._last = values
+            counts = dict(zip(self.fields, values[:-1]))
+            logger.info(
+                f"{self.tag} VERIFY(device) checks {values[-1]} mismatches {counts}"
+                f"{' (final)' if final else ''}"
+            )
+
+    @classmethod
+    def report_all(cls, final: bool = False) -> None:
+        for counter in list(cls._instances):
+            counter.report(final)
+
+    @classmethod
+    def _report_loop(cls, period: float) -> None:
+        while True:
+            time.sleep(period)
+            cls.report_all()
+
+
+_MLA_NVFP4_EPILOGUE_VERIFY_COUNTERS: Dict[str, VerifyMismatchCounter] = {}
+
+
+def _mla_nvfp4_epilogue_verify(kind: str, tokens: int, compute_mismatches) -> None:
+    """Run ``compute_mismatches()`` (0-d device counts) for TRTLLM_MLA_NVFP4_EPILOGUE_VERIFY: 1 = eager forwards
+    only, synchronizing and logging per call; 2 = every forward incl. graph capture, device counters."""
+    capturing = torch.cuda.is_current_stream_capturing()
+    if MLA_NVFP4_EPILOGUE_VERIFY == 1 and not capturing:
+        _mla_nvfp4_epilogue_verify_record(kind, tokens, compute_mismatches())
+    elif MLA_NVFP4_EPILOGUE_VERIFY >= 2:
+        counter = _MLA_NVFP4_EPILOGUE_VERIFY_COUNTERS.get(kind)
+        if counter is None:
+            if capturing:
+                return  # first use must be eager (graph warmup runs before capture)
+            mismatches = compute_mismatches()
+            counter = VerifyMismatchCounter(
+                f"[TRTLLM_MLA_NVFP4_EPILOGUE] {kind}", tuple(sorted(mismatches))
+            )
+            _MLA_NVFP4_EPILOGUE_VERIFY_COUNTERS[kind] = counter
+            counter.add(mismatches)
+            return
+        counter.add(compute_mismatches())
+
+
+@torch.library.custom_op(
+    "trtllm::mla_custom_op_inplace_nvfp4_out",
+    mutates_args=("output", "output_sf"),
+)
+def mla_custom_op_inplace_nvfp4_out(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+    output: torch.Tensor,
+    output_sf: torch.Tensor,
+    latent_cache_gen: Optional[torch.Tensor],
+    hidden_states_fp4: Optional[torch.Tensor] = None,
+    hidden_states_sf: Optional[torch.Tensor] = None,
+) -> None:
+    """mla_custom_op_inplace for a pure-generation batch whose bmm_o writes o_proj's NVFP4 input
+    (TRTLLM_MLA_NVFP4_EPILOGUE bit 1): ``output`` is the packed E2M1 buffer and ``output_sf`` its swizzled scales."""
+    metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
+    if hidden_states_fp4 is not None or hidden_states_sf is not None:
+        assert hidden_states_fp4 is not None and hidden_states_sf is not None, (
+            "hidden_states_fp4 and hidden_states_sf must be passed together"
+        )
+        hidden_states = Fp4QuantizedTensor(
+            fp4_tensor=hidden_states_fp4,
+            scaling_factor=hidden_states_sf,
+            unquantized_hidden_states=hidden_states,
+        )
+    mla_layer.forward_impl(
+        position_ids,
+        hidden_states,
+        metadata,
+        attn_output=[output],
+        latent_cache_gen=latent_cache_gen,
+        output_sf=output_sf,
+    )
+
+
+maybe_bcg_mla_custom_op_inplace_nvfp4_out = eager_on_graph(mla_custom_op_inplace_nvfp4_out)
 
 
 def _is_cute_dsl_fp8_bmm_available(sm_version: Optional[int] = None) -> bool:
@@ -925,8 +1105,18 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         attn_output: list[torch.Tensor],
         latent_cache_gen: Optional[torch.Tensor] = None,
+        output_sf: Optional[torch.Tensor] = None,
     ) -> None:
-        """Run the dense or sparse implementation of the shared MLA module."""
+        """Run the dense or sparse implementation of the shared MLA module.
+
+        ``output_sf`` (TRTLLM_MLA_NVFP4_EPILOGUE bit 1, pure-generation batches only): ``attn_output[0]`` is
+        o_proj's packed NVFP4 input and this its swizzled scale buffer."""
+        if output_sf is not None and (
+            self.sparse_attn_hooks is not None or attn_metadata.num_contexts > 0
+        ):
+            raise RuntimeError(
+                "MLA NVFP4 output (TRTLLM_MLA_NVFP4_EPILOGUE) is for dense pure-generation batches only."
+            )
         if self.sparse_attn_hooks is not None:
             self.sparse_attn_hooks.forward(
                 self,
@@ -943,6 +1133,7 @@ class MLA(nn.Module):
             attn_metadata,
             attn_output[0],
             latent_cache_gen=latent_cache_gen,
+            output_sf=output_sf,
         )
 
     def _forward_impl(
@@ -952,6 +1143,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache_gen: Optional[torch.Tensor] = None,
+        output_sf: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Forward pass for the MLA module. Writes result into output tensor in-place.
@@ -1058,6 +1250,7 @@ class MLA(nn.Module):
                 output[num_ctx_tokens:num_tokens, :],
                 position_ids=position_ids,
                 latent_cache=latent_cache_gen,
+                output_sf=output_sf,
             )
 
     def _use_kvbproj_strided_out(self) -> bool:
@@ -1786,6 +1979,186 @@ class MLA(nn.Module):
         self._ugpu_k_b_proj_trans_shards = k_shards
         self._ugpu_v_b_proj_shards = v_shards
 
+    def _mla_nvfp4_bmm_o_scale(self) -> Optional[torch.Tensor]:
+        """o_proj's static NVFP4 input_scale when bmm_o may write o_proj's NVFP4 input
+        (TRTLLM_MLA_NVFP4_EPILOGUE bit 1), else None. Decided once per module."""
+        cached = self.__dict__.get("_mla_nvfp4_bmm_o_scale_cache")
+        if cached is None:
+            o_proj = getattr(self, "o_proj", None)
+            quant_method = getattr(o_proj, "quant_method", None)
+            input_scale = getattr(o_proj, "input_scale", None)
+            v_b_proj = getattr(self, "v_b_proj", None)
+            eligible = (
+                get_sm_version() == 107
+                and IS_CUTLASS_DSL_AVAILABLE
+                and self.sparse_attn_hooks is None
+                and not self.mapping.has_cp_helix()
+                and self.num_heads_tp_cp == self.num_heads_tp
+                and self._ugpu_v_b_proj_shards is None
+                and isinstance(v_b_proj, torch.Tensor)
+                and v_b_proj.dtype == torch.bfloat16
+                and v_b_proj.dim() == 3
+                and v_b_proj.stride(2) == 1
+                and self.v_head_dim % 64 == 0
+                and self.kv_lora_rank % 8 == 0
+                and type(quant_method) is NVFP4LinearMethod
+                and is_static_nvfp4_input_eligible(o_proj)
+                and getattr(o_proj, "scaling_vector_size", None) == 16
+                and isinstance(input_scale, torch.Tensor)
+                and input_scale.dtype == torch.float32
+                and input_scale.numel() == 1
+                and o_proj.in_features == self.num_heads_tp * self.v_head_dim
+            )
+            cached = input_scale if eligible else False
+            self.__dict__["_mla_nvfp4_bmm_o_scale_cache"] = cached
+            logger.info_once(
+                f"[TRTLLM_MLA_NVFP4_EPILOGUE] bmm_o -> o_proj NVFP4 input eligible: {eligible} "
+                f"(layer {self.layer_idx}, sm {get_sm_version()}, o_proj method "
+                f"{type(quant_method).__name__})",
+                key=f"mla_nvfp4_bmm_o_eligible_{eligible}",
+            )
+        return cached if cached is not False else None
+
+    def _mla_nvfp4_output_buffers(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """o_proj's NVFP4 input buffers (packed E2M1 [tokens, hidden / 2], swizzled scales
+        [pad_up(tokens, 128) * pad_up(hidden / 16, 4)]: the shapes fp4_quantize returns) when bmm_o writes them
+        (TRTLLM_MLA_NVFP4_EPILOGUE bit 1, dense pure-generation batches), else None."""
+        if not (MLA_NVFP4_EPILOGUE & 1) or attn_metadata.num_contexts != 0:
+            return None
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            hidden_states = hidden_states.unquantized_hidden_states
+            if hidden_states is None:
+                return None
+        num_tokens = hidden_states.shape[0]
+        if (
+            num_tokens < MLA_NVFP4_EPILOGUE_MIN_TOKENS
+            or num_tokens != attn_metadata.num_tokens
+            or torch.compiler.is_compiling()
+            or self._mla_nvfp4_bmm_o_scale() is None
+        ):
+            return None
+        hidden = self.num_heads_tp * self.v_head_dim
+        output = hidden_states.new_empty([num_tokens, hidden // 2], dtype=torch.uint8)
+        output_sf = hidden_states.new_empty(
+            [pad_up(num_tokens, 128) * pad_up(hidden // 16, 4)], dtype=torch.uint8
+        )
+        return output, output_sf
+
+    def _mla_nvfp4_bmm_o(
+        self, attn_out_latent: torch.Tensor, output: torch.Tensor, output_sf: torch.Tensor
+    ) -> None:
+        """bmm_o (attn_latent^T x W_UV) whose epilogue writes o_proj's NVFP4 input: ``fp4_quantize``'s bytes for
+        the BF16 [tokens, heads * v_head_dim] product with o_proj's static input_scale (swizzled scales)."""
+        from ..cute_dsl_kernels.rubin.dense_gemm_nvfp4_out import MODE_O, Sm107Nvfp4OutBmm
+
+        num_tokens = attn_out_latent.shape[0]
+        input_scale = self._mla_nvfp4_bmm_o_scale()
+        hidden = self.num_heads_tp * self.v_head_dim
+        if (
+            input_scale is None
+            or output.dtype != torch.uint8
+            or tuple(output.shape) != (num_tokens, hidden // 2)
+            or output_sf.dtype != torch.uint8
+            or output_sf.numel() < pad_up(num_tokens, 128) * pad_up(hidden // 16, 4)
+        ):
+            raise RuntimeError(
+                "MLA NVFP4 bmm_o output received without an eligible o_proj or with wrong buffers: "
+                f"{tuple(output.shape)} {output.dtype}, {output_sf.numel()} scale bytes."
+            )
+        tactic = Sm107Nvfp4OutBmm.run(
+            MODE_O,
+            attn_out_latent.transpose(0, 1),
+            self.v_b_proj,
+            output,
+            output_sf,
+            input_scale,
+            out_stride_m=hidden // 2,
+            out_stride_l=self.v_head_dim // 2,
+            sf_row_m=1,
+            sf_row_l=0,
+            sf_col_l=self.v_head_dim // 16,
+            sf_cols_padded=pad_up(hidden // 16, 4),
+            fp4_rows=num_tokens,
+            sf_rows=pad_up(num_tokens, 128),
+        )
+        logger.info_once(
+            f"[TRTLLM_MLA_NVFP4_EPILOGUE] bmm_o writes o_proj's NVFP4 input in its epilogue (CuTe DSL SM107, "
+            f"tactic {tactic}); first call {num_tokens} tokens",
+            key="mla_nvfp4_bmm_o_active",
+        )
+        if MLA_NVFP4_EPILOGUE_VERIFY:
+
+            def bmm_o_mismatches() -> Dict[str, torch.Tensor]:
+                from .fused_ops.nvfp4_quantize_triton import fp4_quantize
+
+                ref = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device=output.device)
+                torch.ops.trtllm.bmm_out(
+                    attn_out_latent.transpose(0, 1),
+                    self.v_b_proj.transpose(1, 2),
+                    ref.view(num_tokens, self.num_heads_tp, self.v_head_dim).transpose(0, 1),
+                )
+                ref_fp4, ref_sf = fp4_quantize(ref, input_scale, 16, False, True)
+                return {
+                    "fp4_bytes": (output != ref_fp4.view(torch.uint8)).sum(),
+                    "scale_bytes": (output_sf[: ref_sf.numel()] != ref_sf.view(torch.uint8)).sum(),
+                }
+
+            _mla_nvfp4_epilogue_verify("o", num_tokens, bmm_o_mismatches)
+
+    def _mla_nvfp4_bmm_q_prefix_eligible(
+        self, num_tokens: int, attn_metadata: AttentionMetadata
+    ) -> bool:
+        """TRTLLM_MLA_NVFP4_EPILOGUE bit 2 for this generation slice: one token per sequence, at least
+        ..._MIN_TOKENS_Q tokens, BF16 W_UK on the FP4 MLA fused RoPE/Q-quant path, SM107."""
+        if not (MLA_NVFP4_EPILOGUE & 2) or num_tokens < MLA_NVFP4_EPILOGUE_MIN_TOKENS_Q:
+            return False
+        if num_tokens != attn_metadata.num_seqs - attn_metadata.num_contexts:
+            return False
+        eligible = self.__dict__.get("_mla_nvfp4_bmm_q_eligible_cache")
+        if eligible is None:
+            k_weight = getattr(self, "k_b_proj_trans", None)
+            eligible = bool(
+                get_sm_version() == 107
+                and IS_CUTLASS_DSL_AVAILABLE
+                and not self.apply_rotary_emb
+                and self.sparse_attn_hooks is None
+                and not self.mapping.has_cp_helix()
+                and self.num_heads_tp == 128
+                and self.kv_lora_rank == 512
+                and self.qk_nope_head_dim % 8 == 0
+                and self._ugpu_k_b_proj_trans_shards is None
+                and isinstance(k_weight, torch.Tensor)
+                and k_weight.dtype == torch.bfloat16
+                and k_weight.is_contiguous()
+                and tuple(k_weight.shape)
+                == (self.num_heads_tp, self.kv_lora_rank, self.qk_nope_head_dim)
+            )
+            self.__dict__["_mla_nvfp4_bmm_q_eligible_cache"] = eligible
+            logger.info_once(
+                f"[TRTLLM_MLA_NVFP4_EPILOGUE] bmm_q -> FP4 Q prefix eligible: {eligible} "
+                f"(layer {self.layer_idx}, heads {self.num_heads_tp}, sm {get_sm_version()})",
+                key=f"mla_nvfp4_bmm_q_eligible_{eligible}",
+            )
+        return eligible
+
+    def _mla_nvfp4_bmm_q_prefix(
+        self, attn_metadata: AttentionMetadata, q_nope_t: torch.Tensor, overlap: bool
+    ) -> None:
+        """bmm_q into the FP4 MLA Q buffers (the packed Q prefix and its scale columns)."""
+        from ..attention_backend.fp4_mla import fp4_mla_bmm_q_fp4_prefix
+
+        tactic = fp4_mla_bmm_q_fp4_prefix(
+            attn_metadata, q_nope_t, self.k_b_proj_trans, overlap=overlap
+        )
+        logger.info_once(
+            f"[TRTLLM_MLA_NVFP4_EPILOGUE] bmm_q writes the NVFP4 Q prefix in its epilogue (CuTe DSL SM107, "
+            f"tactic {tactic}); the fused RoPE/Q/KV launch runs without Q-prefix programs"
+            f"{' beside it on the aux stream' if overlap else ''}; first call {q_nope_t.shape[1]} tokens",
+            key=f"mla_nvfp4_bmm_q_active_{overlap}",
+        )
+
     def forward_absorption_generation(
         self,
         q: torch.Tensor,
@@ -1795,6 +2168,7 @@ class MLA(nn.Module):
         output: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
+        output_sf: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
@@ -1884,6 +2258,19 @@ class MLA(nn.Module):
                     )
 
             rope_stream = self.aux_stream if not use_fp8_mla else None
+            # TRTLLM_MLA_NVFP4_EPILOGUE bit 2: bmm_q writes the FP4 MLA Q prefix itself; the fused RoPE/Q/KV
+            # launch then writes only the Q tails, K and the latent, and nothing reads fused_q's BF16 prefix
+            # (the FP4 MLA decode consumes the prequantized Q only).
+            fp4_q_prefix = fuse_fp4_q_quant and self._mla_nvfp4_bmm_q_prefix_eligible(
+                num_tokens, attn_metadata
+            )
+            fp4_q_prefix_overlap = False
+            if fp4_q_prefix:
+                fp4_rope_kwargs["fp4_q_prefix_external"] = True
+                # bit 4: that launch no longer reads bmm_q's output, so it may run beside it
+                if (MLA_NVFP4_EPILOGUE & 4) and self.aux_stream is not None:
+                    rope_stream = self.aux_stream
+                    fp4_q_prefix_overlap = True
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
@@ -1893,19 +2280,39 @@ class MLA(nn.Module):
                 # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
                 # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
                 # The output of bmm is written directly into fused_q
-                maybe_execute_in_parallel(
-                    lambda: self._bmm_bf16_out(
+                if fp4_q_prefix:
+                    bmm_q = functools.partial(
+                        self._mla_nvfp4_bmm_q_prefix,
+                        attn_metadata,
+                        q_nope_t,
+                        fp4_q_prefix_overlap,
+                    )
+                else:
+                    bmm_q = functools.partial(
+                        self._bmm_bf16_out,
                         q_nope_t,
                         self.k_b_proj_trans,
                         self.k_b_proj_trans.transpose(1, 2),
                         q_nope_out,
                         self._ugpu_k_b_proj_trans_shards,
-                    ),
+                    )
+                maybe_execute_in_parallel(
+                    bmm_q,
                     _mla_gen_rope,
                     self.ln_events[0],
                     self.ln_events[1],
                     rope_stream,
                 )
+                if fp4_q_prefix and MLA_NVFP4_EPILOGUE_VERIFY:
+                    from ..attention_backend.fp4_mla import fp4_mla_verify_q_prefix
+
+                    _mla_nvfp4_epilogue_verify(
+                        "q",
+                        num_tokens,
+                        functools.partial(
+                            fp4_mla_verify_q_prefix, attn_metadata, q_nope_t, self.k_b_proj_trans
+                        ),
+                    )
 
             elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
                 # [num_heads, num_tokens, self.kv_lora_rank]
@@ -1968,6 +2375,11 @@ class MLA(nn.Module):
 
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view([-1, self.num_heads_tp_cp, self.kv_lora_rank])
+
+        if output_sf is not None:
+            # TRTLLM_MLA_NVFP4_EPILOGUE bit 1: output is o_proj's packed NVFP4 input, output_sf its scales.
+            self._mla_nvfp4_bmm_o(attn_out_latent, output, output_sf)
+            return output
 
         attn_output = output.view([num_tokens, self.num_heads_tp_cp, self.v_head_dim])
 
@@ -2213,7 +2625,42 @@ class MLA(nn.Module):
             hidden_states, attn_metadata, self.mapping, self.layer_idx
         )
 
-        if self.register_to_config:
+        nvfp4_output = self._mla_nvfp4_output_buffers(hidden_states, attn_metadata)
+        if nvfp4_output is not None:
+            # TRTLLM_MLA_NVFP4_EPILOGUE bit 1: bmm_o writes o_proj's NVFP4 input; o_proj skips its quantizer.
+            output_fp4, output_sf = nvfp4_output
+            if self.register_to_config:
+                if isinstance(hidden_states, Fp4QuantizedTensor):
+                    maybe_bcg_mla_custom_op_inplace_nvfp4_out(
+                        hidden_states.unquantized_hidden_states,
+                        position_ids,
+                        self.layer_idx_str,
+                        output_fp4,
+                        output_sf,
+                        latent_cache_gen,
+                        hidden_states.fp4_tensor,
+                        hidden_states.scaling_factor,
+                    )
+                else:
+                    maybe_bcg_mla_custom_op_inplace_nvfp4_out(
+                        hidden_states,
+                        position_ids,
+                        self.layer_idx_str,
+                        output_fp4,
+                        output_sf,
+                        latent_cache_gen,
+                    )
+            else:
+                self.forward_impl(
+                    position_ids,
+                    hidden_states,
+                    attn_metadata,
+                    attn_output=[output_fp4],
+                    latent_cache_gen=latent_cache_gen,
+                    output_sf=output_sf,
+                )
+            attn_output = [Fp4QuantizedTensor(output_fp4, output_sf)]
+        elif self.register_to_config:
             output_hidden_states = hidden_states
             if isinstance(hidden_states, Fp4QuantizedTensor):
                 assert hidden_states.unquantized_hidden_states is not None, (

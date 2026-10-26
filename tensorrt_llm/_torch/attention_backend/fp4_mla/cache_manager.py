@@ -25,12 +25,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 from . import (
+    _FP4_MLA_CUTEDSL_BACKEND,
     _FP4_MLA_K_RESIDUAL_BACKENDS,
     FP4_BLOCK_SIZE,
     FP4_MLA_K_RESIDUAL_DIM,
+    FP4_MLA_MXFP4_2D_ENV,
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
     _fp4_mla_attention_backend,
+    _fp4_mla_cutedsl_fused_v_transpose_enabled,
+    _fp4_mla_mxfp4_2d_enabled,
     get_fp4_mla_v_scale_pool_size,
 )
 
@@ -147,7 +151,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         manager._fp4_mla_storage_backend = _fp4_mla_attention_backend()
         if manager._fp4_mla_storage_backend not in _FP4_MLA_K_RESIDUAL_BACKENDS:
             raise ValueError(
-                "Fp4MlaKVCacheManagerV2 supports only the triton "
+                "Fp4MlaKVCacheManagerV2 supports only the triton and cutedsl "
                 f"backends, got {manager._fp4_mla_storage_backend!r}."
             )
         manager.fp4_mla_k_residual_dim = (
@@ -160,7 +164,32 @@ class Fp4MlaV2CacheLayoutPolicy:
         manager.fp4_mla_context_only_cache = (
             is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
         )
-        manager.mla_v_head_dim = None
+        # MXFP4-2D stores V once (the K pages) with block scales in the K-scale
+        # plane: no V-scale pool and no V-pack. One generation token per step,
+        # and every cached block must be written by this process' writers.
+        manager.fp4_mla_mxfp4_2d = _fp4_mla_mxfp4_2d_enabled()
+        if manager.fp4_mla_mxfp4_2d:
+            if max(0, int(spec_config.tokens_per_gen_step - 1) if spec_config else 0) > 0:
+                raise ValueError(
+                    f"{FP4_MLA_MXFP4_2D_ENV}=1 does not support speculative decoding (MTP)."
+                )
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    f"{FP4_MLA_MXFP4_2D_ENV}=1 requires kv_cache_config.enable_block_reuse=False."
+                )
+        manager.fp4_mla_v_sidecars_dropped = (
+            manager.fp4_mla_context_only_cache or manager.fp4_mla_mxfp4_2d
+        )
+        # CuTeDSL MUFU16 decode reads V from a persistent packed sidecar
+        # (kv_lora_rank x tokens_per_block / 2 bytes per page); the fused-V
+        # variant, context-only and MXFP4-2D caches do not keep it.
+        manager.mla_v_head_dim = (
+            manager.mla_v_scale_head_dim
+            if manager._fp4_mla_storage_backend == _FP4_MLA_CUTEDSL_BACKEND
+            and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+            and not manager.fp4_mla_v_sidecars_dropped
+            else None
+        )
         max_rewind_len = int(spec_config.tokens_per_gen_step - 1) if spec_config else 0
         manager._fp4_mla_hp_pool_size = HP_BLOCK_SIZE + max_rewind_len
         manager._fp4_mla_view_cache = {}
@@ -332,7 +361,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         return self.head_dim_per_layer[local_layer_idx] + self.fp4_mla_k_residual_dim
 
     def _v_scale_bytes_per_page(self) -> int:
-        if self.fp4_mla_context_only_cache:
+        if self.fp4_mla_v_sidecars_dropped:
             return 0
         return get_fp4_mla_v_scale_pool_size(self.mla_v_scale_head_dim, self.tokens_per_block)
 
@@ -380,7 +409,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         result = {}
         for local_layer in self._fp4_mla_local_layer_indices():
             buffers = []
-            if not self.fp4_mla_context_only_cache:
+            if not self.fp4_mla_v_sidecars_dropped:
                 buffers.append(
                     BufferConfig(
                         role=Role.MLA_V_SCALE,
@@ -567,7 +596,7 @@ class Fp4MlaV2CacheLayoutPolicy:
                 f"FP4 and HP; got bf16={sorted(bf16_groups)}."
             )
         cache_roles = [Role.KEY, Role.KEY_BLOCK_SCALE]
-        if not self.fp4_mla_context_only_cache:
+        if not self.fp4_mla_v_sidecars_dropped:
             cache_roles.append(Role.MLA_V_SCALE)
         if self.mla_v_head_dim is not None:
             cache_roles.append(Role.MLA_V_PACKED)
@@ -727,7 +756,7 @@ class Fp4MlaV2CacheLayoutPolicy:
                     self.head_dim_per_layer[bf16_local_layer],
                 ),
             )
-        if not self.fp4_mla_context_only_cache:
+        if not self.fp4_mla_v_sidecars_dropped:
             yield self.get_mla_v_scale_pool_base().view(torch.float8_e4m3fn)
         if self.mla_v_head_dim is not None:
             yield self._role_pool_base_view(
@@ -819,7 +848,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         return pool
 
     def get_mla_v_scale_pool(self) -> Optional[torch.Tensor]:
-        if self.fp4_mla_context_only_cache:
+        if self.fp4_mla_v_sidecars_dropped:
             return None
         return self._all_layer_role_view(
             self._cache_manager_layer_ids,
@@ -829,7 +858,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         ).view(torch.float8_e4m3fn)
 
     def get_mla_v_scale_pool_base(self) -> Optional[torch.Tensor]:
-        if self.fp4_mla_context_only_cache:
+        if self.fp4_mla_v_sidecars_dropped:
             return None
         return self._role_pool_base_view(
             self._cache_manager_layer_ids[0],
@@ -955,7 +984,8 @@ class Fp4MlaV2CacheLayoutPolicy:
         backend = _fp4_mla_attention_backend()
         if backend not in _FP4_MLA_K_RESIDUAL_BACKENDS:
             raise ValueError(
-                f"Fp4MlaKVCacheManagerV2 supports only the triton backends, got {backend!r}."
+                "Fp4MlaKVCacheManagerV2 supports only the triton and cutedsl "
+                f"backends, got {backend!r}."
             )
         residual = FP4_MLA_K_RESIDUAL_DIM if backend in _FP4_MLA_K_RESIDUAL_BACKENDS else 0
         storage_head_dim = logical_head_dim + residual
@@ -964,13 +994,21 @@ class Fp4MlaV2CacheLayoutPolicy:
         context_only = (
             kwargs.get("is_disagg", False) and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
         )
-        if context_only:
+        mx2d = _fp4_mla_mxfp4_2d_enabled()
+        if context_only or mx2d:
             v_scale_page = 0
         per_layer = (
             math.ceil(storage_head_dim / 2)
             + math.ceil(storage_head_dim / FP4_BLOCK_SIZE)
             + math.ceil(v_scale_page / tokens_per_block)
         )
+        if (
+            backend == _FP4_MLA_CUTEDSL_BACKEND
+            and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+            and not context_only
+            and not mx2d
+        ):
+            per_layer += config.kv_lora_rank // 2
         local_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )

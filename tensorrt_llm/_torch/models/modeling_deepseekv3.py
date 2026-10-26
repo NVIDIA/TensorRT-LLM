@@ -47,6 +47,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -82,6 +83,67 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
+
+# MoE-entry add-RMSNorm writes the routed experts' NVFP4 dispatch input (default 0 = off; bitwise against the
+# unfused path): on the attention-DP path the post-attention FlashInfer add-RMSNorm of a MoE layer also emits the
+# NVFP4 of its BF16 output with the experts' fc31_input_scale (linear scale factors), and the CuteDSL MoE's
+# quantize_input takes those bytes instead of quantizing the same BF16 tensor again
+# (cute_dsl_kernels/flashinfer_fused_add_rmsnorm_nvfp4.py). The router and the shared expert keep the BF16 output.
+_MOE_ENTRY_NORM_NVFP4 = os.environ.get("TRTLLM_MOE_ENTRY_NORM_NVFP4",
+                                       "0") == "1"
+# verification only: also run the unfused norm + quantizer on copies and count mismatches; 1 = eager forwards
+# only, logged per call (synchronizes); 2 = every forward incl. CUDA-graph replays, device counters
+# (modules/mla.py VerifyMismatchCounter).
+try:
+    _MOE_ENTRY_NORM_NVFP4_VERIFY = int(
+        os.environ.get("TRTLLM_MOE_ENTRY_NORM_NVFP4_VERIFY", "0") or 0)
+except ValueError:
+    _MOE_ENTRY_NORM_NVFP4_VERIFY = 0
+_MOE_ENTRY_NORM_NVFP4_VERIFY_STATS = {"calls": 0, "bad_calls": 0, "bytes": 0}
+_MOE_ENTRY_NORM_NVFP4_VERIFY_COUNTER = []
+
+
+def _moe_entry_norm_nvfp4_mismatches(norm, ref_hidden, ref_residual,
+                                     hidden_states, residual, fp4, sf,
+                                     scale) -> Dict[str, torch.Tensor]:
+    """The unfused path (FlashInfer add-RMSNorm on copies of the inputs, then fp4_quantize) against the fused
+    kernel's outputs, as 0-d device counts (no host sync)."""
+    from ..custom_ops.flashinfer_custom_ops import flashinfer_fused_add_rmsnorm
+    from ..modules.fused_ops.nvfp4_quantize_triton import fp4_quantize
+    flashinfer_fused_add_rmsnorm(ref_hidden, ref_residual, norm.weight,
+                                 norm.variance_epsilon)
+    ref_fp4, ref_sf = fp4_quantize(ref_hidden, scale, 16, False, False)
+    return {
+        "norm_out": (ref_hidden.view(torch.int16)
+                     != hidden_states.view(torch.int16)).sum(),
+        "residual": (ref_residual.view(torch.int16)
+                     != residual.view(torch.int16)).sum(),
+        "fp4": (ref_fp4.view(torch.uint8) != fp4.view(torch.uint8)).sum(),
+        "sf": (ref_sf.view(torch.uint8).reshape(-1)
+               != sf.view(torch.uint8).reshape(-1)).sum(),
+    }
+
+
+def _moe_entry_norm_nvfp4_verify(mismatches: Dict[str, torch.Tensor],
+                                 num_tokens: int) -> None:
+    if _MOE_ENTRY_NORM_NVFP4_VERIFY >= 2:
+        if not _MOE_ENTRY_NORM_NVFP4_VERIFY_COUNTER:
+            from ..modules.mla import VerifyMismatchCounter
+            _MOE_ENTRY_NORM_NVFP4_VERIFY_COUNTER.append(
+                VerifyMismatchCounter("[TRTLLM_MOE_ENTRY_NORM_NVFP4]",
+                                      tuple(sorted(mismatches))))
+        _MOE_ENTRY_NORM_NVFP4_VERIFY_COUNTER[0].add(mismatches)
+        return
+    bad = {k: int(v) for k, v in mismatches.items()}
+    st = _MOE_ENTRY_NORM_NVFP4_VERIFY_STATS
+    st["calls"] += 1
+    st["bad_calls"] += int(sum(bad.values()) > 0)
+    st["bytes"] += sum(bad.values())
+    if st["calls"] <= 3 or sum(bad.values()) or st["calls"] % 1024 == 0:
+        logger.info(
+            f"[TRTLLM_MOE_ENTRY_NORM_NVFP4] VERIFY call {st['calls']} M={num_tokens} mismatches {bad}; "
+            f"total bad calls {st['bad_calls']} mismatched elements/bytes {st['bytes']}"
+        )
 
 
 @triton.jit
@@ -1434,6 +1496,32 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 quantize_type=nvfp4_norm)
         self.next_layer_layernorm: RMSNorm = None
 
+    def _moe_entry_nvfp4_backend(self, hidden_states: torch.Tensor,
+                                 residual: torch.Tensor):
+        """TRTLLM_MOE_ENTRY_NORM_NVFP4: the CuteDSL MoE backend whose dispatch input post_attention_layernorm may
+        write in NVFP4 for this call, else None."""
+        if not _MOE_ENTRY_NORM_NVFP4 or not isinstance(self.mlp, Deepseekv3MoE):
+            return None
+        from ..cute_dsl_kernels.flashinfer_fused_add_rmsnorm_nvfp4 import \
+            fused_add_rmsnorm_nvfp4_supported
+        from ..modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+        from ..utils import is_torch_compiling
+        experts = self.mlp.experts
+        backend = getattr(experts, "backend", experts)
+        ok = (isinstance(backend, CuteDslFusedMoE) and backend.has_nvfp4
+              and not getattr(experts, "apply_router_weight_on_input", False)
+              and not is_torch_compiling()
+              and self.post_attention_layernorm.runs_flashinfer_cute_fused_add(
+                  hidden_states.device)
+              and fused_add_rmsnorm_nvfp4_supported(
+                  hidden_states, residual, self.post_attention_layernorm.weight,
+                  getattr(backend, "fc31_input_scale", None)))
+        logger.info_once(
+            f"[TRTLLM_MOE_ENTRY_NORM_NVFP4] post-attention add-RMSNorm writes the MoE dispatch NVFP4: {ok} "
+            f"(layer {self.layer_idx}, backend {type(backend).__name__}, M={hidden_states.shape[0]})",
+            key=f"moe_entry_norm_nvfp4_{ok}")
+        return backend if ok else None
+
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         """
@@ -1560,6 +1648,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 do_finalize=do_finalize,
             )
 
+        entry_backend = None
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
             # TODO: unify the two min-latency MoE backends by enabling quant fusion
@@ -1573,9 +1662,36 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     trigger_completion_at_end=False,
                 ))
         else:
-            # No fusion
-            hidden_states, residual = self.post_attention_layernorm(
+            entry_backend = self._moe_entry_nvfp4_backend(
                 hidden_states, residual)
+            if entry_backend is not None:
+                capturing = torch.cuda.is_current_stream_capturing()
+                # mode 1: eager forwards only; mode 2: every forward, but its counter is created eagerly
+                verify = (_MOE_ENTRY_NORM_NVFP4_VERIFY == 1 and not capturing
+                          ) or (_MOE_ENTRY_NORM_NVFP4_VERIFY >= 2 and
+                                (not capturing
+                                 or bool(_MOE_ENTRY_NORM_NVFP4_VERIFY_COUNTER)))
+                if verify:
+                    ref_hidden, ref_residual = hidden_states.clone(
+                    ), residual.clone()
+                # TRTLLM_MOE_ENTRY_NORM_NVFP4: the norm also writes the experts' NVFP4 dispatch input.
+                hidden_states, residual, entry_fp4, entry_sf = (
+                    self.post_attention_layernorm.forward_with_nvfp4_output(
+                        hidden_states, residual,
+                        entry_backend.fc31_input_scale))
+                if verify:
+                    _moe_entry_norm_nvfp4_verify(
+                        _moe_entry_norm_nvfp4_mismatches(
+                            self.post_attention_layernorm, ref_hidden,
+                            ref_residual, hidden_states, residual, entry_fp4,
+                            entry_sf, entry_backend.fc31_input_scale),
+                        hidden_states.shape[0])
+                entry_backend.set_entry_nvfp4_input(hidden_states, entry_fp4,
+                                                    entry_sf)
+            else:
+                # No fusion
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual)
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -1587,6 +1703,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
                                  do_finalize=do_finalize)
+        if entry_backend is not None and entry_backend.clear_entry_nvfp4_input(
+        ):
+            logger.info_once(
+                "[TRTLLM_MOE_ENTRY_NORM_NVFP4] the MoE quantized its input itself (padded or chunked input); "
+                "the norm's NVFP4 was not used",
+                key="moe_entry_norm_nvfp4_unused")
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:

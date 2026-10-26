@@ -57,6 +57,7 @@ from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .fused_ops.nvfp4_quantize_triton import fp4_quantize
 from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
 from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
 
@@ -1649,8 +1650,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         elif isinstance(input, tuple):
             act_fp4, act_sf = input
         else:
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                input, module.input_scale, module.scaling_vector_size, False)
+            act_fp4, act_sf = fp4_quantize(input, module.input_scale,
+                                           module.scaling_vector_size, False)
         return Fp4QuantizedTensor(act_fp4, act_sf)
 
     def _input_prepare(self, module: Linear, input: torch.Tensor):
@@ -1704,8 +1705,11 @@ class NVFP4LinearMethod(LinearMethodBase):
                 act_fp4, act_sf = torch.ops.trtllm.tunable_fp4_quantize(
                     input, input_scale, module.scaling_vector_size, False)
             else:
-                act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                    input, input_scale, module.scaling_vector_size, False)
+                # Same bytes as torch.ops.trtllm.fp4_quantize; a Triton kernel
+                # when TRTLLM_NVFP4_QUANTIZE_TRITON=1.
+                act_fp4, act_sf = fp4_quantize(input, input_scale,
+                                               module.scaling_vector_size,
+                                               False)
             return act_fp4, act_sf, alpha
 
     def apply(

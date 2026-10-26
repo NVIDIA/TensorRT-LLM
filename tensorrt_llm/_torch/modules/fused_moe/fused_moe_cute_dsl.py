@@ -43,6 +43,7 @@ from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
+from ..fused_ops.nvfp4_quantize_triton import fp4_quantize
 from ..linear import _copy_to_new_cuda_allocation
 from .fused_moe_cutlass import CutlassFusedMoE
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
@@ -892,6 +893,25 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         return self.has_nvfp4 or (not self.has_any_quant
                                   and get_sm_version() == 107)
 
+    def set_entry_nvfp4_input(self, x: torch.Tensor, x_fp4: torch.Tensor,
+                              x_sf: torch.Tensor) -> None:
+        """Stash the NVFP4 of ``x`` (the bytes ``fp4_quantize(x, fc31_input_scale, 16, False, False)`` returns)
+        produced by the MoE-entry add-RMSNorm (TRTLLM_MOE_ENTRY_NORM_NVFP4); quantize_input takes it instead of
+        quantizing ``x`` again, for that same tensor object only."""
+        self._entry_nvfp4_input = (x, x_fp4, x_sf)
+
+    def _take_entry_nvfp4_input(
+            self,
+            x: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        stash = self.__dict__.pop("_entry_nvfp4_input", None)
+        if stash is not None and stash[0] is x:
+            return stash[1], stash[2]
+        return None
+
+    def clear_entry_nvfp4_input(self) -> bool:
+        """Drop an untaken stash; True when the MoE quantized its input itself (e.g. padded or chunked input)."""
+        return self.__dict__.pop("_entry_nvfp4_input", None) is not None
+
     def quantize_input(self,
                        x: Union[torch.Tensor, Fp4QuantizedTensor],
                        post_quant_comm: bool = True):
@@ -912,15 +932,22 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         """
         x_sf = None
         if self.has_nvfp4:
+            entry = (None if isinstance(x, Fp4QuantizedTensor) else
+                     self._take_entry_nvfp4_input(x))
             if isinstance(x, Fp4QuantizedTensor):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                 x_row = x.shape[0]
                 x, x_sf = x.fp4_tensor, x.scaling_factor
+            elif entry is not None:
+                # TRTLLM_MOE_ENTRY_NORM_NVFP4: the add-RMSNorm that produced x also wrote these bytes.
+                x_row = x.shape[0]
+                x, x_sf = entry
             else:
                 x_row = x.shape[0]
-                x, x_sf = torch.ops.trtllm.fp4_quantize(
-                    x, self.fc31_input_scale, self.scaling_vector_size, False,
-                    False)
+                # Same bytes as torch.ops.trtllm.fp4_quantize (linear SF); a
+                # Triton kernel when TRTLLM_NVFP4_QUANTIZE_TRITON=1.
+                x, x_sf = fp4_quantize(x, self.fc31_input_scale,
+                                       self.scaling_vector_size, False, False)
         elif self.has_deepseek_fp8_block_scales:
             # FP8 block scales doesn't support permutation of quantized inputs.
             # WAR: The quantization is in run_moe_fp8_block_scales.
@@ -960,6 +987,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         """
         if (not ASYNC_INPUT_QUANT or not self.has_nvfp4
                 or isinstance(x, Fp4QuantizedTensor)
+                or "_entry_nvfp4_input" in self.__dict__
                 or not self._has_moe_output_memset_aux_stream()):
             x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
             return x_q, x_sf, None

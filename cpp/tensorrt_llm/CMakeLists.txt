@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -302,6 +302,12 @@ endif()
 
 if(BUILD_PYT)
   add_subdirectory(thop)
+  # SM107 Push-Combine Torch extension (tile_push_comm_ops.so). A no-op unless
+  # SM107 is targeted; built together with th_common so the wheel ships it.
+  add_subdirectory(kernels/communicationKernels/tileNvfp4)
+  if(TARGET tile_push_comm_ops)
+    add_dependencies(th_common tile_push_comm_ops)
+  endif()
 endif()
 
 add_subdirectory(nanobind)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,8 @@ Available Communication Methods:
 - AllGatherReduceScatter: Default fallback method, always available
 - NVLinkTwoSided: NVLINK-optimized communication for latency (formerly MNNVLLatency)
 - NVLinkOneSided: NVLINK-optimized communication for throughput (formerly MNNVLThroughput)
+- NVLinkOneSidedTilePushCombine: NVLinkOneSided dispatch + SM107 push-based packed-NVFP4
+  combine (opt-in via TRTLLM_FORCE_COMM_METHOD=PUSH_COMBINE)
 - DeepEP: Deep Expert Parallelism with support for large batches
 - DeepEPLowLatency: Deep Expert Parallelism optimized for low latency
 
@@ -36,6 +38,7 @@ from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
 from .nccl_ep import NcclEP
 from .nvlink_one_sided import NVLinkOneSided
+from .nvlink_one_sided_tile_nvfp4_push import NVLinkOneSidedTilePushCombine
 from .nvlink_two_sided import NVLinkTwoSided
 
 __all__ = [
@@ -45,6 +48,7 @@ __all__ = [
     "AllGatherReduceScatter",
     "NVLinkTwoSided",
     "NVLinkOneSided",
+    "NVLinkOneSidedTilePushCombine",
     "DeepEP",
     "DeepEPLowLatency",
     "NcclEP",

@@ -93,7 +93,8 @@ class CommunicationFactory:
         Create the best communication method for the given configuration
 
         Selection priority (using try-catch mechanism):
-        1. Force method (if specified via TRTLLM_FORCE_COMM_METHOD env)
+        1. Force method (if specified via TRTLLM_FORCE_COMM_METHOD env). Opt-in only
+           methods such as PUSH_COMBINE are never auto-selected.
         2. Auto-selection (tries in order):
            - NVLinkOneSided (highest priority for throughput)
            - NVLinkTwoSided (high priority for latency)
@@ -381,6 +382,36 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+            )
+        elif method == "PUSH_COMBINE":
+            # Strict opt-in: NVLinkOneSided dispatch + SM107 push combine
+            # (D0/K1/K23/K4) over the packed-NVFP4 tile-NVFP4 V2 layout. The
+            # wheel-bundled tile_push_comm_ops DSO drives the moe_a2a_push_* ops
+            # for EP in {2, 4, 8, 16, 32}; TRTLLM_TILE_PUSH_COMBINE_DSO is only an
+            # expert override of the DSO path.
+            if use_low_precision_combine:
+                raise ValueError(
+                    "PUSH_COMBINE owns the packed-NVFP4 combine format and is "
+                    "incompatible with use_low_precision_moe_combine"
+                )
+            if model_config.moe_load_balancer is not None:
+                raise ValueError("PUSH_COMBINE does not support expert load balancing")
+            ep_group_health, _, _ = get_wide_ep_ft_options(model_config)
+            if ep_group_health is not None:
+                raise ValueError("PUSH_COMBINE does not support wide-EP fault tolerance")
+
+            from .tile_tma_forced_loader import create_push_combine_strategy_from_env
+
+            return create_push_combine_strategy_from_env(
+                mapping=mapping,
+                num_slots=num_slots,
+                top_k=top_k,
+                max_num_tokens_per_rank=max_num_tokens,
+                # ExternalCommMoEScheduler enables the workspace-backed combine
+                # source per forward when the MoE backend supports it.
+                payload_in_workspace=False,
+                hidden_size=hidden_size,
+                dtype=act_dtype,
             )
         elif method == "DEEPEP":
             return DeepEP(

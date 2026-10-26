@@ -1269,6 +1269,15 @@ def main(*,
             lib_dir / "libdecoder_attention_1.so")
         install_file(build_dir / "tensorrt_llm/runtime/utils/libpg_utils.so",
                      lib_dir / "libpg_utils.so")
+        # SM107 Push-Combine Torch extension, built only when SM107 is targeted.
+        tile_push_comm_ops = (
+            build_dir /
+            "tensorrt_llm/kernels/communicationKernels/tileNvfp4/tile_push_comm_ops.so"
+        )
+        if tile_push_comm_ops.exists():
+            install_file(tile_push_comm_ops, lib_dir / "tile_push_comm_ops.so")
+        else:
+            (lib_dir / "tile_push_comm_ops.so").unlink(missing_ok=True)
 
     # deep_ep/deep_gemm are synced in place below (sync_tree removes stale
     # entries); deep_ep is deleted explicitly when this build does not

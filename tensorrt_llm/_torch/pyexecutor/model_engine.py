@@ -880,6 +880,8 @@ class PyTorchModelEngine(ModelEngine):
             self.runtime_draft_len = 0
             self.max_total_draft_tokens = 0
 
+        self._maybe_keep_bf16_greedy_logits()
+
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
 
         # This field is initialized lazily on the first forward pass.
@@ -8632,6 +8634,44 @@ class PyTorchModelEngine(ModelEngine):
         # back would be a self-assignment, which torch rejects for the
         # non-contiguous slices a TP-padded vocab produces.
 
+    def _maybe_keep_bf16_greedy_logits(self):
+        """TRTLLM_GREEDY_BF16_LOGITS=1 (default off): let the main model's
+        LogitsProcessor return the BF16 lm_head output instead of an FP32 copy
+        (a [B, vocab] casting copy per step). BF16 -> FP32 is exact, so the
+        fast greedy argmax picks the same token; TorchSampler casts to FP32 on
+        every other sampling path, and HandleLogits and logits post processors
+        cast on read. Engines with another logits consumer stay FP32."""
+        from ..modules.logits_processor import LogitsProcessor
+        from .sampler.greedy_bf16 import (GREEDY_BF16_LOGITS_ENV,
+                                          greedy_bf16_logits_enabled)
+        if not greedy_bf16_logits_enabled():
+            return
+        processor = getattr(self.model, "logits_processor", None)
+        reasons = []
+        if self.is_draft_model:
+            reasons.append("draft model")
+        if self.spec_config is not None:
+            reasons.append("speculative decoding")
+        if self.max_beam_width > 1:
+            reasons.append("beam search")
+        if getattr(self.llm_args, "guided_decoding_backend", None) is not None:
+            reasons.append("guided decoding")
+        if "TRTLLMSampler" in str(getattr(self.llm_args, "sampler_type",
+                                          "auto")):
+            reasons.append("TRTLLMSampler")
+        if self.mapping.has_pp():
+            reasons.append("pipeline parallel")
+        if not isinstance(processor, LogitsProcessor):
+            reasons.append("model has no LogitsProcessor")
+        if reasons:
+            logger.info(f"[{GREEDY_BF16_LOGITS_ENV}] BF16 greedy logits "
+                        f"inactive: {', '.join(reasons)}")
+            return
+        processor.keep_bf16_logits = True
+        logger.info(f"[{GREEDY_BF16_LOGITS_ENV}] BF16 greedy logits active: "
+                    "lm_head logits stay BF16; TorchSampler casts to FP32 "
+                    "off the stable greedy path")
+
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
                                        outputs: dict):
@@ -8671,6 +8711,13 @@ class PyTorchModelEngine(ModelEngine):
                 logits_processors = getattr(request,
                                             "py_logits_post_processors", None)
                 if logits_processors:
+                    if logits_tensor.dtype == torch.bfloat16 and getattr(
+                            getattr(self.model, "logits_processor", None),
+                            "keep_bf16_logits", False):
+                        # TRTLLM_GREEDY_BF16_LOGITS: post processors (and the
+                        # sampler after them) see FP32 logits, as before.
+                        logits_tensor = outputs["logits"] = logits_tensor.float(
+                        )
                     token_ids = ([request.get_tokens(0)]
                                  if is_context_request else [
                                      request.get_tokens(beam_idx)

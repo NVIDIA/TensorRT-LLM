@@ -26,6 +26,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 
 
+def _fp4_mla_kv_format(kv_cache_manager: KVCacheManager) -> Optional[str]:
+    if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
+        return None
+    return "mxfp4_2d" if getattr(kv_cache_manager, "fp4_mla_mxfp4_2d", False) else "nvfp4"
+
+
 @dataclass
 class RankInfo:
     instance_name: str
@@ -48,6 +54,10 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    # FP4 MLA KV value format ("nvfp4" or "mxfp4_2d"; None for other caches).
+    # Both sides of a transfer must agree: the bytes are the same shape but the
+    # latent prefix and its scales are encoded differently.
+    fp4_mla_kv_format: Optional[str] = None
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -112,6 +122,7 @@ class RankInfo:
             ),
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
+            fp4_mla_kv_format=_fp4_mla_kv_format(kvm),
         )
 
     @classmethod

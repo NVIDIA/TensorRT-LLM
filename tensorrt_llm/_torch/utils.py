@@ -8,7 +8,7 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -378,6 +378,45 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
     return tuple(num_token_buckets[::-1])
+
+
+# TRTLLM_AUTOTUNE_EXTRA_TOKEN_BUCKETS="1536[,1280,...]" (default unset = off; read
+# once per process): exact token counts that the NVFP4 GEMM autotuner
+# (trtllm::nvfp4_gemm) profiles in addition to its power-of-two buckets, and that
+# a runtime lookup maps to (the largest tuned bucket <= M instead of the largest
+# power of two <= M). Set it to the decode batch per rank when that is not a power
+# of two (e.g. 1536), so the GEMMs at the full-batch CUDA graph run a tactic tuned
+# for that M rather than for M = 1024.
+_AUTOTUNE_EXTRA_TOKEN_BUCKETS_ENV = "TRTLLM_AUTOTUNE_EXTRA_TOKEN_BUCKETS"
+
+
+@functools.lru_cache(maxsize=None)
+def autotune_extra_token_buckets() -> Tuple[int, ...]:
+    value = os.environ.get(_AUTOTUNE_EXTRA_TOKEN_BUCKETS_ENV, "").strip()
+    if value in ("", "0"):
+        return ()
+    buckets = tuple(sorted({int(v) for v in value.split(",") if v.strip()}))
+    if not buckets or buckets[0] < 1:
+        raise ValueError(
+            f"{_AUTOTUNE_EXTRA_TOKEN_BUCKETS_ENV} must list positive "
+            f"token counts, got {value!r}")
+    return buckets
+
+
+def last_positive_power_of_2_or_extra(x: int) -> int:
+    """last_positive_power_of_2, or the largest extra bucket <= x if larger."""
+    return max([last_positive_power_of_2(x)] +
+               [e for e in autotune_extra_token_buckets() if e <= x])
+
+
+def get_last_power_of_2_or_extra_num_tokens_buckets(
+        max_num_tokens) -> Tuple[int, ...]:
+    """get_last_power_of_2_num_tokens_buckets plus the extra buckets <= max."""
+    extras = [e for e in autotune_extra_token_buckets() if e <= max_num_tokens]
+    return tuple(
+        sorted(
+            set(get_last_power_of_2_num_tokens_buckets(max_num_tokens)).union(
+                extras)))
 
 
 def deep_gemm_gen_tuning_buckets(x: int):

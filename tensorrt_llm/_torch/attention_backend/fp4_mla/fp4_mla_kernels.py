@@ -674,7 +674,11 @@ def _fp4_mla_context_cache_update_kernel(
     STORE_HP_TAIL: tl.constexpr,
     WRITE_V_PACKED: tl.constexpr,
     STORE_V_SCALE: tl.constexpr,
+    MX2D: tl.constexpr = False,
 ):
+    # MX2D (MXFP4-2D KV): _mx2d_context_latent_kernel owns the latent prefix and
+    # its HP-row shadow; this kernel keeps Q RoPE and the K-only RoPE tail.
+    tl.static_assert(not MX2D or (not STORE_HP_TAIL and not WRITE_V_PACKED and not STORE_V_SCALE))
     token_idx = tl.program_id(0)
     work_idx = tl.program_id(1)
     if (local_layer < 0) | (local_layer >= num_layers):
@@ -733,6 +737,9 @@ def _fp4_mla_context_cache_update_kernel(
     dim_block = work_idx
     if position % HP_BLOCK != 0:
         return
+    if MX2D:
+        if dim_block * FP4_BLOCK < V_HEAD_D:
+            return
 
     page_size_i64 = tl.cast(page_size, tl.int64)
     page_idx = position // page_size_i64
@@ -1442,7 +1449,13 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     Q_SF_COLS: tl.constexpr,
     WRITE_Q: tl.constexpr,
     Q1_KV_BLOCKS_PER_PROGRAM: tl.constexpr,
+    MX2D: tl.constexpr = False,
 ):
+    # MX2D (MXFP4-2D KV): the latent prefix and its HP-row shadow belong to
+    # _mx2d_generation_latent_kernel; this kernel keeps Q (RoPE, FP4) and the
+    # K-only RoPE tail and stores nothing in the HP pool.
+    tl.static_assert(not MX2D or (FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1))
+    tl.static_assert(not MX2D or not WRITE_V_PACKED)
     q1_shared_main: tl.constexpr = FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1
     q1_grouped_kv: tl.constexpr = q1_shared_main and Q1_KV_BLOCKS_PER_PROGRAM > 1
     q1_main_kv_programs: tl.constexpr = V_HEAD_D // FP4_BLOCK // Q1_KV_BLOCKS_PER_PROGRAM
@@ -1779,6 +1792,8 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
         else:
             kv_owner = work_idx < q1_main_kv_programs
             kv_work_idx = work_idx
+        if MX2D:
+            kv_owner = work_idx < 0  # never: the latent prefix is the MX2D writer's
         if kv_owner:
             block_base_pos = first_tile_pos
             if block_base_pos >= kv_len:
@@ -2059,13 +2074,17 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 residual_stored_scale,
             )
 
-            hp_slot = (cache_position + hp_pos_offset) % HP_POOL_SIZE
-            hp_store_base = (
-                hp_pool_ptr + hp_index * pool_s0 + local_layer * pool_s1 + hp_slot * HEAD_D
-            )
-            tl.store(hp_store_base + tail_even_d, tail_even)
-            tl.store(hp_store_base + tail_odd_d, tail_odd)
+            if not MX2D:
+                hp_slot = (cache_position + hp_pos_offset) % HP_POOL_SIZE
+                hp_store_base = (
+                    hp_pool_ptr + hp_index * pool_s0 + local_layer * pool_s1 + hp_slot * HEAD_D
+                )
+                tl.store(hp_store_base + tail_even_d, tail_even)
+                tl.store(hp_store_base + tail_odd_d, tail_odd)
             return
+
+    if MX2D:
+        return
 
     for tile_iter in tl.static_range(0, MAX_GEN_TILES):
         if FUSE_ROPE_CACHE_STORE:
@@ -2424,3 +2443,388 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 # The next tile can wrap onto HP slots read by this tile.
                 # Keep each dimension block's read-before-overwrite order.
                 tl.debug_barrier()
+
+
+# ---------------------------------------------------------------------------
+# MXFP4-2D KV ("MX2D", TRTLLM_FP4_MLA_MXFP4_2D=1 on every role).
+#
+# The 512-dim latent prefix is stored as E2M1 codes with ONE power-of-two scale
+# per 32 tokens of a sequence x 32 dims (OCP MX rule 2^(floor(log2 amax) - 2),
+# clamped to [2^-15, 4]) inside today's page layout: codes in the K rows, the
+# block scale times the KV global scale (64, so the byte is an exact E4M3 power
+# of two) in all 32 rows x both 16-dim columns of the swizzled K-scale plane.
+# QK reads it as the NVFP4 K it always was; an MX2D decode reads the same
+# nibbles as V (MN-major) with the block scales, so neither the V-pack nor the
+# V-scale pool is needed (360 B per token and layer).
+#
+# The current partial 32-token block is re-quantized whenever a token joins
+# it, so its earlier tokens are kept as a per-(page, layer) shadow inside the
+# existing BF16 HP row: per token the latent prefix as E4M3 ROUNDED TO ODD with
+# a power-of-two scale per 32 dims; bytes [0, 16384) values (token r at
+# r * 512 + dim) and [16384, 16896) the scale bytes (biased exponent, token r at
+# 16384 + r * 16 + group). Round to odd with 4 significant bits never lands on
+# an E2M1 midpoint, so E2M1(shadow / s) == E2M1(x / s) for every block scale s
+# >= the token's own. The HP row travels with the disaggregated KV transfer.
+#
+# Variant label: H78 (MXFP4-2D KV).
+# ---------------------------------------------------------------------------
+MX2D_TOKENS = tl.constexpr(32)
+MX2D_DIMS = tl.constexpr(32)
+MX2D_SHADOW_SCALE_OFFSET = tl.constexpr(16384)
+MX2D_SHADOW_BYTES: int = 16384 + 32 * 16
+
+
+@triton.jit
+def _mx2d_block_scale(amax):
+    """2^(floor(log2 amax) - 2), clamped to [2^-15, 4] (scale x 64 stays an exact E4M3 power of two)."""
+    e = ((amax.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 2
+    e = tl.minimum(tl.maximum(e, 127 - 15), 127 + 2)
+    return (e << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _mx2d_pack_codes(values, scale):
+    """E2M1 codes (nearest, ties up, saturating at 6) of values [R, 32] / scale packed two
+    dims per byte (even dim in the low nibble) -> [R, 16] uint8; a zero is always +0."""
+    codes = _fp4_e2m1_quantize(values / scale)
+    codes = tl.where(codes == 8, 0, codes).to(tl.uint8)
+    pairs = tl.reshape(codes, (values.shape[0], MX2D_DIMS // 2, 2))
+    low, high = tl.split(pairs)
+    return (low | (high << 4)).to(tl.uint8)
+
+
+@triton.jit
+def _mx2d_shadow_encode(values):
+    """Per row of values [R, 32]: the scale byte (biased exponent of 2^(floor(log2 amax) - 7))
+    and the E4M3 bytes of values / scale rounded to odd (|v| < 2^-6 flushes to 0)."""
+    amax = tl.max(tl.abs(values), axis=1)
+    e = (amax.to(tl.int32, bitcast=True) >> 23) & 0xFF
+    sbyte = tl.where(e > 7, e - 7, 127)
+    scale = (sbyte << 23).to(tl.float32, bitcast=True)
+    v = values / scale[:, None]
+    bits = v.to(tl.int32, bitcast=True)
+    mag = bits & 0x7FFFFFFF
+    inexact = (mag & 0xFFFFF) != 0
+    rto = (mag & 0x7FF00000) | (inexact.to(tl.int32) << 20)
+    rto = tl.where(mag < 0x3C800000, 0, rto)
+    rto = rto | (bits & -2147483648)
+    e4m3 = rto.to(tl.float32, bitcast=True).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    return sbyte.to(tl.uint8), e4m3
+
+
+@triton.jit
+def _mx2d_shadow_decode(e4m3_bytes, sbytes):
+    scale = (sbytes.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    return e4m3_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale[:, None]
+
+
+@triton.jit(
+    do_not_specialize=[
+        "page_ids_len",
+        "indptr_len",
+        "metadata_num_tokens",
+        "num_pages",
+        "num_layers",
+        "num_contexts",
+        "num_hp_pages",
+        "token_offset",
+        "num_tokens",
+        "local_layer",
+    ],
+)
+def _mx2d_context_latent_kernel(
+    kv_cache_ptr,
+    sf_cache_ptr,
+    latent_cache_ptr,
+    global_scale_ptr,
+    hp_bytes_ptr,
+    hp_page_ids_ptr,
+    batch_indices_ptr,
+    positions_ptr,
+    paged_kv_indices_ptr,
+    paged_kv_indptr_ptr,
+    leaders_ptr,
+    page_ids_len,
+    indptr_len,
+    metadata_num_tokens,
+    num_pages,
+    num_layers,
+    num_contexts,
+    num_hp_pages,
+    token_offset,
+    num_tokens,
+    local_layer,
+    page_size,
+    kv_s0,
+    kv_s2,
+    kv_s4,
+    sf_s0,
+    lc_s0,
+    lc_s1,
+    pool_s0_bytes,
+    pool_s1_bytes,
+    SF_PER_TOKEN: tl.constexpr,
+    STORE_SHADOW: tl.constexpr,
+):
+    """One program per (32-token block leader, 32-dim group).
+
+    ``leaders_ptr`` lists the context tokens with position % 32 == 0 (-1 past the
+    end); each program quantizes its block of one sequence with the block amax
+    and, for a sequence's partial last block, writes the E4M3 shadow into the HP
+    row of the block's page.
+    """
+    token_idx = tl.load(leaders_ptr + tl.program_id(0))
+    g = tl.program_id(1)
+    if token_idx < 0:
+        return
+    if (local_layer < 0) | (local_layer >= num_layers):
+        return
+    if token_idx >= num_tokens:
+        return
+    metadata_token_idx = token_offset + token_idx
+    if metadata_token_idx >= metadata_num_tokens:
+        return
+    batch_idx = tl.load(batch_indices_ptr + metadata_token_idx).to(tl.int64)
+    position = tl.load(positions_ptr + metadata_token_idx).to(tl.int64)
+    if (batch_idx < 0) | (batch_idx + 1 >= indptr_len) | (position < 0):
+        return
+    if position % MX2D_TOKENS != 0:
+        return
+    page_size_i64 = tl.cast(page_size, tl.int64)
+    page_idx = position // page_size_i64
+    page_pos = position - page_idx * page_size_i64
+    page_start = tl.load(paged_kv_indptr_ptr + batch_idx).to(tl.int64)
+    page_end = tl.load(paged_kv_indptr_ptr + batch_idx + 1).to(tl.int64)
+    page_table_offset = page_start + page_idx
+    if (
+        (page_pos < 0)
+        | (page_pos + MX2D_TOKENS > page_size_i64)
+        | (page_table_offset < page_start)
+        | (page_table_offset >= page_end)
+        | (page_table_offset >= page_ids_len)
+    ):
+        return
+    physical_page = tl.load(paged_kv_indices_ptr + page_table_offset).to(tl.int64)
+    if (physical_page < 0) | (physical_page >= num_pages):
+        return
+
+    rows = tl.arange(0, MX2D_TOKENS)
+    dims = g * MX2D_DIMS + tl.arange(0, MX2D_DIMS)
+    candidates = token_idx + rows
+    valid = (candidates < num_tokens) & (token_offset + candidates < metadata_num_tokens)
+    safe_meta = tl.where(valid, token_offset + candidates, 0)
+    cand_batch = tl.load(batch_indices_ptr + safe_meta, mask=valid, other=-1).to(tl.int64)
+    cand_pos = tl.load(positions_ptr + safe_meta, mask=valid, other=-1).to(tl.int64)
+    valid = valid & (cand_batch == batch_idx) & (cand_pos == position + rows)
+    safe_tok = tl.where(valid, candidates, 0).to(tl.int64)
+    x = tl.load(
+        latent_cache_ptr + safe_tok[:, None] * lc_s0 + dims[None, :].to(tl.int64) * lc_s1,
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    amax = tl.max(tl.max(tl.abs(x), axis=1), axis=0)
+    scale = _mx2d_block_scale(amax)
+    packed = _mx2d_pack_codes(x, scale)
+    page_rows = page_pos + rows
+    byte_cols = g * (MX2D_DIMS // 2) + tl.arange(0, MX2D_DIMS // 2)
+    tl.store(
+        kv_cache_ptr
+        + physical_page * kv_s0
+        + page_rows[:, None] * kv_s2
+        + byte_cols[None, :] * kv_s4,
+        packed,
+        mask=valid[:, None],
+    )
+    stored = scale * tl.load(global_scale_ptr)
+    for half in tl.static_range(2):
+        sf_off = _fp4_mla_swizzled_sf_offset(page_rows, 2 * g + half, SF_PER_TOKEN)
+        tl.store(sf_cache_ptr + physical_page * sf_s0 + sf_off, stored + 0.0 * rows, mask=valid)
+
+    if STORE_SHADOW:
+        n_valid = tl.sum(valid.to(tl.int32), axis=0)
+        if (n_valid < MX2D_TOKENS) & (batch_idx < num_contexts):
+            hp_index = tl.load(hp_page_ids_ptr + page_table_offset).to(tl.int64)
+            if (hp_index >= 0) & (hp_index < num_hp_pages):
+                sbyte, e4m3 = _mx2d_shadow_encode(x)
+                base = hp_bytes_ptr + hp_index * pool_s0_bytes + local_layer * pool_s1_bytes
+                tl.store(base + rows[:, None] * 512 + dims[None, :], e4m3, mask=valid[:, None])
+                tl.store(base + MX2D_SHADOW_SCALE_OFFSET + rows * 16 + g, sbyte, mask=valid)
+
+
+@triton.jit
+def _mx2d_generation_group(
+    kv_cache_ptr,
+    sf_cache_ptr,
+    latent_cache_ptr,
+    base,
+    i,
+    g,
+    r,
+    page_pos,
+    physical_page,
+    gs,
+    kv_s0,
+    kv_s2,
+    kv_s4,
+    sf_s0,
+    lc_s0,
+    lc_s1,
+    SF_PER_TOKEN: tl.constexpr,
+):
+    """One 32-dim group of one generation sequence's new token."""
+    dims = g * MX2D_DIMS + tl.arange(0, MX2D_DIMS)
+    x_new = tl.load(latent_cache_ptr + i.to(tl.int64) * lc_s0 + dims.to(tl.int64) * lc_s1).to(
+        tl.float32
+    )
+    x_row = x_new[None, :]
+    sbyte_new, e4m3_new = _mx2d_shadow_encode(x_row)
+    tl.store(base + r * 512 + dims[None, :], e4m3_new)
+    tl.store(base + MX2D_SHADOW_SCALE_OFFSET + r * 16 + g + tl.arange(0, 1), sbyte_new)
+    s_tok = _mx2d_block_scale(tl.max(tl.abs(x_new), axis=0))
+    # The block scale only grows with its amax and the clamped OCP rule is
+    # monotone, so the new scale is max(old, the token's own).
+    old_off = _fp4_mla_swizzled_sf_offset(page_pos, 2 * g, SF_PER_TOKEN)
+    old_stored = tl.load(sf_cache_ptr + physical_page * sf_s0 + old_off).to(tl.float32)
+    scale = tl.where(r == 0, s_tok, tl.maximum(old_stored / gs, s_tok))
+    stored = scale * gs
+    byte_cols = g * (MX2D_DIMS // 2) + tl.arange(0, MX2D_DIMS // 2)
+    if (r == 0) | (stored == old_stored):
+        packed_new = _mx2d_pack_codes(x_row, scale)
+        tl.store(
+            kv_cache_ptr
+            + physical_page * kv_s0
+            + (page_pos + r) * kv_s2
+            + byte_cols[None, :] * kv_s4,
+            packed_new,
+        )
+        for half_new in tl.static_range(2):
+            sf_off_new = _fp4_mla_swizzled_sf_offset(page_pos + r, 2 * g + half_new, SF_PER_TOKEN)
+            tl.store(sf_cache_ptr + physical_page * sf_s0 + sf_off_new, stored)
+    else:
+        # The scale grew: re-quantize the block's earlier tokens from the shadow.
+        rows = tl.arange(0, MX2D_TOKENS)
+        prev = rows < r
+        sh = tl.load(base + rows[:, None] * 512 + dims[None, :], mask=prev[:, None], other=0)
+        sb = tl.load(base + MX2D_SHADOW_SCALE_OFFSET + rows * 16 + g, mask=prev, other=127)
+        y = tl.where(
+            prev[:, None], _mx2d_shadow_decode(sh, sb), tl.where(rows[:, None] == r, x_row, 0.0)
+        )
+        write = rows <= r
+        page_rows = page_pos + rows
+        packed_all = _mx2d_pack_codes(y, scale)
+        tl.store(
+            kv_cache_ptr
+            + physical_page * kv_s0
+            + page_rows[:, None] * kv_s2
+            + byte_cols[None, :] * kv_s4,
+            packed_all,
+            mask=write[:, None],
+        )
+        for half_all in tl.static_range(2):
+            sf_off_all = _fp4_mla_swizzled_sf_offset(page_rows, 2 * g + half_all, SF_PER_TOKEN)
+            tl.store(
+                sf_cache_ptr + physical_page * sf_s0 + sf_off_all, stored + 0.0 * rows, mask=write
+            )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "page_ids_len",
+        "hp_page_ids_len",
+        "indptr_len",
+        "num_hp_pages",
+        "num_pages",
+        "num_layers",
+        "local_layer",
+    ],
+)
+def _mx2d_generation_latent_kernel(
+    kv_cache_ptr,
+    sf_cache_ptr,
+    latent_cache_ptr,
+    global_scale_ptr,
+    hp_bytes_ptr,
+    kv_lens_ptr,
+    gen_lens_ptr,
+    page_ids_ptr,
+    hp_page_ids_ptr,
+    paged_kv_indptr_ptr,
+    page_ids_len,
+    hp_page_ids_len,
+    indptr_len,
+    num_hp_pages,
+    num_pages,
+    num_layers,
+    local_layer,
+    page_size,
+    kv_s0,
+    kv_s2,
+    kv_s4,
+    sf_s0,
+    lc_s0,
+    lc_s1,
+    pool_s0_bytes,
+    pool_s1_bytes,
+    SF_PER_TOKEN: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr = 4,
+):
+    """One program per (generation sequence, GROUPS_PER_PROGRAM 32-dim groups); one new
+    token per sequence joins its 32-token block's shadow, the block scale follows the
+    amax of its tokens so far, and the block's codes and K-scale bytes are rewritten
+    (all its tokens when the scale changed, else only the new one)."""
+    i = tl.program_id(0)
+    g0 = tl.program_id(1)
+    if (local_layer < 0) | (local_layer >= num_layers):
+        return
+    if i + 1 >= indptr_len:
+        return
+    gen_len = tl.load(gen_lens_ptr + i)
+    if gen_len != 1:
+        return
+    pos = tl.load(kv_lens_ptr + i).to(tl.int64) - 1
+    if pos < 0:
+        return
+    block_pos = (pos // MX2D_TOKENS) * MX2D_TOKENS
+    r = pos - block_pos
+    page_size_i64 = tl.cast(page_size, tl.int64)
+    page_idx = block_pos // page_size_i64
+    page_pos = block_pos - page_idx * page_size_i64
+    page_start = tl.load(paged_kv_indptr_ptr + i).to(tl.int64)
+    page_end = tl.load(paged_kv_indptr_ptr + i + 1).to(tl.int64)
+    page_table_offset = page_start + page_idx
+    if (
+        (page_pos + MX2D_TOKENS > page_size_i64)
+        | (page_table_offset >= page_end)
+        | (page_table_offset >= page_ids_len)
+        | (page_table_offset >= hp_page_ids_len)
+    ):
+        return
+    physical_page = tl.load(page_ids_ptr + page_table_offset).to(tl.int64)
+    if (physical_page < 0) | (physical_page >= num_pages):
+        return
+    hp_index = tl.load(hp_page_ids_ptr + page_table_offset).to(tl.int64)
+    if (hp_index < 0) | (hp_index >= num_hp_pages):
+        return
+
+    base = hp_bytes_ptr + hp_index * pool_s0_bytes + local_layer * pool_s1_bytes
+    gs = tl.load(global_scale_ptr)
+    for gi in tl.static_range(GROUPS_PER_PROGRAM):
+        _mx2d_generation_group(
+            kv_cache_ptr,
+            sf_cache_ptr,
+            latent_cache_ptr,
+            base,
+            i,
+            g0 * GROUPS_PER_PROGRAM + gi,
+            r,
+            page_pos,
+            physical_page,
+            gs,
+            kv_s0,
+            kv_s2,
+            kv_s4,
+            sf_s0,
+            lc_s0,
+            lc_s1,
+            SF_PER_TOKEN,
+        )

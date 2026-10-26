@@ -10,7 +10,9 @@ per sequence.
 Used by the TRTLLM attention backend FP4 MLA FMHA path.
 """
 
+import functools
 import importlib.util
+import inspect
 import os
 from typing import Any, Literal, Optional
 
@@ -22,10 +24,15 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings import DataType
 
 from .fp4_mla_kernels import (
+    MX2D_SHADOW_BYTES,
     _fp4_mla_chunked_cache_gather_kernel,
     _fp4_mla_context_cache_update_kernel,
     _fp4_mla_generation_fused_qk_rope_cache_update_kernel,
+    _fp4_mla_q_sf_offset_h128,
+    _fp4_mla_quantize_q_groups_words,
     _fp4_mla_rebuild_v_scale_from_k_scale_kernel,
+    _mx2d_context_latent_kernel,
+    _mx2d_generation_latent_kernel,
 )
 
 HP_BLOCK_SIZE: int = 16
@@ -38,6 +45,20 @@ FP4_MLA_Q_STATIC_AMAX: float = 400.0
 FP4_MLA_KV_STATIC_AMAX: float = 30.0
 FP4_MLA_Q_GLOBAL_SCALE: float = FP4_MLA_P_GLOBAL_SCALE / FP4_MLA_Q_STATIC_AMAX
 FP4_MLA_KV_GLOBAL_SCALE: float = FP4_MLA_P_GLOBAL_SCALE / FP4_MLA_KV_STATIC_AMAX
+# MXFP4-2D KV (one gate for every role and path; the disaggregated transfer
+# refuses a CTX/GEN mismatch): TRTLLM_FP4_MLA_MXFP4_2D=1 stores the 512-dim
+# latent prefix as E2M1 with one power-of-two (UE8M0-valued) scale per 32
+# tokens x 32 dims, drops the V-pack and V-scale pools (360 B per token-layer)
+# and decodes with the CuTeDSL MXFP4-2D kernel. The KV global scale becomes the
+# power of two 64 so the E4M3 K-scale bytes hold the block scales exactly.
+# Generation is one token per step (no MTP) and block reuse must be off.
+FP4_MLA_MXFP4_2D_ENV = "TRTLLM_FP4_MLA_MXFP4_2D"
+_FP4_MLA_MXFP4_2D: bool = os.environ.get(FP4_MLA_MXFP4_2D_ENV, "0").lower() in ("1", "true", "on")
+MX2D_BLOCK_TOKENS: int = 32
+MX2D_BLOCK_DIMS: int = 32
+FP4_MLA_MX2D_KV_GLOBAL_SCALE: float = 64.0
+if _FP4_MLA_MXFP4_2D:
+    FP4_MLA_KV_GLOBAL_SCALE = FP4_MLA_MX2D_KV_GLOBAL_SCALE
 # Max finite e4m3 magnitude for FP4 MLA block-scale clamping.
 FP4_MLA_E4M3_MAX: float = 448.0
 FP4_MLA_Q_RESIDUAL_DIM: int = 64
@@ -48,12 +69,29 @@ FP4_MLA_Q1_PREFIX_BLOCK_DIM: int = 512
 FP4_MLA_Q_LOGICAL_DIM: int = FP4_MLA_Q_PREFIX_DIM + 2 * FP4_MLA_Q_RESIDUAL_DIM
 FP4_MLA_Q_PACKED_DIM: int = FP4_MLA_Q_LOGICAL_DIM // 2
 FP4_MLA_Q_SF_GROUPS: int = FP4_MLA_Q_LOGICAL_DIM // FP4_BLOCK_SIZE
+# NVFP4-out MLA decode epilogues (modules/mla.py, default 0 = off; generation role only). Bit 2: bmm_q writes the
+# packed FP4 Q prefix (bytes 0-255 of each 320-byte Q row) and Q-scale columns 0-31 itself
+# (fp4_mla_bmm_q_fp4_prefix), so the fused RoPE/Q/KV launch runs without its Q-prefix programs
+# (q_prefix_external). Bit 1 does the same for bmm_o and o_proj's NVFP4 input. Same bytes as the BF16 path.
+MLA_NVFP4_EPILOGUE_ENV = "TRTLLM_MLA_NVFP4_EPILOGUE"
 FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
-_FP4_MLA_K_RESIDUAL_BACKENDS = ("triton",)
-# Architectures on which the K-residual Triton path can run the fused Q-quant
-# cache update. SM103 (Blackwell-Ultra, GB300) is the part this was first
-# exercised on.
-_FP4_MLA_TRITON_Q_QUANT_FUSION_SMS = (103,)
+# Retained for compatibility; mufu16 is the only non-fused CuTeDSL variant.
+FP4_MLA_CUTEDSL_MUFU16_ENV = "TRTLLM_FP4_MLA_CUTEDSL_MUFU16"
+FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV = "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE"
+# Longest-KV-first (LPT) dispatch of the CuTeDSL decode (bitwise identical).
+FP4_MLA_LPT_ENV = "TRTLLM_FP4_MLA_LPT"
+# Persistent CuTeDSL NVFP4 decode (bitwise identical; opt-in) for launches with at
+# least TRTLLM_FP4_MLA_PERSISTENT_MIN_QUERIES queries. MXFP4-2D always decodes
+# with the persistent kernel.
+FP4_MLA_PERSISTENT_ENV = "TRTLLM_FP4_MLA_PERSISTENT"
+FP4_MLA_PERSISTENT_MIN_QUERIES_ENV = "TRTLLM_FP4_MLA_PERSISTENT_MIN_QUERIES"
+# MXFP4-2D decode: mixed-precision rounded-P row sum (H85; bitwise, default on).
+FP4_MLA_MXFP4_2D_MIXED_ROWSUM_ENV = "TRTLLM_FP4_MLA_MXFP4_2D_MIXED_ROWSUM"
+_FP4_MLA_CUTEDSL_BACKEND = "cutedsl"
+_FP4_MLA_K_RESIDUAL_BACKENDS = ("triton", _FP4_MLA_CUTEDSL_BACKEND)
+# Architectures on which the K-residual path can run the fused RoPE/Q-quant
+# cache update: SM103 (Blackwell-Ultra, GB300) and SM107 (Rubin, VR200).
+_FP4_MLA_TRITON_Q_QUANT_FUSION_SMS = (103, 107)
 _FP4_MLA_Q1_KV_BLOCKS_SMALL_BATCH = 4
 _FP4_MLA_Q1_KV_BLOCKS_MEDIUM_BATCH = 16
 _FP4_MLA_Q1_KV_BLOCKS_LARGE_BATCH = 32
@@ -82,6 +120,15 @@ def _env_enabled_default(name: str, default: bool) -> bool:
     )
 
 
+def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
+    return _env_enabled_default(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, False)
+
+
+def _fp4_mla_mxfp4_2d_enabled() -> bool:
+    """Whether this process stores FP4 MLA KV as MXFP4-2D (read once at import)."""
+    return _FP4_MLA_MXFP4_2D
+
+
 def _env_int(name: str) -> Optional[int]:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -90,10 +137,60 @@ def _env_int(name: str) -> Optional[int]:
 
 
 def _fp4_mla_attention_backend() -> str:
+    """Return the FP4 MLA decode backend.
+
+    ``TRTLLM_FP4_MLA_ATTENTION_BACKEND`` (``triton`` or ``cutedsl``) wins;
+    otherwise Rubin SM107 uses the CuTeDSL MUFU16 decode when the installed
+    CuTe DSL provides it, and every other GPU uses Triton.
+    """
     backend = os.getenv(FP4_MLA_ATTENTION_BACKEND_ENV)
     if backend:
         return backend.lower()
+    if get_sm_version() == 107 and _cutedsl_backend_available():
+        return _FP4_MLA_CUTEDSL_BACKEND
     return "triton"
+
+
+# Modules the FP4 MLA CuTe DSL kernels import.
+_CUTEDSL_REQUIRED_MODULES = (
+    "cutlass.cute",
+    "cutlass.experimental",
+    "cuda.bindings.driver",
+)
+
+
+def _cutedsl_dsl_supports_fp4_mla_kernels() -> bool:
+    """Whether the installed CuTe DSL has the descriptor API the kernels use.
+
+    The kernels build tcgen05 shared-memory descriptors with a K-segment
+    offset (public nvidia-cutlass-dsl >= 4.8.0).
+    """
+    from cutlass.experimental.primitives import Tcgen05SmemDesc
+
+    return "k_segment_offset" in inspect.signature(Tcgen05SmemDesc.build).parameters
+
+
+@functools.cache
+def _cutedsl_backend_available() -> bool:
+    try:
+        if not all(
+            importlib.util.find_spec(module) is not None for module in _CUTEDSL_REQUIRED_MODULES
+        ):
+            return False
+        return _cutedsl_dsl_supports_fp4_mla_kernels()
+    except ImportError:
+        return False
+
+
+def _fp4_mla_cutedsl_kernel_module() -> Any:
+    if _fp4_mla_cutedsl_fused_v_transpose_enabled():
+        from . import fp4_mla_cutedsl_mufu16_fused_v_transpose
+
+        return fp4_mla_cutedsl_mufu16_fused_v_transpose
+
+    from . import fp4_mla_cutedsl_mufu16
+
+    return fp4_mla_cutedsl_mufu16
 
 
 def _q_quant_fusion_supported() -> bool:
@@ -136,6 +233,15 @@ def _fp4_mla_q1_prefix_blocks_per_program(
             return min(4, max_prefix_blocks)
         return min(2, max_prefix_blocks)
     return 1
+
+
+def _mla_nvfp4_epilogue_q_prefix_enabled() -> bool:
+    """Whether TRTLLM_MLA_NVFP4_EPILOGUE bit 2 (external FP4 Q prefix) is set (warmup preload only)."""
+    try:
+        bits = int(os.environ.get(MLA_NVFP4_EPILOGUE_ENV, "0") or 0)
+    except ValueError:
+        return False
+    return bool(bits & 2)
 
 
 def _fp4_mla_q1_preload_variants(
@@ -791,6 +897,69 @@ def materialize_fp4_mla_device_page_table(
     metadata._fp4_mla_device_page_table_valid = True
 
 
+@triton.jit
+def _cutedsl_swizzled_sf_offset(row_idx, col_idx, sf_cols: tl.constexpr):
+    padded_cols = ((sf_cols + 3) // 4) * 4
+    return (
+        col_idx % 4
+        + (col_idx // 4) * (4 * 128)
+        + (row_idx % 32) * 16
+        + ((row_idx % 128) // 32) * 4
+        + (row_idx // 128) * (128 * padded_cols)
+    )
+
+
+@triton.jit
+def _cutedsl_pad_q_and_sf_kernel(
+    q_padded_ptr,
+    q_ptr,
+    q_sf_padded_ptr,
+    q_sf_ptr,
+    num_heads,
+    output_heads: tl.constexpr,
+    packed_dim: tl.constexpr,
+    block_bytes: tl.constexpr,
+    sf_cols: tl.constexpr,
+    sf_cols_per_byte_block: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    byte_block = tl.program_id(1)
+    head_offsets = tl.arange(0, output_heads)
+    byte_offsets = byte_block * block_bytes + tl.arange(0, block_bytes)
+    head_mask = head_offsets < num_heads
+    byte_mask = byte_offsets < packed_dim
+    source_rows = query_idx * num_heads + head_offsets
+    destination_rows = query_idx * output_heads + head_offsets
+    values = tl.load(
+        q_ptr + source_rows[:, None] * packed_dim + byte_offsets[None, :],
+        mask=head_mask[:, None] & byte_mask[None, :],
+        other=0,
+    )
+    tl.store(
+        q_padded_ptr + destination_rows[:, None] * packed_dim + byte_offsets[None, :],
+        values,
+        mask=byte_mask[None, :],
+    )
+    sf_col_offsets = byte_block * sf_cols_per_byte_block + tl.arange(0, sf_cols_per_byte_block)
+    sf_col_mask = sf_col_offsets < sf_cols
+    source_offsets = _cutedsl_swizzled_sf_offset(
+        source_rows[:, None], sf_col_offsets[None, :], sf_cols
+    )
+    destination_offsets = _cutedsl_swizzled_sf_offset(
+        destination_rows[:, None], sf_col_offsets[None, :], sf_cols
+    )
+    sf_values = tl.load(
+        q_sf_ptr + source_offsets,
+        mask=head_mask[:, None] & sf_col_mask[None, :],
+        other=1.0,
+    )
+    tl.store(
+        q_sf_padded_ptr + destination_offsets,
+        sf_values,
+        mask=sf_col_mask[None, :],
+    )
+
+
 _SM_COUNT_CACHE: dict[int, int] = {}
 
 
@@ -1203,8 +1372,8 @@ def rebuild_fp4_mla_disagg_imported_cache(
     """Rebuild GEN-local FP4 MLA sidecars after a disaggregated KV import.
 
     The disaggregated payload carries the native V2 K, K-scale, and BF16 HP
-    roles. V scales are deterministic process-local views, so rebuilding them
-    here avoids transfer bandwidth and
+    roles. V scales and CuTeDSL's V-packed layout are deterministic
+    process-local views, so rebuilding them here avoids transfer bandwidth and
     guarantees they are ready before a first decode step that may execute
     through a pre-captured CUDA graph.
     """
@@ -1223,6 +1392,11 @@ def rebuild_fp4_mla_disagg_imported_cache(
     # Helix assigns whole pages round-robin, so a rank may own no prompt pages.
     # There are no process-local V sidecars to rebuild on that rank.
     if prompt_len == 0:
+        return True
+    if getattr(kv_cache_manager, "fp4_mla_mxfp4_2d", False):
+        # MXFP4-2D: the transferred K pages and K scales are the whole format
+        # (V is read from them) and the current block's shadow arrived in the HP
+        # row, so there is nothing to rebuild.
         return True
 
     page_size = int(kv_cache_manager.tokens_per_block)
@@ -1273,9 +1447,10 @@ def rebuild_fp4_mla_disagg_imported_cache(
     )
 
     v_scale_head_dim = int(kv_cache_manager.mla_v_scale_head_dim)
+    cutedsl_backend = _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
     for compact_layer, local_layer in enumerate(fp4_local_layers):
         layer_idx = pp_layers[local_layer]
-        _, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
         _rebuild_fp4_mla_v_scales_from_k_scales(
             sf_cache,
             v_scale_pool,
@@ -1285,6 +1460,26 @@ def rebuild_fp4_mla_disagg_imported_cache(
             v_head_dim=v_scale_head_dim,
             page_size=page_size,
         )
+        if cutedsl_backend and not _fp4_mla_cutedsl_fused_v_transpose_enabled():
+            # The CuTeDSL V-packed sidecar is process-local (never transferred).
+            v_head_dim = getattr(kv_cache_manager, "mla_v_head_dim", None)
+            if v_head_dim is None:
+                raise RuntimeError(
+                    "CuTeDSL FP4 MLA disaggregated import requires a persistent V head dimension."
+                )
+            v_packed = kv_cache_manager.get_mla_v_packed_pool(compact_layer)
+            if not isinstance(v_packed, torch.Tensor):
+                raise RuntimeError(
+                    "CuTeDSL FP4 MLA disaggregated import requires the persistent V-packed pool."
+                )
+            _repack_cutedsl_v_packed_cache(
+                v_packed,
+                kv_cache,
+                page_ids,
+                v_head_dim=int(v_head_dim),
+                page_size=page_size,
+                block_v=FP4_MLA_SCALE_ROW_GROUP,
+            )
     return True
 
 
@@ -1313,6 +1508,170 @@ def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Te
     ):
         raise RuntimeError("FP4 MLA requires a preallocated FP32 Q global-scale tensor.")
     return global_scale
+
+
+@triton.jit
+def _fp4_mla_q_prefix_reference_kernel(
+    q_full_ptr,
+    q_full_s0,
+    q_full_s1,
+    q_global_scale_ptr,
+    q_fp4_out_ptr,
+    q_sf_out_ptr,
+    Q_PREFIX_D: tl.constexpr,
+    Q_PACKED_D: tl.constexpr,
+    FP4_BLOCK: tl.constexpr,
+    Q_SF_COLS: tl.constexpr,
+    BLOCK_Q_HEADS: tl.constexpr,
+):
+    """The fused generation kernel's one-token Q-prefix program on a BF16 bmm_q output (same helpers, same math).
+
+    Reference for fp4_mla_bmm_q_fp4_prefix (TRTLLM_MLA_NVFP4_EPILOGUE_VERIFY and the unit test): writes packed
+    bytes 0..Q_PREFIX_D/2-1 of Q rows token * 128 + head (row stride Q_PACKED_D bytes) and scale columns
+    0..Q_PREFIX_D/16-1 of the H128-swizzled scale plane.
+    """
+    q_token = tl.program_id(0)
+    q_head_block = tl.program_id(1)
+    head_lanes = tl.arange(0, BLOCK_Q_HEADS)
+    heads = q_head_block * BLOCK_Q_HEADS + head_lanes
+    q_rows = q_token * 128 + heads
+    q_global_scale = tl.load(q_global_scale_ptr).to(tl.float32)
+    dims = tl.arange(0, Q_PREFIX_D)
+    values = tl.load(
+        q_full_ptr
+        + q_token.to(tl.int64) * q_full_s0
+        + heads[:, None].to(tl.int64) * q_full_s1
+        + dims[None, :]
+    ).to(tl.float32)
+    groups: tl.constexpr = Q_PREFIX_D // FP4_BLOCK
+    pairs = tl.reshape(values * q_global_scale, (BLOCK_Q_HEADS, groups, FP4_BLOCK // 2, 2))
+    even, odd = tl.split(pairs)
+    words, scales = _fp4_mla_quantize_q_groups_words(even, odd, BLOCK_Q_HEADS, groups)
+    group_offsets = tl.arange(0, groups)
+    word_offsets = q_rows[:, None, None].to(tl.int64) * Q_PACKED_D + (
+        group_offsets[None, :, None] * (FP4_BLOCK // 2)
+        + tl.arange(0, FP4_BLOCK // 8)[None, None, :] * 4
+    ).to(tl.int64)
+    tl.store((q_fp4_out_ptr + word_offsets).to(tl.pointer_type(tl.uint32)), words)
+    sf_offsets = _fp4_mla_q_sf_offset_h128(
+        q_token, q_head_block, head_lanes[:, None], group_offsets[None, :], Q_SF_COLS
+    )
+    tl.store(q_sf_out_ptr + sf_offsets, scales)
+
+
+def fp4_mla_q_prefix_reference(
+    q_bf16: torch.Tensor,
+    q_global_scale: torch.Tensor,
+    q_fp4_out: torch.Tensor,
+    q_sf_out: torch.Tensor,
+) -> None:
+    """Quantize a BF16 Q prefix [tokens, 128 heads, 512] (head stride free, dim stride 1) exactly as the fused
+    generation RoPE/Q/KV kernel's Q-prefix programs do, into Q rows token * 128 + head of ``q_fp4_out``
+    ([rows, FP4_MLA_Q_PACKED_DIM] uint8) and scale columns 0-31 of ``q_sf_out`` (the H128 plane, float8/uint8)."""
+    num_tokens, num_heads, prefix_dim = q_bf16.shape
+    if num_heads != 128 or prefix_dim != FP4_MLA_Q_PREFIX_DIM or q_bf16.stride(2) != 1:
+        raise ValueError(
+            f"FP4 MLA Q-prefix reference needs [tokens, 128, 512], got {tuple(q_bf16.shape)}."
+        )
+    _fp4_mla_q_prefix_reference_kernel[(num_tokens, num_heads // 32)](
+        q_bf16,
+        q_bf16.stride(0),
+        q_bf16.stride(1),
+        q_global_scale,
+        q_fp4_out,
+        q_sf_out,
+        Q_PREFIX_D=FP4_MLA_Q_PREFIX_DIM,
+        Q_PACKED_D=FP4_MLA_Q_PACKED_DIM,
+        FP4_BLOCK=FP4_BLOCK_SIZE,
+        Q_SF_COLS=FP4_MLA_Q_SF_GROUPS,
+        BLOCK_Q_HEADS=32,
+    )
+
+
+def fp4_mla_bmm_q_fp4_prefix(
+    metadata: Any,
+    q_nope_t: torch.Tensor,
+    k_b_proj_trans: torch.Tensor,
+    *,
+    overlap: bool = False,
+) -> Any:
+    """bmm_q with the FP4 MLA Q-prefix quantizer in its epilogue (TRTLLM_MLA_NVFP4_EPILOGUE bit 2).
+
+    q_nope_t: [128 heads, tokens, qk_nope] BF16 (q_nope.transpose(0, 1)); k_b_proj_trans: [128, 512, qk_nope] BF16.
+    Writes packed bytes 0-255 of the Q rows token * 128 + head and scale columns 0-31 of the H128-swizzled scale
+    plane of the manager-owned FP4 MLA Q buffers, the bytes the fused RoPE/Q/KV kernel's Q-prefix programs write
+    from a BF16 bmm_q output. The caller then runs that kernel with q_prefix_external=True. ``overlap``: the RoPE
+    launch runs beside this GEMM on another stream (selects the tactic that co-runs best). Returns the tactic.
+    """
+    from ...cute_dsl_kernels.rubin.dense_gemm_nvfp4_out import MODE_Q, Sm107Nvfp4OutBmm
+
+    num_heads, num_tokens, _ = q_nope_t.shape
+    if num_heads != 128 or tuple(k_b_proj_trans.shape) != (
+        num_heads,
+        FP4_MLA_Q_PREFIX_DIM,
+        q_nope_t.shape[2],
+    ):
+        raise ValueError(
+            f"{MLA_NVFP4_EPILOGUE_ENV}: the bmm_q FP4 prefix epilogue needs 128 heads and W_UK "
+            f"[128, 512, nope]; got q {tuple(q_nope_t.shape)}, W {tuple(k_b_proj_trans.shape)}."
+        )
+    q_fp4, q_sf, _ = _prepare_fp4_mla_q_buffers(metadata, num_tokens, num_heads, q_nope_t.device)
+    q_global_scale = _get_fp4_mla_q_global_scale(metadata, q_nope_t.device)
+    return Sm107Nvfp4OutBmm.run(
+        MODE_Q,
+        q_nope_t,
+        k_b_proj_trans,
+        q_fp4,
+        q_sf.view(torch.uint8),
+        q_global_scale,
+        out_stride_m=num_heads * FP4_MLA_Q_PACKED_DIM,
+        out_stride_l=FP4_MLA_Q_PACKED_DIM,
+        sf_row_m=num_heads,
+        sf_row_l=1,
+        sf_col_l=0,
+        sf_cols_padded=_ceil_div(FP4_MLA_Q_SF_GROUPS, FP4_MLA_SCALE_COL_GROUP)
+        * FP4_MLA_SCALE_COL_GROUP,
+        fp4_rows=num_tokens,
+        sf_rows=num_tokens,
+        overlap=overlap,
+    )
+
+
+def fp4_mla_verify_q_prefix(
+    metadata: Any, q_nope_t: torch.Tensor, k_b_proj_trans: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Recompute the BF16 path's Q-prefix bytes (bmm_out + the prefix quantizer) and count mismatches against
+    the bytes fp4_mla_bmm_q_fp4_prefix wrote. Returns 0-d int64 device tensors (no host sync, so it may run
+    inside a CUDA-graph capture; the caller decides when to read them)."""
+    num_heads, num_tokens, _ = q_nope_t.shape
+    device = q_nope_t.device
+    ref_bf16 = torch.empty(
+        num_tokens, num_heads, FP4_MLA_Q_PREFIX_DIM, dtype=torch.bfloat16, device=device
+    )
+    torch.ops.trtllm.bmm_out(q_nope_t, k_b_proj_trans.transpose(1, 2), ref_bf16.transpose(0, 1))
+    q_fp4, q_sf, _ = _prepare_fp4_mla_q_buffers(metadata, num_tokens, num_heads, device)
+    rows = num_tokens * num_heads
+    num_sf = _get_fp4_mla_swizzled_scale_size(rows, FP4_MLA_Q_LOGICAL_DIM)
+    ref_q = torch.zeros(rows, FP4_MLA_Q_PACKED_DIM, dtype=torch.uint8, device=device)
+    ref_sf = torch.zeros(
+        num_sf, dtype=torch.float8_e4m3fn, device=device
+    )  # the scale plane's dtype
+    fp4_mla_q_prefix_reference(
+        ref_bf16, _get_fp4_mla_q_global_scale(metadata, device), ref_q, ref_sf
+    )
+    ref_sf = ref_sf.view(torch.uint8)
+    offsets = torch.arange(num_sf, device=device)
+    sf_cols_padded = (
+        _ceil_div(FP4_MLA_Q_SF_GROUPS, FP4_MLA_SCALE_COL_GROUP) * FP4_MLA_SCALE_COL_GROUP
+    )
+    logical_col = offsets % 4 + ((offsets % (128 * sf_cols_padded)) // 512) * 4
+    prefix_cols = logical_col < FP4_MLA_Q_PREFIX_DIM // FP4_BLOCK_SIZE
+    got_sf = q_sf.view(torch.uint8)[:num_sf]
+    prefix_bytes = FP4_MLA_Q_PREFIX_DIM // 2
+    return {
+        "prefix_bytes": (q_fp4[:rows, :prefix_bytes] != ref_q[:, :prefix_bytes]).sum(),
+        "scale_cols_0_31": ((got_sf != ref_sf) & prefix_cols).sum(),
+    }
 
 
 def _get_fp4_mla_kv_cache_tensors(
@@ -1406,6 +1765,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     v_page_offset: int = 0,
 ) -> bool:
     num_contexts = metadata.num_contexts
+    mx2d = _fp4_mla_mxfp4_2d_enabled()
     if num_contexts > 0:
         prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_contexts]
         ctx_token_count = int(prompt_lens_cpu.sum().item())
@@ -1414,7 +1774,11 @@ def _scatter_fp4_mla_kv_cache_2d_context(
                 f"FP4 MLA 2D context scatter needs {ctx_token_count} context tokens, got "
                 f"{num_tokens}."
             )
-        _validate_fp4_mla_context_start_alignment(metadata, num_contexts, alignment=FP4_BLOCK_SIZE)
+        _validate_fp4_mla_context_start_alignment(
+            metadata,
+            num_contexts,
+            alignment=MX2D_BLOCK_TOKENS if mx2d else FP4_BLOCK_SIZE,
+        )
 
     apply_k_rope = rotary_cos_sin is not None
     rope_dim = (
@@ -1484,6 +1848,64 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     v_packed_s0 = v_packed_output.stride(0) if write_v_packed else 0
     v_packed_s1 = v_packed_output.stride(1) if write_v_packed else 0
 
+    if mx2d:
+        if write_v_packed or v_sf is not None:
+            raise RuntimeError(
+                f"{FP4_MLA_MXFP4_2D_ENV}=1: the context writer stores no V-pack and no V scales."
+            )
+        if store_hp_tail and pool_s1 * hp_pool.element_size() < MX2D_SHADOW_BYTES:
+            raise RuntimeError(
+                f"{FP4_MLA_MXFP4_2D_ENV}=1: the HP row cannot hold the "
+                f"{MX2D_SHADOW_BYTES}-B MXFP4-2D block shadow."
+            )
+        # 32-token block leaders (position % 32 == 0), compacted on the device
+        # without a host sync; each sequence has at most L / 32 + 1 blocks.
+        positions = metadata.positions[token_offset : token_offset + num_tokens]
+        is_leader = positions.remainder(MX2D_BLOCK_TOKENS) == 0
+        max_leaders = num_tokens // MX2D_BLOCK_TOKENS + max(num_contexts, 1) + 1
+        leader_rank = torch.cumsum(is_leader.to(torch.int32), 0, dtype=torch.int32) - 1
+        leaders = torch.full((max_leaders + 1,), -1, dtype=torch.int32, device=latent_cache.device)
+        leaders.scatter_(
+            0,
+            torch.where(is_leader, leader_rank, max_leaders).to(torch.int64),
+            torch.arange(num_tokens, dtype=torch.int32, device=latent_cache.device),
+        )
+        leaders[max_leaders] = -1
+        _mx2d_context_latent_kernel[(max_leaders, v_head_dim // MX2D_BLOCK_DIMS)](
+            kv_cache,
+            sf_cache,
+            latent_cache,
+            global_scale,
+            hp_pool.view(torch.uint8),
+            hp_page_ids,
+            metadata.batch_indices,
+            metadata.positions,
+            metadata.paged_kv_indices,
+            metadata.paged_kv_indptr,
+            leaders,
+            metadata.paged_kv_indices.shape[0],
+            metadata.paged_kv_indptr.shape[0],
+            metadata.batch_indices.shape[0],
+            kv_cache.shape[0],
+            hp_pool.shape[1],
+            num_contexts,
+            num_hp_pages,
+            token_offset,
+            num_tokens,
+            local_layer,
+            metadata.page_size,
+            kv_cache.stride(0),
+            kv_cache.stride(2),
+            kv_cache.stride(4),
+            sf_cache.stride(0),
+            latent_cache.stride(0),
+            latent_cache.stride(1),
+            pool_s0 * hp_pool.element_size(),
+            pool_s1 * hp_pool.element_size(),
+            SF_PER_TOKEN=sf_per_token,
+            STORE_SHADOW=store_hp_tail,
+        )
+
     _fp4_mla_context_cache_update_kernel[
         (
             num_tokens,
@@ -1548,9 +1970,10 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         Q_NOPE_DIM=q_nope_head_dim if q_nope_head_dim is not None else 0,
         BLOCK_Q_HEADS=block_q_heads,
         POOL_HEAD_D=pool_head_dim,
-        STORE_HP_TAIL=store_hp_tail,
+        STORE_HP_TAIL=store_hp_tail and not mx2d,
         WRITE_V_PACKED=write_v_packed,
         STORE_V_SCALE=v_sf is not None,
+        MX2D=mx2d,
     )
     return store_hp_tail
 
@@ -1660,7 +2083,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     latent_cache: torch.Tensor,
     kv_cache: torch.Tensor,
     sf_cache: torch.Tensor,
-    v_sf: torch.Tensor,
+    v_sf: Optional[torch.Tensor],
     global_scale: torch.Tensor,
     *,
     token_offset: int,
@@ -1681,6 +2104,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     v_page_offset: int,
     helix_position_offsets: Optional[torch.Tensor],
     helix_is_inactive_rank: Optional[torch.Tensor],
+    q_prefix_external: bool = False,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     num_contexts = metadata.num_contexts
     num_seqs = metadata.num_seqs
@@ -1778,6 +2202,27 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         helix_is_inactive_rank = gen_lens_gen
     _validate_fp4_mla_hp_generation_width(hp_pool_size, max_gen_len)
     max_rewind_len = hp_pool_size - HP_BLOCK_SIZE
+    mx2d = _fp4_mla_mxfp4_2d_enabled()
+    if mx2d:
+        if max_gen_len != 1 or use_helix or v_packed_base is not None:
+            raise NotImplementedError(
+                f"{FP4_MLA_MXFP4_2D_ENV}=1 supports one generation token per request "
+                "(no MTP/speculation, no Helix) and no V-packed sidecar; got "
+                f"max_gen_len={max_gen_len}, helix={use_helix}."
+            )
+        if pool.stride(1) * pool.element_size() < MX2D_SHADOW_BYTES:
+            raise RuntimeError(
+                f"{FP4_MLA_MXFP4_2D_ENV}=1: the HP row ({pool.stride(1) * pool.element_size()} B) "
+                f"cannot hold the {MX2D_SHADOW_BYTES}-B MXFP4-2D block shadow."
+            )
+    elif v_sf is None:
+        raise RuntimeError("FP4 MLA generation scatter requires the auxiliary V scale pool.")
+    # MXFP4-2D keeps no V-scale pool; the kernels then never touch these.
+    v_sf_arg = v_sf if v_sf is not None else kv_cache
+    v_sf_num_pages = v_sf.shape[1] if v_sf is not None else kv_cache.shape[0]
+    v_sf_num_layers = v_sf.shape[0] if v_sf is not None else pool.shape[1]
+    v_sf_s0 = v_sf.stride(0) if v_sf is not None else 0
+    v_sf_s1 = v_sf.stride(1) if v_sf is not None else 0
     page_ids = _fp4_mla_generation_page_ids(metadata, num_gen)
     rope_dim = head_dim - v_head_dim
     block_q_heads = 32
@@ -1789,7 +2234,14 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     q_prefix_block_dim = (
         FP4_MLA_Q1_PREFIX_BLOCK_DIM if max_gen_len == 1 else FP4_MLA_Q_PREFIX_BLOCK_DIM
     )
-    q_prefix_blocks = FP4_MLA_Q_PREFIX_DIM // q_prefix_block_dim
+    if q_prefix_external and (max_gen_len != 1 or use_helix):
+        raise NotImplementedError(
+            f"{MLA_NVFP4_EPILOGUE_ENV}: an external FP4 Q prefix needs one generation token per "
+            f"sequence and no Helix (max_gen_len={max_gen_len}, helix={use_helix})."
+        )
+    # q_prefix_external: bmm_q already wrote the Q prefix bytes and scale columns 0-31; this launch then writes
+    # only the Q RoPE tails, K and the latent (no Q-prefix programs, Q_WORK_BLOCKS 1).
+    q_prefix_blocks = 0 if q_prefix_external else FP4_MLA_Q_PREFIX_DIM // q_prefix_block_dim
     q_prefix_blocks_per_program = _fp4_mla_q1_prefix_blocks_per_program(
         num_gen,
         q1_kv_blocks_per_program,
@@ -1875,7 +2327,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         _fp4_mla_generation_fused_qk_rope_cache_update_kernel[grid](
             kv_cache,
             sf_cache,
-            v_sf,
+            v_sf_arg,
             v_packed_output,
             pool,
             latent_cache,
@@ -1898,9 +2350,9 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             page_ids_len,
             hp_page_ids.numel(),
             indptr_len,
-            v_sf.shape[1],
+            v_sf_num_pages,
             num_hp_pages,
-            v_sf.shape[0],
+            v_sf_num_layers,
             local_layer,
             v_page_offset if write_v_packed else 0,
             metadata.page_size,
@@ -1910,8 +2362,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             sf_cache.stride(0),
             pool.stride(0),
             pool.stride(1),
-            v_sf.stride(0),
-            v_sf.stride(1),
+            v_sf_s0,
+            v_sf_s1,
             v_packed_s0,
             v_packed_s1,
             q_pe_input.stride(0),
@@ -1948,13 +2400,49 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             Q_SF_COLS=FP4_MLA_Q_SF_GROUPS,
             WRITE_Q=True,
             Q1_KV_BLOCKS_PER_PROGRAM=q1_kv_blocks_per_program_variant,
+            MX2D=mx2d,
             maxnreg=56,
+        )
+
+    def launch_mx2d_generation_latent(num_programs: int, page_ids_len: int, indptr_len: int):
+        _mx2d_generation_latent_kernel[(num_programs, v_head_dim // 32 // 4)](
+            kv_cache,
+            sf_cache,
+            latent_cache,
+            global_scale,
+            pool.view(torch.uint8),
+            kv_lens_gen,
+            gen_lens_gen,
+            page_ids,
+            hp_page_ids,
+            metadata.paged_kv_indptr_decode,
+            page_ids_len,
+            hp_page_ids.numel(),
+            indptr_len,
+            num_hp_pages,
+            kv_cache.shape[0],
+            pool.shape[1],
+            local_layer,
+            metadata.page_size,
+            kv_cache.stride(0),
+            kv_cache.stride(2),
+            kv_cache.stride(4),
+            sf_cache.stride(0),
+            latent_cache.stride(0),
+            latent_cache.stride(1),
+            pool.stride(0) * pool.element_size(),
+            pool.stride(1) * pool.element_size(),
+            SF_PER_TOKEN=sf_per_token,
+            GROUPS_PER_PROGRAM=4,
+            num_warps=1,
         )
 
     # Triton compiles and loads a CUDA module on first launch. Use runtime-zero
     # work here so every reachable static tuning variant is resident before
     # warmup hands the engine to serving.
     if getattr(metadata, "is_warmup", False) and not torch.cuda.is_current_stream_capturing():
+        # TRTLLM_MLA_NVFP4_EPILOGUE bit 2: also load the Q1 variants without Q-prefix programs.
+        preload_external_prefix = _mla_nvfp4_epilogue_q_prefix_enabled() and not use_helix
         configured_generation_len = int(getattr(metadata, "max_total_draft_tokens", 0) or 0) + 1
         max_preload_generation_len = max(max_gen_len, configured_generation_len)
         if max_preload_generation_len - 1 > max_rewind_len:
@@ -1986,6 +2474,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             metadata.page_size,
             write_v_packed,
             store_k_residual,
+            mx2d,
             use_helix,
             use_helix_local_slots,
             tuple(q1_variants),
@@ -1993,7 +2482,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             tuple(kv_cache.stride()),
             tuple(sf_cache.stride()),
             tuple(pool.stride()),
-            tuple(v_sf.stride()),
+            (v_sf_s0, v_sf_s1),
             tuple(v_packed_output.stride()),
             tuple(q_pe_input.stride()),
             tuple(q_rope_output.stride()),
@@ -2002,7 +2491,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             str(q_pe_input.dtype),
             str(q_fp4_output.dtype),
             str(q_sf_output.dtype),
-        )
+        ) + ((("mla-nvfp4-epilogue-q-prefix-external", True),) if preload_external_prefix else ())
         preload_keys = _fp4_mla_triton_preload_key_set(metadata)
         if preload_key not in preload_keys:
             context_page_ids = getattr(metadata, "_paged_kv_indices", None)
@@ -2020,7 +2509,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             _fp4_mla_context_cache_update_kernel[(1, num_dim_blocks)](
                 kv_cache,
                 sf_cache,
-                v_sf,
+                v_sf_arg,
                 v_packed_output,
                 latent_cache,
                 latent_cache,
@@ -2053,8 +2542,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 latent_cache.stride(0),
                 0,
                 0,
-                v_sf.stride(0),
-                v_sf.stride(1),
+                v_sf_s0,
+                v_sf_s1,
                 v_packed_s0,
                 v_packed_s1,
                 pool.stride(0),
@@ -2076,24 +2565,31 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 Q_NOPE_DIM=0,
                 BLOCK_Q_HEADS=16,
                 POOL_HEAD_D=hp_head_dim,
-                STORE_HP_TAIL=True,
+                STORE_HP_TAIL=not mx2d,
                 WRITE_V_PACKED=write_v_packed,
-                STORE_V_SCALE=True,
+                STORE_V_SCALE=not mx2d,
+                MX2D=mx2d,
             )
+            if mx2d:
+                # Runtime-zero work: indptr_len 0 returns before any access.
+                launch_mx2d_generation_latent(1, 0, 0)
             q1_prefix_blocks = FP4_MLA_Q_PREFIX_DIM // FP4_MLA_Q1_PREFIX_BLOCK_DIM
             for q1_kv_blocks, q1_prefix_blocks_per_program in q1_variants:
-                launch_generation_update(
-                    (1, 1),
-                    page_ids_len=0,
-                    indptr_len=0,
-                    max_gen_tiles_variant=1,
-                    q_prefix_block_dim_variant=FP4_MLA_Q1_PREFIX_BLOCK_DIM,
-                    q_prefix_blocks_variant=q1_prefix_blocks,
-                    q_prefix_blocks_per_program_variant=q1_prefix_blocks_per_program,
-                    q1_kv_blocks_per_program_variant=q1_kv_blocks,
-                )
+                for prefix_blocks in (
+                    (q1_prefix_blocks, 0) if preload_external_prefix else (q1_prefix_blocks,)
+                ):
+                    launch_generation_update(
+                        (1, 1),
+                        page_ids_len=0,
+                        indptr_len=0,
+                        max_gen_tiles_variant=1,
+                        q_prefix_block_dim_variant=FP4_MLA_Q1_PREFIX_BLOCK_DIM,
+                        q_prefix_blocks_variant=prefix_blocks,
+                        q_prefix_blocks_per_program_variant=q1_prefix_blocks_per_program,
+                        q1_kv_blocks_per_program_variant=q1_kv_blocks,
+                    )
             multi_prefix_blocks = FP4_MLA_Q_PREFIX_DIM // FP4_MLA_Q_PREFIX_BLOCK_DIM
-            for multi_token_tile in multi_token_tiles:
+            for multi_token_tile in () if mx2d else multi_token_tiles:
                 launch_generation_update(
                     (1, 1),
                     page_ids_len=0,
@@ -2117,6 +2613,10 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         q_prefix_blocks_per_program_variant=q_prefix_blocks_per_program,
         q1_kv_blocks_per_program_variant=q1_kv_blocks_per_program,
     )
+    if mx2d:
+        launch_mx2d_generation_latent(
+            num_gen, page_ids.shape[0], metadata.paged_kv_indptr_decode.shape[0]
+        )
     return kv_lens_gen, gen_lens_gen, page_ids
 
 
@@ -2274,6 +2774,7 @@ def scatter_fp4_mla_kv_cache(
     helix_is_inactive_rank: Optional[torch.Tensor] = None,
     q_context: Optional[torch.Tensor] = None,
     q_nope_head_dim: Optional[int] = None,
+    q_prefix_external: bool = False,
 ) -> bool:
     """Quantize MLA latent tokens and scatter them into the paged FP4 cache.
 
@@ -2302,9 +2803,15 @@ def scatter_fp4_mla_kv_cache(
     specialization can also rotate Q and new K tails while updating the HP pool.
     The context kernel also stores the final incomplete tile in the BF16 HP
     pool. When ``q_quant_input`` is supplied, the generation kernel also emits
-    backend-ready residual FP4 Q. The return value reports whether the current
-    phase updated the HP pool.
+    backend-ready residual FP4 Q. With ``q_prefix_external`` (TRTLLM_MLA_NVFP4_EPILOGUE
+    bit 2) the Q prefix bytes and scale columns 0-31 were already written by
+    ``fp4_mla_bmm_q_fp4_prefix`` and the kernel writes only the Q RoPE tails. The
+    return value reports whether the current phase updated the HP pool.
     """
+    if q_prefix_external and (phase != "generation" or q_quant_input is None):
+        raise ValueError(
+            "FP4 MLA q_prefix_external needs the fused generation Q quantization (q_quant_input)."
+        )
     if phase == "generation":
         metadata._fp4_mla_prequantized_q = None
         metadata._fp4_mla_prequantized_q_sf = None
@@ -2354,7 +2861,10 @@ def scatter_fp4_mla_kv_cache(
     context_only_cache = getattr(metadata.kv_cache_manager, "fp4_mla_context_only_cache", False)
     if context_only_cache and phase != "context":
         raise RuntimeError("FP4 MLA context-only cache cannot execute generation.")
-    if not context_only_cache and getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
+    # MXFP4-2D reads V and its scales from the K pages: no V-scale pool, no V-pack.
+    mx2d = _fp4_mla_mxfp4_2d_enabled()
+    no_v_sidecars = context_only_cache or mx2d
+    if not no_v_sidecars and getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -2375,11 +2885,7 @@ def scatter_fp4_mla_kv_cache(
         )
 
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
-    v_sf = (
-        None
-        if context_only_cache
-        else get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
-    )
+    v_sf = None if no_v_sidecars else get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
     num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
     sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
 
@@ -2420,6 +2926,80 @@ def scatter_fp4_mla_kv_cache(
         metadata._fp4_mla_prequantized_q_sf = q_sf_out
         metadata._fp4_mla_q_batch_capacity = q_batch_capacity
         hp_pool_updated = True
+    # CuTeDSL MUFU16 decode reads V from a persistent manager-owned packed
+    # sidecar. A context-only (disaggregated CTX) cache never decodes, so it
+    # keeps neither V scales nor the V-packed sidecar; the GEN side rebuilds
+    # both after the KV import.
+    cutedsl_backend = backend == _FP4_MLA_CUTEDSL_BACKEND and not no_v_sidecars
+    fused_v_transpose = cutedsl_backend and _fp4_mla_cutedsl_fused_v_transpose_enabled()
+    kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+    persistent_v_packed = None
+    v_packed_base = None
+    v_page_offset = 0
+    direct_v_packed_write = False
+    if cutedsl_backend and not fused_v_transpose:
+        persistent_v_packed = _get_cutedsl_persistent_v_packed_cache(
+            metadata,
+            local_layer,
+            kv_cache,
+            v_head_dim=v_head_dim,
+            page_size=metadata.page_size,
+            block_v=FP4_MLA_SCALE_ROW_GROUP,
+        )
+        # Reused/imported pages may not carry this process-local sidecar. Write
+        # packed V directly only when the cache pages are exclusively owned.
+        # The fused generation kernel handles uniform linear-MTP batches and
+        # updates every 16-token tile touched by the verification window.
+        num_gen = metadata.num_seqs - metadata.num_contexts
+        block_reuse = getattr(kv_cache_manager, "enable_block_reuse", True)
+        direct_context_v_packed_write = (
+            phase == "context"
+            and metadata.num_contexts > 0
+            and num_tokens > 0
+            and block_reuse is False
+        )
+        direct_generation_v_packed_write = (
+            phase == "generation"
+            and num_gen > 0
+            and num_tokens >= num_gen
+            and num_tokens % num_gen == 0
+            and block_reuse is False
+        )
+        direct_v_packed_write = direct_context_v_packed_write or direct_generation_v_packed_write
+        if direct_v_packed_write:
+            v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
+            get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
+            v_page_offset = (
+                int(get_v_page_offset(local_layer))
+                if callable(get_v_page_offset)
+                else local_layer * kv_cache.shape[0]
+            )
+            expected_row_width = metadata.page_size // 2
+            required_base_rows = (v_page_offset + kv_cache.shape[0]) * v_head_dim
+            if (
+                not isinstance(v_packed_base, torch.Tensor)
+                or v_packed_base.dtype != torch.uint8
+                or v_packed_base.device != kv_cache.device
+                or v_packed_base.ndim != 2
+                or v_packed_base.shape[0] < required_base_rows
+                or v_packed_base.shape[1] != expected_row_width
+                or not v_packed_base.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "FP4 MLA direct V-packed cache update requires the "
+                    "stable full-pool base to be a contiguous uint8 tensor "
+                    f"with at least {required_base_rows} rows and "
+                    f"{expected_row_width} columns on {kv_cache.device}."
+                )
+            expected_layer_ptr = v_packed_base.data_ptr() + (
+                v_page_offset * v_head_dim * expected_row_width
+            )
+            if expected_layer_ptr != persistent_v_packed.data_ptr():
+                raise RuntimeError(
+                    "FP4 MLA V-packed layer view does not match its stable "
+                    "full-pool base and page offset."
+                )
+    generation_state = None
     v_pack_num_valid = None
     if phase == "context":
         _materialize_fp4_mla_device_page_table_for_forward(metadata)
@@ -2441,10 +3021,12 @@ def scatter_fp4_mla_kv_cache(
             num_dim_blocks=num_dim_blocks,
             sf_per_token=sf_per_token,
             sf_per_page=sf_per_page,
+            v_packed_base=v_packed_base,
+            v_page_offset=v_page_offset,
         )
         v_pack_page_ids = metadata.paged_kv_indices
     else:
-        _scatter_fp4_mla_kv_cache_2d_generation(
+        generation_state = _scatter_fp4_mla_kv_cache_2d_generation(
             metadata,
             latent_cache,
             kv_cache,
@@ -2465,10 +3047,11 @@ def scatter_fp4_mla_kv_cache(
             q_quant_input=q_quant_input,
             q_fp4_out=q_fp4_out,
             q_sf_out=q_sf_out,
-            v_packed_base=None,
-            v_page_offset=0,
+            v_packed_base=v_packed_base,
+            v_page_offset=v_page_offset,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=helix_is_inactive_rank,
+            q_prefix_external=q_prefix_external,
         )
         v_pack_page_ids = _fp4_mla_generation_page_ids(
             metadata, metadata.num_seqs - metadata.num_contexts
@@ -2477,8 +3060,47 @@ def scatter_fp4_mla_kv_cache(
             # Frozen launch grids cannot follow the per-replay page count;
             # the repack kernels stride over this device-side count instead.
             v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
-    if context_only_cache:
+    if no_v_sidecars:
         return hp_pool_updated
+    if cutedsl_backend and not fused_v_transpose and not direct_v_packed_write:
+        cutedsl_repack_page_indptr = None
+        cutedsl_repack_kv_lens = None
+        cutedsl_repack_generation_lens = None
+        cutedsl_repack_max_touched_pages = 1
+        if phase == "context":
+            num_contexts = metadata.num_contexts
+            cutedsl_v_pack_page_ids = metadata.paged_kv_indices[: metadata.num_context_blocks]
+            cutedsl_repack_page_indptr = metadata.paged_kv_indptr[: num_contexts + 1]
+            cutedsl_repack_kv_lens = metadata.kv_lens_cuda_runtime[:num_contexts]
+            cutedsl_repack_generation_lens = metadata.prompt_lens_cuda_runtime[:num_contexts]
+            cutedsl_repack_max_touched_pages = int(
+                getattr(metadata, "fp4_mla_context_repack_max_touched_pages", 1)
+            )
+        elif generation_state is not None:
+            kv_lens_gen, gen_lens_gen, generation_page_ids = generation_state
+            num_gen = kv_lens_gen.numel()
+            cutedsl_v_pack_page_ids = generation_page_ids
+            cutedsl_repack_page_indptr = metadata.paged_kv_indptr_decode
+            cutedsl_repack_kv_lens = kv_lens_gen
+            cutedsl_repack_generation_lens = gen_lens_gen
+            cutedsl_repack_max_touched_pages = _ceil_div(
+                num_tokens // num_gen + metadata.page_size - 1,
+                metadata.page_size,
+            )
+        else:
+            cutedsl_v_pack_page_ids = v_pack_page_ids
+        _repack_cutedsl_v_packed_cache(
+            persistent_v_packed,
+            kv_cache,
+            cutedsl_v_pack_page_ids,
+            v_head_dim=v_head_dim,
+            page_size=metadata.page_size,
+            block_v=FP4_MLA_SCALE_ROW_GROUP,
+            page_indptr=cutedsl_repack_page_indptr,
+            kv_lens=cutedsl_repack_kv_lens,
+            generation_lens=cutedsl_repack_generation_lens,
+            max_touched_pages=cutedsl_repack_max_touched_pages,
+        )
     _maybe_update_triton_v_packed_cache(
         metadata,
         layer_idx,
@@ -2584,6 +3206,79 @@ def _v_packed_shape(
     block_v: int,
 ) -> tuple[int, int]:
     return (kv_cache.shape[0] * _ceil_div(v_head_dim, block_v) * block_v, page_size // 2)
+
+
+def _get_fp4_mla_v_packed_pool_base(metadata: Any) -> Optional[torch.Tensor]:
+    return metadata.kv_cache_manager.get_mla_v_packed_pool_base()
+
+
+def _get_fp4_mla_v_scale_pool_base(metadata: Any) -> Optional[torch.Tensor]:
+    return metadata.kv_cache_manager.get_mla_v_scale_pool_base()
+
+
+def _get_cutedsl_persistent_v_packed_cache(
+    metadata: Any,
+    local_layer: int,
+    kv_cache: torch.Tensor,
+    *,
+    v_head_dim: int,
+    page_size: int,
+    block_v: int,
+) -> torch.Tensor:
+    v_packed = _get_fp4_mla_v_packed_pool(metadata, local_layer)
+    if v_packed is None:
+        raise RuntimeError(
+            "CuTeDSL FP4 MLA requires the manager-owned persistent V-packed "
+            "pool; the scratch full-repack fallback has been removed."
+        )
+    expected_shape = _v_packed_shape(kv_cache, v_head_dim, page_size, block_v)
+    if (
+        not isinstance(v_packed, torch.Tensor)
+        or v_packed.dtype != torch.uint8
+        or v_packed.device != kv_cache.device
+        or tuple(v_packed.shape) != expected_shape
+        or not v_packed.is_contiguous()
+    ):
+        raise RuntimeError(
+            "FP4 MLA persistent V-packed pool must be a contiguous uint8 tensor "
+            f"with shape {expected_shape} on {kv_cache.device}; got "
+            f"{type(v_packed).__name__}, "
+            f"shape={getattr(v_packed, 'shape', None)}, "
+            f"dtype={getattr(v_packed, 'dtype', None)}, "
+            f"device={getattr(v_packed, 'device', None)}."
+        )
+    return v_packed
+
+
+def _repack_cutedsl_v_packed_cache(
+    v_packed: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_ids: torch.Tensor,
+    *,
+    v_head_dim: int,
+    page_size: int,
+    block_v: int,
+    page_indptr: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
+    generation_lens: Optional[torch.Tensor] = None,
+    max_touched_pages: int = 1,
+) -> None:
+    if page_ids.numel() == 0:
+        return
+    from .fp4_mla_cutedsl_v_repack import fp4_mla_repack_v_cache
+
+    fp4_mla_repack_v_cache(
+        v_packed,
+        kv_cache,
+        page_ids,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        block_v=block_v,
+        page_indptr=page_indptr,
+        kv_lens=kv_lens,
+        generation_lens=generation_lens,
+        max_touched_pages=max_touched_pages,
+    )
 
 
 def _get_fp4_mla_v_packed_pool(metadata: Any, local_layer: int) -> Optional[torch.Tensor]:
@@ -3728,9 +4423,49 @@ def run_fp4_mla_attention_decode(
         raise ValueError("FP4 MLA attention output batch dimensions do not match.")
 
     backend = _fp4_mla_attention_backend()
+    helix_spec_tokens_valid = bool(getattr(metadata, "_helix_spec_tokens_valid", False))
+    helix_kv_bounds = None
     if softmax_stats_tensor is not None:
-        raise NotImplementedError("FP4 MLA decode does not produce Helix softmax stats.")
-    if getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
+        if backend != _FP4_MLA_CUTEDSL_BACKEND:
+            raise NotImplementedError(
+                "FP4 MLA Helix softmax stats require the cutedsl attention backend."
+            )
+        if query_len_per_seq != 1 and not helix_spec_tokens_valid:
+            raise NotImplementedError(
+                "FP4 MLA multi-token Helix requires speculative per-token metadata."
+            )
+        expected_stats_shape = (num_queries, num_heads, 2)
+        if (
+            softmax_stats_tensor.shape != expected_stats_shape
+            or softmax_stats_tensor.dtype != torch.float32
+            or softmax_stats_tensor.device != q.device
+            or not softmax_stats_tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "FP4 MLA Helix requires contiguous same-device float32 softmax "
+                f"stats with shape {expected_stats_shape}."
+            )
+        if helix_spec_tokens_valid:
+            helix_kv_bounds = getattr(metadata, "helix_kv_bounds", None)
+            if (
+                not isinstance(helix_kv_bounds, torch.Tensor)
+                or helix_kv_bounds.dtype != torch.int32
+                or helix_kv_bounds.device != q.device
+                or helix_kv_bounds.ndim != 1
+                or helix_kv_bounds.numel() < num_queries
+                or not helix_kv_bounds.is_contiguous()
+            ):
+                raise ValueError(
+                    "FP4 MLA speculative Helix KV bounds must be a contiguous "
+                    "same-device int32 tensor covering every query token."
+                )
+            helix_kv_bounds = helix_kv_bounds[:num_queries]
+    mx2d = _fp4_mla_mxfp4_2d_enabled()
+    if mx2d and backend != _FP4_MLA_CUTEDSL_BACKEND:
+        raise NotImplementedError(
+            f"{FP4_MLA_MXFP4_2D_ENV}=1 requires {FP4_MLA_ATTENTION_BACKEND_ENV}=cutedsl."
+        )
+    if not mx2d and getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
         raise RuntimeError(
             "FP4 MLA attention decode requires the auxiliary V scale pool to be allocated."
         )
@@ -3782,8 +4517,12 @@ def run_fp4_mla_attention_decode(
     )
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
 
-    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
-        torch.float8_e4m3fn
+    v_sf = (
+        None
+        if mx2d
+        else get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
+            torch.float8_e4m3fn
+        )
     )
     # The kv_lens runtime alias can lag at the decode anchor (seq_lens == 1) under
     # CUDA graph / one-engine MTP; recover the true total per sequence so the
@@ -3795,6 +4534,33 @@ def run_fp4_mla_attention_decode(
     max_pages = _max_generation_pages(metadata)
     if max_pages == 0:
         raise RuntimeError("FP4 MLA attention decode requires generation cache pages.")
+    if backend == _FP4_MLA_CUTEDSL_BACKEND:
+        _run_cutedsl_attention_decode(
+            metadata=metadata,
+            local_layer=local_layer,
+            q=q,
+            q_fp4=q_fp4,
+            q_sf=q_sf,
+            kv_cache=kv_cache,
+            sf_cache=sf_cache,
+            v_sf=v_sf,
+            global_scale=global_scale,
+            q_global_scale=q_global_scale,
+            src_page_ids=src_page_ids,
+            kv_lens=kv_lens,
+            output=output,
+            num_queries=num_queries,
+            num_heads=num_heads,
+            num_gen_seqs=num_gen_seqs,
+            kv_lora_rank=kv_lora_rank,
+            query_len_per_seq=query_len_per_seq,
+            max_pages=max_pages,
+            sm_scale=float(sm_scale),
+            q_batch_capacity=q_batch_capacity,
+            softmax_stats_tensor=softmax_stats_tensor,
+            helix_kv_bounds=helix_kv_bounds,
+        )
+        return
     total_p_rows = num_queries * max_pages * num_heads
     p_fp4 = _ensure_workspace_tensor(
         metadata,
@@ -3829,7 +4595,8 @@ def run_fp4_mla_attention_decode(
     if backend != "triton":
         raise ValueError(
             f"Unsupported FP4 MLA attention backend '{backend}'. "
-            f"Set {FP4_MLA_ATTENTION_BACKEND_ENV} to 'triton'."
+            f"Set {FP4_MLA_ATTENTION_BACKEND_ENV} to 'triton' or "
+            f"'{_FP4_MLA_CUTEDSL_BACKEND}'."
         )
 
     # Self-contained public-Triton path: TMA-loaded QK + fused page-stats pack,
@@ -3861,3 +4628,352 @@ def run_fp4_mla_attention_decode(
         sm_scale=float(sm_scale),
         q_global_scale=q_global_scale,
     )
+
+
+def _fp4_mla_lpt_request_order(
+    metadata: Any,
+    kv_lens: torch.Tensor,
+    *,
+    num_queries: int,
+    num_gen_seqs: int,
+    query_len_per_seq: int,
+) -> Optional[torch.Tensor]:
+    """Return a device int32 permutation of the decode queries, longest KV first.
+
+    The CuTeDSL decode maps grid-z slot -> query through this order, so the
+    longest requests start first and short ones fill the tail (LPT list
+    scheduling). Each query's math and output are unchanged. The order is
+    sorted on the device (no host sync, CUDA-graph capturable) by the first
+    decoding layer of a forward step and reused by the other layers; the
+    metadata invalidates it together with the generation lengths whenever
+    kv_lens change.
+    """
+    if num_gen_seqs <= 0 or num_queries != num_gen_seqs * query_len_per_seq:
+        return None
+    capturing = torch.cuda.is_current_stream_capturing()
+    buffer = getattr(metadata, "_fp4_mla_lpt_order_buf", None)
+    if buffer is None or buffer.numel() < num_queries or buffer.device != kv_lens.device:
+        if capturing:
+            # The eager warmup allocates the buffer; never allocate during capture.
+            return None
+        capacity = max(
+            num_queries,
+            int(getattr(metadata, "max_num_sequences", 0) or 0) * query_len_per_seq,
+        )
+        buffer = torch.empty((capacity,), dtype=torch.int32, device=kv_lens.device)
+        metadata._fp4_mla_lpt_order_buf = buffer
+        metadata._fp4_mla_lpt_order_valid = False
+    order = buffer[:num_queries]
+    key = (order.data_ptr(), num_queries, query_len_per_seq)
+    record_for_capture = capturing and not getattr(metadata, "_fp4_mla_lpt_capture_recorded", False)
+    if (
+        not record_for_capture
+        and getattr(metadata, "_fp4_mla_lpt_order_valid", False)
+        and getattr(metadata, "_fp4_mla_lpt_order_key", None) == key
+    ):
+        return order
+    seq_order = torch.argsort(kv_lens[:num_gen_seqs], descending=True, stable=True)
+    if query_len_per_seq == 1:
+        order.copy_(seq_order)
+    else:
+        offsets = torch.arange(query_len_per_seq, dtype=seq_order.dtype, device=seq_order.device)
+        order.view(num_gen_seqs, query_len_per_seq).copy_(
+            seq_order[:, None] * query_len_per_seq + offsets
+        )
+    metadata._fp4_mla_lpt_order_key = key
+    metadata._fp4_mla_lpt_order_valid = True
+    if capturing:
+        metadata._fp4_mla_lpt_capture_recorded = True
+    return order
+
+
+def _run_cutedsl_attention_decode(
+    *,
+    metadata: Any,
+    local_layer: int,
+    q: torch.Tensor,
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    kv_cache: torch.Tensor,
+    sf_cache: torch.Tensor,
+    v_sf: torch.Tensor,
+    global_scale: torch.Tensor,
+    q_global_scale: torch.Tensor,
+    src_page_ids: torch.Tensor,
+    kv_lens: torch.Tensor,
+    output: torch.Tensor,
+    num_queries: int,
+    num_heads: int,
+    num_gen_seqs: int,
+    kv_lora_rank: int,
+    query_len_per_seq: int,
+    max_pages: int,
+    sm_scale: float,
+    q_batch_capacity: int,
+    softmax_stats_tensor: Optional[torch.Tensor],
+    helix_kv_bounds: Optional[torch.Tensor],
+) -> None:
+    """Launch the Rubin CuTeDSL MUFU16 FP4 MLA decode (public CuTe DSL)."""
+    if get_sm_version() != 107:
+        raise RuntimeError(
+            "FP4 MLA cutedsl attention backend requires Rubin SM107; "
+            f"current architecture is SM{get_sm_version()}."
+        )
+    if not _cutedsl_backend_available():
+        raise RuntimeError(
+            "FP4 MLA cutedsl attention backend requires a CuTe DSL build "
+            "(nvidia-cutlass-dsl >= 4.8.0) that provides the tcgen05 "
+            "descriptor K-segment offset, and cuda-python."
+        )
+    if not 0 < num_heads <= 128 or kv_lora_rank != 512:
+        raise ValueError(
+            "FP4 MLA cutedsl attention requires 1-128 local heads and "
+            f"kv_lora_rank=512, got num_heads={num_heads}, "
+            f"kv_lora_rank={kv_lora_rank}."
+        )
+
+    cutedsl_kernel = _fp4_mla_cutedsl_kernel_module()
+    qk_logical_dim = cutedsl_kernel.QK_LOGICAL_DIM
+    qk_sf_groups = cutedsl_kernel.QK_SF_GROUPS
+    v_n_per_cta = cutedsl_kernel.SMEM_P4_V_N_PER_CTA
+
+    physical_heads = 128
+    kernel_q = q_fp4
+    kernel_q_sf = q_sf
+    if num_heads < physical_heads:
+        kernel_q_storage, kernel_q_sf_storage, q_batch_capacity = _prepare_fp4_mla_q_buffers(
+            metadata,
+            num_queries,
+            physical_heads,
+            q.device,
+        )
+        active_q_rows = num_queries * physical_heads
+        active_q_sf_bytes = _get_fp4_mla_swizzled_scale_size(active_q_rows, qk_logical_dim)
+        kernel_q = kernel_q_storage[:active_q_rows]
+        kernel_q_sf = kernel_q_sf_storage[:active_q_sf_bytes]
+        _cutedsl_pad_q_and_sf_kernel[(num_queries, _ceil_div(qk_logical_dim // 2, 64))](
+            kernel_q,
+            q_fp4,
+            kernel_q_sf,
+            q_sf,
+            num_heads,
+            output_heads=physical_heads,
+            packed_dim=qk_logical_dim // 2,
+            block_bytes=64,
+            sf_cols=qk_sf_groups,
+            sf_cols_per_byte_block=8,
+        )
+
+    v_sf_pool = metadata.fp4_mla_v_scale_pool
+    kernel_kwargs = {}
+    mx2d = _fp4_mla_mxfp4_2d_enabled()
+    persistent = mx2d or (
+        _env_enabled_default(FP4_MLA_PERSISTENT_ENV, False)
+        and softmax_stats_tensor is None
+        and helix_kv_bounds is None
+        and num_queries >= (_env_int(FP4_MLA_PERSISTENT_MIN_QUERIES_ENV) or 400)
+        and getattr(cutedsl_kernel, "SUPPORTS_PERSISTENT", False)
+    )
+    if persistent:
+        # The work counter must exist before any CUDA-graph capture; the first
+        # (eager) decode allocates it. The kernel's last cluster re-zeroes it.
+        kernel_kwargs["persistent"] = True
+        kernel_kwargs["persistent_counter"] = cutedsl_kernel.persistent_sched_counter(q.device)
+    elif getattr(cutedsl_kernel, "SUPPORTS_PERSISTENT", False) and not (
+        torch.cuda.is_current_stream_capturing()
+    ):
+        cutedsl_kernel.persistent_sched_counter(q.device)
+    if mx2d:
+        # MXFP4-2D: V and its block scales are read from the K pages and the
+        # K-scale plane; there is no V-pack or V-scale sidecar.
+        if not getattr(cutedsl_kernel, "SUPPORTS_MXFP4_2D", False):
+            raise NotImplementedError(
+                f"{FP4_MLA_MXFP4_2D_ENV}=1 needs the CuTeDSL MXFP4-2D decode, which this "
+                "build of fp4_mla_cutedsl_mufu16 does not provide."
+            )
+        if (
+            query_len_per_seq != 1
+            or softmax_stats_tensor is not None
+            or helix_kv_bounds is not None
+        ):
+            raise NotImplementedError(
+                f"{FP4_MLA_MXFP4_2D_ENV}=1 decodes one query per request without Helix."
+            )
+        core_v_packed = None
+        core_v_sf = None
+        v_page_offset = 0
+        kernel_kwargs["mxfp4_2d"] = True
+        kernel_kwargs["mxfp4_2d_mixed_rowsum"] = _env_enabled_default(
+            FP4_MLA_MXFP4_2D_MIXED_ROWSUM_ENV, True
+        )
+    elif _fp4_mla_cutedsl_fused_v_transpose_enabled():
+        # The fusion kernel reads V from the canonical KV cache and uses the
+        # current layer V scales directly.
+        core_v_packed = None
+        core_v_sf = v_sf
+        v_page_offset = 0
+    else:
+        v_packed = _get_cutedsl_persistent_v_packed_cache(
+            metadata,
+            local_layer,
+            kv_cache,
+            v_head_dim=kv_lora_rank,
+            page_size=metadata.page_size,
+            block_v=v_n_per_cta,
+        )
+        core_v_packed = _get_fp4_mla_v_packed_pool_base(metadata)
+        if core_v_packed is None:
+            raise RuntimeError("Persistent FP4 MLA V packing requires a stable full-pool base.")
+        get_v_page_offset = getattr(metadata.kv_cache_manager, "get_mla_v_packed_page_offset", None)
+        v_page_offset = (
+            int(get_v_page_offset(local_layer))
+            if callable(get_v_page_offset)
+            else local_layer * kv_cache.shape[0]
+        )
+        page_bytes = kv_lora_rank * (metadata.page_size // 2)
+        if core_v_packed.data_ptr() + v_page_offset * page_bytes != v_packed.data_ptr():
+            raise RuntimeError(
+                "Persistent FP4 MLA V-packed layer view does not match its "
+                "full-pool base and page offset."
+            )
+
+        v_sf_pool_base = _get_fp4_mla_v_scale_pool_base(metadata)
+        if v_sf_pool_base is None:
+            v_sf_pool_base = v_sf_pool.flatten(0, 1).view(torch.uint8)
+            if v_sf_pool_base.data_ptr() != v_sf_pool.data_ptr():
+                raise RuntimeError("Persistent FP4 MLA V-scale pool must flatten without a copy.")
+        if (
+            not isinstance(v_sf_pool_base, torch.Tensor)
+            or v_sf_pool_base.dtype != torch.uint8
+            or v_sf_pool_base.device != v_sf.device
+            or v_sf_pool_base.ndim != 2
+            or v_sf_pool_base.shape[1] != v_sf_pool.shape[-1]
+            or not v_sf_pool_base.is_contiguous()
+        ):
+            raise RuntimeError(
+                "Persistent FP4 MLA V-scale pool base must be a contiguous "
+                "two-dimensional uint8 tensor with the configured page stride."
+            )
+        core_v_sf = v_sf_pool_base.view(torch.float8_e4m3fn)
+        get_v_sf_page_offset = getattr(
+            metadata.kv_cache_manager, "get_mla_v_scale_page_offset", None
+        )
+        v_sf_page_offset = (
+            int(get_v_sf_page_offset(local_layer))
+            if callable(get_v_sf_page_offset)
+            else local_layer * kv_cache.shape[0]
+        )
+        if v_sf_page_offset != v_page_offset:
+            raise RuntimeError(
+                "Persistent FP4 MLA V-packed and V-scale pools require "
+                "matching encoded layer offsets."
+            )
+        expected_v_sf_ptr = (
+            core_v_sf.data_ptr() + v_sf_page_offset * v_sf_pool.stride(1) * v_sf_pool.element_size()
+        )
+        if expected_v_sf_ptr != v_sf.data_ptr():
+            raise RuntimeError(
+                "Persistent FP4 MLA V-scale layer view does not match its "
+                "full-pool base and page offset."
+            )
+
+    kernel_output = output
+    kernel_softmax_stats = None
+    if softmax_stats_tensor is not None:
+        kernel_softmax_stats = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_cutedsl_softmax_stats_buf",
+            (2, num_queries, physical_heads),
+            dtype=torch.float32,
+            device=output.device,
+        )
+    if num_heads < physical_heads:
+        kernel_output = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_cutedsl_output_buf",
+            (num_queries, physical_heads, kv_lora_rank),
+            dtype=output.dtype,
+            device=output.device,
+        )
+
+    from . import fp4_mla_mx2d_splitkv
+
+    split_kv = None
+    if mx2d and fp4_mla_mx2d_splitkv.split_kv_requested():
+        # TRTLLM_FP4_MLA_MXFP4_2D_SPLITKV: a small batch runs as (query, KV window) tasks
+        # planned in the longest-KV-first order, so the plan is refreshed with that order.
+        refresh_plan = not getattr(metadata, "_fp4_mla_lpt_order_valid", False) or (
+            torch.cuda.is_current_stream_capturing()
+            and not getattr(metadata, "_fp4_mla_lpt_capture_recorded", False)
+        )
+        order = _fp4_mla_lpt_request_order(
+            metadata,
+            kv_lens,
+            num_queries=num_queries,
+            num_gen_seqs=num_gen_seqs,
+            query_len_per_seq=query_len_per_seq,
+        )
+        if order is not None:
+            split_kv = fp4_mla_mx2d_splitkv.prepare_split_kv(
+                metadata,
+                cutedsl_kernel,
+                kv_lens,
+                order,
+                num_queries=num_queries,
+                refresh_plan=refresh_plan,
+            )
+
+    lpt_kwargs = {}
+    if split_kv is not None:
+        # The task map carries the dispatch order (in place of the LPT order).
+        lpt_kwargs["split_kv"] = (split_kv.task_map, split_kv.buffer)
+    elif (
+        _env_enabled_default(FP4_MLA_LPT_ENV, True)
+        and kernel_softmax_stats is None
+        and helix_kv_bounds is None
+        and getattr(cutedsl_kernel, "SUPPORTS_REQUEST_ORDER", False)
+    ):
+        order = _fp4_mla_lpt_request_order(
+            metadata,
+            kv_lens,
+            num_queries=num_queries,
+            num_gen_seqs=num_gen_seqs,
+            query_len_per_seq=query_len_per_seq,
+        )
+        if order is not None:
+            lpt_kwargs["request_order"] = order
+
+    cutedsl_kernel.run_trtllm_fp4_mla_decode_page_native_from_raw(
+        kernel_q,
+        kernel_q_sf,
+        kv_cache,
+        sf_cache,
+        core_v_packed,
+        core_v_sf,
+        global_scale,
+        src_page_ids,
+        metadata.paged_kv_indptr_decode[: num_gen_seqs + 1],
+        kv_lens,
+        kernel_output,
+        max_kv_len=max_pages * metadata.page_size,
+        sm_scale=sm_scale,
+        num_heads=physical_heads,
+        q_global_scale=q_global_scale,
+        page_size=metadata.page_size,
+        query_len_per_seq=query_len_per_seq,
+        v_page_offset=v_page_offset,
+        q_batch_capacity=q_batch_capacity,
+        partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
+        softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
+        softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
+        helix_kv_bounds=helix_kv_bounds,
+        **lpt_kwargs,
+        **kernel_kwargs,
+    )
+    if split_kv is not None:
+        fp4_mla_mx2d_splitkv.merge_split_kv(split_kv, kernel_output)
+    if kernel_output is not output:
+        output.copy_(kernel_output[:, :num_heads])
+    if kernel_softmax_stats is not None:
+        softmax_stats_tensor[..., 0].copy_(kernel_softmax_stats[0, :, :num_heads])
+        softmax_stats_tensor[..., 1].copy_(kernel_softmax_stats[1, :, :num_heads])

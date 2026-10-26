@@ -70,6 +70,11 @@ list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
 # Marlin is built as its own architecture-scoped OBJECT library below.
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
+# SM107 Push-Combine sources are sm_107a-only and register their own Torch ops;
+# they are built into the separate tile_push_comm_ops library
+# (communicationKernels/tileNvfp4/CMakeLists.txt).
+list(FILTER SRC_CPP EXCLUDE REGEX "communicationKernels/tileNvfp4/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "communicationKernels/tileNvfp4/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")

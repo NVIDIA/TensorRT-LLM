@@ -153,6 +153,15 @@ class PeerRegistrar:
         if not self._attention_policy.check_peer_compatible(peer_ri):
             return False
 
+        self_format = self._ri.fp4_mla_kv_format
+        peer_format = peer_ri.fp4_mla_kv_format
+        if self_format is not None and peer_format is not None and self_format != peer_format:
+            raise ValueError(
+                "FP4 MLA KV format mismatch between disaggregated peers: local "
+                f"{self_format!r} vs peer {peer_format!r}. Set TRTLLM_FP4_MLA_MXFP4_2D "
+                "identically on the context and generation servers."
+            )
+
         # Recurrent-state (Mamba/KDA) layout gate. Raises ValueError with a
         # field-level diagnostic instead of returning False, so the precise
         # mismatch reaches the caller of register().
