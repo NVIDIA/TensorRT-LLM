@@ -298,8 +298,20 @@ class _GateKernels:
         self._launch(self.gate, self.sms, args, stream)
 
 
-def _check_call(group, arena, routes: torch.Tensor, epoch: int, rank: int, layer: int = 0) -> list:
-    """Compare one finished layer call with the reference; returns failure strings."""
+def _check_call(
+    group,
+    arena,
+    routes: torch.Tensor,
+    epoch: int,
+    rank: int,
+    layer: int = 0,
+    helper_rows: bool = True,
+) -> list:
+    """Compare one finished layer call with the reference; returns failure strings.
+
+    ``helper_rows=False`` skips the bytewise helper rows, for a layer whose
+    shared helper bank a later layer call has already refilled.
+    """
     failures = []
     experts = _HOME_EXPERTS * _EP_SIZE
     local_slots = _HOME_EXPERTS + _HELPER_SLOTS
@@ -343,7 +355,7 @@ def _check_call(group, arena, routes: torch.Tensor, epoch: int, rank: int, layer
 
     # The relay delivered every received expert byte for byte.
     bound = arena.bound.base
-    for helper, expert in enumerate(plan.helper_table[rank]):
+    for helper, expert in enumerate(plan.helper_table[rank] if helper_rows else []):
         if expert < 0:
             continue
         for plane, nbytes in enumerate(bound.plane_bytes):
@@ -752,10 +764,24 @@ def _run_timing_worker(pdl: bool):
         launches = {"eager": [[] for _ in layers.groups], "cuda_graph": [[] for _ in layers.groups]}
         main = torch.cuda.Stream()
 
+        # Layers share the helper banks round robin, and a pass runs every layer
+        # before the check, so only the last layer on each bank still holds its
+        # helper rows; _case_alternating_banks checks each refill as it lands.
+        banks = [int(arena.provider.layer.helper_set) for arena in layers.arenas]
+        last_on_bank = {bank: layer for layer, bank in enumerate(banks)}
+
         def check(routes: list) -> None:
             for layer, (group, arena) in enumerate(zip(layers.groups, layers.arenas)):
                 failures.extend(
-                    _check_call(group, arena, routes[layer], layers.epochs[layer], rank, layer)
+                    _check_call(
+                        group,
+                        arena,
+                        routes[layer],
+                        layers.epochs[layer],
+                        rank,
+                        layer,
+                        helper_rows=last_on_bank[banks[layer]] == layer,
+                    )
                 )
 
         # Eager: the layers back to back on MAIN, one host sync per iteration.
