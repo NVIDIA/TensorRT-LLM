@@ -1562,13 +1562,20 @@ class DecoderInputPreparer:
                         # the update_helix_param call below.
                         helix_owned_new_tokens.append(0 if request.py_helix_is_inactive_rank else 1)
 
-                first_gather_id = len(position_ids)
-                position_ids.extend([position_id] * beam_width)
-                num_cached_tokens_per_seq.extend(
-                    [past_seen_token_num - request.py_num_compressed_tokens] * beam_width
-                )
-                prompt_lengths.extend([request.py_prompt_len] * beam_width)
-                gather_ids.extend(range(first_gather_id, first_gather_id + beam_width))
+                num_cached_tokens = past_seen_token_num - request.py_num_compressed_tokens
+                # Bulk extend only pays off for wide beams; plain appends are
+                # cheaper for the common beam_width == 1 case.
+                if beam_width == 1:
+                    gather_ids.append(len(position_ids))
+                    position_ids.append(position_id)
+                    num_cached_tokens_per_seq.append(num_cached_tokens)
+                    prompt_lengths.append(request.py_prompt_len)
+                else:
+                    first_gather_id = len(position_ids)
+                    position_ids.extend([position_id] * beam_width)
+                    num_cached_tokens_per_seq.extend([num_cached_tokens] * beam_width)
+                    prompt_lengths.extend([request.py_prompt_len] * beam_width)
+                    gather_ids.extend(range(first_gather_id, first_gather_id + beam_width))
 
                 if _use_mrope:
                     mrope_position_delta = getattr(request, "py_mrope_position_delta", None)
