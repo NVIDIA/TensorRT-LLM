@@ -54,6 +54,18 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
     }
 )
 
+# SM107 has no TRTLLM-Gen FMHA, so the thop paged-context kernel serves every
+# context phase there, at the 128-token pages MiniMax-M3's KV managers opt in
+# (as before those managers listed 128 as a TRTLLM-Gen extra page size); the
+# SM107 P128 paged-context oracle covers it. Every other SM keeps the refusal.
+_THOP_PAGED_CONTEXT_EXTRA_PAGES_SMS: frozenset = frozenset({107})
+
+
+def _thop_serves_extra_page_sizes() -> bool:
+    """Whether the thop paged-context kernel serves a manager's TRTLLM-Gen extra page sizes on this device."""
+    return get_sm_version() in _THOP_PAGED_CONTEXT_EXTRA_PAGES_SMS
+
+
 # ``thop.attention`` kwargs hard-wired to a literal at the call site (no
 # rich object owns them). Sync test enforces both the kwarg name and the
 # literal value.
@@ -256,6 +268,7 @@ class FallbackFmha(Fmha):
                 and phase != FmhaPhase.GENERATION
                 and metadata.use_paged_context_fmha
                 and metadata.tokens_per_block in extra_page_sizes
+                and not _thop_serves_extra_page_sizes()
             ):
                 raise RuntimeError(
                     f"FallbackFmha cannot serve paged prefill with "

@@ -890,3 +890,118 @@ def test_real_kv_pressure_rejects_reserved_prefix_without_transmission() -> None
         if blocker is not None:
             blocker.close()
         manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# probe_context_reuse is a pure lookup: the scheduler's shortest-first append reserve calls it on every pending
+# request each pass, so it must not refresh recency, onboard, or claim / pin pages.
+# ---------------------------------------------------------------------------
+
+
+def _public_state(obj):
+    return {
+        name: repr(getattr(obj, name))
+        for name in dir(obj)
+        if not name.startswith("_") and not callable(getattr(obj, name))
+    }
+
+
+def _cache_state(manager):
+    return (
+        [_public_state(s) for s in manager.impl.get_storage_statistics()],
+        _public_state(manager.impl.get_committed_stats()),
+        sorted(manager.kv_cache_map),
+    )
+
+
+def _commit_prefix(manager, request_id, tokens):
+    request = LlmRequest(
+        request_id=request_id,
+        max_new_tokens=4,
+        input_tokens=list(tokens),
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    schedule(manager, request)
+    manager.kv_cache_map[request_id].commit(list(tokens))
+    manager.free_resources(request)
+
+
+def _probe_request(request_id, tokens):
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=4,
+        input_tokens=list(tokens),
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+
+
+def test_probe_context_reuse_leaves_the_cache_state_unchanged():
+    torch.cuda.init()
+    manager = make_manager(None)
+    try:
+        prefix = list(range(PROMPT_LEN))
+        _commit_prefix(manager, 1, prefix)
+        reader = _probe_request(2, prefix + [7] * TOKENS_PER_BLOCK)
+        before = _cache_state(manager)
+        depths = {manager.probe_context_reuse(reader) for _ in range(100)}
+        assert len(depths) == 1 and depths.pop() > 0
+        assert _cache_state(manager) == before
+        assert 2 not in manager.kv_cache_map
+    finally:
+        manager.shutdown()
+
+
+def test_probe_context_reuse_does_not_refresh_eviction_recency():
+    """Commit P1, then P2; probe P1 many times; grow the pool until one prefix is evicted. A probe that touched
+    recency would make P2 the older one and evict it first; a pure lookup leaves P1 first."""
+    torch.cuda.init()
+    # No host tier: by default the V2 manager provisions one the size of the device quota, an evicted prefix
+    # migrates there and stays probe-able, and the device eviction order this test reads is never observable.
+    # 15-block fillers exhaust the free blocks within the manager's live-sequence limit, so the pool runs out of free
+    # blocks (and must evict a committed prefix) before admission is refused for that limit.
+    manager = make_manager(
+        None,
+        max_seq_len=512,
+        kv_cache_config=KvCacheConfig(max_tokens=2048, enable_block_reuse=True, host_cache_size=0),
+    )
+    try:
+        p1 = list(range(PROMPT_LEN))
+        p2 = list(range(1000, 1000 + PROMPT_LEN))
+        _commit_prefix(manager, 1, p1)
+        _commit_prefix(manager, 2, p2)
+        r1, r2 = _probe_request(3, p1 + [7] * 4), _probe_request(4, p2 + [7] * 4)
+        full1, full2 = manager.probe_context_reuse(r1), manager.probe_context_reuse(r2)
+        assert full1 > 0 and full2 > 0
+        for _ in range(50):
+            manager.probe_context_reuse(r1)
+        # Large fillers take the free blocks; once one no longer fits (admission is all or nothing), one-block
+        # fillers each need exactly one more block, which only evicting a committed prefix block can provide.
+        filler_len = 15 * TOKENS_PER_BLOCK
+        fillers = []
+        evicted = None
+        for k in range(64):
+            # Distinct tokens: a filler sharing a prefix would legitimately claim (and refresh) its blocks.
+            filler = _probe_request(
+                100 + k, list(range(5000 + 1000 * k, 5000 + 1000 * k + filler_len))
+            )
+            if not manager.prepare_context(filler) or not manager.resize_context(
+                filler, filler_len
+            ):
+                if filler.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(filler)
+                if filler_len == TOKENS_PER_BLOCK:
+                    break
+                filler_len = TOKENS_PER_BLOCK
+                continue
+            fillers.append(filler)
+            d2, d1 = manager.probe_context_reuse(r2), manager.probe_context_reuse(r1)
+            if d1 < full1 or d2 < full2:
+                evicted = "P1" if d1 < full1 else "P2"
+                break
+        assert evicted == "P1", f"expected the older prefix P1 to be evicted first, got {evicted}"
+        for filler in fillers:
+            manager.free_resources(filler)
+    finally:
+        manager.shutdown()

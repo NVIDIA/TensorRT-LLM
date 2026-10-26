@@ -24,7 +24,8 @@ modeling_v2: require
 
 | `modeling_v2` | Behaviour |
 |---|---|
-| `off` (default) | The resolver returns immediately. Nothing beyond it is imported and behaviour is byte-for-byte what it is today. |
+| `default` (default) | `auto` where the family's routing module enables the target by default (`enabled_by_default(target, role)`, the serving roles it was measured in), `off` everywhere else. A family without `enabled_by_default` is not routed at all. |
+| `off` | The resolver returns immediately. Nothing beyond it is imported and behaviour is byte-for-byte what it is today. |
 | `auto` | Uses a target when one claims this exact configuration; falls back to the built-in implementation otherwise, logging why. |
 | `require` | Raises instead of falling back, saying which criterion did not hold. |
 

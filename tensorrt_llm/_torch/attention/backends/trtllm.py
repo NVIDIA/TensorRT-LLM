@@ -40,7 +40,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...pyexecutor import step_inputs
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -57,6 +59,11 @@ from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
+
+# With an H2D skip cache active (RuntimeHooks.skip_unchanged_h2d), the prompt-length upload of prepare() joins the
+# open step-input pack instead of going out as its own copy on the main stream between the step graphs; False
+# issues it directly.
+PACK_PROMPT_LENS = True
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -1011,8 +1018,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs],
+                             pack=PACK_PROMPT_LENS)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1065,9 +1073,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
+                          maybe_pin_memory(kv_lens[:self.num_seqs]))
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1216,7 +1223,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        self.prompt_lens_cuda[:num_seqs].copy_(prompt_lens, non_blocking=True)
+        copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens

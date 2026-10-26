@@ -103,6 +103,10 @@ def test_model_moe_forward_passes_lora_params_to_routed_experts(
     )
     if moe_cls is MiniMaxM2MoE:
         fake_self.hidden_dim = hidden_dim
+    if moe_cls is MiniMaxM3MoE:
+        fake_self._prequantized_fp4 = None
+        # LoRA disables the shared-expert fold (the real check needs a GPU for the SM version).
+        fake_self.fold_shared_ok = lambda hidden_states, lora_params: False
 
     moe_cls.forward(
         fake_self,
@@ -388,6 +392,10 @@ def test_feed_forward_moe_wrappers_combine_routed_and_shared_lora() -> None:
         event_dict=MagicMock(),
         aux_stream=object(),
         allreduce=None,
+        _prequantized_fp4=None,
+        # LoRA disables both shared-expert folds (the real checks need a GPU).
+        fold_shared_ok=lambda hidden_states, lora_params: False,
+        cutedsl_fold_ok=lambda: False,
     )
     with patch.object(minimaxm3_module, "maybe_execute_in_parallel", side_effect=run_both):
         m3_output = MiniMaxM3MoE.forward(

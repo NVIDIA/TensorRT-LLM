@@ -23,8 +23,9 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import _map_to_mxfp8_large_
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="MXFP8 GEMM is supported on SM100 and SM103 only. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 GEMM is supported on SM100, SM103 and SM107 only. Current SM is %d."
+    % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "m,n,k",
@@ -62,8 +63,8 @@ def test_mxfp8_mxfp8_gemm_large_m(m: int, n: int, k: int):
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="MXFP8 tactic runner requires SM100 or SM103. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 tactic runner requires SM100, SM103 or SM107. Current SM is %d." % getSMVersion(),
 )
 def test_mxfp8_mxfp8_runner_tactics():
     """Every exposed tactic and the generic fallback produce aligned output."""
@@ -94,8 +95,8 @@ def test_mxfp8_mxfp8_runner_tactics():
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="MXFP8 tactic cache requires SM100 or SM103. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 tactic cache requires SM100, SM103 or SM107. Current SM is %d." % getSMVersion(),
 )
 def test_mxfp8_mxfp8_native_tactic_cache():
     """The direct op uses cached tactics and preserves the generic fallback."""
@@ -156,8 +157,8 @@ def test_mxfp8_mxfp8_native_tactic_cache():
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="MXFP8 tactic cache requires SM100 or SM103. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 tactic cache requires SM100, SM103 or SM107. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "lower_bound,upper_bound,bucket",
@@ -188,3 +189,52 @@ def test_mxfp8_native_tactic_cache_large_m_bucket_boundaries(
         assert runner.get_cached_tactic(upper_bound + 1, n, k) == -2
     finally:
         runner.clear_tactic_cache()
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107,
+    reason="MXFP8 small-M tuning buckets are SM107 only. Current SM is %d." % getSMVersion(),
+)
+def test_mxfp8_native_tactic_cache_sm107_small_m_buckets():
+    """SM107 small-M buckets agree between C++ and Python and give warm-turn M values a tactic."""
+    n, k = 10240, 6144
+    runner = torch.classes.trtllm.MXFP8GemmRunner(torch.bfloat16)
+    buckets = tuple(runner.get_small_m_tuning_buckets())
+    assert buckets == (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 6552)
+
+    try:
+        runner.clear_tactic_cache()
+        previous = 0
+        for bucket in buckets:
+            runner.register_tactic(bucket, n, k, 3)
+            for m in (previous + 1, bucket):
+                assert _map_to_mxfp8_large_m_bucket(m) == bucket
+                assert runner.get_cached_tactic(m, n, k) == 3
+            previous = bucket
+        assert _map_to_mxfp8_large_m_bucket(6553) == 8192
+        assert runner.get_cached_tactic(6553, n, k) == -2
+    finally:
+        runner.clear_tactic_cache()
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107,
+    reason="MXFP8 small-M tuning buckets are SM107 only. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize("m", [6, 300, 2114, 6552])
+def test_mxfp8_mxfp8_sm107_tactics_bitwise_equal(m: int):
+    """Bucketing may pick any tactic for an M value, so every tactic must match the fallback bitwise."""
+    torch.manual_seed(0)
+    n, k = 6144, 8192
+    mat_a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    mat_a[0] *= 3e3
+    mat_a[min(1, m - 1)] = 0
+    mat_b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.02
+    fp8_a, a_block_sf = torch.ops.trtllm.mxfp8_quantize(mat_a, True)
+    fp8_b, b_block_sf = torch.ops.trtllm.mxfp8_quantize(mat_b, True)
+    global_scale = torch.ones((1,), device="cuda", dtype=torch.float32)
+    runner = torch.classes.trtllm.MXFP8GemmRunner(torch.bfloat16)
+    reference = runner.run_gemm(fp8_a, a_block_sf, fp8_b, b_block_sf, global_scale, -1)
+    for tactic in range(runner.get_num_configs()):
+        output = runner.run_gemm(fp8_a, a_block_sf, fp8_b, b_block_sf, global_scale, tactic)
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)

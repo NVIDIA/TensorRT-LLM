@@ -17,6 +17,9 @@ l0_gb300_multi_nodes_node2_gpu8:
   # Kimi K3 GSM8K accuracy plus an acceptance-length gate on the TEP8 DSpark
   # recipe. Measured 25m45s on 2x4 GB300.
   - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8 TIMEOUT (60)
+  # The MiniMax-M3 modeling_v2 tp8 target (two trays): GSM8K, and with Eagle3 GSM8K plus a chat acceptance gate.
+  - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp8::test_gsm8k TIMEOUT (60)
+  - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp8::test_eagle3_gsm8k_and_acceptance TIMEOUT (60)
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp8]
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[dep8]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp8_moetp2_ep4]

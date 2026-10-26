@@ -26,6 +26,7 @@ Both publish one validation status plus the maximum row width in one Int64
 summary; no route payload is constructed.
 """
 
+from ..._worktile_scope import with_scalar_work_tile_info
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -478,6 +479,7 @@ def _fake_compact(
 
 
 @functools.cache
+@with_scalar_work_tile_info
 def compile_block_sparse_inspection(
     *,
     device_index: int,
@@ -541,6 +543,7 @@ def compile_block_sparse_inspection(
 
 
 @functools.cache
+@with_scalar_work_tile_info
 def compile_paged_block_sparse_metadata_inspection(
     *,
     device_index: int,

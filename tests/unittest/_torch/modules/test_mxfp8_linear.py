@@ -30,6 +30,7 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     MXFP8GemmRunner,
     MXFP8QuantizeRunner,
     _get_mxfp8_large_m_tuning_buckets,
+    _get_mxfp8_small_m_buckets,
     _map_to_mxfp8_large_m_bucket,
 )
 from tensorrt_llm._torch.modules.linear import (
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.modules.linear import (
     get_quant_method,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -174,6 +176,7 @@ def _mock_mxfp8_ops(
         ops=SimpleNamespace(trtllm=fake_trtllm_ops),
         ones=torch.ones,
         float32=torch.float32,
+        compiler=SimpleNamespace(is_compiling=lambda: False),
     )
     monkeypatch.setattr(linear_module, "torch", fake_torch)
     return (
@@ -405,7 +408,9 @@ def test_mxfp8_auto_fallback_does_not_rearm_native_autotuning(monkeypatch):
         (32769, 32769),
     ],
 )
-def test_mxfp8_large_m_bucket_mapping(num_tokens, expected):
+def test_mxfp8_large_m_bucket_mapping(monkeypatch, num_tokens, expected):
+    # The SM100 / SM103 large-M bands; SM107 adds small-M buckets (covered below).
+    monkeypatch.setattr(custom_ops_module, "_get_mxfp8_small_m_buckets", lambda: ())
     assert _map_to_mxfp8_large_m_bucket(num_tokens) == expected
 
 
@@ -418,8 +423,21 @@ def test_mxfp8_large_m_bucket_mapping(num_tokens, expected):
         (29765, (8192, 16384, 32768)),
     ],
 )
-def test_mxfp8_large_m_tuning_buckets(max_num_tokens, expected):
+def test_mxfp8_large_m_tuning_buckets(monkeypatch, max_num_tokens, expected):
+    monkeypatch.setattr(custom_ops_module, "_get_mxfp8_small_m_buckets", lambda: ())
     assert _get_mxfp8_large_m_tuning_buckets(max_num_tokens) == expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 107,
+    reason="the native runner has small-M buckets on SM107 only",
+)
+def test_mxfp8_small_m_buckets_map_first_on_sm107():
+    small = _get_mxfp8_small_m_buckets()
+    assert small and small == tuple(sorted(small)) and small[-1] < 8192
+    assert _map_to_mxfp8_large_m_bucket(1) == small[0]
+    assert _map_to_mxfp8_large_m_bucket(small[-1]) == small[-1]
+    assert _get_mxfp8_large_m_tuning_buckets(6599) == small + (8192,)
 
 
 def test_mxfp8_large_m_cache_profile_maps_act_and_constrains_scale():

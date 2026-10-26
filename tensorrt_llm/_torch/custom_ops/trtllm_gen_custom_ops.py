@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -647,6 +648,52 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return tuning_config
 
 
+FP4_MOE_TACTIC_TABLE_ENV = "TLLM_FP4_MOE_TACTIC_TABLE"
+# Read once at import, so eager steps and CUDA-graph capture see the same table.
+_FP4_MOE_TACTIC_TABLE_PATH = os.environ.get(FP4_MOE_TACTIC_TABLE_ENV)
+
+
+@lru_cache(maxsize=None)
+def _load_fp4_moe_tactic_table(path: str) -> dict:
+    """Load an opt-in FP4 MoE tactic table.
+
+    JSON layout: ``{"<top_k>,<intermediate_size>,<local_num_experts>,<act_type>":
+    {"<tuning bucket>": [tile_n, config], ...}, ...}``. The outer key is
+    ``FP4BlockScaleMoERunner.unique_id()``, so a table only applies to the MoE
+    shape it was built for.
+    """
+    with open(path) as f:
+        raw = json.load(f)
+    return {
+        shape: {
+            int(bucket): list(tactic)
+            for bucket, tactic in buckets.items()
+        }
+        for shape, buckets in raw.items()
+    }
+
+
+def _pinned_fp4_moe_tactic(kernel_runner: "FP4BlockScaleMoERunner",
+                           num_tokens: int) -> Optional[List[int]]:
+    """Return the pinned tactic for this runner shape and token count, if any.
+
+    Off unless ``TLLM_FP4_MOE_TACTIC_TABLE`` named a table at import. The token count is
+    mapped with the runner's own tuning-bucket rule, so a pinned entry replaces
+    exactly the autotuner's choice for that bucket. Pinning the same table on
+    every rank and server start makes the MoE output independent of per-start
+    autotuning, whose near-tie choices are not all bitwise-equivalent.
+    """
+    path = _FP4_MOE_TACTIC_TABLE_PATH
+    if not path:
+        return None
+    shape_key = ",".join(str(v) for v in kernel_runner.unique_id())
+    buckets = _load_fp4_moe_tactic_table(path).get(shape_key)
+    if not buckets:
+        return None
+    spec = kernel_runner.tuning_config.dynamic_tensor_specs[0]
+    return buckets.get(spec.map_to_tuning_buckets(num_tokens))
+
+
 @torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
 def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                routing_bias: Optional[torch.Tensor],
@@ -746,6 +793,10 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         tuning_config_with_hook,
         input_tensors_for_tuner,
     )
+    pinned_tactic = _pinned_fp4_moe_tactic(kernel_runner,
+                                           hidden_states.shape[0])
+    if pinned_tactic is not None:
+        best_tactic = pinned_tactic
 
     input_tensors = input_tensors_for_tuner
     input_tensors[
