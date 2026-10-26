@@ -92,6 +92,55 @@ def _spread(batch: int, longest: int) -> tuple[int, ...]:
     return tuple(1 + (longest - 1) * i // (batch - 1) for i in range(batch))
 
 
+#: The Beam dense block's sliding-attention layer: GQA 48q/8kv d128 over a bf16 pool,
+#: RoPE applied outside, one fresh context per call on the packed path. The window is
+#: 512 and so is the pool's per-sequence capacity (16 pages of 32), so the window equals
+#: max_seq_len and no context the block accepts reaches it.
+_BEAM_DENSE = dict(
+    input_type=STANDARD,
+    num_heads=48,
+    num_kv_heads=8,
+    head_size=128,
+    v_head_dim=128,
+    sinks=False,
+    window=512,
+    quant_mode=0,
+    mask_type=1,
+    tokens_per_block=32,
+    num_blocks=16,
+    max_num_requests=1,
+    use_paged_context_fmha=False,
+    num_contexts=1,
+    predicted_tokens_per_seq=1,
+)
+
+#: The Beam six-block model's layers as its generator runs them: the same geometry over a
+#: cache that already holds the request's earlier tokens, on the paged-context path (block
+#: reuse is on), with a 640-token per-sequence pool (20 pages) so histories cross the
+#: 512-token window. `_BEAM_FULL` is block 5, the full-attention layer.
+_BEAM_SLIDING = dict(
+    _BEAM_DENSE,
+    num_blocks=64,
+    max_num_requests=3,
+    max_blocks_per_seq=20,
+    use_paged_context_fmha=True,
+)
+_BEAM_FULL = dict(_BEAM_SLIDING, window=None)
+
+#: The Beam full model's layers on one of four TP ranks (12q/2kv d128) as a DFlash2
+#: verification step runs them: P = 8 rows per generation sequence (the anchor and seven
+#: proposals), on the paged-context path, with a 768-token per-sequence pool (24 pages) so
+#: histories cross the 512-token window. `_BEAM_TP4_FULL` is a full-attention layer.
+_BEAM_TP4_SLIDING = dict(
+    _BEAM_SLIDING,
+    num_heads=12,
+    num_kv_heads=2,
+    num_blocks=96,
+    max_num_requests=4,
+    max_blocks_per_seq=24,
+)
+_BEAM_TP4_FULL = dict(_BEAM_TP4_SLIDING, window=None)
+
 #: A GQA 24/4/256 full-attention layer (Qwen3.8-27B) over an fp8-e4m3 pool at
 #: the production kv scale 1.0. Same chosen pool sizes as `_QWEN4_DENSE`.
 _FP8_24_4_256 = dict(
@@ -765,6 +814,101 @@ class ThopAttention(OpWrapper):
                 predicted_tokens_per_seq=4,
             ),
         ),
+        *(
+            Cell(
+                why=f"beam dense block: GQA 48q/8kv d128, fresh {tokens}-row context",
+                spec=dict(_BEAM_DENSE, cached=(0,), new=(tokens,)),
+            )
+            for tokens in (1, 17, 129)
+        ),
+        Cell(
+            why="beam sliding, paged context: 17 rows over a 64-token reused prefix",
+            spec=dict(
+                _BEAM_SLIDING, cached=(64,), new=(17,), num_contexts=1, predicted_tokens_per_seq=1
+            ),
+        ),
+        Cell(
+            why="beam sliding, paged context: a fresh 513-row context, key 0 leaves the "
+            "window at row 512",
+            spec=dict(
+                _BEAM_SLIDING, cached=(0,), new=(513,), num_contexts=1, predicted_tokens_per_seq=1
+            ),
+        ),
+        Cell(
+            why="beam sliding, paged context: one row at position 512 after a 512-token "
+            "reused prefix",
+            spec=dict(
+                _BEAM_SLIDING, cached=(512,), new=(1,), num_contexts=1, predicted_tokens_per_seq=1
+            ),
+        ),
+        Cell(
+            why="beam sliding decode across the window: histories 511, 512 and 513",
+            spec=dict(
+                _BEAM_SLIDING,
+                cached=(511, 512, 513),
+                new=(1, 1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="beam full layer decode past the sliding window: histories 511, 512 and 513",
+            spec=dict(
+                _BEAM_FULL,
+                cached=(511, 512, 513),
+                new=(1, 1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="beam full layer, paged context: 17 rows over a 64-token reused prefix",
+            spec=dict(
+                _BEAM_FULL, cached=(64,), new=(17,), num_contexts=1, predicted_tokens_per_seq=1
+            ),
+        ),
+        Cell(
+            why="beam tp4 sliding verify P=8: blocks after histories 503, 504 and 505 end "
+            "at 511, 512 and 513, crossing the 512-token window",
+            spec=dict(
+                _BEAM_TP4_SLIDING,
+                cached=(503, 504, 505),
+                new=(8, 8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="beam tp4 full verify P=8: the same blocks on a full-attention layer",
+            spec=dict(
+                _BEAM_TP4_FULL,
+                cached=(503, 504, 505),
+                new=(8, 8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="beam tp4 sliding mixed step P=8: a 20-row context over a 31-token prefix "
+            "ahead of three blocks over histories 17, 600 and 129",
+            spec=dict(
+                _BEAM_TP4_SLIDING,
+                cached=(31, 17, 600, 129),
+                new=(20, 8, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="beam tp4 full mixed step P=8: the same step on a full-attention layer",
+            spec=dict(
+                _BEAM_TP4_FULL,
+                cached=(31, 17, 600, 129),
+                new=(20, 8, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
     )
 
     note = """
@@ -784,6 +928,11 @@ class ThopAttention(OpWrapper):
     step's K/V land in the right pool slots -- is what the paged-cache entries
     beside this one certify, and what the matrix here checks by reading the pool
     back rather than by a reference.
+
+    A sliding window is a mask, not a ring buffer: the append writes every token at its
+    absolute position whatever `attention_window_size` is, and a query reads the keys of its
+    window from those positions (the Beam window cells read the pool back past position 512).
+    Pages wholly below every query's window are never read.
 
     The softmax statistics the MLA chunked-prefill path writes are a second
     output; `softmax_stats` states them separately so `reference` stays one

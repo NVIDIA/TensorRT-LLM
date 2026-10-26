@@ -5539,6 +5539,7 @@ def _op_reference(
     causal: bool = True,
     e4m3: bool = False,
     layer: Optional[int] = None,
+    window: Optional[int] = None,
     nvfp4: bool = False,
 ) -> torch.Tensor:
     """`op.reference` over the history the env mirrored for these requests.
@@ -5570,6 +5571,7 @@ def _op_reference(
         v_head_dim=d,
         softmax_scale=1.0 / math.sqrt(d),
         causal=causal,
+        window=window,
         e4m3_inputs=e4m3,
         e4m3_probabilities=e4m3,
     )
@@ -7113,10 +7115,11 @@ def _cell_paged(cell, arm) -> None:
         tokens_per_block=spec["tokens_per_block"],
         num_blocks=spec["num_blocks"],
         max_batch=spec["max_num_requests"],
-        max_blocks_per_seq=16,
+        max_blocks_per_seq=spec.get("max_blocks_per_seq", 16),
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
         kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
+        attention_window_size=spec["window"],
     )
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     p, paged = spec["predicted_tokens_per_seq"], spec["use_paged_context_fmha"]
@@ -7154,7 +7157,10 @@ def _cell_paged(cell, arm) -> None:
     assert not (nvfp4 and not paged), "an NVFP4 cell runs the paged-context path"
     e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
     causal = spec["mask_type"] == MASK_CAUSAL
-    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3, nvfp4=nvfp4))
+    ref = _op_reference(
+        env, qkv, list(new), rids, causal=causal, e4m3=e4m3, window=spec["window"], nvfp4=nvfp4
+    )
+    _compare(out, ref)
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()
@@ -7296,3 +7302,150 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
         _fp8_mla_r1_generation_decode(
             cell.spec["num_heads"], cell.spec.get("predicted_tokens_per_seq", 1)
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# Beam TP4 speculative verification at the 512-token sliding window
+# ---------------------------------------------------------------------------------------------
+
+#: One TP4 rank of the Beam full model: 12 query / 2 KV heads of 128, 32-token pages.
+BEAM_HQ, BEAM_HKV, BEAM_D, BEAM_WINDOW, BEAM_P = 12, 2, 128, 512, 8
+
+
+def _beam_indicator_qkv(positions: List[int]) -> torch.Tensor:
+    """The one-hot read-out at the Beam TP4 geometry: K = 0 (every unmasked logit is 0, so the
+    softmax is uniform over exactly the attended keys), V[t] = e_t for t < 128 and 0 after, so
+    output column d of a query row is the weight it gives key d."""
+    q_w, kv_w = BEAM_HQ * BEAM_D, BEAM_HKV * BEAM_D
+    qkv = torch.zeros(len(positions), q_w + 2 * kv_w, dtype=torch.bfloat16, device="cuda")
+    qkv[:, :q_w] = torch.randn(len(positions), q_w, dtype=torch.bfloat16, device="cuda")
+    v = torch.zeros(len(positions), BEAM_HKV, BEAM_D, dtype=torch.bfloat16, device="cuda")
+    for i, t in enumerate(positions):
+        if t < BEAM_D:
+            v[i, :, t] = 1.0
+    qkv[:, q_w + kv_w :] = v.reshape(len(positions), kv_w)
+    return qkv
+
+
+def _assert_beam_row_weights(out, row: int, pos: int, window: int, label: str) -> None:
+    """Row ``row`` is the query at absolute position ``pos``: key d < 128 carries exactly
+    1 / n inside ``[pos - window + 1, pos]`` (n = keys in that range) and exactly 0 outside."""
+    w = out.view(-1, BEAM_HQ, BEAM_D)[row].float()
+    lo, n = max(0, pos - window + 1), min(pos + 1, window)
+    inside = [d for d in range(BEAM_D) if lo <= d <= pos]
+    outside = [d for d in range(BEAM_D) if not lo <= d <= pos]
+    if outside:
+        assert bool((w[:, outside] == 0).all()), f"{label}: a key outside [{lo}, {pos}] is attended"
+    expect = torch.full((BEAM_HQ,), 1.0 / n, dtype=torch.float32, device="cuda")
+    for d in inside:
+        torch.testing.assert_close(
+            w[:, d],
+            expect,
+            rtol=SWA_WEIGHT_RTOL,
+            atol=0.0,
+            msg=lambda m, d=d: f"{label}: key {d} weight off\n{m}",
+        )
+
+
+def _beam_verify_env(window: Optional[int]) -> _PagedAttnEnv:
+    return _PagedAttnEnv(
+        num_heads=BEAM_HQ,
+        num_kv_heads=BEAM_HKV,
+        head_dim=BEAM_D,
+        tokens_per_block=32,
+        num_blocks=64,
+        max_batch=1,
+        max_blocks_per_seq=24,
+        attention_window_size=window,
+    )
+
+
+def _beam_block_call(env: _PagedAttnEnv) -> torch.Tensor:
+    """One P = 8 verification block appended after the request's cached history."""
+    start = env.cached_len(0)
+    return env.call_op(
+        _beam_indicator_qkv(list(range(start, start + BEAM_P))),
+        [BEAM_P],
+        0,
+        [0],
+        MASK_CAUSAL,
+        ctx_lens_override=[env.prompt_lens[0]],
+        use_paged_context_fmha=True,
+        predicted_tokens_per_seq=BEAM_P,
+    )
+
+
+def _check_block(out: torch.Tensor, start: int, window: int, label: str) -> None:
+    """Every row of a block at positions start .. start + 7 reads out exactly its key set."""
+    for r in range(BEAM_P):
+        _assert_beam_row_weights(out, r, start + r, window, f"{label} row {r}")
+
+
+def _beam_prefill(env: _PagedAttnEnv, length: int) -> None:
+    env.add_request(0, length)
+    env.call_op(
+        _beam_indicator_qkv(list(range(length))),
+        [length],
+        1,
+        [0],
+        MASK_CAUSAL,
+        ctx_lens_override=[length],
+        use_paged_context_fmha=True,
+    )
+
+
+def _rewind(env: _PagedAttnEnv, committed: int) -> None:
+    """Native rollback of the target cache: only ``committed`` positions stay history; the
+    rejected rows of the block are overwritten by the next block's append."""
+    k, v = torch.cat(env.k_history[0]), torch.cat(env.v_history[0])
+    env.k_history[0], env.v_history[0] = [k[:committed]], [v[:committed]]
+
+
+@pytest.mark.parametrize("accepted", [2, 3, 4], ids=["commit511", "commit512", "commit513"])
+@pytest.mark.parametrize("window", [BEAM_WINDOW, None], ids=["sliding512", "full"])
+def test_beam_verify_block_straddles_the_window_and_rolls_back(window, accepted):
+    """A verification block at 508..515 over a 508-token history, ``accepted`` proposals
+    accepted (committed length 508 + 1 + accepted = 511/512/513), then the next block from the
+    committed length. On the sliding layer row r at position p keeps key p - 511 and drops key
+    p - 512 exactly; the full-attention companion keeps every key. After the rollback the pool
+    holds exactly the committed history and the new block, bitwise."""
+    torch.manual_seed(512 + accepted)
+    env = _beam_verify_env(window)
+    effective = env.attention_window_size
+    _beam_prefill(env, 508)
+    _check_block(_beam_block_call(env), 508, effective, "first block")
+    committed = 508 + 1 + accepted
+    _rewind(env, committed)
+    _check_block(_beam_block_call(env), committed, effective, f"after committing {committed}")
+    env.check_cache(0)
+
+
+def test_beam_verify_retained_rejected_tail_is_detected():
+    """Fault control: a runtime that keeps a rejected block's rows as history (no rewind after
+    two accepted proposals) appends the next block at 516 instead of 511; the exact per-row
+    read-out the rollback test applies at the committed positions must fail."""
+    torch.manual_seed(7)
+    env = _beam_verify_env(BEAM_WINDOW)
+    _beam_prefill(env, 508)
+    _check_block(_beam_block_call(env), 508, BEAM_WINDOW, "first block")
+    committed = 508 + 1 + 2
+    out = _beam_block_call(env)  # the fault: no _rewind(env, committed)
+    assert env.cached_len(0) == 508 + 2 * BEAM_P
+    with pytest.raises(AssertionError, match="weight off"):
+        _check_block(out, committed, BEAM_WINDOW, "retained tail")
+
+
+def test_beam_verify_wrong_accepted_length_is_detected():
+    """Fault control: an accounting that also counts the correction token's row as committed
+    (508 + 2 + 3 instead of 508 + 1 + 3 after three accepted proposals) appends the next block
+    one position late; the exact per-row read-out at the committed positions must fail."""
+    torch.manual_seed(11)
+    env = _beam_verify_env(BEAM_WINDOW)
+    _beam_prefill(env, 508)
+    _check_block(_beam_block_call(env), 508, BEAM_WINDOW, "first block")
+    committed = 508 + 1 + 3
+    _rewind(env, committed + 1)  # the fault: one row more than the native contract commits
+    out = _beam_block_call(env)
+    assert env.cached_len(0) == committed + 1 + BEAM_P
+    with pytest.raises(AssertionError, match="weight off"):
+        _check_block(out, committed, BEAM_WINDOW, "wrong accepted length")

@@ -1,0 +1,451 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Routed ModelingV2 target: the Beam NVFP4 full model on the native PyTorch runtime.
+
+``ModelingV2BeamFullModelNvfp4Sm103Tp4`` is what ``AutoModelForCausalLM`` builds for a
+``BeamForCausalLM`` NVFP4 checkpoint on four sm_103 ranks (attention TP4, MoE TP4/EP1, PP1, no
+attention DP), without speculative decoding or with a DFlash 2 drafter, when ``modeling_v2``
+routes it. It owns exactly one target parameter set: the full-model component
+(``model.BeamFullModelNvfp4Sm103Tp4``), constructed from the checkpoint's own ``config.json``
+and filled by ``weights.BeamNvfp4CheckpointLoader`` through the component's transactional
+``load``; there is no second embedding, head or expert copy.
+
+Each engine step is the native runtime's batch of one or more requests (up to the engine's
+``max_batch_size``), context requests first, dispatched once on the phase:
+
+* ``PrefillTarget``: a step with at least one context request (its prompt tokens, after any
+  reused prefix), possibly followed by generation requests; the logits of each request's
+  last row, or of every row when the engine asks for context logits;
+* ``DecodeTarget``: a step of generation requests, one token each; their next-token logits.
+
+Both return FP32 softcapped logits ``[rows, 151936]`` in request order; the engine's
+TorchSampler selects tokens from them. The KV cache is the engine's ``KVCacheManagerV2``; the
+component validates its layers, windows and the step's metadata before any kernel runs. Eager
+execution only: the expert provider synchronizes with the host, so CUDA graphs and the overlap
+scheduler are not supported.
+
+With a DFlash speculative config (``routing.route`` admits only the DFlash 2 drafter on the
+TRTLLM draft-attention backend) the target composes the native one-model pieces rather than a
+second scheduler, verifier or cache: the drafter ``get_draft_model`` builds from the drafter
+checkpoint (``modeling_dflash.DFlashForCausalLM``), the ``DFlashWorker`` ``get_spec_worker``
+builds, and the engine's separate draft ``KVCacheManagerV2`` pool. Every step is then a
+``VerifyTarget`` step: one target forward over the context rows and each generation request's
+``P = runtime_draft_len + 1`` rows (the pending token and its proposals), with the completed
+block outputs of the drafter's capture layers copied into the step's DFlash capture buffer and
+the FP32 softcapped logits of the verification rows (each context's last row, every generation
+row) handed to the worker, which accepts the proposals equal to the target's argmax, drafts the
+next block and returns the native result dictionary. The drafter's logits processor is the
+checkpoint's ``final_logit_softcapping``, applied once (``DFlashSoftcapLogitsProcessor``); its
+embedding and vocabulary-parallel head are views of the target's own TP vocabulary slices.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import types
+from typing import Optional
+
+import torch
+from torch import nn
+
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_nvfp4__sm_103__tp4.layout import (  # noqa: E501
+    EMBED,
+    HEAD,
+)
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm.logger import logger
+
+from .model import MAX_NUM_TOKENS, NUM_LAYERS, BeamFullModelNvfp4Sm103Tp4
+
+
+def _checkpoint_config(pretrained_config) -> tuple:
+    """The checkpoint directory and its ``config.json`` mapping, read as stored."""
+    checkpoint_dir = getattr(pretrained_config, "name_or_path", None) or getattr(
+        pretrained_config, "_name_or_path", None
+    )
+    if not checkpoint_dir or not os.path.isfile(os.path.join(checkpoint_dir, "config.json")):
+        raise ValueError(
+            "the Beam NVFP4 target is built from the checkpoint's own config.json; the "
+            f"configuration names no readable checkpoint directory ({checkpoint_dir!r})"
+        )
+    with open(os.path.join(checkpoint_dir, "config.json")) as f:
+        return checkpoint_dir, json.load(f)
+
+
+def _log_trace(phase: str, trace: list) -> None:
+    """Record the stages a traced step executed, in what order, and its requests' spans."""
+    layers = [r["layer"] for r in trace if r["stage"] == "layer"]
+    stages = [r["stage"] for r in trace]
+    spans = trace[0].get("requests", [])
+    logger.info(
+        f"[modeling_v2] first {phase} step: {len(spans)} requests (past, new tokens) {spans}, "
+        f"stages {stages[0]}..{stages[-1]}, {len(layers)} logical "
+        f"layers in order 0..{NUM_LAYERS - 1}: {layers == list(range(NUM_LAYERS))}, "
+        f"{sum(r.get('mlp') == 'sparse' for r in trace)} sparse, "
+        f"{sum(r.get('attention') == 'full' for r in trace)} full-attention"
+    )
+
+
+def check_drafter_config(draft_config, target_config: dict, target_layer_ids) -> None:
+    """Raise ValueError unless ``draft_config`` is a DFlash 2 drafter this target can serve.
+
+    The drafter reads the target's completed block outputs at ``target_layer_ids`` (zero-based
+    logical layers, ascending), shares the target's vocabulary, embedding and head (no draft
+    to target id map), runs the DFlash 2 recipe (block convolutions and the candidate
+    selector) at the target's hidden size, and declares its own unary logit softcap.
+    """
+    pretrained = draft_config.pretrained_config
+    dflash = getattr(pretrained, "dflash_config", None) or {}
+    problems = []
+    if pretrained.hidden_size != target_config["hidden_size"]:
+        problems.append(f"hidden_size {pretrained.hidden_size} != {target_config['hidden_size']}")
+    vocab = target_config["vocab_size"]
+    for key in ("vocab_size", "draft_vocab_size"):
+        value = getattr(pretrained, key, vocab)
+        if value != vocab:
+            problems.append(f"{key} {value} != the target's {vocab}")
+    layers = list(target_layer_ids or [])
+    if (
+        not layers
+        or layers != sorted(set(layers))
+        or not all(type(i) is int and 0 <= i < NUM_LAYERS for i in layers)
+        or layers != list(dflash.get("target_layer_ids") or [])
+    ):
+        problems.append(
+            f"target_layer_ids {layers} must be the drafter's own ascending, distinct layers in "
+            f"0..{NUM_LAYERS - 1} (dflash_config: {dflash.get('target_layer_ids')})"
+        )
+    for key in ("conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"):
+        if not int(dflash.get(key, 0) or 0) > 0:
+            problems.append(f"dflash_config.{key} is missing")
+    if dflash.get("final_logit_softcapping") is None:
+        problems.append("dflash_config.final_logit_softcapping is missing")
+    if problems:
+        raise ValueError(
+            "the drafter is not a DFlash 2 drafter of this target: " + "; ".join(problems)
+        )
+
+
+class _Target:
+    """One engine step through all 52 layers; traces the first single- and multi-request step."""
+
+    phase = ""
+
+    def __init__(self, model: BeamFullModelNvfp4Sm103Tp4):
+        self.model = model
+        self.traced = set()
+
+    def _run(self, attn_metadata, input_ids, position_ids, logit_rows, **kwargs):
+        kind = "batched" if attn_metadata.num_seqs > 1 else "single-request"
+        trace = None if kind in self.traced else []
+        out = self.model(
+            input_ids, position_ids, attn_metadata, logit_rows=logit_rows, trace=trace, **kwargs
+        )
+        if trace is not None:
+            self.traced.add(kind)
+            _log_trace(f"{kind} {self.phase}", trace)
+        return out
+
+
+class PrefillTarget(_Target):
+    """A step with a context request, possibly followed by generation requests."""
+
+    phase = "context"
+
+    def forward(
+        self,
+        attn_metadata,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        *,
+        return_context_logits: bool,
+    ) -> torch.Tensor:
+        rows = "all" if return_context_logits else None
+        return self._run(attn_metadata, input_ids, position_ids, rows)
+
+
+class DecodeTarget(_Target):
+    """A step of generation requests: one token each."""
+
+    phase = "generation"
+
+    def forward(
+        self,
+        attn_metadata,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        *,
+        return_context_logits: bool,
+    ) -> torch.Tensor:
+        return self._run(attn_metadata, input_ids, position_ids, None)
+
+
+class VerifyTarget(_Target):
+    """A speculative step: contexts first, then ``P`` verification rows per generation request.
+
+    Copies the completed block output of every capture layer into the step's DFlash capture
+    buffer (``maybe_capture_hidden_states`` keeps only its own layers) and returns the logits
+    of the verification rows, which must be the engine's ``gather_ids``, with the last block's
+    output.
+    """
+
+    phase = "verification"
+
+    def forward(
+        self,
+        attn_metadata,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        spec_metadata,
+        *,
+        extra_kv_tokens: int,
+    ) -> tuple:
+        rows_per_generation = spec_metadata.runtime_draft_len + 1
+        if spec_metadata.runtime_tokens_per_gen_step != rows_per_generation:
+            raise ValueError(
+                f"the step verifies {spec_metadata.runtime_tokens_per_gen_step} rows per "
+                f"generation request but drafts {spec_metadata.runtime_draft_len}; a linear "
+                "draft verifies its proposals and the pending token"
+            )
+        return self._run(
+            attn_metadata,
+            input_ids,
+            position_ids,
+            "verification",
+            generation_rows=rows_per_generation,
+            extra_kv_tokens=extra_kv_tokens,
+            block_output=spec_metadata.maybe_capture_hidden_states,
+            gather_ids=spec_metadata.gather_ids,
+            return_hidden=True,
+        )
+
+
+class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
+    """The engine-facing Beam NVFP4 full model (one rank of four)."""
+
+    def __init__(self, model_config: ModelConfig):
+        super().__init__()
+        self.model_config = model_config
+        mapping = model_config.mapping
+        self.checkpoint_dir, checkpoint_config = _checkpoint_config(model_config.pretrained_config)
+        self.model = BeamFullModelNvfp4Sm103Tp4(
+            checkpoint_config,
+            mapping,
+            torch.device("cuda", torch.cuda.current_device()),
+            max_tokens=MAX_NUM_TOKENS,
+        )
+        self._prefill = PrefillTarget(self.model)
+        self._decode = DecodeTarget(self.model)
+        self.load_record: Optional[dict] = None
+        # The native one-model pieces, built only for a speculative config.
+        self.spec_config = getattr(model_config, "spec_config", None)
+        self.draft_config: Optional[ModelConfig] = None
+        self.draft_model: Optional[nn.Module] = None
+        self.spec_worker: Optional[nn.Module] = None
+        self.use_separate_draft_kv_cache = False
+        self.extra_kv_tokens = 0
+        self.draft_load_record: Optional[dict] = None
+        if self.spec_config is not None:
+            self._build_dflash(model_config, checkpoint_config)
+        logger.info(
+            f"[modeling_v2] {type(self).__name__}: {NUM_LAYERS} layers, rank {mapping.rank} of "
+            f"{mapping.world_size}, max {MAX_NUM_TOKENS} tokens per call, speculative decoding "
+            f"{'DFlash' if self.spec_worker is not None else 'off'}"
+        )
+
+    def _build_dflash(self, model_config: ModelConfig, checkpoint_config: dict) -> None:
+        """Compose the native DFlash drafter, worker and draft-cache choice on this target."""
+        from tensorrt_llm._torch.models.modeling_dflash import (
+            DFlashSoftcapLogitsProcessor,
+            dflash_final_logit_softcap,
+        )
+        from tensorrt_llm._torch.models.modeling_speculative import (
+            _set_draft_kv_cache_quant_algo,
+            external_drafter_config_kwargs,
+            get_draft_model,
+        )
+        from tensorrt_llm._torch.speculative import (
+            get_num_extra_kv_tokens,
+            get_spec_worker,
+            should_use_separate_draft_kv_cache,
+        )
+
+        spec_config = self.spec_config
+        if not spec_config.spec_dec_mode.is_dflash():
+            raise ValueError(
+                f"the Beam NVFP4 target composes a DFlash drafter only, got "
+                f"{type(spec_config).__name__}"
+            )
+        self._verify = VerifyTarget(self.model)
+        self.draft_config = ModelConfig.from_pretrained(
+            spec_config.speculative_model,
+            **external_drafter_config_kwargs(model_config, spec_config),
+        )
+        _set_draft_kv_cache_quant_algo(self.draft_config, model_config)
+        self.draft_config.extra_attrs = model_config.extra_attrs
+        check_drafter_config(self.draft_config, checkpoint_config, spec_config.target_layer_ids)
+        # The draft pages live in the engine's separate draft KV cache manager, which the
+        # worker reads through its own pool views (TRTLLM draft attention).
+        self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(spec_config)
+        self.draft_model = get_draft_model(model_config, self.draft_config, None, self)
+        self.draft_model.logits_processor = DFlashSoftcapLogitsProcessor(
+            dflash_final_logit_softcap(self.draft_config.pretrained_config)
+        )
+        self.spec_worker = get_spec_worker(
+            spec_config,
+            model_config,
+            model_config.mapping,
+            use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+        )
+        if self.spec_worker is None:
+            raise ValueError(f"no speculative worker serves {spec_config.spec_dec_mode!r}")
+        self.spec_worker.set_draft_model(self.draft_model)
+        self.extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+
+    @property
+    def config(self):
+        return self.model_config.pretrained_config
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.model.vocab_size
+
+    def load_checkpoint(self, checkpoint_dir: str) -> dict:
+        """Fill every parameter from ``checkpoint_dir`` (collective; see the component's load)."""
+        if os.path.realpath(checkpoint_dir) != os.path.realpath(self.checkpoint_dir):
+            raise ValueError(
+                f"weights from {checkpoint_dir!r} do not belong to the configuration of "
+                f"{self.checkpoint_dir!r}"
+            )
+        self.load_record = self.model.load(checkpoint_dir)
+        return self.load_record
+
+    def shared_vocabulary_modules(self) -> tuple:
+        """Native ``Embedding`` and vocabulary-parallel ``LMHead`` over the target's own slices.
+
+        Each module's weight is the component's registered rank-local parameter itself
+        (``model.embed_tokens.weight`` / ``lm_head.weight``, rows ``[rank * V/4, (rank + 1) *
+        V/4)``), not a copy: the embedding masks ids outside the slice and all-reduces, the
+        head projects to the rank's vocabulary shard without gathering or capping. Requires a
+        completed target load.
+        """
+        from tensorrt_llm._torch.modules.embedding import Embedding, LMHead
+        from tensorrt_llm._torch.modules.linear import TensorParallelMode
+
+        if not self.model.usable:
+            raise RuntimeError("the target's embedding and head are shared after its load")
+        mapping = self.model_config.mapping
+        vocab, hidden = self.model.vocab_size, self.model.hidden
+        modules = (
+            Embedding(
+                vocab,
+                hidden,
+                dtype=torch.bfloat16,
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=False,
+            ),
+            LMHead(
+                vocab,
+                hidden,
+                dtype=torch.bfloat16,
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=False,
+            ),
+        )
+        lo, hi = self.model.vocab_interval
+        for module, name in zip(modules, (EMBED, HEAD)):
+            weight = self.model.tensor(name)
+            if tuple(module.weight.shape) != tuple(weight.shape):
+                raise ValueError(
+                    f"{type(module).__name__} holds {tuple(module.weight.shape)} rows per rank; "
+                    f"the target's {name} slice is {tuple(weight.shape)}"
+                )
+            module.weight = weight
+        embed, head = modules
+        if (embed.vocab_start_index, embed.vocab_end_index) != (lo, hi):
+            raise ValueError(
+                f"the embedding owns ids [{embed.vocab_start_index}, {embed.vocab_end_index}) on "
+                f"this rank; the target's slice is [{lo}, {hi})"
+            )
+        return embed, head
+
+    def load_draft_weights(self, weights: dict, weight_mapper=None) -> None:
+        """Load the drafter's own tensors, then give it the target's embedding and head.
+
+        The drafter checkpoint carries neither (``DFlashForCausalLM.WEIGHTS_SHARED_WITH_TARGET``)
+        and its own loader rejects every other missing tensor; the shared modules are views of
+        the target's slices (``shared_vocabulary_modules``), handed over through the drafter's
+        native ``load_weights_from_target_model``.
+        """
+        if self.draft_model is None:
+            raise RuntimeError("this target was built without a drafter")
+        self.draft_model.load_weights(weights=weights, weight_mapper=weight_mapper)
+        embed, head = self.shared_vocabulary_modules()
+        self.draft_model.load_weights_from_target_model(
+            types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=embed), lm_head=head)
+        )
+        draft_embed = self.draft_model.draft_model_full.model.embed_tokens
+        self.draft_load_record = {
+            "tensors": len(weights),
+            "embed_shares_target_storage": draft_embed.weight.data_ptr()
+            == self.model.tensor(EMBED).data_ptr(),
+            "head_shares_target_storage": self.draft_model.lm_head.weight.data_ptr()
+            == self.model.tensor(HEAD).data_ptr(),
+            "vocab_interval": list(self.model.vocab_interval),
+        }
+        logger.info(f"[modeling_v2] DFlash drafter loaded: {self.draft_load_record}")
+
+    def forward(
+        self,
+        attn_metadata,
+        input_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata=None,
+        resource_manager=None,
+        **kwargs,
+    ):
+        if inputs_embeds is not None or input_ids is None:
+            raise ValueError("the Beam NVFP4 target takes token ids, not input embeddings")
+        if kwargs.get("lora_params") is not None:
+            raise ValueError("LoRA is not supported by this target")
+        ids = input_ids.reshape(-1).to(torch.int64)
+        if self.spec_worker is None:
+            if spec_metadata is not None:
+                raise ValueError(
+                    "speculative metadata reached a Beam target built without a speculative config"
+                )
+            target = self._decode if attn_metadata.num_contexts == 0 else self._prefill
+            return target.forward(
+                attn_metadata, ids, position_ids, return_context_logits=return_context_logits
+            )
+        if spec_metadata is None:
+            raise ValueError(
+                "the DFlash target verifies every step; the engine passed no speculative metadata"
+            )
+        logits, hidden = self._verify.forward(
+            attn_metadata, ids, position_ids, spec_metadata, extra_kv_tokens=self.extra_kv_tokens
+        )
+        return self.spec_worker(
+            input_ids=ids,
+            position_ids=position_ids,
+            hidden_states=hidden,
+            logits=logits,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=self.draft_model,
+            resource_manager=resource_manager,
+        )
+
+
+__all__ = [
+    "DecodeTarget",
+    "ModelingV2BeamFullModelNvfp4Sm103Tp4",
+    "PrefillTarget",
+    "VerifyTarget",
+    "check_drafter_config",
+]

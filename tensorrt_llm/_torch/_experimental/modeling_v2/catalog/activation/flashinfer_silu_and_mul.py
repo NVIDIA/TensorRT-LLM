@@ -23,7 +23,8 @@ class FlashinferSiluAndMul(OpWrapper):
 
     # deepseek-r1 is the only shipped caller. It reaches this op from two
     # widths -- the routed/shared expert intermediate and the dense layers'
-    # -- at decode and prefill token counts.
+    # -- at decode and prefill token counts. The Beam dense block component
+    # calls it at its 20480 intermediate and three context lengths.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode-shaped, 2 x moe_intermediate (2048)",
@@ -36,6 +37,13 @@ class FlashinferSiluAndMul(OpWrapper):
         Cell(
             why="the dense layers' wider intermediate, 2 x 18432",
             spec=dict(shape=(16, 36864), dtype=torch.bfloat16),
+        ),
+        *(
+            Cell(
+                why=f"beam dense block, {tokens} tokens: 2 x 20480",
+                spec=dict(shape=(tokens, 40960), dtype=torch.bfloat16),
+            )
+            for tokens in (1, 17, 129)
         ),
         Cell(
             why="deepseek default at attention TP8: the shared expert's gate+up, 2 x 2048/8",
