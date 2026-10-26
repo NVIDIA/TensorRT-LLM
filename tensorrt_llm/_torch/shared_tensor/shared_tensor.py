@@ -81,6 +81,7 @@ class _SharedTensorRebuildMethodRegistry:
     REBUILD_CUDA = 1
     REBUILD_CPU = 2
     REBUILD_LOCAL = 3
+    REBUILD_BYTES = 4
 
     _registry: Dict[int, Callable] = {}
 
@@ -376,6 +377,22 @@ class SharedTensorContainer:
         return cls(method_key, tensor_handle)
 
     @classmethod
+    def from_tensor_bytes(cls, tensor: torch.Tensor) -> 'SharedTensorContainer':
+        """Copy tensor values into a JSON-safe, cross-host payload."""
+        tensor_host = tensor.detach().cpu().contiguous()
+        return cls(
+            _SharedTensorRebuildMethodRegistry.REBUILD_BYTES, {
+                "tensor_size":
+                list(tensor_host.shape),
+                "dtype":
+                str(tensor_host.dtype),
+                "data":
+                base64.b64encode(
+                    tensor_host.reshape(-1).view(
+                        torch.uint8).numpy().tobytes()).decode('ascii'),
+            })
+
+    @classmethod
     def from_dict(cls, tensor_info: Dict[str, Any]) -> 'SharedTensorContainer':
         """Create a SharedTensorContainer from a serialized dictionary (Consumer side).
 
@@ -393,6 +410,11 @@ class SharedTensorContainer:
             ValueError: If the method_key is not supported
         """
         method_key = tensor_info['method_key']
+        if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_BYTES:
+            return cls(method_key, {
+                key: tensor_info[key]
+                for key in ("tensor_size", "dtype", "data")
+            })
         if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
             return cls(
                 method_key, {
@@ -419,6 +441,14 @@ class SharedTensorContainer:
         Returns:
             The reconstructed tensor
         """
+        if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_BYTES:
+            dtype = str_to_torch_dtype(self.tensor_handle["dtype"])
+            data = bytearray(
+                base64.b64decode(self.tensor_handle["data"], validate=True))
+            shape = self.tensor_handle["tensor_size"]
+            if not data:
+                return torch.empty(0, dtype=dtype).reshape(shape)
+            return torch.frombuffer(data, dtype=dtype).clone().reshape(shape)
         if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
             if self.tensor_handle["producer_pid"] != os.getpid():
                 raise RuntimeError(
@@ -442,6 +472,8 @@ class SharedTensorContainer:
         Returns:
             Dictionary containing the serialized tensor information
         """
+        if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_BYTES:
+            return {"method_key": self.method_key, **self.tensor_handle}
         if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
             return {
                 "method_key": self.method_key,

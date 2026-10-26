@@ -560,7 +560,9 @@ class MultimodalParams:
         from tensorrt_llm._torch.shared_tensor import \
             _SharedTensorRebuildMethodRegistry
 
-        if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
+        if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_BYTES:
+            return {'tensor_size', 'dtype', 'data'}.issubset(obj.keys())
+        elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
             cuda_keys = {'tensor_size', 'storage_handle', 'storage_device'}
             return cuda_keys.issubset(obj.keys())
         elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
