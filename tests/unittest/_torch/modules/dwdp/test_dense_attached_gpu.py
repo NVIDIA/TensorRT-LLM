@@ -17,12 +17,12 @@
 A real ``DenseDWDP`` runtime, with staging slots from ``allocate_slot_ring`` and a launcher that
 copies each layer's source bytes into the layer's slots, and a real ``DWDPWeightManager``, over a
 stand-in for ``WeightBuffer`` whose prefetch slots hold the remote experts, share one copy stream.
-A harness drives them the way the executor loop (``DwdpManager.start_forward``),
-``KimiLinearModel`` (H0-H3) and ``ConfigurableMoE`` do, with a read kernel in every read window:
-the attention weights between H1 and H2, the MoE-dense weights before the expert bind and after the
-expert finish, the experts between the bind and the finish.  Delaying the reads exposes a missing
-WAR wait (a copy overwrites a slot that is still being read), delaying the copies a missing RAW
-wait.  Every read is checked against the bytes of its layer.
+The attached ``DenseDwdpManager`` holds both.  A harness drives them the way the executor loop
+(``DwdpManager.start_forward``), ``KimiLinearModel`` (H0-H3) and ``ConfigurableMoE`` do, with a
+read kernel in every read window: the attention weights between H1 and H2, the MoE-dense weights
+before the expert bind and after the expert finish, the experts between the bind and the finish.
+Delaying the reads exposes a missing WAR wait (a copy overwrites a slot that is still being read),
+delaying the copies a missing RAW wait.  Every read is checked against the bytes of its layer.
 """
 
 import itertools
@@ -32,9 +32,11 @@ from typing import Dict, List, Optional, Tuple
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.dwdp.dense.manager import DenseDwdpManager
 from tensorrt_llm._torch.modules.dwdp.dense.runtime import DenseDWDP
 from tensorrt_llm._torch.modules.dwdp.dense.types import (
     RING_DEPTH,
+    DenseMode,
     SegmentKind,
     SlotSpec,
     allocate_slot_ring,
@@ -140,12 +142,16 @@ class _Harness:
             kind: allocate_slot_ring(SlotSpec(kind, RING_DEPTH[kind], dense_bytes, 1), "cuda")
             for kind in segments
         }
-        self.dense = DenseDWDP(layers, segments, slots, self.wm.copy_stream)
+        self.dense = DenseDWDP(
+            layers, segments, slots, self.wm.copy_stream, prefetch_next_pass=True
+        )
         self.dense.set_launcher(self._launch_dense)
         self.dense.commit(None)
+        self.dense_manager = DenseDwdpManager(DenseMode.ATTACHED)
+        self.dense_manager.attach(self.dense, expert=self.wm)
         self.mgr = object.__new__(DwdpManager)
         self.mgr._weight_manager = self.wm
-        self.mgr._dense = self.dense
+        self.mgr._dense_manager = self.dense_manager
         self.backend = _Backend()
         self.compute_stream = torch.cuda.Stream()
         self.results: List[Tuple[str, int, torch.Tensor]] = []
@@ -182,7 +188,7 @@ class _Harness:
             self.mgr.start_forward()
         self.compute_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.compute_stream):
-            self.mgr.ensure_primed()  # H0
+            self.dense_manager.ensure_primed()  # H0
             for layer in self.layers:
                 point = stop[0] if stop is not None and stop[1] == layer else None
                 if point == "H1":

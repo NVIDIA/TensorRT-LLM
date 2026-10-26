@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._torch.modules.dwdp import fabric_gather
 from tensorrt_llm._torch.modules.dwdp.weight_manager import DWDPWeightManager
 
 pytestmark = pytest.mark.cpu_only
@@ -200,6 +201,51 @@ class TestDWDPPrefetchPipeline:
         assert self.log == []
         self.manager.start_forward()
         assert self.log == self._first_layers()
+
+    @pytest.mark.parametrize(
+        "copy_mode, env, transfer",
+        [
+            ("batched", "1", "_prefetch_layer_batched"),
+            ("gather", "0", "_prefetch_layer_gather"),
+            ("per_slice", "1", "_prefetch_layer_per_slice"),
+            (None, "1", "_prefetch_layer_gather"),
+            (None, "0", "_prefetch_layer_per_slice"),
+        ],
+    )
+    def test_copy_mode_picks_the_prefetch_transfer(
+        self, monkeypatch: pytest.MonkeyPatch, copy_mode: str | None, env: str, transfer: str
+    ) -> None:
+        """``DwdpConfig.copy_mode`` picks the transfer whatever ``TRTLLM_DWDP_PREFETCH_GATHER``
+        asks for; without it the variable does."""
+        monkeypatch.setenv("TRTLLM_DWDP_PREFETCH_GATHER", env)
+        monkeypatch.setattr(fabric_gather, "gather_op", lambda: object())
+        monkeypatch.setattr(fabric_gather, "apply_compute_side_defaults", lambda: None)
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.modules.dwdp.weight_manager.torch.cuda.Event",
+            lambda: _Event("event", self.log),
+        )
+        used = []
+        for name in (
+            "_prefetch_layer_batched",
+            "_prefetch_layer_gather",
+            "_prefetch_layer_per_slice",
+        ):
+            monkeypatch.setattr(
+                DWDPWeightManager, name, lambda _self, layer, name=name: used.append(name)
+            )
+        manager = DWDPWeightManager(
+            weight_buffer=self.weight_buffer,
+            peer_views={},
+            peer_ranges=[(0, 2), (2, 4)],
+            moe_layer_indices=LAYERS,
+            weight_names=["gate_up_proj", "down_proj"],
+            dwdp_rank=0,
+            dwdp_size=2,
+            copy_mode=copy_mode,
+        )
+        manager._released = True
+        manager.prefetch_layer(LAYERS[0])
+        assert used == [transfer]
 
     def test_unknown_layer_raises(self):
         with pytest.raises(KeyError):

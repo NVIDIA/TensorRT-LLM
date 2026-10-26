@@ -14,14 +14,14 @@
 # limitations under the License.
 """CPU tests of ``DenseConfig``, the dense DWDP settings setup and the runtime read.
 
-``DwdpConfig.enable_dense`` is the only public setting; the other fields keep the values every
-launch uses and are set by tests only.
+``DwdpConfig.enable_dense``, ``copy_mode`` and ``gather_kernel`` are the public settings; the other
+fields keep the values every launch uses and are set by tests only.
 """
 
 import pytest
 
 from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
-from tensorrt_llm._torch.modules.dwdp.dense.types import DEFAULT_MIN_BYTES, SegmentKind
+from tensorrt_llm._torch.modules.dwdp.dense.types import DEFAULT_MIN_BYTES, CopyMode, SegmentKind
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -40,6 +40,15 @@ def test_a_launch_sets_only_whether_dense_dwdp_is_on(
     config = DenseConfig.from_dwdp_config(dwdp_config)
     assert config.segments == (SegmentKind.ATTN, SegmentKind.MOE)
     assert (config.min_bytes, config.store_chunk_mb, config.strict) == (DEFAULT_MIN_BYTES, 0, False)
+
+
+def test_a_launch_sets_the_standalone_transfer() -> None:
+    """``from_dwdp_config`` also takes ``copy_mode`` and ``gather_kernel``."""
+    config = DenseConfig.from_dwdp_config(
+        DwdpConfig(enable_experts=False, enable_dense=True, copy_mode="gather", gather_kernel="tma")
+    )
+    assert (config.copy, config.gather_kernel) == (CopyMode.GATHER, "tma")
+    assert DenseConfig.from_dwdp_config(DwdpConfig(enable_dense=True)).gather_kernel is None
 
 
 def test_segments_are_canonical_and_start_with_attention() -> None:

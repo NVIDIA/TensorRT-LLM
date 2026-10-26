@@ -74,6 +74,29 @@ _CopyBatch = Tuple[List[int], List[int], List[int]]
 _GatherPlan = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 
+def expert_transfer(copy_mode: Optional[str], contention_opt: bool) -> Tuple[bool, bool]:
+    """``(use_gather, use_batched_prefetch)`` of the expert DWDP prefetch.
+
+    ``copy_mode`` (``DwdpConfig.copy_mode``) picks the transfer when it is set: ``"gather"`` (the
+    SM fabric gather), ``"batched"`` (one batched copy-engine copy per layer) or ``"per_slice"``
+    (one copy-engine copy per slice).  When it is None, the gather runs if
+    ``TRTLLM_DWDP_PREFETCH_GATHER`` asks for it and its op is registered
+    (``fabric_gather.available``), and ``contention_opt`` selects the batched copy.
+
+    Raises:
+        ValueError: ``copy_mode`` is ``"gather"`` and ``trtllm::dwdp_fabric_gather`` is not
+            registered.
+    """
+    if copy_mode is None:
+        return fabric_gather.available(), contention_opt
+    if copy_mode == "gather" and fabric_gather.gather_op() is None:
+        raise ValueError(
+            "dwdp_config.copy_mode='gather' needs trtllm::dwdp_fabric_gather, which this build "
+            "does not register; set copy_mode to 'batched' or 'per_slice'"
+        )
+    return copy_mode == "gather", copy_mode == "batched"
+
+
 class DWDPWeightManager:
     """Runtime P2P copy orchestrator for DWDP expert weight prefetch.
 
@@ -129,6 +152,7 @@ class DWDPWeightManager:
         dwdp_size: int,
         contention_opt: bool = False,
         repeated_layer_indices: Sequence[int] = (),
+        copy_mode: Optional[str] = None,
     ) -> None:
         """Initialize the DWDPWeightManager.
 
@@ -162,6 +186,9 @@ class DWDPWeightManager:
             repeated_layer_indices: MoE layers that run several times in a row
                 within a forward pass; their repeats bind the copy still in
                 the slot (see ``PrefetchSchedule``).
+            copy_mode: ``DwdpConfig.copy_mode``: the transfer, which overrides
+                ``contention_opt`` and ``TRTLLM_DWDP_PREFETCH_GATHER`` when set
+                (see ``expert_transfer``).
 
         Raises:
             ValueError: If dwdp_rank is out of range, dwdp_size is invalid,
@@ -230,21 +257,19 @@ class DWDPWeightManager:
         # do not move during inference) so we cache one ``(dst_ptrs,
         # src_ptrs, sizes)`` tuple per layer to avoid host-side rebuild on
         # every prefetch.
-        self._use_batched_prefetch = contention_opt
+        # SM gather: the same per-peer plan, pulled by a kernel instead of the copy
+        # engine (see ``fabric_gather``).  Opt-in; without copy_mode it is off if the
+        # op is not registered.  Layers whose descriptors are not 16-byte aligned
+        # cache None and fall back to the copy engine.
+        self._use_gather, self._use_batched_prefetch = expert_transfer(copy_mode, contention_opt)
         self._batched_copy_plans: Dict[int, _CopyBatch] = {}
         self._released = False
-
-        # SM gather: the same per-peer plan, pulled by a kernel instead of the copy
-        # engine (see ``fabric_gather``).  Opt-in; off if the op is not registered.
-        # Layers whose descriptors are not 16-byte aligned cache None and fall back
-        # to the copy engine.
-        self._use_gather = fabric_gather.available()
         if self._use_gather:
             # Pin the dense GEMM to the CLC scheduler and turn off cooperative MoE
             # routing unless the user set them explicitly.  Runs during setup, before
             # the first forward.  The persistent grids' SM reserve is set by DwdpManager.
             fabric_gather.apply_compute_side_defaults()
-        if fabric_gather.is_enabled() and not self._use_gather:
+        if copy_mode is None and fabric_gather.is_enabled() and not self._use_gather:
             logger.warning(
                 "[DWDPWeightManager] Fabric gather requested but trtllm::dwdp_fabric_gather is "
                 "not registered; falling back to the copy-engine prefetch"
@@ -257,7 +282,9 @@ class DWDPWeightManager:
             f"weights={self._weight_names}, "
             f"experts_per_rank={self._experts_per_rank}, "
             f"contention_opt={contention_opt}, "
-            f"gather={self._use_gather}"
+            f"copy_mode={copy_mode}, "
+            f"gather={self._use_gather}, "
+            f"batched={self._use_batched_prefetch}"
         )
 
     @property

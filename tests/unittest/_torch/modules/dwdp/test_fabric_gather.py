@@ -108,6 +108,22 @@ def test_resident_sms_is_the_block_count_of_a_resident_gather(monkeypatch):
     assert fabric_gather.resident_sms() == 24
 
 
+def test_resident_sms_of_a_gather_chosen_by_the_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Standalone dense DWDP passes its own transport choice instead of the expert one."""
+    _unset(monkeypatch, "TRTLLM_CUTEDSL_SM_RESERVE")
+    monkeypatch.setenv("TRTLLM_DWDP_GATHER_BLOCKS", "30")
+    monkeypatch.setattr(fabric_gather, "available", lambda: False)
+    monkeypatch.setattr(fabric_gather, "THREADS", 1024)
+    assert fabric_gather.resident_sms(gather=True) == 30
+    assert fabric_gather.resident_sms(gather=False) == 0
+    monkeypatch.setattr(fabric_gather, "available", lambda: True)
+    assert fabric_gather.resident_sms(gather=False) == 0
+    monkeypatch.setattr(fabric_gather, "THREADS", 128)
+    assert fabric_gather.resident_sms(gather=True) == 0
+    monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", "24")
+    assert fabric_gather.resident_sms(gather=False) == 24
+
+
 def test_sm_reserve_is_set_explicitly():
     from tensorrt_llm._torch import cute_dsl_utils
 
@@ -140,3 +156,47 @@ def test_sm_reserve_shrinks_supported_grids_only(full, cluster_size, reserve, ex
     from tensorrt_llm._torch.cute_dsl_utils import reserved_max_active_clusters
 
     assert reserved_max_active_clusters(full, cluster_size, reserve) == expected
+
+
+_KERNEL_ENV = "TRTLLM_DWDP_GATHER_KERNEL"
+
+
+def _unset_kernel_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset the kernel variable, and restore it afterwards: ``select_kernel`` writes
+    ``os.environ`` directly, and ``monkeypatch.delenv`` records nothing for an unset variable."""
+    monkeypatch.setenv(_KERNEL_ENV, "")
+    monkeypatch.delenv(_KERNEL_ENV)
+
+
+@pytest.mark.parametrize(
+    "kernel, env, expected, warned",
+    [
+        ("tma", None, "tma", None),
+        ("register", "register", "register", None),
+        ("register", "tma", "register", "overrides TRTLLM_DWDP_GATHER_KERNEL='tma'"),
+        (None, "tma", "tma", "is deprecated; set dwdp_config.gather_kernel"),
+        (None, None, None, None),
+    ],
+    ids=["config", "same-value", "config-over-env", "env-only", "unset"],
+)
+def test_select_kernel_points_the_launcher_at_the_config(
+    monkeypatch: pytest.MonkeyPatch,
+    kernel: str | None,
+    env: str | None,
+    expected: str | None,
+    warned: str | None,
+) -> None:
+    """The configured kernel wins over the environment; the environment alone still applies."""
+    _unset_kernel_env(monkeypatch)
+    if env is not None:
+        monkeypatch.setenv(_KERNEL_ENV, env)
+    warnings = []
+    monkeypatch.setattr(fabric_gather.logger, "warning", warnings.append)
+
+    fabric_gather.select_kernel(kernel)
+
+    assert os.environ.get(_KERNEL_ENV) == expected
+    if warned is None:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1 and warned in warnings[0], warnings

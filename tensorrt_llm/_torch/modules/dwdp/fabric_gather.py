@@ -15,11 +15,12 @@
 
 """Host-side access to the DWDP fabric-gather kernel (``trtllm::dwdp_fabric_gather``).
 
-Opt-in via ``TRTLLM_DWDP_PREFETCH_GATHER=1``: an SM kernel issuing 16-byte loads out-runs the copy
-engine but occupies SMs for the whole step, so it only pays off while compute hides behind the copy.
-``TRTLLM_DWDP_GATHER_LIB`` loads the op from a prebuilt library; ``TRTLLM_DWDP_GATHER_BLOCKS`` and
-``TRTLLM_DWDP_GATHER_THREADS`` size the grid; the launcher reads ``TRTLLM_DWDP_GATHER_CLUSTER`` and
-``TRTLLM_DWDP_GATHER_KERNEL=tma``.  See ``apply_compute_side_defaults`` for the compute-side knobs.
+Opt-in via ``DwdpConfig.copy_mode='gather'`` (or the deprecated ``TRTLLM_DWDP_PREFETCH_GATHER=1``):
+an SM kernel issuing 16-byte loads out-runs the copy engine but occupies SMs for the whole step, so
+it only pays off while compute hides behind the copy.  ``DwdpConfig.gather_kernel`` picks the kernel
+(:func:`select_kernel`).  ``TRTLLM_DWDP_GATHER_LIB`` loads the op from a prebuilt library;
+``TRTLLM_DWDP_GATHER_BLOCKS`` and ``TRTLLM_DWDP_GATHER_THREADS`` size the grid; the launcher reads
+``TRTLLM_DWDP_GATHER_CLUSTER``.  See ``apply_compute_side_defaults`` for the compute-side knobs.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 _ENABLE_ENV = "TRTLLM_DWDP_PREFETCH_GATHER"
+_KERNEL_ENV = "TRTLLM_DWDP_GATHER_KERNEL"
 _LIB_ENV = "TRTLLM_DWDP_GATHER_LIB"
 _BLOCKS_ENV = "TRTLLM_DWDP_GATHER_BLOCKS"
 _THREADS_ENV = "TRTLLM_DWDP_GATHER_THREADS"
@@ -109,19 +111,57 @@ def available() -> bool:
     return is_enabled() and gather_op() is not None
 
 
-def resident_sms() -> int:
-    """SMs the persistent compute grids leave to the gather; read once, by ``DwdpManager``.
+def env_request() -> Optional[bool]:
+    """What ``TRTLLM_DWDP_PREFETCH_GATHER`` asks for: None when it is unset or empty."""
+    if not os.environ.get(_ENABLE_ENV):
+        return None
+    return is_enabled()
+
+
+def resident_sms(gather: Optional[bool] = None) -> int:
+    """SMs the persistent compute grids leave to the gather; read once, by the DWDP managers.
 
     ``TRTLLM_CUTEDSL_SM_RESERVE`` pins the count.  Otherwise it is the gather's block count where
     the gather is the transport and one block of ``THREADS >= 512`` fills an SM; smaller blocks
     share SMs with the compute kernels and reserve none.
+
+    Args:
+        gather: Whether the gather is the transport; None means :func:`available`, the expert
+            DWDP choice (``DwdpManager``).  Standalone dense DWDP passes its own choice.
     """
     pinned = _int_env(_SM_RESERVE_ENV, -1)
     if pinned >= 0:
         return pinned
-    if not available() or THREADS < 512:
+    uses_gather = available() if gather is None else gather
+    if not uses_gather or THREADS < 512:
         return 0
     return total_blocks()
+
+
+def select_kernel(kernel: Optional[str]) -> None:
+    """Point the gather launcher at ``kernel`` (``DwdpConfig.gather_kernel``).
+
+    The launcher reads ``TRTLLM_DWDP_GATHER_KERNEL`` once, at its first launch, so this must run
+    before the first gather.  ``kernel`` replaces a different value the environment holds, with a
+    warning; without ``kernel`` the environment variable still applies and is reported as
+    deprecated.
+
+    Args:
+        kernel: ``"register"`` or ``"tma"``; None keeps the environment as it is.
+    """
+    current = os.environ.get(_KERNEL_ENV)
+    if kernel is None:
+        if current:
+            logger.warning(
+                f"[DWDP] {_KERNEL_ENV}={current!r} is deprecated; set dwdp_config.gather_kernel "
+                "instead"
+            )
+        return
+    if current and current != kernel:
+        logger.warning(
+            f"[DWDP] dwdp_config.gather_kernel={kernel!r} overrides {_KERNEL_ENV}={current!r}"
+        )
+    os.environ[_KERNEL_ENV] = kernel
 
 
 def apply_compute_side_defaults() -> None:

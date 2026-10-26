@@ -14,19 +14,20 @@
 # limitations under the License.
 """Dense DWDP setup: phases P1-P6 over six collectives.
 
-Setup runs once per context worker, from ``DwdpManager.setup`` right after the expert DWDP setup
-returned, so the model is fully loaded and post-processed and the expert transport, buffers and
-backend fixups are done.  Each phase's local work is wrapped so that a failure becomes
-``ok=False`` in the next collective instead of an exception that would skip it; every rank makes
-the same collectives in the same order, reaches the same verdict from the same gathered payloads,
-and raises or returns together with the others.
+Setup runs once per context worker, after the model is fully loaded and post-processed: from
+``DwdpManager.setup`` right after the expert DWDP setup returned (with expert DWDP, so the expert
+transport, buffers and backend fixups are done), or from ``manager.DenseDwdpManager.setup``
+(standalone, over the attention-DP group).  Each phase's local work is wrapped so that a failure
+becomes ``ok=False`` in the next collective instead of an exception that would skip it; every
+rank makes the same collectives in the same order, reaches the same verdict from the same
+gathered payloads, and raises or returns together with the others.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple, NoReturn
+from typing import NamedTuple, NoReturn, Protocol
 
 import torch
 from torch import nn
@@ -53,12 +54,10 @@ from .types import (
     LayerLauncher,
     SegmentKind,
     SlotBuffer,
+    StreamLike,
     TorchCudaOps,
     allocate_slot_ring,
 )
-
-if TYPE_CHECKING:
-    from ..weight_manager import DWDPWeightManager
 
 #: Free device memory P1 requires on top of the store and the slots.
 SETUP_HEADROOM_BYTES = 2 << 30
@@ -75,6 +74,32 @@ _COLLECTIVES = {
 
 #: Most paths or findings one message lists.
 _MAX_LISTED = 8
+
+
+class DenseTransfer(Protocol):
+    """Where and how the dense copies run.
+
+    ``DWDPWeightManager`` (with expert DWDP: the expert DWDP copy stream and transfer) and
+    ``manager.StandaloneTransfer`` (standalone: the dense manager's own stream and
+    ``DwdpConfig.copy_mode``) implement it.  Setup first reads ``copy_stream`` in P2, inside the
+    phase's local work: an implementation may create the stream on that first read, and a failure
+    then becomes this rank's failed P2 report.
+    """
+
+    @property
+    def copy_stream(self) -> StreamLike:
+        """The stream every dense copy runs on; the same object on every read."""
+        ...
+
+    @property
+    def use_gather(self) -> bool:
+        """Whether the copies use the SM fabric gather (``CopyMode.GATHER``)."""
+        ...
+
+    @property
+    def use_batched_prefetch(self) -> bool:
+        """Whether the copies use one batched copy-engine copy per layer (``CopyMode.BATCHED``)."""
+        ...
 
 
 class PhaseReport(NamedTuple):
@@ -133,10 +158,10 @@ class _CommitData(NamedTuple):
 #: Builds the row store for ``(layout, rank, device)``; tests pass the loopback store.
 StoreFactory = Callable[[DenseLayout, int, torch.device], DenseShardStore]
 
-#: Builds the copy launcher for ``(plans, weight_manager, device)``; setup calls it with the
-#: expert DWDP copy stream current.
+#: Builds the copy launcher for ``(plans, transfer, device)``; setup calls it with the transfer's
+#: copy stream current.
 LauncherFactory = Callable[
-    [Mapping[int, LayerCopyPlan], "DWDPWeightManager", torch.device], LayerLauncher
+    [Mapping[int, LayerCopyPlan], DenseTransfer, torch.device], LayerLauncher
 ]
 
 #: ``(free, total)`` bytes of the dense device, as ``torch.cuda.mem_get_info`` returns them.
@@ -146,12 +171,14 @@ MemGetInfo = Callable[[], tuple[int, int]]
 def dense_roots_available(model: nn.Module) -> bool:
     """Whether the model's decoder layers provide ``dense_dwdp_roots``.
 
-    ``DwdpManager.setup`` calls :func:`setup_dense_dwdp` for such models whether or not dense
-    DWDP is requested on this rank, so collective #1 always runs and catches ranks whose
-    ``DwdpConfig.enable_dense`` disagrees.  The answer depends only on the model code, so it is
-    the same on every rank: for a model without roots no rank makes a dense collective, and a
-    rank that asks for dense DWDP calls :func:`refuse_dense_dwdp_without_roots` instead.  The
-    decoder is found as the expert DWDP setup finds it; a model without one has no roots.
+    With expert DWDP, ``DwdpManager.setup`` calls :func:`setup_dense_dwdp` for such models whether
+    or not dense DWDP is requested on this rank, so collective #1 always runs and catches ranks
+    whose ``DwdpConfig.enable_dense`` disagrees.  Standalone, ``DenseDwdpManager.setup`` checks it
+    before it creates the dense group.  The answer depends only on the model code, so it is the
+    same on every rank: for a model without roots no rank makes a dense collective (standalone,
+    no rank builds the group either), and a rank that asks for dense DWDP calls
+    :func:`refuse_dense_dwdp_without_roots` instead.  The decoder is found as the expert DWDP
+    setup finds it; a model without one has no roots.
     """
     try:
         decoder = _get_decoder_model(model)
@@ -163,11 +190,13 @@ def dense_roots_available(model: nn.Module) -> bool:
 def refuse_dense_dwdp_without_roots(model: nn.Module) -> NoReturn:
     """Turn down a request for dense DWDP on a model without ``dense_dwdp_roots``.
 
-    ``DwdpManager.setup`` calls it instead of :func:`setup_dense_dwdp` on a rank that asks for
-    dense DWDP (``DwdpConfig.enable_dense``) when :func:`dense_roots_available` is False.  No rank
-    makes a dense collective for such a model (whether it has roots is the same on every rank), so
-    this rank raises alone and at once rather than wait in collective #1 for peers that do not ask
-    for dense DWDP.  A rank that does not ask for it does not call it and carries on.
+    ``DwdpManager.setup`` (with expert DWDP) calls it instead of :func:`setup_dense_dwdp` on a
+    rank that asks for dense DWDP (``DwdpConfig.enable_dense``) when :func:`dense_roots_available`
+    is False, and so does ``DenseDwdpManager.setup`` (standalone, where every rank asks for dense
+    DWDP) instead of building the dense group.  No rank makes a dense collective for such a model
+    (whether it has roots is the same on every rank), so this rank raises alone and at once rather
+    than wait in collective #1 for peers that do not ask for dense DWDP.  A rank that does not ask
+    for it does not call it and carries on.
 
     Args:
         model: The loaded model, named in the message.
@@ -201,13 +230,13 @@ def dense_dwdp_active(model: nn.Module) -> bool:
 
 def setup_dense_dwdp(
     model: nn.Module,
-    weight_manager: DWDPWeightManager,
+    transfer: DenseTransfer,
     comm: GroupComm,
     *,
     dwdp_rank: int,
     dwdp_size: int,
     device_id: int,
-    moe_layers: list[int],
+    moe_layers: Sequence[int] | None = None,
     config: DenseConfig,
     store_factory: StoreFactory | None = None,
     ops: DeviceOps | None = None,
@@ -221,7 +250,7 @@ def setup_dense_dwdp(
 
     1. P1: ``layout.collect_dense_layout`` over the decoder layers with the
        ``dense_dwdp_attr_allow`` / ``dense_dwdp_exclude`` tables the layers carry, check that the
-       covered layers are ``moe_layers`` and that ``free >= store + slots +
+       covered layers are ``moe_layers`` (if given) and that ``free >= store + slots +
        SETUP_HEADROOM_BYTES`` (``free`` read after ``torch.cuda.empty_cache()``), then
        ``layout.compute_checksums``; no copies.  A rank that did not ask for dense DWDP does none
        of this.  Data ``(requested, digest, checksums, store_bytes, slot_bytes, free_bytes)``.
@@ -230,7 +259,8 @@ def setup_dense_dwdp(
        abandon.  The checksums catch a dense tensor that has the same shape on every rank but
        other bytes, e.g. a tensor-parallel shard.
     2. P2: allocate the store and the slots, write this rank's rows, ``synchronize``, construct
-       the runtime (it records the consume events), export.  Data: the exported handles.
+       the runtime on ``transfer.copy_stream`` (the first read of it; the runtime records the
+       consume events), export.  Data: the exported handles.
     3. P3: import and map the peers, build the plans and, with the copy stream current, the
        launcher; install it, ``synchronize``.  Doubles as the barrier after every write and
        mapping.
@@ -262,19 +292,24 @@ def setup_dense_dwdp(
     Args:
         model: The loaded model (the VL wrapper or the causal LM); the decoder is found like the
             expert setup finds it.
-        weight_manager: The expert DWDP weight manager: copy stream and transfer mode.
-        comm: The DWDP group.
-        dwdp_rank: This rank in the group.
-        dwdp_size: Group size ``N``.
+        transfer: Copy stream and transfer mode: the expert DWDP weight manager with expert DWDP,
+            a ``manager.StandaloneTransfer`` standalone.
+        comm: The dense group: the DWDP group, or the attention-DP group standalone.
+        dwdp_rank: This rank in the dense group (its DWDP rank, or its tp rank standalone).
+        dwdp_size: Dense group size ``N``.
         device_id: CUDA device of this rank.
-        moe_layers: Expert DWDP MoE layers; the covered dense layers must equal them.
+        moe_layers: Expert DWDP MoE layers; the covered dense layers must equal them, and the
+            runtime prefetches the next forward's first layers at the end of a forward
+            (``DenseDWDP``'s ``prefetch_next_pass``).  None (standalone): no such check; the
+            covered layers are the decoder layers whose dense roots are not empty, ascending, and
+            the dense manager primes every forward.
         config: The settings; ``config.enabled`` says whether this rank asks for dense DWDP.
         store_factory: Row store constructor; ``FabricShardStore`` if None.
         ops: CUDA seam for the runtime; ``TorchCudaOps(device_id)`` if None.
         device: The dense device; ``cuda:<device_id>`` if None (unit tests pass the CPU).
         launcher_factory: Builds the copy launcher from the plans; if None,
-            ``DenseCopyLauncher(plans, select_copy_mode(use_gather=weight_manager.use_gather,
-            use_batched=weight_manager.use_batched_prefetch), device=device)``.
+            ``DenseCopyLauncher(plans, select_copy_mode(use_gather=transfer.use_gather,
+            use_batched=transfer.use_batched_prefetch), device=device)``.
         mem_get_info: ``(free, total)`` device memory; ``torch.cuda.mem_get_info(device_id)`` if
             None.
 
@@ -289,7 +324,7 @@ def setup_dense_dwdp(
     """
     run = _DenseSetup(
         model,
-        weight_manager,
+        transfer,
         comm,
         rank=dwdp_rank,
         size=dwdp_size,
@@ -317,14 +352,14 @@ class _DenseSetup:
     def __init__(
         self,
         model: nn.Module,
-        weight_manager: DWDPWeightManager,
+        transfer: DenseTransfer,
         comm: GroupComm,
         *,
         rank: int,
         size: int,
         device_id: int,
         device: torch.device | None,
-        moe_layers: Sequence[int],
+        moe_layers: Sequence[int] | None,
         config: DenseConfig,
         store_factory: StoreFactory,
         ops: DeviceOps,
@@ -332,7 +367,7 @@ class _DenseSetup:
         mem_get_info: MemGetInfo,
     ) -> None:
         self._model = model
-        self._weight_manager = weight_manager
+        self._transfer = transfer
         self._comm = comm
         self._rank = rank
         self._size = size
@@ -511,7 +546,8 @@ class _DenseSetup:
                 attr_allow=attr_allow,
                 exclude=exclude,
             )
-            _check_coverage(layout, self._moe_layers)
+            if self._moe_layers is not None:
+                _check_coverage(layout, self._moe_layers)
             _check_free_memory(layout, free_bytes)
             compute_checksums(layout)
             data = _CollectData(
@@ -541,11 +577,16 @@ class _DenseSetup:
             }
             store.write_local_rows()
             self._ops.synchronize()
+            # The first read of the copy stream, which the transfer may create here: a failure
+            # is this rank's P2 report.
             self._runtime = DenseDWDP(
                 layout.layers,
                 layout.segment_kinds,
                 self._slots,
-                self._weight_manager.copy_stream,
+                self._transfer.copy_stream,
+                # With expert DWDP the next forward's first layers are gathered at the end of a
+                # forward, beside the expert prefetch; standalone, the dense manager primes them.
+                prefetch_next_pass=self._moe_layers is not None,
                 ops=self._ops,
                 strict=self._config.strict,
                 store=store,
@@ -567,8 +608,8 @@ class _DenseSetup:
                 chunk_bases=store.chunk_bases(),
                 slot_bases=slot_bases,
             )
-            with self._ops.stream(self._weight_manager.copy_stream):
-                self._launcher = self._launcher_factory(plans, self._weight_manager, self._device)
+            with self._ops.stream(self._transfer.copy_stream):
+                self._launcher = self._launcher_factory(plans, self._transfer, self._device)
             self._runtime.set_launcher(self._launcher)
             self._ops.synchronize()
         except Exception as exc:  # a local failure must reach collective #3, never skip it
@@ -710,11 +751,15 @@ class _DenseSetup:
 
 
 def _copy_launcher(
-    plans: Mapping[int, LayerCopyPlan], weight_manager: DWDPWeightManager, device: torch.device
+    plans: Mapping[int, LayerCopyPlan], transfer: DenseTransfer, device: torch.device
 ) -> LayerLauncher:
-    """The production launcher: the transfer the expert DWDP prefetch uses."""
+    """The production launcher in the transfer's mode.
+
+    With expert DWDP that is the transfer the expert DWDP prefetch uses; standalone, the one
+    ``DwdpConfig.copy_mode`` picks.
+    """
     mode = select_copy_mode(
-        use_gather=weight_manager.use_gather, use_batched=weight_manager.use_batched_prefetch
+        use_gather=transfer.use_gather, use_batched=transfer.use_batched_prefetch
     )
     return DenseCopyLauncher(plans, mode, device=device)
 
