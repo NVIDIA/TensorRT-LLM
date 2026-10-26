@@ -269,8 +269,13 @@ class OpenEngineMetrics:
         if not self.owner:
             return
         bind_host = self.host.strip("[]")
-        family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
-        self._socket = socket.create_server((bind_host, self.port), family=family, backlog=8)
+        addresses = socket.getaddrinfo(
+            bind_host or None, self.port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+        )
+        address = next(
+            (address for address in addresses if address[0] == socket.AF_INET), addresses[0]
+        )
+        self._socket = socket.create_server(address[4], family=address[0], backlog=8)
         self.port = self._socket.getsockname()[1]
         self._thread = threading.Thread(
             target=self._http.run,

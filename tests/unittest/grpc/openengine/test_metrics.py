@@ -343,15 +343,22 @@ async def _lifecycle() -> None:
             pass  # IPv6 can be disabled even when the Python build supports it.
         else:
             ipv6_socket.close()
-            ipv6 = OpenEngineMetrics(llm, "test-model", "[::1]", 0, True)
-            try:
-                await ipv6.start()
-                await asyncio.to_thread(
-                    lambda: socket.create_connection(("::1", ipv6.port), timeout=2).close()
-                )
-            finally:
-                await ipv6.stop()
-                await ipv6.wait_for_collection()
+
+            def ipv6_only(host, *args, **kwargs):
+                return resolve("::1" if host == "metrics-v6.test" else host, *args, **kwargs)
+
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(socket, "getaddrinfo", ipv6_only)
+                for host in ("[::1]", "metrics-v6.test"):
+                    ipv6 = OpenEngineMetrics(llm, "test-model", host, 0, True)
+                    try:
+                        await ipv6.start()
+                        await asyncio.to_thread(
+                            lambda: socket.create_connection(("::1", ipv6.port), timeout=2).close()
+                        )
+                    finally:
+                        await ipv6.stop()
+                        await ipv6.wait_for_collection()
     with socket.create_server(("127.0.0.1", 0)) as occupied:
         service = OpenEngineMetrics(llm, "test-model", "127.0.0.1", occupied.getsockname()[1], True)
         try:
