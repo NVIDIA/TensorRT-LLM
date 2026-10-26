@@ -23,8 +23,9 @@ import numpy as np
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
-from tensorrt_llm._torch.disaggregation.base import Cancelled, Chunk, Failed, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
@@ -416,6 +417,7 @@ def test_committed_session_outcome_survives_late_settlement(
     else:
         receiver = Mock()
         receiver._enforce_physical_ownership = True
+        receiver._ownership_poisoned = None
         receiver._get_ownership_admission_lock.return_value = threading.Lock()
         receiver._bounce.is_bounced.return_value = False
         session = transfer_mod.RxSession(request_id=401, params=_params(), receiver=receiver)

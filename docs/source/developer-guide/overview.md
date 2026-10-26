@@ -43,6 +43,13 @@ During each iteration of its background loop, the `PyExecutor` performs the foll
 - Output Handling: Updates the partial outputs for ongoing requests and finalizes the results for any requests that have reached completion, returning them to the user.
 
 
+## Multimodal Requests
+
+Multimodal input preparation and execution share `MultimodalParams`. The executor
+owns request cache references; encoder and LLM forwards use separate execution views.
+See the [multimodal developer guide](multimodal.md) for the data contracts,
+process boundaries, and encoder/prefill handoff.
+
 ## Runtime Optimizations
 
 TensorRT LLM enhances inference throughput and reduces latency by integrating a suite of runtime optimizations, including CUDA Graph, [Overlap Scheduler](../features/overlap-scheduler.md), [Speculative decoding](../features/speculative-decoding.md), etc.
@@ -185,6 +192,15 @@ export DG_JIT_BARRIER_TIMEOUT_SECONDS=300
 The value is baked into the kernels at JIT compile time and participates in the
 JIT cache key, so changing it recompiles the affected kernels rather than
 silently reusing a cached binary.
+
+TensorRT-LLM overrides this default at runtime, without recompiling. While the
+engine warms up, the barriers use `TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC` (default
+1800 seconds), because one-time per-rank work such as kernel JIT compilation can
+delay a healthy rank by minutes. While serving, they use
+`TRTLLM_MOE_COMM_TIMEOUT_SEC` when it is set, so `DG_JIT_BARRIER_TIMEOUT_SECONDS`
+only sets the serving budget when `TRTLLM_MOE_COMM_TIMEOUT_SEC` is unset. Both
+variables apply to every MoE communication kernel; see "Communication timeouts"
+in `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md`.
 
 This is primarily a diagnostic knob: raising it distinguishes a slow-but-healthy
 rendezvous (all ranks eventually arrive and the run proceeds) from a genuine

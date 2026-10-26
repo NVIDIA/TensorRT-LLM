@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Metadata construction and request-time updates shared across model runners."""
+"""Attention metadata construction shared across model runners."""
 
 from __future__ import annotations
 
@@ -14,8 +14,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
 )
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.speculative import SpecMetadata
+from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm.mapping import Mapping
 
 from ..config_utils import is_mla
@@ -23,16 +22,17 @@ from ..config_utils import is_mla
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-    from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
-__all__ = [
-    "build_attention_metadata",
-    "update_spec_metadata",
-]
+__all__ = ["build_attention_metadata"]
 
 
-def _get_num_heads_per_kv(pretrained_config: object) -> int:
+def _get_max_num_heads_per_kv(model_config: ModelConfig) -> int:
+    """Return the largest per-layer GQA ratio for shared mask allocation."""
+    layer_specs = _get_kv_cache_layer_specs(model_config)
+    if layer_specs:
+        return max(spec.num_q_heads // spec.num_kv_heads for spec in layer_specs)
+
+    pretrained_config = model_config.pretrained_config
     num_attention_heads = getattr(pretrained_config, "num_attention_heads", None)
     num_key_value_heads = getattr(pretrained_config, "num_key_value_heads", None)
     if isinstance(num_key_value_heads, (list, tuple)):
@@ -58,7 +58,7 @@ def build_attention_metadata(
     kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
     draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
     enable_context_mla_with_cached_kv: bool | None = None,
-    num_heads_per_kv: int | None = None,
+    max_num_heads_per_kv: int | None = None,
 ) -> AttentionMetadata:
     """Construct attention metadata and resolve model-derived inputs."""
     pretrained_config = model_config.pretrained_config
@@ -66,8 +66,8 @@ def build_attention_metadata(
         enable_context_mla_with_cached_kv = is_mla(pretrained_config) and (
             attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
         )
-    if num_heads_per_kv is None:
-        num_heads_per_kv = _get_num_heads_per_kv(pretrained_config)
+    if max_num_heads_per_kv is None:
+        max_num_heads_per_kv = _get_max_num_heads_per_kv(model_config)
 
     sparse_attention_config = model_config.sparse_attention_config
     sparse_metadata_params = (
@@ -86,52 +86,6 @@ def build_attention_metadata(
         enable_flash_mla=model_config.enable_flash_mla,
         enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
         cache_indirection=cache_indirection,
-        num_heads_per_kv=num_heads_per_kv,
+        max_num_heads_per_kv=max_num_heads_per_kv,
         sparse_metadata_params=sparse_metadata_params,
-    )
-
-
-def update_spec_metadata(
-    spec_metadata: SpecMetadata,
-    scheduled_requests: ScheduledRequests,
-    attn_metadata: AttentionMetadata,
-    spec_tree_manager: SpecTreeManager | None,
-    *,
-    runtime_draft_len: int,
-    runtime_tokens_per_gen_step: int,
-    attention_backend: type[AttentionBackend],
-    original_max_draft_len: int,
-    original_max_total_draft_tokens: int,
-    spec_dec_max_total_draft_tokens: int,
-) -> None:
-    """Update speculative and attention metadata for one scheduled batch."""
-    spec_metadata.runtime_draft_len = runtime_draft_len
-    spec_metadata.runtime_tokens_per_gen_step = runtime_tokens_per_gen_step
-
-    is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(attention_backend)
-    # Parallel-draft modes advertise their full generation width rather than a
-    # conventional draft length, so attention needs the total-token capacity.
-    if spec_metadata.spec_dec_mode.is_parallel_draft():
-        max_draft_len = original_max_total_draft_tokens
-        max_total_draft_tokens = original_max_total_draft_tokens
-    else:
-        max_draft_len = original_max_draft_len
-        max_total_draft_tokens = spec_dec_max_total_draft_tokens
-
-    if spec_tree_manager is not None:
-        spec_tree_manager.slot_storage.fill_all_slot_ids(
-            scheduled_requests.context_requests,
-            scheduled_requests.generation_requests,
-        )
-
-    attn_metadata.update_spec_dec_param(
-        batch_size=scheduled_requests.batch_size,
-        is_spec_decoding_enabled=is_spec_dec_mode,
-        is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
-        is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
-        max_draft_len=max_draft_len,
-        max_total_draft_tokens=max_total_draft_tokens,
-        spec_metadata=spec_metadata,
-        spec_tree_manager=spec_tree_manager,
-        num_contexts=scheduled_requests.num_context_requests,
     )

@@ -14,7 +14,18 @@
 # limitations under the License.
 
 from tensorrt_llm._torch.configs.cosmos3 import Cosmos3Config
+from tensorrt_llm._torch.configs.cosmos3_edge import (
+    Cosmos3EdgeConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
+)
 from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
+from tensorrt_llm._torch.configs.deepseek_v41 import (
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+    DeepseekV41VisionConfig,
+)
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.configs.gemma4 import (
     Gemma4AssistantConfig,
@@ -33,6 +44,8 @@ from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
+from tensorrt_llm._torch.configs.musespark_open import MuseSparkOpenConfig
+from tensorrt_llm._torch.configs.nemotron_h import NemotronHConfig
 from tensorrt_llm._torch.configs.qwen4_exp import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -63,9 +76,21 @@ def _register_custom_configs_with_transformers() -> None:
         # backward-compat alias for checkpoints that predate the rename.
         "cosmos3": Cosmos3Config,
         "cosmos3_omni": Cosmos3Config,
+        "cosmos3_edge": Cosmos3EdgeConfig,
+        "cosmos3_edge_text": Cosmos3EdgeTextConfig,
+        "cosmos3_edge_vision": Cosmos3EdgeVisionConfig,
+        "cosmos3_edge_projector": Cosmos3EdgeProjectorConfig,
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
+        # DeepSeek-V4.1 composite multimodal config ("deepseek_v41") plus its two
+        # sub-configs. V4.1 is NOT config-compatible with V4 (the compress_ratios
+        # encoding changed kind, the FP8 block moved to 32x32, the router grew a
+        # second bias, and Engram is reparameterized), so it gets its own family
+        # rather than an alias onto "deepseek_v4".
+        "deepseek_v41": DeepseekV41Config,
+        "deepseek_v41_text": DeepseekV41TextConfig,
+        "deepseek_v41_vision": DeepseekV41VisionConfig,
         "glm5_next": Glm5NextConfig,
         "glm5_next_text": Glm5NextTextConfig,
         "glm5_next_vision": Glm5NextVisionConfig,
@@ -103,13 +128,30 @@ def _register_custom_configs_with_transformers() -> None:
             continue
         CONFIG_MAPPING.register(model_type, config_class, exist_ok=True)
 
+    # `nemotron_h` is the one model_type we override rather than gap-fill.
+    # transformers 5.5.x ships a native NemotronHConfig, but it cannot represent
+    # dense Nemotron-H checkpoints: `hybrid_override_pattern` strings containing
+    # "-" (MLP) layers raise `KeyError: '-'` during config construction, so
+    # AutoConfig -- and therefore AutoTokenizer -- fails outright. Our
+    # NemotronHConfig.from_dict delegates straight back to the native class for
+    # every pattern transformers can express, so this only affects checkpoints
+    # that cannot be loaded at all today.
+    CONFIG_MAPPING.register("nemotron_h", NemotronHConfig, exist_ok=True)
+
 
 _register_custom_configs_with_transformers()
 del _register_custom_configs_with_transformers
 
 __all__ = [
     "Cosmos3Config",
+    "Cosmos3EdgeConfig",
+    "Cosmos3EdgeProjectorConfig",
+    "Cosmos3EdgeTextConfig",
+    "Cosmos3EdgeVisionConfig",
     "DeepseekV3Config",
+    "DeepseekV41Config",
+    "DeepseekV41TextConfig",
+    "DeepseekV41VisionConfig",
     "DeepseekV4Config",
     "Glm5NextConfig",
     "Glm5NextTextConfig",
@@ -126,6 +168,8 @@ __all__ = [
     "LagunaConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
+    "MuseSparkOpenConfig",
+    "NemotronHConfig",
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
     "Qwen4ExpVisionConfig",

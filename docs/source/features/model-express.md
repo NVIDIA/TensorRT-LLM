@@ -29,6 +29,7 @@ profiles:
 | `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `mistral-for-causal-lm-bf16-target-v1` | `MistralForCausalLM` | `MistralForCausalLM` / `mistral` | Target model | 1 | `trtllm-mistral-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, no sliding window, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `phi3-for-causal-lm-bf16-target-v1` | `Phi3ForCausalLM` | `Phi3ForCausalLM` / `phi3` | Target model | 1 | `trtllm-phi3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, and any runtime constraints
@@ -53,6 +54,32 @@ model type to `mistral_common`; it cannot be combined with the MX loading path.
 The unregistered Llama-based `MistralForCausalLM` class in `modeling_llama.py`
 shares components with the qualified root but is not qualified.
 
+The Phi3 identity covers dense Hugging Face-format checkpoints that resolve to
+the exact `Phi3ForCausalLM` / `phi3` pair; Phi-4 is the qualified canary.
+Phi-4-reasoning-plus, Phi-3-mini-4k-instruct, and Phi-3-medium-4k-instruct
+declare the same identity with BF16 weights, default RoPE, and untied
+embeddings, so they match the profile under the same runtime constraints. The
+Phi-3 4k configurations set `sliding_window`, but the Phi3 root does not apply
+it: every Phi3 checkpoint runs full attention in TensorRT LLM, so this profile
+does not constrain the sliding window. The 128k-context Phi-3 checkpoints and
+Phi-3.5-mini-instruct use LongRoPE scaling, and Phi-4-mini-instruct also ties
+its embeddings, so these checkpoints do not match the profile. Phi-3-small
+(`Phi3SmallForCausalLM`), the Phi-3 and Phi-3.5 vision models
+(`Phi3VForCausalLM`), Phi-3.5-MoE (`PhiMoEForCausalLM`), and
+Phi-4-multimodal (`Phi4MMForCausalLM`, including its quantized variants) use
+other roots. Phi4MM builds a Phi3 language model internally, but qualification
+matches the outer root, so these checkpoints fall back as well.
+
+Phi3 has one known limitation. `Phi3Attention.__init__` in
+`tensorrt_llm/_torch/models/modeling_phi3.py` writes the runtime `max_seq_len`
+into the shared pretrained configuration for LongRoPE, and `SourceIdentity`
+hashes that configuration. A donor and a receiver with different `max_seq_len`
+values therefore get different model fingerprints: the receiver logs a
+`SourceIdentity mismatch` warning and falls back to non-shared weight loading,
+even though no transferred weight of a default-RoPE checkpoint depends on the
+value. Until the model code stops recording it, run both sides with the same
+`max_seq_len`.
+
 TensorRT LLM applies two independent compatibility gates:
 
 - The qualification profile records that a model/config/lifecycle combination
@@ -71,14 +98,14 @@ standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
 submodel.
 
-The Llama, Qwen2, Qwen3, and Mistral profiles are text-only and do not enable
-reward-model, embedding, MoE, or vision-language roots. FP16, quantized weights
-or KV cache, alternate attention backends, YaRN, tied embeddings, TP greater
-than 2, PP greater than 1, CP greater than 1, LoRA, sparse attention, attention
-DP, multi-node transfer, and speculative decoding require separate
-qualification rows. Each profile also pins its qualified RoPE realization:
-Llama, Qwen2, and Mistral require the default fused RoPE path, so unfused RoPE
-requires separate qualification for them, while Qwen3 fuses RoPE into the
+The Llama, Qwen2, Qwen3, Mistral, and Phi3 profiles are text-only and do not
+enable reward-model, embedding, MoE, or vision-language roots. FP16, quantized
+weights or KV cache, alternate attention backends, YaRN or LongRoPE scaling,
+tied embeddings, TP greater than 2, PP greater than 1, CP greater than 1, LoRA,
+sparse attention, attention DP, multi-node transfer, and speculative decoding
+require separate qualification rows. Each profile also pins its qualified RoPE realization:
+Llama, Qwen2, Mistral, and Phi3 require the default fused RoPE path, so unfused
+RoPE requires separate qualification for them, while Qwen3 fuses RoPE into the
 QK-norm kernel and therefore requires `rope_fusion=False` in the realized
 configuration. The Mistral profile additionally pins the realized attention
 window: every attention layer must run without a sliding window, so
@@ -170,10 +197,12 @@ durations.
 
 Run the TP=2 rank-mapping qualification on four GPUs by selecting
 `llama-bf16-tp2`. `TRTLLM_MX_LLAMA_MODEL` can override the default TinyLlama
-checkpoint path. The Qwen2, Qwen3, and Mistral profile rows use
-`qwen2-bf16-tp1` / `qwen2-bf16-tp2`, `qwen3-bf16-tp1` / `qwen3-bf16-tp2`, and
-`mistral-bf16-tp1` / `mistral-bf16-tp2`, with optional model path overrides in
-`TRTLLM_MX_QWEN2_MODEL`, `TRTLLM_MX_QWEN3_MODEL`, and `TRTLLM_MX_MISTRAL_MODEL`.
+checkpoint path. The Qwen2, Qwen3, Mistral, and Phi3 profile rows use
+`qwen2-bf16-tp1` / `qwen2-bf16-tp2`, `qwen3-bf16-tp1` / `qwen3-bf16-tp2`,
+`mistral-bf16-tp1` / `mistral-bf16-tp2`, and `phi3-bf16-tp1` /
+`phi3-bf16-tp2`, with optional model path overrides in
+`TRTLLM_MX_QWEN2_MODEL`, `TRTLLM_MX_QWEN3_MODEL`, `TRTLLM_MX_MISTRAL_MODEL`,
+and `TRTLLM_MX_PHI3_MODEL`.
 `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
@@ -182,13 +211,23 @@ baseline worker, receiver worker, and donor-readiness wait; increase it for
 slow model storage or startup.
 
 The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
-sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
-automatically in post-merge pipelines or when a multi-GPU file changes, while
-direct pre-merge dispatch requires the `ci: full pre-merge approved` label.
-Trigger it directly with:
+sidecars. Coverage is tiered so that pull requests pay for one lightweight
+end-to-end canary while every qualified family still runs on each main commit:
+
+| Stage | When it runs | Rows |
+| --- | --- | --- |
+| `DGX_H100-2_GPUs-PyTorch-ModelExpress-1` | Pre-merge and post-merge | `llama-bf16-tp1` and `test_mx_source_identity_gate.py` |
+| `DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` | Post-merge only | The other TP=1 family rows and the accuracy canaries below |
+| `DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1` | On demand only | Every TP=2 row |
+
+The two-GPU stages are classified as multi-GPU, so running either of them on a
+pull request requires the `ci: full pre-merge approved` label; the pre-merge
+stage is also selected automatically when a multi-GPU file changes. Trigger
+them directly with:
 
 ```text
 /bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-1"
+/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1"
 ```
 
 TP=2 is the minimum evidence for adding or changing a parallel profile. Its
@@ -199,10 +238,75 @@ multi-GPU runs:
 /bot run --stage-list "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1"
 ```
 
-Both stages set `TRTLLM_MX_E2E_REQUIRED=1`, so missing service, model, client,
-or NIXL prerequisites fail instead of skipping. Do not add every model profile
-to recurring coverage: use the harness for representative rows claimed by the
-support table and keep wider matrices in scheduled qualification.
+All three stages set `TRTLLM_MX_E2E_REQUIRED=1`, so missing service, model,
+client, or NIXL prerequisites fail instead of skipping. Do not grow pre-merge
+coverage with each new family: its TP=1 row belongs in the `post_merge` block of
+`tests/integration/test_lists/test-db/l0_model_express.yml` and its TP=2 row
+in the on-demand stage, while the pre-merge block keeps a single
+representative row.
+
+### Accuracy Canaries (Post-Merge)
+
+`tests/integration/defs/model_express/test_model_express_accuracy.py` runs
+reference-backed accuracy canaries on an MX receiver. The donor publishes exactly as in the smoke test and never evaluates; the receiver starts
+from the metadata-only snapshot and, right after load, confirms that every rank
+wrote its transfer manifest at the MX P2P success boundary. If any rank did
+not, the receiver exits with status 3 before spending any evaluation time.
+Otherwise it evaluates the task with `tensorrt_llm.evaluate` inside its own
+subprocess and writes the score to JSON. The pytest process never constructs an `LLM`: it loads the
+accuracy reference YAMLs, asserts the same hypothesis-testing threshold as
+`tests/integration/defs/accuracy/`, and additionally requires the transfer
+evidence and the donor/receiver weight manifests to match. There is no paired
+HF baseline evaluation because the reference value is that baseline.
+
+Current rows (TP=1, BF16; `references/*.yaml` holds the expected values):
+
+| Test ID | Model | Task | Model path override |
+| --- | --- | --- | --- |
+| `qwen3-8b-gsm8k-tp1` | `Qwen3/Qwen3-8B` | GSM8K | `TRTLLM_MX_QWEN3_MODEL` |
+
+A canary needs a bare BF16 reference for its task that was measured on the
+PyTorch backend. The Qwen3 GSM8K entry is the one gated by
+`tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B`,
+so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
+Qwen2, or Mistral checkpoint has such a reference today, so those families are
+covered by their smoke rows until one is added.
+
+The rows are registered as `stage: post_merge` entries in
+`tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
+`DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` on every main commit and
+are never selected automatically in pre-merge pipelines. Trigger the stage on a
+pull request, which requires the `ci: full pre-merge approved` label, with:
+
+```text
+/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1"
+```
+
+GSM8K needs the `lm_eval` package from `requirements-dev.txt`; the test checks
+for it and, under `TRTLLM_MX_E2E_REQUIRED=1`, fails instead of skipping when it
+is absent. The receiver gets its own `TRTLLM_MX_ACCURACY_TIMEOUT_S` budget
+(default 3600 seconds) for load, transfer, and the whole evaluation, while
+`TRTLLM_MX_E2E_TIMEOUT_S` still bounds the donor-readiness wait. The reference
+guard `test_mx_accuracy_cases_have_references` needs no GPU and also runs in the
+pre-merge CPU stage, so a pruned reference fails on the pull request that prunes
+it. Each run records the donor and receiver load times, the evaluation
+time, the score, and the threshold as junit properties and as
+`model_express_accuracy/<test-id>.json` under `--output-dir`; load times are
+observed only, not gated. To run one canary locally:
+
+```bash
+TRTLLM_MX_E2E_REQUIRED=1 \
+MODEL_EXPRESS_URL=http://127.0.0.1:8001 \
+LLM_MODELS_ROOT=/path/to/llm-models \
+pytest -v tests/integration/defs/model_express/test_model_express_accuracy.py \
+  -k qwen3-8b-gsm8k-tp1 --output-dir /path/to/artifacts
+```
+
+Adding a canary is one `MxAccuracyCase` row (the model must be inside the
+family's qualified runtime envelope and have a bare BF16 reference entry for
+the task, measured on the PyTorch backend with the task's default evaluator
+settings), one line in the `post_merge` block of `l0_model_express.yml`, and a
+row in the table above.
 
 ### Transform-Layout ABI Rules
 
@@ -316,13 +420,17 @@ path.
 ## Notes and Limitations
 
 - Post-transform MX reception is currently limited to the exact Llama,
-  Qwen2/Qwen2.5 dense, Qwen3 dense, and Mistral dense profiles above. Other
-  roots and variants that do not match the documented identity and runtime
-  envelope safely fall back to Hugging Face loading until explicitly qualified.
+  Qwen2/Qwen2.5 dense, Qwen3 dense, Mistral dense, and Phi3 dense profiles
+  above. Other roots and variants that do not match the documented identity and
+  runtime envelope safely fall back to Hugging Face loading until explicitly
+  qualified.
 - Mistral checkpoints served through the native `mistral` checkpoint format
   (`mistral_common` model type), sliding-window or Ministral `layer_types`
   variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
   are not qualified and use the Hugging Face fallback.
+- Phi LongRoPE variants (128k-context Phi-3, Phi-3.5-mini, and Phi-4-mini),
+  tied-embedding variants, and the Phi-3-small, vision, MoE, and Phi4MM
+  multimodal roots are not qualified and use the Hugging Face fallback.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.

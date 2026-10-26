@@ -95,41 +95,35 @@ class TestAttentionConfigQuantValidation:
             )
 
     def test_quant_config_rejected_when_unsupported(self):
-        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
-            AttentionConfig(
-                backend="TRTLLM",
-                quant_attention_config=QuantAttentionConfig(
-                    qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
-                ),
-            )
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
+                    ),
+                )
 
-    @pytest.mark.parametrize(
-        ("backend", "quant_config"),
-        [
-            (
-                "TRTLLM",
-                QuantAttentionConfig(
-                    qk_dtype="fp8",
-                    q_block_size=1,
-                    k_block_size=1,
-                    v_block_size=1,
-                ),
-            ),
-            (
-                "CUTEDSL",
-                QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
-            ),
-        ],
-    )
-    def test_vsa_and_quantization_are_mutually_exclusive(self, backend, quant_config):
-        with pytest.raises(
-            ValidationError, match="VSA and quant_attention_config are mutually exclusive"
-        ):
-            AttentionConfig(
-                backend=backend,
-                quant_attention_config=quant_config,
+    def test_vsa_and_quantization_compose_only_on_trtllm(self):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            sage = QuantAttentionConfig(
+                qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1
+            )
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=sage,
                 sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
             )
+            assert attention.quant_attention_config is sage
+
+            with pytest.raises(
+                ValidationError, match="VSA and quant_attention_config are mutually exclusive"
+            ):
+                AttentionConfig(
+                    backend="CUTEDSL",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
+                    sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+                )
 
     def test_skip_softmax_and_sage_quantization_can_be_combined(self):
         # int8 Q/K SAGE has a compiled cubin only on SM100; pin the SM so this
@@ -150,19 +144,28 @@ class TestAttentionConfigQuantValidation:
         assert attention.sparse_attention_config.algorithm == "skip_softmax"
 
     @pytest.mark.parametrize(
-        ("qk_dtype", "q_block_size", "k_block_size", "v_block_size"),
+        ("sm_ver", "qk_dtype", "q_block_size", "k_block_size", "v_block_size"),
         [
-            ("int8", 1, 1, 1),
-            ("int8", 1, 4, 1),
-            ("int8", 1, 16, 1),
-            ("fp8", 1, 1, 1),
-            ("fp8", 1, 4, 1),
+            (90, "int8", 2, 16, 1),
+            (100, "int8", 1, 1, 1),
+            (100, "int8", 1, 4, 1),
+            (100, "int8", 1, 16, 1),
+            (100, "fp8", 1, 1, 1),
+            (100, "fp8", 1, 4, 1),
+            (100, "fp8", 1, 16, 1),
+            (103, "fp8", 1, 1, 1),
+            (103, "fp8", 1, 4, 1),
+            (103, "fp8", 1, 16, 1),
+            (100, "bf16", 0, 0, 0),
+            (100, "fp8", 0, 0, 0),
+            (103, "bf16", 0, 0, 0),
+            (103, "fp8", 0, 0, 0),
         ],
     )
-    def test_supported_quant_config_sage(self, qk_dtype, q_block_size, k_block_size, v_block_size):
-        # int8 Q/K SAGE has a compiled cubin only on SM100; pin the SM so this
-        # supported-recipe check is host-independent (CI CPU stages have no GPU).
-        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+    def test_supported_quant_config_trtllm(
+        self, sm_ver, qk_dtype, q_block_size, k_block_size, v_block_size
+    ):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
             attention = AttentionConfig(
                 backend="TRTLLM",
                 quant_attention_config=QuantAttentionConfig(
@@ -175,18 +178,41 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
-    @pytest.mark.parametrize("sm_version", [90, 107, 120])
-    def test_int8_sage_rejected_on_non_sm100(self, sm_version):
-        # int8 Q/K SAGE only has an SM100 cubin; validation must fail fast on
-        # any other SM instead of silently falling back to unfused MHA.
-        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_version):
-            with pytest.raises(ValidationError, match="only supports sm_100"):
+    @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
+    @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
+    def test_smoothing_rejected_without_sage_recipe(self, backend, smoothing):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="are SageAttention options"):
                 AttentionConfig(
-                    backend="TRTLLM",
+                    backend=backend,
                     quant_attention_config=QuantAttentionConfig(
-                        qk_dtype="int8", q_block_size=1, k_block_size=1, v_block_size=1
+                        qk_dtype="bf16", v_dtype="fp8", **{smoothing: True}
                     ),
                 )
+
+    @pytest.mark.parametrize(
+        ("sm_ver", "qk_dtype", "q_block_size", "accepted"),
+        [(90, "int8", 2, False), (100, "int8", 1, True), (103, "fp8", 1, True)],
+    )
+    def test_smooth_v_requires_primts_architecture(self, sm_ver, qk_dtype, q_block_size, accepted):
+        def build():
+            return AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype,
+                    q_block_size=q_block_size,
+                    k_block_size=16,
+                    v_block_size=1,
+                    smooth_v=True,
+                ),
+            )
+
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            if accepted:
+                assert build().quant_attention_config.smooth_v
+            else:
+                with pytest.raises(ValidationError, match="smooth_v needs the PrimTS kernels"):
+                    build()
 
     def test_supported_quant_config_cute(self):
         attention = AttentionConfig(
@@ -275,11 +301,12 @@ class TestAttentionConfigQuantValidation:
             )
 
     def test_blockscaled_qk_dtype_rejected_on_trtllm(self):
-        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
-            AttentionConfig(
-                backend="TRTLLM",
-                quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
-            )
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
+                )
 
     def test_supported_quant_config_cudnn_fp8(self):
         attention = AttentionConfig(
@@ -574,6 +601,48 @@ class TestParallelConfigValidation:
             ulysses_size=2,
         )
         assert pc.seq_parallel_size == 8
+
+
+class TestTokenShardedTPConfig:
+    """parallel_config.tp_layout validation and round trips."""
+
+    @pytest.mark.parametrize("tp_size,layout", [(1, None), (1, "replicated"), (2, "replicated")])
+    def test_off_unless_token_sharded(self, tp_size, layout):
+        # "replicated" is a truthy string: callers must test the property, not the field.
+        assert ParallelConfig(tp_size=tp_size, tp_layout=layout).token_sharded_tp is False
+
+    def test_requires_tp(self):
+        with pytest.raises(ValidationError, match=r"requires tp_size > 1 \(got tp_size=1\)"):
+            ParallelConfig(tp_layout="token_sharded")
+
+    @pytest.mark.parametrize(
+        "seq_kwargs",
+        [{"ulysses_size": 2}, {"ring_size": 2}, {"attn2d_size": (2, 1)}],
+        ids=["ulysses", "ring", "attn2d"],
+    )
+    def test_rejects_sequence_sharding(self, seq_kwargs):
+        with pytest.raises(ValidationError, match="cannot be combined with ulysses_size"):
+            ParallelConfig(tp_size=2, tp_layout="token_sharded", **seq_kwargs)
+
+    def test_composes_with_cfg(self):
+        pc = ParallelConfig(cfg_size=2, tp_size=2, tp_layout="token_sharded")
+        assert pc.token_sharded_tp is True
+        assert pc.n_workers == 4
+
+    def test_yaml_roundtrip(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\n"
+            "parallel_config:\n"
+            "  cfg_size: 2\n"
+            "  tp_size: 2\n"
+            "  tp_layout: token_sharded\n"
+        )
+        args = VisualGenArgs.from_yaml(yaml_path)
+        assert args.parallel_config.token_sharded_tp is True
+        dumped = args.model_dump()
+        assert dumped["parallel_config"]["tp_layout"] == "token_sharded"
+        assert VisualGenArgs(**dumped).parallel_config == args.parallel_config
 
 
 class TestVisualGenArgsPickle:

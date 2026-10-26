@@ -65,6 +65,8 @@ struct AttentionContextWorkspaceSizes
     size_t sageQScale{};
     size_t sageKScale{};
     size_t sageVScale{};
+    size_t sageKMean{};
+    size_t sageKMeanSum{};
     size_t cpWorkspace{};
     size_t fmhaMultiCtasKvScratch{};
 };
@@ -96,6 +98,8 @@ struct AttentionContextWorkspaceLayout
     WorkspaceSlice sageQScale{};
     WorkspaceSlice sageKScale{};
     WorkspaceSlice sageVScale{};
+    WorkspaceSlice sageKMean{};
+    WorkspaceSlice sageKMeanSum{};
     WorkspaceSlice cpWorkspace{};
     WorkspaceSlice fmhaMultiCtasKvScratch{};
     size_t totalSize{};
@@ -129,6 +133,8 @@ struct AttentionContextWorkspaceViews
     float* sageQScale{};
     float* sageKScale{};
     float* sageVScale{};
+    float* sageKMean{};
+    int64_t* sageKMeanSum{};
     T* gatherInBuffer{};
     T* gatherOutBuffer{};
     int* cuCpPartialSeqlens{};
@@ -254,6 +260,8 @@ public:
         layout.sageQScale = nextSlice(offset, sizes.sageQScale, alignment);
         layout.sageKScale = nextSlice(offset, sizes.sageKScale, alignment);
         layout.sageVScale = nextSlice(offset, sizes.sageVScale, alignment);
+        layout.sageKMean = nextSlice(offset, sizes.sageKMean, alignment);
+        layout.sageKMeanSum = nextSlice(offset, sizes.sageKMeanSum, alignment);
         layout.cpWorkspace = nextSlice(offset, sizes.cpWorkspace, alignment);
         layout.fmhaMultiCtasKvScratch = nextSlice(offset, sizes.fmhaMultiCtasKvScratch, alignment);
         layout.totalSize = offset;
@@ -291,6 +299,8 @@ public:
         views.sageQScale = ptr<float>(workspace, layout.sageQScale);
         views.sageKScale = ptr<float>(workspace, layout.sageKScale);
         views.sageVScale = ptr<float>(workspace, layout.sageVScale);
+        views.sageKMean = ptr<float>(workspace, layout.sageKMean);
+        views.sageKMeanSum = ptr<int64_t>(workspace, layout.sageKMeanSum);
 
         views.gatherInBuffer = ptr<T>(workspace, layout.cpWorkspace);
         if (views.gatherInBuffer != nullptr)

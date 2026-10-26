@@ -53,8 +53,9 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionStreamResponse, DeltaFunctionCall,
                               DeltaMessage, DeltaToolCall, FunctionCall,
                               PromptTokensDetails, ResponsesRequest,
-                              ResponsesResponse, StreamOptions, ToolCall,
-                              UsageInfo, to_disaggregated_params)
+                              ResponsesResponse, SpeculativeDecodingStats,
+                              StreamOptions, ToolCall, UsageInfo,
+                              to_disaggregated_params)
 from .tool_parser.base_tool_parser import (BaseToolParser,
                                            warn_if_tool_call_unparsed)
 from .tool_parser.core_types import StreamingParseResult, ToolCallItem
@@ -102,6 +103,7 @@ class ChatPostprocArgs(PostprocArgs):
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_parser: Optional[str] = None
+    tool_parser_grammar_constrained: bool = False
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
@@ -144,6 +146,74 @@ class ChatPostprocArgs(PostprocArgs):
             ctx_usage=None if request.disaggregated_params is None else
             request.disaggregated_params.ctx_usage,
         )
+
+
+def _build_spec_decode_stats(
+        counters: Any, args: PostprocArgs,
+        finish_reason: Optional[str]) -> Optional[SpeculativeDecodingStats]:
+    """Derive per-request speculative-decoding acceptance for one sequence.
+
+    ``counters`` is the sequence's own ``CompletionOutput._spec_dec_counters``,
+    never the request-level copies on the GenerationResult: with n > 1 every
+    candidate reports its own counters and those copies hold whichever
+    candidate responded last. Callers read it with getattr, since outputs that
+    are not a CompletionOutput (test doubles, for one) lack the field.
+
+    Returns None -- meaning the field is omitted entirely -- when the caller has
+    not opted in, when the sequence has not finished (streaming carries this
+    only on the terminal chunk), when the request never drafted, or when the
+    executor attached no per-position vectors, as on the non-PyTorch backend.
+
+    per_pos_accepted is prefix-cumulative and therefore a survival function:
+    entry k counts the steps that accepted *at least* k+1 draft tokens. The
+    acceptance histogram is its negative first difference. Totals come from
+    spec_dec_totals, which the executor accumulates exactly, rather than from
+    summing the vectors.
+    """
+    if (not args.return_spec_decode_stats or finish_reason is None
+            or counters is None):
+        return None
+    totals = counters.spec_dec_totals
+    per_pos_accepted = counters.per_pos_accepted
+    per_pos_drafted = counters.per_pos_drafted
+    if not totals or not per_pos_drafted or not per_pos_accepted:
+        return None
+    accepted, drafted = totals
+    # Position 0 is incremented once for every step that drafted at all, so it
+    # is the verify-step count.
+    num_spec_steps = per_pos_drafted[0]
+    if drafted <= 0 or num_spec_steps <= 0:
+        return None
+
+    # Survival is non-increasing, so its positive entries form a prefix whose
+    # length is the deepest acceptance any single step reached.
+    deepest = 0
+    for count in per_pos_accepted:
+        if count <= 0:
+            break
+        deepest += 1
+
+    # Size to the configured draft budget when there is one, so the histogram's
+    # length describes the configuration rather than what this request happened
+    # to reach. Under draft_len_schedule there is no fixed bound, so it sizes to
+    # the observed depth instead.
+    num_spec_tokens = args.spec_decode_num_spec_tokens
+    width = deepest if num_spec_tokens is None else max(deepest,
+                                                        num_spec_tokens)
+    histogram = [0] * (width + 1)
+    histogram[0] = num_spec_steps - per_pos_accepted[0]
+    for j in range(1, deepest + 1):
+        following = per_pos_accepted[j] if j < len(per_pos_accepted) else 0
+        histogram[j] = per_pos_accepted[j - 1] - following
+
+    return SpeculativeDecodingStats(
+        acceptance_rate=accepted / drafted,
+        total_accepted_draft_tokens=accepted,
+        total_draft_tokens=drafted,
+        num_spec_steps=num_spec_steps,
+        acceptance_histogram=histogram,
+        num_spec_tokens=num_spec_tokens,
+    )
 
 
 def _ensure_stream_metadata(args: Any, rsp: GenerationResultBase,
@@ -230,7 +300,8 @@ def apply_tool_parser(args: ChatPostprocArgs,
         if output_index not in args.tool_parser_dict:
             args.tool_parser_dict[
                 output_index] = ToolParserFactory.create_tool_parser(
-                    args.tool_parser)
+                    args.tool_parser,
+                    grammar_constrained=args.tool_parser_grammar_constrained)
         tool_parser = args.tool_parser_dict[output_index]
 
     if tool_parser is not None and tools is not None:
@@ -521,6 +592,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
+            speculative_decoding=_build_spec_decode_stats(
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
             stop_reason=output.stop_reason,
         )
         if args.return_logprobs:
@@ -686,6 +760,9 @@ def chat_response_post_processor(
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
+            speculative_decoding=_build_spec_decode_stats(
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if output.finish_reason == "stop" and args.has_tool_call.get(
                 output.index, False):
@@ -814,6 +891,9 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
+            speculative_decoding=_build_spec_decode_stats(
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
@@ -882,6 +962,9 @@ def completion_response_post_processor(
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
+            speculative_decoding=_build_spec_decode_stats(
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs
@@ -1007,6 +1090,7 @@ def responses_api_post_processor(
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
         num_prompt_tokens=args.num_prompt_tokens,
+        tokenizer=args.tokenizer,
     )
 
 
@@ -1020,5 +1104,5 @@ def responses_api_streaming_post_processor(
     if rsp._done:
         outputs.append(
             args.streaming_processor.get_final_response_non_store(
-                rsp, args.num_prompt_tokens))
+                rsp, args.num_prompt_tokens, tokenizer=args.tokenizer))
     return outputs

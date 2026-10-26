@@ -29,7 +29,7 @@ namespace tensorrt_llm::runtime::lora
 
 LoraModuleConfig::LoraModuleConfig(LoraModuleConfig::TensorPtr loraConfigTensor)
 {
-    auto const dataPtr = bufferCast<int32_t>(*loraConfigTensor);
+    auto const dataPtr = loraConfigTensor->getBufferPtr<int32_t>();
     // backwards compatibility with pre-dora configs
     auto const configSupportsDora = loraConfigTensor->getShape().d[1] >= lora::kLORA_CONFIG_ROW_SIZE;
     moduleId = dataPtr[lora::kLORA_CONFIG_MODULE_OFF];

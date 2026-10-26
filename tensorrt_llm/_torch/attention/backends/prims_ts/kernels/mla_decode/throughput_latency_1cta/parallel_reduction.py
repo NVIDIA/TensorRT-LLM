@@ -19,8 +19,12 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
-from ...separate_reduction import finalize_log2_sum_exp, normalized_lse_weight
-from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ...separate_reduction import (
+    finalize_log2_sum_exp,
+    normalized_lse_weight,
+    attention_sink_scale,
+)
+from ..helpers.constants import LN_2, SPLIT_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.math import ceil_div
 from ..helpers.ops import (
     fmax_f32,
@@ -197,6 +201,10 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     cu_seqlens_q,
     cfg,
     elements_per_slice: cutlass.Constexpr[int],
+    atten_sinks=None,
+    finalize_attention: cutlass.Constexpr[bool] = False,
+    output_quant: cutlass.Constexpr = None,
+    output_quant_args=None,
 ):
     """Reduce G1 partials with the compact row-shared schedule."""
 
@@ -204,8 +212,15 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     thread_idx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane_idx = thread_idx % Int32(GMEM_REDUCTION_WARP_LANES)
-    head_dim_cta_idx = block_idx_y % Int32(cfg.num_ctas_per_head_dim)
-    q_idx = block_idx_y // Int32(cfg.num_ctas_per_head_dim)
+    if cutlass.const_expr(finalize_attention):
+        # The final sparse grid is one CTA per logical head. Decode its
+        # physical producer tile without launching padded head/V slices.
+        q_idx = slice_idx // Int32(cfg.tile_size_q)
+        slice_idx = slice_idx % Int32(cfg.tile_size_q)
+        head_dim_cta_idx = Int32(0)
+    else:
+        head_dim_cta_idx = block_idx_y % Int32(cfg.num_ctas_per_head_dim)
+        q_idx = block_idx_y // Int32(cfg.num_ctas_per_head_dim)
     elements_per_slice = _parallel_reduction_effective_slice_elements(
         cfg, elements_per_slice
     )
@@ -223,18 +238,14 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
 
     # One statistics warp per covered row stripes over split slots, then
     # publishes normalized scales for all output threads to reuse.
+    # Keep branch-local names separate from the output phase below so CuTe
+    # DSL 4.8 does not thread undefined values through inactive stats warps.
     if warp_idx < Int32(rows_per_slice):
         stats_row = warp_idx
         stats_element = slice_element_base + stats_row * Int32(cfg.head_dim_per_cta_v)
-        head_idx = stats_element // Int32(cfg.head_dim_per_cta_v)
-        (
-            storage_flat_query_row,
-            _,
-            _,
-            _,
-            valid_output_row,
-        ) = flat_query_row_state(
-            head_idx,
+        stats_head_idx = stats_element // Int32(cfg.head_dim_per_cta_v)
+        stats_query_row = flat_query_row_state(
+            stats_head_idx,
             q_idx,
             cfg.tile_size_q,
             cfg.logical_num_heads_q,
@@ -242,8 +253,8 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             cu_seqlens_q=cu_seqlens_q,
             batch_idx=batch_idx,
         )
-        if head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-            row_lse = acc_lse[head_idx, None, q_idx, batch_idx]
+        if stats_head_idx < Int32(cfg.num_heads_q) and stats_query_row[4]:
+            row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
             lse_per_lane = ceil_div(
                 cfg.num_ctas_per_seq_kv,
                 GMEM_REDUCTION_WARP_LANES,
@@ -255,10 +266,12 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             )
             lse_max = Float32(-Float32.inf)
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                split_idx = lane_idx + Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES)
+                stats_split_idx = lane_idx + Int32(
+                    lane_slot_i * GMEM_REDUCTION_WARP_LANES
+                )
                 lane_lse[lane_slot_i] = (
-                    Float32(row_lse[split_idx])
-                    if split_idx < Int32(cfg.num_ctas_per_seq_kv)
+                    Float32(row_lse[stats_split_idx])
+                    if stats_split_idx < Int32(cfg.num_ctas_per_seq_kv)
                     else Float32(-Float32.inf)
                 )
                 lse_max = fmax_f32(lse_max, lane_lse[lane_slot_i])
@@ -273,25 +286,39 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                 )
             lse_sum = warp_reduce_sum_f32(lse_sum)
             global_lse = finalize_log2_sum_exp(lse_max, lse_sum)
+            stats_sink_scale = Float32(1)
+            if cutlass.const_expr(finalize_attention and atten_sinks is not None):
+                stats_sink_scale = attention_sink_scale(
+                    global_lse, Float32(atten_sinks[stats_query_row[1]])
+                )
             if (
                 lane_idx == Int32(0)
                 and head_dim_cta_idx == Int32(0)
                 and stats_element % Int32(cfg.head_dim_per_cta_v) == Int32(0)
             ):
-                output_query_row = public_query_flat_row(
+                stats_output_query_row = public_query_flat_row(
                     cfg,
-                    storage_flat_query_row,
+                    stats_query_row[0],
                     batch_idx,
                     cu_seqlens_q,
                 )
-                (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                (lse.iterator.raw_ptr() + stats_output_query_row).store(
+                    global_lse * Float32(LN_2) if finalize_attention else global_lse
+                )
 
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                split_idx = lane_idx + Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES)
-                if split_idx < Int32(cfg.num_ctas_per_seq_kv):
+                stats_split_idx = lane_idx + Int32(
+                    lane_slot_i * GMEM_REDUCTION_WARP_LANES
+                )
+                if stats_split_idx < Int32(cfg.num_ctas_per_seq_kv):
+                    stats_weight = normalized_lse_weight(
+                        lane_lse[lane_slot_i], global_lse
+                    )
+                    if cutlass.const_expr(finalize_attention):
+                        stats_weight *= stats_sink_scale
                     smem_scale[
-                        stats_row * Int32(cfg.num_ctas_per_seq_kv) + split_idx
-                    ] = normalized_lse_weight(lane_lse[lane_slot_i], global_lse)
+                        stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
+                    ] = stats_weight
 
     prims.barrier_cta_sync(
         barrier_id=SPLIT_REDUCTION_SCALE_BARRIER_ID,
@@ -304,13 +331,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     dim_in_cta = flat_element - head_idx * Int32(cfg.head_dim_per_cta_v)
     row_in_slice = (flat_element - slice_element_base) // Int32(cfg.head_dim_per_cta_v)
     dim_idx = head_dim_cta_idx * Int32(cfg.head_dim_per_cta_v) + dim_in_cta
-    (
-        storage_flat_query_row,
-        _,
-        _,
-        _,
-        valid_output_row,
-    ) = flat_query_row_state(
+    output_query_row_state = flat_query_row_state(
         head_idx,
         q_idx,
         cfg.tile_size_q,
@@ -323,7 +344,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         thread_elem_offset < Int32(elements_per_slice)
         and head_idx < Int32(cfg.num_heads_q)
         and dim_idx < Int32(cfg.head_dim_v)
-        and valid_output_row
+        and output_query_row_state[4]
     )
     if valid_output:
         output_acc = cutlass.Array(
@@ -348,25 +369,31 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             scale = Float32(
                 smem_scale[row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx]
             )
-            split_ptr = acc_row_ptr + Int64(split_i * cfg.head_dim_v)
-            if cutlass.const_expr(output_elements_per_thread == 1):
-                output_acc[0] += Float32(split_ptr.load()) * scale
-            else:
-                partial_o = split_ptr.load(
-                    count=output_elements_per_thread,
-                    alignment=output_elements_per_thread * cfg.partial_o_dtype_bytes,
-                ).to(Float32)
-                for elem_i in cutlass.range_constexpr(output_elements_per_thread):
-                    output_acc[elem_i] += partial_o[elem_i] * scale
+            # Sparse masked splits can leave their vector unused. Do not
+            # multiply an uninitialized/NaN partial by a zero statistical weight.
+            if not finalize_attention or scale > Float32(0):
+                split_ptr = acc_row_ptr + Int64(split_i * cfg.head_dim_v)
+                if cutlass.const_expr(output_elements_per_thread == 1):
+                    output_acc[0] += Float32(split_ptr.load()) * scale
+                else:
+                    partial_o = split_ptr.load(
+                        count=output_elements_per_thread,
+                        alignment=output_elements_per_thread
+                        * cfg.partial_o_dtype_bytes,
+                    ).to(Float32)
+                    for elem_i in cutlass.range_constexpr(output_elements_per_thread):
+                        output_acc[elem_i] += partial_o[elem_i] * scale
 
         output_query_row = public_query_flat_row(
             cfg,
-            storage_flat_query_row,
+            output_query_row_state[0],
             batch_idx,
             cu_seqlens_q,
         )
         out_elem_offset = _output_element_offset(cfg, output_query_row, dim_idx)
-        if cutlass.const_expr(output_elements_per_thread == 1):
+        if cutlass.const_expr(output_quant is not None):
+            output_quant.store(output_quant_args, output_acc, output_query_row, dim_idx)
+        elif cutlass.const_expr(output_elements_per_thread == 1):
             (output.iterator.raw_ptr() + out_elem_offset).store(
                 output.element_type(output_acc[0])
             )
@@ -775,9 +802,15 @@ def run_parallel_gmem_reduction_kernel(
     slots_per_rank: cutlass.Constexpr[int],
     actual_splits: cutlass.Constexpr[int],
     elements_per_slice: cutlass.Constexpr[int],
+    atten_sinks=None,
+    finalize_attention: cutlass.Constexpr[bool] = False,
+    output_quant: cutlass.Constexpr = None,
+    output_quant_args=None,
 ):
     """Reduce split-KV partials with row-shared local and peer statistics."""
 
+    if cutlass.const_expr(finalize_attention and cluster_size != 1):
+        raise ValueError("final attention output uses a single-CTA reducer per row")
     prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
     if cutlass.const_expr(cluster_size == 1):
@@ -790,6 +823,10 @@ def run_parallel_gmem_reduction_kernel(
             cu_seqlens_q,
             cfg,
             elements_per_slice,
+            atten_sinks,
+            finalize_attention,
+            output_quant,
+            output_quant_args,
         )
         return
 

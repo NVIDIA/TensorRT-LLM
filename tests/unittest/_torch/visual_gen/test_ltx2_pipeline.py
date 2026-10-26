@@ -478,6 +478,29 @@ class TestLTX2BatchSupport:
             assert torch_shape[0] == batch_size
 
     @pytest.mark.cpu_only
+    def test_video_scale_factors_follow_tensor_axis_order(self):
+        """Asymmetric scale factors map to time, height, and width axes."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.patchifier import get_pixel_coords
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.types import (
+            SpatioTemporalScaleFactors,
+            VideoLatentShape,
+            VideoPixelShape,
+        )
+
+        scale_factors = SpatioTemporalScaleFactors(time=2, height=4, width=8)
+        pixel_shape = VideoPixelShape(batch=1, frames=9, height=16, width=32, fps=24.0)
+        latent_shape = VideoLatentShape.from_pixel_shape(
+            pixel_shape, latent_channels=128, scale_factors=scale_factors
+        )
+
+        assert latent_shape[2:] == (5, 4, 4)
+        assert latent_shape.upscale(scale_factors)[2:] == (9, 16, 32)
+
+        latent_bounds = torch.tensor([[[[1, 2]], [[1, 2]], [[1, 2]]]])
+        pixel_bounds = get_pixel_coords(latent_bounds, scale_factors)
+        assert pixel_bounds.tolist() == [[[[2, 4]], [[4, 8]], [[8, 16]]]]
+
+    @pytest.mark.cpu_only
     def test_prompt_normalization(self):
         """forward() normalizes str prompt to List[str] and computes batch_size."""
         # Simulate the normalization logic from forward()
@@ -1161,6 +1184,31 @@ def ltx2_two_stage_assets_exist():
     )
 
 
+class TestLTX2CudaGraphSetup:
+    def test_uses_pipeline_shared_pool(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        class TinyTransformer:
+            def register_cuda_graph_extra_key_fns(self, runner):
+                pass
+
+            def forward(self, *args, **kwargs):
+                return args, kwargs
+
+        pipeline = object.__new__(LTX2Pipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinyTransformer()
+        pipeline._cuda_graph_runners = {}
+
+        pipeline._setup_cuda_graphs()
+
+        runner = pipeline._cuda_graph_runners["transformer"]
+        assert runner._shared_pool is pipeline._cuda_graph_shared_pool
+
+
 class TestLTX2TwoStageLoRAHelpers:
     """Test LTX-2 two-stage distilled LoRA helpers without model loading."""
 
@@ -1335,6 +1383,7 @@ class TestLTX2TwoStageLoRAHelpers:
 
         runner = pipeline._cuda_graph_runners["transformer"]
         assert isinstance(runner, ltx2_two_stages._LTX2TwoStageCUDAGraphRunner)
+        assert runner._shared_pool is pipeline._cuda_graph_shared_pool
         assert runner._lora_state_getter() == "original"
         # Same contract as the single-stage pipeline: the transformer's extra
         # CUDA-graph keys (skip-softmax / Sol-Attn phase) must be registered.

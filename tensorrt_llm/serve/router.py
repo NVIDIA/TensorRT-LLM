@@ -27,14 +27,15 @@ from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.metadata_server import JsonDictionary
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                ResponsesRequest)
 # Shared tokenization / block-hashing utilities (single source of truth).
 # Re-exported here for backward compat.
 from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_DEFAULT, KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
     KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
-    BlockHashMixin, OpenAIRequest, block_key_hasher, get_cache_salt_id,
-    get_request_num_tokens, hash_v1_block_key, truncate_sha256_hash_to_int64)
+    BlockHashMixin, OpenAIRequest, block_key_hasher, get_request_num_tokens,
+    hash_v1_block_key, responses_request_text, truncate_sha256_hash_to_int64)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 COORDINATOR_SELECT_MAX_ATTEMPTS = 2
@@ -984,7 +985,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self._server_state[server].set_hash_algo(worker_algo)
 
     @staticmethod
-    def _content_affinity_key(request: OpenAIRequest) -> Optional[int]:
+    def _content_affinity_key(
+            request: OpenAIRequest,
+            token_ids: Optional[List[int]] = None) -> Optional[int]:
+        """Conversation key from the first messages and the first prompt tokens.
+
+        ``token_ids`` are the router's own ids, for a request it did not write them
+        back into: the key must not depend on whether the ids were forwarded.
+        """
         messages = getattr(request, "messages", None)
         if not messages:
             return None
@@ -993,7 +1001,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             content = (message.get("content") if isinstance(message, dict) else
                        getattr(message, "content", ""))
             parts.append(str(content))
-        token_ids = getattr(request, "prompt_token_ids", None)
+        token_ids = getattr(request, "prompt_token_ids", None) or token_ids
         if token_ids:
             parts.append(str(list(token_ids[:ROUTE_AFFINITY_TOKEN_PREFIX])))
         digest = blake3("".join(parts).encode("utf-8"),
@@ -1019,7 +1027,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         Tokenization and per-algorithm block hashing are CPU-bound and run in a
         thread. The returned plain dict can be sent over HTTP unchanged.
         """
-        cache_salt_id = self._get_request_cache_salt_id(request)
+        cache_salt = self._get_request_cache_salt(request)
         # Hash for every algo any server might use (usually one).
         algos = ({self._routing_hash_algo}
                  if self._routing_hash_algo is not None else {
@@ -1032,11 +1040,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 "synchronize it with the coordinator before routing")
         token_lists, block_hashes_by_algo = \
             self._tokenize_and_compute_block_hashes_by_algo(
-                request, algos, cache_salt_id)
+                request, algos, cache_salt)
         return {
-            "block_hashes_by_algo": block_hashes_by_algo,
-            "conv_key": self._content_affinity_key(request),
-            "num_tokens": sum(len(token_list) for token_list in token_lists),
+            "block_hashes_by_algo":
+            block_hashes_by_algo,
+            "conv_key":
+            self._content_affinity_key(
+                request, token_lists[0] if len(token_lists) == 1 else None),
+            "num_tokens":
+            sum(len(token_list) for token_list in token_lists),
         }
 
     async def _route(self, key, exclude_server=None, request=None, req_id=None):
@@ -1430,6 +1442,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     @staticmethod
     def _extract_text(request: OpenAIRequest) -> str:
         """Return a canonical text representation of the request content."""
+        if isinstance(request, ResponsesRequest):
+            return responses_request_text(request)
         if isinstance(request, ChatCompletionRequest):
             parts = []
             for msg in request.messages:
@@ -1454,6 +1468,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         Returns ``None`` when the request does not already carry them.
         """
+        if isinstance(request, ResponsesRequest):
+            token_ids = request.relayed_prompt_token_ids()
+            return None if token_ids is None else [token_ids]
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]

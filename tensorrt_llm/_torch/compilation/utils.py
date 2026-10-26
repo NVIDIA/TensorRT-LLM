@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -142,16 +145,20 @@ def inplace_info():
             2: "paged_score",
             3: "output"
         },
+        # Must list every mutable argument of the op schema, in order:
+        # remove_copy_pass rebuilds the call from these names only.
         torch.ops.trtllm.compressor_postprocess_scatter.default: {
             1: "kv_out",
             2: "kv_cache",
-            3: "quant_output",
-            4: "scale_output"
+            3: "kv_cache_scale",
+            4: "quant_output",
+            5: "scale_output"
         },
         torch.ops.trtllm.mhc_big_fuse.default: {
             1: "post_mix",
             2: "comb_mix",
-            3: "layer_input"
+            3: "layer_input",
+            4: "pre_mix_out"
         },
         torch.ops.trtllm.mhc_gemm_sqrsum_fma.default: {
             1: "y",
@@ -170,7 +177,8 @@ def inplace_info():
             4: "layer_input_cur",
             5: "y_acc_workspace",
             6: "r_acc_workspace",
-            7: "done_counter_workspace"
+            7: "done_counter_workspace",
+            8: "pre_mix_out"
         },
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
@@ -224,10 +232,11 @@ def inplace_info():
             1: "output"
         },
         # The ordinary outputs are compact Q/index-Q; the next
-        # two outputs of auto_functionalized are the mutated paged caches.
+        # three outputs of auto_functionalized are the mutated paged caches.
         "minimax_m3_fused_sparse_qkv_producer": {
             2: "kv_cache",
-            3: "index_k_cache"
+            3: "index_k_cache",
+            4: "kv_scale_cache"
         },
         "fused_sigmoid_mul_inplace": {
             1: "attention_output"
@@ -246,6 +255,12 @@ def inplace_info():
             1: "output"
         },
         "cute_dsl_bf16_gemm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_gemm_locality_domain_inplace_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_bmm_locality_domain_inplace_rubin": {
             1: "output"
         },
         "cute_dsl_fp8_bmm_rubin": {
@@ -276,6 +291,14 @@ def inplace_info():
         "mla_rope_generation": {
             1: "fused_q",
             2: "q_pe"
+        },
+        # Registered lazily: the op only exists once fused_shared_expert is
+        # imported (Qwen3-Next family). Omitting this entry is a correctness
+        # bug, not just perf: the following allreduce would consume the
+        # functionalization clone instead of the allocate_output
+        # symmetric-heap buffer.
+        "fused_sigmoid_gate_mul_add_": {
+            1: "output"
         },
     }
     for op_name, mutates_args in optional_inplace_infos.items():

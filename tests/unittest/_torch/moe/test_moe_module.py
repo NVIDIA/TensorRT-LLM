@@ -69,8 +69,8 @@ from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
     DEFAULT_MOE_ACTIVATION,
@@ -110,6 +110,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
@@ -673,6 +674,8 @@ def _test_moe_worker_impl(
         )
 
         with (
+            # Standalone outputs remain live through reference and accuracy checks.
+            nccl_window_tensor_scope(x),
             moe_load_balancer,
             create_moe(
                 routing_method=routing_method,
@@ -801,7 +804,7 @@ def _test_moe_worker_impl(
 # thread is spawned lazily on first submit and persists by design, so the
 # multi-GPU tests disable pytest-threadleak via @pytest.mark.threadleak(
 # enabled=False) (same convention as the conftest mpi_pool_executor users
-# test_moe_a2a / test_autotuner), rather than excluding it in pytest.ini.
+# test_nvlink_one_sided / test_autotuner), rather than excluding it in pytest.ini.
 # ---------------------------------------------------------------------------
 
 
@@ -863,7 +866,7 @@ def moe_multi_gpu_executor():
     pool's manager thread is spawned lazily on first submit and persists by
     design, so the multi-GPU tests disable pytest-threadleak via
     @pytest.mark.threadleak(enabled=False) (same convention as the other
-    mpi_pool_executor users, test_moe_a2a / test_autotuner). world_size is 4.
+    mpi_pool_executor users, test_nvlink_one_sided / test_autotuner). world_size is 4.
     """
     world_size = 4
     with MPIPoolExecutor(
@@ -1849,6 +1852,164 @@ def test_configurable_moe_multi_gpu(
 
 
 # ============================================================================
+# unfinalized_combine_fn: numerical hook-vs-finalize check under a real comm
+# ============================================================================
+
+
+def _hook_vs_finalize_worker(mapping, model_config, seq_len):
+    try:
+        _hook_vs_finalize_worker_impl(mapping, model_config, seq_len)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def _hook_vs_finalize_worker_impl(mapping, model_config, seq_len):
+    """``do_finalize=False`` + registered hook must equal ``do_finalize=True``.
+
+    The hook re-implements the kernel's own finalize (gather the permuted rows
+    through ``expanded_idx_to_permuted_idx``, weight, sum; non-local slots are
+    ``-1`` and contribute zeros), so running it on the dispatched rows and
+    letting the combine reduce the finalized partials has to reproduce the
+    in-kernel finalize up to accumulation order.
+    """
+    num_experts = model_config.num_experts
+    top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+    dtype = torch.bfloat16
+
+    mapping.rank = mpi_rank()
+    all_rank_num_tokens = [seq_len] * mapping.world_size
+    torch.cuda.set_device(mapping.rank)
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        # Per-rank inputs: attention DP ranks hold different tokens.
+        torch.manual_seed(mapping.rank)
+        torch.cuda.manual_seed(mapping.rank)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, MoeBackendType.TRTLLM
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            num_local_experts=num_experts // mapping.moe_ep_size,
+            activation_type=ActivationType.Swiglu,
+        )
+        quant_kwargs.pop("ref_cls", None)
+
+        model_cfg = _create_model_config(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            moe_backend=MoeBackendType.TRTLLM.value,
+            enable_eplb=False,
+            num_slots=-1,
+            layer_updates_per_iter=-1,
+            max_num_tokens=max(256, seq_len),
+        )
+
+        def model_finalize(
+            *,
+            gemm2_output,
+            expanded_idx_to_permuted_idx,
+            token_selected_slots,
+            routing_weights,
+            num_tokens,
+        ):
+            del token_selected_slots  # an identity transform needs no expert id
+            rows = gemm2_output[..., :hidden_size].to(torch.float32)
+            idx = expanded_idx_to_permuted_idx.view(num_tokens, -1).to(torch.long)
+            weights = routing_weights.view(num_tokens, -1).to(torch.float32)
+            valid = idx >= 0
+            gathered = rows[idx.clamp(min=0)]
+            return (gathered * (weights * valid).unsqueeze(-1)).sum(dim=1)
+
+        with create_moe(
+            routing_method=routing_method,
+            reduce_results=False,  # the backend's unfinalized path asserts this
+            model_config=model_cfg,
+            weight_loading_mode=getattr(
+                quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
+            ),
+            unfinalized_combine_fn=model_finalize,
+        ) as fused_moe:
+            fused_moe.create_weights()
+            weights = quantize_util.create_weights(**quant_kwargs)
+            fused_moe.load_weights([weights])
+            fused_moe.post_load_weights()
+            fused_moe.cuda(f"cuda:{mapping.rank}")
+
+            assert fused_moe.comm is not None, (
+                "the point of this test is the finalize-before-combine path; "
+                "without a comm strategy it validates nothing"
+            )
+
+            with torch.inference_mode():
+                finalized = fused_moe.forward(
+                    x,
+                    router_logits,
+                    do_finalize=True,
+                    output_dtype=dtype,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                )
+                hooked = fused_moe.forward(
+                    x,
+                    router_logits,
+                    do_finalize=False,
+                    output_dtype=dtype,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                )
+            torch.cuda.synchronize()
+
+            assert hooked.shape == finalized.shape
+            # Same expert outputs on both passes; the two finalizes differ only
+            # in accumulation order and the hook's FP32 math vs the kernel's.
+            torch.testing.assert_close(hooked.float(), finalized.float(), rtol=5e-2, atol=5e-2)
+
+
+def _hook_vs_finalize_entry(comm_method_type, *worker_args):
+    os.environ["TRTLLM_FORCE_COMM_METHOD"] = comm_method_type
+    try:
+        return _hook_vs_finalize_worker(*worker_args)
+    finally:
+        _reset_moe_comm_state()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
+@pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
+def test_unfinalized_combine_fn_matches_in_kernel_finalize_multi_gpu(moe_multi_gpu_executor):
+    if get_sm_version() < 100:
+        pytest.skip("TRTLLM-Gen NVFP4 (the backend that returns the triple) needs Blackwell")
+
+    world_size = 4
+    mapping = _create_mapping_for_parallel_mode(world_size, "DEP")
+    model_config = MoeModelConfig(8, 2, 512, 512)
+    results = moe_multi_gpu_executor.map(
+        _hook_vs_finalize_entry,
+        *zip(*[("ALLGATHER", mapping, model_config, 4)] * world_size),
+    )
+    for r in results:
+        assert r is None
+
+
+# ============================================================================
 # MoE Multi-GPU EPLB Tests
 # ============================================================================
 # EPLB-specific configuration
@@ -1880,16 +2041,12 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
         return None
 
     # CUTLASS backend
-    # Mapping based on CutlassFusedMoE._get_quant_method() logic
+    # What each CUTLASS leaf's _get_quant_method() returns, for the formats
+    # this test sweeps.
     if backend_str == "CUTLASS":
-        DSFP8BlockScalesFusedMoEMethod = (
-            DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm
-            if get_sm_version() == 120
-            else DeepSeekFP8BlockScalesFusedMoEMethod
-        )
         method_map = {
             QuantAlgo.FP8: FP8QDQFusedMoEMethod,
-            QuantAlgo.FP8_BLOCK_SCALES: DSFP8BlockScalesFusedMoEMethod,
+            QuantAlgo.FP8_BLOCK_SCALES: DeepSeekFP8BlockScalesFusedMoEMethod,
             QuantAlgo.NVFP4: NVFP4CutlassFusedMoEMethod,
             # W4A8_AWQ uses is_int4_weight_only_per_group() -> WInt4AFP8FusedMoEMethod
             QuantAlgo.W4A8_AWQ: WInt4AFP8FusedMoEMethod,

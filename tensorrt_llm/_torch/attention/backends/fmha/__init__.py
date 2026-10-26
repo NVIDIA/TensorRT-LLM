@@ -24,6 +24,7 @@ from .msa_decode import MsaDecodeFmha
 from .msa_prefill import MsaPrefillFmha
 from .phased import FmhaParams, PhasedFmha
 from .prims_ts import PrimsTSFmha
+from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
 from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
 from .triton_custom_mask import TritonCustomMaskFmha
 
@@ -44,6 +45,7 @@ __all__ = [
     "MsaPrefillFmha",
     "PhasedFmha",
     "PrimsTSFmha",
+    "PrimsTSSparseMlaFmha",
     "TritonCustomMaskFmha",
     "get_enabled_fmha_lib_classes",
 ]

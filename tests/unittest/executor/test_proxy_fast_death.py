@@ -290,7 +290,6 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         result_queue_addr=("result", b"key"),
     )
     worker_module.worker_main(
-        engine=object(),
         worker_queues=worker_queues,
         log_level=worker_module.logger.level,
         worker_cls=_FailingWorker,
@@ -307,7 +306,6 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
     init_status_queue.succeeds = False
     with pytest.raises(RuntimeError, match="Failed to deliver worker process identities to proxy"):
         worker_module.worker_main(
-            engine=object(),
             worker_queues=worker_queues,
             log_level=worker_module.logger.level,
             worker_cls=_FailingWorker,
@@ -457,32 +455,6 @@ def test_remote_worker_death_roundtrip():
     assert "rank 3 exploded" in str(exc)
 
 
-def test_server_async_callback_forwards_only_failures():
-    from concurrent.futures import Future
-
-    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer, RemoteWorkerDeath
-
-    server = object.__new__(RemoteMpiCommSessionServer)
-    sent = []
-    server.queue = type("Q", (), {"put": lambda self, m: sent.append(m)})()
-
-    ok = Future()
-    ok.set_result(42)
-    server.mpi_async_error_callback(ok)
-    assert sent == []
-
-    cancelled = Future()
-    cancelled.cancel()
-    server.mpi_async_error_callback(cancelled)
-    assert sent == []
-
-    failed = Future()
-    failed.set_exception(RuntimeError("worker segfault"))
-    server.mpi_async_error_callback(failed)
-    assert len(sent) == 1 and isinstance(sent[0], RemoteWorkerDeath)
-    assert sent[0].message == "worker segfault"
-
-
 class _FakeZmqQueue:
     """poll()/get() stub fed with a fixed message sequence."""
 
@@ -618,6 +590,41 @@ def test_shutdown_keeps_blocking_semantics_when_engine_alive():
     dispatcher.join.assert_called_once_with(timeout=None)
     proxy.mpi_session.shutdown.assert_called_once_with()
     proxy.mpi_session.abandon.assert_not_called()
+    assert proxy.workers_started is False
+
+
+def test_shutdown_bounds_wait_on_worker_that_never_finishes(monkeypatch):
+    """A worker that never completes (with no error queued) cannot wedge shutdown.
+
+    The wait is one deadline shared by all futures, and running out of it
+    routes the rest of teardown through the dead-engine path.
+    """
+    monkeypatch.setattr(GenerationExecutorProxy, "_WORKER_SHUTDOWN_TIMEOUT_S", 0.5)
+    proxy = _teardown_proxy(engine_dead=False)
+    r = _FakeResult()
+    proxy._results = {1: r}
+    done = _Future()
+    done.set_result(None)
+    stuck = [_Future() for _ in range(4)]  # never complete
+    proxy.mpi_futures = [done, *stuck]
+
+    dispatcher = _Mock()
+    dispatcher.is_alive.return_value = True
+    proxy.dispatch_result_thread = dispatcher
+
+    start = _time.monotonic()
+    proxy.shutdown()
+    elapsed = _time.monotonic() - start
+
+    # One shared deadline, not one per stuck future (which would be 2 s here).
+    assert elapsed < 1.5
+    assert proxy._engine_dead is True
+    item = r.queue.get_nowait()
+    assert isinstance(item, EngineDeadError)
+    assert isinstance(item.root_cause, TimeoutError)
+    dispatcher.join.assert_called_once_with(timeout=5.0)
+    proxy.mpi_session.abandon.assert_called_once_with()
+    proxy.mpi_session.shutdown.assert_not_called()
     assert proxy.workers_started is False
 
 

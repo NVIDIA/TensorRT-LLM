@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Run benchmarking with `trtllm-serve`
 
 TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
@@ -198,7 +203,7 @@ To get more detailed metrics besides the key metrics above, there is an [experim
 
 ## Profile a server with HTTP API endpoints
 
-> **Beta.** PyTorch backend only. No-op on the TensorRT backend.
+> **Beta.** Applies to the PyTorch executor (`PyExecutor`).
 
 `trtllm-serve` exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime — no restart and no env vars required:
 
@@ -289,7 +294,13 @@ curl -s -X POST http://127.0.0.1:8000/start_profile \
    :end-before: .. end-note-config-flag-alias
 ```
 
-`trtllm-serve` provides `--config` to **overwrite** the parameters specified by `trtllm-serve`.
+`trtllm-serve` provides `--config` for supplying LLM arguments that do not
+have dedicated command-line options. Explicit dedicated CLI flags override
+conflicting values in the YAML file. To override an individual YAML field
+without editing the file, use the repeatable `--set PATH=YAML_VALUE` option;
+`--set` has the highest precedence. See
+[Configuring with YAML Files and `--set`](./trtllm-serve.rst#configuring-with-yaml-files)
+for its supported scope and reserved paths.
 Generally, we create a YAML file that contains various performance switches. For example:
 
 ```yaml
@@ -342,7 +353,7 @@ The following is a list of common performance switches.
 
 &emsp;&emsp;**Default**: CUTLASS
 
-### `attention_backend`
+### `attn_backend`
 
 &emsp;**Description**: The backend to use for attention calculations.
 

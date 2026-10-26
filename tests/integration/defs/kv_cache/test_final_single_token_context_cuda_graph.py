@@ -24,6 +24,7 @@ import torch
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
@@ -41,7 +42,7 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from ..conftest import llm_models_root
 
-MODEL = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
 SPEC_MODEL = f"{llm_models_root()}/Qwen3/Qwen3-8B"
 EAGLE3_MODEL = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
 PROMPT_TOKEN_IDS = [1] + [42] * 63 + [43]
@@ -124,8 +125,10 @@ class _CudaGraphExecutionProbe:
         self,
         key: KeyType,
         current_inputs: dict[str, Any],
+        *,
+        position_id_offsets: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        output = self._replay(key, current_inputs)
+        output = self._replay(key, current_inputs, position_id_offsets=position_id_offsets)
         if self._pending_execution is not None and self._pending_execution.key == key:
             self._pending_execution.replayed = True
             self._pending_execution = None
@@ -140,6 +143,9 @@ def _get_worker_cuda_graph_runner(
     worker: GenerationExecutorWorker,
 ) -> CUDAGraphRunner:
     assert isinstance(worker.engine, PyExecutor)
+    assert isinstance(worker.engine.kv_cache_manager, KVCacheManagerV2)
+    if worker.engine.draft_kv_cache_manager is not None:
+        assert isinstance(worker.engine.draft_kv_cache_manager, KVCacheManagerV2)
     model_engine = worker.engine.model_engine
     assert isinstance(model_engine, PyTorchModelEngine)
     return model_engine.cuda_graph_runner
@@ -346,7 +352,7 @@ def _generate_changed_final_token_cold_and_reused(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_final_token_reuse_cuda_graph(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -363,7 +369,7 @@ def test_final_token_reuse_cuda_graph(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_changed_final_token_reuse_cuda_graph(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -383,7 +389,7 @@ def test_changed_final_token_reuse_cuda_graph(
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_final_token_reuse_cuda_graph_tp2(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -421,7 +427,7 @@ def test_final_token_reuse_cuda_graph_tp2(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_context_logits_after_final_token_reuse(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -446,7 +452,7 @@ def test_context_logits_after_final_token_reuse(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_guided_decoding_after_final_token_reuse(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -470,7 +476,7 @@ def test_guided_decoding_after_final_token_reuse(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_zero_runtime_draft_speculation_after_final_token_reuse(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,

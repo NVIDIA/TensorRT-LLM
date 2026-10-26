@@ -1,5 +1,200 @@
+diff --git a/_compile_cache.py b/_compile_cache.py
+index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254006f8cb8 100644
+--- a/_compile_cache.py
++++ b/_compile_cache.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -15,10 +16,13 @@
+ """Persistent compilation shared by the PrimTS attention adapters."""
+ 
+ from collections.abc import Callable
++import contextlib
++import contextvars
+ import dataclasses
+ import enum
+ import functools
+ import hashlib
++import os
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -64,6 +68,128 @@ def _compile_cache_key(spec: object, options: str, extra: tuple = ()) -> str | N
+     return hashlib.sha256(encoded.encode()).hexdigest()
+ 
+ 
++# Warm-up precompile modes. Under ``precompile_only()`` the attention kernels
++# are compiled through ``JitSpecCuteDsl.compile_and_persist()`` (the
++# ``cute.compile`` runs outside the module-level file lock that
++# ``build_and_load()`` holds for a whole build, so sibling processes compile
++# different kernels concurrently), committed to disk, and not loaded: the
++# serving process loads them afterwards. Under ``probe_cached()`` nothing is
++# compiled; a kernel missing from the cache raises ``KernelNotCached``. Both
++# modes return a placeholder in place of the kernel.
++_PRECOMPILE_MODE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
++    "prims_ts_precompile_mode", default=None
++)
++_SKIP_BUSY: contextvars.ContextVar[bool] = contextvars.ContextVar(
++    "prims_ts_precompile_skip_busy", default=False
++)
++
++
++class KernelNotCached(Exception):
++    """Raised under ``probe_cached()`` for a kernel that is not on disk."""
++
++
++class KernelBusy(Exception):
++    """Raised under ``precompile_only(skip_busy=True)`` while another process compiles the kernel."""
++
++
++@contextlib.contextmanager
++def precompile_only(*, skip_busy: bool = False):
++    """Compile and persist kernels without loading them (see module note).
++
++    With ``skip_busy`` a kernel whose per-kernel lock another process holds
++    raises ``KernelBusy`` instead of waiting, so a worker can defer it and
++    compile something else first.
++    """
++    token = _PRECOMPILE_MODE.set("persist")
++    busy_token = _SKIP_BUSY.set(skip_busy)
++    try:
++        yield
++    finally:
++        _SKIP_BUSY.reset(busy_token)
++        _PRECOMPILE_MODE.reset(token)
++
++
++@contextlib.contextmanager
++def probe_cached():
++    """Report, without compiling, whether every kernel a plan needs is on disk."""
++    token = _PRECOMPILE_MODE.set("probe")
++    try:
++        yield
++    finally:
++        _PRECOMPILE_MODE.reset(token)
++
++
++def expected_cache_meta() -> dict:
++    """The on-disk module metadata this process would write (arch, DSL version, source hash)."""
++    from flashinfer.jit.cute_dsl_core import (
++        _get_compile_arch,
++        _get_cute_dsl_version,
++        _hash_source_files,
++    )
++
++    return {
++        "arch": _get_compile_arch(),
++        "cute_dsl_version": _get_cute_dsl_version(),
++        "source_sha256": _hash_source_files(tuple(_kernel_source_files())),
++    }
++
++
++def _unloaded_kernel(*args, **kwargs):
++    raise RuntimeError(
++        "PrimTS kernel was compiled in precompile-only mode and never loaded; "
++        "load it through a normal plan() outside precompile_only()."
++    )
++
++
++def is_placeholder(compiled) -> bool:
++    """True for the stand-in returned under the precompile modes."""
++    return compiled is _unloaded_kernel
++
++
++def _make_spec(module_name: str, kernel_name: str, compile_fn, key_files):
++    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
++
++    return JitSpecCuteDsl(module_name, kernel_name, compile_fn, _hash_source_files(tuple(key_files)))
++
++
++def _precompile_kernel(module_name: str, kernel_name: str, compile_fn, key_files) -> None:
++    """Compile one kernel into the on-disk cache unless it is already there.
++
++    One compile per kernel per workspace: a sibling that wants the same kernel
++    waits on the per-kernel lock (or raises ``KernelBusy`` under ``skip_busy``)
++    and then finds it on disk. The lock lives in FlashInfer's tmp directory,
++    not in the module directory: creating that directory before the first
++    export would let ``compile_and_persist()`` of a sibling read a missing
++    meta.json as a stale module and wipe the exports already there.
++    """
++    from filelock import FileLock, Timeout
++    from flashinfer.jit.core import get_tmpdir
++
++    spec = _make_spec(module_name, kernel_name, compile_fn, key_files)
++    if spec.is_compiled:
++        return
++    lock = FileLock(get_tmpdir() / f"{spec.module_dir_name}.{spec.kernel_name}.lock", thread_local=False)
++    if _SKIP_BUSY.get():
++        try:
++            lock.acquire(timeout=0)
++        except Timeout:
++            raise KernelBusy(spec.name) from None
++    else:
++        lock.acquire()
++    try:
++        if spec.is_compiled:
++            return
++        spec.compile_and_persist()
++    finally:
++        lock.release()
++
++
++def _probe_kernel(module_name: str, kernel_name: str, compile_fn, key_files) -> None:
++    spec = _make_spec(module_name, kernel_name, compile_fn, key_files)
++    if not spec.is_compiled:
++        raise KernelNotCached(spec.name)
++
++
+ @functools.cache
+ def _kernel_source_files() -> tuple[str, ...]:
+     # Family adapters share masks, reductions, sparse/Sage preparation and
+@@ -82,16 +208,26 @@ def build_and_load_attention_kernel(
+     extra: tuple = (),
+ ) -> Any:
+     """Build or load under the caller's selected CUDA device context."""
+-    from ...jit.cute_dsl_core import (
++    from flashinfer.jit.cute_dsl_core import (
+         build_and_load_cute_dsl_kernel,
+         cute_dsl_cache_disabled,
+     )
+ 
++    mode = _PRECOMPILE_MODE.get()
++    if mode is not None and os.environ.get("FLASHINFER_DISABLE_JIT"):
++        raise RuntimeError("PrimTS warm-up precompile cannot compile with FLASHINFER_DISABLE_JIT set.")
+     if cute_dsl_cache_disabled():
++        if mode is not None:
++            raise RuntimeError(
++                "PrimTS warm-up precompile needs the on-disk CuTe DSL cache "
++                "(FLASHINFER_CUTE_DSL_DISABLE_CACHE=1 is set)."
++            )
+         return compile_fn()
+ 
+     key = _compile_cache_key(spec, options, extra)
+     if key is None:
++        if mode is not None:
++            raise RuntimeError("PrimTS warm-up precompile cannot key this kernel for the on-disk cache.")
+         return compile_fn()
+     import torch
+ 
+@@ -99,6 +235,14 @@ def build_and_load_attention_kernel(
+     # host-selected tuning defaults. The module metadata keys the target;
+     # the specialization must also distinguish the physical capability.
+     major, minor = torch.cuda.get_device_capability()
++    if mode == "persist":
++        _precompile_kernel(
++            f"prims_ts_{family}", f"{kind}_sm{major}{minor}_{key}", compile_fn, _kernel_source_files()
++        )
++        return _unloaded_kernel
++    if mode == "probe":
++        _probe_kernel(f"prims_ts_{family}", f"{kind}_sm{major}{minor}_{key}", compile_fn, _kernel_source_files())
++        return _unloaded_kernel
+     return build_and_load_cute_dsl_kernel(
+         f"prims_ts_{family}",
+         f"{kind}_sm{major}{minor}_{key}",
 diff --git a/block_sparse.py b/block_sparse.py
-index c7e881ca73dfb95314da532912db39fe7b05eb94..e19dc7b1de7fca03c44b8e98217f8d10fb17e26b 100644
+index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe2532a1c7 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -7,70 +202,73 @@ index c7e881ca73dfb95314da532912db39fe7b05eb94..e19dc7b1de7fca03c44b8e98217f8d10
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -35,12 +36,6 @@ from typing import Literal
+@@ -37,13 +38,7 @@ from typing import Literal
+ 
  import torch
  
- from flashinfer.api_logging import flashinfer_api
+-from flashinfer.api_logging import flashinfer_experimental_api
 -from flashinfer.trace.templates.attention import (
 -    prims_ts_block_sparse_trace_dispatch,
 -    prims_ts_block_sparse_wrapper_trace_dispatch,
 -    prims_ts_paged_block_sparse_trace_dispatch,
 -    prims_ts_paged_block_sparse_wrapper_trace_dispatch,
 -)
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
  
- from ._block_sparse.common import _validate_contiguous_route_mode
- from ._block_sparse.config import _validate_block_sparse_static_profile
-@@ -239,7 +234,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+ from ._block_sparse.common import (
+     _num_sparse_pattern_heads,
+@@ -320,7 +315,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
          # previously published revision intact and runnable.
          self._plan_state = candidate
  
--    @flashinfer_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
-+    @flashinfer_api
+-    @flashinfer_experimental_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
++    @flashinfer_experimental_api
      def run(
          self,
          q: torch.Tensor,
-@@ -361,7 +356,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+@@ -452,7 +447,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
--@flashinfer_api(trace=prims_ts_block_sparse_trace_dispatch)
-+@flashinfer_api
+-@flashinfer_experimental_api(trace=prims_ts_block_sparse_trace_dispatch)
++@flashinfer_experimental_api
  def block_sparse_attention(
      q: torch.Tensor,
      k: torch.Tensor,
-@@ -607,7 +602,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -757,9 +752,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
              )
          self._plan_state = candidate
  
--    @flashinfer_api(trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch)
-+    @flashinfer_api
+-    @flashinfer_experimental_api(
+-        trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch
+-    )
++    @flashinfer_experimental_api
      def run(
          self,
          q: torch.Tensor,
-@@ -727,7 +722,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -881,7 +874,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
--@flashinfer_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
-+@flashinfer_api
+-@flashinfer_experimental_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
++@flashinfer_experimental_api
  def block_sparse_attention_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29d692b430 100644
+index d3f104e4e34b1bcb7ada697f9e76f7013d6ca100..1ec1080b942f60fad22e3e4a1627cad9592697ad 100644
 --- a/context.py
 +++ b/context.py
-@@ -31,8 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
- position.
+@@ -48,7 +48,7 @@ from ._hardware import get_max_active_clusters
  
- PrimTS context entry points are intentionally excluded from ``fi_trace`` for
--now; unlike the decode APIs, their ``@flashinfer_api`` decorators do not
--register trace templates.
-+now; their ``@flashinfer_api`` decorators do not register trace templates.
- """
+ import torch
  
- from dataclasses import dataclass
-@@ -438,7 +437,7 @@ def _validate_device(device: torch.device) -> int:
+-from flashinfer.api_logging import flashinfer_experimental_api
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ 
+ 
+ if TYPE_CHECKING:
+@@ -493,7 +493,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -80,7 +278,7 @@ index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29
          require_cute_dsl_arch(device_index)
      return device_index
 diff --git a/decode.py b/decode.py
-index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841cdbce7b2 100644
+index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac722fed527 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -88,19 +286,20 @@ index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -25,11 +26,6 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
- import torch
+@@ -26,11 +27,7 @@ import torch
  
- from flashinfer.api_logging import flashinfer_api
+ from ._compile_cache import build_and_load_attention_kernel
+ 
+-from flashinfer.api_logging import flashinfer_experimental_api
 -from flashinfer.trace.templates.attention import (
 -    attention_ts_decode_trace_dispatch,
--    prims_ts_decode_trace_dispatch,
 -    prims_ts_decode_wrapper_trace_dispatch,
 -)
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
  
- from ._tensor_aliasing import (
-     _validate_out_does_not_overlap_inputs,
-@@ -702,7 +698,7 @@ def _validate_runtime_device(device: torch.device) -> int:
+ from . import _q_token_kv_block_sparse_policy as _sparse_policy
+ from ._block_sparse.common import _num_sparse_pattern_heads
+@@ -780,7 +777,7 @@ def _validate_runtime_device(device: torch.device) -> None:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -108,36 +307,119 @@ index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841
 +        from flashinfer.cute_dsl.utils import require_cute_dsl_arch
  
          require_cute_dsl_arch(device_index)
-     return device_index
-@@ -2145,7 +2141,7 @@ def _validate_decode_run_metadata_values(
-                 )
  
- 
--@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
-+@flashinfer_api
- def prims_ts_batch_decode_with_kv_cache(
-     query: torch.Tensor,
-     kv_cache: PagedKVCache,
-@@ -2708,7 +2704,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4075,7 +4072,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
--    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
-+    @flashinfer_api
+-    @flashinfer_experimental_api(trace=prims_ts_decode_wrapper_trace_dispatch)
++    @flashinfer_experimental_api
      def run(
          self,
          q: torch.Tensor,
-@@ -2893,7 +2889,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4257,7 +4254,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
--@flashinfer_api(trace=attention_ts_decode_trace_dispatch)
-+@flashinfer_api
+-@flashinfer_experimental_api(trace=attention_ts_decode_trace_dispatch)
++@flashinfer_experimental_api
  def batch_decode_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
+diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
+index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2fe30a922 100644
+--- a/kernels/fmha_context/fmha_resources.py
++++ b/kernels/fmha_context/fmha_resources.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -1199,8 +1200,6 @@ class GmemQKVResource(MemoryResource):
+                 if cutlass.const_expr(self.cfg.has_uniform_varlen):
+                     seqlen_k = Int32(self.cfg.uniform_seq_len_k)
+                 else:
+-                    from .helpers_paged import _load_runtime_seq_len_kv
+-
+                     seqlen_k = _load_runtime_seq_len_kv(
+                         self.seqlens_kv, self.max_seq_len_kv, batch_coord
+                     )
+@@ -1223,8 +1222,6 @@ class GmemQKVResource(MemoryResource):
+                     kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
+                     kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
+                 else:
+-                    from .helpers_paged import _load_block_table_row_bounds
+-
+                     kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
+                         Int32(self.block_table_row_stride),
+                         self.cfg,
+@@ -1300,13 +1297,9 @@ class GmemQKVResource(MemoryResource):
+             kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
+             kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
+         else:
+-            from .helpers_paged import _load_runtime_seq_len_kv
+-
+             cached_seqlen_kv = _load_runtime_seq_len_kv(
+                 self.seqlens_kv, self.max_seq_len_kv, batch_coord
+             )
+-            from .helpers_paged import _load_block_table_row_bounds
+-
+             kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
+                 Int32(self.block_table_row_stride),
+                 self.cfg,
+@@ -1743,8 +1736,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
+         kv_request_begin: Int32,
+         kv_page_idx_ub: Int32,
+     ) -> None:
+-        from .helpers_paged import _resolve_kv_tile_idx_context
+-
+         cfg = self.cfg
+         # Context's K/V tile index is kv_tile_start + loop_offset; for V the
+         # producer runs one tile ahead in TAIL, so reuse the same expression
+@@ -1835,8 +1826,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
+         tile_offset: cutlass.Constexpr[int] = 0,
+     ) -> cutlass.Array:
+         """Retain one tile's page IDs after its SMEM window is released."""
+-        from .helpers_paged import _resolve_kv_tile_idx_context
+-
+         tile_idx = _resolve_kv_tile_idx_context(
+             stage_info, kv_tile_start, tile_offset=tile_offset
+         )
+@@ -5770,3 +5759,14 @@ class GmemOResource(MemoryResource):
+                 prims.cp_async_bulk_commit_group()
+                 if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
+                     prims.cp_async_bulk_wait_group(0, read=True)
++
++
++# helpers_paged imports FmhaConfig from this module, so it is imported here,
++# after FmhaConfig is defined. The methods above call these helpers while being
++# traced inside the kernel's runtime loops, where the CuTe DSL rejects a first
++# import of a module; importing at module scope keeps those calls import-free.
++from .helpers_paged import (
++    _load_block_table_row_bounds,
++    _load_runtime_seq_len_kv,
++    _resolve_kv_tile_idx_context,
++)
+diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
+index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a32c5289e 100644
+--- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
++++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -36,7 +37,7 @@ from cutlass.experimental.task_scheduling.resources import (
+     producer_work,
+ )
+ 
+-from ......cute_dsl.availability import is_rubin_cute_dsl_available
++from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
+ from ..fmha_decode_config import FmhaDecodeConfig
+ from .helpers_common import (
+     _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/mla_decode.py b/mla_decode.py
-index 8b7f19d1cc2baab6309018d46213f509c44d919a..cff2ee7d2ad051c8061ad396b87ee973eebed788 100644
+index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e231c98a52 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -145,20 +427,347 @@ index 8b7f19d1cc2baab6309018d46213f509c44d919a..cff2ee7d2ad051c8061ad396b87ee973
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -25,7 +26,6 @@ from flashinfer.api_logging import flashinfer_api
- from flashinfer.trace.templates.attention import (
-     prims_ts_decode_mla_one_shot_trace_dispatch,
-     prims_ts_decode_mla_trace_dispatch,
--    prims_ts_decode_mla_wrapper_trace_dispatch,
- )
+@@ -27,11 +28,7 @@ from ._hardware import get_max_active_clusters
  
- from ._tensor_aliasing import (
-@@ -1799,7 +1799,7 @@ class BatchMLADecodePagedTSWrapper:
+ import torch
+ 
+-from flashinfer.api_logging import flashinfer_experimental_api
+-from flashinfer.trace.templates.attention import (
+-    prims_ts_decode_mla_one_shot_trace_dispatch,
+-    prims_ts_decode_mla_wrapper_trace_dispatch,
+-)
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ 
+ from .decode import (
+     _WorkspaceSection,
+@@ -1047,11 +1044,35 @@ def _make_mla_decode_compile_spec(
+     )
+ 
+ 
+-@functools.cache
+-def _get_compiled_mla_decode(
+-    compile_spec: _MLADecodeCompileSpec,
+-):
+-    """Compile and cache one batch-dynamic TS MLA topology."""
++_COMPILED_MLA_DECODE: dict = {}
++
++
++def _get_compiled_mla_decode(compile_spec: _MLADecodeCompileSpec):
++    """Compile and cache one batch-dynamic TS MLA topology.
++
++    A manual memo rather than ``functools.cache``: under the warm-up precompile
++    modes of ``_compile_cache`` the build returns a placeholder (probe / persist
++    only), which must not be remembered for the serving launches that follow.
++    """
++    compiled = _COMPILED_MLA_DECODE.get(compile_spec)
++    if compiled is None:
++        compiled = _compile_mla_decode(compile_spec)
++        if not _compile_cache_is_placeholder(compiled):
++            _COMPILED_MLA_DECODE[compile_spec] = compiled
++    return compiled
++
++
++_get_compiled_mla_decode.cache_clear = _COMPILED_MLA_DECODE.clear  # type: ignore[attr-defined]
++
++
++def _compile_cache_is_placeholder(compiled) -> bool:
++    from ._compile_cache import is_placeholder
++
++    return is_placeholder(compiled)
++
++
++def _compile_mla_decode(compile_spec: _MLADecodeCompileSpec):
++    """Build (or load from the on-disk cache) one batch-dynamic TS MLA topology."""
+ 
+     import cutlass
+     import cutlass.cute as cute
+@@ -1459,11 +1480,12 @@ def _launch_mla_decode(
+         runtime.sparse_inputs,
+         runtime.bmm1_scale,
+         runtime.bmm2_scale,
+-        **(
+-            {"output_quant_args": runtime.output_quant_args}
+-            if runtime.output_quant_args is not None
+-            else {}
+-        ),
++        # Passed positionally and also when None. The kernel was compiled with
++        # ``output_quant_args`` in its signature (``None`` for unquantized
++        # output), and a kernel reloaded from the persistent compile cache is
++        # a positional TVM-FFI entry with no Python defaults: it rejects both
++        # a missing parameter and a keyword argument.
++        runtime.output_quant_args,
+     )
+     return runtime.out
+ 
+@@ -1637,7 +1659,7 @@ class BatchMLADecodePagedTSWrapper:
              split_kv=int(dict(policy)["split_kv"]),
          )
  
--    @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
-+    @flashinfer_api
+-    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
++    @flashinfer_experimental_api
      def run(
          self,
          query: torch.Tensor,
+@@ -1742,7 +1764,7 @@ class BatchMLADecodePagedTSWrapper:
+         )
+ 
+ 
+-@flashinfer_experimental_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
++@flashinfer_experimental_api
+ def batch_mla_decode_with_paged_kv_cache(
+     query: torch.Tensor,
+     kv_cache: torch.Tensor,
+@@ -2099,6 +2121,7 @@ def _prepare_sparse_output_quant(
+     )
+ 
+ 
++@functools.lru_cache(maxsize=1024)
+ def _resolve_sparse_mla_plan(
+     device,
+     batch_size,
+@@ -2119,17 +2142,17 @@ def _resolve_sparse_mla_plan(
+ ):
+     """Resolve sparse geometry and scratch sizing without allocation/compilation."""
+     import cutlass
+-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
++    from .kernels.mla_decode.throughput_latency_1cta.config import (
+         MlaProfile,
+         compute_workspace_size,
+     )
+-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
++    from .kernels.mla_decode.throughput_latency_1cta.kernel import (
+         ThroughputLatencyMlaDecodeTs,
+     )
+-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
++    from .kernels.mla_decode.throughput_2cta.config import (
+         compute_workspace_size as workspace_2cta,
+     )
+-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
++    from .kernels.mla_decode.throughput_2cta.kernel import (
+         MlaDecodeTs,
+     )
+ 
+@@ -2264,6 +2287,9 @@ def _resolve_sparse_mla_plan(
+     return device, profile, spec, sections, byte_end, capacity, output_quant
+ 
+ 
++# Prepared launches kept per plan (one per layer sharing the plan; DeepSeek-V4 has 61).
++_PREPARED_LAUNCH_LIMIT = 256
++
+ class BatchSparseMLADecodePagedTSWrapper:
+     """Plan native BF16/E4M3 attention, then bind one or two source index lists.
+ 
+@@ -2297,6 +2323,11 @@ class BatchSparseMLADecodePagedTSWrapper:
+         self._workspace_buffer = workspace_buffer
+         self._state = None
+         self._scalar_cache = {}
++        # Prepared launches for the unfused validate=False path: everything that
++        # is static for one (plan, pools, scales, sinks) tuple, keyed by the pools'
++        # storage and the sinks address. One plan serves every layer of a model,
++        # and each layer brings its own sinks, so one entry per layer.
++        self._prepared: dict[tuple, dict] = {}
+         self.workspace_size_bytes = 0
+ 
+     def plan(
+@@ -2386,6 +2417,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+                 kernel_signature=_mla_kernel_compile_signature(static_kernel),
+             )
+         )
++        self._prepared.clear()
+         self._state = dict(
+             device=device,
+             batch=batch_size,
+@@ -2608,6 +2640,38 @@ class BatchSparseMLADecodePagedTSWrapper:
+         state = self._state
+         if state is None:
+             raise RuntimeError("plan() must be called before run()")
++        lse_arg = lse
++        prepared_key = (
++            kv_cache.data_ptr(),
++            kv_cache.shape,
++            kv_cache.stride(),
++            kv_cache.dtype,
++            None
++            if extra_kv_cache is None
++            else (
++                extra_kv_cache.data_ptr(),
++                extra_kv_cache.shape,
++                extra_kv_cache.stride(),
++                extra_kv_cache.dtype,
++            ),
++            None if sinks is None else sinks.data_ptr(),
++            softmax_scale,
++            output_scale,
++        )
++        if (
++            not validate
++            and out is not None
++            and lse is None
++            and qo_indptr is None
++            and token_positions is None
++            and cos_sin_cache is None
++            and out_scale is None
++        ):
++            prepared = self._prepared.get(prepared_key)
++            if prepared is not None:
++                return self._run_prepared(
++                    prepared, query, indices, lengths, extra_indices, extra_lengths, out
++                )
+         _validate_query(
+             query,
+             packed_query=state["packed"],
+@@ -2781,10 +2845,124 @@ class BatchSparseMLADecodePagedTSWrapper:
+                 if static_scales
+                 else state["compiled"],
+             )
++        if (
++            rows
++            and quant is None
++            and static_scales
++            and not state["packed"]
++            and not state["return_lse"]
++            and state["max_q"] == 1
++            and lse_arg is None
++        ):
++            # Static for this (plan, pools, scales): pool views, scalars, sinks, split,
++            # workspace. The next validate=False launch with the same pools re-forms
++            # only the query / index / output views (see _run_prepared).
++            if len(self._prepared) >= _PREPARED_LAUNCH_LIMIT:
++                self._prepared.clear()
++            self._prepared[prepared_key] = dict(
++                primary=primary,
++                extra=extra,
++                primary_rows=primary.shape[0],
++                c_latent=primary.permute(1, 2, 0),
++                c_rope=extra.permute(1, 2, 0),
++                scalars=(scale_tensors[0], scale_tensors[1], sinks),
++                bmm=(bmm1_scale, bmm2_scale),
++                ks=state["ks"],
++                kc=state["kc"],
++                dummy_indices=state["dummy_indices"],
++                default_cl=state["default_cl"],
++            )
+         if quant is not None:
+             return (out, out_scale, lse) if state["return_lse"] else (out, out_scale)
+         return (out, lse) if state["return_lse"] else out
+ 
++    def _run_prepared(self, prepared, query, indices, lengths, extra_indices, extra_lengths, out):
++        """Launch with the static arguments recorded by the last full run().
++
++        Only the per-call tensors are checked and viewed: query and output
++        geometry, index/length shapes, dtypes and strides. Pool geometry,
++        scales and sinks were validated by the full path that prepared this
++        launch, and the caller passed validate=False. Byte-identical to the
++        full path for the same arguments.
++        """
++        state = self._state
++        rows, heads, device = state["batch"], state["heads"], state["device"]
++        if (
++            query.shape != (rows, 1, heads, 512)
++            or query.dtype != state["dtype"]
++            or query.device != device
++            or not query.is_contiguous()
++            or query.data_ptr() % 16
++        ):
++            raise ValueError(
++                "prepared launch: query must be a contiguous, 16-byte aligned "
++                "[batch, 1, heads, 512] tensor of the planned dtype on the planned device"
++            )
++        if (
++            out.numel() != rows * heads * 512
++            or out.dtype != torch.bfloat16
++            or out.device != device
++            or not out.is_contiguous()
++            or out.data_ptr() % 16
++        ):
++            raise ValueError(
++                "prepared launch: out must be a contiguous, 16-byte aligned BF16 tensor "
++                "holding one 512-wide row per query head"
++            )
++        if (
++            indices.shape != (rows, prepared["ks"])
++            or indices.dtype != torch.int32
++            or indices.device != device
++            or indices.stride(-1) != 1
++            or lengths.shape != (rows,)
++            or lengths.dtype != torch.int32
++            or lengths.device != device
++            or not lengths.is_contiguous()
++        ):
++            raise ValueError("prepared launch: invalid primary indices/lengths")
++        if prepared["kc"]:
++            if (
++                not isinstance(extra_indices, torch.Tensor)
++                or not isinstance(extra_lengths, torch.Tensor)
++                or extra_indices.shape != (rows, prepared["kc"])
++                or extra_indices.dtype != torch.int32
++                or extra_indices.device != device
++                or extra_indices.stride(-1) != 1
++                or extra_lengths.shape != (rows,)
++                or extra_lengths.dtype != torch.int32
++                or extra_lengths.device != device
++                or not extra_lengths.is_contiguous()
++            ):
++                raise ValueError("prepared launch: invalid extra indices/lengths")
++            ci, cl = extra_indices, extra_lengths
++        else:
++            if extra_indices is not None or extra_lengths is not None:
++                raise ValueError("prepared launch: extra indices without a planned extra pool")
++            ci, cl = prepared["dummy_indices"][:rows], prepared["default_cl"][:rows]
++        buffers = state["buffers"]
++        s0, s1, sinks = prepared["scalars"]
++        q_kernel = query.permute(2, 3, 1, 0)
++        lse_kernel = buffers["public_lse"][:rows].view(rows, 1, heads).permute(2, 1, 0)
++        bmm1, bmm2 = prepared["bmm"]
++        state["compiled_static"](
++            q_kernel,
++            q_kernel,
++            prepared["c_latent"],
++            prepared["c_rope"],
++            indices.transpose(0, 1),
++            out.view(rows, 1, heads, 512).permute(2, 3, 1, 0),
++            lse_kernel,
++            buffers["core"] if buffers["core"].numel() else None,
++            state["splits"],
++            lengths,
++            None,
++            (indices, ci, lengths, cl, s0, s1, sinks),
++            bmm1,
++            bmm2,
++            None,
++        )
++        return out
++
+ 
+ def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
+     """Return workspace bytes using the same arguments as wrapper.plan().
+diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
+index e2bbef13c0f552030875e6b433e0fcdb20686cf6..dff16046cf7cf9ff03950043cf462ac28de6c670 100644
+--- a/q_token_kv_block_sparse_metadata.py
++++ b/q_token_kv_block_sparse_metadata.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -41,9 +42,9 @@ from dataclasses import dataclass
+ from typing import Any, Literal, Optional
+ 
+ import torch
+-from flashinfer.api_logging import flashinfer_experimental_api
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ 
+-from ...utils import device_support_pdl
++from flashinfer.utils import device_support_pdl
+ from ._block_sparse.common import _num_sparse_pattern_heads
+ 
+ _Q_TOKEN_KV_BLOCK_SPARSE_MIN_BLOCK_SIZE = 4
+@@ -63,7 +64,7 @@ _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT = 256
+ def _get_prims_ts_q_token_kv_block_sparse_metadata_module() -> Any:
+     """Build and cache the CUDA C++ QToken-KvBlock-Sparse-Attention metadata implementation."""
+ 
+-    from ...jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
++    from flashinfer.jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
+ 
+     return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
+ 

@@ -24,6 +24,8 @@ checks recovery guidance for an incomplete installation.
 import asyncio
 import builtins
 import importlib
+import os
+import subprocess
 import sys
 import types
 from collections.abc import Sequence
@@ -32,6 +34,121 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from click.testing import CliRunner
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("implementation", ["python", "upb"])
+def test_protobuf_warning_in_fresh_process(implementation: str) -> None:
+    """Check the loaded implementation, even after the environment changes."""
+    script = (
+        "import os, sys\n"
+        "from unittest.mock import patch\n"
+        "from google.protobuf.internal import api_implementation\n"
+        "from tensorrt_llm.grpc import _protobuf\n"
+        "assert api_implementation.Type() == sys.argv[1]\n"
+        "os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = "
+        "'upb' if sys.argv[1] == 'python' else 'python'\n"
+        "with patch.object(_protobuf.logger, 'warning') as warning:\n"
+        "    _protobuf._warn_if_python_protobuf()\n"
+        "    if sys.argv[1] == 'python':\n"
+        "        warning.assert_called_once()\n"
+        "        assert 'before starting Python' in warning.call_args.args[0]\n"
+        "    else:\n"
+        "        warning.assert_not_called()\n"
+        "assert api_implementation.Type() == sys.argv[1]\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, implementation],
+        env={**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": implementation},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.cpu_only
+def test_cpp_protobuf_does_not_warn(monkeypatch) -> None:
+    from google.protobuf.internal import api_implementation
+
+    from tensorrt_llm.grpc import _protobuf
+
+    warning = MagicMock()
+    monkeypatch.setattr(api_implementation, "Type", lambda: "cpp")
+    monkeypatch.setattr(_protobuf.logger, "warning", warning)
+    _protobuf._warn_if_python_protobuf()
+    warning.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("missing_api", ["import", "Type"])
+def test_protobuf_warning_skips_unavailable_api(monkeypatch, missing_api: str) -> None:
+    """An unavailable diagnostic API must not prevent import or startup."""
+    from google.protobuf.internal import api_implementation
+
+    from tensorrt_llm.grpc import _protobuf
+
+    warning = MagicMock()
+    monkeypatch.setattr(_protobuf.logger, "warning", warning)
+    if missing_api == "import":
+        real_import = builtins.__import__
+
+        def import_without_implementation(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "google.protobuf.internal" and "api_implementation" in fromlist:
+                raise ImportError("protobuf implementation API unavailable")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_implementation)
+    else:
+        monkeypatch.delattr(api_implementation, "Type")
+
+    importlib.reload(_protobuf)
+    _protobuf._warn_if_python_protobuf()
+    warning.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("protocol", ["smg", "openengine"])
+@pytest.mark.parametrize("implementation_available", [True, False])
+def test_protobuf_warning_does_not_block_model_startup(
+    monkeypatch, protocol: str, implementation_available: bool
+) -> None:
+    import google.protobuf.internal as protobuf_internal
+
+    if protocol == "smg":
+        pytest.importorskip("smg_grpc_proto")
+    server_module = importlib.import_module(f"tensorrt_llm.grpc.{protocol}.server")
+    warning = MagicMock()
+
+    def initialize_model(**kwargs):
+        if implementation_available:
+            warning.assert_called_once()
+        else:
+            warning.assert_not_called()
+        raise RuntimeError("model startup reached")
+
+    llm_factory = MagicMock(side_effect=initialize_model)
+    monkeypatch.setattr(server_module, "PyTorchLLM", llm_factory)
+    monkeypatch.setattr(server_module.logger, "warning", warning)
+    monkeypatch.setattr(server_module.uvloop, "run", asyncio.run)
+    # Replace only the package attribute the warning helper imports. Protobuf's own
+    # modules keep their bound api_implementation, so messages first imported during
+    # startup still register against the active backend.
+    fake_api = (
+        types.SimpleNamespace(Type=lambda: "python")
+        if implementation_available
+        else types.SimpleNamespace()
+    )
+    monkeypatch.setattr(protobuf_internal, "api_implementation", fake_api)
+    launch = server_module.launch_smg_server if protocol == "smg" else server_module.launch_server
+    with pytest.raises(RuntimeError, match="model startup reached"):
+        launch("127.0.0.1", 50051, {"backend": "pytorch", "model": "test-model"})
+    llm_factory.assert_called_once()
+    assert (
+        llm_factory.call_args.kwargs.items()
+        >= {"backend": "pytorch", "model": "test-model"}.items()
+    )
 
 
 def test_smg_bindings_missing_gives_actionable_error(monkeypatch):
@@ -115,8 +232,14 @@ def test_smg_server_startup_failure_cleans_up(monkeypatch, failure_point):
         grpc_server.add_insecure_port.return_value = 8000
         grpc_server.start.side_effect = RuntimeError("start failed")
 
-    monkeypatch.setitem(sys.modules, "grpc_reflection", None)
-    monkeypatch.delitem(sys.modules, "grpc_reflection.v1alpha", raising=False)
+    real_import = builtins.__import__
+
+    def import_without_reflection(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "grpc_reflection.v1alpha":
+            raise ModuleNotFoundError("No module named 'grpc_reflection'", name="grpc_reflection")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_reflection)
     monkeypatch.setattr(server_module.uvloop, "run", asyncio.run)
     monkeypatch.setattr(server_module, "PyTorchLLM", MagicMock(return_value=llm))
     monkeypatch.setattr(server_module, "GrpcRequestManager", MagicMock())
@@ -227,4 +350,32 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
     )
 
     assert result.exit_code == 1
-    assert 'python -m pip install "grpcio>=1.67.1,<2"' in result.output
+    assert (
+        'python -m pip install "grpcio>=1.73.1,<2" '
+        '"grpcio-health-checking>=1.73.1,<1.82"' in result.output
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("via_config", [False, True])
+def test_smg_rejects_multiple_frontends_before_engine_start(tmp_path, via_config):
+    """Config-file overrides must not bypass the SMG single-frontend guard."""
+    from click.testing import CliRunner
+
+    from tensorrt_llm.commands.serve import serve
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}'
+    )
+    args = [str(model), "--grpc", "--gpus_per_node", "1"]
+    if via_config:
+        config = tmp_path / "serve.yml"
+        config.write_text("num_serve_frontends: 4\n")
+        args.extend(["--config", str(config)])
+    else:
+        args.extend(["--num_serve_frontends", "4"])
+    result = CliRunner().invoke(serve, args)
+    assert result.exit_code != 0
+    assert "Multiple gRPC frontends require --grpc-protocol openengine" in result.output

@@ -43,11 +43,21 @@ class _WarmupTimer:
         )
 
     @contextmanager
-    def phase(self, name: str, *, record: bool = True, log_start: bool = True) -> Iterator[None]:
+    def phase(
+        self,
+        name: str,
+        *,
+        record: bool = True,
+        log_start: bool = True,
+        metrics: dict[str, float] | None = None,
+        metric_name: str | None = None,
+    ) -> Iterator[None]:
         """Log start/end of one warmup phase and record its wall-clock time.
 
         ``name`` should match the ``log_mem_snapshot`` tag of the same phase
         (``warmup/after_<name>``) so timing and memory logs line up.
+        When ``metrics`` is provided, accumulate the same elapsed value under
+        ``metric_name`` (or ``name``), independently of summary recording.
         """
         if log_start:
             logger.info(f"{self.prefix} {name}: start")
@@ -60,6 +70,9 @@ class _WarmupTimer:
             elapsed = time.perf_counter() - start
             if record:
                 self.timings[name] = self.timings.get(name, 0.0) + elapsed
+            if metrics is not None:
+                key = metric_name if metric_name is not None else name
+                metrics[key] = metrics.get(key, 0.0) + elapsed
             if completed:
                 logger.info(f"{self.prefix} {name}: done in {elapsed:.1f}s")
             else:

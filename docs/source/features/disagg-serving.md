@@ -157,6 +157,8 @@ cache_transceiver_config:
 
 `kv_transfer_timeout_ms` bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is `60000`.
 
+The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` in `kv_cache_config` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, set `use_kv_cache_manager_v2: false` and select `transceiver_runtime: CPP` for a model that supports V1.
+
 `kv_cache_bounce_size_mb` is `0` by default, which sends each KV block separately. Setting it to a positive size enables a bounce buffer, which helps when a request's blocks are scattered. With the default Python implementation this is one contiguous buffer of that many MiB per direction and a single NIXL write per request; the C++ implementation (next paragraph) instead uses one buffer shared by both directions and chunked writes. The default Python implementation is designed for fabric (MNNVL) memory; the C++ implementation falls back to `cudaMalloc` where fabric memory is unavailable.
 
 `agent_bounce_buffer_enable` (default `false`) switches to the C++ transfer-agent bounce implementation, which uses one buffer of `kv_cache_bounce_size_mb` MiB shared by send and receive (prefer a power of two; the usable capacity rounds down to one). By default it engages only for KV writes with many small descriptors (at least 1024, averaging at most 16 KiB), i.e. head-mismatch layouts such as context TP != generation TP or DP; head-matched layouts (MLA, symmetric TP) stay on the standard NIXL path unless `agent_bounce_params` relaxes the gate (lower `min_descriptor_count`, where `0` means no minimum; raise `max_average_descriptor_size`, e.g. `4MB`; `max_average_descriptor_size: 0` routes every outbound write to standard NIXL, acting as an outbound gate off switch — it disables outbound routing only: the arena is still allocated, the handshake still advertised and inbound transfers still served; set `agent_bounce_buffer_enable: false` to turn the feature off). Set it consistently on the context and generation workers; in particular `request_timeout_ms` and the effective chunk cap must match on both sides, otherwise the pair falls back to standard NIXL with a WARNING when the peer is loaded (transfers are then routed silently). The compared chunk cap is the effective one, min(`max_chunk_size`, the arena's usable capacity): `kv_cache_bounce_size_mb` matters only when its usable capacity (rounded down to a power of two) is below `max_chunk_size`; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL.
@@ -223,6 +225,17 @@ curl http://localhost:8000/v1/completions \
         "temperature": 0
     }' -w "\n"
 ```
+
+#### Responses API
+
+The disaggregated server also serves `/v1/responses`, with both `context_first` and `generation_first` scheduling, and `/v1/models`, which it answers from a context worker. A streamed response carries the generation worker's events unchanged. Unlike a single `trtllm-serve` instance, the disaggregated server keeps no response history:
+
+- A request with `previous_response_id` is rejected with a 400, because a stored response lives in one worker's memory and a later request may reach another worker. Send the earlier turns in `input` instead.
+- `store` is ignored: nothing is persisted, and the server logs a warning once when a client asks for it.
+
+One limitation applies to `/v1/responses` on every server, disaggregated or not:
+
+- `parallel_tool_calls: false`, and a `tool_choice` other than `auto` or `none` on non-Harmony models, are accepted but not enforced. The server logs a warning once.
 
 #### Launching disaggregated servers on SLURM clusters
 
@@ -333,6 +346,44 @@ generation_servers:
 ```{note}
 A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
 ```
+
+### DeepSeek-V4.1 context decoder weights
+
+Set `bounded_replay_on_generation: true` at the top level of the
+disaggregated serving YAML. The orchestrator passes it to both workers;
+`trtllm-serve serve ... --server_role context` then omits decoder weights on the
+context worker. The flag defaults to `false` and does not require conditional
+disaggregation. Python API deployments must set `TRTLLM_DISAGG_ROLE=context`
+before creating the model. Generation workers retain the complete model.
+
+The context worker keeps the encoder prefix and the boundary layer's GLOBAL
+KV/index projections. It skips the boundary query/output/MoE weights, subsequent
+decoder layers, final normalization and language-model head. Pruning happens
+before GPU weight materialization; the standard HF loader reads only retained
+checkpoint tensors. Logical layer numbering remains unchanged. The context
+cache allocator also omits the decoder's unused SWA buffers, while retaining
+encoder SWA and all GLOBAL KV, index and compressor-state buffers. The
+generation worker retains its complete cache layout; transfer matches the
+retained buffers by their model-layer identities.
+For prompts shorter than the replay window, generation replays the entire prompt.
+
+Both runtime capacity accounting and the static cache estimator use the same
+validated boundary as the model. Weight savings already enter the KV budget
+through measured post-load memory usage and are not added a second time.
+
+This experimental path uses the same approximate bounded-replay semantics as
+remote-tail replay. It requires text-only context requests, a KV transceiver,
+beam width one, block reuse disabled, and non-pipelined transfer. Context logits
+and speculative decoding on the context worker are unsupported. Saved weight
+memory is available to KV cache or larger batches/token budgets, subject to the
+remaining runtime memory requirements.
+
+Remote-tail handoffs disable HTTP retries on the generation hop in context-first
+serving, and on both hops in generation-first serving. Retrying one side cannot
+safely replay or cancel the paired transfer. Context-first context requests and
+requests that bypass the handoff retain the configured retry policy. With
+remote-tail replay disabled, ordinary disaggregated requests retain their
+configured retry policy, including the transient TCP retry budget.
 
 ## Environment Variables
 

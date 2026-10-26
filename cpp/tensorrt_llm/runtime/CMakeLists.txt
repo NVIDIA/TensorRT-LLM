@@ -15,33 +15,23 @@
 include(FetchContent)
 
 set(SRCS
-    utils/mpiUtils.cpp
+    bufferManagerNvls.cpp
     mcastGroupComm.cpp
     utils/numpyUtils.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
     locality_domain/locality_domain_utils.cpp
-    bufferManager.cpp
-    cudaMemPool.cpp
     loraUtils.cpp
     loraModule.cpp
     loraCache.cpp
-    iBuffer.cpp
-    iTensor.cpp
     ipcUtils.cpp
     ipcSocket.cpp
-    ipcNvlsMemory.cu
     mcastDeviceMemory.cpp
-    memoryCounters.cpp
     moeLoadBalancer/gdrwrap.cpp
     moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
     moeLoadBalancer/moeLoadBalancer.cpp
-    moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
-    tllmBuffers.cpp
-    workerPool.cpp
-    worldConfig.cpp
-    virtualMemory.cpp)
+    workerPool.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
@@ -60,10 +50,55 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+set(RUNTIME_MEMORY_SRCS cudaMemPool.cpp memoryCounters.cpp)
+set(RUNTIME_BUFFERS_SRCS bufferManager.cpp iBuffer.cpp iTensor.cpp
+                         tllmBuffers.cpp virtualMemory.cpp)
+set(RUNTIME_DISTRIBUTED_SRCS utils/mpiUtils.cpp worldConfig.cpp)
+
+add_library(tllm_runtime_topology STATIC moeLoadBalancer/topologyDetector.cpp)
+add_library(tllm::runtime_topology ALIAS tllm_runtime_topology)
+target_link_libraries(tllm_runtime_topology PUBLIC tllm::common_cuda
+                                                   Threads::Threads)
+if(NOT WIN32)
+  target_link_libraries(tllm_runtime_topology PUBLIC NUMA::NUMA)
+endif()
+
+add_library(tllm_runtime_memory STATIC ${RUNTIME_MEMORY_SRCS})
+add_library(tllm::runtime_memory ALIAS tllm_runtime_memory)
+target_link_libraries(
+  tllm_runtime_memory
+  PUBLIC tllm::common_logging CUDA::cudart
+  PRIVATE Threads::Threads)
+
+add_library(tllm_runtime_buffers STATIC ${RUNTIME_BUFFERS_SRCS})
+add_library(tllm::runtime_buffers ALIAS tllm_runtime_buffers)
+target_link_libraries(
+  tllm_runtime_buffers PUBLIC tllm::runtime_memory tllm::common_cuda
+                              CUDA::cuda_driver)
+
+add_library(tllm_runtime_distributed STATIC ${RUNTIME_DISTRIBUTED_SRCS})
+add_library(tllm::runtime_distributed ALIAS tllm_runtime_distributed)
+target_link_libraries(tllm_runtime_distributed
+                      PUBLIC tllm::common_logging CUDA::cudart Threads::Threads)
+target_compile_definitions(
+  tllm_runtime_distributed
+  PUBLIC ENABLE_MULTI_DEVICE=$<BOOL:${ENABLE_MULTI_DEVICE}>)
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(tllm_runtime_distributed PUBLIC MPI::MPI_C)
+endif()
+
+foreach(component tllm_runtime_memory tllm_runtime_buffers
+                  tllm_runtime_distributed tllm_runtime_topology)
+  target_compile_features(${component} PUBLIC cxx_std_20)
+  set_target_properties(${component} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endforeach()
+
 add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
+target_link_libraries(runtime_src PUBLIC ipc_nvls_memory_src
+                                         tllm::runtime_topology)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
@@ -72,28 +107,7 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 
 if(NOT WIN32)
-  find_package(libnuma QUIET CONFIG)
-
-  if(NOT libnuma_FOUND)
-    message(
-      STATUS "libnuma not found via Conan, falling back to system libnuma")
-    find_path(NUMA_INCLUDE_DIR numa.h)
-    find_library(NUMA_LIBRARY numa)
-
-    if(NUMA_INCLUDE_DIR AND NUMA_LIBRARY)
-      add_library(libnuma::libnuma UNKNOWN IMPORTED)
-      set_target_properties(
-        libnuma::libnuma
-        PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}"
-                   INTERFACE_INCLUDE_DIRECTORIES "${NUMA_INCLUDE_DIR}")
-    else()
-      message(FATAL_ERROR "NUMA library not found, please install libnuma-dev")
-    endif()
-  else()
-    message(STATUS "libnuma found.")
-  endif()
-  target_link_libraries(runtime_src PUBLIC libnuma::libnuma)
-  target_link_options(runtime_src PUBLIC ${CONAN_LIBNUMA_LINK_OPTIONS})
+  target_link_libraries(runtime_src PUBLIC NUMA::NUMA)
 endif()
 
 # Add utils subdirectory for pg_utils module

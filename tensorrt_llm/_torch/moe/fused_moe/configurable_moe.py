@@ -29,7 +29,7 @@ Design Principles:
 
 import copy
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Type, Union
+from typing import Callable, Dict, List, Optional, Type, Union
 
 import torch
 
@@ -81,6 +81,7 @@ class ConfigurableMoE(MoE):
     # Do not treat this ``True`` as "the wrapper supports it": nothing else
     # checks, because the backend is built with ``init_load_balancer=False``.
     _supports_non_divisible_ep: bool = True
+    supports_routing_aux: bool = True
     """
     Configurable MoE layer using composition pattern with automatic configuration
 
@@ -106,6 +107,10 @@ class ConfigurableMoE(MoE):
         aux_stream_dict: Auxiliary CUDA streams for overlap
         weight_loading_mode: Weight loading mode
         layer_idx: Layer index
+        accepts_global_routed_output: Under attention TP with
+            ``reduce_results=False``, take a ``FUSED_COMM`` backend's globally
+            combined output on every rank instead of a rank partial. Only for
+            callers that skip the routed all-reduce for such backends.
         **kwargs: Additional arguments
             - tune_max_num_tokens: Max tokens for profiling (passed to backend)
             - Other backend-specific arguments
@@ -118,9 +123,10 @@ class ConfigurableMoE(MoE):
     Auto-Detection:
         - EPLB: Enabled if get_moe_load_balancer() is not None
         - Backend: Resolved from ``model_config.moe_backend`` by
-                   ``moe_resolution.resolve_moe_impl``, which degrades to
-                   CutlassFusedMoE when the requested backend cannot serve the
-                   layer and records the reason in the returned report.
+                   ``moe_resolution.resolve_moe_impl``, which degrades to the
+                   CUTLASS leaf for the layer's format when the requested
+                   backend cannot serve the layer and records the reason in
+                   the returned report.
                    ``create_moe`` passes the resolved class in as ``moe_cls``;
                    constructing this wrapper directly resolves on demand.
         - Communication: Auto-selected based on hardware (NVLINK > DeepEP > AllGather);
@@ -132,14 +138,14 @@ class ConfigurableMoE(MoE):
         """Always ineligible: ConfigurableMoE delegates, it does not compute.
 
         Answering ``False`` rather than raising is what lets a registry walk
-        include this class harmlessly. Query the backend it would delegate to
-        (``CutlassFusedMoE``, ``TRTLLMGenFusedMoE``, ...) instead.
+        include this class harmlessly. Resolve the layer instead
+        (``moe_resolution.resolve_moe_impl``) and query the leaf it picks.
         """
         del p, d  # a wrapper's answer cannot depend on the question
         return _reject(
             MoERejectReason.NOT_AN_IMPL,
             "ConfigurableMoE is a wrapper class. "
-            "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly.",
+            "Resolve the layer (moe_resolution.resolve_moe_impl) and query the leaf it picks.",
         )
 
     def __init__(
@@ -159,6 +165,8 @@ class ConfigurableMoE(MoE):
         override_quant_config: Optional["QuantConfig"] = None,
         moe_cls: Optional[Type] = None,
         communication_method: Optional[str] = None,
+        unfinalized_combine_fn: Optional[Callable[..., torch.Tensor]] = None,
+        accepts_global_routed_output: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -181,12 +189,13 @@ class ConfigurableMoE(MoE):
         self.model_config = model_config
         self.aux_stream_dict = aux_stream_dict
         self.communication_method = communication_method
+        self.accepts_global_routed_output = accepts_global_routed_output
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # ========== Create MoE Backend (selected by model_config.moe_backend) ==========
-        self._create_and_sync_backend(
+        backend_model_config = self._create_and_sync_backend(
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
@@ -207,10 +216,32 @@ class ConfigurableMoE(MoE):
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
 
+        # ========== Model-owned finalize for do_finalize=False ==========
+        # A model that needs a per-(token, expert) transform applied to each
+        # expert output before the top-k sum registers its finalize here, and
+        # ``ExternalCommMoEScheduler`` runs it on every ``do_finalize=False``
+        # forward -- on the dispatched rows, before any communication combine
+        # -- so the forward's return type depends only on this static config,
+        # never on which comm strategy was auto-selected. Signature:
+        #
+        #     fn(*, gemm2_output, expanded_idx_to_permuted_idx,
+        #        token_selected_slots, routing_weights, num_tokens)
+        #       -> [num_tokens, hidden_size]
+        #
+        # It must be computed from one ``(token, expert)`` row at a time, so
+        # that combining the per-rank finalized partials equals finalizing
+        # after the combine. ``validate_backend`` rejects every combination
+        # this contract cannot hold under (backend without the unfinalized
+        # triple, a combine that is not an unweighted row sum, router weights
+        # folded into the activations).
+        self.unfinalized_combine_fn = unfinalized_combine_fn
+
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
-        # The default value is max_num_tokens * dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens
+        # The default value is max_num_tokens * dp_size. Read it from the config
+        # the backend was built with: a backend may cap it there (DeepGEMM sizes
+        # its workspace from it).
+        self.moe_max_num_tokens = backend_model_config.moe_max_num_tokens
         default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
 
         # Auxiliary stream for chunking overlap
@@ -228,8 +259,14 @@ class ConfigurableMoE(MoE):
             self.event_dict = None
 
         # Validate configuration
-        self.validate_config()
-        self.validate_backend(self.backend)
+        validated = False
+        try:
+            self.validate_config()
+            self.validate_backend(self.backend)
+            validated = True
+        finally:
+            if not validated and self.comm is not None:
+                self.comm.destroy()
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
@@ -276,8 +313,10 @@ class ConfigurableMoE(MoE):
         override_quant_config: Optional["QuantConfig"],
         moe_cls: Optional[Type] = None,
         **kwargs,
-    ) -> None:
+    ) -> ModelConfig:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
+
+        Returns the ``ModelConfig`` the backend was built with.
 
         Why this dance:
         - ``init_load_balancer=False``: the backend would otherwise
@@ -318,7 +357,9 @@ class ConfigurableMoE(MoE):
 
         backend_model_config = model_config
         if override_quant_config is not None:
-            backend_model_config = copy.deepcopy(model_config)
+            # A shallow copy shares the per-weight quant_config_dict instead of
+            # cloning it for every layer.
+            backend_model_config = copy.copy(model_config)
             backend_model_config.quant_config = override_quant_config
 
         with self._temporarily_skip_weight_creation(backend_model_config):
@@ -361,14 +402,14 @@ class ConfigurableMoE(MoE):
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
-        # Layerwise quantization is applied after the model is constructed.
-        # Defer allocation so the backend is built from the final wrapper
-        # quant_config rather than an earlier global value. Module exclusions
+        # Layerwise quantization is applied after the model is constructed, so
+        # allocation waits for the final wrapper quant_config. Module exclusions
         # reset _weights_created on matching modules during __post_init__, so
-        # unrelated exclusions retain the historical eager allocation path.
+        # unrelated exclusions keep eager allocation.
         has_post_init_quant_config = model_config.quant_config_dict is not None
         if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
             self.create_weights()
+        return backend_model_config
 
     def _reject_non_divisible_ep_backend(self) -> None:
         """Enforce the non-divisible-EP contract on the resolved backend.
@@ -412,6 +453,16 @@ class ConfigurableMoE(MoE):
         if not hasattr(self, "backend") or self.backend is None:
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
+
+    @property
+    def returns_global_routed_output(self) -> bool:
+        """True only for a ``FUSED_COMM`` backend whose caller opted in with
+        ``accepts_global_routed_output``; ``FusedCommMoEScheduler`` otherwise
+        hands back a rank partial under attention TP."""
+        return (
+            self.accepts_global_routed_output
+            and self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
+        )
 
     @property
     def num_fused_shared_expert(self) -> int:
@@ -618,6 +669,7 @@ class ConfigurableMoE(MoE):
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
+            allow_alltoall=self.backend.supports_alltoall,
         )
 
     def forward_impl(
@@ -630,6 +682,7 @@ class ConfigurableMoE(MoE):
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         lora_params: Optional[Dict] = None,
+        input_ready_event: Optional[torch.cuda.Event] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -643,8 +696,16 @@ class ConfigurableMoE(MoE):
         4. Advances the EPLB ``repeat_idx``.
 
         DP-padding handling and chunking live in the scheduler.
+
+        ``input_ready_event``: ``x`` is written on another stream; the join is
+        deferred to the first kernel that reads ``x``, so routing overlaps it.
         """
         input_ids = kwargs.get("input_ids")
+        routing_aux = kwargs.get("routing_aux")
+        if routing_aux is not None and (
+            routing_aux.ndim == 0 or routing_aux.shape[0] != router_logits.shape[0]
+        ):
+            raise ValueError("routing_aux must have one row per router-logit row")
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -667,6 +728,8 @@ class ConfigurableMoE(MoE):
             use_dp_padding=use_dp_padding,
             input_ids=input_ids,
             lora_params=lora_params,
+            routing_aux=routing_aux,
+            input_ready_event=input_ready_event,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
@@ -690,6 +753,10 @@ class ConfigurableMoE(MoE):
           1. ``backend`` is not None.
           2. If EPLB is enabled, the backend must support routing
              separation (``backend._supports_load_balancer()``).
+          3. If ``unfinalized_combine_fn`` is registered, the combination
+             must be able to honor it: the backend returns the unfinalized
+             triple, the combine (if any) is an unweighted row sum, and the
+             routing weights are not folded into the activations.
 
         Backend-specific checks are delegated to
         ``backend.validate_configurable_moe(self)``; backends with extra
@@ -700,7 +767,7 @@ class ConfigurableMoE(MoE):
         wrapper-owned attribute is assigned (EPLB / num_slots /
         ep_size via ``MoE.__init__`` -> ``_init_load_balancer``,
         ``self.comm`` from ``_create_comm_strategy_auto``, and
-        ``self.moe_max_num_tokens`` from ``model_config``). Backend
+        ``self.moe_max_num_tokens`` from the backend's ``model_config``). Backend
         hooks can therefore inspect them directly without ``getattr``
         guards or sentinel defaults.
         """
@@ -713,6 +780,36 @@ class ConfigurableMoE(MoE):
                 f"does not support load balancer. "
                 f"Either disable EPLB or use a backend that supports load balancer."
             )
+
+        if self.unfinalized_combine_fn is not None:
+            # Runs after ``self.comm`` is assigned, so the three refusals
+            # below cover the exact configuration the forwards will run with.
+            if not callable(self.unfinalized_combine_fn):
+                raise ValueError(
+                    f"unfinalized_combine_fn must be callable, got "
+                    f"{type(self.unfinalized_combine_fn).__name__}."
+                )
+            if not backend.supports_unfinalized_output():
+                raise ValueError(
+                    f"unfinalized_combine_fn is registered but backend "
+                    f"{backend.__class__.__name__} cannot return the unfinalized "
+                    "(gemm2_output, expert_weights, expanded_idx_to_permuted_idx) "
+                    "triple for do_finalize=False; there is nothing for the "
+                    "finalize to run on."
+                )
+            if self.comm is not None and not self.comm.supports_finalize_before_combine():
+                raise ValueError(
+                    f"unfinalized_combine_fn is registered but "
+                    f"{type(self.comm).__name__}.combine is not an unweighted row "
+                    "sum over a dense per-token tensor, so partials finalized "
+                    "before the combine would not reduce to the finalized result."
+                )
+            if self.apply_router_weight_on_input:
+                raise ValueError(
+                    "unfinalized_combine_fn needs the routing weights, but "
+                    "apply_router_weight_on_input folds them into the activations "
+                    "and leaves only placeholders. The two are not combinable."
+                )
 
         backend.validate_configurable_moe(self)
 
@@ -854,6 +951,15 @@ class ConfigurableMoE(MoE):
     def has_nvfp4(self):
         """Delegate has_nvfp4 to backend"""
         return getattr(self.backend, "has_nvfp4", False)
+
+    @property
+    def _moe_lora_enabled(self) -> bool:
+        """Delegate to the backend, which holds the routed-expert LoRA state.
+
+        Read by ``MoE.forward`` to refuse MoE LoRA on the torch.compile graph
+        path; a backend that does not fuse MoE LoRA reads as False.
+        """
+        return getattr(self.backend, "_moe_lora_enabled", False)
 
     def forward_fake(
         self,

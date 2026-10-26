@@ -364,6 +364,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   CompletionResponse:
     fields:
@@ -453,6 +459,12 @@ models:
         type: Optional[float]
         default: null
         status: beta
+        required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
         required: false
 
   CompletionStreamResponse:
@@ -578,6 +590,12 @@ models:
         kind: openai
         type: Optional[Union[str, List[str]]]
         default: <factory:list>
+        status: stable
+        required: false
+      store:
+        kind: openai
+        type: Optional[bool]
+        default: null
         status: stable
         required: false
       stream:
@@ -883,6 +901,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionResponse:
     fields:
@@ -973,6 +997,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionStreamResponse:
     fields:
@@ -1020,6 +1050,18 @@ models:
         type: Optional[bool]
         default: false
         status: stable
+        required: false
+      conversation_params:
+        kind: extension
+        type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: prototype
         required: false
       include:
         kind: openai
@@ -1080,6 +1122,18 @@ models:
         type: Optional[ResponsePrompt]
         default: null
         status: stable
+        required: false
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
         required: false
       reasoning:
         kind: openai
@@ -1168,6 +1222,18 @@ models:
 
   ResponsesResponse:
     fields:
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: prototype
+        required: false
+      finish_reason:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       id:
         kind: openai
         type: str
@@ -1178,6 +1244,12 @@ models:
         kind: openai
         type: int
         default: <factory:<lambda>>
+        status: stable
+        required: false
+      incomplete_details:
+        kind: openai
+        type: Optional[IncompleteDetails]
+        default: null
         status: stable
         required: false
       instructions:
@@ -1216,6 +1288,18 @@ models:
         default: null
         status: stable
         required: true
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       temperature:
         kind: openai
         type: float

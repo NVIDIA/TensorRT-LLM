@@ -613,8 +613,6 @@ public:
     /// @param pTuningConfig The prompt tuning configuration
     /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths, optional
     /// exact prompt runs}
-    /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
-    /// hidden_dim]
     /// @param mRopeConfig The mrope configuration
     /// @param loraConfig The LoRA configuration
     /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
@@ -645,8 +643,7 @@ public:
         std::optional<Tensor> embeddingBias = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<MultimodalInput> multimodalInput = std::nullopt,
-        std::optional<Tensor> multimodalEmbedding = std::nullopt, std::optional<MropeConfig> mRopeConfig = std::nullopt,
-        std::optional<LoraConfig> loraConfig = std::nullopt,
+        std::optional<MropeConfig> mRopeConfig = std::nullopt, std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
         bool returnAllGeneratedTokens = false, PriorityType priority = kDefaultPriority,
@@ -677,7 +674,6 @@ public:
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const;
-    [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const;
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const;
@@ -704,7 +700,6 @@ public:
     void setStopWords(std::list<VecTokens> const& stopWords);
     void setEmbeddingBias(Tensor const& embeddingBias);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
-    void setMultimodalEmbedding(Tensor const& multimodalEmbedding);
     void setMultimodalInput(MultimodalInput const& multimodalInput);
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
@@ -728,34 +723,6 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
-/// @brief Struct that holds the logits information when using direct transfer
-struct SpeculativeDecodingFastLogitsInfo
-{
-    /// @brief Draft request id
-    uint64_t draftRequestId;
-
-    /// @brief MPI world rank of the draft model leader
-    int32_t draftParticipantId;
-};
-
-struct AdditionalOutput
-{
-    AdditionalOutput(std::string name, Tensor output)
-        : name(std::move(name))
-        , output(std::move(output))
-    {
-    }
-
-    AdditionalOutput(AdditionalOutput const& other) = default;
-    AdditionalOutput(AdditionalOutput&& other) noexcept = default;
-    AdditionalOutput& operator=(AdditionalOutput const& other) = default;
-    AdditionalOutput& operator=(AdditionalOutput&& other) noexcept = default;
-    ~AdditionalOutput() = default;
-
-    std::string name;
-    Tensor output;
-};
-
 /// @brief Struct that holds the generation result
 struct Result
 {
@@ -770,20 +737,6 @@ struct Result
 
     /// @brief The log probabilities for each generated token. Size [beamSize, outputLen]
     std::optional<std::vector<VecLogProbs>> logProbs;
-
-    /// @brief The context logits. Size [promptLen, vocabSizePadded]
-    std::optional<Tensor> contextLogits;
-
-    /// @brief The generation logits. Size [beamSize, maxTokens, vocabSizePadded] (non-streaming)
-    /// or [maxTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
-    /// or [1, beamSize, vocabSizePadded] (streaming and non-allGeneratedTokens)
-    std::optional<Tensor> generationLogits;
-
-    /// @brief Logits information for direct transfer when using fast logits
-    std::optional<SpeculativeDecodingFastLogitsInfo> specDecFastLogitsInfo;
-
-    /// @brief The encoder output. Size [encoderLen, hiddenSize]
-    std::optional<Tensor> encoderOutput;
 
     /// @brief The reason why the model stopped generating tokens for each beam in this request. Size [beamSize].
     /// Currently only supported when beamSize is 1 and when using BatchingType::kINFLIGHT.
@@ -813,9 +766,6 @@ struct Result
 
     /// @brief Performance metrics if returnPerfMetrics is set in OutputConfig
     std::optional<RequestPerfMetrics> requestPerfMetrics;
-
-    /// @brief The additional outputs
-    std::vector<AdditionalOutput> additionalOutputs;
 };
 
 /// @brief Class that holds either an error or a result
