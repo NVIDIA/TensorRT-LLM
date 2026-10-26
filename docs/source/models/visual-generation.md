@@ -181,9 +181,12 @@ are not supported. See the
 [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
 - FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
-  distilled 4-step checkpoint. TensorRT-LLM currently runs it through the dense
-  MiniMax-H3 attention path; model-specific VSA gate/metadata wiring is not yet
-  implemented for the H3 transformer.
+  distilled 4-step checkpoint. Dense attention and model-specific VSA are supported.
+  For single-GPU text-to-video with audio, enable VSA using
+  `fasth3-bf16-trtllm-vsa-1gpu.yaml` or `fasth3-bf16-cutedsl-vsa-1gpu.yaml`.
+  Both preserve the trained compression gate and dense text/audio routes.
+  CUTEDSL VSA requires supported Blackwell hardware and at most 4096 tiles;
+  unsupported shapes fail explicitly rather than silently running dense attention.
 - Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
   with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
   `pipeline_config: {workflow: ref2va}`; it requires `transformer_ref/` weights.

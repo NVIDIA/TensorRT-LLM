@@ -175,9 +175,10 @@ class MiniMaxH3Attention(Attention):
         self.use_async_ulysses = use_async_ulysses
         sparse = model_config.attention.sparse_attention_config
         self.to_gate_compress = None
+        self._vsa_backend = model_config.attention.backend
         if sparse is not None and sparse.algorithm == "vsa":
-            if model_config.attention.backend != "TRTLLM":
-                raise ValueError("MiniMax-H3 VSA currently requires the TRTLLM backend.")
+            if self._vsa_backend not in ("TRTLLM", "CUTEDSL"):
+                raise ValueError("MiniMax-H3 VSA requires the TRTLLM or CUTEDSL backend.")
             if model_config.mapping.world_size != 1:
                 raise ValueError("MiniMax-H3 VSA currently supports a single GPU.")
             self.to_gate_compress = Linear(
@@ -278,7 +279,13 @@ class MiniMaxH3Attention(Attention):
             metadata = get_h3_vsa_context()
             gate = self.to_gate_compress(hidden_states).view_as(query)
             output = h3_vsa_attention(
-                query, key, value.view_as(query), gate, metadata, self._attn_impl
+                query,
+                key,
+                value.view_as(query),
+                gate,
+                metadata,
+                self._attn_impl,
+                backend=self._vsa_backend,
             )
             return self.to_out[0](output.flatten(2))
 
