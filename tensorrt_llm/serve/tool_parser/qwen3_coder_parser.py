@@ -265,8 +265,9 @@ class Qwen3CoderToolParser(BaseToolParser):
                 raise ValueError("Required XML tools do not support additionalProperties.")
             tool["function"]["parameters"] = {"properties": {}, **schema}
         try:
+            # XGrammar's builtin Qwen3-Coder XML tool-call format.
             template = xgrammar.get_builtin_structural_tag(
-                model="qwen_coder", tools=tool_dicts, reasoning=False
+                model="qwen_3_coder", tools=tool_dicts, reasoning=False
             )
             for tag, tool in zip(template.format.tags, tool_dicts):
                 schema = tool["function"]["parameters"]
