@@ -238,6 +238,8 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     ex.model_engine.spec_config = None
     ex.model_engine.enable_overlap_headroom = False
     ex.model_engine.warmup_scope = nullcontext
+    ex.model_engine.register_beam_histories_callable = Mock()
+    ex.sampler = Mock(spec=["start_beam_histories"])
     ex.model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
     ex.model_engine.get_max_num_sequences = Mock(return_value=2)
     ex.model_engine.warmup = Mock()
@@ -312,7 +314,12 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         assert not ex.shutdown_event.is_set()
         for name in bound_fields:
             assert getattr(ex, name) is getattr(resources, name), name
-        create_waiting_queue.assert_called_once_with(resources.waiting_queue_policy)
+        create_waiting_queue.assert_called_once_with(
+            resources.waiting_queue_policy, gen_admission=ex._gen_admission
+        )
+        engine.register_beam_histories_callable.assert_called_once_with(
+            ex.sampler.start_beam_histories
+        )
         assert ex.max_num_active_requests == engine.get_max_num_sequences.return_value
         assert ex.kv_cache_manager is cache
         assert ex.model_engine is engine and ex.execution_stream is stream
