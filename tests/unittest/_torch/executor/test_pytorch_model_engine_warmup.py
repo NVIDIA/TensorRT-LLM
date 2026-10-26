@@ -2012,5 +2012,325 @@ def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
     owner.dist.tp_allgather.assert_called_once_with(1)
 
 
+@pytest.mark.parametrize("helpers_running", [True, False])
+def test_mamba_warmup_primes_the_multi_seq_pass_without_compile_ahead_helpers(
+    helpers_running: bool, monkeypatch
+) -> None:
+    """With JIT compile ahead on (tune ahead off), the Mamba hybrid warmup
+    drops its multi-sequence pass only while Triton helpers build its
+    variants; without them it runs both passes, as without compile ahead."""
+    import tensorrt_llm._torch.jit_prefetch as jit_prefetch
+
+    engine, resource_manager = _build_engine_and_resource_manager()
+    runner = engine._runner
+    kv_cache_manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+    monkeypatch.delenv("TLLM_WARMUP_JIT_COVERAGE", raising=False)
+    monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
+    monkeypatch.setenv("TLLM_JIT_TUNE_AHEAD", "0")
+    monkeypatch.setattr(jit_prefetch, "prefetch_helpers_running", lambda kind: helpers_running)
+    create = Mock(return_value=ScheduledRequests())
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(runner._dummy_requests, "create_warmup_request", create))
+        stack.enter_context(
+            patch.object(
+                runner._dummy_requests,
+                "release_batch_context",
+                side_effect=lambda request, resources: contextlib.nullcontext(request),
+            )
+        )
+        stack.enter_context(patch.object(runner._warmup, "_forward_warmup", Mock()))
+        stack.enter_context(
+            patch.object(decoder_warmup_module, "MambaHybridCacheManager", type(kv_cache_manager))
+        )
+        stack.enter_context(
+            patch.object(kv_cache_manager, "get_num_available_tokens", return_value=8)
+        )
+        stack.enter_context(
+            patch.object(
+                runner._warmup, "_config", replace(runner._warmup._config, enable_autotuner=False)
+            )
+        )
+        runner._warmup._run_mamba_hybrid_warmup(resource_manager)
+    # The multi-sequence pass is the one without chunk alignment.
+    passes = [c.kwargs["chunk_aligned"] for c in create.call_args_list]
+    assert passes == ([True] if helpers_running else [False, True])
+
+
+class _StopWarmup(Exception):
+    """Raised by a stand-in warmup phase to end the warmup there."""
+
+
+def _compile_ahead_warmup(monkeypatch, events: list, *, prefetch: bool, sampling_pending: bool):
+    """A stand-in engine whose decoder runner warms up with every phase
+    replaced by one that appends its name to ``events``; CUDA graph capture
+    ends the warmup (``_StopWarmup``). With ``prefetch`` the JIT compile-ahead
+    FlashInfer helpers are stand-ins too: one builds a layer module, and the
+    model loader started one on the sampling module if ``sampling_pending``.
+    Returns (engine, runner, resource manager)."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops
+    from tensorrt_llm._torch.modules.mamba import jit_prefetch_decode
+
+    for var in ("TLLM_JIT_AHEAD", "TLLM_JIT_TUNE_AHEAD", "TLLM_JIT_STATS"):
+        monkeypatch.delenv(var, raising=False)
+    if prefetch:
+        monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
+
+    def record(name, result=None):
+        return lambda *args, **kwargs: events.append(name) or result
+
+    def stop(name):
+        def _stop(*args, **kwargs):
+            events.append(name)
+            raise _StopWarmup()
+
+        return _stop
+
+    helpers: set = set()
+    if prefetch:
+        helpers.add("layer")
+        if sampling_pending:
+            helpers.add("sampling")
+
+    def start_build(*args, **kwargs):
+        if not prefetch:
+            return False
+        events.append("start_sampling_helper")
+        helpers.add("sampling")
+        return True
+
+    def join(*args, **kwargs):
+        events.append("join_helpers")
+        helpers.clear()
+
+    def join_layers(*args, **kwargs):
+        events.append("join_layer_helpers")
+        helpers.discard("layer")
+
+    monkeypatch.setattr(jp, "flashinfer_build_pending", lambda name: name in helpers)
+    monkeypatch.setattr(jp, "start_flashinfer_build", start_build)
+    monkeypatch.setattr(jp, "flashinfer_layer_builds_pending", lambda: "layer" in helpers)
+    monkeypatch.setattr(jp, "wait_flashinfer_layer_builds", join_layers)
+    monkeypatch.setattr(jp, "flashinfer_builds_pending", lambda: bool(helpers))
+    monkeypatch.setattr(jp, "wait_flashinfer_build", join)
+    monkeypatch.setattr(jp, "cancel_flashinfer_build", record("cancel_helpers"))
+    monkeypatch.setattr(jit_prefetch_decode, "start_recording", record("start_recording"))
+    monkeypatch.setattr(jit_prefetch_decode, "stop_recording", record("stop_recording"))
+    monkeypatch.setattr(decoder_warmup_module, "warmup_sampling_module", record("sampling_module"))
+    monkeypatch.setattr(decoder_warmup_module, "warmup_named_allreduce_topologies", lambda m: None)
+    monkeypatch.setattr(decoder_warmup_module, "log_mem_snapshot", lambda tag: None)
+    monkeypatch.setattr(decoder_warmup_module, "AutoTuner", SimpleNamespace(get=lambda: None))
+    monkeypatch.setattr(torch_custom_ops.MoERunner, "clear_all_workspaces", lambda: None)
+
+    runner = object.__new__(DecoderRunner)
+    warmup = runner._warmup = object.__new__(DecoderWarmup)
+    warmup._warmup_timer = _WarmupTimer(rank=0)
+    warmup._metrics = {}
+    warmup._context_warmups_supported = True
+    warmup.model = torch.nn.Module()
+    warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
+    warmup._agreement = SimpleNamespace(agree_flag=lambda flag: flag, agree_shapes=lambda s: s)
+    warmup._inputs = SimpleNamespace(guided_decoder=None)
+    warmup._graphs = SimpleNamespace(
+        reset_padding_dummies=lambda: None,
+        no_cuda_graph=contextlib.nullcontext,
+        warmup_and_capture=stop("cuda_graph_capture"),
+    )
+    for name, phase in (
+        ("_prewarm_engram_kernels", "prewarm"),
+        ("_prewarm_csa2_sparse_indexer", None),
+        ("_prewarm_minimax_m3_msa_indexer", None),
+        ("_prewarm_cute_dsl_indexer_q", "indexer_q_prewarm"),
+        ("_run_attention_warmup", "attention_warmup"),
+        ("_general_warmup", "general_warmup"),
+        ("_run_autotuner_warmup", "autotuner_warmup"),
+        ("_run_mamba_hybrid_warmup", "mamba_warmup"),
+    ):
+        monkeypatch.setattr(warmup, name, record(phase) if phase else (lambda *a, **k: None))
+    monkeypatch.setattr(warmup, "_get_full_general_warmup_requests", lambda rm: [])
+    monkeypatch.setattr(warmup, "_torch_compile_bypass", contextlib.nullcontext, raising=False)
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine._runner = runner
+    engine.model = warmup.model
+    engine.mapping = SimpleNamespace(rank=0)
+    monkeypatch.setattr(engine, "_start_warmup_triton_builds", record("start_triton_providers"))
+    monkeypatch.setattr(engine, "_init_jit_prefetch", record("init_jit_prefetch"))
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = Mock()
+    return engine, runner, resource_manager
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "prefetch,sampling_pending",
+    [(False, False), (True, False), (True, True)],
+    ids=["off", "on", "on_sampling_helper_from_loader"],
+)
+def test_compile_ahead_warmup_order(monkeypatch, prefetch: bool, sampling_pending: bool) -> None:
+    """With JIT compile ahead on, the decode launches are recorded through
+    warmup; the sampling module is built in a helper (the model loader's, or
+    one warmup starts) instead of in place, and joined, with the module
+    loaded, before CUDA graph capture; the Triton providers start once the
+    pre-JIT prewarms are done, and the layers' FlashInfer modules are joined
+    before the first forward. Unjoined helpers are stopped on the way out,
+    and the engine's hooks are unset again. With it off, warmup runs as
+    without compile ahead."""
+    events: list = []
+    engine, runner, resource_manager = _compile_ahead_warmup(
+        monkeypatch, events, prefetch=prefetch, sampling_pending=sampling_pending
+    )
+    with pytest.raises(_StopWarmup):
+        engine._warmup_impl(resource_manager)
+    forwards = ["attention_warmup", "general_warmup", "autotuner_warmup", "mamba_warmup"]
+    if prefetch:
+        expected = [
+            "start_recording",
+            *([] if sampling_pending else ["start_sampling_helper"]),
+            "prewarm",
+            "indexer_q_prewarm",
+            "start_triton_providers",
+            "join_layer_helpers",
+            *forwards,
+            "join_helpers",
+            "sampling_module",
+            "cuda_graph_capture",
+            "cancel_helpers",
+            "stop_recording",
+        ]
+    else:
+        expected = [
+            "sampling_module",
+            "prewarm",
+            "indexer_q_prewarm",
+            *forwards,
+            "cuda_graph_capture",
+            "cancel_helpers",
+        ]
+    assert events == expected
+    assert runner.before_warmup_forwards_callable is None
+    assert runner.warmup_batch_callable is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "env,initialized",
+    [({}, False), ({"TLLM_JIT_AHEAD": "1"}, True), ({"TLLM_JIT_STATS": "1"}, True)],
+    ids=["off", "ahead", "stats"],
+)
+def test_engine_sets_up_jit_prefetch_after_warmup(monkeypatch, env, initialized: bool) -> None:
+    """After the runner's warmup the engine sets up JIT compile ahead and the
+    JIT stats, and only when one of them is on: the forward that follows is
+    then the one that binds the executor thread."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch.modules.mamba import jit_prefetch_decode
+
+    for var in ("TLLM_JIT_AHEAD", "TLLM_JIT_TUNE_AHEAD", "TLLM_JIT_STATS"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    prefetcher = Mock()
+    monkeypatch.setattr(jp.JitPrefetcher, "init", classmethod(lambda cls, rank: prefetcher))
+    monkeypatch.setattr(jit_prefetch_decode, "start_recording", lambda model: None)
+    monkeypatch.setattr(jit_prefetch_decode, "stop_recording", lambda: None)
+    engine = object.__new__(PyTorchModelEngine)
+    engine._runner = Mock(spec=DecoderRunner)
+    engine.model = torch.nn.Module()
+    engine.mapping = SimpleNamespace(rank=0)
+    engine.batch_size = engine.max_num_tokens = engine.max_seq_len = 8
+    with (
+        patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", False),
+        patch.object(engine, "_register_triton_providers") as register,
+    ):
+        engine._warmup_impl(Mock())
+    engine._runner.warmup.assert_called_once()
+    assert engine._jit_bind_pending is initialized
+    assert (engine._jit_prefetcher is prefetcher) is initialized
+    if env.get("TLLM_JIT_AHEAD") == "1":
+        register.assert_called_once_with(prefetcher)
+        prefetcher.wait_ready.assert_called_once_with()
+        prefetcher.tune.assert_called_once_with()
+        prefetcher.start_background.assert_called_once_with()
+    else:
+        register.assert_not_called()
+        prefetcher.start_background.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_first_forward_after_warmup_binds_the_jit_executor_thread() -> None:
+    """After warmup the engine's first forward binds the JIT prefetcher's
+    executor thread, once, so the JIT stats count the serving executor's
+    launches; forwards inside a warmup scope never bind it."""
+    prefetcher = Mock()
+    engine = object.__new__(PyTorchModelEngine)
+    engine._jit_prefetcher = prefetcher
+    engine._jit_bind_pending = True
+    engine._warmup_depth = 1
+    engine._runner = object()
+    with (
+        patch.object(model_engine_module, "make_scheduled_inputs", return_value=Mock()),
+        patch.object(engine, "_forward_scheduled", return_value={}) as forward_scheduled,
+    ):
+        engine.forward(ScheduledRequests(), Mock())
+        assert not prefetcher.bind_executor_thread.called
+        engine._warmup_depth = 0
+        engine.forward(ScheduledRequests(), Mock())
+        engine.forward(ScheduledRequests(), Mock())
+    prefetcher.bind_executor_thread.assert_called_once_with()
+    assert forward_scheduled.call_count == 3
+    assert engine._jit_bind_pending is False
+
+
+@pytest.mark.cpu_only
+def test_warmup_forward_reports_its_batch_before_it_runs() -> None:
+    """Every warmup forward hands its batch to the runner's
+    ``warmup_batch_callable`` (the engine's JIT compile-ahead planning)
+    before it runs, and none is handed over without one."""
+    runner = object.__new__(DecoderRunner)
+    runner._trtllm_gen_jit_warmup = False
+    order = []
+    batch = object()
+
+    def forward(inputs, resource_manager, is_dummy):
+        order.append(("forward", inputs))
+
+    runner.forward = forward
+    with patch.object(decoder_runner_module, "make_scheduled_inputs", return_value="inputs"):
+        runner.warmup_batch_callable = lambda b: order.append(("planned", b))
+        runner._forward_warmup(batch, Mock(), enable_spec_decode=False, runtime_draft_len=0)
+        runner.warmup_batch_callable = None
+        runner._forward_warmup(batch, Mock(), enable_spec_decode=False, runtime_draft_len=0)
+    assert order == [("planned", batch), ("forward", "inputs"), ("forward", "inputs")]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("forced", [False, True], ids=["plain", "forced_initial_states"])
+def test_engine_plans_a_warmup_batch_from_its_requests(monkeypatch, forced: bool) -> None:
+    """The engine describes a warmup forward's batch to the JIT prefetcher
+    by its context chunk lengths and whether a request has a cached prefix,
+    which Mamba's warmup can force; a batch without context requests is not
+    planned."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+
+    planned = []
+    prefetcher = SimpleNamespace(plan_warmup_batch=planned.append)
+    monkeypatch.setattr(jp.JitPrefetcher, "get", classmethod(lambda cls: prefetcher))
+    monkeypatch.setattr(Mamba2Metadata, "_warmup_force_initial_states", forced)
+    engine = object.__new__(PyTorchModelEngine)
+    ctx = [
+        SimpleNamespace(
+            context_chunk_size=n, context_current_position=0, py_num_compressed_tokens=0
+        )
+        for n in (100, 28)
+    ]
+    engine._plan_warmup_batch(SimpleNamespace(context_requests=[]))
+    assert planned == []
+    engine._plan_warmup_batch(SimpleNamespace(context_requests=ctx))
+    (batch_ctx,) = planned
+    assert batch_ctx.ctx_chunk_lens == [100, 28]
+    assert batch_ctx.any_ctx_cached is forced
+
+
 if __name__ == "__main__":
     unittest.main()

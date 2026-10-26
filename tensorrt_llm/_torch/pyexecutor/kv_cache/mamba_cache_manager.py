@@ -23,7 +23,6 @@ from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
 
 import torch
 import triton
-import triton.language as tl
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -65,6 +64,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
 # Shared with the KV budget estimator so allocator and budgeting can never
 # diverge on the sharding rule (config_utils is import-cycle-free).
 from ..config_utils import is_glm5_next, is_kimi_linear, mamba_effective_tp_size
+from .mamba_state_kernels import _promote_mamba_state_kernel
 
 GB = 1 << 30
 
@@ -1941,72 +1941,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                                      dtype=torch.int32,
                                      device=device)
         self.update_mamba_states(attn_metadata, num_accepted, state_indices)
-
-
-@triton.jit
-def _promote_mamba_state_kernel(
-    src_ptr,
-    dst_ptr,
-    src_idx_ptr,
-    accepted_position_source_ptr,
-    num_accepted_tokens_ptr,
-    blk_ptr,
-    replay_pnat_ptr,
-    replay_cache_buf_idx_ptr,
-    dummy_request_mask_ptr,
-    num_gens,
-    count,
-    src_s_layer,
-    src_s_row,
-    src_s_step,
-    dst_s_layer,
-    dst_s_block,
-    POSITION_SOURCE_IS_TOKEN_COUNT: tl.constexpr,
-    REPLAY_STEP_WIDTH: tl.constexpr,
-    REPLAY_HISTORY_SIZE: tl.constexpr,
-    UPDATE_REPLAY_BOOKKEEPING: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    # One program copies a BLOCK-sized tile of the contiguous inner state for a
-    # single (layer, gen) pair. grid = (num_layers * num_gens, ceil(count/BLOCK)).
-    pair = tl.program_id(0)
-    tile = tl.program_id(1)
-    layer = (pair // num_gens).to(tl.int64)
-    g = pair % num_gens
-    row = tl.load(src_idx_ptr + g).to(tl.int64)
-    accepted_position = tl.load(accepted_position_source_ptr + g)
-    if POSITION_SOURCE_IS_TOKEN_COUNT:
-        accepted_position -= 1
-    acc = accepted_position.to(tl.int64)
-    blk = tl.load(blk_ptr + g).to(tl.int64)
-
-    # The replay metadata update is batch-scoped, so layer 0's first copy tile
-    # owns it. This folds PNAT and active-buffer maintenance into the existing
-    # accepted-convolution-state promotion launch.
-    if UPDATE_REPLAY_BOOKKEEPING:
-        if (layer == 0) & (tile == 0):
-            num_accepted_tokens = tl.load(num_accepted_tokens_ptr + g)
-            is_dummy_request = tl.load(dummy_request_mask_ptr + g)
-            pnat = tl.load(replay_pnat_ptr + blk)
-            cache_buf_idx = tl.load(replay_cache_buf_idx_ptr + blk)
-            wrote_checkpoint = pnat + REPLAY_STEP_WIDTH > REPLAY_HISTORY_SIZE
-            next_pnat = tl.where(wrote_checkpoint, num_accepted_tokens,
-                                 pnat + num_accepted_tokens)
-            next_cache_buf_idx = tl.where(wrote_checkpoint, 1 - cache_buf_idx,
-                                          cache_buf_idx)
-            tl.store(replay_pnat_ptr + blk, next_pnat, mask=~is_dummy_request)
-            tl.store(replay_cache_buf_idx_ptr + blk,
-                     next_cache_buf_idx,
-                     mask=~is_dummy_request)
-
-    # int64 throughout: per-layer strides are O(1e8), so layer*stride overflows
-    # int32 and would corrupt addresses / fault.
-    src_base = layer * src_s_layer + row * src_s_row + acc * src_s_step
-    dst_base = layer * dst_s_layer + blk * dst_s_block
-    offs = tile * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < count
-    v = tl.load(src_ptr + src_base + offs, mask=mask)
-    tl.store(dst_ptr + dst_base + offs, v, mask=mask)
 
 
 def _promote_mamba_state_triton(

@@ -197,6 +197,10 @@ l0_b200:
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # JIT compile ahead: what the CPU-only helpers build is what the ops load.
+  - unittest/_torch/test_jit_prefetch_cute_dsl.py
+  - unittest/_torch/test_jit_prefetch_flashinfer.py
+  - unittest/_torch/modules/test_jit_prefetch_mlp.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/fused_moe/test_cutedsl_fc2_tuning.py
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py

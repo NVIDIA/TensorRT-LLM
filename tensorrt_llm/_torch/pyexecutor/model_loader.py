@@ -1099,6 +1099,15 @@ class ModelLoader:
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
 
+            # With JIT compile ahead on (TLLM_JIT_AHEAD=1), the JIT kernels
+            # the model's layers build in warmup (FlashInfer modules, CuTe DSL
+            # GEMM tactics and norms) are built in CPU-only helpers while the
+            # weights load.
+            from ..jit_prefetch import start_model_builds
+            start_model_builds(model,
+                               rank=self.mapping.rank,
+                               llm_args=self.llm_args)
+
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
                 for module in model.modules())

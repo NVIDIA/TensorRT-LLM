@@ -931,6 +931,12 @@ class PyExecutor:
         with _StartupTimer("pre_warmup_rank_barrier"):
             self.dist.barrier()
 
+        # With JIT compile ahead on (TLLM_JIT_AHEAD=1), the sampler's Triton
+        # kernels are queued for the CPU-only helpers before the first warmup
+        # forward samples.
+        from .sampler.jit_prefetch import register_sampler_providers
+        register_sampler_providers(self.sampler, rank=self.dist.rank)
+
         # During warmup, we don't enable the profiler
         # Run warmup on the execution_stream for proper synchronization with
         # KVCacheTransferManager's onboard/offload operations.
@@ -3061,6 +3067,10 @@ class PyExecutor:
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
+        from ..jit_prefetch import JitPrefetcher
+        prefetcher = JitPrefetcher.get()
+        if prefetcher is not None:
+            prefetcher.shutdown()
         self.shutdown_event.set()
 
         # The loop may exit while the benchmark fill gate is still closed.
