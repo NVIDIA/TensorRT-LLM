@@ -38,7 +38,8 @@ from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
-from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
+from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
+                                          LogitsProcessor, SamplingParams)
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, StreamOptions
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
@@ -705,6 +706,46 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
         **llm_kwargs)
+
+
+class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
+
+    def __init__(self, biased_word_id):
+        self.biased_word_id = biased_word_id
+
+    def __call__(self, req_ids: List[int], logits: List[torch.Tensor],
+                 ids: List[List[List[int]]], stream_ptr: Optional[int],
+                 client_ids: List[Optional[int]]):
+        assert len(req_ids) == len(logits) == len(ids) == len(client_ids)
+        stream = None if stream_ptr is None else torch.cuda.ExternalStream(
+            stream_ptr)
+        with torch.cuda.stream(stream):
+            for rows in logits:
+                rows[:] = float("-inf")
+                rows[..., self.biased_word_id] = 0
+
+
+def tinyllama_batched_logits_processor_test_harness(backend=None, **llm_kwargs):
+    tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    max_tokens = 6
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
+    with assert_resource_freed(
+            LLM,
+            llama_model_path,
+            batched_logits_processor=MyBatchedLogitsProcessor(biased_word_id),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+            backend=backend,
+            **llm_kwargs) as llm:
+        # Only the request that opts in is handed to the batched processor.
+        outputs = llm.generate(["A B C", "A B C"], [
+            SamplingParams(max_tokens=max_tokens,
+                           apply_batched_logits_processor=True),
+            SamplingParams(max_tokens=max_tokens),
+        ])
+        assert outputs[0].outputs[0].text == expected_output
+        assert outputs[1].outputs[0].text != expected_output
 
 
 def test_executor_results_cleanup():

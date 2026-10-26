@@ -583,6 +583,8 @@ class BaseWorker(GenerationExecutor):
                     kv_hints=request.kv_hints,
                     arrival_time=request.arrival_time,
                     watermarking=request.sampling_params.watermarking,
+                    apply_batched_logits_processor=request.sampling_params.
+                    apply_batched_logits_processor,
                 ),
             )
 
