@@ -165,7 +165,8 @@ def test_processor_preserves_interleaved_text_and_image_payload() -> None:
     data = extra["multimodal_data"]
     image = data["image"]
     assert image["positions"] == [1, 6]
-    assert image["num_tokens"] == data["multimodal_embedding_lengths"] == [4, 10]
+    assert image["num_tokens"] == [4, 10]
+    assert data["multimodal_encoder_item_metadata"].output_embedding_lengths == (4, 10)
     assert image["image_grid_hw"] == [(3, 3), (4, 7)]
     assert image["llm_grid_hw"] == [(1, 1), (2, 3)]
     assert image["token_types"][1].tolist() == [0, 1, 1, 1, 2, 1, 1, 1, 2, 3]

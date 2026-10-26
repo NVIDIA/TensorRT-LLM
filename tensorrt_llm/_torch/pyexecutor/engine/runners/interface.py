@@ -11,10 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionBackend,
-    AttentionRuntimeFeatures,
-)
+from tensorrt_llm._torch.attention.backends.interface import AttentionBackend
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
@@ -78,13 +75,12 @@ class RunnerConfig:
     max_beam_width: int
     without_logits: bool
     attention_backend: type[AttentionBackend]
-    attention_runtime_features: AttentionRuntimeFeatures
 
 
 class ModelRunner(ABC):
     """Shared lifecycle for scheduled and packed model execution."""
 
-    def release_graphs(self) -> None:
+    def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
         """Release captured graphs before their referenced resources are replaced.
 
         The caller must stop execution and synchronize outstanding work first.

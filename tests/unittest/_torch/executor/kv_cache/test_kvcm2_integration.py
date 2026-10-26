@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_generation_kv_capacity,
     _get_kv_alloc_extra_tokens,
     _KVCacheManagerInitStatus,
+    _swa_branch_snapshot_point,
     _swa_endpoint_priority,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
@@ -86,6 +87,19 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_layer_spec_rejects_odd_head_dim() -> None:
+    with pytest.raises(ValueError, match="NVFP4 head_dim must be even"):
+        KVCacheLayerSpec(
+            global_layer_id=0,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=DataType.NVFP4,
+            num_kv_heads=16,
+            head_dim=1,
+            buffer_roles=(Role.KEY, Role.KEY_BLOCK_SCALE),
+        )
 
 
 @pytest.mark.cpu_only
@@ -1671,6 +1685,66 @@ def test_try_commit_blocks_at_context_end(guard: str | None) -> None:
     assert kv_cache.stopped_committing is (guard is not None)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("divergence", "num_lookup_tokens", "reused", "expected"),
+    [
+        # A sibling diverges at 34,400; the point aligns down to the 64-token block.
+        (34400, 34999, 0, 34368),
+        # The whole lookup matched, so there is no fork.
+        (34999, 34999, 0, None),
+        # Less than one shared block.
+        (40, 999, 0, None),
+        # Reuse already reached the fork.
+        (34400, 34999, 34368, None),
+    ],
+)
+def test_swa_branch_snapshot_point(
+    divergence: int, num_lookup_tokens: int, reused: int, expected: int | None
+) -> None:
+    assert (
+        _swa_branch_snapshot_point(divergence, num_lookup_tokens, reused, num_lookup_tokens + 1, 64)
+        == expected
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("record", "is_dummy_request", "num_lookup_tokens", "points", "expected"),
+    [
+        (True, False, 999, [], [512]),
+        # A later lookup that matches in full clears the earlier point.
+        (True, False, 512, [256], []),
+        # A resumed cache does no lookup and keeps the point.
+        (True, False, None, [256], [256]),
+        (False, False, 999, [], []),
+        (True, True, 999, [], []),
+    ],
+)
+def test_record_branch_snapshot_point(
+    record: bool,
+    is_dummy_request: bool,
+    num_lookup_tokens: int | None,
+    points: list[int],
+    expected: list[int],
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._record_branch_snapshots = record
+    manager.tokens_per_block = 64
+    request = SimpleNamespace(
+        py_request_id=1,
+        is_dummy_request=is_dummy_request,
+        prompt_len=1000,
+        expect_snapshot_points=points,
+    )
+    kv_cache = Mock(num_committed_tokens=0)
+    kv_cache._get_num_reusable_tokens_before_pruning.return_value = 512
+
+    manager._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens)
+
+    assert request.expect_snapshot_points == expected
+
+
 def test_generation_allocation_reserves_dynamic_width() -> None:
     request = SimpleNamespace(
         py_request_id=80,
@@ -2103,7 +2177,6 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
                 max_beam_width=1,
                 use_mrope=False,
             ),
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             model=SimpleNamespace(
                 model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
             ),
