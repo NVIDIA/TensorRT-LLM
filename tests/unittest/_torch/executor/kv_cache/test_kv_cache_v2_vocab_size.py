@@ -10,6 +10,7 @@ the lookup order inside ``resolve_vocab_size``, and unresolved vocabulary sizes.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_vocab_size
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -101,7 +103,8 @@ def _capture_manager_kwargs(
     model_engine = (
         SimpleNamespace(
             model=SimpleNamespace(model_config=model_config),
-            is_multimodal=is_multimodal,
+            max_cuda_graph_batch_size=4,
+            input_processor=Mock(spec=BaseMultimodalInputProcessor) if is_multimodal else None,
         )
         if is_multimodal is not None
         else None

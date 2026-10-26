@@ -92,8 +92,6 @@ def test_FusedIpcQueue():
 def create_rsp(id, finished: bool = False):
     result = tllm.Result()
     result.output_token_ids = [[id]]
-    result.context_logits = None
-    result.generation_logits = None
     result.log_probs = None
     result.cum_log_probs = None
     if finished:

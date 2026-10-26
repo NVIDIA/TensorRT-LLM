@@ -176,6 +176,7 @@ def _test_attention_trtllm_sage(
         pytest.param(True, 1, 4, 1e-1, 4e-2, (100,), id="sm100-int8-q1k4"),
         pytest.param(True, 1, 16, 5e-1, 5e-1, (100,), id="sm100-int8-q1k16"),
         pytest.param(False, 1, 1, 3e-1, 2e-1, (100, 103), id="sm10x-fp8-q1k1"),
+        pytest.param(False, 1, 16, 3e-1, 2e-1, (100, 103), id="sm10x-fp8-q1k16"),
     ],
 )
 def test_attention_trtllm_sage(

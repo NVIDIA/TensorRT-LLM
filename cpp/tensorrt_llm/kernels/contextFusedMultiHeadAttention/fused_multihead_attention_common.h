@@ -285,6 +285,8 @@ struct MHARunnerParams
     void const* kPtr;
     // The V buffer ptr (for separate V input).
     void const* vPtr;
+    // Physical V token stride for separate Q, K, V input; zero derives it from the layout.
+    int64_t vStrideInBytes = 0;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
     // The paged kv cache array for scaling factor.
