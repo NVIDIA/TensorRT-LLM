@@ -459,7 +459,9 @@ Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` functio
 
 ### Post-merge Run Frequency
 
-The post-merge `Disagg-PerfSanity` stages (disaggregated `e2e` and `gen_only` tests) run once every 2 post-merge builds: split `k` runs on the post-merge builds whose `BUILD_NUMBER % 2 == (k - 1) % 2`, so `...-Post-Merge-1` runs on even builds and `...-Post-Merge-2` on odd builds. All other perf-sanity stages run on every build. The intervals are set by `POST_MERGE_STAGE_BUILD_INTERVALS` in `jenkins/L0_Test.groovy`. PR pipelines, including `/bot run --post-merge`, run every selected stage.
+The post-merge `Disagg-PerfSanity` stages (disaggregated `e2e` and `gen_only` tests) run once every 2 post-merge builds: split `k` runs on the post-merge builds whose `BUILD_NUMBER % 2 == (k - 1) % 2`, so `...-Post-Merge-1` runs on even builds and `...-Post-Merge-2` on odd builds. All other perf-sanity stages run on every build. The intervals are set by `POST_MERGE_STAGE_BUILD_INTERVALS` in `jenkins/L0_Test.groovy`.
+
+A PR's `/bot run --post-merge` runs no post-merge perf-sanity stage (a stage whose name contains both `PerfSanity` and `Post-Merge`); only the official post-merge pipeline runs them. The pre-merge perf-sanity stages run as in a plain `/bot run`. To run a post-merge perf-sanity stage on a PR, name it with `--stage-list` or `--extra-stage`.
 
 ### Pre-merge vs Post-merge Perf-Regression Gating
 

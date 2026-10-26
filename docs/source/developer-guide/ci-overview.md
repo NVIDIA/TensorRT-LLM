@@ -154,7 +154,11 @@ Post-merge pipelines and GitLab MR builds are exempt from this label check.
 ### Triggering Post-merge tests
 
 Full `/bot run --post-merge` runs require the `ci: post-merge approved` PR
-label because they can consume substantial shared GPU resources. The label is
+label because they can consume substantial shared GPU resources. Such a run
+adds the post-merge stages except the post-merge perf-sanity ones (stage names
+containing both `PerfSanity` and `Post-Merge`), which only the official
+post-merge pipeline runs; name one with `--stage-list` or `--extra-stage` to run
+it on a PR. The label is
 intended to be applied by an active member of the
 `NVIDIA/trt-llm-ci-approvers` GitHub team. A GitHub workflow validates the label
 actor and normally removes invalid approvals. This is a best-effort resource

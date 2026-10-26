@@ -3098,6 +3098,12 @@ int getPostMergeStageBuildPhase(String stageName, int interval) {
     return (splitId - 1) % interval
 }
 
+// Return the --stage-list and --extra-stage patterns: the stages they name are never dropped by
+// the post-merge stage filters below.
+def getExplicitStagePatterns(Map testFilter) {
+    return (testFilter[(TEST_STAGE_LIST)] ?: []) + (testFilter[(EXTRA_STAGE_LIST)] ?: [])
+}
+
 // Drop the selected stages that are not due on this official post-merge build (see
 // POST_MERGE_STAGE_BUILD_INTERVALS). Stages named in --stage-list or --extra-stage are kept.
 // postMergeBuildNumber is null outside the official post-merge pipeline, so nothing is dropped.
@@ -3110,7 +3116,7 @@ def filterPostMergeStagesByBuildInterval(Map selectedJobs, Map testFilter, def p
         return selectedJobs
     }
     int buildNumber = postMergeBuildNumber.toString().toInteger()
-    def explicitStagePatterns = (testFilter[(TEST_STAGE_LIST)] ?: []) + (testFilter[(EXTRA_STAGE_LIST)] ?: [])
+    def explicitStagePatterns = getExplicitStagePatterns(testFilter)
     def notDueJobs = selectedJobs.findAll { key, _ ->
         int interval = getPostMergeStageBuildInterval(key)
         return interval > 1 &&
@@ -3126,6 +3132,25 @@ def filterPostMergeStagesByBuildInterval(Map selectedJobs, Map testFilter, def p
         echo "Post-merge build #${buildNumber} skips ${notDueJobs.size()} stage(s) that are not due:\n${details.join('\n')}"
     }
     return selectedJobs - notDueJobs
+}
+
+// Drop the post-merge perf-sanity stages from a pre-merge pipeline run with `/bot run --post-merge`
+// (SKIP_POST_MERGE_PERF_SANITY); only the official post-merge pipeline runs them. Pre-merge
+// perf-sanity stages and the stages named in --stage-list or --extra-stage are kept.
+def filterPostMergePerfSanityStages(Map selectedJobs, Map testFilter) {
+    if (!testFilter[(SKIP_POST_MERGE_PERF_SANITY)]) {
+        return selectedJobs
+    }
+    def explicitStagePatterns = getExplicitStagePatterns(testFilter)
+    def skippedJobs = selectedJobs.findAll { key, _ ->
+        return key.contains("PerfSanity") && key.contains("Post-Merge") &&
+            !stageMatchesAnyPattern(key, explicitStagePatterns)
+    }
+    if (skippedJobs) {
+        echo "/bot run --post-merge skips ${skippedJobs.size()} post-merge perf-sanity stage(s), which only " +
+            "the official post-merge pipeline runs:\n${skippedJobs.keySet().collect { "  ${it}" }.join('\n')}"
+    }
+    return selectedJobs - skippedJobs
 }
 
 // Return the OpenSearch regexp for sibling shards and their CBTS variants.
@@ -3215,7 +3240,8 @@ def MULTI_GPU_RUN_WITH_SINGLE = [
 // explicitly with --stage-list / --extra-stage, are not affected.
 @Field
 def POST_MERGE_STAGE_BUILD_INTERVALS = [
-    // Multi-node disaggregated perf-sanity stages: the disagg e2e and gen_only tests.
+    // Multi-node disaggregated perf-sanity stages: the disagg e2e and gen_only tests. The
+    // *-PerfSanity-GEN1-* stages hold aggregated gen_only_no_context tests and run every build.
     "*-Disagg-PerfSanity-*-Post-Merge-*": 2,
 ]
 
@@ -3233,6 +3259,10 @@ def GPU_TYPE_LIST = "gpu_type"
 def TEST_BACKEND = "test_backend"
 @Field
 def IS_POST_MERGE = "post_merge"
+// Set by L0_MergeRequest.groovy for a pre-merge pipeline run with `/bot run --post-merge`;
+// see filterPostMergePerfSanityStages.
+@Field
+def SKIP_POST_MERGE_PERF_SANITY = "skip_post_merge_perf_sanity"
 @Field
 def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
 @Field
@@ -3272,6 +3302,7 @@ def testFilter = [
     (GPU_TYPE_LIST): null,
     (TEST_BACKEND): null,
     (IS_POST_MERGE): false,
+    (SKIP_POST_MERGE_PERF_SANITY): false,
     (ADD_MULTI_GPU_TEST): false,
     (ONLY_MULTI_GPU_TEST): false,
     (DISABLE_MULTI_GPU_TEST): false,
@@ -7406,9 +7437,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     parallelJobsFiltered = filterCbtsStageJobs(
         parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
 
-    // Last selection step, so no later step can bring back a stage that is not due.
+    // Last selection steps, so no later step can bring back a stage that they drop.
     parallelJobsFiltered = filterPostMergeStagesByBuildInterval(
         parallelJobsFiltered, testFilter, globalVars[POST_MERGE_BUILD_NUMBER])
+    parallelJobsFiltered = filterPostMergePerfSanityStages(parallelJobsFiltered, testFilter)
 
     if (globalVars[RUN_MODE] == "nightly_release") {
         parallelJobsFiltered = sanityCheckJobs
