@@ -19,6 +19,7 @@ from contextlib import ExitStack
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
+import transformers
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
@@ -190,6 +191,56 @@ def is_disagg_enabled(
             and cache_transceiver_config.backend is not None)
 
 
+def _is_step5(config) -> bool:
+    """Whether ``config`` is a loaded Step-5 checkpoint config."""
+    return (isinstance(config, transformers.PretrainedConfig)
+            and config_utils.is_step5(config))
+
+
+def _kv_cache_text_config(config):
+    """The decoder config the KV cache is laid out from.
+
+    Step-5's published config is a vision-language composite whose decoder
+    fields live under ``text_config``.
+    """
+    if _is_step5(config):
+        from ..attention.backends.sparse.step5 import step5_text_config
+        return step5_text_config(config)
+    return config
+
+
+def _get_step5_kv_cache_manager_cls(
+        kv_cache_config: KvCacheConfig,
+        is_disagg: bool = False,
+        cache_transceiver_config: Optional[CacheTransceiverConfig] = None):
+    """Step-5 keeps its sparse-indexer state in V2 buffers beside the K/V of
+    its full-attention layers, so only the V2 manager can hold its cache.
+
+    In disaggregated serving only the Python NIXL transceiver moves V2 pools
+    (the windowed K/V, the full-attention K/V and the indexer pages), so any
+    other route is refused here, before the pools are allocated.
+    """
+    if kv_cache_config.use_kv_cache_manager_v2 is not True:
+        raise ValueError(
+            "Step-5 requires the KV cache manager V2: its sparse-indexer state "
+            "is a V2 buffer of the full-attention layers. Set "
+            "kv_cache_config.use_kv_cache_manager_v2=True (the default); got "
+            f"{kv_cache_config.use_kv_cache_manager_v2!r}.")
+    if is_disagg:
+        backend, runtime = _resolve_disagg_transceiver_route(
+            cache_transceiver_config)
+        if runtime != "PYTHON" or backend != "NIXL":
+            raise ValueError(
+                "Step-5 disaggregated serving requires cache_transceiver_config "
+                "backend='NIXL' with transceiver_runtime='PYTHON' (or 'auto', "
+                "which resolves to it with the NIXL backend): only the Python "
+                "transceiver moves the V2 pools holding the sliding-window "
+                "K/V, the full-attention K/V and the sparse-indexer pages (got "
+                f"backend={backend!r}, transceiver_runtime={runtime!r}).")
+    from ..attention.backends.sparse.step5 import Step5CacheManager
+    return Step5CacheManager
+
+
 def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
@@ -242,6 +293,9 @@ def get_kv_cache_manager_cls(
 
         return Fp4MlaKVCacheManagerV2
     use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
+    if _is_step5(config):
+        return _get_step5_kv_cache_manager_cls(kv_cache_config, is_disagg,
+                                               cache_transceiver_config)
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid routes.
@@ -756,7 +810,7 @@ def _derive_v2_layer_type_attention_windows(
     if not (isinstance(kv_cache_manager_cls, type)
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
         return None
-    config = model_config.pretrained_config
+    config = _kv_cache_text_config(model_config.pretrained_config)
     layer_specs = _get_kv_cache_layer_specs(model_config)
     if layer_specs and any(spec.attention_window is not None
                            for spec in layer_specs):
@@ -797,7 +851,7 @@ def _get_num_pool_groups_for_estimation(
     Hybrid recurrent/attention models also retain their distinct layer types
     when automatic window derivation does not apply.
     """
-    config = model_config.pretrained_config
+    config = _kv_cache_text_config(model_config.pretrained_config)
     attention_windows = kv_cache_config.max_attention_window
     if attention_windows is None and _has_variable_kv_cache_geometry(
             model_config):
@@ -1040,6 +1094,11 @@ class KvCacheCreator:
                         f"supported with "
                         f"{incompat_str}. Disable the incompatible features to "
                         f"run sparse-attention models.")
+                if _is_step5(config):
+                    raise NotImplementedError(
+                        "Step-5 requires KVCacheManagerV2, which is not "
+                        f"supported with {incompat_str}. Disable these "
+                        "features to run Step-5.")
                 if _has_variable_kv_cache_geometry(model_config):
                     raise NotImplementedError(
                         f"Variable per-layer KV geometry requires KVCacheManagerV2, "
@@ -3319,6 +3378,7 @@ def _create_kv_cache_manager(
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
         _model_config = model_engine.model.model_config
+    config = _kv_cache_text_config(config)
 
     if dtype is None:
         dtype = model_engine.model.config.torch_dtype

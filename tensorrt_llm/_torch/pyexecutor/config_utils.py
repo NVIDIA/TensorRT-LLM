@@ -493,6 +493,59 @@ def is_qwen4_exp(config: transformers.PretrainedConfig) -> bool:
     }
 
 
+_STEP5_ARCHITECTURES = ("Step5ForConditionalGeneration", "Step5ForCausalLM")
+_STEP5_MODEL_TYPES = ("step5_vl", "step5")
+
+
+def is_step5(config: transformers.PretrainedConfig) -> bool:
+    """Return whether this is a StepFun Step-5 composite or text config.
+
+    True for the published composite (``Step5ForConditionalGeneration``,
+    model_type ``step5_vl``) and for its ``step5`` text config.
+    """
+    architectures = getattr(config, "architectures", None)
+    if architectures and architectures[0] in _STEP5_ARCHITECTURES:
+        return True
+    return getattr(config, "model_type", None) in _STEP5_MODEL_TYPES
+
+
+def get_step5_text_config(
+        config: transformers.PretrainedConfig) -> transformers.PretrainedConfig:
+    """Return the Step-5 text config of a composite or text config."""
+    text_config = getattr(config, "text_config", None)
+    return config if text_config is None else text_config
+
+
+def step5_routed_experts_module(layer_idx: int) -> str:
+    """The module name ModelOpt's ``exclude_modules`` uses for a layer's routed experts.
+
+    The checkpoint stores the experts as ``model.layers.<i>.moe.{gate,up,down}_proj``,
+    but the exclusions name them ``model.layers.<i>.moe.experts``; matching the
+    checkpoint's tensor names instead is wrong both ways, since ``*layers.<i>.moe.gate*``
+    (the router exclusion) also matches ``moe.gate_proj``.
+    """
+    return f"model.layers.{layer_idx}.moe.experts"
+
+
+def get_step5_nvfp4_expert_layers(config: transformers.PretrainedConfig,
+                                  quant_config) -> tuple[int, ...]:
+    """Decoder layers whose routed experts the checkpoint stores as NVFP4.
+
+    Every other weight -- attention, routers, shared experts, dense MLPs, the routed
+    experts of the remaining MoE layers, embeddings and lm_head -- is excluded from
+    quantization and stays in the checkpoint's dtype.
+    """
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    text = get_step5_text_config(config)
+    if quant_config is None or quant_config.quant_algo != QuantAlgo.NVFP4:
+        return ()
+    return tuple(layer_idx for layer_idx in range(text.num_hidden_layers)
+                 if text.is_moe_layer(layer_idx)
+                 and not quant_config.is_module_excluded_from_quantization(
+                     step5_routed_experts_module(layer_idx)))
+
+
 def get_qwen3_hybrid_layer_types(config):
     """Return per-layer type list for a Qwen3 hybrid model.
 
@@ -1093,6 +1146,23 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type == "step5_vl":
+        # Step-5 ships no configuration class; keep the published composite and
+        # its architecture names, which modeling_v2 routes on.
+        from tensorrt_llm._torch.configs import Step5Config
+        text_dict = dict(config_dict.get("text_config") or {})
+        resolved_dtype = _resolve_composite_torch_dtype(config_dict, text_dict)
+        model_config = Step5Config.from_dict(config_dict)
+        model_config.architectures = list(architectures
+                                          or ["Step5ForConditionalGeneration"])
+        model_config.text_config.architectures = list(
+            text_dict.get("architectures") or ["Step5ForCausalLM"])
+        model_config.text_config.torch_dtype = resolved_dtype
+        model_config.torch_dtype = resolved_dtype
+    elif model_type == "step5":
+        from tensorrt_llm._torch.configs import Step5TextConfig
+        model_config = Step5TextConfig.from_dict(config_dict)
+        model_config.architectures = list(architectures or ["Step5ForCausalLM"])
     elif model_type in ("deepseek_v41", "deepseek_v41_text"):
         # Preserve the composite config and propagate its dtype to the text tower.
         # Vision checkpoints use the internal ConditionalGeneration dispatch alias.

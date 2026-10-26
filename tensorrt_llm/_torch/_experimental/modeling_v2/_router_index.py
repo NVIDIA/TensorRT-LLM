@@ -57,6 +57,8 @@ MODELING_V2_ROUTERS = {
     # config loader's composite branch writes the same name back.
     "Qwen4ExpForConditionalGeneration": "models.qwen4_exp.routing",
     "GlmMoeDsaForCausalLM": "models.glm_moe_dsa.routing",
+    # Step-5 publishes only the composite step5_vl config, under this name.
+    "Step5ForConditionalGeneration": "models.step5.routing",
 }
 
 

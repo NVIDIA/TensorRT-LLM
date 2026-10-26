@@ -282,3 +282,110 @@ def test_draft_manager_skips_derivation(monkeypatch):
     _run_create_kv_cache_manager(monkeypatch, manager_cls, kv_cache_config, is_draft=True)
 
     assert captured["kv_cache_config"].max_attention_window is None
+
+
+# ---------------------------------------------------------------------------
+# Step-5: a vision-language composite whose decoder fields live under
+# ``text_config``; 69 sliding layers at a 512-token window and 23 full-attention
+# layers (3, 7, ..., 91) that also hold the sparse indexer's state.
+# ---------------------------------------------------------------------------
+
+STEP5_LAYERS = 92
+STEP5_WINDOW = 512
+STEP5_MAX_SEQ_LEN = 9216
+STEP5_FULL_LAYERS = tuple(range(3, STEP5_LAYERS, 4))
+
+
+def _step5_config():
+    from tensorrt_llm._torch.configs import Step5Config
+
+    # The checkpoint lists the three MTP layers after the decoder layers.
+    layer_types = (["sliding_attention"] * 3 + ["full_attention"]) * 23 + ["sliding_attention"] * 3
+    return Step5Config(
+        text_config=dict(
+            num_hidden_layers=STEP5_LAYERS,
+            layer_types=layer_types,
+            sliding_window=STEP5_WINDOW,
+            num_attention_heads=64,
+            num_attention_groups=4,
+            head_dim=192,
+            sparse_config={
+                "enabled": True,
+                "proxy_dim": 256,
+                "sparse_indexer_num_k_heads": 1,
+                "region_block_size": 8,
+                "apply_to_layer_types": ["full_attention"],
+            },
+        )
+    )
+
+
+def _step5_windows():
+    return [
+        STEP5_MAX_SEQ_LEN if layer in STEP5_FULL_LAYERS else STEP5_WINDOW
+        for layer in range(STEP5_LAYERS)
+    ]
+
+
+def test_step5_windows_come_from_its_text_config():
+    """The composite carries no layer_types of its own; the windows come from its
+    decoder's, and the MTP entries past layer 91 are not cache layers."""
+    from tensorrt_llm._torch.attention.backends.sparse.step5 import Step5CacheManager
+
+    model_config = SimpleNamespace(pretrained_config=_step5_config())
+    windows = util._derive_v2_layer_type_attention_windows(
+        KvCacheConfig(), Step5CacheManager, model_config, STEP5_MAX_SEQ_LEN
+    )
+    assert windows == _step5_windows()
+
+
+def _step5_model_config():
+    return SimpleNamespace(
+        pretrained_config=_step5_config(),
+        sparse_attention_config=None,
+        quant_config=None,
+        attn_backend="TRTLLM",
+        mapping=None,
+    )
+
+
+def test_step5_selects_its_v2_manager():
+    from tensorrt_llm._torch.attention.backends.sparse.step5 import Step5CacheManager
+
+    assert (
+        util.get_kv_cache_manager_cls(_step5_model_config(), KvCacheConfig()) is Step5CacheManager
+    )
+
+
+def test_step5_refuses_the_v1_manager():
+    """The indexer state is a V2 buffer: a V1 request fails instead of serving
+    the full-attention layers without it."""
+    with pytest.raises(ValueError, match="Step-5 requires the KV cache manager V2"):
+        util.get_kv_cache_manager_cls(
+            _step5_model_config(), KvCacheConfig(use_kv_cache_manager_v2=False)
+        )
+
+
+@pytest.mark.parametrize(("tp_size", "attention_dp", "kv_heads"), [(4, False, 1), (4, True, 4)])
+def test_step5_static_cost_charges_padded_kv_and_indexer(tp_size, attention_dp, kv_heads):
+    """Per token, each full-attention layer costs its K/V at heads padded to 256
+    plus 1056 bytes of indexer state ([k | z] bf16 at proxy_dim 256, and one fp8
+    256-wide summary per 8 tokens); the sliding layers are a per-request cost."""
+    from tensorrt_llm._torch.attention.backends.sparse.step5 import Step5CacheManager
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.mapping import Mapping
+
+    mapping = Mapping(world_size=tp_size, rank=0, tp_size=tp_size, enable_attention_dp=attention_dp)
+    model_config = ModelConfig(pretrained_config=_step5_config(), mapping=mapping)
+    slope, fixed = Step5CacheManager.get_cache_size_per_token(
+        model_config,
+        mapping,
+        tokens_per_block=32,
+        kv_cache_config=KvCacheConfig(max_attention_window=_step5_windows()),
+        max_seq_len=STEP5_MAX_SEQ_LEN,
+        max_batch_size=128,
+        max_num_tokens=8192,
+    )
+    bf16_kv_per_token = 2 * kv_heads * 256 * 2
+    assert slope == len(STEP5_FULL_LAYERS) * (bf16_kv_per_token + 1056)
+    assert fixed > 0

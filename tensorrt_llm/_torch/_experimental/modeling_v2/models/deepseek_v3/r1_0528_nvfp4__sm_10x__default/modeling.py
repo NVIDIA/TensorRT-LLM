@@ -73,6 +73,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm impor
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import fused_moe
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
     flashinfer_fused_add_rmsnorm,
@@ -92,7 +93,6 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
-from .ops.moe.fused_moe import fused_moe
 
 # sm_100 (B200, GB200) and sm_103 (B300, GB300): the same kernels, certified on both.
 _SMS = ((10, 0), (10, 3))

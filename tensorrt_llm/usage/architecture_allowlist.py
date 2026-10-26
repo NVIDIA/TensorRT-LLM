@@ -122,6 +122,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "Starcoder2ForCausalLM",
         "Step3p5ForCausalLM",
         "Step3p7ForConditionalGeneration",
+        "Step5ForConditionalGeneration",
         "T5ForConditionalGeneration",
         "WhisperForConditionalGeneration",
     }

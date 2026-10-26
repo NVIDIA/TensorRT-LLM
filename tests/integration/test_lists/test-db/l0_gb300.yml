@@ -19,6 +19,19 @@ l0_gb300:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  # Step-5 model kernels, cache lifecycle and Python NIXL pool transfer.
+  - unittest/_torch/modeling_v2/models/step5 -m "not large"
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_flashinfer_apply_rope_with_cos_sin_cache.py -m "not large"
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_flashinfer_top_k_ragged_transform.py -m "not large"
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_qsa_paged_kv_store.py -m "not large"
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_qsa_paged_kv_store_nvfp4.py -m "not large"
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_qsa_paged_sparse_gqa.py -m "not large"
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_qsa_paged_sparse_gqa_nvfp4.py -m "not large"
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py -m "not large"
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_fused_moe.py -m "not large"
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_cuda_tile_rms_norm.py -m "not large"
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_cuda_tile_rms_norm_fuse_residual.py -m "not large"
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_layer_norm.py -m "not large"
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py

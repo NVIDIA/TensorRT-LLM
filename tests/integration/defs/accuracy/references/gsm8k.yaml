@@ -447,6 +447,29 @@ stepfun-ai/Step-3.7-Flash:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 89.121
+stepfun-ai/Step-5-Preview:
+  # Independent official HF reference, NVFP4 weights/activations and BF16 KV.
+  # HF revision 364b3b03fed2477aa0953fe855a2c4c8c48ee3cc; measured 2026-10-24.
+  # Full GSM8K test split: 1319 requests, 5-shot, greedy, max_new_tokens=256.
+  # Mean of production strict-match (1229/1319) and flexible-extract (1228/1319).
+  # Invalid/length-limited answers remain in the denominator.
+  # Raw samples SHA256: 35c1b8dfd7e249b25fa8c0b165c6320aaab8946aba3eeb5992a824ce085558bd
+  - quant_algo: NVFP4
+    accuracy: 93.13874147081123
+  # Independent official HF reference, same protocol, logical FP8 KV at unit scales.
+  # Mean of production strict-match (1234/1319) and flexible-extract (1233/1319).
+  # Invalid/length-limited answers remain in the denominator.
+  # Raw samples SHA256: 8575777733846e0f6694e1266c31667b22ed7e94adb142fa7996750471a8ae6f
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 93.51781652767248
+  # Independent official HF reference, same protocol, logical NVFP4 KV at unit scales.
+  # Mean of production strict-match (1218/1319) and flexible-extract (1219/1319).
+  # Invalid/length-limited answers remain in the denominator.
+  # Raw samples SHA256: 8a1b9b640a5080e9e25489e4642879c95c04761aae85a0dcea221d33a9c7f680
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: NVFP4
+    accuracy: 92.3805913570887
 bigcode/starcoder2-15b:
   - accuracy: 54.5
 poolside/laguna-XS.2:

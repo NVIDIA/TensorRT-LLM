@@ -1740,7 +1740,7 @@ def _qsa_paged_sparse_gqa_kernel(
         scores = tl.dot(query_values, keys) * softmax_scale * _LOG2_E
         scores = tl.where(valid[None, :], scores, -float("inf"))
         next_max = tl.maximum(running_max, tl.max(scores, axis=1))
-        correction = tl.math.exp2(running_max - next_max)
+        correction = tl.where(next_max == -float("inf"), 1.0, tl.math.exp2(running_max - next_max))
         probabilities = tl.where(
             valid[None, :],
             tl.math.exp2(scores - next_max[:, None]),
@@ -1890,7 +1890,7 @@ def _qsa_paged_sparse_gqa_splitk_kernel(
         scores *= softmax_scale * _LOG2_E
         scores = tl.where(valid[None, :], scores, -float("inf"))
         next_max = tl.maximum(running_max, tl.max(scores, axis=1))
-        correction = tl.math.exp2(running_max - next_max)
+        correction = tl.where(next_max == -float("inf"), 1.0, tl.math.exp2(running_max - next_max))
         probabilities = tl.where(
             valid[None, :],
             tl.math.exp2(scores - next_max[:, None]),

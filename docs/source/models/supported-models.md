@@ -54,6 +54,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen4ExpForCausalLM`                | Qwen3.8-Flash-Next (text)          | `Qwen/Qwen3.8-Flash-Next`                    |
 | `Qwen4ExpForConditionalGeneration`   | Qwen3.8-Flash-Next                 | `Qwen/Qwen3.8-Flash-Next`                    |
 | `Step3p7ForConditionalGeneration` [^8]| Step-3.7-Flash                    | `stepfun-ai/Step-3.7-Flash`                  |
+| `Step5ForConditionalGeneration` | Step-5-Preview (experimental modeling_v2, SM103, NVFP4) | `stepfun-ai/Step-5-Preview` |
 | `T5ForConditionalGeneration`         | T5, Flan-T5, ByT5                  | `google/flan-t5-small`                       |
 | `WhisperForConditionalGeneration`    | Whisper                            | `openai/whisper-large-v3`                    |
 
@@ -292,3 +293,5 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Qwen-Image-Layered** [^vg2] | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+
+For the experimental Step-5-Preview target, see the [Step-5 example](source:examples/models/core/step5/README.md) for parallel layouts, cache formats, image input, and validation limits.

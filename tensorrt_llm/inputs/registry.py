@@ -897,6 +897,11 @@ class MultimodalPlaceholderRegistry:
             MULTIMODAL_MODEL_TYPE_TO_MODULE
         module_name = MULTIMODAL_MODEL_TYPE_TO_MODULE.get(model_type)
         if module_name is None:
+            for architecture, (
+                    v2_model_type,
+                    _) in MODELING_V2_INPUT_PROCESSOR_MODULES.items():
+                if v2_model_type == model_type:
+                    _import_modeling_v2_input_processor(architecture)
             return
         full_name = f"tensorrt_llm._torch.models.{module_name}"
         try:
@@ -921,6 +926,8 @@ class MultimodalPlaceholderRegistry:
             MULTIMODAL_MODEL_TYPE_TO_MODULE
         for model_type in MULTIMODAL_MODEL_TYPE_TO_MODULE:
             self._ensure_provider_imported(model_type)
+        for architecture in MODELING_V2_INPUT_PROCESSOR_MODULES:
+            _import_modeling_v2_input_processor(architecture)
 
     def remove_placeholder_metadata(self, model_type: str):
         self._ensure_provider_imported(model_type)
@@ -1026,9 +1033,73 @@ class InputProcessorRegistry:
     def __init__(self) -> None:
         self._input_processors_cls_by_model_type: Dict[
             Type[nn.Module], Type[InputProcessor]] = {}
+        # Keyed by ``architectures[0]`` for architectures no built-in model
+        # class serves, so the model-class key above has nothing to key on.
+        self._input_processors_cls_by_architecture: Dict[
+            str, Type[InputProcessor]] = {}
 
 
 INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
+
+#: Input processors of architectures only a modeling_v2 target serves:
+#: ``architectures[0]`` -> (``model_type``, module). The built-in zoo has no
+#: model class for these, so ``get_model_architecture`` raises for them and
+#: ``create_input_processor`` looks here instead. Importing the module runs its
+#: ``register_architecture_input_processor`` call, which registers the
+#: processor and the model type's placeholder metadata.
+MODELING_V2_INPUT_PROCESSOR_MODULES: Dict[str, Tuple[str, str]] = {
+    "Step5ForConditionalGeneration":
+    ("step5_vl", "tensorrt_llm._torch._experimental.modeling_v2.models.step5."
+     "step5_preview_nvfp4__sm_103__unified.input_processor"),
+}
+
+
+def register_architecture_input_processor(
+        architecture: str, processor_cls: Type[InputProcessor], model_type: str,
+        placeholder_metadata: MultimodalPlaceholderMetadata) -> None:
+    """Register ``processor_cls`` for ``architecture``, which has no model class.
+
+    The counterpart of ``register_input_processor`` for a processor that a
+    modeling_v2 target's architecture needs: the target is built by its
+    routing module rather than registered in the model zoo.
+    """
+    if placeholder_metadata is None:
+        raise ValueError(
+            f"A valid placeholder_metadata must be provided for {architecture}")
+    INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_architecture[
+        architecture] = processor_cls
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        model_type,
+        placeholder_metadata,
+        registrant_module=processor_cls.__module__)
+    processor_cls._registered_model_type = model_type
+
+
+def _import_modeling_v2_input_processor(architecture: str) -> None:
+    """Import the module that registers ``architecture``'s input processor."""
+    entry = MODELING_V2_INPUT_PROCESSOR_MODULES.get(architecture)
+    if (entry is None or architecture
+            in INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_architecture):
+        return
+    full_name = entry[1]
+    try:
+        importlib.import_module(full_name)
+    except ModuleNotFoundError as e:
+        # Swallow only "the module (or a package on its path) is missing"; a
+        # missing dependency inside it is a real error.
+        if e.name is None or not (full_name == e.name
+                                  or full_name.startswith(e.name + ".")):
+            raise
+        logger.warning(f"Import of the {architecture} input processor "
+                       f"{full_name} failed: {e!r}")
+
+
+def get_architecture_input_processor(
+        architecture: str) -> Optional[Type[InputProcessor]]:
+    """The input processor registered for ``architecture`` by name, or None."""
+    _import_modeling_v2_input_processor(architecture)
+    return INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_architecture.get(
+        architecture)
 
 
 def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
@@ -1162,9 +1233,12 @@ def create_input_processor(
             model_cls, _ = get_model_architecture(config)
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
-        except RuntimeError:  # unregistered model
-            logger.info("Unregistered model, using DefaultInputProcessor")
-            input_processor_cls = None
+        except RuntimeError:  # no built-in model class
+            architectures = getattr(config, "architectures", None) or [None]
+            input_processor_cls = get_architecture_input_processor(
+                architectures[0])
+            if input_processor_cls is None:
+                logger.info("Unregistered model, using DefaultInputProcessor")
         if input_processor_cls is not None:
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):

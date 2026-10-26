@@ -15,11 +15,13 @@
 
 import contextlib
 import importlib
+import json
 import os
 import pickle  # nosec B403
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from tokenizers import Tokenizer as TokenizerBackend
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 
@@ -81,25 +83,27 @@ def _reconstruct_transformers_tokenizer(inner_bytes: bytes):
     return TransformersTokenizer(pickle.loads(inner_bytes))  # nosec B301
 
 
-def _tokenizer_json_uses_byte_level(pretrained_model_dir: str) -> bool:
-    """Return True if tokenizer.json declares a ByteLevel pre-tokenizer."""
-    import json
+def _load_byte_level_tokenizer_json(
+        pretrained_model_dir: str) -> Optional[Dict[str, Any]]:
+    """Read the serialized backend when it declares ByteLevel pre-tokenization."""
     tj_path = os.path.join(pretrained_model_dir, "tokenizer.json")
     if not os.path.isfile(tj_path):
-        return False
+        return None
     try:
         with open(tj_path) as f:
             tj = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return False
+        return None
     pt = tj.get("pre_tokenizer") or {}
-    if pt.get("type") == "ByteLevel":
-        return True
-    if pt.get("type") == "Sequence":
-        return any(
+    uses_byte_level = pt.get("type") == "ByteLevel" or (
+        pt.get("type") == "Sequence" and any(
             sub.get("type") == "ByteLevel"
-            for sub in pt.get("pretokenizers", []))
-    return False
+            for sub in pt.get("pretokenizers", [])))
+    if not uses_byte_level:
+        return None
+    # Normalize optional defaults and older merge-list encodings before
+    # comparing with the loaded backend's serialization.
+    return json.loads(TokenizerBackend.from_str(json.dumps(tj)).to_str())
 
 
 # Keys forwarded from tokenizer_config.json to PreTrainedTokenizerFast when
@@ -168,7 +172,7 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
                                    **kwargs):
     """Work around Transformers 5.x LlamaTokenizer overriding tokenizer.json.
 
-    Some model repos (e.g. DeepSeek-V3) declare ``tokenizer_class:
+    Some model repos (e.g. DeepSeek-V3 and Step5) declare ``tokenizer_class:
     LlamaTokenizer`` in tokenizer_config.json but ship a ByteLevel BPE
     tokenizer.json.  In Transformers 5.x, LlamaTokenizer forces a Metaspace
     pre-tokenizer during __init__, silently replacing the ByteLevel one from
@@ -176,24 +180,29 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
     (e.g. "hello world" tokenizes to "helloworld"), causing catastrophic
     accuracy drops.
 
-    Detect this mismatch and reload through PreTrainedTokenizerFast, which
-    respects tokenizer.json verbatim.
+    A decoder override can also expose byte-level markers in generated text
+    even when the pre-tokenizer is intact. Check the serialized model,
+    normalizer, pre-tokenizer and decoder, then reload the complete tokenizer
+    through PreTrainedTokenizerFast, including special tokens and chat template.
     """
     if not os.path.isdir(pretrained_model_dir):
         return tokenizer
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is None:
         return tokenizer
-    pre_tok = getattr(backend, "pre_tokenizer", None)
-    if pre_tok is None:
+    serialized = _load_byte_level_tokenizer_json(pretrained_model_dir)
+    if serialized is None:
         return tokenizer
-    if type(pre_tok).__name__ != "Metaspace":
-        return tokenizer
-    if not _tokenizer_json_uses_byte_level(pretrained_model_dir):
+    loaded = json.loads(backend.to_str())
+    changed = [
+        key for key in ("model", "normalizer", "pre_tokenizer", "decoder")
+        if loaded.get(key) != serialized.get(key)
+    ]
+    if not changed:
         return tokenizer
     logger.warning(
-        f"Tokenizer at {pretrained_model_dir} loaded with Metaspace "
-        "pre-tokenizer but tokenizer.json declares ByteLevel. "
+        f"Tokenizer at {pretrained_model_dir} changed {', '.join(changed)} "
+        "from the serialized ByteLevel tokenizer.json. "
         "Reloading via PreTrainedTokenizerFast to respect tokenizer.json.")
     fast_kwargs = {
         k: v

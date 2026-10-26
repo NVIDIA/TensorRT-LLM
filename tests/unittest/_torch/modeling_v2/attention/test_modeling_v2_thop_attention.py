@@ -194,6 +194,20 @@ exercised:
    scales in a second pool, unit fp32 [3] second-level scales, bf16 output):
    the pool and its block scales bitwise as the append writes them, and the
    output against `reference` over the NVFP4 values (the cells).
+15. Step-5-Preview: heads zero-padded 192 -> 256 with q_scaling sqrt(192/256)
+   under a 512-key window, at 64q/4kv (attention DP) and 16q/1kv (TP4) over
+   bf16, fp8 and NVFP4 pools on the paged-context path, histories to 9215
+   tokens in a 288-column block table; one decode cell per generation kernel
+   the launch picks between 1 and 128 requests. Beside the cells: the pad
+   columns of the output are exact zeros, and the q_scaling-ignored and
+   window-ignored rivals land far outside the band, and so does ignoring
+   the pool's quantization. Over fp8 and NVFP4 pools the reference rounds
+   the probabilities as each kernel tiles them (`ProbabilityTiling`). The
+   history is written into the pool directly, bitwise as the append writes
+   it; the certified call's own append is checked bitwise, and that no other
+   pool row moved. The vision tower: MHA
+   16/16 with heads 96 padded to 128 and q_scaling sqrt(96/128) over 2704-
+   and 1296-row frames.
 The cells at the end drive the entry's own `reference` and `_compare` over the
 configurations the targets run.
 """
@@ -209,6 +223,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     MLA_CONTEXT,
     STANDARD,
+    ProbabilityTiling,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention as op,
@@ -397,6 +412,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     models it instead. Measured on sm_103: the qwen4_exp, encoder and fp8
     context cells use at most 0.25 of the element gate and 0.16 of the RMS
     one; the fp8 200-token decode, whose KV range spans tiles, 0.58 of both.
+    The Step-5 cells, whose fp8 and NVFP4 references follow each kernel's
+    `ProbabilityTiling`, at most 0.65 (an fp8 8192-row prompt) and 0.20 over
+    four seeds.
     """
     assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
@@ -5582,10 +5600,12 @@ def _packed_reference(
     num_kv_heads: int,
     head_dim: int,
     causal: bool,
+    q_scaling: float = 1.0,
 ) -> torch.Tensor:
     """`op.reference` over each segment's own packed rows and nothing else:
     what the no-KV-cache mode computes, and the rival a cached-prefix call
-    must be separated from (its prefix ignored)."""
+    must be separated from (its prefix ignored). The softmax scale is
+    `1 / (q_scaling * sqrt(head_dim))`, as the op forms it."""
     q_w, kv_w = num_heads * head_dim, num_kv_heads * head_dim
     return op.reference(
         qkv[:, :q_w],
@@ -5597,7 +5617,7 @@ def _packed_reference(
         num_kv_heads=num_kv_heads,
         qk_head_dim=head_dim,
         v_head_dim=head_dim,
-        softmax_scale=1.0 / math.sqrt(head_dim),
+        softmax_scale=1.0 / (q_scaling * math.sqrt(head_dim)),
         causal=causal,
     )
 
@@ -6977,6 +6997,344 @@ def test_encoder_no_kv_cache_boundaries() -> None:
     )
 
 
+# ─── Step-5-Preview: padded heads, q_scaling and a 512-key window ───────
+#
+# The sliding-window layers run heads zero-padded 192 -> 256 with q_scaling
+# sqrt(192/256) under a 512-key window; the vision tower 96 -> 128 with
+# sqrt(96/128) and no KV cache. The cells drive both against `reference`;
+# what is here is what a cell does not carry: the rivals the band has to
+# separate (q_scaling left at 1, the window dropped) and the shared plumbing.
+
+
+def _zero_head_pad(qkv: torch.Tensor, head_size: int, real_head_dim: int) -> None:
+    """Zero columns `[real_head_dim, head_size)` of every head of a packed
+    `[T, heads * head_size]` buffer, in place: what a caller padding narrower
+    heads to a kernel's width passes."""
+    if real_head_dim < head_size:
+        qkv.view(qkv.shape[0], -1, head_size)[:, :, real_head_dim:] = 0
+
+
+def _assert_pad_columns_zero(
+    out: torch.Tensor, num_heads: int, head_size: int, real_head_dim: int
+) -> None:
+    """A zero-padded V contributes exact zeros to every pad column of every
+    head, whatever the softmax weights: the caller's slice back to
+    `real_head_dim` drops nothing."""
+    pad = out.view(out.shape[0], num_heads, head_size)[:, :, real_head_dim:]
+    assert bool((pad == 0).all()), f"pad columns carry up to {pad.float().abs().max().item():.4g}"
+
+
+def _pool_image(env: _PagedAttnEnv, x: torch.Tensor, role: int):
+    """`[n, Hkv, D]` bf16 K or V -> (data `[n, Hkv, D']`, scales `[n, Hkv, D/16]`
+    or None): the bytes the op's append leaves in the pool for them."""
+    if not env.nvfp4:
+        return env.expected_cache(x), None
+    n, hkv, d = x.shape
+    packed, scales = _nvfp4_quantize(x.reshape(n * hkv, d), env.kv_scale_orig_quant[1 + role])
+    return packed.view(n, hkv, d // 2), scales.view(n, hkv, d // NVFP4_BLOCK)
+
+
+def _pool_slots(env: _PagedAttnEnv, rid: int, start: int, stop: int):
+    """(page, slot) of tokens `[start, stop)` of one request, as index tensors."""
+    tpb = env.tokens_per_block
+    t = torch.arange(start, stop, device="cuda")
+    pages = torch.tensor(env.pages[rid], dtype=torch.long, device="cuda")[t // tpb]
+    return pages, t % tpb
+
+
+def _v_scale_columns(env: _PagedAttnEnv, slots: torch.Tensor) -> torch.Tensor:
+    """`[n, D/16]` positions in a head page's flat V-scale plane: V's block
+    scales are stored in four-token groups `[tpb/4, D/16, 4]`."""
+    groups = env.head_dim // NVFP4_BLOCK
+    g = torch.arange(groups, device="cuda") * 4
+    return ((slots // 4) * groups * 4 + slots % 4).unsqueeze(1) + g
+
+
+def _write_pool(env: _PagedAttnEnv, rid: int, start: int, k: torch.Tensor, v: torch.Tensor):
+    """Put tokens `[start, start + n)` of one request into its pages, bitwise
+    as the op's append writes them (the cells' append checks pin that), and
+    into the env's history mirror."""
+    pages, slots = _pool_slots(env, rid, start, start + k.shape[0])
+    for role, x in ((0, k), (1, v)):
+        data, scales = _pool_image(env, x, role)
+        env.kv_cache[pages, role, :, slots, :] = data
+        if scales is None:
+            continue
+        if role == 0:
+            env.kv_block_scales[pages, 0, :, slots, :] = scales
+        else:
+            flat = env.kv_block_scales.view(*env.kv_block_scales.shape[:3], -1)
+            flat[pages.unsqueeze(1), 1, :, _v_scale_columns(env, slots)] = scales.permute(0, 2, 1)
+    env.k_history[rid].append(k)
+    env.v_history[rid].append(v)
+
+
+def _check_pool_rows(env: _PagedAttnEnv, rid: int, start: int, stop: int) -> None:
+    """Tokens `[start, stop)` of one request sit at their absolute positions,
+    bitwise as the append writes them (data, and an NVFP4 pool's block scales)."""
+    pages, slots = _pool_slots(env, rid, start, stop)
+    k, v = _history(env, rid)
+    for role, x in ((0, k[start:stop]), (1, v[start:stop])):
+        data, scales = _pool_image(env, x, role)
+        got = env.kv_cache[pages, role, :, slots, :]
+        assert _bitwise_equal(got, data), f"request {rid} role {role}: tokens {start}..{stop}"
+        if scales is None:
+            continue
+        if role == 0:
+            got_sf = env.kv_block_scales[pages, 0, :, slots, :]
+        else:
+            flat = env.kv_block_scales.view(*env.kv_block_scales.shape[:3], -1)
+            got_sf = flat[pages.unsqueeze(1), 1, :, _v_scale_columns(env, slots)].permute(0, 2, 1)
+        assert _bitwise_equal(got_sf, scales), f"request {rid} role {role}: block scales"
+
+
+def _run_step5(spec: Dict, seed: int):
+    """One Step-5 sliding-layer call over a freshly built pool.
+
+    Pages are handed out in a shuffled order, every history is written at its
+    absolute positions (all of it, as an engine that keeps pages for block
+    reuse holds it; the block table has the 288 columns max_seq_len 9216
+    gives), and the call appends this step's rows and attends. Returns
+    `(env, qkv, out, before)`, `before` the pool as it stood before the call.
+    """
+    torch.manual_seed(seed)
+    cached, new, nc = list(spec["cached"]), list(spec["new"]), spec["num_contexts"]
+    hkv, d, real = spec["num_kv_heads"], spec["head_size"], spec["real_head_dim"]
+    tpb = spec["tokens_per_block"]
+    fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
+    nvfp4 = bool(spec["quant_mode"] & QUANT_MODE_NVFP4_KV_CACHE)
+    env = _PagedAttnEnv(
+        num_heads=spec["num_heads"],
+        num_kv_heads=hkv,
+        head_dim=d,
+        tokens_per_block=tpb,
+        num_blocks=spec["num_blocks"],
+        max_batch=spec["max_num_requests"],
+        max_blocks_per_seq=spec["max_seq_len"] // tpb,
+        pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
+        quant_mode=spec["quant_mode"],
+        kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
+        attention_window_size=spec["window"],
+    )
+    assert spec["predicted_tokens_per_seq"] == 1 and all(n == 1 for n in new[nc:])
+    rids = list(range(len(new)))
+    free = torch.randperm(spec["num_blocks"], generator=torch.Generator().manual_seed(seed))
+    free = free.tolist()
+    for rid in rids:
+        env.add_request(rid, cached[rid] + (new[rid] if rid < nc else 0))
+        need = -(-(cached[rid] + new[rid]) // tpb)
+        env.pages[rid], free = free[:need], free[need:]
+        if cached[rid]:
+            kv = torch.randn(2, cached[rid], hkv * d, dtype=torch.bfloat16, device="cuda")
+            _zero_head_pad(kv[0], d, real)
+            _zero_head_pad(kv[1], d, real)
+            _write_pool(env, rid, 0, kv[0].view(-1, hkv, d), kv[1].view(-1, hkv, d))
+    assert len(free) >= 1, "the pool keeps spare pages beyond what the cell occupies"
+    qkv = env.random_qkv(sum(new))
+    _zero_head_pad(qkv, d, real)
+    before = env.kv_cache.clone()
+    out = env.call_op(
+        qkv,
+        new,
+        nc,
+        rids,
+        spec["mask_type"],
+        ctx_lens_override=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
+        use_paged_context_fmha=spec["use_paged_context_fmha"],
+        predicted_tokens_per_seq=1,
+        op_overrides=dict(q_scaling=spec["q_scaling"]),
+    )
+    return env, qkv, out, before
+
+
+# A history suffix handed to `reference` starts on a multiple of this many keys,
+# so the probability tiles keep the boundaries they have in the whole history.
+STEP5_SUFFIX_ALIGN = 1024
+
+
+def _step5_reference(
+    env: _PagedAttnEnv,
+    qkv: torch.Tensor,
+    spec: Dict,
+    q_scaling: Optional[float] = None,
+    window: Optional[int] = -1,
+    quantized: bool = True,
+) -> torch.Tensor:
+    """`op.reference` over the history the env mirrored, at the cell's
+    q_scaling and window unless overridden (`window=None` is the rival with
+    the window dropped). Keys before the earliest one any of the call's rows
+    can keep are left out, which changes no row: the window masks them.
+    Over an fp8 or NVFP4 pool every operand is e4m3, an NVFP4 pool's K/V are
+    first the values it returns, and the probabilities are rounded by the
+    cell's `p_tiling` -- in a mixed step the generation rows by its
+    `p_tiling_gen`, the kernel they run on; `quantized=False` is the rival
+    that drops all of that."""
+    nc, new = spec["num_contexts"], list(spec["new"])
+    parts = [(0, len(new), "p_tiling")]
+    if "p_tiling_gen" in spec:
+        parts = [(0, nc, "p_tiling"), (nc, len(new), "p_tiling_gen")]
+    outs = []
+    for first_seq, last_seq, tiling_key in parts:
+        rows = slice(sum(new[:first_seq]), sum(new[:last_seq]))
+        outs.append(
+            _step5_reference_part(
+                env,
+                qkv[rows],
+                spec,
+                range(first_seq, last_seq),
+                tiling_key,
+                spec["q_scaling"] if q_scaling is None else q_scaling,
+                spec["window"] if window == -1 else window,
+                quantized,
+            )
+        )
+    return torch.cat(outs)
+
+
+def _step5_reference_part(
+    env: _PagedAttnEnv,
+    qkv: torch.Tensor,
+    spec: Dict,
+    rids: range,
+    tiling_key: str,
+    q_scaling: float,
+    window: Optional[int],
+    quantized: bool,
+) -> torch.Tensor:
+    """`_step5_reference` for the requests `rids`, whose q rows `qkv` holds."""
+    hq, hkv, d = spec["num_heads"], spec["num_kv_heads"], spec["head_size"]
+    nvfp4 = quantized and bool(spec["quant_mode"] & QUANT_MODE_NVFP4_KV_CACHE)
+    e4m3 = quantized and bool(
+        spec["quant_mode"] & (QUANT_MODE_FP8_KV_CACHE | QUANT_MODE_NVFP4_KV_CACHE)
+    )
+    tiling = ProbabilityTiling(*spec[tiling_key]) if e4m3 else None
+    new = [spec["new"][rid] for rid in rids]
+    ks, vs = [], []
+    for rid, n in zip(rids, new):
+        k, v = _history(env, rid)
+        first = 0 if window is None else max(0, k.shape[0] - n - window + 1)
+        first -= first % STEP5_SUFFIX_ALIGN
+        k, v = k[first:], v[first:]
+        if nvfp4:
+            k = _nvfp4_roundtrip(k, env.kv_scale_orig_quant[1])
+            v = _nvfp4_roundtrip(v, env.kv_scale_orig_quant[2])
+        ks.append(k)
+        vs.append(v)
+    return op.reference(
+        qkv[:, : hq * d],
+        torch.cat(ks).reshape(-1, hkv * d),
+        torch.cat(vs).reshape(-1, hkv * d),
+        new,
+        [k.shape[0] for k in ks],
+        num_heads=hq,
+        num_kv_heads=hkv,
+        qk_head_dim=d,
+        v_head_dim=d,
+        softmax_scale=1.0 / (q_scaling * math.sqrt(d)),
+        causal=spec["mask_type"] == MASK_CAUSAL,
+        window=window,
+        e4m3_inputs=e4m3,
+        e4m3_probabilities=e4m3,
+        e4m3_probability_tiling=tiling,
+    )
+
+
+def _check_step5_pool(env: _PagedAttnEnv, before: torch.Tensor, spec: Dict) -> None:
+    """The call wrote exactly this step's rows, at their absolute positions,
+    bitwise as the append writes them, and no other pool slot moved."""
+    cached, new = spec["cached"], spec["new"]
+    expected = torch.zeros(env.kv_cache.shape[:2] + (env.tokens_per_block,), dtype=torch.bool)
+    expected = expected.cuda()
+    for rid, (c, n) in enumerate(zip(cached, new)):
+        _check_pool_rows(env, rid, c, c + n)
+        pages, slots = _pool_slots(env, rid, c, c + n)
+        expected[pages, :, slots] = True
+    moved = before.view(torch.uint8) != env.kv_cache.view(torch.uint8)
+    moved = moved.any(-1).any(2)
+    assert torch.equal(moved, expected), (
+        f"the call moved {int(moved.sum())} (page, role, slot) rows, "
+        f"{int((moved & ~expected).sum())} of them outside this step's appends"
+    )
+
+
+def _cell_step5(cell, arm) -> None:
+    """A Step-5-Preview sliding-layer cell: `_run_step5`, gated against
+    `op.reference` at the cell's q_scaling and window; then the pad columns
+    and the pool."""
+    spec = cell.spec
+    arm(op)
+    env, qkv, out, before = _run_step5(spec, zlib.crc32(cell.why.encode()))
+    _compare(out, _step5_reference(env, qkv, spec))
+    _assert_pad_columns_zero(out, spec["num_heads"], spec["head_size"], spec["real_head_dim"])
+    _check_step5_pool(env, before, spec)
+
+
+def _element_gate_multiple(out: torch.Tensor, ref: torch.Tensor) -> float:
+    """How many times `_compare`'s 8-ulp element gate the largest row-scaled
+    error is: above 1.0 `_compare` fails, by that factor."""
+    o, r = out.float().reshape(-1, out.shape[-1]), ref.float().reshape(-1, ref.shape[-1])
+    scale = r.abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
+    return float(((o - r).abs() / scale).max()) / (8.0 * ULP[torch.bfloat16])
+
+
+# A rival model has to sit this many element gates away from the op's output.
+STEP5_MIN_SEPARATION = 3.0
+
+
+def _step5_cell_spec(why_prefix: str) -> Dict:
+    (cell,) = [c for c in op.CELLS if c.why.startswith(why_prefix)]
+    return cell.spec
+
+
+def test_step5_sliding_rivals() -> None:
+    """What the Step-5 cells' band separates, at the calls a sliding layer
+    makes most: a 512-row chunk over a 1024-token prefix (attention DP, bf16
+    and fp8 pools) and decodes over histories to 9215 (TP4, bf16 at one
+    request and NVFP4 at 128).
+
+    q_scaling left at 1.0 (softmax scale 1/16, the padded width's, instead of
+    192^-0.5), the window dropped (every row attending its whole history) and,
+    over a quantized pool, the quantization ignored (bf16 operands, fp32
+    probabilities) must each land outside the band by `STEP5_MIN_SEPARATION`.
+    """
+    for prefix in (
+        "step5 dp64/4 bf16 chunk 512 over 1024",
+        "step5 tp16/1 bf16 decode b=1 to",
+        "step5 dp64/4 fp8 chunk 512 over 1024",
+        "step5 tp16/1 nvfp4 decode b=128 to 9215",
+    ):
+        spec = _step5_cell_spec(prefix)
+        env, qkv, out, _ = _run_step5(spec, seed=1301)
+        _compare(out, _step5_reference(env, qkv, spec))
+        rivals = [
+            ("q_scaling 1.0", _step5_reference(env, qkv, spec, q_scaling=1.0)),
+            ("no window", _step5_reference(env, qkv, spec, window=None)),
+        ]
+        if spec["quant_mode"]:
+            rivals.append(("unquantized", _step5_reference(env, qkv, spec, quantized=False)))
+        for label, rival in rivals:
+            gap = _element_gate_multiple(out, rival)
+            print(f"{prefix}: {label} rival at {gap:.1f}x the element gate")
+            assert gap > STEP5_MIN_SEPARATION, f"{prefix}: the {label} rival is only {gap:.3g}x out"
+
+
+def test_step5_vision_q_scaling_rival() -> None:
+    """The vision call at d96 padded to 128: q_scaling left at 1.0 (softmax
+    scale 128^-0.5 instead of 96^-0.5) must land outside the band."""
+    torch.manual_seed(1302)
+    seg_lens = [1296, 2704]
+    qkv = torch.randn(sum(seg_lens), 48 * 128, dtype=torch.bfloat16, device="cuda")
+    _zero_head_pad(qkv, 128, 96)
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    q_scaling = math.sqrt(96 / 128)
+    out = _encoder_call(qkv, seg_lens, 16, 16, 128, MASK_PADDING, workspace, q_scaling=q_scaling)
+    _compare(out, _packed_reference(qkv, seg_lens, 16, 16, 128, False, q_scaling=q_scaling))
+    rival = _packed_reference(qkv, seg_lens, 16, 16, 128, False)
+    gap = _element_gate_multiple(out, rival)
+    print(f"vision: q_scaling 1.0 rival at {gap:.1f}x the element gate")
+    assert gap > STEP5_MIN_SEPARATION, f"the q_scaling 1.0 rival is only {gap:.3g}x out"
+
+
 # ─── The entry's own cell list ──────────────────────────────────────────
 
 
@@ -7249,17 +7607,26 @@ def _cell_layered(cell, arm) -> None:
 
 def _cell_encoder(cell, arm) -> None:
     """The no-KV-cache mode: one context sequence per frame, no cache
-    addressing, gated against `op.reference` over each frame's own rows."""
+    addressing, gated against `op.reference` over each frame's own rows.
+
+    A cell with `real_head_dim` runs heads zero-padded from that width to
+    `head_size`, as a tower whose head width has no kernel passes them, with
+    the cell's `q_scaling`; the pad columns of the output must come back
+    exact zeros."""
     spec = cell.spec
     arm(op)
     _seed(cell)
     seg_lens = list(spec["seg_lens"])
     h, hkv, d = spec["num_heads"], spec["num_kv_heads"], spec["head_size"]
+    real = spec.get("real_head_dim", d)
+    q_scaling = spec.get("q_scaling", 1.0)
     qkv = torch.randn(sum(seg_lens), (h + 2 * hkv) * d, dtype=torch.bfloat16, device="cuda")
+    _zero_head_pad(qkv, d, real)
     workspace = torch.empty(0, dtype=torch.int8, device="cuda")
-    out = _encoder_call(qkv, seg_lens, h, hkv, d, spec["mask_type"], workspace)
+    out = _encoder_call(qkv, seg_lens, h, hkv, d, spec["mask_type"], workspace, q_scaling=q_scaling)
     causal = spec["mask_type"] == MASK_CAUSAL
-    _compare(out, _packed_reference(qkv, seg_lens, h, hkv, d, causal=causal))
+    _compare(out, _packed_reference(qkv, seg_lens, h, hkv, d, causal=causal, q_scaling=q_scaling))
+    _assert_pad_columns_zero(out, h, d, real)
     del qkv, out
     torch.cuda.empty_cache()
 
@@ -7282,6 +7649,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     kind = spec["input_type"]
     if spec.get("kv_cache") == "none":
         _cell_encoder(cell, certifying)
+    elif "real_head_dim" in spec:
+        _cell_step5(cell, certifying)
     elif "pool_layout" in spec:
         _cell_layered(cell, certifying)
     elif "cached" in spec:

@@ -43,10 +43,20 @@ class Reducescatter(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # deepseek-r1 at dep4 and the gpt-oss default target under attention DP
-    # are the callers, and both always pass `sizes=None`: each pads to a
-    # common height first. The row counts are the full heights an
-    # attention-DP step reduces, which is the rank count times a slice.
+    # The first three cells: deepseek-r1 at dep4 and the gpt-oss default target
+    # under attention DP, which both pad every rank to a common height and pass
+    # `sizes=None`. The row counts are the full heights an attention-DP step
+    # reduces, which is the rank count times a slice. They carry no `world` key
+    # and run at world 4.
+    #
+    # After them, Step-5-Preview's attention-DP reduce-scatter of the routed
+    # expert output (hidden 4096) back to each rank's rows, at dep4 and at the
+    # disaggregated dep2 world, in bf16 and fp32. `rows_per_rank` is the slice
+    # each rank keeps under `sizes=None`; a ragged cell passes `sizes`, one row
+    # count per rank, the unpadded form where each rank keeps only its own
+    # requests' rows. Per rank a call sees one decode token, the 128-request
+    # decode batch (`max_batch_size`) or one 8192-token prefill chunk
+    # (`max_num_tokens`, the envelope's largest row count).
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank after the split, hidden 7168",
@@ -60,13 +70,95 @@ class Reducescatter(OpWrapper):
             why="prefill chunk height",
             spec=dict(rows_per_rank=2048, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
         ),
+        Cell(
+            why="step5 dep4 decode: one row per rank, bf16",
+            spec=dict(world=4, rows_per_rank=1, trailing=(4096,), dtype=torch.bfloat16, sizes=None),
+        ),
+        Cell(
+            why="step5 dep4 padded decode batch, 128 rows per rank, bf16",
+            spec=dict(
+                world=4, rows_per_rank=128, trailing=(4096,), dtype=torch.bfloat16, sizes=None
+            ),
+        ),
+        Cell(
+            why="step5 dep4 prefill chunk, 8192 rows per rank, bf16",
+            spec=dict(
+                world=4, rows_per_rank=8192, trailing=(4096,), dtype=torch.bfloat16, sizes=None
+            ),
+        ),
+        Cell(
+            why="step5 dep4 ragged decode [128, 1, 37, 64], fp32",
+            spec=dict(
+                world=4,
+                rows_per_rank=None,
+                trailing=(4096,),
+                dtype=torch.float32,
+                sizes=[128, 1, 37, 64],
+            ),
+        ),
+        Cell(
+            why="step5 dep4 prefill chunk 8192 per rank, fp32 (envelope max)",
+            spec=dict(
+                world=4, rows_per_rank=8192, trailing=(4096,), dtype=torch.float32, sizes=None
+            ),
+        ),
+        Cell(
+            why="step5 dep2 padded decode batch, 128 rows per rank, fp32",
+            spec=dict(
+                world=2, rows_per_rank=128, trailing=(4096,), dtype=torch.float32, sizes=None
+            ),
+        ),
+        Cell(
+            why="step5 dep2 ragged prefill against decode [8192, 17], bf16",
+            spec=dict(
+                world=2,
+                rows_per_rank=None,
+                trailing=(4096,),
+                dtype=torch.bfloat16,
+                sizes=[8192, 17],
+            ),
+        ),
     )
 
     note = """
-    The ragged form and dtypes other than bf16 work and are exercised by the op
-    matrix, but no shipped target reaches them, so they are not cells. CUDA
-    graph behaviour is carried by the matrix's own named checks rather than as
-    a cell axis.
+    Every cell is driven through both symbols `__call__` routes to: the MPI-session
+    `reducescatter` (`process_group=None`, ranks started by mpirun, the symbol a
+    serving world launched under MPI calls) and `reducescatter_pg` (a boxed c10d
+    group, MPI disabled), each at the cell's world size. A cell without `world`
+    is a world-4 cell. deepseek-r1 and gpt-oss always pass `sizes=None`; the
+    ragged form is a cell only at Step-5's unpadded attention-DP step. fp16 and
+    the integer dtypes work and are exercised by the op matrix at hidden 2560,
+    but no target's call site reaches them. CUDA graph behaviour is carried by
+    the matrix's own named checks rather than as a cell axis.
+
+    Numerics, on standard-normal payloads at hidden 4096 and 1, 128 and 8192
+    rows per rank, bf16 and fp32, both symbols, worlds 2 and 4: the result is
+    deterministic and bitwise equal to a sequential sum in the input dtype, in
+    ring order starting at the destination's successor. At world 2 that is one
+    rounded add, the correctly rounded sum. At world 4 it is not (the matrix
+    asserts more than 5% of bf16 elements differ from an fp32 sum rounded once,
+    at hidden 2560). The error stays inside
+    `(world-1) * u * sum|x|` (u = 2^-8 bf16, 2^-24 fp32); the worst measured
+    ratio is 0.9419 for bf16 and 0.9139 for fp32 at world 4.
+
+    The MPI symbol builds its NCCL communicator for a rank set on that set's
+    first call, so that first call must be eager (a serving engine's warm-up
+    forward is that call); the `_pg` symbol's communicator exists from
+    `init_process_group` and its first call captures directly. Under CUDA graphs
+    a captured call holds the `sizes` it was captured with, so a captured step
+    passes padded (uniform) rows. Step-5's decode graphs are driven as captured:
+    19 batch sizes [1, 2, 4, 8, 16, ..., 128] with 88 reduce-scatters each
+    (one per MoE layer) in one pool, replayed shuffled and in bursts.
+
+    ARCHS: the three deepseek/gpt-oss cells were driven on sm_100 and sm_103.
+    The Step-5 cells (`step5 ...`, worlds 2 and 4, both symbols) were driven on
+    sm_103 only and are not certified on sm_100 until they run there.
+
+    Not certified here: rows per rank above 128 under capture at hidden 4096
+    (the dep4 tune list reaches 256), and fp16 or integer dtypes at hidden 4096.
+
+    Hard limits: the op's element count crosses 2^31 at 524288 total rows of
+    hidden 4096 (2^31 / 4096), 16x the envelope's 32768 (4 x 8192). Not probed.
     """
 
     def __call__(
@@ -76,10 +168,12 @@ class Reducescatter(OpWrapper):
         group: List[int],
         process_group: Optional[object] = None,
     ) -> torch.Tensor:
-        """`process_group` selects the communicator flavor, mirroring the
-        product router in `_torch/distributed/ops.py`: None runs the
-        MPI-session symbol -- the one a dep4 serving world calls -- and a boxed
-        c10d ProcessGroup runs the `_pg` symbol the non-MPI backends use.
+        """Reduce-scatter through the symbol `process_group` selects.
+
+        `process_group` selects the communicator flavor, mirroring the product
+        router in `_torch/distributed/ops.py`: None runs the MPI-session symbol
+        -- the one a dep4 serving world calls -- and a boxed c10d ProcessGroup
+        runs the `_pg` symbol the non-MPI backends use.
         """
         if process_group is None:
             return torch.ops.trtllm.reducescatter(input, sizes, group)

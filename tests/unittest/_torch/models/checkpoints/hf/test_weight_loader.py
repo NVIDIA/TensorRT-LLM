@@ -496,7 +496,9 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     assert len(progress_logs) >= 12
 
 
-@pytest.mark.parametrize("model_type", ["kimi_k3", "glm5_next", "glm5_next_text"])
+@pytest.mark.parametrize(
+    "model_type", ["kimi_k3", "glm5_next", "glm5_next_text", "step5_vl", "step5"]
+)
 def test_lazy_load_records_the_checkpoint_dir(tmp_path, model_type):
     """A model that re-opens shards itself needs the directory back.
 
@@ -546,3 +548,30 @@ def test_requires_lazy_safetensors_is_false_for_other_checkpoints(
 def test_requires_lazy_safetensors_is_false_without_a_config(tmp_path: Path) -> None:
     """A directory without config.json cannot opt in to lazy loading."""
     assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_step5_model_types_select_lazy_loading(tmp_path: Path, nested: bool) -> None:
+    text_config = {"model_type": "step5", "architectures": ["Step5ForCausalLM"]}
+    config = (
+        {
+            "model_type": "step5_vl",
+            "architectures": ["Step5ForConditionalGeneration"],
+            "text_config": text_config,
+        }
+        if nested
+        else text_config
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path))
+
+
+def test_step5_published_checkpoint_selects_lazy_loading() -> None:
+    checkpoint_dir = os.environ.get("STEP5_CHECKPOINT_PATH")
+    if checkpoint_dir is None:
+        pytest.skip("STEP5_CHECKPOINT_PATH is not set")
+    config = json.loads((Path(checkpoint_dir) / "config.json").read_text())
+    assert config["model_type"] == "step5_vl"
+    assert config["text_config"]["model_type"] == "step5"
+    assert HfWeightLoader._requires_lazy_safetensors(checkpoint_dir)

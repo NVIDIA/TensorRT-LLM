@@ -117,8 +117,23 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_con
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.fused_sigmoid_mul_inplace import (
+    fused_sigmoid_mul_inplace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
     fused_qk_norm_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_kv_store import (
+    qsa_paged_kv_store,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_kv_store_nvfp4 import (
+    qsa_paged_kv_store_nvfp4,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa import (
+    qsa_paged_sparse_gqa,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4 import (
+    qsa_paged_sparse_gqa_nvfp4,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     QM_FP8_KV_CACHE,
@@ -129,6 +144,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.layer_norm import layer_norm
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -141,7 +157,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
-from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
 from .ops.activation.gelu_erf import gelu_erf
 from .ops.activation.gelu_tanh import gelu_tanh
 from .ops.activation.silu_and_mul_rows import silu_and_mul_rows
@@ -150,13 +165,9 @@ from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
 from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
 from .ops.attention.qsa_paged_index_scores import qsa_paged_index_scores
 from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
-from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
-from .ops.attention.qsa_paged_kv_store_nvfp4 import qsa_paged_kv_store_nvfp4
-from .ops.attention.qsa_paged_sparse_gqa import qsa_paged_sparse_gqa
 from .ops.attention.qsa_paged_sparse_gqa_decode import MAX_ROWS as _SPARSE_DECODE_MAX_ROWS
 from .ops.attention.qsa_paged_sparse_gqa_decode import qsa_paged_sparse_gqa_decode
 from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decode_supports
-from .ops.attention.qsa_paged_sparse_gqa_nvfp4 import qsa_paged_sparse_gqa_nvfp4
 from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
 from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile
 from .ops.attention.qsa_topk_expand_decode import qsa_topk_expand_decode
@@ -194,7 +205,6 @@ from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
 from .ops.moe.renorm_moe_routing_op import renorm_moe_routing_op
 from .ops.norm.flashinfer_gemma_rmsnorm import flashinfer_gemma_rmsnorm
-from .ops.norm.layer_norm import layer_norm
 from .ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
 from .ops.ple.gated_ngram_injection import gated_ngram_injection
 from .ops.ple.ngram_token_history import ngram_token_history

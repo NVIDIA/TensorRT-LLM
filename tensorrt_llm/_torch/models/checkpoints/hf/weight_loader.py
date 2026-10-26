@@ -56,10 +56,10 @@ _NATIVE_IO_POLICY = "native"
 _RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
 _SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
 _SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
-# Model families whose checkpoints are too large to materialize in host RAM;
-# their models stream rank-local slices out of the lazy mmapped handles.
+# Model families whose loaders stream rank-local slices from mmapped handles,
+# including composite checkpoints whose text path leaves vision tensors unread.
 _LAZY_SAFETENSORS_MODEL_TYPES = ("kimi_k3", "kimi_linear", "glm5_next",
-                                 "glm5_next_text")
+                                 "glm5_next_text", "step5_vl", "step5")
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
@@ -366,10 +366,9 @@ class HfWeightLoader(BaseWeightLoader):
         """Whether this checkpoint must stay mmapped instead of being read
         into host RAM.
 
-        The listed model families ship checkpoints too large to materialize
-        in host RAM (Kimi K3 is about 1.5 TB), and their models stream
-        rank-local slices (expert-parallel expert ranges) out of the lazy
-        handles during `load_weights`.
+        The listed model families stream rank-local slices during
+        `load_weights`, avoiding full-checkpoint host allocation and reads of
+        tensors omitted by the model, such as vision weights on a text path.
         """
         config_path = os.path.join(checkpoint_dir, "config.json")
         if not os.path.isfile(config_path):

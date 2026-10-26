@@ -28,6 +28,16 @@ _TIE_UP = (False, True, False, True, False, True, False)
 TIE_WINDOW = 2.0**-20
 
 
+#: Step-5-Preview's NVFP4 MoE input regimes, read from the checkpoint: the
+#: gate/up `input_scale` of the layer (identical across its 352 experts and
+#: between gate and up), and the RMS of its `post_attention_layernorm` weight.
+#: Layer 3 holds the smallest input_scale of layers 3-87 (the largest global
+#: scale, 4327.85; calibrated amax 0.621), layer 81 the largest (global scale
+#: 145.30; calibrated amax 18.5).
+_STEP5_LAYER3 = dict(input_scale=0.00023106166918296367, sigma=0.2348, outlier=1.0, tiny=4e-6)
+_STEP5_LAYER81 = dict(input_scale=0.006882440764456987, sigma=0.0248, outlier=8.0, tiny=1e-4)
+
+
 def _pad_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
@@ -45,6 +55,8 @@ class Fp4Quantize(OpWrapper):
     is something a consumer has to be told, not something its shape shows.
     """
 
+    # The Step-5 cells below were driven on sm_103 only; every other cell was
+    # certified on both sm_100 and sm_103.
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # deepseek-r1 reaches this op from both layouts: the swizzled one feeding
@@ -92,11 +104,91 @@ class Fp4Quantize(OpWrapper):
             why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
             spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
+        # Step-5-Preview quantizes the routed experts' input (hidden 4096) with
+        # swizzled scales before the CUTLASS fused MoE, NVFP4 layers 3-87. The
+        # global scale is the engine's `fc31_input_scale`: the reciprocal of the
+        # checkpoint's per-layer gate/up `input_scale`, passed as a 0-dim fp32
+        # tensor. Unlike the cells above, it is not derived from the input, so
+        # blocks above the calibrated amax (2688 * input_scale) saturate the
+        # e4m3 scale at 448. `sigma` is the layer's post-attention RMSNorm
+        # weight RMS (the norm output has unit RMS before the weight), `outlier`
+        # the std of 8 outlier channels that push blocks past saturation, and
+        # `tiny` the std of one 16-channel block sized to land a subnormal
+        # e4m3 scale.
+        Cell(
+            why="step5 decode, 1 row x 4096, layer-3 input scale, swizzled",
+            spec=dict(
+                shape=(1, 4096),
+                dtype=torch.bfloat16,
+                vec=16,
+                swizzled=True,
+                **_STEP5_LAYER3,
+            ),
+        ),
+        Cell(
+            why="step5 decode batch, 128 rows x 4096 (max_batch_size), layer 3",
+            spec=dict(
+                shape=(128, 4096),
+                dtype=torch.bfloat16,
+                vec=16,
+                swizzled=True,
+                **_STEP5_LAYER3,
+            ),
+        ),
+        Cell(
+            why="step5 prefill chunk, 8192 x 4096 (max_num_tokens), layer 3",
+            spec=dict(
+                shape=(8192, 4096),
+                dtype=torch.bfloat16,
+                vec=16,
+                swizzled=True,
+                **_STEP5_LAYER3,
+            ),
+        ),
+        Cell(
+            why="step5 dep4 gathered decode, 512 x 4096, layer-81 scale (largest)",
+            spec=dict(
+                shape=(512, 4096),
+                dtype=torch.bfloat16,
+                vec=16,
+                swizzled=True,
+                **_STEP5_LAYER81,
+            ),
+        ),
     )
 
     note = """
     `sf_use_ue8m0=True` selects power-of-two scales instead of e4m3. No shipped
     target uses it and this entry does not certify it.
+
+    Step-5-Preview call site: the NVFP4 routed-expert input of layers 3-87,
+    `fp4_quantize(x [rows, 4096] bf16, fc31_input_scale (0-dim fp32), 16, False,
+    True)`, ahead of the CUTLASS fused MoE, in prefill (8192-row chunks) and in
+    decode (b rows at tp4/tep4, 4b at dep4 after the all-gather; CUDA-graph
+    captured). The global scale is 1 / input_scale from the checkpoint, so the
+    op meets saturated block scales (block max above 2688 * input_scale: the
+    e4m3 scale clamps to 448 and the codes to +-6) and, on near-zero channel
+    blocks, subnormal e4m3 scales; the Step-5 cells assert both are reached and
+    match the reference bit for bit away from the e2m1 tie window. Measured on
+    sm_103: the layer-3 cells saturate 358689 of 2097152 blocks at 8192 rows
+    and the layer-81 cell 102 of 131072, every cell has one subnormal scale per
+    row, scales match exactly, 0.135% to 0.244% of elements sit in the tie
+    window, and no code differs, inside it or outside. A block whose scale
+    underflows to 0 dequantizes to 0 whatever its codes; no cell holds one.
+    Capture and replay at 128 rows reproduce the eager result bit for bit.
+
+    Uncertified for Step-5: every Step-5 cell on sm_100 (driven on sm_103
+    only); linear (`is_sf_swizzled_layout=False`) scales at
+    width 4096 (the trtllm-gen MoE backends ask for that order; the Step-5 MoE
+    entry is CUTLASS), row counts other than 1, 128, 512 and 8192 at width
+    4096 (a gathered prefill set larger than one 8192-row chunk included), and
+    global scales between the layer-3 and layer-81 ends of the checkpoint's
+    range.
+
+    Hard limits: the input is addressed flat; at width 4096, 2^31 elements is
+    524288 rows, 64x the envelope's largest row count (8192 per chunk, 512
+    gathered decode), so no cell probes it. The swizzled scale buffer is
+    pad128(rows) * K/16 bytes.
     """
 
     def __call__(

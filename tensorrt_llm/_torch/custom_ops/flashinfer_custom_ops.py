@@ -10,7 +10,33 @@ if IS_FLASHINFER_AVAILABLE:
     from flashinfer.norm import (fused_add_rmsnorm, fused_add_rmsnorm_quant,
                                  gemma_fused_add_rmsnorm, gemma_rmsnorm,
                                  rmsnorm)
-    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+    from flashinfer.rope import (apply_rope_with_cos_sin_cache,
+                                 apply_rope_with_cos_sin_cache_inplace)
+
+    # FlashInfer rotates these head widths with its per-head-dim kernels, which
+    # keep every token inside one warp. Every other width is routed to
+    # RopeQuantizeKernel, which gives a token ceil(rotary_dim / vec) lanes of
+    # one 32-byte vector each, packs tokens back to back across the block, and
+    # reads each lane's NeoX partner from global memory.
+    _FLASHINFER_ROPE_HEAD_DIM_KERNELS = (64, 128, 256, 512)
+    _FLASHINFER_ROPE_QUANTIZE_VEC_BYTES = 32
+    _WARP_SIZE = 32
+
+    def _rope_quantize_lanes_straddle_warps(query: torch.Tensor, head_size: int,
+                                            cos_sin_cache: torch.Tensor,
+                                            is_neox: bool) -> bool:
+        """Whether an in-place NeoX rotation would race in RopeQuantizeKernel.
+
+        When a token's lane count does not divide the warp size, its lanes
+        span two warps, and a lane can load its partner's inputs after the
+        partner's lane has already stored the rotated values over them.
+        Interleaved pairs sit inside one lane's vector and do not race.
+        """
+        if not is_neox or head_size in _FLASHINFER_ROPE_HEAD_DIM_KERNELS:
+            return False
+        vec = _FLASHINFER_ROPE_QUANTIZE_VEC_BYTES // query.element_size()
+        lanes = max(1, -(-cos_sin_cache.shape[1] // vec))
+        return _WARP_SIZE % lanes != 0
 
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
     @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
@@ -110,6 +136,21 @@ if IS_FLASHINFER_AVAILABLE:
         cos_sin_cache: torch.Tensor,
         is_neox: bool = True,
     ) -> None:
+        if _rope_quantize_lanes_straddle_warps(query, head_size, cos_sin_cache,
+                                               is_neox):
+            # Rotate out of place, so no lane reads a value another lane has
+            # overwritten, then write the rotated heads back.
+            query_out, key_out = apply_rope_with_cos_sin_cache(
+                positions,
+                query,
+                key,
+                head_size,
+                cos_sin_cache,
+                is_neox,
+            )
+            query.copy_(query_out)
+            key.copy_(key_out)
+            return
         apply_rope_with_cos_sin_cache_inplace(
             positions,
             query,

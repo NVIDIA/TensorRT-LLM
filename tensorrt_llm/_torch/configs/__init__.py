@@ -50,6 +50,7 @@ from tensorrt_llm._torch.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
     Qwen4ExpVisionConfig,
 )
+from tensorrt_llm._torch.configs.step5 import Step5Config, Step5TextConfig, Step5VisionConfig
 
 
 def _register_custom_configs_with_transformers() -> None:
@@ -117,6 +118,10 @@ def _register_custom_configs_with_transformers() -> None:
         "qwen4_exp_text": Qwen4ExpTextConfig,
         "qwen4_exp": Qwen4ExpConfig,
         "qwen4_exp_vision": Qwen4ExpVisionConfig,
+        # Step-5 publishes a composite "step5_vl" config around a "step5" text
+        # config and ships no configuration class.
+        "step5_vl": Step5Config,
+        "step5": Step5TextConfig,
     }
     # Cosmos3Config resolves vision sub-configs via ``qwen3_vl_vision``; that
     # alias is only present in newer transformers releases.
@@ -171,4 +176,7 @@ __all__ = [
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
     "Qwen4ExpVisionConfig",
+    "Step5Config",
+    "Step5TextConfig",
+    "Step5VisionConfig",
 ]

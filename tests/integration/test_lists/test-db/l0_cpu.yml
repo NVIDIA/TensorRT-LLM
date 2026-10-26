@@ -68,6 +68,9 @@ l0_cpu:
   # derivation and attention-call arguments, its routed-expert scalars and its weight table.
   # The rest of unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
+  # Step-5 config, input processing, weight sharding, tokenizer and EOS contracts.
+  - unittest/_torch/modeling_v2/models/step5
+  - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py

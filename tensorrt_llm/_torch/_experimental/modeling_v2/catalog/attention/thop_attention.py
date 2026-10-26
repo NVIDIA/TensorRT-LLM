@@ -11,7 +11,8 @@ thread-local metadata.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+import math
+from typing import NamedTuple, Optional, Sequence
 
 import torch
 
@@ -29,6 +30,24 @@ QM_FP8_KV_CACHE = 128
 #: quant_mode bit for an NVFP4 KV cache: e2m1 values in the pool, one e4m3 scale
 #: per 16 values in a second pool, fp32 [3] kv scales (q, K, V).
 QM_NVFP4_KV_CACHE = 8192
+
+
+class ProbabilityTiling(NamedTuple):
+    """How an fp8 / NVFP4 kernel's online softmax rounds probabilities to e4m3.
+
+    A query row's attended keys fall in `tile`-key tiles aligned at key 0 of the
+    sequence. The row's tiles are split into `ctas` runs as even as ceil-division
+    makes them, one per CTA; inside a run, tile `t` goes to stream `t % streams`.
+    Each (run, stream) keeps its own running max, and a tile's probabilities are
+    rounded against that running max as the tile is reached; everything is then
+    rescaled to the row max exactly and the row sum taken over the unrounded
+    weights. `ctas=1, streams=1` is the textbook online softmax.
+    """
+
+    tile: int = 128
+    streams: int = 1
+    ctas: int = 1
+
 
 #: qwen4_exp's full-attention layer -- the twelve trunk layers and the MTP
 #: module alike: packed-QKV causal GQA over a bf16 pool, rope applied outside,
@@ -111,6 +130,158 @@ _FP8_24_4_256 = dict(
 )
 
 
+#: Step-5-Preview's sliding-window layers (69 of its 92): causal GQA over a 512-key
+#: window that includes the query itself, rope applied outside, the paged-context path
+#: on (the target serves with block reuse and chunked prefill). The 192-wide heads are
+#: zero-padded to 256 -- trtllm-gen has no head-192 FMHA on sm_103 -- and q_scaling
+#: sqrt(192/256) restores the 192^-0.5 softmax scale. 64q/4kv is an attention-DP rank,
+#: 16q/1kv a TP4 one. Block-offset tables are what the engine sizes at max_seq_len 9216
+#: (ISL 8192 + OSL 1024) and max_batch_size 128: 288 columns, 128 rows. Pool pages are
+#: chosen per cell: what its histories and this call's appends occupy, plus 64 spare.
+_STEP5_Q_SCALING = math.sqrt(192 / 256)
+_STEP5_SPARE_PAGES = 64
+_STEP5_DP = dict(
+    input_type=STANDARD,
+    num_heads=64,
+    num_kv_heads=4,
+    head_size=256,
+    v_head_dim=256,
+    real_head_dim=192,
+    sinks=False,
+    window=512,
+    quant_mode=0,
+    mask_type=1,
+    q_scaling=_STEP5_Q_SCALING,
+    tokens_per_block=32,
+    use_paged_context_fmha=True,
+    max_num_requests=128,
+    max_seq_len=9216,
+    predicted_tokens_per_seq=1,
+)
+_STEP5_TP4 = dict(_STEP5_DP, num_heads=16, num_kv_heads=1)
+_STEP5_GEOMETRY = {"dp64/4": _STEP5_DP, "tp16/1": _STEP5_TP4}
+_STEP5_POOLS = {
+    "bf16": dict(quant_mode=0),
+    "fp8": dict(quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0),
+    "nvfp4": dict(quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0),
+}
+
+#: Step-5-Preview's vision tower: the no-KV-cache mode, one context sequence per
+#: 728 px overview (52x52 = 2704 patches) or 504 px crop (36x36 = 1296), MHA 16/16
+#: with the 96-wide heads zero-padded to 128 and q_scaling sqrt(96/128), padding mask.
+_STEP5_VISION = dict(
+    _QWEN4_VISION,
+    head_size=128,
+    v_head_dim=128,
+    real_head_dim=96,
+    q_scaling=math.sqrt(96 / 128),
+)
+
+
+def _step5_tiling(geometry: str, pool: str, batch: int, num_contexts: int) -> ProbabilityTiling:
+    """The e4m3 probability tiling of the kernel a Step-5 call over an fp8 or NVFP4 pool
+    selects (measured on sm_103; the note has the kernel table). Context kernels run one
+    online softmax over 128-key tiles. The fp8 decode kernels step 256 keys as two
+    128-key streams; the NVFP4 ones one 128-key stream. A multi-CTA decode splits a row's
+    tiles among its CTAs: two at one request, three on the NVFP4 kernels' non-CGA split
+    (12 requests at 64q/4kv, 47-50 at 16q/1kv)."""
+    if num_contexts:
+        return ProbabilityTiling(128, 1, 1)
+    streams = 2 if pool == "fp8" else 1
+    if batch == 1:
+        return ProbabilityTiling(128, streams, 2)
+    if pool == "nvfp4" and (geometry, batch) in (("dp64/4", 12), ("tp16/1", 48)):
+        return ProbabilityTiling(128, streams, 3)
+    return ProbabilityTiling(128, streams, 1)
+
+
+def _step5_cell(why: str, geometry: str, pool: str, cached, new, num_contexts: int) -> Cell:
+    """One Step-5-Preview sliding-layer call: `cached` tokens already in the pool and
+    `new` q rows per sequence, contexts first. Over an fp8 or NVFP4 pool the cell also
+    names the `ProbabilityTiling` of the kernel the launch picks for it (`p_tiling`),
+    and in a mixed step that of the generation kernel too (`p_tiling_gen`)."""
+    spec = dict(_STEP5_GEOMETRY[geometry], **_STEP5_POOLS[pool])
+    if pool != "bf16":
+        spec["p_tiling"] = _step5_tiling(geometry, pool, len(new), num_contexts)
+        if 0 < num_contexts < len(new):
+            spec["p_tiling_gen"] = _step5_tiling(geometry, pool, len(new) - num_contexts, 0)
+    tpb = spec["tokens_per_block"]
+    pages = sum(-(-(c + n) // tpb) for c, n in zip(cached, new))
+    spec.update(
+        cached=tuple(cached),
+        new=tuple(new),
+        num_contexts=num_contexts,
+        num_blocks=pages + _STEP5_SPARE_PAGES,
+    )
+    return Cell(why=f"step5 {geometry} {pool} {why}", spec=spec)
+
+
+def _step5_cells() -> tuple[Cell, ...]:
+    """The sliding-layer cells. Decode cells pick one batch per generation kernel the
+    launch selects between 1 and 128 requests (the note's table): histories up to 9215
+    keep a batch on the sliding-mask kernels, histories at most 511 (every key inside the
+    window) on the dense-mask ones."""
+    cells = []
+    for geometry in _STEP5_GEOMETRY:
+        for pool in _STEP5_POOLS:
+            cells.append(
+                _step5_cell("prefill 8192 rows in one call", geometry, pool, [0], [8192], 1)
+            )
+            cells.append(
+                _step5_cell("chunk 512 fresh, KV == window", geometry, pool, [0], [512], 1)
+            )
+            cells.append(
+                _step5_cell("chunk 512 over 1024 cached", geometry, pool, [1024], [512], 1)
+            )
+    long_batches = {
+        ("dp64/4", "bf16"): (1, 24, 128),
+        ("dp64/4", "fp8"): (1, 24, 128),
+        ("dp64/4", "nvfp4"): (1, 12, 24, 128),
+        ("tp16/1", "bf16"): (1, 128),
+        ("tp16/1", "fp8"): (1, 128),
+        ("tp16/1", "nvfp4"): (1, 48, 128),
+    }
+    short_batches = {
+        ("dp64/4", "bf16"): (24, 128),
+        ("dp64/4", "fp8"): (24, 128),
+        ("dp64/4", "nvfp4"): (1, 24, 128),
+        ("tp16/1", "bf16"): (128,),
+        ("tp16/1", "fp8"): (128,),
+        ("tp16/1", "nvfp4"): (1, 128),
+    }
+    for (geometry, pool), batches in long_batches.items():
+        for b in batches:
+            cached = (9215,) if b == 1 else _spread(b, 9215)
+            cells.append(_step5_cell(f"decode b={b} to 9215", geometry, pool, cached, (1,) * b, 0))
+    for (geometry, pool), batches in short_batches.items():
+        for b in batches:
+            cached = (511,) if b == 1 else _spread(b, 511)
+            cells.append(
+                _step5_cell(
+                    f"decode b={b} to 511, dense-mask kernel", geometry, pool, cached, (1,) * b, 0
+                )
+            )
+    for pool in _STEP5_POOLS:
+        cells.append(
+            _step5_cell(
+                "mixed: chunk 512 over 600 + 24 decodes to 9215",
+                "dp64/4",
+                pool,
+                (600,) + _spread(24, 9215),
+                (512,) + (1,) * 24,
+                1,
+            )
+        )
+    for seg_lens in ((2704,), (1296,) * 4 + (2704,), (1296,) * 8 + (2704,)):
+        cells.append(
+            Cell(
+                why=f"step5 vision d96->128: {len(seg_lens)} frames, {sum(seg_lens)} rows",
+                spec=dict(_STEP5_VISION, seg_lens=seg_lens),
+            )
+        )
+    return tuple(cells)
+
+
 class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
 
@@ -121,7 +292,10 @@ class ThopAttention(OpWrapper):
     qwen4_exp on the standard path twice over -- its full-attention layers and
     MTP module (GQA 24/2/256 over a bf16 or an fp8-e4m3 pool, a P-token draft
     block per generation sequence, a two-pool hybrid mapping), and its vision
-    tower with no KV cache at all.
+    tower with no KV cache at all. Step-5-Preview runs its sliding-window
+    layers through it (heads zero-padded 192 -> 256, q_scaling sqrt(192/256),
+    a 512-key window, at 64q/4kv and 16q/1kv over bf16, fp8 and NVFP4 pools)
+    and its vision tower with no KV cache (heads 96 padded to 128).
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
@@ -765,6 +939,9 @@ class ThopAttention(OpWrapper):
                 predicted_tokens_per_seq=4,
             ),
         ),
+        # Step-5-Preview: the sliding-window layers at both per-rank geometries over each
+        # pool dtype, and the vision tower. See `_step5_cells`.
+        *_step5_cells(),
     )
 
     note = """
@@ -854,6 +1031,73 @@ class ThopAttention(OpWrapper):
     tensorrt_llm`: a `pip` on PATH that cannot see the install fails every
     generation call, and the first failure poisons the process ("Jitify fatal
     error: Uninitialized").
+
+    The Step-5-Preview cells (every `why` starting "step5") were driven on
+    sm_103 only; on sm_100 they are not certified, the other cells are.
+
+    Step-5-Preview's sliding-window layers: heads 192 zero-padded to 256 with
+    q_scaling sqrt(192/256) (the op's softmax scale is 1 / (q_scaling *
+    sqrt(head_size)), so 192^-0.5), causal under attention_window_size 512 --
+    the newest 512 keys, the query's own included -- at 64q/4kv and 16q/1kv
+    over bf16, fp8 (128) and NVFP4 (8192) pools at kv scale 1.0, paged-context
+    path, tokens_per_block 32, a 288-column block table (max_seq_len 9216)
+    with 128 rows. The pad columns of the output come back exact zeros, so a
+    caller slicing back to 192 drops nothing; under NVFP4 a pad block is
+    sixteen zeros with a zero scale. The append lands every token at its
+    absolute position up to 9215 (page t // 32 of the row, not t modulo the
+    window) and nothing else in the pool moves. The cells write whole
+    histories; that pages wholly older than the window are unread is the
+    gpt-oss measurement above, not re-measured at this geometry. Pool pages
+    are chosen per cell (what the cell occupies plus 64, in shuffled order),
+    not taken from an engine's capacity planning; the 64q/4kv bf16 pool of
+    the 128-request decode cell is 2432696320 bytes, so pages past the
+    2^31-byte mark are addressed.
+
+    The kernels a Step-5 call runs on sm_103, read by profiler. Context:
+    PagedKvCausal while the KV range fits the window (a fresh 512-row chunk),
+    PagedKvSlidingOrChunkedCausal past it; Q128Kv128, persistent at 64q/4kv
+    and static at 16q/1kv. Generation at P = 1 by request count, every history
+    9215 ("sliding") or 300 ("dense"):
+      64q/4kv bf16, fp8: sliding 1-19 MultiCtasKvCga, 20-38 static, 39-128
+        persistent; dense 1-38 static, 39-128 persistent.
+      64q/4kv nvfp4: sliding 1-11 and 13-19 MultiCtasKvCga, 12 MultiCtasKv,
+        20-38 static, 39-128 persistent; dense 1-19 MultiCtasKvCga, 20-38
+        static, 39-128 persistent.
+      16q/1kv bf16, fp8: sliding 1-76 MultiCtasKvCga, 77-128 static; dense
+        1-128 static.
+      16q/1kv nvfp4: sliding 1-46 and 51-76 MultiCtasKvCga, 47-50 MultiCtasKv,
+        77-128 static; dense 1-76 MultiCtasKvCga, 77-128 static.
+    The bf16 and fp8 decode kernels step 256 keys, the NVFP4 ones 128. The cells
+    hold one request count per entry of that table, histories spread to 9215 or
+    to 511, beside an 8192-row prompt and 512-row chunks at both geometries and
+    a mixed step (a chunk ahead of 24 decodes) at 64q/4kv, over every pool.
+    The boundaries were measured at the two uniform histories only, and the
+    choice reads the batch's longest history, so a batch of shorter ones can
+    land in another column than its request count says. The vision call runs
+    PackedQkvDense H128 Q256Kv128, persistent.
+
+    Over fp8 and NVFP4 pools these kernels round the softmax probabilities to
+    e4m3 per 128-key tile against a running max, so across a 512-key window the
+    row-max model of `e4m3_probabilities` is off by up to 1.8 element gates and
+    7.4 ulp RMS. Each quantized cell names its kernel's `ProbabilityTiling`
+    (context: one stream; fp8 decode: two interleaved; NVFP4 decode: one;
+    multi-CTA decode: the row's tiles split two ways, three on NVFP4's non-CGA
+    kernel). With it every Step-5 cell, over four seeds, uses at most 0.65 of
+    `_compare`'s element gate (the fp8 8192-row prompts; 0.43 every other
+    cell) and 0.20 of its RMS gate; the multi-CTA kernels
+    keep a 0.7 ulp RMS residual the model does not explain. Outside the band:
+    q_scaling left at 1.0 (9.8-23.4x the element gate), the window dropped
+    (60-214x), and the pool's quantization ignored (4.1x on an fp8 chunk, 8.5x
+    on an NVFP4 decode).
+
+    Step-5-Preview's vision tower: MHA 16/16 with heads 96 zero-padded to 128,
+    q_scaling sqrt(96/128), padding mask, frames of 2704 and 1296 rows, up to
+    nine per call (13072 rows); q_scaling left at 1.0 lands 25.7x outside.
+
+    Hard limits at Step-5's values: an 8192-row 64q/4kv call's packed qkv is
+    8192 x 18432 = 1.5e8 elements and a 13072-row vision call's 8.0e7, both
+    far below 2^31; a block-offset entry (2 * page + 1) stays an int32 to
+    2^30 pages.
     """
 
     def __call__(
@@ -1117,6 +1361,7 @@ class ThopAttention(OpWrapper):
         e4m3_inputs: bool = False,
         out_scale: float = 1.0,
         e4m3_probabilities: bool = False,
+        e4m3_probability_tiling: Optional[ProbabilityTiling] = None,
     ) -> torch.Tensor:
         """Masked softmax attention over explicit per-sequence K/V, in fp32.
 
@@ -1156,6 +1401,15 @@ class ThopAttention(OpWrapper):
         rounded unscaled. At kv scale 2.0 it is bitwise exact on a one-tile
         decode; at 1.5 nothing tried fits (4.2 ulp RMS at best). Not modelled
         with sinks.
+
+        `e4m3_probability_tiling` replaces that row-max model with the kernel's
+        own tiling (`ProbabilityTiling`): which max each probability is rounded
+        against, tile by tile. Key indices count from the first row of each
+        sequence's `k`, so a caller passing a suffix of a history starts it on
+        a tile boundary. Measured over 512-key windows on sm_103: the context
+        kernels, the single-CTA decode kernels and the multi-CTA ones at the
+        split the launch picked agree with it to 0.03, 0.02 and 0.72 bf16 ulp
+        RMS, where the row-max model sits at 2-7.
         """
         rep = num_heads // num_kv_heads
         total_q = sum(q_lens)
@@ -1169,39 +1423,50 @@ class ThopAttention(OpWrapper):
                 # them; saying so here keeps a caller from reading them.
                 q_start += q_len
                 continue
-            q_seq = q[q_start : q_start + q_len].reshape(q_len, num_heads, qk_head_dim).float()
-            k_seq = k[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, qk_head_dim)
-            v_seq = v[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, v_head_dim)
-            k_seq, v_seq = k_seq.float(), v_seq.float()
-            if rep > 1:
-                k_seq = k_seq.repeat_interleave(rep, dim=1)
-                v_seq = v_seq.repeat_interleave(rep, dim=1)
-            if e4m3_inputs:
-                q_seq = q_seq.to(torch.float8_e4m3fn).float()
-                k_seq = k_seq.to(torch.float8_e4m3fn).float()
-                v_seq = v_seq.to(torch.float8_e4m3fn).float()
+            k_all = k[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, qk_head_dim)
+            v_all = v[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, v_head_dim)
+            # Query rows in blocks, each over only the keys its mask can keep:
+            # a masked key contributes exp(-inf) = 0 to both sums, so the
+            # restriction changes no row's arithmetic and bounds the score
+            # matrix at an 8192-row prefill.
+            for first in range(0, q_len, self._Q_BLOCK):
+                last = min(q_len, first + self._Q_BLOCK)
+                k_lo, k_hi = self._key_range(first, last, q_len, kv_len, causal, window)
+                q_blk = q[q_start + first : q_start + last].reshape(-1, num_heads, qk_head_dim)
+                q_blk = q_blk.float()
+                k_seq, v_seq = k_all[k_lo:k_hi].float(), v_all[k_lo:k_hi].float()
+                if rep > 1:
+                    k_seq = k_seq.repeat_interleave(rep, dim=1)
+                    v_seq = v_seq.repeat_interleave(rep, dim=1)
+                if e4m3_inputs:
+                    q_blk = q_blk.to(torch.float8_e4m3fn).float()
+                    k_seq = k_seq.to(torch.float8_e4m3fn).float()
+                    v_seq = v_seq.to(torch.float8_e4m3fn).float()
 
-            scores = torch.einsum("ihd,jhd->hij", q_seq, k_seq) * softmax_scale
-            keep = self._mask(q_len, kv_len, causal, window, q.device)
-            scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
+                scores = torch.einsum("ihd,jhd->hij", q_blk, k_seq) * softmax_scale
+                keep = self._mask(first, last, k_lo, k_hi, q_len, kv_len, causal, window, q.device)
+                scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
 
-            if e4m3_probabilities:
-                assert attention_sinks is None, "e4m3 probabilities are not modelled with sinks"
-                weights = torch.exp(scores - scores.max(dim=-1, keepdim=True).values)
-                e4m3_max = torch.finfo(torch.float8_e4m3fn).max
-                rounded = (weights * e4m3_max).to(torch.float8_e4m3fn).float() / e4m3_max
-                probs = rounded / weights.sum(dim=-1, keepdim=True)
-            elif attention_sinks is None:
-                probs = torch.softmax(scores, dim=-1)
-            else:
-                sink = attention_sinks.float().view(num_heads, 1)
-                peak = torch.maximum(scores.max(dim=-1).values, sink)
-                weights = torch.exp(scores - peak.unsqueeze(-1))
-                probs = weights / (weights.sum(-1) + torch.exp(sink - peak)).unsqueeze(-1)
+                if e4m3_probabilities and e4m3_probability_tiling is not None:
+                    assert attention_sinks is None, "e4m3 probabilities are not modelled with sinks"
+                    probs = self._tiled_e4m3_probabilities(scores, k_lo, e4m3_probability_tiling)
+                elif e4m3_probabilities:
+                    assert attention_sinks is None, "e4m3 probabilities are not modelled with sinks"
+                    weights = torch.exp(scores - scores.max(dim=-1, keepdim=True).values)
+                    e4m3_max = torch.finfo(torch.float8_e4m3fn).max
+                    rounded = (weights * e4m3_max).to(torch.float8_e4m3fn).float() / e4m3_max
+                    probs = rounded / weights.sum(dim=-1, keepdim=True)
+                elif attention_sinks is None:
+                    probs = torch.softmax(scores, dim=-1)
+                else:
+                    sink = attention_sinks.float().view(num_heads, 1)
+                    peak = torch.maximum(scores.max(dim=-1).values, sink)
+                    weights = torch.exp(scores - peak.unsqueeze(-1))
+                    probs = weights / (weights.sum(-1) + torch.exp(sink - peak)).unsqueeze(-1)
 
-            out[q_start : q_start + q_len] = (
-                torch.einsum("hij,jhd->ihd", probs, v_seq).reshape(q_len, -1) * out_scale
-            )
+                out[q_start + first : q_start + last] = (
+                    torch.einsum("hij,jhd->ihd", probs, v_seq).reshape(last - first, -1) * out_scale
+                )
             q_start += q_len
             kv_start += kv_len
         return out.to(q.dtype)
@@ -1245,7 +1510,7 @@ class ThopAttention(OpWrapper):
             if rep > 1:
                 k_seq = k_seq.repeat_interleave(rep, dim=1)
             scores = torch.einsum("ihd,jhd->hij", q_seq, k_seq) * softmax_scale
-            keep = self._mask(q_len, kv_len, causal, window, q.device)
+            keep = self._mask(0, q_len, 0, kv_len, q_len, kv_len, causal, window, q.device)
             scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
             row_max = scores.max(dim=-1).values
             row_sum = torch.exp(scores - row_max.unsqueeze(-1)).sum(dim=-1)
@@ -1255,17 +1520,81 @@ class ThopAttention(OpWrapper):
             kv_start += kv_len
         return stats
 
+    #: Query rows per block in `reference`.
+    _Q_BLOCK = 256
+
     @staticmethod
-    def _mask(q_len: int, kv_len: int, causal: bool, window: Optional[int], device) -> torch.Tensor:
-        """`[q_len, kv_len]` keep-mask, bottom-right aligned."""
-        if not causal and window is None:
-            return torch.ones(q_len, kv_len, dtype=torch.bool, device=device)
-        keep = torch.zeros(q_len, kv_len, dtype=torch.bool, device=device)
+    def _tiled_e4m3_probabilities(
+        scores: torch.Tensor, k_lo: int, tiling: ProbabilityTiling
+    ) -> torch.Tensor:
+        """`[h, i, j]` masked logits over keys `k_lo + j` -> softmax probabilities
+        rounded to e4m3 the way `tiling` says (see `ProbabilityTiling`)."""
+        h, rows, n_keys = scores.shape
+        device = scores.device
+        keys = torch.arange(k_lo, k_lo + n_keys, device=device)
+        first_tile = k_lo // tiling.tile
+        key_tile = keys // tiling.tile - first_tile
+        n_tiles = int(key_tile[-1]) + 1
+        tile_max = torch.full((h, rows, n_tiles), float("-inf"), device=device)
+        tile_max = tile_max.scatter_reduce(
+            -1, key_tile.view(1, 1, -1).expand(h, rows, -1), scores, "amax"
+        )
+        # Each row's attended tile range, split into `ctas` runs.
+        kept = (tile_max > float("-inf")).any(0)
+        tiles = torch.arange(n_tiles, device=device).unsqueeze(0)
+        lo = torch.where(kept, tiles, n_tiles).amin(-1, keepdim=True)
+        hi = torch.where(kept, tiles, -1).amax(-1, keepdim=True)
+        per_cta = (hi - lo + tiling.ctas) // tiling.ctas
+        rel = (tiles - lo).clamp_min(0)
+        group = (rel // per_cta) * tiling.streams + (tiles + first_tile) % tiling.streams
+        running = torch.full_like(tile_max, float("-inf"))
+        for g in range(tiling.ctas * tiling.streams):
+            mine = (group == g).unsqueeze(0)
+            run_g = torch.where(mine, tile_max, float("-inf")).cummax(-1).values
+            running = torch.where(mine, run_g, running)
+        key_max = running.gather(-1, key_tile.view(1, 1, -1).expand(h, rows, -1))
+        row_max = scores.max(dim=-1, keepdim=True).values
+        live = scores > float("-inf")
+        key_max = torch.where(live, key_max, row_max)
+        weights = torch.where(live, torch.exp(scores - key_max), 0.0)
+        e4m3_max = torch.finfo(torch.float8_e4m3fn).max
+        rounded = (weights * e4m3_max).to(torch.float8_e4m3fn).float() / e4m3_max
+        rescale = torch.exp(key_max - row_max)
+        return rounded * rescale / (weights * rescale).sum(dim=-1, keepdim=True)
+
+    @staticmethod
+    def _key_range(
+        first: int, last: int, q_len: int, kv_len: int, causal: bool, window: Optional[int]
+    ) -> tuple[int, int]:
+        """Keys `[lo, hi)` any of query rows `[first, last)` can keep."""
         offset = kv_len - q_len
-        for i in range(q_len):
-            high = offset + i + 1 if causal else kv_len
-            low = 0 if window is None else max(0, high - window)
-            keep[i, low:high] = True
+        hi = offset + last if causal else kv_len
+        lo_high = offset + first + 1 if causal else kv_len
+        lo = 0 if window is None else max(0, lo_high - window)
+        return lo, hi
+
+    @staticmethod
+    def _mask(
+        first: int,
+        last: int,
+        k_lo: int,
+        k_hi: int,
+        q_len: int,
+        kv_len: int,
+        causal: bool,
+        window: Optional[int],
+        device,
+    ) -> torch.Tensor:
+        """`[last - first, k_hi - k_lo]` keep-mask of query rows `[first, last)`
+        over keys `[k_lo, k_hi)`, bottom-right aligned: row `i` keeps keys
+        below `kv_len - q_len + i + 1` (all of them when not causal), and
+        with a window only the newest `window` of those."""
+        rows = torch.arange(first, last, device=device).unsqueeze(1)
+        keys = torch.arange(k_lo, k_hi, device=device).unsqueeze(0)
+        high = kv_len - q_len + rows + 1 if causal else torch.full_like(rows, kv_len)
+        keep = keys < high
+        if window is not None:
+            keep &= keys >= high - window
         return keep
 
     def is_valid(

@@ -10,9 +10,10 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as op
 
 __extra_import_path__ = [".."]
-from _validating import (  # noqa: E402 — needs the path declared above
+from _validating import (  # noqa: E402,F401 — path above; fixture by name
     ULP,
     assert_within_ulp,
+    certifying,
     validating,
 )
 
@@ -23,16 +24,19 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     """One GEMM's worth of accumulation-order difference.
 
     Kernel and reference consume bit-identical operands and differ only in
-    the order cuBLAS and torch sum over K. Over random operands a few
-    outputs land near zero, where that reordering shows up as a relative
-    difference of 10 on an absolute difference of 1.5e-4 -- which is what
-    torch's default band rejects, and what no bf16 result could represent
-    anyway: one ulp at these rows' scale is about 6e-1.
+    the order cuBLAS and torch sum over K, then each rounds once to the output
+    dtype. Over random operands a few outputs land near zero, where that
+    reordering shows up as a large relative difference on a tiny absolute
+    one -- which is what torch's default band rejects, and what no bf16 result
+    could represent anyway.
 
-    So: 4 ulp element-wise against the row scale, 2 ulp of relative RMS.
-    Measured worst case across this entry's cells is 1.5e-4 absolute, or
-    roughly 3e-4 ulp -- four orders of margin, and a band that a genuinely
-    wrong product would miss by orders rather than squeak past.
+    So: 4 ulp element-wise against the row scale, 2 ulp of relative RMS. The
+    fp32 sums differ by about sqrt(K) fp32 ulps of the row scale (K <= 14336
+    here: under 1e-4 bf16 ulp), and the final rounding to bf16 adds at most one
+    ulp where the two sums straddle a rounding boundary; four ulp leaves a
+    genuinely wrong product (a dropped K slice, a transposed operand) missing
+    by orders rather than squeaking past. Measured worst case across the
+    gpt-oss and deepseek cells is 1.5e-4 absolute, roughly 3e-4 ulp.
     """
     # Scored in bf16 ulp even when the output is fp32: every cell's
     # operands are bf16, so the fp32 out_dtype the router asks for is a
@@ -60,13 +64,26 @@ def _build(spec, seed):
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell) -> None:
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — the fixture
+    certifying(op)
     mat_a, mat_b, bias, out_dtype = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    with validating(op):
-        out = op(mat_a, mat_b, bias, out_dtype)
+    out = op(mat_a, mat_b, bias, out_dtype)
     assert out.shape == (mat_a.shape[0], mat_b.shape[1])
     assert out.dtype is (out_dtype or mat_a.dtype)
-    _compare(out, op.reference(mat_a, mat_b, bias, out_dtype))
+    ref = op.reference(mat_a, mat_b, bias, out_dtype)
+    del mat_a, mat_b, bias
+    _compare(out, ref)
+
+
+def test_cell_ids_are_distinct() -> None:
+    """Every cell keeps a test id of its own.
+
+    The id is the first 44 characters of `why`; two cells sharing it would let
+    pytest disambiguate them with a numeric suffix nobody can map back to a
+    shape.
+    """
+    ids = [c.why[:44] for c in op.CELLS]
+    assert len(set(ids)) == len(ids), sorted(i for i in ids if ids.count(i) > 1)
 
 
 def _ok(dtype=torch.bfloat16):

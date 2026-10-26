@@ -17,7 +17,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields
-from typing import Any, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
@@ -25,6 +25,9 @@ from strenum import StrEnum
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig, PreTrainedTokenizerBase
 
 MAX_TOP_LOGPROBS = 100
 
@@ -40,6 +43,35 @@ _GENERATION_CONFIG_SAMPLING_FIELDS = frozenset(
         "top_p",
     }
 )
+
+
+def _step5_eos_token_ids(
+    hf_model_config: "PretrainedConfig", tokenizer: "PreTrainedTokenizerBase | None"
+) -> list[int]:
+    """Resolve Step5's text-config and tokenizer end-of-turn EOS union."""
+    text_config = getattr(hf_model_config, "text_config", hf_model_config)
+    config_eos = (
+        text_config.get("eos_token_id")
+        if isinstance(text_config, Mapping)
+        else getattr(text_config, "eos_token_id", None)
+    )
+    result: set[int] = set()
+    for label, value in (
+        ("config eos_token_id", config_eos),
+        ("tokenizer eos_token_id", getattr(tokenizer, "eos_token_id", None)),
+    ):
+        if value is None:
+            continue
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for token in values:
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError(
+                    f"{label} must contain non-negative integer token ids, got {token!r}"
+                )
+            result.add(token)
+    if not result:
+        raise ValueError("generation has no EOS token ids")
+    return sorted(result)
 
 
 def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
@@ -570,10 +602,15 @@ class SamplingParams:
     def _setup(
         self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
     ) -> "SamplingParams":
+        model_eos_token_ids = []
         if self.end_id is None:
+            if getattr(hf_model_config, "model_type", None) in ("step5", "step5_vl"):
+                model_eos_token_ids = _step5_eos_token_ids(hf_model_config, tokenizer)
             self.end_id = tokenizer.eos_token_id
-            self.pad_id = tokenizer.pad_token_id
-
+            if self.end_id is None and model_eos_token_ids:
+                self.end_id = model_eos_token_ids[0]
+            if self.pad_id is None:
+                self.pad_id = tokenizer.pad_token_id
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
@@ -592,20 +629,18 @@ class SamplingParams:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
             self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
 
-        # Add eos_token_id in generation_config to stop_token_ids
-        # The eos_token_id in generation_config are really mean to stop the text generation.
+        # Model EOS ids are single-token stops; caller stop strings remain separate.
         if generation_config is not None and generation_config.eos_token_id is not None:
-            if isinstance(generation_config.eos_token_id, int):
-                generation_config.eos_token_id = [generation_config.eos_token_id]
-            # else is always List[int]
-
-            if not self.stop_token_ids:
-                self.stop_token_ids = []
-            for stop_token in generation_config.eos_token_id:
-                if stop_token != self.end_id and stop_token not in self.stop_token_ids:
-                    self.stop_token_ids.append(stop_token)
-            if not self.stop_token_ids:
-                self.stop_token_ids = None
+            generation_eos = generation_config.eos_token_id
+            model_eos_token_ids.extend(
+                [generation_eos] if isinstance(generation_eos, int) else generation_eos
+            )
+        if model_eos_token_ids:
+            stop_token_ids = list(self.stop_token_ids or [])
+            for stop_token in model_eos_token_ids:
+                if stop_token != self.end_id and stop_token not in stop_token_ids:
+                    stop_token_ids.append(stop_token)
+            self.stop_token_ids = stop_token_ids or None
 
         return self
 
