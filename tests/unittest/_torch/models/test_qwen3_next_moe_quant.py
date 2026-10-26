@@ -255,7 +255,7 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
     )
 
     assert captured["moe_backend"] == "CUTLASS"
-    assert captured["moe_cls"] == "CutlassFusedMoE"
+    assert captured["moe_cls"] == "TrtllmCutlassUnquantizedImpl"
     assert captured["override"] is not per_layer_quant_config
     assert not captured["override"].layer_quant_mode.has_any_quant(exclude_kv_cache=True)
     assert captured["override"].kv_cache_quant_algo == QuantAlgo.FP8
@@ -269,7 +269,7 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
 @pytest.mark.parametrize(
     "backend,sm,quant_algo,expected_moe_cls",
     [
-        ("CUTLASS", 90, QuantAlgo.FP8_BLOCK_SCALES, "CutlassFusedMoE"),
+        ("CUTLASS", 90, QuantAlgo.FP8_BLOCK_SCALES, "DeepgemmCudaHopperFp8BlockScalesImpl"),
         ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TrtllmTrtllmGenFp8BlockScalesImpl"),
         ("DEEPGEMM", 100, QuantAlgo.FP8_BLOCK_SCALES, "DeepgemmCudaFp8BlockScalesImpl"),
         ("CUTEDSL", 100, QuantAlgo.NVFP4, "CuteDslFusedMoE"),

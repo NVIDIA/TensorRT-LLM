@@ -956,6 +956,106 @@ def test_stream_tool_call_arguments_concatenate():
     assert message_delta["delta"]["stop_reason"] == "tool_use"
 
 
+def _tool_call_chunk(index, call_id, name, arguments):
+    return chunk(
+        {
+            "tool_calls": [
+                {"index": index, "id": call_id, "function": {"name": name, "arguments": arguments}}
+            ]
+        }
+    )
+
+
+def test_stream_whitespace_between_blocks_opens_no_text_block():
+    """Whitespace-only text between blocks opens no text block of its own."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "check the weather"}),
+            chunk({"content": "\n\n"}),
+            _tool_call_chunk(0, "call_1", "get_weather", '{"city": "sf"}'),
+            chunk({"content": "\n"}),
+            _tool_call_chunk(1, "call_2", "get_weather", '{"city": "nyc"}'),
+            chunk({"content": "\n"}),
+            chunk({}, finish_reason="tool_calls"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking", "tool_use", "tool_use"]
+
+
+def test_stream_whitespace_before_text_stays_with_the_text():
+    """Whitespace that precedes text is that text's, delivered unchanged."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "plan"}),
+            chunk({"content": "\n\n"}),
+            chunk({"content": "Answer.\n"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    texts = [
+        p["delta"]["text"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(texts) == "\n\nAnswer.\n"
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking", "text"]
+
+
+def test_stream_whitespace_inside_an_open_text_block_stays_with_the_text():
+    """Whitespace inside a text block that holds text is delivered unchanged."""
+    events = run_reframer(
+        [
+            chunk({"content": "hello"}),
+            chunk({"content": " "}),
+            chunk({"content": "world"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    texts = [
+        p["delta"]["text"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(texts) == "hello world"
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["text"]
+
+
+def test_stream_trailing_whitespace_opens_no_text_block():
+    """Whitespace-only text at the end of the stream opens no text block."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "plan"}),
+            chunk({"content": "\n\n"}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
+    assert starts == ["thinking"]
+    assert not [
+        p for n, p in events if n == "content_block_delta" and p["delta"]["type"] == "text_delta"
+    ]
+
+
+def test_whitespace_only_content_is_not_a_text_block():
+    message = ChatMessage(
+        role="assistant",
+        content="\n\n",
+        tool_calls=[
+            ToolCall(
+                id="call_1", function=FunctionCall(name="get_weather", arguments='{"city": "sf"}')
+            )
+        ],
+    )
+    resp = convert_chat_response(make_chat_response(message, finish_reason="tool_calls"))
+    assert [block.type for block in resp.content] == ["tool_use"]
+
+
 def test_stream_parallel_tool_calls_get_separate_blocks():
     events = run_reframer(
         [
@@ -1212,6 +1312,122 @@ def test_stream_reframer_reassembles_sse_frames_split_across_chunks():
         if name == "content_block_delta" and payload["delta"]["type"] == "text_delta"
     ]
     assert "".join(text_deltas) == "hello"
+
+
+def test_stream_reframer_reads_the_upstream_to_its_end_after_done():
+    """The upstream runs past [DONE], so the work it does there runs.
+
+    The chat stream records the request's metrics after its last frame. A
+    reframer that stopped reading at [DONE] left it suspended there, to be
+    closed with GeneratorExit: every streamed /v1/messages request lost its
+    metrics, and the server logged a traceback for it.
+    """
+    after_done = []
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert after_done == ["ran"]
+
+
+def test_stream_reframer_reads_the_upstream_to_its_end_before_message_stop():
+    """A consumer that stops reading at message_stop still lets the upstream end.
+
+    A client may disconnect as soon as it has message_stop. Had message_stop
+    gone out before the upstream was drained, the chat stream would be left
+    suspended at [DONE] and its metrics never recorded.
+    """
+    after_done = []
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        after_done.append("ran")
+
+    async def read_until_message_stop():
+        stream = reframe_openai_stream(source(), MODEL)
+        frames = []
+        async for frame in stream:
+            frames.append(frame)
+            if frame.startswith("event: message_stop"):
+                break
+        await stream.aclose()
+        return frames
+
+    events = parse_frames(asyncio.run(read_until_message_stop()))
+    assert_event_invariants(events)
+    assert after_done == ["ran"]
+
+
+def test_stream_reframer_drops_anything_after_done():
+    """Lines after [DONE] are read to reach the end, never reframed."""
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        yield f"data: {chunk({'content': 'late'}).model_dump_json()}\n\n"
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    text_deltas = [
+        payload["delta"]["text"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(text_deltas) == "hello"
+
+
+def test_stream_reframer_adds_no_event_when_the_upstream_fails_after_done():
+    """message_stop stays the last event when reading past [DONE] fails."""
+
+    async def source():
+        yield f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        yield f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        raise RuntimeError("failed after the last frame")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert "error" not in [name for name, _ in events]
+
+
+def test_stream_reframer_reads_a_byte_stream_to_its_end_when_done_is_split():
+    """A relayed byte stream is read to its EOF however [DONE] is chunked."""
+    body = (
+        f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        "data: [DONE]\n\n"
+    ).encode()
+    split = body.index(b"[DONE]") + len(b"[DO")
+    after_last_chunk = []
+
+    async def source():
+        yield body[:split]
+        yield body[split:]
+        after_last_chunk.append("ran")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert after_last_chunk == ["ran"]
 
 
 def test_stream_reframer_splits_multibyte_characters():

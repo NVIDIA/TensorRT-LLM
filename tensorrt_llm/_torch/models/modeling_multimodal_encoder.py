@@ -16,13 +16,20 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/blob/main/llava/model/multimodal_encoder/
 
 import os
-from typing import Optional, Type
+from typing import TYPE_CHECKING, Optional, Type, cast
 
+import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
 
+from ..._utils import prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
 from .modeling_multimodal_utils import multiscale_forward
+
+if TYPE_CHECKING:
+    from ...llmapi.llm_args import (MultimodalConfig,
+                                    MultimodalEncoderCudaGraphConfig)
+    from .multimodal_encoder_graph import MultimodalEncoderGraphRunner
 
 # Legacy fallback for encoders that do not yet opt into atomic-item scheduling
 # or provide a model-specific item/token-to-segment mapping. Their encoder
@@ -36,6 +43,89 @@ from .modeling_multimodal_utils import multiscale_forward
 # Runtime-scheduled Qwen and Mistral/Pixtral encoders override
 # ``get_encoder_attention_metadata_capacity`` and do not consume this fallback.
 _ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
+
+
+def prepare_encoder_attn_metadata(seq_lens: list[int],
+                                  attn_metadata: AttentionMetadata, *,
+                                  max_seq_len: int) -> AttentionMetadata:
+    """Refresh packed no-KV encoder lengths while preserving captured buffers.
+
+    Args:
+        seq_lens: Nonempty list of nonnegative lengths for independent attention segments,
+            including the isolated padding segment when using a padded graph.
+        attn_metadata: Initialized encoder metadata. Captured length buffers are updated in place.
+        max_seq_len: Positive, stable per-segment capacity, at least the largest live length.
+
+    Returns:
+        The supplied metadata, prepared for context-only attention without a KV cache.
+    """
+    seq_lens = [int(seq_len) for seq_len in seq_lens]
+    if not seq_lens:
+        raise ValueError("Encoder attention requires at least one segment")
+
+    min_seq_len = min(seq_lens)
+    if min_seq_len < 0:
+        raise ValueError(
+            f"Encoder attention segment length must be nonnegative, got {min_seq_len}"
+        )
+
+    if max_seq_len <= 0:
+        raise ValueError(
+            f"Encoder attention max_seq_len must be positive, got {max_seq_len}"
+        )
+    actual_max_seq_len = max(seq_lens)
+    if actual_max_seq_len > max_seq_len:
+        raise ValueError(
+            "Encoder attention segment length exceeds the configured "
+            f"maximum: actual={actual_max_seq_len}, maximum={max_seq_len}. "
+            "Increase encoder_max_num_tokens or reduce the input max_pixels.")
+
+    num_segments = len(seq_lens)
+    seq_lens_torch = torch.tensor(seq_lens,
+                                  dtype=torch.int,
+                                  pin_memory=prefer_pinned())
+    cu_seqlens = torch.empty(num_segments + 1,
+                             dtype=torch.int32,
+                             pin_memory=prefer_pinned())
+    cu_seqlens[0] = 0
+    torch.cumsum(seq_lens_torch, dim=0, out=cu_seqlens[1:])
+
+    attn_metadata.num_contexts = num_segments
+    attn_metadata.request_ids = list(range(1, num_segments + 1))
+    prepare_graph_replay = getattr(attn_metadata,
+                                   "prepare_encoder_cuda_graph_replay", None)
+    is_cuda_graph = attn_metadata.is_cuda_graph
+    if is_cuda_graph and callable(prepare_graph_replay):
+        prepare_graph_replay(seq_lens, sum(seq_lens))
+        # The replay helper refreshes only the host lengths, but the captured
+        # attention op also reads the device lengths; update them in place.
+        attn_metadata.seq_lens_cuda[:num_segments].copy_(seq_lens_torch,
+                                                         non_blocking=True)
+    else:
+        attn_metadata.seq_lens = seq_lens_torch
+    cu_seqlens = cu_seqlens.to(device=attn_metadata.seq_lens_cuda.device,
+                               non_blocking=True)
+    if (is_cuda_graph and attn_metadata.cu_q_seqlens is not None
+            and attn_metadata.cu_q_seqlens.shape == cu_seqlens.shape):
+        # CUDA graph capture bakes these addresses into attention kernels.
+        # Refresh their contents without replacing the captured buffers.
+        attn_metadata.cu_q_seqlens.copy_(cu_seqlens, non_blocking=True)
+        if (attn_metadata.cu_kv_seqlens.data_ptr()
+                != attn_metadata.cu_q_seqlens.data_ptr()):
+            attn_metadata.cu_kv_seqlens.copy_(cu_seqlens, non_blocking=True)
+    else:
+        attn_metadata.cu_q_seqlens = cu_seqlens
+        attn_metadata.cu_kv_seqlens = cu_seqlens
+    # Keep the native attention-op cache key stable across image resolutions.
+    # Actual segment lengths remain available through seq_lens / cu_seqlens.
+    attn_metadata.max_seq_len = max_seq_len
+    # The vision tower runs no-cache, context-only attention and supplies its
+    # own `cu_seqlens` above, so the heavy KV-oriented `prepare()` (kv_lens /
+    # prompt_lens / host_request_types setup) is unnecessary host work.
+    # `prepare_encoder_only` runs the lean path on backends that have one
+    # (TRTLLM) and falls back to the full `prepare()` elsewhere.
+    attn_metadata.prepare_encoder_only()
+    return attn_metadata
 
 
 class MultimodalEncoderMixin:
@@ -52,6 +142,88 @@ class MultimodalEncoderMixin:
     """
     metadata_cls: Type[AttentionMetadata]
     attn_metadata: Optional[AttentionMetadata] = None
+    encoder_cuda_graph_modality: str | None = None
+    _encoder_cuda_graph_config: "MultimodalEncoderCudaGraphConfig | None" = None
+    _blocks_graph_runner: "MultimodalEncoderGraphRunner | None" = None
+
+    @property
+    def encoder_cuda_graph_config(
+            self) -> "MultimodalEncoderCudaGraphConfig | None":
+        """CUDA graph configuration selected for this encoder tower."""
+        return self._encoder_cuda_graph_config
+
+    @encoder_cuda_graph_config.setter
+    def encoder_cuda_graph_config(
+            self, config: "MultimodalEncoderCudaGraphConfig | None") -> None:
+        self._encoder_cuda_graph_config = config
+
+    def configure_encoder_cuda_graph(
+            self, multimodal_config: "MultimodalConfig | None") -> None:
+        """Select this tower's configuration without rejecting other towers' modalities.
+
+        Subclasses declare ``encoder_cuda_graph_modality`` when their graph factory is supported.
+        The engine validates the requested keys against all local encoder capabilities before
+        capturing any graphs. Explicit configs for standalone encoders remain supported.
+
+        Args:
+            multimodal_config: Model-wide configuration shared by its encoder towers.
+        """
+        graph_configs = (multimodal_config.encoder_cuda_graph
+                         if multimodal_config is not None else None)
+        self._encoder_cuda_graph_config = (
+            graph_configs.get(self.encoder_cuda_graph_modality)
+            if graph_configs is not None
+            and self.encoder_cuda_graph_modality is not None else None)
+
+    def _build_blocks_graph_runner(
+        self, config: "MultimodalEncoderCudaGraphConfig"
+    ) -> "MultimodalEncoderGraphRunner":
+        """Describe the block function, tensor specs, and metadata provider.
+
+        Encoders opting into graphs override this factory. Model-specific
+        preprocessing and output assembly stay in the encoder forward.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support encoder CUDA graphs")
+
+    def enable_blocks_cuda_graph(
+        self,
+        config: "MultimodalEncoderCudaGraphConfig | None" = None,
+        *,
+        device: torch.device | None = None,
+        max_num_tokens: int | None = None,
+    ) -> None:
+        """Capture configured block graphs once, after weights and metadata are ready.
+
+        The engine drives this lifecycle for every local multimodal encoder.
+        Standalone callers may provide an explicit config and device. Automatic
+        configs use their own token cap or the engine's original encoder budget;
+        raising the scheduling budget for an oversized item does not enlarge captures.
+        """
+        config = config if config is not None else self._encoder_cuda_graph_config
+        if config is None or self._blocks_graph_runner is not None:
+            return
+        if config.buckets is None and config.max_num_tokens is None:
+            if max_num_tokens is None or max_num_tokens <= 0:
+                raise ValueError("Automatic encoder graphs need max_num_tokens "
+                                 "from the config or engine.")
+            config = config.model_copy(
+                update={"max_num_tokens": max_num_tokens})
+        runner = self._build_blocks_graph_runner(config)
+        if device is None:
+            device = next(cast(nn.Module, self).parameters()).device
+        runner.capture_all(device)
+        self._blocks_graph_runner = runner
+
+    def clear_blocks_cuda_graph(self,
+                                *,
+                                release_nccl_window_owners: bool = True
+                                ) -> None:
+        """Release block graphs at the engine's coordinated teardown boundary."""
+        if self._blocks_graph_runner is not None:
+            self._blocks_graph_runner.clear(
+                release_nccl_window_owners=release_nccl_window_owners)
+            self._blocks_graph_runner = None
 
     def get_encoder_attention_metadata_capacity(
             self, max_num_tokens: int) -> dict[str, int]:

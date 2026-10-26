@@ -1777,10 +1777,12 @@ def test_beam_search_cba_reorders_stop_window():
         m.cache_indirection[0, b, :] = b
     m.cum_log_probs[0] = torch.tensor([-5.0, -1.0])
     # window rows distinguishable per beam
-    stop_window = torch.zeros((3, 1, K), dtype=torch.int32)
+    allocation = torch.zeros(2 * 3 * K, dtype=torch.int32)
+    stop_window = allocation[:3 * K].view(3, 1, K)
     stop_window[:, 0, 0] = 100
     stop_window[:, 0, 1] = 200
-    m.stop_past_tokens = stop_window
+    m.stop_words_metadata = torch.tensor([[allocation.data_ptr(), 0, 0, 3, K]],
+                                         dtype=torch.int64)
 
     # beam1 dominates: both slots descend from beam 1
     logits = torch.full((K, vocab), -50.0)

@@ -644,7 +644,7 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
             content.append(
                 AnthropicThinkingBlock(thinking=reasoning, signature=thinking_signature(reasoning))
             )
-        if message.content:
+        if message.content and message.content.strip():
             content.append(AnthropicTextBlock(text=message.content))
         for tool_call in message.tool_calls:
             try:
@@ -755,6 +755,14 @@ class AnthropicStreamReframer:
         # Whether this stream emitted any tool_use block, which decides the
         # terminating stop_reason; see finish().
         self.emitted_tool_use = False
+        # Whitespace-only text waiting for text that is more than whitespace.
+        # Anthropic clients drop whitespace-only text blocks when they send a
+        # turn back (the API rejects them), so such a block would make the
+        # replayed turn differ from the one served. The model's layout between
+        # blocks (the newlines before a tool call, say) is held here instead:
+        # it opens a text block only together with the text that follows it,
+        # and is dropped when another kind of block opens or the stream ends.
+        self.pending_whitespace = ""
         self.stop_reason: AnthropicStopReason = "end_turn"
         self.stop_sequence: Optional[str] = None
         self.final_usage: Optional[AnthropicUsage] = None
@@ -783,6 +791,8 @@ class AnthropicStreamReframer:
         return frames
 
     def _open_block(self, block: Any, block_type: str) -> List[str]:
+        if block_type != "text":
+            self.pending_whitespace = ""
         frames = self._close_block()
         self.block_index += 1
         self.open_block_type = block_type
@@ -973,12 +983,18 @@ class AnthropicStreamReframer:
                         )
                     )
                 )
-            if delta.content:
+            text = delta.content
+            if text and self.open_block_type != "text":
+                text = self.pending_whitespace + text
+                self.pending_whitespace = "" if text.strip() else text
+                if self.pending_whitespace:
+                    text = ""
+            if text:
                 frames.extend(self._ensure_block("text"))
                 frames.append(
                     anthropic_sse(
                         AnthropicContentBlockDeltaEvent(
-                            index=self.block_index, delta=AnthropicTextDelta(text=delta.content)
+                            index=self.block_index, delta=AnthropicTextDelta(text=text)
                         )
                     )
                 )
@@ -1098,8 +1114,20 @@ async def reframe_openai_stream(
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames."""
     reframer = AnthropicStreamReframer(model=model)
+    done = False
+    # The frames that close the message, held from [DONE] until the upstream
+    # has been read to its end.
+    closing_frames: List[str] = []
     try:
         async for line in _iter_openai_sse_lines(openai_sse):
+            if done:
+                # The upstream is read to its end before the message is closed:
+                # the chat stream records the request's metrics after its last
+                # frame, and a consumer that stops reading at message_stop would
+                # leave it suspended at [DONE], to be closed there (GeneratorExit)
+                # without doing that work. A relayed byte stream likewise ends
+                # cleanly at the worker's EOF.
+                continue
             line = line.strip()
             if not line.startswith("data:"):
                 continue
@@ -1107,15 +1135,19 @@ async def reframe_openai_stream(
             if not data:
                 continue
             if data == "[DONE]":
-                for frame in reframer.finish():
-                    yield frame
-                return
+                closing_frames = reframer.finish()
+                done = True
+                continue
             try:
                 chunk = ChatCompletionStreamResponse(**json.loads(data))
             except (json.JSONDecodeError, ValueError) as e:
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
+        if done:
+            for frame in closing_frames:
+                yield frame
+            return
         # Upstream ended without [DONE]. Both streaming producers emit it only
         # after the response is complete, so its absence means the stream was
         # cut short. Calling finish() here would close the message with
@@ -1133,5 +1165,11 @@ async def reframe_openai_stream(
             yield frame
     except Exception as e:  # noqa: BLE001 - stream must end with an event
         logger.error(f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}")
+        if done:
+            # The response was complete at [DONE], so a failure while reading
+            # the rest of the upstream is logged and the message still closes.
+            for frame in closing_frames:
+                yield frame
+            return
         for frame in reframer.error("Internal server error"):
             yield frame

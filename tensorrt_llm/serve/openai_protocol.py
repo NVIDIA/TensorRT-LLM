@@ -1085,6 +1085,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
+    # the server keeps no copy of a chat completion, so there is nothing to
+    # store or to leave unstored.
+    store: Optional[bool] = None
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None

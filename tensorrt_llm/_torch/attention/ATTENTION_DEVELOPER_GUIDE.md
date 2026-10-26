@@ -742,7 +742,7 @@ Working rules:
 | `tensorrt_llm/_torch/attention/qk_norm_attention.py` | QK-norm attention module logic and fused QK-norm/RoPE/gate dispatch |
 | `tensorrt_llm/_torch/attention/cross_attention.py` | Encoder-decoder cross-attention module logic and cross-KV cache reuse |
 | `tensorrt_llm/_torch/attention/rotary_embedding.py` | Unfused RoPE and mRoPE modules shared across the attention stack |
-| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and unfused fallbacks |
+| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and decide what to do when a kernel does not apply |
 | `tensorrt_llm/_torch/attention/backends/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention/backends/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention/backends/trtllm.py` | TRTLLM backend execution and metadata |
