@@ -286,7 +286,12 @@ def test_independent_prefill_handoffs_keep_distinct_transfer_ids(
     from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID
 
     nonces = iter((0, (1 << 63) - MIN_GLOBAL_ID - 1))
-    monkeypatch.setattr("secrets.randbelow", lambda _upper: next(nonces))
+
+    def next_nonce(upper: int) -> int:
+        assert upper == (1 << 63) - MIN_GLOBAL_ID
+        return next(nonces)
+
+    monkeypatch.setattr("secrets.randbelow", next_nonce)
     transfer_ids = []
     for worker in range(2):
         request = generation_pb2.GenerateRequest()
