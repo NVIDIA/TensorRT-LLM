@@ -438,7 +438,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     kv_cache_manager.nvfp4_residual_dim,
                     num_pool_tokens,
                 )
-                if metadata.retained_block_table is not None:
+                if metadata.has_mixed_precision_retained_rows:
                     overlay_retained_rows(
                         self,
                         metadata,
@@ -488,7 +488,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )
-                    if metadata.retained_block_table is not None:
+                    if metadata.has_mixed_precision_retained_rows:
                         overlay_retained_rows(
                             self,
                             metadata,

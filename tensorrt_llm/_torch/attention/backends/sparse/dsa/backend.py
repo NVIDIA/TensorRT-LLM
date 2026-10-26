@@ -230,7 +230,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
                 metadata._cached_num_pool_tokens,
             )
-            if metadata.retained_block_table is not None:
+            if metadata.has_mixed_precision_retained_rows:
                 overlay_retained_rows(
                     self,
                     metadata,
@@ -269,7 +269,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
                 metadata._cached_num_pool_tokens,
             )
-            if metadata.retained_block_table is not None:
+            if metadata.has_mixed_precision_retained_rows:
                 overlay_retained_rows(
                     self,
                     metadata,

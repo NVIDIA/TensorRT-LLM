@@ -1702,7 +1702,7 @@ class MLA(nn.Module):
                             quant_q_buffer,
                             **fp4_rope_kwargs,
                         )
-                        if getattr(attn_metadata, "retained_block_table", None) is not None:
+                        if getattr(attn_metadata, "has_mixed_precision_retained_rows", False):
                             # Mixed precision: store the retained rows too.
                             store_retained_generation_rows(
                                 self.mqa, attn_metadata, latent_cache, position_ids
