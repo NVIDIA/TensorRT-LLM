@@ -247,16 +247,22 @@ class DeepSeekV31Parser(BaseToolParser):
         """Stream the arguments of the current call from the text that arrived.
 
         Gives the same result as matching the whole buffer: the arguments run
-        from the separator to the first call end token (or the buffer end) and
-        are sent without surrounding whitespace.
+        from the separator to the first call end token (or the buffer end,
+        less a partial call end token) and are sent without surrounding
+        whitespace.
         """
         calls: list[ToolCallItem] = []
         end_idx = current_text.find(_TOOL_CALL_END, self._end_search_start)
         if end_idx == -1:
-            args_end = len(current_text)
             self._end_search_start = max(
                 self._args_start, len(current_text) - len(_TOOL_CALL_END) + 1
             )
+            # A partial call end token is held back until the rest of it
+            # arrives. The token holds one "<", so only the last one can start it.
+            partial_end = current_text.rfind("<", self._end_search_start)
+            if partial_end == -1 or not _TOOL_CALL_END.startswith(current_text[partial_end:]):
+                partial_end = len(current_text)
+            args_end = partial_end
         else:
             args_end = end_idx
             self._end_search_start = end_idx
@@ -299,7 +305,7 @@ class DeepSeekV31Parser(BaseToolParser):
             if end_idx != -1:
                 self._buffer = current_text[end_idx + len(_TOOL_CALL_END) :]
             else:
-                self._buffer = ""
+                self._buffer = current_text[partial_end:]
             self._sep_search_start = 0
             self._args_start = -1
 

@@ -3361,6 +3361,37 @@ def test_deepseek_long_tool_call_streams_in_linear_time(
             })]
 
 
+@pytest.mark.parametrize("chunk_size", range(1, 9))
+def test_deepseek_v31_two_calls_stream_at_any_chunk_size(
+        sample_tools: list[ChatCompletionToolsParam], chunk_size: int) -> None:
+    """Two V3.1 calls with whitespace in their values, cut every few characters.
+
+    The cuts split the call end token, so a partial end token after complete
+    JSON must stay out of the arguments and still end the call.
+    """
+    calls = [("get_weather", '{"location": "a  b", "unit": "x \\n y"}'),
+             ("search_web", '{"query": "  P "}')]
+    text = ("<｜tool▁calls▁begin｜>" + "".join(
+        f"<｜tool▁call▁begin｜>{name}<｜tool▁sep｜>\n{args}\n<｜tool▁call▁end｜>"
+        for name, args in calls) + "<｜tool▁calls▁end｜>")
+    parser = DeepSeekV31Parser()
+    names, arguments = [], {}
+
+    for i in range(0, len(text), chunk_size):
+        result = parser.parse_streaming_increment(text[i:i + chunk_size],
+                                                  sample_tools)
+        for call in result.calls:
+            if call.name:
+                names.append(call.name)
+            arguments[call.tool_index] = (arguments.get(call.tool_index, "") +
+                                          call.parameters)
+
+    assert names == [name for name, _ in calls]
+    assert arguments == {i: args for i, (_, args) in enumerate(calls)}
+    assert [call["arguments"] for call in parser.prev_tool_call_arr
+            ] == [json.loads(args) for _, args in calls]
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
