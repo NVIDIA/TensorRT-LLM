@@ -169,9 +169,8 @@ class PyTorchModelEngine(ModelEngine):
         )
         self._init_from_model()
         self._size_cuda_graphs()
-        backend_num_streams = self._compile_model(
-            configured_encoder_max_num_tokens)
-        self._init_execution_services(backend_num_streams)
+        self._compile_model(configured_encoder_max_num_tokens)
+        self._init_execution_services()
 
     def _init_from_args(
         self,
@@ -440,11 +439,10 @@ class PyTorchModelEngine(ModelEngine):
         self._prefill_cuda_graph_num_tokens = plan.prefill_num_tokens
 
     def _compile_model(
-        self, configured_encoder_max_num_tokens: Optional[int]
-    ) -> Optional[Backend.Streams]:
-        """Compile the model, or install the eager NCCL window tensor scopes, and
-        capture the local multimodal encoders' CUDA graphs; returns the compile
-        backend's auxiliary streams."""
+            self, configured_encoder_max_num_tokens: Optional[int]) -> None:
+        """Compile the model, or install the eager NCCL window tensor scopes,
+        capture the local multimodal encoders' CUDA graphs, and wrap the result
+        in the model caller."""
         torch_compile_config = self.llm_args.torch_compile_config
         prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
         torch_compile_enabled = bool(torch_compile_config is not None)
@@ -540,13 +538,16 @@ class PyTorchModelEngine(ModelEngine):
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
-        return backend_num_streams
+        self._model_caller = ModelCaller(
+            self.model,
+            compile_backend=self._torch_compile_backend,
+            aux_streams=backend_num_streams,
+            prefill_compile_only=self._torch_compile_prefill_only,
+        )
 
-    def _init_execution_services(
-            self, backend_num_streams: Optional[Backend.Streams]) -> None:
+    def _init_execution_services(self) -> None:
         """Build the attention backend, update the speculation config from the
-        loaded model, and build the model caller and the runner around the
-        compiled model."""
+        loaded model, and build the runner around the model caller."""
         # Start outside warmup: load-balancer statistics on, serving MoE
         # communication timeouts.
         self._warmup_depth = 0
@@ -583,12 +584,6 @@ class PyTorchModelEngine(ModelEngine):
         self._lora_model: Optional[torch.nn.Module] = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
-        self._model_caller = ModelCaller(
-            self.model,
-            compile_backend=self._torch_compile_backend,
-            aux_streams=backend_num_streams,
-            prefill_compile_only=self._torch_compile_prefill_only,
-        )
         self._runner = self._initialize_runner(runner_cls)
 
         layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
