@@ -27,8 +27,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
+from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
@@ -38,6 +40,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.render import chat as render_chat_module
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
 # CPU-Generic CI stage, which selects with `-m cpu_only`.
@@ -271,6 +274,168 @@ def test_messages_route_reframes_streaming_response(server_kind):
     assert backend.await_args.args[0].stream
 
 
+class _StreamedGeneration:
+    """A streamed generation whose steps are already post-processed frames.
+
+    After its steps it ends, raises ``then``, or (``hang=True``) waits forever
+    for the next step, as a generation does while the model is still running.
+    """
+
+    prompt_token_ids = [1, 2, 3]
+
+    def __init__(self, steps, *, then=None, hang=False):
+        self._steps = list(steps)
+        self._then = then
+        self._hang = hang
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._steps:
+            frames = self._steps.pop(0)
+            return SimpleNamespace(
+                finished=not self._steps,
+                outputs=[SimpleNamespace(_postprocess_result=frames)],
+            )
+        if self._then is not None:
+            raise self._then
+        if self._hang:
+            await asyncio.Event().wait()
+        raise StopAsyncIteration
+
+
+class _ModelConfig:
+    model_type = "llama"
+    vocab_size = 1024
+
+
+async def _chat_stream(monkeypatch, generation):
+    """The body of a streamed /v1/chat/completions response, and the server.
+
+    The real ``openai_chat`` handler runs on a server built with
+    ``object.__new__``; prompt rendering and the engine are stubbed, and the
+    engine's output is already post-processed into SSE frames.
+    """
+
+    async def render(**kwargs):
+        return "rendered prompt"
+
+    monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render)
+    server = object.__new__(OpenAIServer)
+    server.model = MODEL
+    server.allow_request_chat_template = False
+    server.model_config = _ModelConfig()
+    server.processor = None
+    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1024))
+    server.chat_template = None
+    server.tool_parser = None
+    server.tool_call_id_type = "random"
+    server.multimodal_server_config = None
+    server._is_visual_gen = False
+    server._adjusted_steady_clock = SimpleNamespace(now=time.monotonic)
+    server.generator = SimpleNamespace(
+        args=SimpleNamespace(
+            gather_generation_logits=False,
+            reasoning_parser=None,
+            backend="pytorch",
+            guided_decoding_backend=None,
+            num_postprocess_workers=1,
+        ),
+        generate_async=Mock(return_value=generation),
+    )
+    server.await_disconnected = AsyncMock()
+    server._extract_metrics = AsyncMock()
+    request = ChatCompletionRequest(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True
+    )
+    raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+    response = await server.openai_chat(request, raw_request)
+    assert isinstance(response, StreamingResponse), response.body
+    return response.body_iterator, server
+
+
+@pytest.fixture
+def server_logger(monkeypatch):
+    log = Mock()
+    monkeypatch.setattr(openai_server_module, "logger", log)
+    return log
+
+
+def test_chat_stream_read_to_its_end_records_the_metrics(monkeypatch, server_logger):
+    """Past [DONE] the chat stream records the request's metrics."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"], ["data: two\n\n"]])
+        stream, server = await _chat_stream(monkeypatch, generation)
+        frames = [frame async for frame in stream]
+        return frames, server
+
+    frames, server = asyncio.run(run())
+
+    assert frames == ["data: one\n\n", "data: two\n\n", "data: [DONE]\n\n"]
+    server._extract_metrics.assert_awaited_once()
+    server_logger.error.assert_not_called()
+
+
+def test_chat_stream_closed_by_its_consumer_logs_no_error(monkeypatch, server_logger):
+    """A consumer that stops reading (GeneratorExit) is not a stream error."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"], ["data: two\n\n"]])
+        stream, server = await _chat_stream(monkeypatch, generation)
+        assert await stream.__anext__() == "data: one\n\n"
+        await stream.aclose()
+        return server
+
+    server = asyncio.run(run())
+
+    server._extract_metrics.assert_not_awaited()
+    server_logger.error.assert_not_called()
+
+
+def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server_logger):
+    """A client that disconnects cancels the stream; that is not a stream error."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"]], hang=True)
+        stream, _ = await _chat_stream(monkeypatch, generation)
+        first_frame = asyncio.Event()
+
+        async def consume():
+            async for _ in stream:
+                first_frame.set()
+
+        consumer = asyncio.create_task(consume())
+        # Bounded, so a stream that fails before its first frame fails the
+        # test instead of hanging it.
+        await asyncio.wait_for(first_frame.wait(), timeout=5.0)
+        # The stream is now waiting on the generation for its next step.
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+    asyncio.run(run())
+
+    server_logger.error.assert_not_called()
+
+
+def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
+    """A failure of the generation itself is still logged and raised."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
+        stream, _ = await _chat_stream(monkeypatch, generation)
+        with pytest.raises(RuntimeError, match="engine failed"):
+            async for _ in stream:
+                pass
+
+    asyncio.run(run())
+
+    server_logger.error.assert_called_once()
+    assert "engine failed" in server_logger.error.call_args.args[0]
+
+
 def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
     # The disagg server's register_routes mounts a prometheus multiprocess
     # collector, which errors unless PROMETHEUS_MULTIPROC_DIR points at a real
@@ -287,9 +452,10 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
         args=SimpleNamespace(return_perf_metrics=False),
     )
     standard.use_harmony = False
-    # register_routes() reads this to decide whether to mount the RL
+    # register_routes() reads these to decide whether to mount the optional
     # control endpoints. Building the server with object.__new__ skips
     # __init__, so anything register_routes() touches has to be supplied.
+    standard._enable_runtime_control_endpoints = False
     standard._enable_rl_control_endpoints = False
     standard.register_routes()
 
@@ -374,9 +540,10 @@ def test_batch_routes_are_registered_on_the_standard_server():
         args=SimpleNamespace(return_perf_metrics=False),
     )
     standard.use_harmony = False
-    # register_routes() reads this to decide whether to mount the RL
+    # register_routes() reads these to decide whether to mount the optional
     # control endpoints. Building the server with object.__new__ skips
     # __init__, so anything register_routes() touches has to be supplied.
+    standard._enable_runtime_control_endpoints = False
     standard._enable_rl_control_endpoints = False
     standard.register_routes()
 
@@ -609,23 +776,33 @@ def test_handle_exception_maps_status_and_counter(exception, expected_status, ex
     assert incremented == {expected_counter}
 
 
+_FAKE_DEFAULT_TEMPLATE = "FAKE-DEFAULT-TEMPLATE"
+
+
 class _FakeTokenizer:
     """Renders a prompt the way a chat template would, and counts words."""
 
-    def apply_chat_template(self, messages, **kwargs):
+    def get_chat_template(self, chat_template=None, tools=None):
+        return chat_template or _FAKE_DEFAULT_TEMPLATE
+
+    def apply_chat_template(self, messages=None, **kwargs):
+        if messages is None:
+            # The chat pipeline passes the conversation by keyword.
+            messages = kwargs.pop("conversation")
         parts = [str(m.get("content", "")) for m in messages]
         # Tools and the thinking prefix change the real prompt, so reflect them
         # here too - a count that ignored them would not be worth taking.
         for tool in kwargs.get("tools") or []:
             parts.append(str(tool))
         # A real template changes the rendered prompt, so a fake that dropped
-        # it would make any test of template plumbing pass vacuously.
+        # it would make any test of template plumbing pass vacuously. The
+        # tokenizer's own default template is not an override.
         template = kwargs.get("chat_template")
-        if template:
+        if template and template != _FAKE_DEFAULT_TEMPLATE:
             parts.append(str(template))
         return " ".join(parts)
 
-    def encode(self, text):
+    def encode(self, text, add_special_tokens=True, **kwargs):
         return text.split()
 
 

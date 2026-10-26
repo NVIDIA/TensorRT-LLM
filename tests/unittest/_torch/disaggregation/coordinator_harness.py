@@ -47,7 +47,7 @@ class TransferRequest(SimpleNamespace):
         super().__init__(**defaults)
         self.state_at_response_creation = None
 
-    def create_response(self, _use_fast_logits, _rank):
+    def create_response(self):
         self.state_at_response_creation = self.state
         return self.response
 
@@ -78,6 +78,7 @@ class CoordinatorHarness:
         draft_kv_cache_manager=None,
         admission_controller=None,
         is_kv_manager_v2=False,
+        defer_unready_gen_receives=False,
         dist=None,
     ) -> None:
         self.transceiver = FakeKvCacheTransceiver(
@@ -112,6 +113,7 @@ class CoordinatorHarness:
             draft_kv_cache_manager=draft_kv_cache_manager,
             admission_controller=admission_controller,
             is_kv_manager_v2=is_kv_manager_v2,
+            defer_unready_gen_receives=defer_unready_gen_receives,
         )
 
     def send(self, *requests: TransferRequest) -> None:

@@ -47,8 +47,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // ---------------------------------------------------------------------------
 
 // Serialized layout of a ReuseScope, consumed by Hasher::update(ReuseScope).
-// Must stay byte-identical to the Python ReuseScope.to_bytes(): a mask byte
-// followed by one little-endian uint64 per present field (signed=False).
+// A presence mask, followed by an optional little-endian uint64 LoRA id and
+// an optional salt encoded as its uint64 byte length followed by its bytes.
+// An absent salt and an empty string have different presence masks.
 template <typename Emit>
 static void emitReuseScopeBytes(ReuseScope const& scope, Emit&& emit)
 {
@@ -69,8 +70,9 @@ static void emitReuseScopeBytes(ReuseScope const& scope, Emit&& emit)
     }
     if (scope.salt.has_value())
     {
-        std::uint64_t const value = *scope.salt;
-        emit(reinterpret_cast<uint8_t const*>(&value), sizeof(value));
+        std::uint64_t const length = scope.salt->size();
+        emit(reinterpret_cast<uint8_t const*>(&length), sizeof(length));
+        emit(reinterpret_cast<uint8_t const*>(scope.salt->data()), scope.salt->size());
     }
 }
 
@@ -250,6 +252,7 @@ NodeBase::~NodeBase()
     for (auto& [k, child] : next)
     {
         child->prev = nullptr;
+        child->root = nullptr;
     }
 }
 
@@ -262,7 +265,9 @@ SharedPtr<Block> NodeBase::detachNext(BlockKey const& blockKey)
     }
 
     auto block = it->second;
+    TLLM_CHECK_DEBUG(block->next.empty()); // Subtrees are detached leaf-first by removeSubtree().
     block->prev = nullptr;
+    block->root = nullptr;
     next.erase(it);
     if (eventSink)
     {
@@ -315,6 +320,8 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
     : NodeBase(k, prevNode->eventSink)
     , tokens(std::move(toks))
     , prev(prevNode)
+    , root(prevNode->type() == Type::kROOT_BLOCK ? static_cast<RootBlock*>(prevNode)
+                                                 : static_cast<Block*>(prevNode)->root)
     , storage(prevNode->numLifeCycles(), nullptr) // tree-wide count, derived from prev
     , mOrdinal(prevNode->ordinal() + 1)
 {
@@ -387,6 +394,7 @@ Block::~Block()
 
 bool Block::isOrphan() const noexcept
 {
+    KVCM2_CHECK_FATAL_DEBUG((prev == nullptr) == (root == nullptr));
     KVCM2_CHECK_FATAL_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
     return prev == nullptr;
 }
@@ -482,7 +490,8 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 
     // If this is a full-attention block or a sink block: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
+    if (alc && alc->requiresPrefixCoverage()
+        && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
         detachedBlocks.push_back(removeSubtree(block));
@@ -585,6 +594,9 @@ void attachBlock(NodeBase* prev, SharedPtr<Block> const& block)
     // Redundant for a freshly constructed block; the re-attach path needs it to restore
     // the link the prune walk cleared.
     block->prev = prev;
+    block->root
+        = prev->type() == NodeBase::Type::kROOT_BLOCK ? static_cast<RootBlock*>(prev) : static_cast<Block*>(prev)->root;
+    TLLM_CHECK_DEBUG(block->root != nullptr);
     // Keep the parent attached while covered children are replaced. Adding the replacement
     // first prevents detachNext() from pruning an emptied RootBlock out of the tree.
     prevNext[block->key] = block;
@@ -887,6 +899,10 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
+            if (!attn->requiresPrefixCoverage())
+            {
+                continue;
+            }
             auto const staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
             int const staleBeg = staleRange.beg.value();
             int const staleEnd = staleRange.end.value();

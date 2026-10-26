@@ -49,7 +49,7 @@ from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
                       NonNegativeInt, PositiveInt, field_validator,
-                      model_validator)
+                      model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -152,6 +152,73 @@ class OpenAIBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
+class SpeculativeDecodingStats(OpenAIBaseModel):
+    """Per-request speculative-decoding acceptance for one generated sequence.
+
+    Opt-in: emitted only when the server sets per_request_spec_decode_stats.
+    Absent entirely when the request drafted nothing. PyTorch backend only.
+
+    ``mean acceptance length`` is deliberately not a field here: it is already
+    reported per choice as ``avg_decoded_tokens_per_iter``, and duplicating it
+    would let the two drift. Consumers derive it as
+    ``1 + total_accepted_draft_tokens / num_spec_steps``.
+
+    Three identities hold on every emitted record, and a consumer may rely on
+    them:
+
+    * ``sum(acceptance_histogram) == num_spec_steps``
+    * ``sum(j * acceptance_histogram[j]) == total_accepted_draft_tokens``
+    * ``total_accepted_draft_tokens <= total_draft_tokens``
+    """
+
+    acceptance_rate: float = Field(
+        description="Accepted draft tokens divided by proposed draft tokens.")
+    total_accepted_draft_tokens: int = Field(
+        description="Draft tokens accepted across the request, excluding the "
+        "always-accepted bonus token.")
+    total_draft_tokens: int = Field(
+        description="Draft tokens proposed across the request. For tree "
+        "drafting this counts paths, not tree nodes, mirroring the "
+        "getMaxDraftPathLen clamp in updateNumTokensPerIteration.")
+    num_spec_steps: int = Field(
+        description="Verify steps performed for the request. Equals the sum of "
+        "acceptance_histogram.")
+    acceptance_histogram: List[int] = Field(
+        description="Dense histogram indexed by accepted-draft count: entry j "
+        "is the number of verify steps that accepted exactly j draft tokens. "
+        "Tree-agnostic -- it records output lengths per step and encodes no "
+        "parent/child structure.")
+    num_spec_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum draft length per step, when the run has a fixed "
+        "bound. None under draft_len_schedule, where the bound varies by batch "
+        "size.")
+
+
+class _OmitsAbsentSpecDecodeStats(OpenAIBaseModel):
+    """Drops ``speculative_decoding`` from serialized output when it is absent.
+
+    Per-request spec-decode stats are off by default, so without this every
+    response on the paths that serialize with a plain ``model_dump()`` -- the
+    non-streaming chat and completions responses, and the completions stream
+    (``exclude_unset=False``) -- would gain ``"speculative_decoding": null`` for
+    every user, whether or not they enabled ``per_request_spec_decode_stats``.
+
+    Scoped to this one field on purpose. Blanket ``exclude_none`` would also
+    strip unrelated optional fields that clients may rely on being present, and
+    the dump calls are spread across the serving layer rather than funnelled
+    through one place where an ``exclude=`` argument could be applied.
+    """
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_spec_decode_stats(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("speculative_decoding",
+                                               ...) is None:
+            data.pop("speculative_decoding", None)
+        return data
+
+
 class StreamOptions(OpenAIBaseModel):
     include_usage: Optional[bool] = True
     continuous_usage_stats: Optional[bool] = False
@@ -241,6 +308,15 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     ctx_usage: Optional[UsageInfo] = None
+    remote_tail_start: Optional[NonNegativeInt] = Field(
+        default=None,
+        description=
+        "Prompt-token boundary transferred by a remote-tail context worker.")
+    multimodal_positions: Optional[List[NonNegativeInt]] = Field(
+        default=None,
+        description="Prompt-token offset of each multimodal item.")
+    multimodal_lengths: Optional[List[PositiveInt]] = Field(
+        default=None, description="Prompt-token count of each multimodal item.")
     # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
     # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
     # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
@@ -252,6 +328,22 @@ class DisaggregatedParams(OpenAIBaseModel):
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
     resolved_thinking: Optional[bool] = None
+    # Orchestrator -> generation worker: seconds since arrival at the orchestrator.
+    orig_elapsed_s: Optional[float] = None
+
+    @model_validator(mode="after")
+    def validate_multimodal_spans(self) -> "DisaggregatedParams":
+        if (self.multimodal_positions is None) != (self.multimodal_lengths
+                                                   is None):
+            raise ValueError(
+                "multimodal_positions and multimodal_lengths must be provided together"
+            )
+        if (self.multimodal_positions is not None and len(
+                self.multimodal_positions) != len(self.multimodal_lengths)):
+            raise ValueError(
+                "multimodal_positions and multimodal_lengths must have the same length"
+            )
+        return self
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -286,7 +378,9 @@ class ErrorResponse(OpenAIBaseModel):
     message: str
     type: str
     param: Optional[str] = None
-    code: int
+    # HTTP status by default; a machine-readable string for conditions that
+    # define one (e.g. "context_length_exceeded", matching OpenAI).
+    code: Union[int, str]
 
 
 class CompletionLogProbs(OpenAIBaseModel):
@@ -296,7 +390,7 @@ class CompletionLogProbs(OpenAIBaseModel):
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
-class CompletionResponseChoice(OpenAIBaseModel):
+class CompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     text: str
     token_ids: Optional[List[int]] = None
@@ -313,6 +407,8 @@ class CompletionResponseChoice(OpenAIBaseModel):
     )
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -327,7 +423,7 @@ class CompletionResponse(OpenAIBaseModel):
     prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
 
 
-class CompletionResponseStreamChoice(OpenAIBaseModel):
+class CompletionResponseStreamChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     text: str
     token_ids: Optional[List[int]] = None
@@ -341,6 +437,8 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
             "including encountering the EOS token"),
     )
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -628,7 +726,6 @@ class CompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             if backend == "pytorch" or gather_generation_logits:
                 sampling_logprobs = self.logprobs
@@ -636,8 +733,6 @@ class CompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             best_of=self.best_of,
@@ -681,8 +776,6 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -822,7 +915,7 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: Optional[List[ChatCompletionLogProbsContent]] = None
 
 
-class ChatCompletionResponseChoice(OpenAIBaseModel):
+class ChatCompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     message: ChatMessage
     logprobs: Optional[ChatCompletionLogProbs] = None
@@ -834,6 +927,8 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -860,13 +955,15 @@ class DeltaMessage(OpenAIBaseModel):
     tool_calls: Optional[List[DeltaToolCall]] = None
 
 
-class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
+class ChatCompletionResponseStreamChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     delta: DeltaMessage
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -990,6 +1087,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
+    # the server keeps no copy of a chat completion, so there is nothing to
+    # store or to leave unstored.
+    store: Optional[bool] = None
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None
@@ -1153,7 +1254,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
             if backend == "pytorch" or gather_generation_logits:
@@ -1162,8 +1262,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`gather_generation_logits` must be `True` to use `top_logprobs`"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -1207,8 +1305,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -1742,6 +1838,12 @@ class MemoryUpdateRequest(OpenAIBaseModel):
         description="Memory tags to release/resume, e.g. ['model', 'kv_cache']")
 
 
+class RuntimeMemoryUpdateRequest(OpenAIBaseModel):
+    tags: Optional[List[str]] = Field(
+        default=None,
+        description="Memory tags to release/resume; omit to select defaults")
+
+
 class UpdateWeightsRequest(OpenAIBaseModel):
     weights: Optional[Dict[str, str]] = Field(
         default=None,
@@ -1889,6 +1991,9 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
+        remote_tail_start=tllm_disagg_params.remote_tail_start,
+        multimodal_positions=tllm_disagg_params.multimodal_positions,
+        multimodal_lengths=tllm_disagg_params.multimodal_lengths,
     )
 
 
@@ -1913,6 +2018,10 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
+        remote_tail_start=disaggregated_params.remote_tail_start,
+        multimodal_positions=disaggregated_params.multimodal_positions,
+        multimodal_lengths=disaggregated_params.multimodal_lengths,
+        orig_elapsed_s=disaggregated_params.orig_elapsed_s,
     )
 
 

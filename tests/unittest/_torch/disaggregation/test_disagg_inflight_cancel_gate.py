@@ -29,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2,
@@ -488,7 +489,7 @@ def test_direct_cpp_wrapper_rejects_python_runtime_opt_in(monkeypatch):
 
 
 def test_flag_unset_preserves_existing_backend_selection(monkeypatch):
-    config = CacheTransceiverConfig(backend="UCX")
+    config = CacheTransceiverConfig(backend="UCX", transceiver_runtime="CPP")
     expected = object()
     constructor = Mock(return_value=expected)
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
@@ -507,7 +508,9 @@ def test_flag_unset_preserves_python_transceiver(monkeypatch):
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
     monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
 
-    result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+    result = transceiver_module.create_kv_cache_transceiver(
+        Mock(), Mock(), Mock(spec=KVCacheManagerV2), Mock(), config
+    )
 
     assert result is expected
     constructor.assert_called_once()
@@ -568,7 +571,7 @@ def test_cpp_runtime_keeps_cpp_mamba_manager(monkeypatch, runtime):
 
 def test_flag_unset_preserves_libfabric_selection(monkeypatch):
     monkeypatch.setenv(transceiver_module._NIXL_KVCACHE_BACKEND_ENV, "LIBFABRIC")
-    config = CacheTransceiverConfig(backend="NIXL")
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
     expected = object()
     constructor = Mock(return_value=expected)
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
@@ -590,7 +593,7 @@ def test_flag_unset_preserves_libfabric_selection(monkeypatch):
 )
 def test_flag_unset_preserves_legacy_backend_env(monkeypatch, selector, expected_backend):
     monkeypatch.setenv(selector, "1")
-    config = CacheTransceiverConfig(backend="DEFAULT")
+    config = CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
     constructor = Mock(return_value=object())
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
 
@@ -608,7 +611,7 @@ def test_flag_unset_preserves_legacy_backend_env_precedence(monkeypatch):
         "TRTLLM_USE_NIXL_KVCACHE",
     ):
         monkeypatch.setenv(selector, "1")
-    config = CacheTransceiverConfig(backend="DEFAULT")
+    config = CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", Mock())
 
     transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)

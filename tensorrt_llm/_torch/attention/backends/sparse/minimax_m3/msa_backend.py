@@ -60,7 +60,7 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import MsaIndexer, cutedsl_score_runner
+from .msa_indexer import MsaIndexer, cutedsl_score_runner, segmented_proxy_plan
 
 
 def _cache_device(meta) -> torch.device:
@@ -154,7 +154,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_out_cache_loc: Optional[torch.Tensor] = None
     # Zero-copy pool views prepared outside Dynamo; PCG passes these explicitly
     # to its mutable producer instead of hiding writes behind runtime metadata.
-    msa_layer_cache_tensors: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None
+    msa_layer_cache_tensors: Optional[
+        dict[int, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]
+    ] = None
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
@@ -165,6 +167,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # plan, so both forms are staged rather than derived at the call site.
     msa_block_table: Optional[torch.Tensor] = None
     msa_seq_lens_cuda: Optional[torch.Tensor] = None
+    msa_qo_lens_cuda: Optional[torch.Tensor] = None
     msa_cu_q_lens: Optional[torch.Tensor] = None
     msa_cu_kv_lens: Optional[torch.Tensor] = None
     # msa_block_table with each slot expanded into the K and V sub-pages the
@@ -191,6 +194,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # never captured. Built once per step in prepare() and reused by every
     # layer.
     _msa_prefill_proxy_plan: Optional[tuple] = None
+    _msa_prefill_proxy_kv_indices: Optional[torch.Tensor] = None
     _msa_prefill_gqa_plan: Optional[tuple] = None
     _msa_prefill_dense_plan: Optional[tuple] = None
     # Per-token valid-block count for the prefill-side indexer proxy. It is
@@ -277,6 +281,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def msa_prefill_proxy_plan(self) -> Optional[tuple]:
         """Prebuilt indexer proxy plan for this step's fmha_sm100 rows."""
         return self._msa_prefill_proxy_plan
+
+    @property
+    def msa_prefill_proxy_kv_indices(self) -> Optional[torch.Tensor]:
+        """Flattened page table msa_prefill_proxy_plan reads; see segmented_proxy_plan."""
+        kv_indices = self._msa_prefill_proxy_kv_indices
+        return self.msa_kv_indices if kv_indices is None else kv_indices
 
     @property
     def msa_prefill_gqa_plan(self) -> Optional[tuple]:
@@ -411,6 +421,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             layer_idx: (
                 kv_cache_manager.get_buffers(layer_idx, kv_layout="HND"),
                 self.msa_idx_k_cache(layer_idx),
+                (
+                    kv_cache_manager.get_block_scale_buffers(layer_idx, kv_layout="HND")
+                    if kv_cache_manager.is_nvfp4_layer(layer_idx)
+                    else None
+                ),
             )
             for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ())
             if layer_idx in kv_cache_manager.layer_offsets
@@ -451,6 +466,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
         if getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4:
+            self.msa_qo_lens_cuda = self.get_empty(
+                buffers,
+                (max_num_sequences,),
+                cache_name="msa_qo_lens_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
             self.msa_cu_q_lens = self.get_empty(
                 buffers,
                 (max_num_sequences + 1,),
@@ -889,6 +911,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         per-step tensors.
         """
         self._msa_prefill_proxy_plan = None
+        self._msa_prefill_proxy_kv_indices = None
         self._msa_prefill_gqa_plan = None
         self._msa_prefill_dense_plan = None
         self._msa_prefill_n_valid_blocks = None
@@ -955,16 +978,30 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
         # branch; output_maxscore feeds the indexer's top-k block selection.
-        self._msa_prefill_proxy_plan = plan_for(
-            self._msa_proxy_plan_rows(),
-            num_qo_heads=num_index_heads,
-            num_kv_heads=1,
-            output_maxscore=True,
+        # Its rows are a batch prefix, so their pages prefix msa_kv_indices.
+        proxy_rows = self._msa_proxy_plan_rows()
+        segmented = proxy_rows is not None and segmented_proxy_plan(
+            fmha_sm100,
+            qo_lens_cpu[: proxy_rows[1]],
+            qo_offset_cpu[: proxy_rows[1]],
+            num_index_heads=num_index_heads,
+            page_size=page_size,
+            kv_indices=self.msa_kv_indices,
         )
+        if segmented:
+            self._msa_prefill_proxy_plan, self._msa_prefill_proxy_kv_indices = segmented
+        else:
+            self._msa_prefill_proxy_plan = plan_for(
+                proxy_rows,
+                num_qo_heads=num_index_heads,
+                num_kv_heads=1,
+                output_maxscore=True,
+            )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
+        # NVFP4 sparse layers run the MSA CSR kernel, which takes no plan.
         self._msa_prefill_gqa_plan = plan_for(
-            attn_rows,
+            None if self.kv_cache_manager.dtype == DataType.NVFP4 else attn_rows,
             num_qo_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             kv_block_num=params.topk,
@@ -1089,8 +1126,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_live_batch = batch_size
             self.msa_cu_q_lens[0].zero_()
             self.msa_cu_kv_lens[0].zero_()
+            qo_lens_cuda = self.msa_qo_lens_cuda[:batch_size]
+            qo_lens_cuda.copy_(qo_lens_cpu, non_blocking=True)
             torch.cumsum(
-                maybe_pin_memory(qo_lens_cpu).to(cache_device, non_blocking=True),
+                qo_lens_cuda,
                 0,
                 out=self.msa_cu_q_lens[1 : batch_size + 1],
             )
@@ -1509,7 +1548,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             idx_q_view,
             idx_k_cache,
             idx_sm_scale=idx_sm_scale,
-            kv_indices=metadata.msa_kv_indices,
+            kv_indices=metadata.msa_prefill_proxy_kv_indices,
             qo_lens_cpu=metadata.msa_qo_lens_cpu,
             kv_lens_cpu=metadata.msa_kv_lens_cpu,
             qo_offset_cpu=metadata.msa_qo_offset_cpu,

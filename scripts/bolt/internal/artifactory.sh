@@ -20,8 +20,15 @@
 #       bundle for an OLD ref without repointing latest at it. Used by POSTMERGE.
 #
 #   pull-latest <branch> <triple> <dest_dir>
-#       Download + extract latest.tar.gz for <branch>/<triple> into <dest_dir>.
-#       Used by PREMERGE (and postmerge fallback is intentionally NOT provided).
+#       Download + extract a bundle for <branch>/<triple> into <dest_dir>.
+#       Honours BOLT_PROFILE_REF: when set, pulls the immutable
+#       bolt-profile-<ref>-<triple>.tar.gz instead of the mutable latest.tar.gz,
+#       so every consumer in a pipeline can be pinned to one bundle. Unset keeps
+#       today's behaviour.
+#
+#   resolve-latest <branch> <triple>
+#       Print the ref latest.tar.gz currently points at, for a caller that wants
+#       to pin the rest of a pipeline to it. Prints nothing if undeterminable.
 #
 # The premerge "override" case does NOT use promote: the gen recipe packages a
 # bundle locally and apply consumes it directly (run-scoped, never promoted).
@@ -116,12 +123,66 @@ cmd_promote() {
     fi
 }
 
+# Print the ref that <branch>/<triple>'s latest.tar.gz currently points at, or
+# nothing when it cannot be determined. Read-only, anonymous, cheap.
+#
+# `promote` labels latest.tar.gz with a bolt.ref property in the same request that
+# uploads it, so the label and the bytes can never disagree. Bundles promoted
+# before that existed carry no property, hence the manifest fallback: download the
+# bundle (~1 MB) and read `ref` out of manifest.json. A caller that gets nothing
+# back should stay unpinned rather than guess.
+cmd_resolve_latest() {
+    local branch="${1:?resolve-latest: <branch> <triple>}"
+    local triple="${2:?triple required}"
+    local base="${BOLT_ARTIFACTORY_BASE:-https://urm.nvidia.com/artifactory}"
+    local path; path="$(promote_dir "$branch" "$triple")/latest.tar.gz"
+
+    local props ref=""
+    # --max-time as well as --connect-timeout: the caller runs this in
+    # preparation(), before any job launches, so a stalled transfer (connected,
+    # then silent) would hold the entire pipeline rather than fall back to
+    # unpinned. Bound the whole request, retries included.
+    props="$(curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --max-time 60 \
+                  "$base/api/storage/$path?properties" 2>/dev/null || true)"
+    # { "properties": { "bolt.ref": [ "<ref>" ] } } -- fixed, tiny shape, so a sed
+    # extraction avoids depending on python3 or jq, neither of which is guaranteed
+    # on every pod that might call this.
+    ref="$(printf '%s' "$props" \
+           | tr -d ' \n' \
+           | sed -n 's/.*"bolt\.ref":\["\([^"]*\)"\].*/\1/p')"
+    if [[ -n "$ref" ]]; then
+        printf '%s\n' "$ref"
+        return 0
+    fi
+
+    log "no bolt.ref property on $path; falling back to the bundle manifest"
+    local tmp; tmp="$(mktemp -d)"
+    if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 60 --max-time 300 \
+            -o "$tmp/latest.tar.gz" "$base/$path" 2>/dev/null \
+       && tar -xzf "$tmp/latest.tar.gz" -C "$tmp" manifest.json 2>/dev/null; then
+        ref="$(tr -d ' \n' < "$tmp/manifest.json" \
+               | sed -n 's/.*"ref":"\([^"]*\)".*/\1/p')"
+    fi
+    rm -rf "$tmp"
+    [[ -n "$ref" ]] && printf '%s\n' "$ref"
+    return 0
+}
+
 cmd_pull_latest() {
     local branch="${1:?pull-latest: <branch> <triple> <dest_dir>}"
     local triple="${2:?triple required}"
     local dest="${3:?dest_dir required}"
     local base="${BOLT_ARTIFACTORY_BASE:-https://urm.nvidia.com/artifactory}"
-    local url="$base/$(promote_dir "$branch" "$triple")/latest.tar.gz"
+    # BOLT_PROFILE_REF pins this pull to one immutable bundle. Threaded as an env
+    # var rather than an argument so every existing call site keeps working: a
+    # caller opts into pinning by exporting it, and unset means today's behaviour.
+    local url
+    if [[ -n "${BOLT_PROFILE_REF:-}" ]]; then
+        url="$base/$(promote_dir "$branch" "$triple")/bolt-profile-${BOLT_PROFILE_REF}-${triple}.tar.gz"
+        log "Pinned to ${BOLT_PROFILE_REF}"
+    else
+        url="$base/$(promote_dir "$branch" "$triple")/latest.tar.gz"
+    fi
     mkdir -p "$dest"
     log "Pulling $url -> $dest"
     # Anonymous download (like jenkins/Build.groovy's tarball from the same
@@ -148,8 +209,9 @@ cmd_pull_latest() {
 }
 
 case "${1:-}" in
-    package)      shift; cmd_package "$@" ;;
-    promote)      shift; cmd_promote "$@" ;;
-    pull-latest)  shift; cmd_pull_latest "$@" ;;
-    *) die "usage: artifactory.sh {package|promote|pull-latest} ..." ;;
+    package)        shift; cmd_package "$@" ;;
+    promote)        shift; cmd_promote "$@" ;;
+    pull-latest)    shift; cmd_pull_latest "$@" ;;
+    resolve-latest) shift; cmd_resolve_latest "$@" ;;
+    *) die "usage: artifactory.sh {package|promote|pull-latest|resolve-latest} ..." ;;
 esac

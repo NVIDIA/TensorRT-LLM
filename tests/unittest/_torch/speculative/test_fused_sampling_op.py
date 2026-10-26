@@ -14,11 +14,11 @@
 # limitations under the License.
 """Correctness of the fused sampling op against Torch references.
 
-Semantic tests use the production pipeline -- ``min_p_renorm_probs`` then top-k then
-top-p renorm, the order ``sampler_strategy._compute_probs`` uses and
-``docs/source/features/sampling.md`` documents.  A separate numerical-error matrix uses
-a mechanically independent pure-Torch implementation, so sharing a backend cannot make
-the fused op and its oracle reproduce the same arithmetic mistake.
+Semantic tests use a reference pipeline -- softmax, ``min_p_renorm_probs``, then
+flashinfer's top-k and top-p renorm, the filter order ``docs/source/features/sampling.md``
+documents.  A separate numerical-error matrix uses a mechanically independent pure-Torch
+implementation, so sharing a backend cannot make the fused op and its oracle reproduce the
+same arithmetic mistake.
 
 What is deliberately NOT asserted: equality of sampled token *ids* against the flashinfer
 path. The two consume their RNG differently, so identical ids are not expected; token
@@ -76,7 +76,7 @@ def _reference_probs(
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
 ) -> torch.Tensor:
-    """The TorchSampler pipeline: temperature+softmax, then min-p, top-k, top-p."""
+    """TorchSampler's filter order: temperature+softmax, then min-p, top-k, top-p."""
     probs = torch.softmax(logits.float() / temperatures.unsqueeze(-1), dim=-1)
     if (min_ps > 0).any():
         probs = min_p_renorm_probs(probs, min_ps)
@@ -490,6 +490,76 @@ def test_same_seed_and_offset_reproduce_the_same_tokens() -> None:
     assert torch.equal(first, second)
 
 
+def test_tiny_temperature_scales_logits_exactly() -> None:
+    """At T=1e-8 a 1e-6 logit gap is 100 nats: the larger token must always win."""
+    dev = "cuda"
+    rows, vocab = 256, 4096
+    logits = torch.full((rows, vocab), -1.0, device=dev)
+    logits[:, 0] = 0.0
+    logits[:, 1] = 1e-6
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, temperature=1e-8)
+    seed, offset = _rng(rows, dev)
+
+    tokens, probs = fused.fused_sample_from_logits_with_probs(
+        logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+    )
+    assert (probs[:, 1] > 0.999).all()
+    assert (tokens == 1).all()
+
+
+@pytest.mark.parametrize("with_probs", [False, True], ids=["tokens", "with_probs"])
+@pytest.mark.parametrize("rows", [4, 32])
+@pytest.mark.parametrize("vocab", [4096, 65536])
+@pytest.mark.parametrize(
+    "filters",
+    [
+        pytest.param({}, id="neutral"),
+        pytest.param({"top_p": 0.9}, id="top_p"),
+        pytest.param({"top_k": 50}, id="top_k"),
+        pytest.param({"top_k": 50, "top_p": 0.9}, id="top_k_top_p"),
+        pytest.param({"min_p": 0.05}, id="min_p"),
+    ],
+)
+def test_per_row_rng_ignores_row_position(
+    filters: dict[str, Any], vocab: int, rows: int, with_probs: bool
+) -> None:
+    """Rows sharing logits, parameters and a per-row (seed, offset) draw the same token,
+    whichever row they occupy. Only positions within one launch are compared: the kernel
+    picks its algorithm by batch size, so a different row count may map the same draw
+    elsewhere."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    logits = (torch.randn(1, vocab, device=dev) * 2.0).expand(rows, vocab).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, **filters)
+    op = fused.fused_sample_from_logits_with_probs if with_probs else fused.fused_sample_from_logits
+
+    out = op(
+        logits,
+        temps,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed=torch.full((rows,), 1234, dtype=torch.int64, device=dev),
+        offset=torch.full((rows,), 64, dtype=torch.int64, device=dev),
+    )
+    tokens = out[0] if with_probs else out
+    assert torch.equal(tokens, tokens[:1].expand(rows))
+
+
+def test_shared_rng_separates_rows() -> None:
+    dev = "cuda"
+    torch.manual_seed(0)
+    rows = 32
+    logits = (torch.randn(1, 4096, device=dev) * 2.0).expand(rows, 4096).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, top_p=0.95)
+    seed, offset = _rng(rows, dev, seed=1234)
+
+    tokens = fused.fused_sample_from_logits(
+        logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+    )
+    assert tokens.unique().numel() > 1
+
+
 def test_sampling_follows_the_filtered_distribution() -> None:
     """Many draws over a small vocabulary should reproduce the probs the op reports.
 
@@ -514,6 +584,58 @@ def test_sampling_follows_the_filtered_distribution() -> None:
     counts = torch.bincount(tokens.long(), minlength=vocab).float() / draws
     tv = 0.5 * (counts - probs[0]).abs().sum().item()
     assert tv < 0.05, f"total-variation distance {tv:.3f} between draws and the reported probs"
+
+
+def test_single_row_call_draws_the_per_row_stream() -> None:
+    """A one-row call is per-row: the row draws what it would beside other rows."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    logits = torch.randn(1, 128, device=dev).expand(3, 128).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(3, device=dev, temperature=1.0, top_k=64)
+    for offset in range(8):
+        seeds = torch.tensor([1234, 42, 999], dtype=torch.int64, device=dev)
+        offsets = torch.tensor([offset, 1 << 62, offset], dtype=torch.int64, device=dev)
+        batched = fused.fused_sample_from_logits(
+            logits, temps, top_ks, top_ps, min_ps, seed=seeds, offset=offsets
+        )
+        alone = fused.fused_sample_from_logits(
+            logits[:1],
+            temps[:1],
+            top_ks[:1],
+            top_ps[:1],
+            min_ps[:1],
+            seed=seeds[:1],
+            offset=offsets[:1],
+        )
+        assert alone.item() == batched[0].item()
+
+
+def test_consecutive_per_row_offsets_draw_independent_streams() -> None:
+    """Per-row offsets one apart must not share draws: each names its own subsequence.
+
+    Rows without top-k take the rejection path, which draws several values per row, so
+    streams that overlapped would skew the sample away from the reported probs.
+    """
+    dev = "cuda"
+    torch.manual_seed(0)
+    vocab, draws = 64, 4096
+    logits = (torch.randn(1, vocab, device=dev) * 1.5).expand(draws, vocab).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(draws, device=dev, temperature=1.0, top_p=0.9)
+    expected = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)[0]
+
+    tokens = fused.fused_sample_from_logits(
+        logits,
+        temps,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed=torch.full((draws,), 99, dtype=torch.int64, device=dev),
+        offset=torch.arange(draws, dtype=torch.int64, device=dev),
+    )
+
+    counts = torch.bincount(tokens.long(), minlength=vocab).float() / draws
+    tv = 0.5 * (counts - expected).abs().sum().item()
+    assert tv < 0.05, f"total-variation distance {tv:.3f} from the filtered distribution"
 
 
 # --- The tokens-only rejection path ------------------------------------------------

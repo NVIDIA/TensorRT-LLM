@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # An alternative lib to trt_test to let TRT_LLM developer run test using pure pytest command
 import contextlib
 import os
@@ -277,25 +291,3 @@ else:  # has trt_test
                                wsl_to_win_path, make_clean_dirs)  # noqa
     # yapf: on
     # isort: on
-
-
-# custom test checker
-def check_call_negative_test(*popenargs, **kwargs):
-    # Create a copy of kwargs without env to avoid displaying sensitive information
-    simplified_kwargs = kwargs.copy()
-    if 'env' in simplified_kwargs:
-        del simplified_kwargs['env']
-    print(
-        f"[info] Start subprocess with check_call_negative_test({popenargs}, {simplified_kwargs})"
-    )
-    retcode = call(*popenargs, suppress_output_info=True, **kwargs)
-    if retcode:
-        return 0
-    else:
-        cmd = kwargs.get("args")
-        if cmd is None:
-            cmd = popenargs[0]
-        print(
-            f"Subprocess expected to fail with check_call_negative_test({popenargs}, {simplified_kwargs}), but passed."
-        )
-        raise subprocess.CalledProcessError(1, cmd)

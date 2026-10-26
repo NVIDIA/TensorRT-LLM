@@ -61,16 +61,12 @@ protected:
         }
         return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig,
             /*isStreaming=*/false,
-            /*endId=*/std::nullopt,
-            /*positionIds=*/std::nullopt,
+
             /*promptEmbeddingTable=*/std::nullopt, /*promptVocabSize=*/std::nullopt,
             /*multimodalHashes=*/std::nullopt, /*multimodalPos=*/std::nullopt, /*multimodalLength=*/std::nullopt,
-            /*multimodalUuids=*/std::nullopt, /*multimodalEmbedding=*/std::nullopt,
-            /*mropeRotaryCosSin=*/std::nullopt, /*mropePositionDeltas*/ std::nullopt,
+            /*multimodalUuids=*/std::nullopt,
             /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-            /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-            /*returnLogProbs=*/false,
-            /*returnContextLogits=*/false, /*returnGenerationLogits=*/false, draftTokens);
+            /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, draftTokens);
     }
 
     RequestTable forward(

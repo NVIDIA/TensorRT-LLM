@@ -364,6 +364,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   CompletionResponse:
     fields:
@@ -453,6 +459,12 @@ models:
         type: Optional[float]
         default: null
         status: beta
+        required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
         required: false
 
   CompletionStreamResponse:
@@ -578,6 +590,12 @@ models:
         kind: openai
         type: Optional[Union[str, List[str]]]
         default: <factory:list>
+        status: stable
+        required: false
+      store:
+        kind: openai
+        type: Optional[bool]
+        default: null
         status: stable
         required: false
       stream:
@@ -883,6 +901,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionResponse:
     fields:
@@ -972,6 +996,12 @@ models:
         type: Optional[float]
         default: null
         status: beta
+        required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
         required: false
 
   ChatCompletionStreamResponse:

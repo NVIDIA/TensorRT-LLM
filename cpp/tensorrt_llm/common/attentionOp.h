@@ -155,6 +155,10 @@ public:
         // optional for separate QKV input, currently only used for context MLA
         T const* k_ptr = nullptr;
         T const* v_ptr = nullptr;
+        // Separate V has shape [tokens, numKvHeads * headDimV] with unit feature stride.
+        // The physical byte stride is used by context FMHA or its FP8/NVFP4 input quantizer.
+        // Zero uses the layout-derived token stride.
+        int64_t v_stride_in_bytes = 0;
 
         // Helix parallelism params.
         int32_t const* helix_position_offsets = nullptr;
@@ -255,6 +259,7 @@ public:
         int32_t spec_decoding_max_generation_length = 1;
         int64_t* spec_decoding_bl_tree_mask_offset = nullptr;
         uint32_t* spec_decoding_bl_tree_mask = nullptr;
+        int64_t spec_decoding_bl_tree_mask_capacity = 0;
         int32_t* spec_bl_tree_first_sparse_mask_offset_kv = nullptr;
         // optional when fuse_fp4_quant is enabled
         int32_t start_token_idx_sf = 0;
@@ -428,6 +433,22 @@ public:
         return useSparseMLA() || (mUseSparseAttention && mUseTllmGen && mUseTllmGenSparseAttention);
     }
 
+    [[nodiscard]] bool sageAttnRequested() const
+    {
+        return mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0;
+    }
+
+    [[nodiscard]] bool useSageAttn() const
+    {
+        return sageAttnRequested() && mFP8ContextFMHA && !mIsMLAEnabled && !useKVCache();
+    }
+
+    [[nodiscard]] bool useHopperSageAttn() const
+    {
+        return useSageAttn() && mSM == kernels::kSM_90 && mSageAttnQkInt8 && mSageAttnNumEltsPerBlkQ == 2
+            && mSageAttnNumEltsPerBlkK == 16 && mSageAttnNumEltsPerBlkV == 1;
+    }
+
     [[nodiscard]] int smVersion() const
     {
         return mSM;
@@ -561,12 +582,12 @@ public:
     float mSkipCorrectionThreshold = 0;
     // Use spcompress (context phase, SM107 only).
     bool mUsesSpcompress = false;
-    // Optional SageAttention block sizes.
-    // Currently, these are only consumed by the TllmGen backend path.
+    // Optional SageAttention block sizes, in tokens per scale for q/k and channels per scale for v.
     int mSageAttnNumEltsPerBlkQ = 0;
     int mSageAttnNumEltsPerBlkK = 0;
     int mSageAttnNumEltsPerBlkV = 0;
     bool mSageAttnQkInt8 = false;
+    bool mSageAttnSmoothK = false;
 #ifdef SKIP_SOFTMAX_STAT
     uint32_t* mSkipSoftmaxTotalBlocks;
     uint32_t* mSkipSoftmaxSkippedBlocks;
@@ -592,7 +613,7 @@ public:
             mSkipAttn, mFuseFp4Quant, mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores,
             mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
             mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold, mUsesSpcompress, mSageAttnNumEltsPerBlkQ,
-            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
+            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8, mSageAttnSmoothK);
     };
 
 private:

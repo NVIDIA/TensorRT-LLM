@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 372" width="1000" height="372">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect width="1000" height="372" fill="#f5f5f5"/>
+<text x="52.0" y="30.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Qwen3.5-397B-A17B · 10 GB300 · concurrency 192</text>
+<text x="52.0" y="66.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Requests completed per second</text>
+<line x1="52" y1="290.0" x2="332" y2="290.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="46.0" y="293.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">0</text>
+<line x1="52" y1="252.0" x2="332" y2="252.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="46.0" y="255.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">1</text>
+<line x1="52" y1="214.0" x2="332" y2="214.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="46.0" y="217.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">2</text>
+<line x1="52" y1="176.0" x2="332" y2="176.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="46.0" y="179.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">3</text>
+<line x1="52" y1="138.0" x2="332" y2="138.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="46.0" y="141.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">4</text>
+<line x1="52" y1="100.0" x2="332" y2="100.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="46.0" y="103.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">5</text>
+<rect x="58.0" y="223.3" width="20" height="66.7" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="68.0" y="219.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">1.75</text>
+<rect x="82.0" y="218.1" width="20" height="71.9" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="92.0" y="214.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">1.89</text>
+<text x="80.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">0</text>
+<rect x="114.0" y="214.3" width="20" height="75.7" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="124.0" y="210.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">1.99</text>
+<rect x="138.0" y="188.3" width="20" height="101.7" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="148.0" y="184.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">2.68</text>
+<text x="136.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">128</text>
+<rect x="170.0" y="203.9" width="20" height="86.1" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="180.0" y="199.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">2.27</text>
+<rect x="194.0" y="161.1" width="20" height="128.9" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="204.0" y="157.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">3.39</text>
+<text x="192.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">256</text>
+<rect x="226.0" y="188.9" width="20" height="101.1" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="236.0" y="184.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">2.66</text>
+<rect x="250.0" y="123.8" width="20" height="166.2" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="260.0" y="119.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">4.37</text>
+<text x="248.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">512</text>
+<rect x="282.0" y="185.1" width="20" height="104.9" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="292.0" y="181.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">2.76</text>
+<rect x="306.0" y="124.5" width="20" height="165.5" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="316.0" y="120.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">4.36</text>
+<text x="304.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">1024</text>
+<text x="192.0" y="320.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">disk tier per prefill rank (GiB)</text>
+<text x="378.0" y="66.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Cache-read hit rate (%)</text>
+<line x1="378" y1="290.0" x2="658" y2="290.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="372.0" y="293.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">0</text>
+<line x1="378" y1="242.5" x2="658" y2="242.5" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="372.0" y="246.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">25</text>
+<line x1="378" y1="195.0" x2="658" y2="195.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="372.0" y="198.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">50</text>
+<line x1="378" y1="147.5" x2="658" y2="147.5" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="372.0" y="151.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">75</text>
+<line x1="378" y1="100.0" x2="658" y2="100.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="372.0" y="103.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">100</text>
+<line x1="378" y1="107.3" x2="658" y2="107.3" stroke="#76B900" stroke-width="1" stroke-dasharray="5,3"/>
+<text x="658.0" y="103.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#76B900" text-anchor="end">reachable hit rate 96.2</text>
+<rect x="384.0" y="181.3" width="20" height="108.7" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="394.0" y="177.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">57</text>
+<rect x="408.0" y="173.3" width="20" height="116.7" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="418.0" y="169.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">61</text>
+<text x="406.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">0</text>
+<rect x="440.0" y="167.3" width="20" height="122.7" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="450.0" y="163.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">65</text>
+<rect x="464.0" y="147.1" width="20" height="142.9" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="474.0" y="143.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">75</text>
+<text x="462.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">128</text>
+<rect x="496.0" y="149.8" width="20" height="140.2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="506.0" y="145.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">74</text>
+<rect x="520.0" y="133.1" width="20" height="156.9" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="530.0" y="129.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">83</text>
+<text x="518.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">256</text>
+<rect x="552.0" y="133.4" width="20" height="156.6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="562.0" y="129.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">82</text>
+<rect x="576.0" y="124.9" width="20" height="165.1" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="586.0" y="120.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">87</text>
+<text x="574.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">512</text>
+<rect x="608.0" y="126.2" width="20" height="163.8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="618.0" y="122.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">86</text>
+<rect x="632.0" y="124.1" width="20" height="165.9" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="642.0" y="120.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">87</text>
+<text x="630.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">1024</text>
+<text x="518.0" y="320.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">disk tier per prefill rank (GiB)</text>
+<text x="704.0" y="66.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Average TTFT (s)</text>
+<line x1="704" y1="290.0" x2="984" y2="290.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="698.0" y="293.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">0</text>
+<line x1="704" y1="226.7" x2="984" y2="226.7" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="698.0" y="230.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">50</text>
+<line x1="704" y1="163.3" x2="984" y2="163.3" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="698.0" y="166.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">100</text>
+<line x1="704" y1="100.0" x2="984" y2="100.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="698.0" y="103.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">150</text>
+<rect x="710.0" y="122.7" width="20" height="167.3" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="720.0" y="118.7" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">132</text>
+<rect x="734.0" y="138.8" width="20" height="151.2" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="744.0" y="134.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">119</text>
+<text x="732.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">0</text>
+<rect x="766.0" y="145.3" width="20" height="144.7" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="776.0" y="141.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">114</text>
+<rect x="790.0" y="185.9" width="20" height="104.1" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="800.0" y="181.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">82</text>
+<text x="788.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">128</text>
+<rect x="822.0" y="164.5" width="20" height="125.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="832.0" y="160.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">99</text>
+<rect x="846.0" y="215.0" width="20" height="75.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="856.0" y="211.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">59</text>
+<text x="844.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">256</text>
+<rect x="878.0" y="186.5" width="20" height="103.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="888.0" y="182.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">82</text>
+<rect x="902.0" y="236.4" width="20" height="53.6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="912.0" y="232.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">42</text>
+<text x="900.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">512</text>
+<rect x="934.0" y="191.6" width="20" height="98.4" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="944.0" y="187.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">78</text>
+<rect x="958.0" y="235.9" width="20" height="54.1" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="968.0" y="231.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="7.5" font-weight="600" fill="#2d3142" text-anchor="middle">43</text>
+<text x="956.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">1024</text>
+<text x="844.0" y="320.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">disk tier per prefill rank (GiB)</text>
+<rect x="52" y="80" width="11" height="11" fill="#ffffff" stroke="#2d3142"/>
+<text x="68.0" y="89.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">uncompressed FP8 cold pages</text>
+<rect x="252" y="80" width="11" height="11" fill="rgba(118,185,0,0.08)" stroke="#76B900"/>
+<text x="268.0" y="89.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">NVFP4 cold pages</text>
+</svg>

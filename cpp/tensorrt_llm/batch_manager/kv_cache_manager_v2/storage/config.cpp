@@ -23,7 +23,9 @@
 #include <algorithm>
 #include <map>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -152,13 +154,13 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     LifeCycleRegistry registry{config};
     int tokensPerBlock = config.tokensPerBlock;
 
-    // Map: lifeCycleId → (bufferSize → list of BufferId).
-    // Outer map key is LifeCycleId; inner map key is expanded buffer size.
+    // Map: lifeCycleId → ((coalescingGroup, expanded buffer size) → list of BufferId).
     // NOTE: Python uses insertion-ordered dict/defaultdict here. The std::map
     // grouping below intentionally remains sorted, which can make observable
     // pool-group indices/layout order differ from Python. Later lookups use
     // StorageConfig mappings, so this is not expected to affect correctness.
-    std::map<LifeCycleId, std::map<size_t, std::vector<BufferId>>> bufferGroups;
+    using CoalescingKey = std::pair<int, size_t>;
+    std::map<LifeCycleId, std::map<CoalescingKey, std::vector<BufferId>>> bufferGroups;
     std::unordered_map<BufferId, int, BufferIdHash> expansionMap;
 
     for (auto const& layer : config.layers)
@@ -177,7 +179,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
                     BufferId bid{cfg.layerId, buf.role};
                     expansionMap[bid] = exp;
-                    bufferGroups[lcId][expandedSize].push_back(bid);
+                    bufferGroups[lcId][{buf.coalescingGroup, expandedSize}].push_back(bid);
                 }
             },
             layer);
@@ -187,14 +189,14 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     // Each variant: coalesced buffers sorted by size descending.
     std::vector<SlotDescVariant> slotGroups;
     slotGroups.reserve(bufferGroups.size());
-    for (auto const& [lcId, sizeMap] : bufferGroups)
+    for (auto const& [lcId, coalescingMap] : bufferGroups)
     {
         SlotDescVariant var;
         var.lifeCycleId = lcId;
-        for (auto const& [sz, bufIds] : sizeMap)
+        for (auto const& [key, bufIds] : coalescingMap)
         {
             CoalescedBuffer cb;
-            cb.singleBufferSize = sz;
+            cb.singleBufferSize = key.second;
             cb.bufferIds = bufIds;
             var.coalescedBuffers.push_back(std::move(cb));
         }
@@ -204,20 +206,35 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Merge SlotDescVariants that share the same slotSizeList.
-    // Key: tuple of sizes (sorted desc).
-    std::map<std::vector<size_t>, std::vector<SlotDescVariant>> poolGroupsBySizes;
+    // Distinct sparsity and reuse policies need separate GPU pools and eviction queues.
+    struct PoolGroupKey
+    {
+        AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+        std::vector<size_t> slotSizes;
+        bool isSparse = false;
+
+        bool operator<(PoolGroupKey const& other) const
+        {
+            return std::tie(reusePolicy, slotSizes, isSparse)
+                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse);
+        }
+    };
+
+    std::map<PoolGroupKey, std::vector<SlotDescVariant>> poolGroups;
     for (auto& sg : slotGroups)
     {
-        auto sizes = sg.slotSizeList();
-        poolGroupsBySizes[sizes.raw()].push_back(std::move(sg));
+        auto const sizes = sg.slotSizeList();
+        auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
+        bool const isSparse = attn != nullptr && attn->isSparse;
+        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
+        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
     }
 
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.expansion = expansionMap;
 
-    for (auto& [sizes, variants] : poolGroupsBySizes)
+    for (auto& [key, variants] : poolGroups)
     {
         SlotDesc sd;
         sd.variants = std::move(variants);

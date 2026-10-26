@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: kimi_k3
   precision: fp4
@@ -93,11 +96,9 @@ worker_config:
       # PYTHON is mandatory: the C++ transceiver throws at construction for
       # K3's MixedMambaHybridCacheManager.
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
-      # Must hold one full request payload (433 MiB KDA state + ~27 KB/token
-      # MLA latent = 649 MiB at 8k ISL); undersizing silently falls back to
-      # the host-staged tcp path.
+      # Shared C++ agent arena for chunked gather/write/scatter transfers.
       kv_cache_bounce_size_mb: 1024
+      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     trust_remote_code: true
   ctx:
@@ -122,7 +123,7 @@ worker_config:
     cache_transceiver_config:
       backend: NIXL
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
       kv_cache_bounce_size_mb: 1024
+      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: true
     trust_remote_code: true

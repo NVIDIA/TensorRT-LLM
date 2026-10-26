@@ -3,17 +3,26 @@
 
 import dataclasses
 from collections.abc import Mapping as AbcMapping
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Protocol, Sequence, Union
 
 import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          is_speculators_dspark_config,
+                                          translate_speculators_dspark_config)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
+
+
+class _NamedLayerType(Protocol):
+    name: str
+
+
+_LayerType = Union[str, _NamedLayerType]
 
 
 def resolve_cache_transceiver_config(
@@ -45,7 +54,9 @@ def resolve_cache_transceiver_config(
             "enable_pipelined_transfer is set; auto-selecting the Python "
             "transceiver instead of the C++ transceiver to enable "
             "pipelined KV cache transfer. "
-            "Set transceiver_runtime='CPP' to disable this auto-selection.")
+            "Set transceiver_runtime='CPP' and "
+            "kv_cache_config.use_kv_cache_manager_v2=False to select C++ "
+            "with a model that supports V1; disable pipelined transfer too.")
         cache_transceiver_config.transceiver_runtime = "PYTHON"
     elif runtime == "CPP" and enable_pipelined_transfer:
         raise ValueError(
@@ -58,8 +69,9 @@ def resolve_cache_transceiver_config(
         raise ValueError(
             f"Python transceiver currently only supports NIXL backend, "
             f"got {effective_backend}. "
-            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
-        )
+            "Please use transceiver_runtime='CPP' with "
+            "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
+            "or MOONCAKE backends, with a model that supports V1.")
 
 
 def uses_vswa_kv_cache_layout(
@@ -75,7 +87,7 @@ def uses_vswa_kv_cache_layout(
                     for window in max_attention_windows))
 
 
-def _is_sliding_attention_layer(layer_type: object) -> bool:
+def _is_sliding_attention_layer(layer_type: _LayerType) -> bool:
     """Return whether a config layer type denotes sliding attention."""
     layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
     return "sliding" in layer_type_name
@@ -125,14 +137,6 @@ def get_layer_attention_window(
         raise ValueError(
             "Sliding attention requires a positive integer sliding_window.")
     return sliding_window
-
-
-def is_gemma4_hybrid(config):
-    """True for Gemma4 models with hybrid attention (different head_dim per layer type)."""
-    global_head_dim = getattr(config, 'global_head_dim', None)
-    head_dim = getattr(config, 'head_dim', None)
-    return (global_head_dim is not None and isinstance(head_dim, int)
-            and global_head_dim != head_dim)
 
 
 def is_hybrid_linear(config):
@@ -334,8 +338,8 @@ def resolve_auto_ssm_cache_dtype(config, fallback):
     kv_cache_config.mamba_ssm_cache_dtype; prefill, decode and sequential
     verify then stage the addressed rows through an fp32 copy and round the
     committed state back to bf16. The fused MTP verify kernel
-    (``trtllm::kda_mtp_decode``) has no such staging and rejects a non-fp32
-    pool outright, so bf16 and fused KDA MTP verify are mutually exclusive.
+    (``trtllm::kda_mtp_decode``) reads and writes a bf16 pool directly and
+    rounds the committed state to nearest.
     A checkpoint-declared
     mamba_ssm_cache_dtype is not applied to Kimi K3 (the released
     checkpoints do not carry the field); it is logged when it would have
@@ -784,37 +788,6 @@ def extract_mamba_kv_cache_params(
     )
 
 
-def is_qwen_image_bench_config(config_dict: dict) -> bool:
-    """Detect Qwen-Image-Bench's composite VLM checkpoint config.
-
-    The checkpoint advertises the generic Qwen3.5 VLM architecture, but
-    TRT-LLM needs a dedicated architecture key to route it to
-    QwenImageBenchModel. Generic Qwen3.5 text checkpoints can also publish
-    composite text/vision metadata, so require the explicit
-    `language_model_only: false` marker from Qwen-Image-Bench before
-    rewriting the architecture.
-
-    The text-config normalization itself lives on
-    `modeling_qwen3_5.Qwen35ConfigCompat`; this stays here because it is pure
-    dispatch detection over the raw config dict and keeps the model module out
-    of the hot path until a Qwen3.5 checkpoint is actually loaded.
-    """
-    architectures = config_dict.get("architectures") or []
-    text_config = config_dict.get("text_config")
-    vision_config = config_dict.get("vision_config")
-    required_multimodal_token_ids = {
-        "image_token_id",
-        "video_token_id",
-        "vision_start_token_id",
-        "vision_end_token_id",
-    }
-    return (config_dict.get("language_model_only") is False
-            and architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
-            and isinstance(text_config, dict) and bool(text_config)
-            and isinstance(vision_config, dict) and bool(vision_config)
-            and required_multimodal_token_ids.issubset(config_dict))
-
-
 def _resolve_composite_torch_dtype(*config_dicts: dict) -> torch.dtype:
     """Resolve a concrete torch dtype from one or more raw config dicts.
 
@@ -852,7 +825,7 @@ def _build_minicpmv4_6_config(
     # Extract + normalize the Qwen3.5 dense text tower (rope flatten,
     # quantization inheritance, architectures -> Qwen3_5ForCausalLM). MiniCPM-V
     # 4.6 always nests its language model under ``text_config``, so force
-    # extraction of that nested config (same path Qwen-Image-Bench uses).
+    # extraction of that nested config.
     text_dict = Qwen35ConfigCompat.normalize(config_dict,
                                              require_text_config=True)
     text_config = transformers.Qwen3NextConfig.from_dict(text_dict)
@@ -948,6 +921,10 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     cosmos3="Cosmos3Config",
     cosmos3_omni=
     "Cosmos3Config",  # backward-compat alias for pre-rename checkpoints
+    cosmos3_edge="Cosmos3EdgeConfig",
+    cosmos3_edge_text="Cosmos3EdgeTextConfig",
+    cosmos3_edge_vision="Cosmos3EdgeVisionConfig",
+    cosmos3_edge_projector="Cosmos3EdgeProjectorConfig",
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
@@ -1018,18 +995,18 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
-    elif is_qwen_image_bench_config(config_dict):
-        from tensorrt_llm._torch.models.modeling_qwen3_5 import (
-            Qwen35ConfigCompat, _normalize_qwen35_quantization_config)
-        model_config = transformers.AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code)
-        # Keep the composite VLM config so the vision encoder and multimodal
-        # token IDs remain available, but normalize the text side to the
-        # Qwen3Next-compatible shape used by TRT-LLM's Qwen3.5 decoder.
-        model_config.architectures = ["QwenImageBenchForConditionalGeneration"]
-        model_config.text_config = transformers.Qwen3NextConfig.from_dict(
-            Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
-        _normalize_qwen35_quantization_config(model_config)
+    elif is_speculators_dspark_config(config_dict):
+        # A DSpark drafter in the vLLM speculators format: no top-level
+        # model_type, and its auto_map needs the speculators package. Build
+        # the backbone's config from the translation the spec config uses.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        translated = translate_speculators_dspark_config(config_dict)
+        model_config = CONFIG_MAPPING["qwen3"].from_dict(translated)
+        logger.info(
+            f"{model_name_or_path}: speculators-format DSpark drafter, read as "
+            f"qwen3 with target_layer_ids "
+            f"{translated['dflash_config']['target_layer_ids']} "
+            f"(aux_hidden_state_layer_ids - 1) and no sliding window")
     elif model_type in ("glm5_next", "glm5_next_text"):
         from tensorrt_llm._torch import configs
         config_name = ("Glm5NextConfig"
@@ -1116,6 +1093,30 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("deepseek_v41", "deepseek_v41_text"):
+        # Preserve the composite config and propagate its dtype to the text tower.
+        # Vision checkpoints use the internal ConditionalGeneration dispatch alias.
+        from tensorrt_llm._torch.configs import (DeepseekV41Config,
+                                                 DeepseekV41TextConfig)
+        nested_text = config_dict.get("text_config")
+        if isinstance(nested_text, dict) and nested_text:
+            resolved_dtype = _resolve_composite_torch_dtype(
+                config_dict, nested_text)
+            model_config = DeepseekV41Config.from_dict(config_dict, **kwargs)
+            model_config.text_config.architectures = ["DeepseekV41ForCausalLM"]
+            model_config.text_config.torch_dtype = resolved_dtype
+            model_config.torch_dtype = resolved_dtype
+        else:
+            # ``dict(config_dict)`` already carries the top-level
+            # ``quantization_config``, and ``DeepseekV41TextConfig`` propagates it
+            # in ``__init__`` (see the note above), so the flat branch needs no
+            # hoisting step of its own.
+            model_config = DeepseekV41TextConfig.from_dict(
+                dict(config_dict), **kwargs)
+        model_config.architectures = ["DeepseekV41ForCausalLM"]
+        vision_config = getattr(model_config, "vision_config", None)
+        if getattr(vision_config, "num_hidden_layers", 0) > 0:
+            model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

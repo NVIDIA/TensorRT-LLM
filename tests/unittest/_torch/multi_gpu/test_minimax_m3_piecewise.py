@@ -146,6 +146,9 @@ def _run_empty_adp_rank(world_size: int) -> int:
                 )
                 metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
                 metadata._msa_qo_offset_cpu = torch.zeros(local_contexts, dtype=torch.int32)
+                # What the base seq_lens setter would derive; the cache writers
+                # read the live (unpadded) count off it.
+                metadata._num_tokens = live_tokens
                 metadata._build_msa_fields()
                 assert metadata.msa_out_cache_loc.tolist() == list(
                     range(128, 128 + live_tokens)

@@ -1005,6 +1005,7 @@ def fused_fp4_mla_decode_ctm(
     use_consecutive_page_pair: ctm.Constexpr = False,
     use_ksf_gather4: ctm.Constexpr = False,
     write_softmax_stats: ctm.Constexpr = False,
+    store_split: ctm.Constexpr = False,
 ) -> None:
     n, k = problem_size
     m = runtime_m
@@ -1352,6 +1353,7 @@ def fused_fp4_mla_decode_ctm(
         use_consecutive_page_pair,
         use_ksf_gather4,
         write_softmax_stats,
+        store_split,
     ).launch(
         grid=(
             cute.ceil_div(c_tensor.shape[0], SMEM_P4_CTA_GROUP_M) * CLUSTER_SHAPE_MNK[0],
@@ -4197,7 +4199,6 @@ def _load_p4_n256_score_half_from_tmem(
     _publish_p4_n256_atomic_rowmax(
         sAtomicRunningRowMax, tile_row_max, warp_idx, tidx, producer_warp_base
     )
-    cute.nvgpu.cfence()
     return (
         ctm.Vector.from_elements(tuple(score_values), dtype=ctm.Float32),
         ctm.Vector.from_elements(tuple(group_max_values), dtype=ctm.Float32),
@@ -4437,7 +4438,6 @@ def _prepack_p4_n256_score_half_before_rowmax(
         )
         group_valid = group_valid_values[local_group_idx]
         group_max = group_max_values[local_group_idx]
-        cute.nvgpu.warp_switch()
         if cutlass.const_expr(use_mixed_imlp):
             p_bias = ctm.Float32(LOG2_6) - group_max * softmax_scale_log2
             word0, word1, p_sum = _pack_p4_16_scores_from_group_packed_f16x2(
@@ -4617,9 +4617,7 @@ def _finalize_p4_n256_score_half_psf_source(
         bank_idx, score_half_idx, local_warp_idx, lane_idx
     )
     sPSF[psf_source_word_offset] = pv_sf_word
-    cute.nvgpu.cfence()
     prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    cute.nvgpu.cfence()
     return (denominator_sf_word, prequant_row_sum)
 
 
@@ -4729,9 +4727,7 @@ def _runtime_finalize_final_p4_n256_score_half_psf_source(
         bank_idx, score_half_idx, local_warp_idx, lane_idx
     )
     sPSF[psf_source_word_offset] = pv_sf_word
-    cute.nvgpu.cfence()
     prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    cute.nvgpu.cfence()
     return (denominator_sf_word, prequant_row_sum)
 
 
@@ -4990,6 +4986,7 @@ def _store_final_o_from_tmem(
     output_normalizer: ctm.Float32,
     write_softmax_stats: ctm.Constexpr = False,
     producer_warp_base: ctm.Constexpr = 0,
+    store_split: ctm.Constexpr = False,
 ) -> None:
     gC_arr = ctm.make_array_view(mC_mnl)
     gAccum_arr = ctm.make_array_view(mAccum_mnl)
@@ -5009,6 +5006,11 @@ def _store_final_o_from_tmem(
         + cta_rank * ctm.Int32(SMEM_P4_BMM1_M)
         + local_row
     )
+    if cutlass.const_expr(store_split):
+        # Both column bands have the same row state; export each row once.
+        if col_band == ctm.Int32(0):
+            mRowMax_ml[row, bidz] = final_row_max
+            mRowSum_ml[row, bidz] = final_row_sum
     batch_offset = bidz * m * n
     if cutlass.const_expr(write_softmax_stats):
         if col_band == ctm.Int32(0) and bidy == ctm.Int32(0):
@@ -5039,17 +5041,25 @@ def _store_final_o_from_tmem(
         for vec_idx in ctm.range_constexpr(subtile_cols // vsize):
             linear_idx = row * n + col_base + vec_idx * vsize + batch_offset
             vec_f32 = c_rmem[vec_idx * vsize : vec_idx * vsize + vsize]
-        output_linear_idx = row * n + col_base + batch_offset
-        output_vec_f32 = c_rmem[0:subtile_cols]
-        output_vec = (output_vec_f32 * output_normalizer).to(mC_mnl.element_type)
-        # The decode output is consumed after this kernel and has no in-kernel
-        # reuse.  Avoid allocating its streaming write in L1; on GR100 this
-        # preserves the 256-bit vector store while lowering it to
-        # STG.E.NA.ENL2.256.
-        (gC_arr.subview(output_linear_idx)).data_ptr().nvvm_store_ext(
-            output_vec,
-            evict=EvictPriority.NOALLOCATE,
-        )
+            if cutlass.const_expr(store_split):
+                gAccum_arr.store(
+                    vec_f32 * final_stat_scale,
+                    idx=linear_idx,
+                    vector_size=vsize,
+                    alignment=32,
+                )
+        if cutlass.const_expr(not store_split):
+            output_linear_idx = row * n + col_base + batch_offset
+            output_vec_f32 = c_rmem[0:subtile_cols]
+            output_vec = (output_vec_f32 * output_normalizer).to(mC_mnl.element_type)
+            # The decode output is consumed after this kernel and has no in-kernel
+            # reuse.  Avoid allocating its streaming write in L1; on GR100 this
+            # preserves the 256-bit vector store while lowering it to
+            # STG.E.NA.ENL2.256.
+            (gC_arr.subview(output_linear_idx)).data_ptr().nvvm_store_ext(
+                output_vec,
+                evict=EvictPriority.NOALLOCATE,
+            )
 
 
 @cute.jit
@@ -5189,7 +5199,6 @@ def _runtime_issue_pv_tile_slot(
                 a_collector_op=a_collector_op,
             )
     if stream_li_idx > ctm.Int32(0) and stream_li_idx + ctm.Int32(1) == stream_li_total:
-        cute.nvgpu.cfence()
         if prims.elect_sync():
             _cross_arrive_smem_p4_cta2_mbar(
                 pair_overlap_sync_mbars.subview(
@@ -5567,7 +5576,6 @@ def _runtime_t336_prepare_p_source(
             )
         )
     if is_compute_warp:
-        cute.nvgpu.cfence()
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
     _store_prepacked_p4_n256_score_half_to_direct_a(
@@ -5581,8 +5589,6 @@ def _runtime_t336_prepare_p_source(
     )
     if prims.elect_sync():
         prims.mbarrier_arrive(direct_p_ready_mbar)
-    if is_compute_warp:
-        cute.nvgpu.cfence()
     owned_psf_word, prequant_row_sum = _finalize_p4_n256_score_half_psf_source(
         sPSF,
         group_max_values,
@@ -5798,7 +5804,6 @@ def _runtime_t336_producer_tile(
             sAtomicRunningRowMax, warp_idx, tidx, producer_warp_base=producer_warp_base
         )
     if is_compute_warp:
-        cute.nvgpu.cfence()
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
     lane_rebase = ctm.Boolean(False)
@@ -5833,8 +5838,6 @@ def _runtime_t336_producer_tile(
     )
     if prims.elect_sync():
         prims.mbarrier_arrive(direct_p_ready_mbar)
-    if is_compute_warp:
-        cute.nvgpu.cfence()
     if cutlass.const_expr(not is_final_tile):
         next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
             _select_smem_p4_lazy_anchor_runtime(
@@ -5914,14 +5917,14 @@ def _runtime_t336_producer_tile(
             ):
                 pass
             cute.arch.mbarrier_arrive(
-                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.index(),
+                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.current_handle().index,
                 cutlass.Int32(0),
             )
             p4_smem_slot0_producer.advance()
             cute.arch.mbarrier_arrive(
                 tmem_score_slot0_mbar_ptr
                 + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-                + tmem_score_slot0_consumer.index(),
+                + tmem_score_slot0_consumer.current_handle().index,
                 cutlass.Int32(0),
             )
             tmem_score_slot0_consumer.advance()
@@ -6187,14 +6190,14 @@ def _runtime_t336_producer_tile_v23(
             ):
                 pass
             cute.arch.mbarrier_arrive(
-                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.index(),
+                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.current_handle().index,
                 cutlass.Int32(0),
             )
             p4_smem_slot0_producer.advance()
             cute.arch.mbarrier_arrive(
                 tmem_score_slot0_mbar_ptr
                 + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-                + tmem_score_slot0_consumer.index(),
+                + tmem_score_slot0_consumer.current_handle().index,
                 cutlass.Int32(0),
             )
             tmem_score_slot0_consumer.advance()
@@ -6332,6 +6335,7 @@ def _run_mla_decode_body(
     use_consecutive_page_pair: ctm.Constexpr = False,
     use_ksf_gather4: ctm.Constexpr = False,
     write_softmax_stats: ctm.Constexpr = False,
+    store_split: ctm.Constexpr = False,
 ) -> None:
     pv_psf_rescale = ctm.Float32(FP4_MLA_P_GLOBAL_SCALE) * pv_output_scale
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -7030,7 +7034,6 @@ def _run_mla_decode_body(
                 ):
                     pass
                 stream_li_total = kv_tiles
-                cute.nvgpu.cfence()
                 qk0_handle = qk_smem_consumer.wait()
                 qk_smem_consumer.advance()
                 qk0_score_handle = tmem_score_slot0_producer.acquire_and_advance()
@@ -7306,16 +7309,15 @@ def _run_mla_decode_body(
                 final_direct_p_ready_mbar, final_direct_p_phase, time_limit=10000000
             ):
                 pass
-            cute.nvgpu.cfence()
             cute.arch.mbarrier_arrive(
-                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.index(),
+                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.current_handle().index,
                 cutlass.Int32(0),
             )
             p4_smem_slot0_producer.advance()
             cute.arch.mbarrier_arrive(
                 tmem_score_slot0_mbar_ptr
                 + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-                + tmem_score_slot0_consumer.index(),
+                + tmem_score_slot0_consumer.current_handle().index,
                 cutlass.Int32(0),
             )
             tmem_score_slot0_consumer.advance()
@@ -7349,6 +7351,16 @@ def _run_mla_decode_body(
                     final_stat_scale = ctm.Float32(1.0)
                     final_row_max = ctm.Float32(-ctm.Float32.inf)
                     final_row_sum = ctm.Float32(0.0)
+            if cutlass.const_expr(store_split):
+                # Convert the lazy-anchor numerator and denominator to the
+                # true row maximum expected by the shared reduction kernel.
+                # Empty splits avoid evaluating -inf - -inf.
+                if final_anchor_row_sum != ctm.Float32(0.0):
+                    final_stat_scale = cute.exp2(
+                        (running_row_anchor - running_row_max) * softmax_scale_log2,
+                        fastmath=True,
+                    )
+                    final_row_sum = final_anchor_row_sum * final_stat_scale
             output_normalizer = ctm.Float32(0.0)
             if valid_k_for_l != ctm.Int32(0) and final_anchor_row_sum != ctm.Float32(0.0):
                 output_normalizer = cute.arch.rcp_approx(final_anchor_row_sum) * pv_output_scale
@@ -7381,6 +7393,7 @@ def _run_mla_decode_body(
                 final_stat_scale=final_stat_scale,
                 output_normalizer=output_normalizer,
                 write_softmax_stats=write_softmax_stats,
+                store_split=store_split,
                 producer_warp_base=SMEM_P4_CORRECTION_WARP_ID_BEGIN,
             )
             prims.barrier(barrier_id=O_STORE_BAR_ID, number_of_threads=O_STORE_BAR_THREADS)
@@ -7434,6 +7447,7 @@ def kernel(
     use_consecutive_page_pair: ctm.Constexpr,
     use_ksf_gather4: ctm.Constexpr,
     write_softmax_stats: ctm.Constexpr,
+    store_split: ctm.Constexpr = False,
 ) -> None:
     _run_mla_decode_body(
         mPageTable_pl,
@@ -7474,6 +7488,7 @@ def kernel(
         use_consecutive_page_pair,
         use_ksf_gather4,
         write_softmax_stats,
+        store_split,
     )
 
 
@@ -7674,6 +7689,7 @@ def _compile_fused(
     use_consecutive_page_pair: bool = False,
     write_softmax_stats: bool = False,
     use_helix_kv_bounds: bool = False,
+    store_split: bool = False,
 ) -> Callable:
     if type(kv) is not int:
         raise TypeError(f"runtime-KV compile K must be an int, got {type(kv).__name__}")
@@ -7700,6 +7716,7 @@ def _compile_fused(
         use_ksf_gather4,
         write_softmax_stats,
         use_helix_kv_bounds,
+        store_split,
     )
     cached = _FUSED_COMPILE_CACHE.get(cache_key)
     if cached is not None:
@@ -7748,6 +7765,7 @@ def _compile_fused(
         use_consecutive_page_pair=use_consecutive_page_pair,
         use_ksf_gather4=use_ksf_gather4,
         write_softmax_stats=write_softmax_stats,
+        store_split=store_split,
         options="--opt-level 2 --ptxas-options '--uumn'",
     )
     _FUSED_COMPILE_CACHE[cache_key] = compiled
@@ -7782,6 +7800,7 @@ def run_trtllm_fp4_mla_decode_page_native(
     softmax_row_max: torch.Tensor | None = None,
     softmax_row_sum: torch.Tensor | None = None,
     helix_kv_bounds: torch.Tensor | None = None,
+    split_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -8028,6 +8047,25 @@ def run_trtllm_fp4_mla_decode_page_native(
         raise TypeError("q_global_scale must be a scalar FP32 CUDA tensor")
     if kv_global_scale.dtype != torch.float32 or kv_global_scale.numel() != 1:
         raise TypeError("kv_global_scale must be a scalar FP32 CUDA tensor")
+    if split_kv_buffers is not None:
+        if write_softmax_stats:
+            raise ValueError("split-KV buffers and softmax stats outputs are mutually exclusive")
+        expected_shapes = (
+            (l_batch, physical_m, TRTLLM_V_HEAD_DIM),
+            (l_batch, physical_m),
+            (l_batch, physical_m),
+        )
+        if len(split_kv_buffers) != 3:
+            raise ValueError("split_kv_buffers requires numerator, maxima, and sums")
+        for tensor, shape in zip(split_kv_buffers, expected_shapes):
+            if (
+                tensor.shape != shape
+                or tensor.dtype != torch.float32
+                or tensor.device != device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(f"split-KV buffer must be contiguous FP32 {shape} on {device}")
+            _validate_tensor_pointer_alignment("split-KV buffer", tensor, alignment_bytes=32)
     stream = _current_cu_stream()
     device_index = torch.cuda.current_device()
     context_result, current_context = cuda.cuCtxGetCurrent()
@@ -8052,6 +8090,11 @@ def run_trtllm_fp4_mla_decode_page_native(
         helix_kv_bounds.data_ptr() if helix_kv_bounds is not None else valid_k_data_ptr
     )
     c_data_ptr = output.data_ptr()
+    split_o_data_ptr, split_max_data_ptr, split_sum_data_ptr = (
+        tuple(tensor.data_ptr() for tensor in split_kv_buffers)
+        if split_kv_buffers is not None
+        else (scratch_ptr, row_max_data_ptr, row_sum_data_ptr)
+    )
     page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
     q_global_scale_data_ptr = q_global_scale.data_ptr()
     kv_global_scale_data_ptr = kv_global_scale.data_ptr()
@@ -8071,9 +8114,9 @@ def run_trtllm_fp4_mla_decode_page_native(
         valid_k_data_ptr,
         helix_kv_bounds_data_ptr,
         c_data_ptr,
-        scratch_ptr,
-        row_max_data_ptr,
-        row_sum_data_ptr,
+        split_o_data_ptr,
+        split_max_data_ptr,
+        split_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -8093,6 +8136,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         use_consecutive_page_pair=use_consecutive_page_pair,
         write_softmax_stats=write_softmax_stats,
         use_helix_kv_bounds=helix_kv_bounds is not None,
+        store_split=split_kv_buffers is not None,
     )
     supports_prepared = _class_defines_callables(
         fused, "to", "generate_execution_args", "run_compiled_program"
@@ -8112,8 +8156,9 @@ def run_trtllm_fp4_mla_decode_page_native(
         valid_k_data_ptr,
         helix_kv_bounds_data_ptr,
         c_data_ptr,
-        row_max_data_ptr,
-        row_sum_data_ptr,
+        split_o_data_ptr,
+        split_max_data_ptr,
+        split_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -8148,9 +8193,9 @@ def run_trtllm_fp4_mla_decode_page_native(
         valid_k_data_ptr,
         helix_kv_bounds_data_ptr,
         c_data_ptr,
-        scratch_ptr,
-        row_max_data_ptr,
-        row_sum_data_ptr,
+        split_o_data_ptr,
+        split_max_data_ptr,
+        split_sum_data_ptr,
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
@@ -8232,6 +8277,7 @@ def run_trtllm_fp4_mla_decode_page_native_from_raw(
     softmax_row_max: torch.Tensor | None = None,
     softmax_row_sum: torch.Tensor | None = None,
     helix_kv_bounds: torch.Tensor | None = None,
+    split_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -8286,4 +8332,5 @@ def run_trtllm_fp4_mla_decode_page_native_from_raw(
         softmax_row_max=softmax_row_max,
         softmax_row_sum=softmax_row_sum,
         helix_kv_bounds=helix_kv_bounds,
+        split_kv_buffers=split_kv_buffers,
     )

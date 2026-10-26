@@ -94,6 +94,22 @@ def _make_manager(max_num_tokens, tokens_per_block, enable_chunked_prefill=True)
     return mgr
 
 
+def test_replay_prefix_is_included_in_post_allocation_budget():
+    from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
+
+    req = _FakeRequest(context_current_position=4096, context_chunk_size=904, prompt_len=5000)
+    req.py_ced_replay = EncoderReplay(req.py_request_id, 123, 4096, 3968)
+    manager = _make_manager(1024, 128)
+    assert manager._request_forward_tokens(req, is_context=True) == 1032
+    batch = _make_batch(context_requests=[req])
+    manager.fit_token_budget(batch)
+    assert req.context_chunk_size == 896
+    assert manager._request_forward_tokens(req, is_context=True) == 1024
+    assert req.context_current_position == 4096
+    assert not req.py_ced_replay.consumed
+    assert batch.context_requests_chunking == [req]
+
+
 def _make_batch(context_requests=(), generation_requests=()):
     batch = ScheduledRequests()
     for req in context_requests:
@@ -103,7 +119,7 @@ def _make_batch(context_requests=(), generation_requests=()):
 
 
 def _forward_tokens(mgr, batch):
-    """What _prepare_tp_inputs will materialize for this batch."""
+    """What prepare_inputs will materialize for this batch."""
     return sum(
         mgr._request_forward_tokens(r, is_context=False) for r in batch.generation_requests
     ) + sum(
@@ -149,7 +165,7 @@ class TestReuseDiscountedChunk(unittest.TestCase):
             self.assertEqual(req.context_chunk_size, 12, "chunk must be untouched")
 
     def test_chunk_beyond_prompt_end_is_clamped(self):
-        # _prepare_tp_inputs slices all_prompt_tokens[pos:pos + chunk], and
+        # _pack_context_requests slices all_prompt_tokens[pos:pos + chunk], and
         # Python clamps that to the end of the list. A chunk that overhangs the
         # prompt must be costed at what is actually left, not at its nominal
         # size.

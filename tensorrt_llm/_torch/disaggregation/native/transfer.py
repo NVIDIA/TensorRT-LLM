@@ -38,7 +38,6 @@ except ImportError:
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base import Chunk
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -56,36 +55,49 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
+from tensorrt_llm._torch.disaggregation.lifecycle.retirement import (
+    QuiescenceFatalEvent,
+    RetirementDeadline,
+    RetirementWatchdog,
+)
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
 )
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    PhysicalOperationState as _PhysicalOperationState,  # noqa: F401 -- native diagnostic alias
+)
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    ReceiveOperationOwner as _ReceiveOperationOwner,
+)
+from tensorrt_llm._torch.disaggregation.native.ownership import SendOperationOwner
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    TransferNotSubmittedError as _TransferNotSubmittedError,
+)
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.native.retirement import (
-    QuiescenceFatalEvent,
-    RetirementDeadline,
-    RetirementWatchdog,
-)
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.disaggregation.base.agent import TransferStatus
+
     from .bounce import Config
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -101,10 +113,6 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
-
-
-class _TransferNotSubmittedError(RuntimeError):
-    """The sender rejected an operation before the backend could access memory."""
 
 
 @dataclass
@@ -189,6 +197,7 @@ class MessageType:
     REGISTER_RANK_INFO = b"REGISTER_RANK_INFO"
     AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
     CANCEL_SESSION = b"CANCEL_SESSION"
+    SESSION_QUIESCED = b"SESSION_QUIESCED"
 
 
 class PeerIncompatibleError(ValueError):
@@ -328,217 +337,6 @@ class _LogicalTask:
         return self._logical_outcomes.get(self._logical_index)
 
 
-class _ReceiveOperationOwner:
-    """Track destination access independently from a task's logical result."""
-
-    def __init__(self, retirement: Optional[RetirementDeadline] = None) -> None:
-        self._retirement = retirement
-        self._lock = threading.Lock() if retirement is None else retirement.lock
-        self._publication_pending = False
-        self._cancelled_unpublished = False
-        self._expected_writers: Optional[int] = None
-        self._writer_cohort: Optional[frozenset[int]] = None
-        self._writer_results: dict[int, bool] = {}
-        self._in_doubt_writers: set[int] = set()
-        self._settled_writers: set[int] = set()
-        self._publication_failed = False
-        self._local_completion_pending = False
-        self._invalid_evidence = False
-
-    def _settle_if_drained_locked(self) -> None:
-        """Remove this claim only after the complete cohort and local work settle."""
-        if self._retirement is not None and self._resources_drained_locked():
-            self._retirement.settle(self)
-
-    def _invalidate_evidence_locked(self) -> None:
-        """Quarantine conflicting proof, including proof disputed after settlement."""
-        self._invalid_evidence = True
-        if self._retirement is not None:
-            self._retirement.retain_unproven(self, "invalid receive ownership evidence")
-
-    def begin_publication(self) -> None:
-        with self._lock:
-            if self._publication_pending or self._expected_writers is not None:
-                raise RuntimeError("destination publication was already started")
-            self._publication_pending = True
-
-    def seal_writer_cohort(
-        self,
-        expected_writers: int,
-        writer_cohort: Optional[set[int]] = None,
-    ) -> None:
-        if expected_writers < 0:
-            raise ValueError(f"expected_writers must be non-negative, got {expected_writers}")
-        cohort = None if writer_cohort is None else frozenset(writer_cohort)
-        if cohort is not None and len(cohort) != expected_writers:
-            raise ValueError(
-                f"writer cohort has {len(cohort)} member(s), expected {expected_writers}"
-            )
-        with self._lock:
-            if self._expected_writers is not None:
-                if self._expected_writers != expected_writers or self._writer_cohort != cohort:
-                    raise RuntimeError("writer cohort was already sealed differently")
-                return
-            self._expected_writers = expected_writers
-            self._writer_cohort = cohort
-
-    def finish_publication(self) -> None:
-        """Record that every authorized REQUEST_DATA message was sent."""
-        with self._lock:
-            self._publication_pending = False
-            self._settle_if_drained_locked()
-
-    def abort_publication(self, published_writers: set[int]) -> None:
-        """Close a failed fan-out around the writers whose sends succeeded."""
-        with self._lock:
-            published = frozenset(published_writers)
-            if self._writer_cohort is not None and not published.issubset(self._writer_cohort):
-                self._invalidate_evidence_locked()
-                raise RuntimeError("publication recorded a writer outside the sealed cohort")
-            if not (self._writer_results.keys() | self._in_doubt_writers) <= published:
-                self._invalidate_evidence_locked()
-                raise RuntimeError("terminal evidence came from an unpublished writer")
-            self._expected_writers = len(published)
-            self._writer_cohort = frozenset(published)
-            self._publication_failed = True
-            self._cancelled_unpublished = not published
-            self._publication_pending = False
-            self._settle_if_drained_locked()
-
-    def cancel_unpublished(self) -> bool:
-        """Close a publication that did not authorize a remote writer."""
-        with self._lock:
-            if self._invalid_evidence:
-                return False
-            if self._expected_writers is not None:
-                return self._cancelled_unpublished
-            self._cancelled_unpublished = True
-            self._expected_writers = 0
-            self._writer_cohort = frozenset()
-            self._publication_pending = False
-            self._settle_if_drained_locked()
-            return True
-
-    def record_writer_in_doubt(self, peer_rank: int) -> bool:
-        """Retain ownership after a writer reports no safe terminal evidence."""
-        with self._lock:
-            if self._expected_writers is None:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(
-                    f"writer {peer_rank} reported ambiguous evidence before publication"
-                )
-            if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
-            if peer_rank in self._in_doubt_writers or peer_rank in self._settled_writers:
-                return False
-            self._in_doubt_writers.add(peer_rank)
-            if self._retirement is not None:
-                self._retirement.retain_unproven(self, "receive ownership is in doubt")
-            return True
-
-    def record_writer_settlement(self, peer_rank: int) -> bool:
-        """Accept physical DONE for a writer that previously reported IN_DOUBT.
-
-        Ordinary FAILED is not this proof: it may describe a later, unsubmitted
-        chunk while the earlier ambiguous write is still touching the destination.
-        """
-        with self._lock:
-            if self._expected_writers is None or (
-                self._writer_cohort is not None and peer_rank not in self._writer_cohort
-            ):
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} settled outside the published cohort")
-            if peer_rank in self._settled_writers:
-                return False
-            if peer_rank not in self._in_doubt_writers:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} settled without prior ambiguous evidence")
-            if self._writer_results.get(peer_rank) is True:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} settled after contradictory success")
-            self._writer_results[peer_rank] = False
-            self._in_doubt_writers.remove(peer_rank)
-            self._settled_writers.add(peer_rank)
-            self._settle_if_drained_locked()
-            return True
-
-    def record_writer_result(
-        self,
-        peer_rank: int,
-        succeeded: bool,
-        *,
-        wait_for_local_completion: bool,
-    ) -> tuple[bool, bool]:
-        """Record one writer and return ``(accepted, all_succeeded)``."""
-        with self._lock:
-            if self._expected_writers is None:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(
-                    f"writer {peer_rank} reported terminal evidence before publication"
-                )
-            if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
-            if peer_rank in self._in_doubt_writers:
-                if succeeded:
-                    self._invalidate_evidence_locked()
-                    raise RuntimeError(f"writer {peer_rank} reported success while in doubt")
-                return False, False
-            previous = self._writer_results.get(peer_rank)
-            if previous is not None:
-                if previous != succeeded:
-                    self._invalidate_evidence_locked()
-                    raise RuntimeError(
-                        f"writer {peer_rank} reported contradictory terminal evidence"
-                    )
-                return False, False
-            if len(self._writer_results) >= self._expected_writers:
-                return False, False
-            self._writer_results[peer_rank] = succeeded
-            all_reported = len(self._writer_results) == self._expected_writers
-            all_succeeded = (
-                all_reported and not self._publication_failed and all(self._writer_results.values())
-            )
-            if all_succeeded and wait_for_local_completion:
-                self._local_completion_pending = True
-            self._settle_if_drained_locked()
-            return True, all_succeeded
-
-    def finish_local_completion(self) -> None:
-        with self._lock:
-            self._local_completion_pending = False
-            self._settle_if_drained_locked()
-
-    @property
-    def all_writers_reported(self) -> bool:
-        """Whether every writer of the sealed cohort has reported a terminal result."""
-        with self._lock:
-            return (
-                self._expected_writers is not None
-                and len(self._writer_results) == self._expected_writers
-                and not self._in_doubt_writers
-            )
-
-    @property
-    def resources_drained(self) -> bool:
-        with self._lock:
-            return self._resources_drained_locked() and (
-                self._retirement is None or self._retirement.can_retire()
-            )
-
-    def _resources_drained_locked(self) -> bool:
-        """Check physical evidence without consulting the session's other owners."""
-        return (
-            self._expected_writers is not None
-            and len(self._writer_results) == self._expected_writers
-            and not self._publication_pending
-            and not self._local_completion_pending
-            and not self._in_doubt_writers
-            and not self._invalid_evidence
-        )
-
-
 class AgentResult(Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
@@ -595,44 +393,6 @@ def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResul
     ]
 
 
-class _PhysicalOperationState(Enum):
-    """Sender-side evidence for one peer's access to a task's source memory.
-
-    The legal forward paths are::
-
-        ADMITTED -> NOT_SUBMITTED
-        ADMITTED -> SUBMITTING -> SUBMITTED -> BACKEND_DONE
-        SUBMITTING -> IN_DOUBT
-        SUBMITTED -> IN_DOUBT -> BACKEND_DONE (same retained status reports DONE)
-
-    Only NOT_SUBMITTED and BACKEND_DONE prove that the operation can no longer
-    access the source. An IN_DOUBT operation without a retained backend status
-    cannot retire. Repeating a terminal transition is idempotent, and repeating
-    IN_DOUBT preserves the retained backend evidence.
-    """
-
-    ADMITTED = "ADMITTED"
-    SUBMITTING = "SUBMITTING"
-    SUBMITTED = "SUBMITTED"
-    NOT_SUBMITTED = "NOT_SUBMITTED"
-    BACKEND_DONE = "BACKEND_DONE"
-    IN_DOUBT = "IN_DOUBT"
-
-
-_DRAINED_PHYSICAL_OPERATION_STATES = frozenset(
-    (_PhysicalOperationState.NOT_SUBMITTED, _PhysicalOperationState.BACKEND_DONE)
-)
-
-
-@dataclass
-class _PhysicalOperation:
-    """State plus strong backend roots retained until physical quiescence."""
-
-    state: _PhysicalOperationState
-    request: Optional[TransferRequest] = None
-    status: Optional[object] = None
-
-
 @dataclass
 class _PendingSettlement:
     write_meta: WriteMeta
@@ -652,8 +412,9 @@ class SendTaskBase(_LogicalTask):
         self._params = params
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
-        self._physical_lock = threading.Lock()
-        self._physical_operations: dict[int, _PhysicalOperation] = {}
+        self._physical_owner = SendOperationOwner()
+        # Preserve the task's diagnostic view of its owner's exact roots.
+        self._physical_operations = self._physical_owner._physical_operations
 
     def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
         """Bind session outcome and deadline before exposing the task to workers.
@@ -662,8 +423,7 @@ class SendTaskBase(_LogicalTask):
             outcomes: The session's stable logical-result arbiter.
         """
         super().bind_logical_outcomes(outcomes)
-        if self._retirement is not None:
-            self._physical_lock = self._retirement.lock
+        self._physical_owner.bind_retirement(self._retirement)
 
     def fail(self, exc: Exception) -> None:
         self._logical_outcomes.fail(exc)
@@ -685,142 +445,41 @@ class SendTaskBase(_LogicalTask):
         return self._event.is_set()
 
     def begin_physical_operation(self, peer_rank: int) -> bool:
-        with self._physical_lock:
-            if peer_rank in self._physical_operations:
-                return False
-            self._physical_operations[peer_rank] = _PhysicalOperation(
-                _PhysicalOperationState.ADMITTED
-            )
-            return True
+        """Admit a participant once in the native physical owner."""
+        return self._physical_owner.begin_physical_operation(peer_rank)
 
-    def _require_physical_operation_locked(
-        self,
-        peer_rank: int,
-        expected_states: tuple[_PhysicalOperationState, ...],
-    ) -> _PhysicalOperation:
-        operation = self._physical_operations.get(peer_rank)
-        if operation is None:
-            raise RuntimeError(f"physical operation {peer_rank} was not admitted")
-        if operation.state not in expected_states:
-            expected = ", ".join(state.value for state in expected_states)
-            raise RuntimeError(
-                f"physical operation {peer_rank} is {operation.state.value}, expected {expected}"
-            )
-        return operation
+    def begin_backend_submission(self, peer_rank: int, request: TransferRequest) -> None:
+        """Root the request before the native backend submission escapes."""
+        self._physical_owner.begin_backend_submission(peer_rank, request)
 
-    def begin_backend_submission(
-        self,
-        peer_rank: int,
-        request: TransferRequest,
-    ) -> None:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank, (_PhysicalOperationState.ADMITTED,)
-            )
-            if self._retirement is not None and not self._retirement.expose(operation):
-                operation.state = _PhysicalOperationState.NOT_SUBMITTED
-                raise _TransferNotSubmittedError("source retirement admission is closed")
-            operation.request = request
-            operation.state = _PhysicalOperationState.SUBMITTING
-
-    def record_backend_submission(self, peer_rank: int, status: object) -> None:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank, (_PhysicalOperationState.SUBMITTING,)
-            )
-            operation.status = status
-            operation.state = _PhysicalOperationState.SUBMITTED
+    def record_backend_submission(self, peer_rank: int, status: TransferStatus) -> None:
+        """Retain the exact status returned by the native backend."""
+        self._physical_owner.record_backend_submission(peer_rank, status)
 
     def mark_physical_operation_in_doubt(self, peer_rank: int) -> None:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank,
-                (
-                    _PhysicalOperationState.SUBMITTING,
-                    _PhysicalOperationState.SUBMITTED,
-                    _PhysicalOperationState.IN_DOUBT,
-                ),
-            )
-            operation.state = _PhysicalOperationState.IN_DOUBT
-            if self._retirement is not None:
-                self._retirement.request_drain("backend quiescence unproven")
+        """Retain ambiguous access independently of the logical outcome."""
+        self._physical_owner.mark_physical_operation_in_doubt(peer_rank)
 
     def retire_unsubmitted_physical_operation(self, peer_rank: int) -> None:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank,
-                (
-                    _PhysicalOperationState.ADMITTED,
-                    _PhysicalOperationState.NOT_SUBMITTED,
-                ),
-            )
-            operation.state = _PhysicalOperationState.NOT_SUBMITTED
+        """Record that a participant never submitted a backend operation."""
+        self._physical_owner.retire_unsubmitted_physical_operation(peer_rank)
 
     def retire_backend_done_physical_operation(self, peer_rank: int) -> bool:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank,
-                (
-                    _PhysicalOperationState.SUBMITTED,
-                    _PhysicalOperationState.BACKEND_DONE,
-                ),
-            )
-            if operation.state is _PhysicalOperationState.BACKEND_DONE:
-                return True
-            if self._retirement is not None and not self._retirement.settle(operation):
-                operation.state = _PhysicalOperationState.IN_DOUBT
-                return False
-            operation.request = None
-            operation.status = None
-            operation.state = _PhysicalOperationState.BACKEND_DONE
-            return True
+        """Settle backend-defined completion through the common deadline arbiter."""
+        return self._physical_owner.retire_backend_done_physical_operation(peer_rank)
 
     def poll_in_doubt_physical_operation(self, peer_rank: int) -> bool:
-        """Retire once, only after a fresh DONE query on the retained status.
-
-        Polling does not change the task's logical outcome. Keep strong local
-        roots across the query, and reject a result if its operation changed.
-        """
-        with self._physical_lock:
-            operation = self._physical_operations.get(peer_rank)
-            if operation is None or operation.state is not _PhysicalOperationState.IN_DOUBT:
-                return False
-            request, status = operation.request, operation.status
-        if status is None:
-            return False
-        try:
-            completed = status.is_completed()
-        except Exception:
-            # A backend query failure is not evidence that its accessors stopped.
-            return False
-        if completed is not True:
-            return False
-        with self._physical_lock:
-            if (
-                self._physical_operations.get(peer_rank) is not operation
-                or operation.state is not _PhysicalOperationState.IN_DOUBT
-                or operation.request is not request
-                or operation.status is not status
-            ):
-                return False
-            if self._retirement is not None and not self._retirement.settle(operation):
-                return False
-            operation.request = None
-            operation.status = None
-            operation.state = _PhysicalOperationState.BACKEND_DONE
-            return True
+        """Query and settle only the exact retained ambiguous operation."""
+        return self._physical_owner.poll_in_doubt_physical_operation(peer_rank)
 
     def has_started_physical_operation(self, peer_rank: int) -> bool:
-        with self._physical_lock:
-            return peer_rank in self._physical_operations
+        """Whether this task has admitted the participant."""
+        return self._physical_owner.has_started_physical_operation(peer_rank)
 
     @property
     def resources_drained(self) -> bool:
-        with self._physical_lock:
-            return (self._retirement is None or self._retirement.can_retire()) and all(
-                operation.state in _DRAINED_PHYSICAL_OPERATION_STATES
-                for operation in self._physical_operations.values()
-            )
+        """Whether operation evidence and the session deadline permit retirement."""
+        return self._physical_owner.resources_drained
 
     def print_perf_info(self, peer_rank: int, instance_name: str, instance_rank: int):
         if self._perf_timer is None:
@@ -867,6 +526,15 @@ class KVSendTask(SendTaskBase):
         return self.transferred_count < self.expected_transfers
 
 
+@dataclass(frozen=True)
+class _SessionQuiescence:
+    """A FIFO marker for one cancelled request's no-future-access acknowledgment."""
+
+    unique_rid: int
+    peer_rank: int
+    endpoint: Optional[str]
+
+
 class Sender(SenderBase):
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
@@ -899,7 +567,10 @@ class Sender(SenderBase):
         # unique_rid -> whether the peer asked, for cancels that arrive before the session exists.
         # Who asked is not recoverable from the id alone, and the two differ: a peer's cancel is a
         # transfer error, our own side's is an ordinary end.
+        # Ownership mode also fences existing sessions: keep one entry per
+        # cancelled immutable ID until Sender teardown, not merely metadata TTL.
         self._pre_cancelled_rids: dict[int, bool] = {}
+        self._pending_session_quiescence: dict[tuple[int, int], _SessionQuiescence] = {}
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -996,32 +667,37 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if self._shutdown_requested:
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
+            if self._enforce_physical_ownership and unique_rid in self._sessions:
+                raise RuntimeError("cannot replace an owned TxSession")
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
-                cancelled_by_peer = self._pre_cancelled_rids.pop(unique_rid)
+                cancelled_by_peer = self._pre_cancelled_rids[unique_rid]
+                if not self._enforce_physical_ownership:
+                    self._pre_cancelled_rids.pop(unique_rid)
             if not (pre_cancel and self._enforce_physical_ownership):
                 self._sessions[unique_rid] = (
                     tx_session if self._enforce_physical_ownership else weakref.ref(tx_session)
                 )
         if pre_cancel:
             if self._enforce_physical_ownership:
-                tx_session.cancel_local(by_peer=cancelled_by_peer)
+                tx_session.cancel_local(by_peer=cancelled_by_peer, report_unsubmitted_aux=False)
                 # Make the cancelled session visible only after its terminal
-                # state and the previously saved requests are captured. This
-                # prevents the listener from reporting the same first
-                # REQUEST_DATA concurrently with this pre-cancel path.
+                # state and the previously saved requests are captured. Late
+                # creation cannot reopen admission while the listener
+                # acknowledges the generation-first cancellation.
                 with self._sessions_lock:
                     if self._shutdown_requested:
                         raise RuntimeError("cannot create a TxSession after Sender shutdown")
-                    self._pre_cancelled_rids.pop(unique_rid, None)
+                    if unique_rid in self._sessions:
+                        raise RuntimeError("cannot replace an owned TxSession")
+                    # Keep the fence for this immutable request ID after
+                    # session cleanup, so delayed creation cannot reopen it.
                     with self._peer_requests_lock:
                         req_infos = list(self._peer_requests.get(unique_rid, {}).values())
                     self._sessions[unique_rid] = tx_session
                 for info in req_infos:
-                    self._send_failed_result_to_receiver(
-                        info,
-                        include_aux=tx_session._claim_unsubmitted_aux_failure(info),
-                        defer_to_worker=True,
+                    self._queue_session_quiescence(
+                        unique_rid, info.instance_name, info.instance_rank
                     )
             else:
                 tx_session.cancel(by_peer=cancelled_by_peer)
@@ -1176,6 +852,11 @@ class Sender(SenderBase):
                     write_meta = task_queue.get()
                 if write_meta is None:
                     break
+                if isinstance(write_meta, _SessionQuiescence):
+                    if not self._send_session_quiesced(write_meta):
+                        task_queue.put(write_meta)
+                        time.sleep(0.01)
+                    continue
                 if isinstance(write_meta, tuple):
                     endpoint, message = write_meta
                     try:
@@ -1186,7 +867,9 @@ class Sender(SenderBase):
                 try:
                     if write_meta.meta_type == WriteMetaType.AUX:
                         logger.debug(
-                            f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
+                            "_process_task_queue[%d]: delivering aux task to agent: %s",
+                            thread_idx,
+                            write_meta,
                         )
                         self._deliver_aux_to_agent(write_meta)
                     else:
@@ -1692,6 +1375,8 @@ class Sender(SenderBase):
         # Send ownership is per pool: replicated pools elect one fan-in
         # owner, sharded pools keep head-duplication routing.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
+            if (self_lg, self_pi) in task._chunk.excluded_pool_views:
+                continue
             if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
 
@@ -1929,15 +1614,72 @@ class Sender(SenderBase):
         session = None
         with self._sessions_lock:
             session = self._get_session(unique_rid)
-            if session is None:
+            if session is None or self._enforce_physical_ownership:
                 # Parked with the peer as who asked: the session built afterwards reads its
                 # cancellation from here, and an id on its own would read as a local cancel.
-                self._pre_cancelled_rids[unique_rid] = True
+                if self._enforce_physical_ownership:
+                    self._pre_cancelled_rids.setdefault(unique_rid, True)
+                else:
+                    self._pre_cancelled_rids[unique_rid] = True
         if session is not None:
             if self._enforce_physical_ownership:
                 session.cancel_local(by_peer=True)
             else:
                 session.cancel(by_peer=True)
+        if self._enforce_physical_ownership and len(message) == 4:
+            # Routing is carried by CANCEL itself, not by expiring REQUEST_DATA.
+            self._queue_session_quiescence(unique_rid, message[2].decode(), int(message[3]))
+
+    def _queue_session_quiescence(
+        self, unique_rid: int, instance_name: str, instance_rank: int
+    ) -> None:
+        """Queue proof on the same worker/socket as this peer's piece results."""
+        endpoint = self._registrar.get_peer_rank_info(instance_name, instance_rank).self_endpoint
+        key = (unique_rid, instance_rank)
+        with self._sessions_lock:
+            if self._shutdown_requested or key in self._pending_session_quiescence:
+                return
+            marker = _SessionQuiescence(unique_rid, instance_rank, endpoint)
+            self._pending_session_quiescence[key] = marker
+            self._send_task_queues[hash(key) % self._num_threads].put(marker)
+
+    def _send_session_quiesced(self, marker: _SessionQuiescence) -> bool:
+        """Acknowledge a fenced, drained session; return False to retry later.
+
+        Called only by the ordered worker, after earlier queued piece reports.
+        Session absence is safe only with the persistent admission fence. An
+        existing session must also prove that all KV and AUX accesses drained.
+        """
+        key = (marker.unique_rid, marker.peer_rank)
+        with self._sessions_lock:
+            if marker.unique_rid not in self._pre_cancelled_rids:
+                return False
+            session = self._get_session(marker.unique_rid)
+        if session is not None:
+            with session.lock:
+                if not session.has_failed() or not session.resources_drained():
+                    return False
+        thread_idx = hash(key) % self._num_threads
+        if any(
+            pending.write_meta.unique_rid == marker.unique_rid
+            and pending.write_meta.peer_rank == marker.peer_rank
+            for pending in self._pending_settlements[thread_idx].values()
+        ):
+            return False
+        try:
+            self._get_or_connect_thread_dealer(marker.endpoint).send(
+                [
+                    MessageType.SESSION_QUIESCED,
+                    str(self._instance_rank).encode("ascii"),
+                    str(marker.unique_rid).encode("ascii"),
+                ]
+            )
+        except Exception as error:
+            logger.warning(f"Failed to acknowledge fenced session {marker.unique_rid}: {error}")
+            return False
+        with self._sessions_lock:
+            self._pending_session_quiescence.pop(key, None)
+        return True
 
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
@@ -1946,9 +1688,16 @@ class Sender(SenderBase):
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
-            if session is None:
+            fenced = (
+                self._enforce_physical_ownership and info.unique_rid in self._pre_cancelled_rids
+            )
+            if session is None and not fenced:
                 self._save_peer_req_info(info)
                 return
+        if fenced:
+            self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
+            return
+        assert session is not None
         with session.lock:
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
@@ -2468,7 +2217,7 @@ class TxSession(TxSessionBase):
         self._sender.send_cancel_to_receivers(self.disagg_request_id)
         return True
 
-    def cancel_local(self, by_peer: bool = False) -> bool:
+    def cancel_local(self, by_peer: bool = False, *, report_unsubmitted_aux: bool = True) -> bool:
         aux_failures: list[RecvReqInfo] = []
         retirement = getattr(self, "_retirement", None)
         if retirement is not None:
@@ -2490,7 +2239,8 @@ class TxSession(TxSessionBase):
             if self.aux_task is not None and self.aux_task.status == TaskStatus.INIT:
                 self.aux_task.fail(exc)
             req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
-            aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
+            if report_unsubmitted_aux:
+                aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
         self._report_unsubmitted_aux_failures(aux_failures)
         return True
 
@@ -3210,6 +2960,7 @@ class Receiver(ReceiverBase):
             task.slice_id,
             sender_endpoints,
             writer_cohort,
+            writer_candidates=set(peer_ranks),
             publish=publish_requests,
             published_writers=published_writers,
         ):
@@ -3253,7 +3004,7 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
-            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
+            # Peer compatibility gates on the receiver side.
             # The sender-side check (PeerRegistrar.register) runs in the
             # sender's listener thread, where exceptions are only logged, so
             # reject here — before REGISTER_RANK_INFO is even sent, so no
@@ -3262,6 +3013,7 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
+                self._registrar.validate_bounded_replay_compatible(sender_info)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
@@ -3294,15 +3046,22 @@ class Receiver(ReceiverBase):
         else:
             return self._sender_ep_instance_map[info_endpoint]
 
-    def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> None:
-        """Notify all senders involved in this session to cancel."""
+    def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> set[str]:
+        """Notify senders and return the endpoints whose cancel message was sent."""
+        message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+        if self._enforce_physical_ownership:
+            rank_info = self._registrar.self_rank_info
+            message.extend(
+                [rank_info.instance_name.encode(), str(rank_info.instance_rank).encode("ascii")]
+            )
+        sent = set()
         for endpoint in sender_endpoints:
             try:
-                self._get_or_connect_dealer(endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
-                )
+                self._get_or_connect_dealer(endpoint).send(message)
+                sent.add(endpoint)
             except Exception as e:
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
+        return sent
 
     def _start_listener(self):
         def handle_message(messages: list[bytes]) -> bool:
@@ -3321,6 +3080,11 @@ class Receiver(ReceiverBase):
                         self._process_aux_agent_result(send_id, msg)
                     except Exception as e:
                         logger.error(f"Receiver: error handling AUX_AGENT_RESULT: {e}")
+                case MessageType.SESSION_QUIESCED:
+                    try:
+                        self._process_session_quiesced(msg)
+                    except Exception as e:
+                        logger.error(f"Receiver: error handling SESSION_QUIESCED: {e}")
                 case MessageType.CANCEL_SESSION:
                     try:
                         self._handle_cancel_session(msg)
@@ -3331,6 +3095,15 @@ class Receiver(ReceiverBase):
             return True
 
         self._messenger.start_listener(handle_message)
+
+    def _process_session_quiesced(self, message: list[bytes]) -> None:
+        """Dispatch no-future-access proof only to the matching live request."""
+        if not self._enforce_physical_ownership:
+            return
+        peer_rank, unique_rid = int(message[1]), int(message[2])
+        session = self._get_session(unique_rid)
+        if session is not None:
+            session.process_session_quiesced(peer_rank)
 
     def _handle_cancel_session(self, message: list[bytes]):
         unique_rid = int(message[1])
@@ -3458,6 +3231,8 @@ class RxSession(RxSessionBase):
             self._aux_physical_owner = _ReceiveOperationOwner(self._retirement)
             self._aux_physical_owner.begin_publication()
         self._sender_endpoints: set[str] = set()
+        self._cancelled_sender_endpoints: set[str] = set()
+        self._cancel_notification_started = False
         # Serialize REQUEST_DATA publication with cancellation notification
         # without holding the session state lock across a potentially blocking
         # network send. The ordering is publication -> cancellation whenever
@@ -3554,6 +3329,7 @@ class RxSession(RxSessionBase):
         sender_endpoints: set[str],
         writer_cohort: Optional[set[int]] = None,
         *,
+        writer_candidates: Optional[set[int]] = None,
         publish: Optional[Callable[[], None]] = None,
         published_writers: Optional[set[int]] = None,
     ) -> bool:
@@ -3581,7 +3357,11 @@ class RxSession(RxSessionBase):
                 unpublished = [owner for owner in owners if owner._expected_writers is None]
                 try:
                     for owner in owners:
-                        owner.seal_writer_cohort(task.expected_transfers, writer_cohort)
+                        owner.seal_writer_cohort(
+                            task.expected_transfers,
+                            writer_cohort,
+                            published_writers=writer_candidates,
+                        )
                     if retirement is not None and not retirement.expose(*owners):
                         raise RuntimeError("destination retirement admission is closed")
                 except Exception:
@@ -3597,7 +3377,13 @@ class RxSession(RxSessionBase):
                 self._publication_may_have_escaped = True
                 try:
                     publish()
-                    if writer_cohort is not None and published_writers != writer_cohort:
+                    expected_publication = (
+                        writer_candidates if writer_candidates is not None else writer_cohort
+                    )
+                    if (
+                        expected_publication is not None
+                        and published_writers != expected_publication
+                    ):
                         raise RuntimeError("publication did not queue the complete writer cohort")
                 except Exception:
                     # ZMQ delivers multipart messages atomically. A successful
@@ -4069,10 +3855,37 @@ class RxSession(RxSessionBase):
             return set(self._sender_endpoints)
 
     def notify_cancel(self, sender_endpoints: Optional[set[str]] = None) -> None:
-        if sender_endpoints is None:
-            sender_endpoints = self.capture_cancel_targets()
         with self._publication_lock:
-            self._receiver.send_cancel_to_senders(self.disagg_request_id, sender_endpoints)
+            if sender_endpoints is None:
+                sender_endpoints = self.capture_cancel_targets()
+            if self._enforce_physical_ownership:
+                with self.lock:
+                    self._cancel_notification_started = True
+                sender_endpoints = sender_endpoints - self._cancelled_sender_endpoints
+            sent = self._receiver.send_cancel_to_senders(self.disagg_request_id, sender_endpoints)
+            if self._enforce_physical_ownership and sent:
+                self._cancelled_sender_endpoints.update(sent)
+
+    def process_session_quiesced(self, peer_rank: int) -> None:
+        """Settle missing pieces only after every published candidate fences writes."""
+        with self._ownership_evidence_guard(), self.lock:
+            if (
+                not self._enforce_physical_ownership
+                or self._closed
+                or not self._cancel_notification_started
+                or not self.has_failed()
+            ):
+                return
+            owners = [task._get_physical_owner() for task in self._kv_tasks]
+            if self._aux_physical_owner is not None:
+                owners.append(self._aux_physical_owner)
+            try:
+                for owner in owners:
+                    if owner._expected_writers is not None and not owner._cancelled_unpublished:
+                        owner.record_session_quiesced(peer_rank)
+            except Exception as error:
+                self._record_ownership_evidence_error(error)
+                raise
 
     def cancel(self, by_peer: bool = False) -> bool:
         """Cancel locally, then notify every writer without holding the lock.
@@ -4153,7 +3966,7 @@ class RxSession(RxSessionBase):
                 if self._closed:
                     return True
                 retirement = getattr(self, "_retirement", None)
-                if retirement is not None and retirement.controller.admission_closed:
+                if retirement is not None and retirement.controller.shutdown_requested:
                     # Publication also holds this session lock. Only unsealed
                     # owners can be cancelled here; a reserved send remains live
                     # even before its network callback has actually started.
@@ -4287,7 +4100,7 @@ def _create_nixl_agent(
 
 
 def _make_aux_buffer(
-    kvm: KVCacheManager, max_slots: int, max_draft_len: Optional[int] = None
+    kvm: KVCacheManagerV2, max_slots: int, max_draft_len: Optional[int] = None
 ) -> Optional[AuxBuffer]:
     if max_slots <= 0:
         return None
@@ -4303,7 +4116,7 @@ def _make_aux_buffer(
 
 @dataclass
 class TransferWorkerConfig:
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: KVCacheManagerV2
     device_id: int
     instance_name: str
     max_concurrent_sessions: int = 0
@@ -4409,7 +4222,7 @@ class TransferWorker:
         """Forward to Sender to evict orphaned RecvReqInfo from ADP broadcast."""
         self._sender.sweep_stale_req_infos()
 
-    def _setup_peer_infrastructure(self, kvm: KVCacheManager):
+    def _setup_peer_infrastructure(self, kvm: KVCacheManagerV2):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
         self._kv_extractor = KVRegionExtractorV1(kvm)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)

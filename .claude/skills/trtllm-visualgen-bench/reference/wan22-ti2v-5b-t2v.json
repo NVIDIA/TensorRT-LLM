@@ -1,0 +1,141 @@
+{
+  "date": "20260906-164055",
+  "backend": "openai-videos",
+  "model": "Wan2.2-TI2V-5B-Diffusers",
+  "duration": 10.249647890013875,
+  "config": {
+    "num_requests": 1,
+    "num_gpus": 8,
+    "max_concurrency": 1,
+    "output_media_dir": "<run dir>/vg-bench-<stamp>/output_media",
+    "request_rate": "inf",
+    "burstiness": 1.0,
+    "response_format": "path",
+    "format": "mp4",
+    "poll_interval": 0.1
+  },
+  "total_requests": 1,
+  "completed": 1,
+  "request_throughput": 0.09756432715842751,
+  "frames_per_second": 11.805283586169729,
+  "e2e_latency": {
+    "mean": 10.24955229999614,
+    "median": 10.24955229999614,
+    "std": 0.0,
+    "min": 10.24955229999614,
+    "max": 10.24955229999614,
+    "percentiles": {
+      "p50": 10.24955229999614,
+      "p90": 10.24955229999614,
+      "p99": 10.24955229999614
+    }
+  },
+  "per_gpu_throughput": 0.01219554089480344,
+  "gen_latency": {
+    "mean": 9.474758144991938,
+    "median": 9.474758144991938,
+    "std": 0.0,
+    "min": 9.474758144991938,
+    "max": 9.474758144991938,
+    "percentiles": {
+      "p50": 9.474758144991938,
+      "p90": 9.474758144991938,
+      "p99": 9.474758144991938
+    }
+  },
+  "timings": {
+    "server_e2e": {
+      "mean": 10.215955,
+      "median": 10.215955,
+      "std": 0.0,
+      "min": 10.215955,
+      "max": 10.215955,
+      "percentiles": {
+        "p50": 10.215955,
+        "p90": 10.215955,
+        "p99": 10.215955
+      }
+    },
+    "server_gen": {
+      "mean": 9.406458427,
+      "median": 9.406458427,
+      "std": 0.0,
+      "min": 9.406458427,
+      "max": 9.406458427,
+      "percentiles": {
+        "p50": 9.406458427,
+        "p90": 9.406458427,
+        "p99": 9.406458427
+      }
+    },
+    "server_pre_denoise": {
+      "mean": 0.037183743,
+      "median": 0.037183743,
+      "std": 0.0,
+      "min": 0.037183743,
+      "max": 0.037183743,
+      "percentiles": {
+        "p50": 0.037183743,
+        "p90": 0.037183743,
+        "p99": 0.037183743
+      }
+    },
+    "server_denoise": {
+      "mean": 6.303172851999999,
+      "median": 6.303172851999999,
+      "std": 0.0,
+      "min": 6.303172851999999,
+      "max": 6.303172851999999,
+      "percentiles": {
+        "p50": 6.303172851999999,
+        "p90": 6.303172851999999,
+        "p99": 6.303172851999999
+      }
+    },
+    "server_post_denoise": {
+      "mean": 3.065820312,
+      "median": 3.065820312,
+      "std": 0.0,
+      "min": 3.065820312,
+      "max": 3.065820312,
+      "percentiles": {
+        "p50": 3.065820312,
+        "p90": 3.065820312,
+        "p99": 3.065820312
+      }
+    }
+  },
+  "requests": [
+    {
+      "index": 0,
+      "success": true,
+      "prompt": "A cat sitting on a sunny windowsill watching birds outside.",
+      "params": {
+        "response_format": "path",
+        "format": "mp4",
+        "height": 704,
+        "width": 1280,
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
+        "max_sequence_length": 512,
+        "seed": 42,
+        "num_frames": 121,
+        "frame_rate": 24.0
+      },
+      "start": 9.55900177359581e-05,
+      "end": 10.249647890013875,
+      "client_e2e": 10.24955229999614,
+      "client_gen": 9.474758144991938,
+      "server_e2e": 10.215955,
+      "server_gen": 9.406458427,
+      "server_pre_denoise": 0.037183743,
+      "server_denoise": 6.303172851999999,
+      "server_post_denoise": 3.065820312,
+      "poll_count": 101,
+      "output_paths": [
+        "<run dir>/vg-bench-<stamp>/output_media/0000_0.mp4"
+      ],
+      "error": null
+    }
+  ]
+}
