@@ -1516,6 +1516,14 @@ def test_message_id_without_an_engine_request_id_is_random():
     assert re.fullmatch(r"msg_[0-9a-f]{32}", convert_chat_response(response).id)
 
 
+def test_nonstreamed_message_id_takes_the_engine_request_id_from_the_caller():
+    """A non-streamed chat completion's own id is random; the caller's request id names it."""
+    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
+    response.id = "chatcmpl-0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", convert_chat_response(response, request_id=42).id)
+
+
 def test_streamed_message_id_carries_the_engine_request_id():
     first = chunk({"role": "assistant", "content": "hi"})
     first.id = "chatcmpl-77"

@@ -16,6 +16,7 @@
 
 import asyncio
 import json
+import re
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -254,6 +255,41 @@ def test_messages_route_hides_invalid_generated_tool_arguments(server_kind):
         "type": "error",
         "error": {"type": "api_error", "message": "Internal server error"},
     }
+
+
+def _records_engine_request_id(request_id):
+    """An openai_chat stand-in that, like the real one, notes the engine's id on the request."""
+
+    async def answer(chat_request, raw_request):
+        raw_request.state.engine_request_id = request_id
+        return _json_chat_response()
+
+    return answer
+
+
+def test_nonstream_message_is_named_after_the_engine_request():
+    client, backend = _make_route_client("standard", _json_chat_response())
+    backend.side_effect = _records_engine_request_id(42)
+
+    response = client.post("/v1/messages", json=_request())
+
+    assert response.status_code == 200
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", response.json()["id"])
+
+
+def test_batched_message_is_named_after_the_engine_request():
+    from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+
+    server = object.__new__(OpenAIServer)
+    server.model = MODEL
+    server.openai_chat = AsyncMock(side_effect=_records_engine_request_id(7))
+
+    status, message = asyncio.run(
+        server._run_batched_message(AnthropicMessagesRequest(**_request()))
+    )
+
+    assert status == "succeeded"
+    assert re.fullmatch(r"msg_7_[0-9a-f]{16}", message["id"])
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])

@@ -612,24 +612,37 @@ def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
     return anthropic_usage
 
 
-def anthropic_message_id(chat_id: Optional[str]) -> str:
-    """The Anthropic message id for the chat completion ``chat_id``.
+def anthropic_message_id(chat_id: Optional[str], request_id: Optional[int] = None) -> str:
+    """The Anthropic message id for a generation.
 
-    The serving engine names a generation ``chatcmpl-<engine request id>``. The
-    message keeps that request id, ``msg_<engine request id>_<random hex>``, so a
-    reply can be matched with the server's log lines and raw-output records for
-    the same request; the random part keeps the id unique across server
-    restarts, which reset the engine's counter. Any other chat id gets an id
-    with no request id in it.
+    The message keeps the engine's request id, ``msg_<engine request id>_<random
+    hex>``, so a reply can be matched with the server's log lines and raw-output
+    records for the same request; the random part keeps the id unique across
+    server restarts, which reset the engine's counter.
+
+    ``request_id`` is that id when the caller has it. Otherwise it is read from a
+    ``chatcmpl-<engine request id>`` chat id, which is how a streamed chat
+    completion is named; a non-streamed one has a random id, so its caller must
+    pass ``request_id``. With neither, the message id has no request id in it.
     """
     prefix = "chatcmpl-"
-    if chat_id and chat_id.startswith(prefix) and chat_id[len(prefix) :].isdigit():
-        return f"msg_{chat_id[len(prefix) :]}_{uuid.uuid4().hex[:16]}"
+    if request_id is None and chat_id and chat_id.startswith(prefix):
+        suffix = chat_id[len(prefix) :]
+        if suffix.isdigit():
+            request_id = int(suffix)
+    if request_id is not None:
+        return f"msg_{request_id}_{uuid.uuid4().hex[:16]}"
     return f"msg_{uuid.uuid4().hex}"
 
 
-def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMessagesResponse:
-    """Translate a non-streaming chat completion into an Anthropic message."""
+def convert_chat_response(
+    chat_response: ChatCompletionResponse, request_id: Optional[int] = None
+) -> AnthropicMessagesResponse:
+    """Translate a non-streaming chat completion into an Anthropic message.
+
+    ``request_id`` is the engine's id for the generation, when the caller has it;
+    the message id carries it (see ``anthropic_message_id``).
+    """
     content: List[Any] = []
     stop_reason: AnthropicStopReason = "end_turn"
     stop_sequence: Optional[str] = None
@@ -673,7 +686,7 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
         content.append(AnthropicTextBlock(text=""))
 
     return AnthropicMessagesResponse(
-        id=anthropic_message_id(chat_response.id),
+        id=anthropic_message_id(chat_response.id, request_id),
         model=chat_response.model,
         content=content,
         stop_reason=stop_reason,
