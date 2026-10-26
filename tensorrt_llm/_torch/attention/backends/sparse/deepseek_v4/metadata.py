@@ -308,14 +308,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             if is_compress_layer(compress_ratio)
         }
         # Mixed-precision KV: page table of the retained twins, -1 where a page is not retained.
-        self.mixed_high_block_table = None
+        self.retained_block_table = None
         if getattr(self.kv_cache_manager, "high_layers", None):
             # Twins of the two compression ratios have different page sizes and pools.
-            self.mixed_high_block_table = {
+            self.retained_block_table = {
                 compress_ratio: self.get_empty(
                     self.cuda_graph_buffers,
                     compress_block_table_shape,
-                    cache_name=f"mixed_high_block_table_{compress_ratio}",
+                    cache_name=f"retained_block_table_{compress_ratio}",
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
@@ -532,7 +532,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
-        high_tables = getattr(self, "mixed_high_block_table", None)
+        high_tables = getattr(self, "retained_block_table", None)
         if high_tables and self.kv_cache_manager.high_layers:
             manager = self.kv_cache_manager
             for compress_ratio, high_table in high_tables.items():

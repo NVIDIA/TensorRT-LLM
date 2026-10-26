@@ -20,7 +20,7 @@ from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
-from ..mixed_precision_overlay import write_context_rows
+from ..mixed_precision_retained_rows import store_retained_context_rows
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSABackendForwardArgs
 
@@ -87,7 +87,7 @@ def forward_context_sparse_attn(
             q, latent_cache, attn_metadata, is_generation=False
         )
         # The append kernel rotated k_pe in latent_cache: store the retained rows too.
-        write_context_rows(self.mqa, attn_metadata, latent_cache)
+        store_retained_context_rows(self.mqa, attn_metadata, latent_cache)
         return self.forward_absorption_context(
             q,
             compressed_kv,

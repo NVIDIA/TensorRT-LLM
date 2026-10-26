@@ -770,8 +770,8 @@ def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
 @pytest.mark.cpu_only
 def test_retained_compress_target_masks_rows_outside_the_twin():
     """DeepSeek-V4: the second native scatter only writes rows whose page the twin holds."""
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_overlay import (
-        retained_compress_target,
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
+        retained_compressed_scatter_args,
     )
 
     rows_per_page, ratio = 4, 4
@@ -789,9 +789,9 @@ def test_retained_compress_target_masks_rows_outside_the_twin():
         layer_offsets={3: 0},
         _get_mixed_precision_buffers=lambda local, layout, kind: pool,
     )
-    metadata = SimpleNamespace(kv_cache_manager=manager, mixed_high_block_table={ratio: table})
+    metadata = SimpleNamespace(kv_cache_manager=manager, retained_block_table={ratio: table})
     compressor = SimpleNamespace(layer_idx=3, compress_ratio=ratio)
-    out = retained_compress_target(
+    out = retained_compressed_scatter_args(
         compressor, metadata, num_comp, cu, start_pos, compressed_mask, 2, 9
     )
     assert out is not None
@@ -810,7 +810,7 @@ def test_retained_compress_target_masks_rows_outside_the_twin():
     # request 0: rows at positions 2..6 -> pages 0,0,1,1,1 all held; row 5 is padding.
     # request 1: positions 9,10(masked),11 -> page 2 held.
     assert expected == [True, True, True, True, True, False, True, False, True]
-    assert metadata.mixed_high_block_table[ratio] is table
+    assert metadata.retained_block_table[ratio] is table
 
 
 @pytest.mark.cpu_only

@@ -1090,7 +1090,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                         BufferConfig(
                             role=Role.KEY,
                             size=get_size_in_bytes(
-                                rows_per_page * self.head_dim, self.retained_dtype
+                                rows_per_page * self.head_dim, self.high_precision_dtype
                             ),
                         )
                     ],
@@ -1119,7 +1119,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             1,
             self.head_dim,
         ]
-        return convert_to_torch_tensor(TensorWrapper(address, self.retained_dtype, shape))
+        return convert_to_torch_tensor(TensorWrapper(address, self.high_precision_dtype, shape))
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """

@@ -62,7 +62,7 @@ from .backends import (
 )
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
 from .backends.sparse.hooks import get_sparse_mla_hooks
-from .backends.sparse.mixed_precision_overlay import write_generation_rows
+from .backends.sparse.mixed_precision_retained_rows import store_retained_generation_rows
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
 
@@ -1702,9 +1702,9 @@ class MLA(nn.Module):
                             quant_q_buffer,
                             **fp4_rope_kwargs,
                         )
-                        if getattr(attn_metadata, "mixed_high_block_table", None) is not None:
+                        if getattr(attn_metadata, "retained_block_table", None) is not None:
                             # Mixed precision: store the retained rows too.
-                            write_generation_rows(
+                            store_retained_generation_rows(
                                 self.mqa, attn_metadata, latent_cache, position_ids
                             )
 

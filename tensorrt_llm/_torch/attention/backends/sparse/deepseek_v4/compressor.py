@@ -14,7 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
-from ..mixed_precision_overlay import retained_compress_target
+from ..mixed_precision_retained_rows import retained_compressed_scatter_args
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -352,9 +352,10 @@ class Compressor(nn.Module):
             scale_output,
         )
 
-        # Mixed-precision KV: the same scatter writes the retained rows into this layer's twin.
-        twin = (
-            retained_compress_target(
+        # Mixed-precision KV: the same scatter also writes this layer's retained twin.
+        retained = None
+        if not self.is_indexer:
+            retained = retained_compressed_scatter_args(
                 self,
                 metadata,
                 num_comp_tokens,
@@ -364,11 +365,15 @@ class Compressor(nn.Module):
                 bsz,
                 total_tokens,
             )
-            if not self.is_indexer
-            else None
-        )
-        if twin is not None:
-            twin_cache, twin_table, twin_mask, twin_rows_per_block = twin
+        if retained is not None:
+            retained_kv_cache, retained_block_table, retained_mask, retained_tokens_per_block = (
+                retained
+            )
+            retained_dtype = (
+                KVCacheDtype.FP8_PERTENSOR
+                if retained_kv_cache.dtype == torch.float8_e4m3fn
+                else KVCacheDtype.NONE
+            )
             torch.ops.trtllm.compressor_postprocess_scatter(
                 kv_comp,
                 None,
@@ -378,19 +383,15 @@ class Compressor(nn.Module):
                 position_ids,
                 self.nope_head_dim,
                 self.rope_head_dim,
-                twin_cache,
+                retained_kv_cache,
                 None,
                 num_comp_tokens,
                 cu_new_comp_kv,
                 start_pos,
-                twin_table,
-                twin_mask,
-                twin_rows_per_block,
-                int(
-                    KVCacheDtype.FP8_PERTENSOR
-                    if twin_cache.dtype == torch.float8_e4m3fn
-                    else KVCacheDtype.NONE
-                ),
+                retained_block_table,
+                retained_mask,
+                retained_tokens_per_block,
+                int(retained_dtype),
                 1.0,
                 0,
                 self.rotate_activation,
