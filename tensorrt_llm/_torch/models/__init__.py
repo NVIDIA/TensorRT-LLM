@@ -69,6 +69,7 @@ __all__ = [
     "MistralForCausalLM",
     "MixtralForCausalLM",
     "MllamaForConditionalGeneration",
+    "MuseSparkForConditionalGeneration",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
     "NemotronHMultimodalModel",
