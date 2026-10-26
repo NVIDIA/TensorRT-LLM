@@ -14,7 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
-from ..mixed_precision_overlay import write_compressed_rows
+from ..mixed_precision_overlay import retained_row_buffer, write_compressed_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -313,11 +313,9 @@ class Compressor(nn.Module):
         compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
         # Mixed-precision KV: the main compressor also stores its post-processed
         # rows in the retained-token twin of this layer.
-        write_retained = (
-            not self.is_indexer and getattr(metadata, "mixed_high_block_table", None) is not None
-        )
-        if write_retained and kv_out is None:
-            kv_out = torch.empty_like(kv_comp)
+        retained_rows = None
+        if not self.is_indexer and getattr(metadata, "mixed_high_block_table", None) is not None:
+            retained_rows = retained_row_buffer(metadata, kv_comp)
 
         if self.footer_scale_cache and not self.is_indexer:
             self._footer_scale_postprocess_scatter(
@@ -337,7 +335,7 @@ class Compressor(nn.Module):
         # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache write
         torch.ops.trtllm.compressor_postprocess_scatter(
             kv_comp,
-            kv_out,
+            kv_out if kv_out is not None else retained_rows,
             self.norm.weight,
             self.norm.variance_epsilon,
             self.rotary_emb.rotary_cos_sin,
@@ -360,11 +358,11 @@ class Compressor(nn.Module):
             scale_output,
         )
 
-        if write_retained:
+        if retained_rows is not None:
             write_compressed_rows(
                 self,
                 metadata,
-                kv_out,
+                retained_rows,
                 num_comp_tokens,
                 cu_new_comp_kv,
                 start_pos,
@@ -375,7 +373,7 @@ class Compressor(nn.Module):
             if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
                 return quant_output.view(torch.float4_e2m1fn_x2), scale_output
             return quant_output.view(torch.float8_e4m3fn), scale_output
-        if kv_out is not None and self.is_indexer:
+        if kv_out is not None:
             return kv_out, None
         return kv_comp, None
 

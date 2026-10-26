@@ -1125,10 +1125,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         ]
         return convert_to_torch_tensor(TensorWrapper(address, self.retained_dtype, shape))
 
-    def fill_mixed_precision_page_tables(self, request_ids: List[int], layer_idx: int, out) -> None:
-        # Only the retained lane exists here; the history stays in the native pools.
-        self._fill_page_table(self.high_layers[self.layer_offsets[layer_idx]], request_ids, out[1])
-
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
         Add DeepSeek-V4 layers and warmup constraints to the cache config.

@@ -3373,6 +3373,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 np.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor),
             )
 
+    def fill_retained_page_table(
+        self, request_ids: List[int], layer_idx: int, out: np.ndarray
+    ) -> None:
+        """Write the ``(batch, pages)`` page table of ``layer_idx``'s retained-token twin.
+
+        Backends that read their history through their own gather (sparse MLA)
+        need only this lane; ``fill_mixed_precision_page_tables`` adds the low lane.
+        """
+        self._fill_page_table(self.high_layers[self.layer_offsets[layer_idx]], request_ids, out)
+
     def get_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int
     ) -> tuple[list[list[int]], ...]:

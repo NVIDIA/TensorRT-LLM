@@ -378,8 +378,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
     def _has_mixed_precision_kv(self) -> bool:
-        # The NVFP4 pool is read through the top-k gather, and the retained
-        # rows are overlaid there (mixed_precision_overlay); no staging copy.
+        # No dense-path staging copy here. After the indexer's top-k, this
+        # backend's gather already dequantizes the selected rows into a
+        # per-call FP8 scratch (k rows per token, not the whole sequence), so
+        # that scratch is the staging: the retained tokens' rows are overlaid
+        # onto it after the gather (mixed_precision_overlay.overlay_rows).
         return False
 
     def prepare(self):
@@ -2098,18 +2101,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         high_table = getattr(self, "mixed_high_block_table", None)
         if high_table is not None and self.kv_cache_manager.high_layers:
-            tables = torch.full(
-                (2, self.num_seqs, max_blocks_used),
-                -1,
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
+            table = torch.full(
+                (self.num_seqs, max_blocks_used), -1, dtype=torch.int32, pin_memory=prefer_pinned()
             )
-            # Every mixed layer shares the same two pools, so one table serves all of them.
+            # Every twin shares one pool and page scale, so one table serves all layers.
             local = next(iter(self.kv_cache_manager.high_layers))
-            self.kv_cache_manager.fill_mixed_precision_page_tables(
-                self.request_ids, self.kv_cache_manager.pp_layers[local], tables.numpy()
+            self.kv_cache_manager.fill_retained_page_table(
+                self.request_ids, self.kv_cache_manager.pp_layers[local], table.numpy()
             )
-            high_table[: self.num_seqs, :max_blocks_used].copy_(tables[1], non_blocking=True)
+            high_table[: self.num_seqs, :max_blocks_used].copy_(table, non_blocking=True)
             # Absolute position of every context token, for the retained-row write.
             self.mixed_ctx_positions = None
             if self.num_ctx_tokens > 0:
