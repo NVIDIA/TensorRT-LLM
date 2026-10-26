@@ -3018,8 +3018,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 batch_sizes=[1, 2, 3, 1000000000000000000000000]))
         model_engine = DummyModelEngine(llm_args, torch.half)
 
-        self.assertEqual(model_engine._cuda_graph_batch_sizes,
+        self.assertEqual(model_engine.cuda_graph_batch_sizes,
                          [1, 2, 3, model_engine.max_seq_len])
+        self.assertTrue(model_engine.cuda_graph_padding_enabled)
 
     def test_forward_pass_callable_on_cuda_graph_on(self):
         llm_args = TorchLlmArgs(model="dummy",

@@ -112,6 +112,7 @@ def _configure_deep_gemm_pdl() -> None:
 
 
 class ModelEngine:
+    """Own model setup and coordinate runner execution and resource lifetimes."""
 
     def __init__(
         self,
@@ -554,7 +555,7 @@ class ModelEngine:
             self.max_total_draft_tokens = 0
 
         self._metrics: dict[str, float] = defaultdict(float)
-        self.iter_states = {}
+        self.iter_states: dict[str, Any] = {}
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._lora_owner: Optional[DecoderLoraOwner] = None
         self._lora_model: Optional[torch.nn.Module] = None
@@ -769,15 +770,27 @@ class ModelEngine:
         return self._runner.cuda_graph_runner
 
     @property
+    def cuda_graph_batch_sizes(self) -> list[int]:
+        """Return the resolved decode graph batch sizes."""
+        return self._cuda_graph_batch_sizes
+
+    @property
+    def cuda_graph_padding_enabled(self) -> bool:
+        """Return whether decode graph batches are padded to capture sizes."""
+        return self._cuda_graph_padding_enabled
+
+    @property
     def metrics(self) -> dict[str, float]:
         """Return model-engine warmup time metrics."""
         return self._metrics
 
-    def register_forward_pass_callable(self, callable: Callable):
+    def register_forward_pass_callable(self, callable: Callable) -> None:
+        """Install the KV connector hook on the decoder runner."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.forward_pass_callable = callable
 
-    def register_sample_in_graph_callable(self, callable: Optional[Callable]):
+    def register_sample_in_graph_callable(self,
+                                          callable: Optional[Callable]) -> None:
         """Register the hook that samples at the tail of the forward graph."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.sample_in_graph_callable = callable
@@ -789,7 +802,7 @@ class ModelEngine:
 
     def register_sample_type_resolver(self,
                                       resolver: Optional[Callable],
-                                      stage: Optional[Callable] = None):
+                                      stage: Optional[Callable] = None) -> None:
         """Register how a batch maps to its sampling tier, for the graph key."""
         assert isinstance(self._runner, DecoderRunner)
         self._runner.register_sample_type_resolver(resolver, stage)
@@ -1420,7 +1433,7 @@ class ModelEngine:
 
         return True
 
-    def wait_for_input_copy(self):
+    def wait_for_input_copy(self) -> None:
         """
         Wait for input preparation and H2D copy of previous iteration before modifying host input,
         otherwise the input of previous iteration will be overwritten.

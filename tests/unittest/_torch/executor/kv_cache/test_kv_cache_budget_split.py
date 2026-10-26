@@ -2012,8 +2012,8 @@ class TestGraphCaptureConcurrencyWarning:
         # the check sees.
         c = _make_creator(max_gpu_total_bytes=total)
         c._max_batch_size = max_batch_size
-        c._model_engine._cuda_graph_batch_sizes = capture_sizes
-        c._model_engine._cuda_graph_padding_enabled = padding
+        c._model_engine.cuda_graph_batch_sizes = capture_sizes
+        c._model_engine.cuda_graph_padding_enabled = padding
         return c
 
     def _warnings(self, mocker, c):
