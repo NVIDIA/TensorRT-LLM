@@ -640,11 +640,15 @@ def resolve_hf_chat_template(
             return templates[chat_template]
         return chat_template
 
-    # 2. If tool is not provided, use the processor's default chat template
-    if not tools and processor and hasattr(processor, 'chat_template'):
-        return processor.chat_template
+    # 2. Without tools, prefer the processor's chat template when it has one.
+    #    A processor without one (some keep the template on their tokenizer
+    #    only) falls through to the tokenizer below.
+    if not tools and processor:
+        processor_template = getattr(processor, "chat_template", None)
+        if processor_template is not None:
+            return processor_template
 
-    # 3. If tool is provided, use the tool
+    # 3. Use the tokenizer's chat template, which accounts for the tools
     try:
         return tokenizer.get_chat_template(chat_template, tools=tools)
     except Exception:
@@ -985,6 +989,7 @@ async def async_build_multimodal_prompt(
     inputs = prompt_inputs(rendered)
     if mm_data:
         inputs["multi_modal_data"] = mm_data
+        inputs["chat_template_applied"] = True
         item_order = mm_data_tracker.item_order()
         if item_order:
             inputs["mm_item_order"] = item_order
@@ -1168,6 +1173,7 @@ def default_multimodal_input_loader(
         input = {"prompt": prompt}
 
         if mm_placeholder_counts:
+            input["chat_template_applied"] = True
             if mm_embeddings is not None:
                 _, input[
                     "multi_modal_embeddings"] = mm_data_tracker.retrieve_all_sync(

@@ -43,6 +43,7 @@ from tensorrt_llm.executor.result import Logprob
 from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
 from .ops.flashinfer import radix_topk_op
+from .ops.triton import reorder_compact_stop_word_history
 from .sampler_common import _get_beam_width_out, _request_get_sampling_params, int_tensor
 from .sampler_features import _SideStreamCopier
 
@@ -317,6 +318,41 @@ def _gather_beam_path(
 
 
 @dataclass(kw_only=True)
+class PendingBeamHistories:
+    """Live beam histories whose device-to-host copy may still be running.
+
+    Made by ``BeamSearchHandler.start_beam_histories``. ``paths`` holds, for each
+    request, the tokens of every beam from the smallest prompt length in the
+    group onwards; it is None when no request has generated a token yet.
+    """
+
+    paths: torch.Tensor | None
+    copied: torch.cuda.Event | None
+    widths: list[int]
+    prompt_lens: list[int]
+    num_tokens: list[int]
+
+    def wait(self) -> list[list[list[int]]]:
+        """Per request, one list of generated tokens (prompt excluded) per beam.
+
+        There is one list for each of the
+        ``get_beam_width_by_iter(for_next_iteration=False)`` beams the current
+        iteration scores.
+        """
+        if self.paths is None:
+            return [[[] for _ in range(width)] for width in self.widths]
+        assert self.copied is not None
+        self.copied.synchronize()
+        start = min(self.prompt_lens)
+        return [
+            self.paths[i, :width, prompt_len - start : length - start].tolist()
+            for i, (width, prompt_len, length) in enumerate(
+                zip(self.widths, self.prompt_lens, self.num_tokens)
+            )
+        ]
+
+
+@dataclass(kw_only=True)
 class BeamSearchMetadata:
     """Stateful tensors required by beam_search_sampling_batch_cba."""
 
@@ -330,14 +366,8 @@ class BeamSearchMetadata:
     pending_harvest: torch.Tensor
     predecessor_beams: torch.Tensor
     beam_idx_arange: torch.Tensor
-    stop_past_tokens: Optional[torch.Tensor] = None
-    """[max_stop_word_length, max_num_sequences, max_beam_width] int32, the
-    finish handler's rolling stop-word window (FinishReasonsHandler store).
-    The beam axis is reordered by the
-    step's predecessor beams so the handler's stop-word matching stays correct
-    across beam swaps. When None (tests without stop words), the reorder is
-    skipped — multi-token stop-word matching would then be unreliable across
-    beam swaps."""
+    stop_words_metadata: Optional[torch.Tensor] = None
+    """Per-slot compact stop-word allocations, including the rolling history."""
     cba: Optional[CBAState] = None
     """Candidate-Beams-Array state, present for every beam-search request
     regardless of its early_stopping mode; None until the first one."""
@@ -523,7 +553,7 @@ def beam_candidate_topk(
 class CBAStepResult(NamedTuple):
     """Return of ``_cba_step_math``. A NamedTuple (not a dataclass) so it is a
     valid output of the torch.compile'd fullgraph function while still naming
-    the eleven tensors the caller writes back."""
+    the tensors the caller writes back."""
 
     slot_pred: torch.Tensor
     """[bs, num_beams] int32, predecessor beam of each continuing slot."""
@@ -545,9 +575,6 @@ class CBAStepResult(NamedTuple):
     """[bs, pool_width, snap_len] float32, merged CBA pool per-token log-probs."""
     done: torch.Tensor
     """[bs] bool, per-slot beam-search termination verdict."""
-    reordered_window: Optional[torch.Tensor]
-    """Stop-word window reordered to follow the beam swap, or None when no
-    stop-word window is present."""
 
 
 def _cba_step_math(
@@ -573,7 +600,6 @@ def _cba_step_math(
     cba_lengths: torch.Tensor,
     cba_tokens: torch.Tensor,
     cba_log_probs: torch.Tensor,
-    stop_past_tokens: Optional[torch.Tensor],
     # static (graph-specializing) parameters
     beam_width_in: int,
     num_beams: int,
@@ -740,15 +766,6 @@ def _cba_step_math(
     ignore_attainable = early_stopping == BeamSearchEarlyStop.TRUE
     done = pool_full & (ignore_attainable | (min_kept >= best_attainable))
 
-    # Reorder the finish handler's rolling stop-word window to follow the
-    # beam swap (matching stays correct across swaps).
-    reordered_window = None
-    if stop_past_tokens is not None:
-        window = stop_past_tokens[:, slots, :beam_width_in]
-        reordered_window = torch.gather(
-            window, 2, slot_pred.long().unsqueeze(0).expand(window.size(0), -1, -1)
-        )
-
     return CBAStepResult(
         slot_pred=slot_pred,
         slot_tok=slot_tok,
@@ -760,7 +777,6 @@ def _cba_step_math(
         merged_tokens=merged_tokens,
         merged_lps=merged_lps,
         done=done,
-        reordered_window=reordered_window,
     )
 
 
@@ -939,7 +955,6 @@ def beam_search_sampling_batch_cba(
         merged_tokens,
         merged_lps,
         done,
-        reordered_window,
     ) = step_fn(
         cand_cum=cand_cum,
         cand_pred=cand_pred,
@@ -961,7 +976,6 @@ def beam_search_sampling_batch_cba(
         cba_lengths=cba.cba_lengths,
         cba_tokens=cba.cba_tokens,
         cba_log_probs=cba.cba_log_probs,
-        stop_past_tokens=args.stop_past_tokens,
         beam_width_in=beam_width_in,
         num_beams=num_beams,
         early_stopping=early_stopping,
@@ -999,9 +1013,8 @@ def beam_search_sampling_batch_cba(
         torch.full_like(prev_reasons, FinishReason.LENGTH.value),
         prev_reasons,
     )
-    stop_window = args.stop_past_tokens
-    if reordered_window is not None and stop_window is not None:
-        stop_window[:, slots, :num_beams] = reordered_window
+    if args.stop_words_metadata is not None:
+        reorder_compact_stop_word_history(args.stop_words_metadata, slots, slot_pred)
 
     # --- Beam-slot state updates (same contract as beam_search_sampling_batch_cba).
     args.predecessor_beams[slots, :num_beams] = slot_pred
@@ -1559,7 +1572,7 @@ class BeamSearchHandler:
         num_requests: int,
         new_log_probs: torch.Tensor,
         end_ids_cuda: torch.Tensor,
-        past_tokens_cuda: torch.Tensor,
+        stop_words_metadata_cuda: torch.Tensor | None,
     ) -> BeamSearchMetadata:
         """Build the beam-search metadata for a beam-search group.
 
@@ -1567,7 +1580,7 @@ class BeamSearchHandler:
         tensors plus the group's slot/length tensors and the host-derived
         ``max_gen_len`` bound. Mirrors ``TopPDecayHandler.build_metadata``.
 
-        ``new_log_probs``, ``end_ids_cuda`` and ``past_tokens_cuda`` are owned
+        ``new_log_probs``, ``end_ids_cuda`` and ``stop_words_metadata_cuda`` are owned
         by the log-probs and finish-reason handlers respectively and are passed
         in rather than reached for, keeping this module independent of them.
         """
@@ -1598,7 +1611,7 @@ class BeamSearchHandler:
             pending_harvest=store.pending_harvest,
             predecessor_beams=store.predecessor_beams,
             beam_idx_arange=store.beam_idx_arange,
-            stop_past_tokens=past_tokens_cuda,
+            stop_words_metadata=stop_words_metadata_cuda,
             # None unless a beam-search request has been
             # admitted; the CBA tensors are not allocated before that.
             cba=None
@@ -1637,6 +1650,66 @@ class BeamSearchHandler:
     def record_first_finish_reasons(self, slot: int, reasons: torch.Tensor | None) -> None:
         """Snapshot this step's first_finish_reasons for the next step's predictor."""
         self._prev_first_finish_reasons[slot] = reasons
+
+    def start_beam_histories(self, requests: list[LlmRequest]) -> PendingBeamHistories:
+        """Start copying the generated tokens of each live beam, as the search holds them.
+
+        A request's per-beam token lists are appended slot by slot, so once the
+        search reorders its beams a slot's list no longer matches the hypothesis
+        the slot holds; the corrected paths are only written back when the
+        request finishes (see ``finalize_beam``). This rebuilds the live
+        hypotheses mid-flight with the gather finalization uses:
+        ``original_tokens`` read through ``cache_indirection`` over the
+        generated positions. One gather for all requests, one device-to-host
+        copy.
+
+        The copy is queued without waiting, so that a caller can start it before
+        launching the forward pass and only wait for the copy, not the forward,
+        when it needs the result (``PendingBeamHistories.wait``).
+        """
+        widths = [request.get_beam_width_by_iter(for_next_iteration=False) for request in requests]
+        prompt_lens = [request.py_prompt_len for request in requests]
+        num_tokens = [request.max_beam_num_tokens for request in requests]
+        if not requests or max(num_tokens) <= min(prompt_lens):
+            return PendingBeamHistories(
+                paths=None,
+                copied=None,
+                widths=widths,
+                prompt_lens=prompt_lens,
+                num_tokens=num_tokens,
+            )
+        store = self._store
+        assert store is not None
+        slots = [request.py_seq_slot for request in requests]
+        assert all(slot is not None for slot in slots), "beam-search requests must have seq slots"
+        start = min(prompt_lens)
+        end = max(num_tokens)
+        slots_cuda = torch.tensor(slots, dtype=torch.int64, pin_memory=prefer_pinned()).to(
+            device="cuda", non_blocking=True
+        )
+        # Only the live rows of cache_indirection are written each step; the rows
+        # above a request's beam width hold whatever the buffer held before, and
+        # a stray value there would trip gather's index check. Read only the rows
+        # the widest request needs and clamp them. A live row never points past
+        # the buffer, so clamping leaves real histories alone. The source keeps
+        # every row: after a width shrink, a live row may point to a row above
+        # the current width.
+        index = store.cache_indirection[slots_cuda, : max(widths), start:end].long()
+        index.clamp_(0, store.original_tokens.size(1) - 1)
+        paths_cuda = torch.gather(
+            store.original_tokens[slots_cuda, :, start:end], dim=1, index=index
+        )
+        paths = torch.empty_like(paths_cuda, device="cpu", pin_memory=prefer_pinned())
+        paths.copy_(paths_cuda, non_blocking=True)
+        copied = torch.cuda.Event()
+        copied.record()
+        return PendingBeamHistories(
+            paths=paths,
+            copied=copied,
+            widths=widths,
+            prompt_lens=prompt_lens,
+            num_tokens=num_tokens,
+        )
 
     def predict_is_likely_finishing(
         self,

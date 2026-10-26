@@ -46,7 +46,7 @@ from ..activation import (
     MoEActivationSupport,
 )
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
-from ..impl_contract import canonical_quant, identity_quant_of, normalize_quant
+from ..impl_contract import identity_quant_of, require_layer_quant_format
 from ..impl_identity import MOE_IMPL_REGISTRY
 from ..interface import FORCE_SEPARATED_ROUTING, MoEWeightLoadingMode
 from ..moe_op_backend import MoEOpBackend, get_op_backend
@@ -376,28 +376,9 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     def _check_quant_config_is_my_format(self) -> None:
         """Fail loudly if this layer ended up on a leaf of the wrong format.
 
-        Resolution keys on the model-level ``quant_algo``, but
-        ``apply_layerwise_quant_config`` and
-        ``apply_quant_config_exclude_modules`` can give a layer its own
-        ``quant_config`` afterwards, so a layer can be admitted by a leaf whose
-        format it no longer has. Nothing else catches this, and the mismatch
-        surfaces here rather than at the pass that moved the layer, so the
-        message has to name both. Unchecked it means weights the checkpoint
-        cannot fill, or silently wrong numerics.
+        See :func:`..impl_contract.require_layer_quant_format`.
         """
-        expected = identity_quant_of(type(self))
-        actual = normalize_quant(
-            canonical_quant(None if self.quant_config is None else self.quant_config.quant_algo)
-        )
-        if actual != expected:
-            raise ValueError(
-                f"{type(self).__name__} implements quant={expected}, but layer "
-                f"{self.layer_idx}'s quant_config resolves to {actual}. The "
-                f"implementation was picked from the model-level quant_algo; "
-                f"layerwise quantization or a module exclusion moved this layer "
-                f"afterwards, and the layer must be re-resolved for the format "
-                f"it actually has."
-            )
+        require_layer_quant_format(self, identity_quant_of(type(self)))
 
     def _create_quant_method_weights(self) -> None:
         """Hand the module to its quantization method, and settle the layout.

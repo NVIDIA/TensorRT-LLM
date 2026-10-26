@@ -1075,9 +1075,7 @@ class TestBenchmarkFillAdmissionFlowControl:
         """Warmup must bypass the slow-start ramp so warmup iters are not
         artificially throttled and `_fill_admit_cap` stays unchanged."""
         ex = self._make_executor(tp_size=4)
-        # Bypass the is_warmup property setter (which also pokes model_engine,
-        # not present on this stub).
-        ex._is_warmup = True
+        ex.is_warmup = True
 
         ex._pop_from_waiting_queue(
             Mock(),
@@ -1280,6 +1278,7 @@ class TestFailFastDuringBenchmarkFill:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex.sampler = Mock(spec=["release_request"])
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
         # The fill-gate requests model "waiting for KV" / "generating", not
@@ -1583,6 +1582,8 @@ class TestFailFastDuringBenchmarkFill:
             assert request.state == LlmRequestState.GENERATION_COMPLETE
         freed = [call.args[0] for call in ex.resource_manager.free_resources.call_args_list]
         assert freed == requests
+        released = [call.args[0] for call in ex.sampler.release_request.call_args_list]
+        assert released == requests
         assert ex._fatal_error is None and not ex.is_shutdown
 
     def test_a_fitting_init_request_keeps_the_real_error_path_quiet(self, monkeypatch):
@@ -1596,6 +1597,7 @@ class TestFailFastDuringBenchmarkFill:
         assert ex.responses == {}
         assert ex.active_requests == requests
         ex.resource_manager.free_resources.assert_not_called()
+        ex.sampler.release_request.assert_not_called()
 
     def test_the_fail_fast_wakes_a_consumer_asleep_in_await_responses(self, monkeypatch):
         """The error responses are published under the response condition and

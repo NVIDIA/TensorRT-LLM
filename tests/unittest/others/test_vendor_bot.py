@@ -2268,15 +2268,19 @@ def test_heartbeat_during_blocked_discovery_does_not_fake_progress(
 ) -> None:
     caplog.set_level(logging.INFO, logger="vendor-bot")
     monkeypatch.setattr(b, "_HEARTBEAT_SECONDS", 0.01)
+    discovery_blocked = threading.Event()
     reported = threading.Event()
     original = monitor.progress.heartbeat
 
     def heartbeat() -> None:
+        if not discovery_blocked.is_set():
+            return
         original()
         reported.set()
 
     def wait_for_heartbeat(endpoint: str, **kwargs):
         before = monitor.store.get("health")
+        discovery_blocked.set()
         assert reported.wait(2), "No heartbeat during blocked API call"
         assert monitor.store.get("health") == before
         return []

@@ -9,9 +9,21 @@ slices, fp32 gating params and NVFP4 scalars are derived in `modeling.py` after 
 
 Transforms:
 
+* trunk attention input projection: `q_proj`, `k_proj`, `v_proj` and the indexer's
+  `index_qk_proj` read the same activation, so they are one
+  `[q | k | v | gate | index | pad, hidden]` operand and one GEMM (`_attn_in_w`). `q_proj`
+  interleaves q and the output gate per head; its q halves go first so the GEMM output's
+  leading columns are the packed `[q | k | v]` the fused norm+rope rewrites in place, then
+  the gate halves, the index projection and `index_head_dim` zero rows (a row is a whole
+  number of `head_dim` heads). The draft (MTP) layer keeps its separate projections;
 * fused shared-expert gate|up: `[gate ; up]` (the half order `flashinfer_silu_and_mul` reads);
-* NVFP4 routed-expert stacks: `[up ; gate]`, interleave, 32-row block shuffle of weight
-  and scale bytes, then 128x4 scale swizzle (FC2: shuffle only);
+* NVFP4 routed-expert stacks, laid out for the trunk's routed backend
+  (`core.trunk_moe_backend`): `[up ; gate]`, then 128x4 scale swizzle. trtllm-gen also
+  interleaves FC1 row by row and 32-row block shuffles weight and scale bytes (FC2:
+  shuffle only); CuteDSL interleaves FC1 in 64-row up/gate groups and leaves FC2 in
+  checkpoint row order. Under trtllm-gen a second copy in the CuteDSL layout (`fc*_cd`)
+  serves the prefill-sized launches (`modeling._CUTE_DSL_MOE_MIN_ROWS`) when the core keeps
+  it (`core.moe_prefill_copy`);
 * n-gram table: 128 row chunks concatenated into one `[rows, 160]` buffer (the hash
   emits global row indices).
 
@@ -23,9 +35,9 @@ same either way. Offloading frees ~47.7 GiB, which the KV cache manager turns in
 more slots; several entries certify at most 461 slots, so raising
 `kv_cache_fraction` with the offload on needs those cells re-checked.
 
-Not loaded: `mtp.*` when there is no `speculative_config`, and
-`mtp.layers.0.self_attn.indexer.*` always (the draft layer runs dense attention).
-MTP experts are plain row-major FP8 128x128: `[up ; gate]` concat, bf16
+Not loaded: `mtp.*` when there is no `speculative_config`. With one, the whole MTP module
+is loaded, including the draft layer's own QSA indexer (`_index_branch`). MTP experts are
+plain row-major FP8 128x128: `[up ; gate]` concat, bf16
 `weight_scale_inv` cast to fp32. `lm_head` is the shell's parameter.
 
 `load(model, weights)` fills every declared parameter once and asserts coverage
@@ -40,7 +52,7 @@ import torch
 from cuda.bindings import runtime as cudart
 from torch import nn
 
-from tensorrt_llm._utils import CUASSERT, prefer_pinned
+from tensorrt_llm._utils import CUASSERT
 
 #: `layers=ALL_LAYERS` is the common case and the default. A sentinel rather
 #: than a lambda so the table reads as data, and rather than `True` so the
@@ -103,7 +115,7 @@ class W:
 # ----------------------------------------------------------- host residency --
 #
 # Allocates the one PLE n-gram table. The table stays a `cuda` tensor of the same
-# shape/dtype. Pinned, device-mapped pages (not a host gather) because the gather's
+# shape/dtype. Registered, device-mapped pages (not a host gather) because the gather's
 # row indices are produced on device inside the captured decode graph.
 
 #: `cudaMemoryType` values; the core asserts on them after load.
@@ -123,10 +135,45 @@ def memory_kind(ptr: int) -> int:
     return int(attributes.type)
 
 
-def _host_resident_empty(rows: int, cols: int, dtype, device) -> tuple[torch.Tensor, torch.Tensor]:
+#: `cudaHostRegister` flags (`driver_types.h`): mapped, so a kernel may dereference the
+#: pages, and portable, for every context in the process.
+_CUDA_HOST_REGISTER_PORTABLE = 0x01
+_CUDA_HOST_REGISTER_MAPPED = 0x02
+
+
+class _RegisteredHostBuffer:
+    """A pageable CPU allocation registered (pinned and mapped) for the device, and
+    unregistered before its storage is released: at this size glibc serves the
+    allocation with `mmap` and returns it with `munmap`, so freeing registered pages
+    would leave the driver mapping memory the OS may hand out again.
+
+    Not torch's pinned allocator: it rounds the 47.7 GiB table up to 64 GiB, and on
+    GB300 the device's random row gathers from its pages run an order of magnitude
+    slower than from registered pageable memory."""
+
+    def __init__(self, nbytes: int) -> None:
+        self._storage = torch.empty(nbytes, dtype=torch.uint8)
+        self.pointer = self._storage.data_ptr()
+        CUASSERT(
+            cudart.cudaHostRegister(
+                self.pointer, nbytes, _CUDA_HOST_REGISTER_PORTABLE | _CUDA_HOST_REGISTER_MAPPED
+            )
+        )
+        # Bound now: at interpreter shutdown the module may already be torn down.
+        self._unregister = cudart.cudaHostUnregister
+
+    def __del__(self) -> None:
+        pointer, self.pointer = self.pointer, 0
+        if pointer:
+            self._unregister(pointer)
+
+
+def _host_resident_empty(
+    rows: int, cols: int, dtype, device
+) -> tuple[torch.Tensor, _RegisteredHostBuffer]:
     """`[rows, cols]` of `dtype` on `device`, whose bytes live in host memory.
 
-    Returns the tensor and the pinned CPU allocation that owns the pages. The
+    Returns the tensor and the registered CPU allocation that owns the pages. The
     caller **must** keep the second alive for as long as the first: the tensor
     is a view through a device address and owns nothing.
     """
@@ -137,14 +184,8 @@ def _host_resident_empty(rows: int, cols: int, dtype, device) -> tuple[torch.Ten
     )
     assert device.type == "cuda", f"host offload needs a cuda device to map into; got {device}"
 
-    # torch's pinned allocator rounds up to a power of two (47.7 GiB -> 64 GiB resident),
-    # and keeps the block cached after release.
-    host = torch.empty(rows * cols, dtype=torch.uint8, pin_memory=prefer_pinned())
-    assert host.is_pinned(), (
-        "host offload maps pinned memory into the device, which is unavailable "
-        "here (e.g. Confidential Compute)"
-    )
-    (device_pointer,) = CUASSERT(cudart.cudaHostGetDevicePointer(host.data_ptr(), 0))
+    host = _RegisteredHostBuffer(rows * cols)
+    (device_pointer,) = CUASSERT(cudart.cudaHostGetDevicePointer(host.pointer, 0))
 
     # No public torch API builds a tensor over a pointer the caching allocator
     # did not hand out; `__cuda_array_interface__` is the numba/cupy path.
@@ -176,15 +217,6 @@ _VISUAL = "model.visual"
 _MTP = "mtp"
 _MTP_LAYER = "mtp.layers.0"
 
-# The three tensors of the draft layer that are never loaded, with their reason
-# in the module docstring: its own QSA index projection and the two per-head
-# norms that go with it. The draft layer runs dense attention.
-_MTP_NOT_LOADED = (
-    f"{_MTP_LAYER}.self_attn.indexer.index_qk_proj.weight",
-    f"{_MTP_LAYER}.self_attn.indexer.q_layernorm.weight",
-    f"{_MTP_LAYER}.self_attn.indexer.k_layernorm.weight",
-)
-
 # NVFP4 block size: one e4m3 scale per 16 contiguous elements along K.
 SF_VEC = 16
 
@@ -196,7 +228,15 @@ FP8_BLOCK = 128
 # relayouts allocate per-expert scratch 512 times per parameter and the table
 # fill stages one shard at a time; without this, peak load memory is the whole
 # model rather than one parameter.
-_RELEASE_AFTER = ("_fc2_s", "_fc1_s", "ple_table", "mtp_fc1_w", "mtp_fc2_w")
+_RELEASE_AFTER = (
+    "_fc2_s",
+    "_fc1_s",
+    "_fc2_s_cd",
+    "_fc1_s_cd",
+    "ple_table",
+    "mtp_fc1_w",
+    "mtp_fc2_w",
+)
 
 
 def _block32_perm(rows: int, device) -> torch.Tensor:
@@ -221,8 +261,25 @@ def _interleave_perm(rows: int, device) -> torch.Tensor:
     return p.to(device)
 
 
-def _fc1_perm(rows: int, device) -> torch.Tensor:
-    """Interleave then 32-row block shuffle, composed into one gather."""
+#: The group the CuteDSL FC1 epilogue pairs up and gate rows in: rows `[128k, 128k + 64)`
+#: of the fused operand are up rows and the next 64 their gate rows.
+_CUTEDSL_GATE_UP_GROUP = 64
+
+
+def _group_interleave_perm(rows: int, group: int, device) -> torch.Tensor:
+    """Gather index that interleaves the `[up | gate]` halves of a `2*I` row stack in
+    `group`-row blocks: up[0:g], gate[0:g], up[g:2g], gate[g:2g], ..."""
+    assert rows % (2 * group) == 0, (rows, group)
+    idx = torch.arange(rows, device=device).view(2, rows // (2 * group), group)
+    return idx.transpose(0, 1).reshape(-1)
+
+
+def _fc1_perm(rows: int, device, core) -> torch.Tensor:
+    """The FC1 row gather of the trunk's routed backend. trtllm-gen: interleave then
+    32-row block shuffle, composed into one gather. CuteDSL: the 64-row group
+    interleave alone."""
+    if core.trunk_moe_backend == "CUTEDSL":
+        return _group_interleave_perm(rows, _CUTEDSL_GATE_UP_GROUP, device)
     return _interleave_perm(rows, device)[_block32_perm(rows, device)]
 
 
@@ -233,39 +290,87 @@ def _swizzle(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.trtllm.block_scale_interleave(x.contiguous())
 
 
+#: Rows after the shared expert's gate|up rows in its fused operand: the per-token gate's
+#: one row, then zeros, so the GEMM's output row stays a whole number of 16-byte vectors.
+SH_GATE_ROWS = 8
+
+
 def _cat_rows(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
-    """Fused shared-expert gate|up weight bytes: **gate** rows first, the half
-    order `flashinfer_silu_and_mul` reads."""
-    return torch.cat(t, dim=0).contiguous()
+    """Fused shared-expert weight bytes: **gate** rows first, the half order
+    `flashinfer_silu_and_mul` reads, then up, then the per-token gate's row and
+    `SH_GATE_ROWS - 1` zero rows -- one GEMM forms gate|up and the gate logit."""
+    gate, up, sh_gate = t
+    pad = sh_gate.new_zeros(SH_GATE_ROWS - 1, sh_gate.shape[-1])
+    return torch.cat((gate, up, sh_gate, pad), dim=0).contiguous()
+
+
+def _attn_in_w(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
+    """(q_proj, k_proj, v_proj, index_qk_proj) -> the fused `[q | k | v | gate | index |
+    pad]` input projection of one trunk attention layer (see the module docstring).
+
+    `q_proj`'s rows are `[heads, 2, head_dim]`: head `h`'s q rows, then its gate rows.
+    """
+    q, k, v, idx = t
+    heads, head_dim, hidden = core.heads_q, core.head_dim, q.shape[-1]
+    qg = q.reshape(heads, 2, head_dim, hidden)
+    pad = q.new_zeros(core.index_head_dim, hidden)
+    rows = (qg[:, 0].reshape(heads * head_dim, hidden), k, v)
+    rows += (qg[:, 1].reshape(heads * head_dim, hidden), idx, pad)
+    return torch.cat(rows, dim=0).contiguous()
 
 
 def _expert_fc1_w(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
     """(up, gate) packed nibbles -> one expert's FC1 operand."""
     up, gate = t
     w = torch.cat([up, gate], dim=0)
-    return torch.index_select(w, 0, _fc1_perm(w.shape[0], w.device)).contiguous()
+    return torch.index_select(w, 0, _fc1_perm(w.shape[0], w.device, core)).contiguous()
 
 
 def _expert_fc1_s(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
-    """(up, gate) e4m3 scales -> one expert's FC1 scale operand."""
+    """(up, gate) e4m3 scales -> one expert's FC1 scale operand: the weight's own row
+    permutation, then the swizzle."""
     up, gate = t
     s = torch.cat([up.view(torch.uint8), gate.view(torch.uint8)], dim=0)
     rows, cols = s.shape
-    s = torch.index_select(s, 0, _fc1_perm(rows, s.device))
+    s = torch.index_select(s, 0, _fc1_perm(rows, s.device, core))
     return _swizzle(s).reshape(rows, cols)
 
 
 def _expert_fc2_w(t: torch.Tensor, core) -> torch.Tensor:
-    """`down_proj` packed nibbles -> one expert's FC2 operand (no interleave)."""
+    """`down_proj` packed nibbles -> one expert's FC2 operand (no interleave): the
+    32-row block shuffle on trtllm-gen, checkpoint row order on CuteDSL."""
+    if core.trunk_moe_backend == "CUTEDSL":
+        return t.contiguous()
     return torch.index_select(t, 0, _block32_perm(t.shape[0], t.device)).contiguous()
 
 
 def _expert_fc2_s(t: torch.Tensor, core) -> torch.Tensor:
-    """`down_proj` e4m3 scales -> one expert's FC2 scale operand."""
+    """`down_proj` e4m3 scales -> one expert's FC2 scale operand: the weight's own row
+    order, then the swizzle."""
     s = t.view(torch.uint8)
     rows, cols = s.shape
-    s = torch.index_select(s, 0, _block32_perm(rows, s.device))
+    if core.trunk_moe_backend != "CUTEDSL":
+        s = torch.index_select(s, 0, _block32_perm(rows, s.device))
     return _swizzle(s).reshape(rows, cols)
+
+
+#: The layout argument of the second, CuteDSL-layout expert copy (`fc*_cd`).
+_CUTEDSL_LAYOUT = SimpleNamespace(trunk_moe_backend="CUTEDSL")
+
+
+def _expert_fc1_w_cd(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
+    """(up, gate) packed nibbles -> one expert's FC1 operand in the CuteDSL layout."""
+    return _expert_fc1_w(t, _CUTEDSL_LAYOUT)
+
+
+def _expert_fc1_s_cd(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
+    """(up, gate) e4m3 scales -> one expert's FC1 scale operand in the CuteDSL layout."""
+    return _expert_fc1_s(t, _CUTEDSL_LAYOUT)
+
+
+def _expert_fc2_s_cd(t: torch.Tensor, core) -> torch.Tensor:
+    """`down_proj` e4m3 scales -> one expert's FC2 scale operand in the CuteDSL layout."""
+    return _expert_fc2_s(t, _CUTEDSL_LAYOUT)
 
 
 def _mtp_fc1_w(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
@@ -307,6 +412,24 @@ def _attn_layers(d):
 def _gdn_layers(d):
     """The Gated-DeltaNet (linear-attention) layers."""
     return [i for i, a in enumerate(d.is_attn) if not a]
+
+
+#: The Gated-DeltaNet input projections, in the row order of the concatenated
+#: `in_proj_w` (and so the column order of its GEMM output).
+_IN_PROJ_PARTS = ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b")
+
+
+def _in_proj_rows(d, part: int) -> tuple[slice]:
+    """The row range of `in_proj_w` that input projection `part` fills."""
+    start = sum(d.in_proj_split[:part])
+    return (slice(start, start + d.in_proj_split[part]),)
+
+
+def _cute_dsl_copy_layers(d):
+    """Every layer when the core keeps the second, CuteDSL-layout copy that prefill-sized
+    launches read under trtllm-gen (`core.moe_prefill_copy`); none otherwise, CuteDSL among
+    them, whose one copy is it."""
+    return range(d.num_layers) if d.moe_prefill_copy else ()
 
 
 def _vision_blocks(d):
@@ -440,9 +563,34 @@ def _mixer(tag, prefix, layers):
     )
 
 
-def _gated_attention(tag, src, layers):
+def _attn_in_fused(tag, src, layers):
+    """The trunk attention layers' one input projection: q_proj, k_proj, v_proj and the
+    QSA indexer's index_qk_proj, re-laid by `_attn_in_w`."""
+    keys = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "indexer.index_qk_proj.weight")
+    return (
+        W(
+            f"{tag}attn_in_w",
+            shape=lambda d: (d.attn_in_rows, d.hidden),
+            src=lambda d, i: [(tuple(src(k).format(p=f"{_LM}.layers.{i}") for k in keys), None)],
+            transform=_attn_in_w,
+            layers=layers,
+        ),
+    )
+
+
+def _gated_attention(tag, src, layers, fused_in=False):
     """The gated GQA block's six weights. `q_proj` is twice as wide as q: q and the output
-    gate interleave per head."""
+    gate interleave per head. With `fused_in`, q/k/v are not declared here: they are part
+    of `_attn_in_fused`'s one operand."""
+    return (
+        *_attn_in_separate(tag, src, layers, fused_in),
+        *_attn_out_and_norms(tag, src, layers),
+    )
+
+
+def _attn_in_separate(tag, src, layers, fused_in):
+    if fused_in:
+        return ()
     return (
         W(
             f"{tag}q_w",
@@ -462,6 +610,11 @@ def _gated_attention(tag, src, layers):
             src=src("v_proj.weight"),
             layers=layers,
         ),
+    )
+
+
+def _attn_out_and_norms(tag, src, layers):
+    return (
         W(
             f"{tag}o_w",
             shape=lambda d: (d.hidden, d.q_width),
@@ -473,17 +626,46 @@ def _gated_attention(tag, src, layers):
     )
 
 
+def _index_branch(tag, src, layers, fused_in=False):
+    """The QSA index branch's three weights: one replicated, unquantized projection
+    producing `[index_heads q | 1 k]`, and two per-head gemma norms. With `fused_in`, the
+    projection is part of `_attn_in_fused`'s one operand and only the norms are declared."""
+    projection = W(
+        f"{tag}idx_w",
+        shape=lambda d: (d.index_width, d.hidden),
+        src=src("index_qk_proj.weight"),
+        layers=layers,
+    )
+    return (
+        *(() if fused_in else (projection,)),
+        W(
+            f"{tag}idx_qn",
+            shape=lambda d: (d.index_head_dim,),
+            src=src("q_layernorm.weight"),
+            layers=layers,
+        ),
+        W(
+            f"{tag}idx_kn",
+            shape=lambda d: (d.index_head_dim,),
+            src=src("k_layernorm.weight"),
+            layers=layers,
+        ),
+    )
+
+
 def _shared_expert(tag, prefix, layers):
-    """The bf16 shared expert beside the routed ones, and its per-token gate."""
+    """The bf16 shared expert beside the routed ones, its per-token gate in the same
+    operand as its gate|up (`_cat_rows`)."""
     return (
         W(
             f"{tag}sh_gu",
-            shape=lambda d: (2 * d.shared_inter, d.hidden),
+            shape=lambda d: (2 * d.shared_inter + SH_GATE_ROWS, d.hidden),
             src=lambda d, i: [
                 (
                     (
                         f"{prefix(i)}.shared_expert.gate_proj.weight",
                         f"{prefix(i)}.shared_expert.up_proj.weight",
+                        f"{prefix(i)}.shared_expert_gate.weight",
                     ),
                     None,
                 )
@@ -495,12 +677,6 @@ def _shared_expert(tag, prefix, layers):
             f"{tag}sh_dn",
             shape=lambda d: (d.hidden, d.shared_inter),
             src=lambda d, i: [(f"{prefix(i)}.shared_expert.down_proj.weight", None)],
-            layers=layers,
-        ),
-        W(
-            f"{tag}sh_gate",
-            shape=lambda d: (1, d.hidden),
-            src=lambda d, i: [(f"{prefix(i)}.shared_expert_gate.weight", None)],
             layers=layers,
         ),
     )
@@ -528,51 +704,24 @@ class Qwen4ExpTp1Weights:
             )
         ),
         # --- the gated GQA layers and their QSA index branch ---
-        *_gated_attention("", lambda s: f"{{p}}.self_attn.{s}", _attn_layers),
-        # One replicated, unquantized projection producing [index_heads q | 1 k], and
-        # two per-head gemma norms.
-        W(
-            "idx_w",
-            shape=lambda d: (d.index_width, d.hidden),
-            src="{p}.self_attn.indexer.index_qk_proj.weight",
-            layers=_attn_layers,
-        ),
-        W(
-            "idx_qn",
-            shape=lambda d: (d.index_head_dim,),
-            src="{p}.self_attn.indexer.q_layernorm.weight",
-            layers=_attn_layers,
-        ),
-        W(
-            "idx_kn",
-            shape=lambda d: (d.index_head_dim,),
-            src="{p}.self_attn.indexer.k_layernorm.weight",
-            layers=_attn_layers,
-        ),
+        # q/k/v and the indexer's replicated, unquantized [index_heads q | 1 k]
+        # projection as one operand, then o_proj, the q/k norms and the indexer's two
+        # per-head gemma norms.
+        *_attn_in_fused("", lambda s: f"{{p}}.self_attn.{s}", _attn_layers),
+        *_gated_attention("", lambda s: f"{{p}}.self_attn.{s}", _attn_layers, fused_in=True),
+        *_index_branch("", lambda s: f"{{p}}.self_attn.indexer.{s}", _attn_layers, fused_in=True),
         # --- the Gated-DeltaNet layers ---
+        # The four input projections read the same activation, so they are one
+        # weight and one GEMM: rows `[q|k|v (conv_dim) | z (value_dim) | a | b]`
+        # (`d.in_proj_split`), each checkpoint tensor copied into its own row
+        # range. The forward splits the output into column views.
         W(
-            "in_qkv_w",
-            shape=lambda d: (d.conv_dim, d.hidden),
-            src="{p}.linear_attn.in_proj_qkv.weight",
-            layers=_gdn_layers,
-        ),
-        W(
-            "in_z_w",
-            shape=lambda d: (d.value_dim, d.hidden),
-            src="{p}.linear_attn.in_proj_z.weight",
-            layers=_gdn_layers,
-        ),
-        # The two per-head scalar projections.
-        W(
-            "in_a_w",
-            shape=lambda d: (d.num_v_heads, d.hidden),
-            src="{p}.linear_attn.in_proj_a.weight",
-            layers=_gdn_layers,
-        ),
-        W(
-            "in_b_w",
-            shape=lambda d: (d.num_v_heads, d.hidden),
-            src="{p}.linear_attn.in_proj_b.weight",
+            "in_proj_w",
+            shape=lambda d: (sum(d.in_proj_split), d.hidden),
+            src=tuple(
+                (f"{{p}}.linear_attn.{name}.weight", lambda d, j=j: _in_proj_rows(d, j))
+                for j, name in enumerate(_IN_PROJ_PARTS)
+            ),
             layers=_gdn_layers,
         ),
         W(
@@ -636,6 +785,39 @@ class Qwen4ExpTp1Weights:
             dtype=u8,
             src=_experts(_trunk_mlp, "down_proj.weight_scale"),
             transform=_expert_fc2_s,
+        ),
+        # Under trtllm-gen, the same experts again in the CuteDSL layout: prefill-sized
+        # launches run on them (`modeling._CUTE_DSL_MOE_MIN_ROWS`).
+        W(
+            "fc1_w_cd",
+            shape=lambda d: (d.num_experts, 2 * d.moe_inter, d.hidden // 2),
+            dtype=u8,
+            src=_experts(_trunk_mlp, "up_proj.weight", "gate_proj.weight"),
+            transform=_expert_fc1_w_cd,
+            layers=_cute_dsl_copy_layers,
+        ),
+        W(
+            "fc1_s_cd",
+            shape=lambda d: (d.num_experts, 2 * d.moe_inter, d.hidden // SF_VEC),
+            dtype=u8,
+            src=_experts(_trunk_mlp, "up_proj.weight_scale", "gate_proj.weight_scale"),
+            transform=_expert_fc1_s_cd,
+            layers=_cute_dsl_copy_layers,
+        ),
+        W(
+            "fc2_w_cd",
+            shape=lambda d: (d.num_experts, d.hidden, d.moe_inter // 2),
+            dtype=u8,
+            src=_experts(_trunk_mlp, "down_proj.weight"),
+            layers=_cute_dsl_copy_layers,
+        ),
+        W(
+            "fc2_s_cd",
+            shape=lambda d: (d.num_experts, d.hidden, d.moe_inter // SF_VEC),
+            dtype=u8,
+            src=_experts(_trunk_mlp, "down_proj.weight_scale"),
+            transform=_expert_fc2_s_cd,
+            layers=_cute_dsl_copy_layers,
         ),
         *(
             W(name, shape=lambda d: (d.num_experts,), dtype=f32, src=_experts(_trunk_mlp, suffix))
@@ -872,6 +1054,9 @@ class Qwen4ExpTp1Weights:
             )
         ),
         *_gated_attention("mtp_", lambda s: _mtp_key(f"{_MTP_LAYER}.self_attn.{s}"), _mtp_only),
+        *_index_branch(
+            "mtp_", lambda s: _mtp_key(f"{_MTP_LAYER}.self_attn.indexer.{s}"), _mtp_only
+        ),
         W(
             "mtp_router",
             shape=lambda d: (d.num_experts, d.hidden),
@@ -946,10 +1131,15 @@ class Qwen4ExpTp1Weights:
             kv_width=cfg.num_key_value_heads * cfg.head_dim,
             index_head_dim=cfg.indexer_head_dim,
             index_width=(index_heads + index_kv_heads) * cfg.indexer_head_dim,
+            # [q | k | v | gate | index q, k | pad of one index head]
+            attn_in_rows=2 * cfg.num_attention_heads * cfg.head_dim
+            + 2 * cfg.num_key_value_heads * cfg.head_dim
+            + (index_heads + index_kv_heads + 1) * cfg.indexer_head_dim,
             num_v_heads=num_v_heads,
             head_v_dim=cfg.linear_value_head_dim,
             conv_dim=2 * key_dim + value_dim,
             value_dim=value_dim,
+            in_proj_split=(2 * key_dim + value_dim, value_dim, num_v_heads, num_v_heads),
             conv_kernel=cfg.linear_conv_kernel_dim,
             num_experts=cfg.num_experts,
             moe_inter=cfg.moe_intermediate_size,
@@ -969,17 +1159,16 @@ class Qwen4ExpTp1Weights:
             v_pos_rows=vcfg.num_position_embeddings,
             v_merge_dim=v_hidden * vcfg.spatial_merge_size * vcfg.spatial_merge_size,
             mtp_enabled=getattr(core.model_config, "spec_config", None) is not None,
+            trunk_moe_backend=core.trunk_moe_backend,
+            moe_prefill_copy=core.moe_prefill_copy,
             dtype=core.model_config.torch_dtype,
         )
 
     def expected_unconsumed(self, core, weights) -> set:
-        """With MTP off, the whole `mtp.` subtree; with it on, exactly the three draft
-        indexer tensors. Named explicitly rather than by prefix so that a fourth unloaded
-        `mtp.*` key fails the coverage assert instead of hiding."""
+        """With MTP off, the whole `mtp.` subtree; with it on, nothing, so that any
+        unloaded `mtp.*` key fails the coverage assert instead of hiding."""
         if core.mtp_enabled:
-            for key in _MTP_NOT_LOADED:
-                assert key in weights, f"checkpoint key missing: {key}"
-            return set(_MTP_NOT_LOADED)
+            return set()
         return {k for k in weights if k.startswith(f"{_MTP}.")}
 
     def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
@@ -1082,9 +1271,7 @@ class Qwen4ExpTp1Weights:
         torch.cuda.synchronize()
         leftover = set(weights.keys()) - consumed
         expected = self.expected_unconsumed(core, weights)
-        what = (
-            "the draft layer's three QSA indexer tensors" if core.mtp_enabled else "the MTP module"
-        )
+        what = "empty" if core.mtp_enabled else "the MTP module"
         assert leftover == expected, (
             f"checkpoint coverage: leftover keys are not exactly {what}; "
             f"unexpected {sorted(leftover - expected)[:8]}, "
