@@ -26,6 +26,7 @@ message names the option to fix.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, TypeVar
@@ -108,8 +109,13 @@ class SelectionRequest:
         ladder: Optional[str] = None,
         out_dir: Optional[str] = None,
     ) -> SelectionRequest:
-        """The request for `profile`, catalogued or generated; the ladder is checked before `out_dir`."""
+        """The request for `profile`, catalogued or generated; the ladder is checked before `out_dir`.
+
+        An explicit `ladder` replaces the profile's, so the record carries the run's.
+        """
         parsed_ladder = cls.ladder_for(ladder, profile)
+        if ladder is not None:
+            profile = dataclasses.replace(profile, ladder=tuple(parsed_ladder))
         return cls(
             machine=profile.name,
             profile=profile,

@@ -57,12 +57,14 @@ class LocalProfile:
 class SavedProfile:
     """A profile saved for this host: the `profile` object of a `local.json`.
 
-    Exactly `MachineProfile.FIELDS`, typed as a catalogue entry types them. Every
-    other key of the file is ignored, so a previous run's record reads back.
+    A catalogue entry: `MachineProfile.FIELDS`, typed, and an optional `ladder`
+    that fits the node. Every other key of the file is ignored, so a previous
+    run's record reads back.
     """
 
     COUNTS = ("sm", "device_memory_mib", "max_gpu_per_node")
     NAMES = ("device_name", "cpu_arch")
+    OPTIONAL = ("ladder",)
 
     @classmethod
     def read(cls, path: Path) -> MachineProfile:
@@ -78,7 +80,7 @@ class SavedProfile:
         SavedProfileError.check(isinstance(profile, dict), path, 'no "profile" object')
         missing = [field for field in MachineProfile.FIELDS if field not in profile]
         SavedProfileError.check(not missing, path, f"profile is missing {', '.join(missing)}")
-        unexpected = sorted(set(profile) - set(MachineProfile.FIELDS))
+        unexpected = sorted(set(profile) - set(MachineProfile.FIELDS) - set(cls.OPTIONAL))
         SavedProfileError.check(
             not unexpected,
             path,
@@ -99,7 +101,15 @@ class SavedProfile:
                 path,
                 f"profile.{field} must be a non-empty string, got {json.dumps(value)}",
             )
-        return MachineProfile(name=LocalProfile.NAME, **profile)
+        SavedProfileError.check(
+            isinstance(profile.get("ladder", []), list),
+            path,
+            f"profile.ladder must be a list of GPU counts, got {json.dumps(profile.get('ladder'))}",
+        )
+        try:
+            return MachineProfile(name=LocalProfile.NAME, **profile).checked_ladder()
+        except ValueError as error:
+            raise SavedProfileError(path, f"profile {error}") from error
 
 
 class HostProbe:

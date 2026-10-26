@@ -58,9 +58,13 @@ class Saved:
             json.dumps({"profile": {k: v for k, v in H20.items() if k != "cpu_arch"}}),
             "profile is missing cpu_arch",
         ),
-        "ladder": (
-            json.dumps({"profile": dict(H20, ladder=[1, 4])}),
-            "profile has unexpected field ladder",
+        "unknown_field": (
+            json.dumps({"profile": dict(H20, rack="r7")}),
+            "profile has unexpected field rack",
+        ),
+        "rung_above_node": (
+            json.dumps({"profile": dict(H20, ladder=[1, 8])}),
+            "profile ladder 1,8 exceeds max_gpu_per_node 4",
         ),
         "sm_text": (
             json.dumps({"profile": dict(H20, sm="120")}),
@@ -122,6 +126,30 @@ def test_bad_saved_profile_is_a_usage_error(selection, case):
     assert not (run.path / DeviceCases.IMPORT_SENTINEL).exists()
 
 
+# A saved local profile is read before the host is probed / A saved ladder is the default
+def test_saved_ladder_is_the_default(selection):
+    """`ladder` in `local.json` is the run's ladder when `--ladder` is absent."""
+    selection.seed(Saved.NAME, Saved.of(dict(Saved.H20, ladder=[1, 4])))
+
+    run = selection.run(DeviceCases.MODULE, "--selection-out-dir={out}")
+
+    assert run.record["ladder"] == [1, 4]
+    assert run.written == ["local-1gpu.ids", "local-4gpu.ids", "local.json"]
+
+
+# A saved local profile is read before the host is probed /
+# An explicit ladder replaces the saved one
+def test_explicit_ladder_replaces_the_saved_one(selection):
+    """`--ladder=1` is written into `local.json`, so the next run without it keeps `1`."""
+    selection.seed(Saved.NAME, Saved.of(dict(Saved.H20, ladder=[1, 4])))
+
+    explicit = selection.run(DeviceCases.MODULE, "--ladder=1", "--selection-out-dir={out}")
+    following = selection.run(DeviceCases.MODULE, "--selection-out-dir={out}")
+
+    assert explicit.record["ladder"] == following.record["ladder"] == [1]
+    assert following.record["profile"] == dict(Saved.H20, ladder=[1])
+
+
 # A saved local profile is read before the host is probed / A named machine ignores the saved profile
 def test_named_machine_ignores_the_saved_profile(selection):
     """`--machine=B200` selects for B200 and leaves `local.json` byte for byte as it was."""
@@ -130,5 +158,5 @@ def test_named_machine_ignores_the_saved_profile(selection):
 
     run = selection.run(DeviceCases.MODULE, "--machine=B200", "--selection-out-dir={out}")
 
-    assert run.record["profile"] == Saved.B200
+    assert run.record["profile"] == dict(Saved.B200, ladder=[1, 4, 8])
     assert seeded.read_text(encoding="utf-8") == content

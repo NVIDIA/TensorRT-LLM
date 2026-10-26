@@ -69,19 +69,29 @@ def test_option_overrides_profile_ladder(selection):
     assert run.written == ["B200-8gpu.ids", "B200.json"]
 
 
-@pytest.mark.parametrize(
-    "ladder, message",
-    [
-        ([1, 4], "ladder 1,4 must end at max_gpu_per_node 8"),
-        ([1, 4, 8, 16], "ladder 1,4,8,16 must end at max_gpu_per_node 8"),
-        ([4, 1, 8], "rungs must ascend without repeating"),
-    ],
-)
-def test_profile_ladder_ends_at_the_node(tmp_path, ladder, message):
-    """A profile's ladder ascends to exactly its node, or the catalogue is refused.
+# A profile's ladder fits its node / A ladder below the node is accepted
+def test_ladder_below_the_node_is_accepted(tmp_path):
+    """An 8-GPU profile may divide its node as `1,4`; a run without `--ladder` then uses it.
 
     Read through the loader: no option points the plugin at another catalogue.
     """
+    profile = dict(json.loads(PROFILES.read_text())["B200"], ladder=[1, 4])
+    source = tmp_path / "profiles.json"
+    source.write_text(json.dumps({"B200": profile}))
+
+    assert list(MachineCatalog.load(source).profile_for("B200").default_ladder) == [1, 4]
+
+
+# A profile's ladder fits its node / A rung above the node is refused
+@pytest.mark.parametrize(
+    "ladder, message",
+    [
+        ([1, 4, 8, 16], "profile 'B200': ladder 1,4,8,16 exceeds max_gpu_per_node 8"),
+        ([4, 1, 8], "rungs must ascend without repeating"),
+    ],
+)
+def test_ladder_above_the_node_is_refused(tmp_path, ladder, message):
+    """A rung above the node, or rungs out of order, and the catalogue is refused."""
     profile = dict(json.loads(PROFILES.read_text())["B200"], ladder=ladder)
     source = tmp_path / "profiles.json"
     source.write_text(json.dumps({"B200": profile}))
