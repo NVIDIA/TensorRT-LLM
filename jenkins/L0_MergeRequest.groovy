@@ -332,6 +332,10 @@ def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 def RELEASE_TARGET = "release_target"
 @Field
 def JOB_TYPE = "job_type"
+// BUILD_NUMBER of the official post-merge pipeline, passed to every L0_Test job so they all
+// pick the same stages of L0_Test.groovy's POST_MERGE_STAGE_BUILD_INTERVALS; null otherwise.
+@Field
+def POST_MERGE_BUILD_NUMBER = "post_merge_build_number"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (BASE_COMMIT): gitlabParamsFromBot.get('base_commit', null),
@@ -349,6 +353,7 @@ def globalVars = [
     (BOLT_PROFILE_BRANCH): "",
     (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
     (JOB_TYPE): env.JOB_BASE_NAME,
+    (POST_MERGE_BUILD_NUMBER): (env.JOB_NAME ==~ /.*PostMerge.*/) ? env.BUILD_NUMBER : null,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase

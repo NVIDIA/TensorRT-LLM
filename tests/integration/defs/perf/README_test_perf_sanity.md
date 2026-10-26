@@ -457,6 +457,10 @@ Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` functio
 
 **Important**: Pre-merge and post-merge tests must be in separate stages.
 
+### Post-merge Run Frequency
+
+The post-merge `Disagg-PerfSanity` stages (disaggregated `e2e` and `gen_only` tests) run once every 2 post-merge builds: split `k` runs on the post-merge builds whose `BUILD_NUMBER % 2 == (k - 1) % 2`, so `...-Post-Merge-1` runs on even builds and `...-Post-Merge-2` on odd builds. All other perf-sanity stages run on every build. The intervals are set by `POST_MERGE_STAGE_BUILD_INTERVALS` in `jenkins/L0_Test.groovy`. PR pipelines, including `/bot run --post-merge`, run every selected stage.
+
 ### Pre-merge vs Post-merge Perf-Regression Gating
 
 By default, `test_perf_sanity.py` fails CI on perf regression for pre-merge stages and only warns for post-merge stages. This is auto-detected from the Jenkins job URL (`PostMerge` substring), not the stage name.
