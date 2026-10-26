@@ -359,6 +359,10 @@ and the entries it owns are certified on sm_103. Kimi K3's sm_100 operation
 receipts remain in its adjacent records; its generic-operation regressions
 exercise the relocated entries.
 
+The K3 targets use the engine-selected `KimiK3HybridCacheManager`; its
+model-owned replay state supplies the pending accepted-draft counts consumed
+by fused acceptance and KDA verification.
+
 The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
 their cells through `__call__` and `reference`. Where that runs depends on the
 entry:

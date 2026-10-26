@@ -3,7 +3,7 @@
 """GPU test for the ssm/k3_kda_verify catalog entry, on a real cache object.
 
 Kimi K3's KDA speculative verify of R requests of 1 + num_spec tokens, at the TP16 rank slice (6 heads, K = V = 128,
-conv width 4), on the verify pools of a real ``MambaHybridCacheManagerV2`` built with MTP-style speculation, the KDA
+conv width 4), on the verify pools of a real ``KimiK3HybridCacheManager`` built with MTP-style speculation, the KDA
 replay caches and the drafts' records (``_kda_cells.build_manager``): every layer's conv caches (fp32,
 dim-contiguous), its fp32 state (strided by the manager's per-slot coalescing) and draft records, and the
 accepted-draft record all layers share (``prev_num_accepted_tokens``), at the slots the manager assigned.

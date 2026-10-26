@@ -23,6 +23,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
     modeling as route_b,
 )
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KDAIntermediateLayerCache,
+    KDAReplayLayerCache,
+)
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
 
 spec_worker_a = import_module(f"{route_a.__package__}.spec_worker")
@@ -245,7 +249,15 @@ def test_kda_verify_keeps_builtin_fallback_dense(
     )
     core = torch.arange(8 * 2 * 128, dtype=torch.float32).to(torch.bfloat16).reshape(8, 2, 128)
     output = torch.empty_like(core) if use_output_buffer else None
-    cache = types.SimpleNamespace(has_kda_replay_caches=has_replay_caches, kda_state_tok=None)
+    cache = (
+        KDAReplayLayerCache(
+            conv=torch.empty(0),
+            temporal=torch.empty(0),
+            kda_conv_q=torch.empty(0),
+        )
+        if has_replay_caches
+        else KDAIntermediateLayerCache(conv=torch.empty(0), temporal=torch.empty(0))
+    )
 
     def verify_fused(self, *args, output=None, allow_prequantized_output=False):
         if allow_prequantized_output:
@@ -321,7 +333,8 @@ def test_spec_accept_uses_current_slot_buffer(monkeypatch, target, request_ids, 
 
     monkeypatch.setattr(torch.ops.trtllm, "k3_spec_accept", accept_kernel, raising=False)
     manager = types.SimpleNamespace(
-        prev_num_accepted_tokens=torch.zeros(3), _dummy_request_mask=torch.zeros(3)
+        _kda_replay=types.SimpleNamespace(prev_num_accepted_tokens=torch.zeros(3)),
+        _dummy_request_mask=torch.zeros(3),
     )
     metadata = types.SimpleNamespace(
         num_seqs=3,

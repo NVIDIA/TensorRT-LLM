@@ -247,7 +247,7 @@ _NON_COMPUTE_IMPORTS = frozenset(
         "AllReduceStrategy",
         "AttentionMetadata",
         "AuxStreamType",
-        "MambaHybridCacheManagerV2",
+        "KimiK3HybridCacheManager",
         "Mapping",
         "ModelConfig",
         "MoESchedulerKind",

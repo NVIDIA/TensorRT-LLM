@@ -3,7 +3,7 @@
 """GPU test for the ssm/k3_kda_decode_attn catalog entry, on a real cache object and a caller-owned K3KdaBuffers.
 
 Kimi K3's fused KDA projection + plain decode of R <= 8 requests of one token, at the TP16 rank slice, on the
-plain-decode pools of a real ``MambaHybridCacheManagerV2`` (``_kda_cells.build_manager``: conv bf16
+plain-decode pools of a real ``KimiK3HybridCacheManager`` (``_kda_cells.build_manager``: conv bf16
 ``[slots, 2304, 3]``, fp32 state, strided by the manager's per-slot coalescing) at the slots the manager assigned.
 
 References, as the op's own test: the projection stream alone (``k3_kda_qkvg`` on a 104-CTA set, its Lamport buffers

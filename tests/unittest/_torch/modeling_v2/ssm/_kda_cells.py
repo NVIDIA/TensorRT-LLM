@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""What the ssm/ entry tests share: a real ``MambaHybridCacheManagerV2`` at Kimi K3's per-rank KDA shapes, its
+"""What the ssm/ entry tests share: a real ``KimiK3HybridCacheManager`` at Kimi K3's per-rank KDA shapes, its
 per-layer pools, and the references of the ops' own tests (k3_kda_qkvg's rows decoded from its Lamport buffers; a
 float64 plain decode; a float64 verify that keeps each request's committed history).
 
@@ -53,18 +53,16 @@ def load_ops():
 # The cache objects
 # ---------------------------------------------------------------------------------------------------------------
 def build_manager(num_layers: int, num_spec: int | None = None, max_batch_size: int = 8):
-    """A real MambaHybridCacheManagerV2 with ``num_layers`` KDA layers (and one attention layer). With ``num_spec``:
+    """A real KimiK3HybridCacheManager with ``num_layers`` KDA layers (and one attention layer). With ``num_spec``:
     MTP-style speculation of ``num_spec`` drafts, the KDA replay caches and the drafts' records
     (``kda_draft_records``) that k3_kda_verify / k3_kda_attn read and write."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-        MambaHybridCacheManagerV2,
-    )
+    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
     from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
     from tensorrt_llm.mapping import Mapping
 
     spec = MTPDecodingConfig(max_draft_len=num_spec) if num_spec else None
-    return MambaHybridCacheManagerV2(
+    return KimiK3HybridCacheManager(
         mamba_d_state=K,
         mamba_d_conv=W,
         mamba_num_heads=H,

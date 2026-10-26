@@ -3,7 +3,7 @@
 """GPU test for the ssm/kda_decode catalog entry, on a real cache object.
 
 Kimi K3's plain decode shape (6 heads, K = V = 128, conv width 4, the lower-bound gate, the output norm, beta sigmoid
-in the kernel) on the pools of a real ``MambaHybridCacheManagerV2`` (``_kda_cells.build_manager``): its per-layer
+in the kernel) on the pools of a real ``KimiK3HybridCacheManager`` (``_kda_cells.build_manager``): its per-layer
 conv views (``[q | k | v]`` sections of one bf16 ``[slots, 2304, 3]`` pool) and fp32 state views, strided by the
 manager's per-slot coalescing, at the slots the manager assigned. The reference is an fp32 torch decode.
 B runs 1..8: on sm_100 B <= 5 selects the four-CTA cluster kernel and 6 <= B <= 24 the

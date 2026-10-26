@@ -128,6 +128,7 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.kimi_k3_mla import KimiK3MLAAttention
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import maybe_bcg_kda_core_inplace
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -142,7 +143,6 @@ from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -2334,7 +2334,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         allow_prequantized_output: bool = False,
     ) -> torch.Tensor:
         """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'."""
-        if not (layer_cache.has_kda_replay_caches and layer_cache.kda_state_tok is not None):
+        if not (self._has_kda_replay_caches(layer_cache) and layer_cache.kda_state_tok is not None):
             return super().forward_verify(
                 x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices, output=output
             )
@@ -3553,8 +3553,8 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             f"{attn_metadata.tokens_per_block}"
         )
         manager = attn_metadata.kv_cache_manager
-        assert isinstance(manager, MambaHybridCacheManagerV2), (
-            "this target needs the V2 hybrid KV / state cache manager "
+        assert isinstance(manager, KimiK3HybridCacheManager), (
+            "this target needs the Kimi K3 hybrid KV / state cache manager "
             "(kv_cache_config.use_kv_cache_manager_v2); the engine built "
             f"{type(manager).__name__}"
         )

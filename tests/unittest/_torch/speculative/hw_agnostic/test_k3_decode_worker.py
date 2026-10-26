@@ -47,8 +47,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
 )
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.models import modeling_dflash
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KDAReplayState,
+    KimiK3HybridCacheManager,
+)
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
@@ -96,18 +99,18 @@ def _worker(cls=KimiK3DFlashWorker, **attrs):
     return worker
 
 
-class _OwnStateUpdate(MambaHybridCacheManagerV2):
+class _OwnStateUpdate(KimiK3HybridCacheManager):
     """A manager whose recurrent-state update is not the V2 one the kernel reproduces."""
 
     def update_mamba_states(self, *args, **kwargs):
         pass
 
 
-def _kda_manager(cls=MambaHybridCacheManagerV2):
+def _kda_manager(cls=KimiK3HybridCacheManager):
     """The V2 hybrid manager with the KDA replay record, without ``__init__``."""
     mgr = object.__new__(cls)
-    mgr._use_kda_replay_update = True
-    mgr.prev_num_accepted_tokens = torch.zeros(4, dtype=torch.int32)
+    mgr._kda_replay = KDAReplayState(K)
+    mgr._kda_replay.prev_num_accepted_tokens = torch.zeros(4, dtype=torch.int32)
     mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.bool))
     return mgr
 
@@ -227,8 +230,8 @@ _ACCEPT_DECLINES = {
     "another recurrent-state update": _set(
         "attn.kv_cache_manager", lambda c: _kda_manager(_OwnStateUpdate)
     ),
-    "no KDA replay": _set("attn.kv_cache_manager._use_kda_replay_update", False),
-    "no replay record": _set("attn.kv_cache_manager.prev_num_accepted_tokens", None),
+    "no KDA replay": _set("attn.kv_cache_manager._kda_replay", None),
+    "no replay record": _set("attn.kv_cache_manager._kda_replay.prev_num_accepted_tokens", None),
     "no dummy-request mask": _set("attn.kv_cache_manager._dummy_request_mask_buffer", None),
     "no Mamba metadata": _set("attn.mamba_metadata", None),
     "int64 state indices": _set(

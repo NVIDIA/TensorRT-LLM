@@ -124,9 +124,7 @@ class KimiK3DFlashWorker(DFlashWorker):
         """Everything ``_k3_accept_applies`` checks but the target logits."""
         if not self.k3_decode:
             return False
-        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-            MambaHybridCacheManagerV2,
-        )
+        from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 
         if num_contexts != 0 or not 0 < num_gens <= 8 or self.guided_decoder is not None:
             return False
@@ -152,10 +150,10 @@ class KimiK3DFlashWorker(DFlashWorker):
         mgr = attn_metadata.kv_cache_manager
         mamba_metadata = getattr(attn_metadata, "mamba_metadata", None)
         if (
-            not isinstance(mgr, MambaHybridCacheManagerV2)
-            or type(mgr).update_mamba_states is not MambaHybridCacheManagerV2.update_mamba_states
+            not isinstance(mgr, KimiK3HybridCacheManager)
+            or type(mgr).update_mamba_states is not KimiK3HybridCacheManager.update_mamba_states
             or not mgr.use_kda_replay_update
-            or getattr(mgr, "prev_num_accepted_tokens", None) is None
+            or mgr._kda_replay.prev_num_accepted_tokens is None
             or getattr(mgr, "_dummy_request_mask", None) is None
             or mamba_metadata is None
             or mamba_metadata.state_indices.dtype != torch.int32
@@ -463,7 +461,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             self._ctx_block_divisor,
             self._ctx_block_counts,
             self._ctx_block_tables,
-            mgr.prev_num_accepted_tokens,
+            mgr._kda_replay.prev_num_accepted_tokens,
             attn_metadata.mamba_metadata.state_indices,
             mgr._dummy_request_mask,
             attn_metadata.kv_lens_cuda,
