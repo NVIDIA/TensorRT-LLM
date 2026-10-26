@@ -244,6 +244,9 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.moe_allreduce = None
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+            # Keeps max_token unless the geometry has a measured profile.
+            self.moe_allreduce.select_finalize_max_tokens(
+                self.mlp.experts, self.allreduce)
 
     def forward(
         self,
@@ -292,7 +295,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
         do_finalize = not (
             self.fusion_config.POST_MOE_FUSION
-            and hidden_states.shape[0] <= self.moe_allreduce.max_token
+            and hidden_states.shape[0] <= self.moe_allreduce.finalize_max_tokens
             and self.model_config.moe_backend == 'TRTLLM'
             and self.mlp.experts.has_nvfp4 and self.is_p2p_supported)
 
