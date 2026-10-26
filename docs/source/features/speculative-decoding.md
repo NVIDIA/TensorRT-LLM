@@ -175,7 +175,14 @@ both and each request's draft pages are allocated, padded and freed with its
 target pages. The draft layers keep the drafter's own dtype, so an FP8 target KV
 cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache.
 
-In disaggregated serving, the context server's draft pages are transferred to
+In disaggregated serving, direct worker launches require
+`TRTLLM_DISAGG_SHARED_DRAFT_KV=1` on both the context and generation workers
+to enable shared draft-KV transfer. The `disaggregated_mpi_worker` launcher
+enables this setting automatically when both servers enable compatible
+speculation and use the same `tensor_parallel_size` and
+`enable_attention_dp`.
+
+When sharing is enabled, the context server's draft pages are transferred to
 the generation server with the target pages, so the drafter starts generation
 with the prompt context instead of an empty one. This requires the draft layers
 to have the target's rank-local KV-head count; the draft dtype and head
