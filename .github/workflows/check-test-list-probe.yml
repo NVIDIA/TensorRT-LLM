@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Probe whether the Jenkins "Check Test List" stage can run on a GitHub runner.
+# Probe whether the Jenkins "Check Test List" stage can run on a GitHub runner,
+# comparing the NVIDIA-hosted CPU runner with the GitHub-hosted one.
 # Reports, without gating anything:
 #   - runner resources: CPUs, memory, disk, sudo, docker
 #   - whether container jobs work (needed to reuse LLM_DOCKER_IMAGE)
@@ -24,13 +25,16 @@
 #     them; a plain runner has none, and the Jenkins pod has no GPU driver)
 name: Check Test List Probe
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/check-test-list-probe.yml'
   push:
     branches:
       - 'user/*/check-test-list-probe*'
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -40,14 +44,18 @@ env:
 
 jobs:
   runner-env:
-    name: Runner resources and network
-    runs-on: linux-amd64-cpu4
+    name: Runner resources and network (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-amd64-cpu4, ubuntu-latest]
     timeout-minutes: 15
     steps:
       - name: Resources
         run: |
           {
-            echo "## Runner resources"
+            echo "## Runner resources (${{ matrix.runner }})"
             echo '```'
             echo "runner: ${RUNNER_NAME:-unknown}  user: $(id -un)  nproc: $(nproc)"
             grep PRETTY_NAME /etc/os-release || true
@@ -77,7 +85,7 @@ jobs:
             printf '| %s | %s | %s |\n' "$url" "${ip:-no DNS}" "$result"
           }
           {
-            echo "## Network reach (401 on /v2/ means the registry is reachable)"
+            echo "## Network reach from ${{ matrix.runner }} (401 on /v2/ means the registry is reachable)"
             echo "| URL | IP | HTTP / time |"
             echo "|---|---|---|"
             probe "${TRT_PYPI_INDEX}/trt-test-db/"
@@ -107,12 +115,13 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   collect:
-    name: Collect (${{ matrix.deps }} deps)
-    runs-on: linux-amd64-cpu4
+    name: Collect (${{ matrix.deps }} deps, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        runner: [linux-amd64-cpu4, ubuntu-latest]
         # full: requirements-dev.txt as Jenkins installs it, but with CPU torch.
         # full-cuda: same with CUDA torch, which pulls the CUDA runtime wheels.
         # reduced: drop GPU-only and MPI packages to see what collection needs.
@@ -203,7 +212,7 @@ jobs:
       - name: CUDA libraries visible
         run: |
           {
-            echo "## CUDA libraries (${{ matrix.deps }} deps)"
+            echo "## CUDA libraries (${{ matrix.deps }} deps, ${{ matrix.runner }})"
             echo '```'
             python - <<'EOF'
           import ctypes
@@ -262,10 +271,10 @@ jobs:
         run: |
           used_kb=$(( $(df -k --output=used / | tail -1) - DISK_BEFORE_KB ))
           {
-            echo "## Collect with ${{ matrix.deps }} deps"
+            echo "## Collect with ${{ matrix.deps }} deps on ${{ matrix.runner }}"
             echo "| Step | Result | Seconds |"
             echo "|---|---|---|"
-            echo "| CPU torch | done | ${TORCH_SECONDS:-} |"
+            echo "| torch | done | ${TORCH_SECONDS:-} |"
             echo "| requirements | ${{ steps.install.outcome }} | ${REQ_SECONDS:-} |"
             echo "| trt-test-db | ${{ steps.trt_test_db.outcome }} | ${TTDB_SECONDS:-} |"
             echo "| check_test_list | ${{ steps.collect.outcome }} | ${COLLECT_SECONDS:-} |"
