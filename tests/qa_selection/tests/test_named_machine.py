@@ -28,7 +28,7 @@ from mocks import DeviceCases
 
 
 class Catalogue:
-    """`profiles.json`, and B200's entry in it, without its `ladder`, spelled out."""
+    """`profiles.json`, and B200's entry in it, spelled out."""
 
     PROFILES = Path(__file__).parents[1] / "core" / "profiles.json"
     B200 = {
@@ -37,6 +37,7 @@ class Catalogue:
         "device_memory_mib": 183359,
         "max_gpu_per_node": 8,
         "cpu_arch": "x86_64",
+        "ladder": [1, 4, 8],
     }
 
 
@@ -56,9 +57,17 @@ def test_selection_runs_where_no_gpu_is_present(selection):
 
 # The record carries the profile it decided for / A catalogue run records its entry
 def test_catalogue_run_records_its_entry(selection):
-    """`B200.json`'s `profile` is B200's `profiles.json` entry, less its `ladder`."""
+    """`B200.json`'s `profile` is B200's `profiles.json` entry, ladder included."""
     run = selection.run(DeviceCases.MODULE, "--machine=B200", "--selection-out-dir={out}")
 
-    entry = json.loads(Catalogue.PROFILES.read_text())["B200"]
-    del entry["ladder"]
-    assert run.record["profile"] == entry
+    assert run.record["profile"] == json.loads(Catalogue.PROFILES.read_text())["B200"]
+
+
+# The record carries the profile it decided for / An explicit ladder is recorded in the profile
+def test_explicit_ladder_is_recorded_in_the_profile(selection):
+    """`--ladder=8` replaces B200's `1,4,8` in the recorded profile, as in the run."""
+    run = selection.run(
+        DeviceCases.MODULE, "--machine=B200", "--ladder=8", "--selection-out-dir={out}"
+    )
+
+    assert run.record["profile"] == dict(Catalogue.B200, ladder=[8])

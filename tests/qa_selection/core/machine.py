@@ -21,7 +21,8 @@
 A profile field holds what a run-time probe returns on that machine: `sm` for
 `get_sm_version()`, and `device_name`, `device_memory_mib`, `cpu_arch` likewise.
 `max_gpu_per_node` and `ladder` are read by no rule: `ladder` is the default
-`--ladder`, and `[max_gpu_per_node]` stands in for a profile without one. A rule
+`--ladder`, no rung above the node, and `[max_gpu_per_node]` stands in for a
+profile without one. A rule
 is keyed by a `skipif`'s `reason=`, and a reason with no rule keeps the test.
 """
 
@@ -108,33 +109,41 @@ class MachineProfile:
     device_memory_mib: int
     max_gpu_per_node: int
     cpu_arch: str
-    # The allocation sizes the machine's fleet schedules by; None when it is held whole.
+    # The default `--ladder`; None when the machine is held whole.
     ladder: Optional[Tuple[int, ...]] = None
 
     @classmethod
     def from_mapping(cls, source: Path, name: str, values: object) -> MachineProfile:
-        """One catalogue entry: the profile's fields, and an optional ladder ending at the node."""
+        """One catalogue entry: the profile's fields, and an optional ladder that fits the node."""
         where = f"{source}: profile {name!r}"
         try:
-            profile = cls(name=name, **values)
+            return cls(name=name, **values).checked_ladder()
         except TypeError as error:
             raise ProfileConfigError(f"{where}: {error}") from error
-        if profile.ladder is None:
-            return profile
-
-        try:
-            ladder = Ladder.of(profile.ladder)
         except ValueError as error:
-            raise ProfileConfigError(f"{where}: ladder: {error}") from error
-        ProfileConfigError.check(
-            ladder.largest == profile.max_gpu_per_node,
-            f"{where}: ladder {ladder} must end at max_gpu_per_node {profile.max_gpu_per_node}",
-        )
-        return dataclasses.replace(profile, ladder=tuple(ladder))
+            raise ProfileConfigError(f"{where}: {error}") from error
+
+    def checked_ladder(self) -> MachineProfile:
+        """This profile, its ladder validated as `--ladder` is; raises ValueError.
+
+        Positive rungs, ascending without repeats, none above `max_gpu_per_node`.
+        """
+        if self.ladder is None:
+            return self
+        try:
+            ladder = Ladder.of(self.ladder)
+        except ValueError as error:
+            raise ValueError(f"ladder: {error}") from error
+        if ladder.largest > self.max_gpu_per_node:
+            raise ValueError(f"ladder {ladder} exceeds max_gpu_per_node {self.max_gpu_per_node}")
+        return dataclasses.replace(self, ladder=tuple(ladder))
 
     def to_mapping(self) -> Dict[str, Any]:
-        """The facts as a catalogue entry states them, without `ladder`."""
-        return {field: getattr(self, field) for field in self.FIELDS}
+        """The profile as a catalogue entry states it, `ladder` only when it has one."""
+        mapping: Dict[str, Any] = {field: getattr(self, field) for field in self.FIELDS}
+        if self.ladder is not None:
+            mapping["ladder"] = list(self.ladder)
+        return mapping
 
     @property
     def default_ladder(self) -> Ladder:
