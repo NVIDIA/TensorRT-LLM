@@ -908,7 +908,15 @@ def test_k3_markov():
 def launch() -> int:
     """This file's ``report`` under ``mpirun -n WORLD`` (one rank per visible device), killed with its process
     group at the deadline."""
-    command = ["mpirun", "-n", str(WORLD), sys.executable, os.path.abspath(__file__), "report"]
+    command = [
+        "mpirun",
+        "--allow-run-as-root",
+        "-n",
+        str(WORLD),
+        sys.executable,
+        os.path.abspath(__file__),
+        "report",
+    ]
     print(f"[launch] {' '.join(command)}", flush=True)
     process = subprocess.Popen(command, start_new_session=True)
     try:

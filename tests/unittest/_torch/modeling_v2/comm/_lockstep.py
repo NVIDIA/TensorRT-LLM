@@ -55,8 +55,19 @@ def spawn(entry_file: str, args: argparse.Namespace, deadline_s: int) -> None:
     assert 2 <= world <= len(visible), (
         f"world size {world} needs 2..{len(visible)} visible devices (one rank per device)"
     )
-    command = ["mpirun", "-n", str(world), sys.executable, str(Path(entry_file).resolve()), WORKER_FLAG,
-               "--world-size", str(world), "--fabric-handle", args.fabric_handle]  # fmt: skip
+    command = [
+        "mpirun",
+        "--allow-run-as-root",
+        "-n",
+        str(world),
+        sys.executable,
+        str(Path(entry_file).resolve()),
+        WORKER_FLAG,
+        "--world-size",
+        str(world),
+        "--fabric-handle",
+        args.fabric_handle,
+    ]
     print(f"[launcher] {' '.join(command)}", flush=True)
     process = subprocess.Popen(command, start_new_session=True)
     try:
