@@ -6057,6 +6057,18 @@ class BaseLlmArgs(StrictBaseModel):
         "path only).",
         status="prototype")
 
+    serve_graceful_shutdown_timeout_s: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an "
+        "LLM, embedding or multimodal-encoder server waits after a shutdown "
+        "signal for request handlers that are still running (uvicorn's "
+        "timeout_graceful_shutdown), in every frontend process. Handlers "
+        "still running then are cancelled and the server shuts down as "
+        "usual, so a handler waiting for a request the executor dropped "
+        "cannot hold the shutdown up. None waits for every handler.",
+        status="prototype")
+
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.",
@@ -6655,6 +6667,24 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description="Disable the overlap scheduler.",
         status="beta")
+
+    drop_inflight_requests_on_shutdown: bool = Field(
+        default=False,
+        description=
+        "Once shutdown is requested, stop the executor with requests still "
+        "active or queued instead of finishing them first; they get no final "
+        "response. A pending KV connector load or transfer is still waited "
+        "for. Meant for the context servers of disaggregated serving, whose "
+        "clients are gone when they shut down; on a generation server, a "
+        "request still receiving its KV cache would have that cache freed "
+        "under the transfer. trtllm-serve refuses it on a server launched "
+        "with --server_role GENERATION or as a generation server of a "
+        "disaggregated MPI launch. It cannot check a server without a role "
+        "and warns when such a server has a cache transceiver, so launch "
+        "context servers with --server_role CONTEXT. Requires the overlap "
+        "scheduler off (disable_overlap_scheduler=True) and "
+        "pipeline_parallel_size=1.",
+        status="prototype")
 
     enable_return_routed_experts: bool = Field(
         default=False,
@@ -7838,6 +7868,28 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             self.decoding_config = None
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_drop_inflight_requests_on_shutdown(self) -> 'TorchLlmArgs':
+        """Accept drop_inflight_requests_on_shutdown only where it is safe.
+
+        Only the executor loop without the overlap scheduler and pipeline
+        parallelism may stop with requests in flight: the overlap loop still
+        owes the previous batch its processing, and a pipeline-parallel loop
+        can have microbatches travelling between ranks. The check follows
+        validate_speculative_config, which may turn the overlap scheduler off.
+        """
+        if not self.drop_inflight_requests_on_shutdown:
+            return self
+        if (not self.disable_overlap_scheduler
+                or self.pipeline_parallel_size != 1):
+            raise ValueError(
+                "drop_inflight_requests_on_shutdown requires the overlap "
+                "scheduler off (disable_overlap_scheduler=True) and "
+                "pipeline_parallel_size=1, but got disable_overlap_scheduler="
+                f"{self.disable_overlap_scheduler} and pipeline_parallel_size="
+                f"{self.pipeline_parallel_size}.")
         return self
 
     @model_validator(mode="after")

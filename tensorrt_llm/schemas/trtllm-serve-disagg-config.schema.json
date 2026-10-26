@@ -1904,6 +1904,13 @@
             }
           ]
         },
+        "drop_inflight_requests_on_shutdown": {
+          "default": false,
+          "description": "Once shutdown is requested, stop the executor with requests still active or queued instead of finishing them first; they get no final response. A pending KV connector load or transfer is still waited for. Meant for the context servers of disaggregated serving, whose clients are gone when they shut down; on a generation server, a request still receiving its KV cache would have that cache freed under the transfer. trtllm-serve refuses it on a server launched with --server_role GENERATION or as a generation server of a disaggregated MPI launch. It cannot check a server without a role and warns when such a server has a cache transceiver, so launch context servers with --server_role CONTEXT. Requires the overlap scheduler off (disable_overlap_scheduler=True) and pipeline_parallel_size=1.",
+          "status": "prototype",
+          "title": "Drop Inflight Requests On Shutdown",
+          "type": "boolean"
+        },
         "dtype": {
           "default": "auto",
           "description": "The data type to use for the model. When 'auto' (default), it is read from the HF config.json ('dtype', or the deprecated 'torch_dtype'); for composite/VLM configs it falls back to the nested text_config.dtype. Defaults to bfloat16 if none is found.",
@@ -2908,6 +2915,21 @@
           "$ref": "#/$defs/SchedulerConfig",
           "description": "Scheduler config.",
           "status": "prototype"
+        },
+        "serve_graceful_shutdown_timeout_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an LLM, embedding or multimodal-encoder server waits after a shutdown signal for request handlers that are still running (uvicorn's timeout_graceful_shutdown), in every frontend process. Handlers still running then are cancelled and the server shuts down as usual, so a handler waiting for a request the executor dropped cannot hold the shutdown up. None waits for every handler.",
+          "status": "prototype",
+          "title": "Serve Graceful Shutdown Timeout S"
         },
         "skip_tokenizer_init": {
           "default": false,
@@ -8314,6 +8336,13 @@
       "default": null,
       "title": "Disagg Coordinator Url"
     },
+    "drop_inflight_requests_on_shutdown": {
+      "default": false,
+      "description": "Once shutdown is requested, stop the executor with requests still active or queued instead of finishing them first; they get no final response. A pending KV connector load or transfer is still waited for. Meant for the context servers of disaggregated serving, whose clients are gone when they shut down; on a generation server, a request still receiving its KV cache would have that cache freed under the transfer. trtllm-serve refuses it on a server launched with --server_role GENERATION or as a generation server of a disaggregated MPI launch. It cannot check a server without a role and warns when such a server has a cache transceiver, so launch context servers with --server_role CONTEXT. Requires the overlap scheduler off (disable_overlap_scheduler=True) and pipeline_parallel_size=1.",
+      "status": "prototype",
+      "title": "Drop Inflight Requests On Shutdown",
+      "type": "boolean"
+    },
     "dtype": {
       "default": "auto",
       "description": "The data type to use for the model. When 'auto' (default), it is read from the HF config.json ('dtype', or the deprecated 'torch_dtype'); for composite/VLM configs it falls back to the nested text_config.dtype. Defaults to bfloat16 if none is found.",
@@ -9375,6 +9404,21 @@
       "$ref": "#/$defs/SchedulerConfig",
       "description": "Scheduler config.",
       "status": "prototype"
+    },
+    "serve_graceful_shutdown_timeout_s": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an LLM, embedding or multimodal-encoder server waits after a shutdown signal for request handlers that are still running (uvicorn's timeout_graceful_shutdown), in every frontend process. Handlers still running then are cancelled and the server shuts down as usual, so a handler waiting for a request the executor dropped cannot hold the shutdown up. None waits for every handler.",
+      "status": "prototype",
+      "title": "Serve Graceful Shutdown Timeout S"
     },
     "server_keep_alive_timeout": {
       "default": 10,

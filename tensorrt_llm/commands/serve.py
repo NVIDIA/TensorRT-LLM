@@ -35,6 +35,7 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
                     Sequence, Set, Tuple)
 
 import click
+import pydantic
 import torch
 import uvloop
 import yaml
@@ -618,6 +619,55 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
     llm_args["num_serve_frontends"] = 1
 
 
+def _bool_setting(value: object) -> bool:
+    """A boolean LLM argument as TorchLlmArgs reads it; False if it does not parse.
+
+    A value that does not parse is left to the LLM arguments' own validation.
+    """
+    try:
+        return pydantic.TypeAdapter(bool).validate_python(value)
+    except pydantic.ValidationError:
+        return False
+
+
+def _check_context_only_settings(llm_args: dict, *, warn: bool) -> None:
+    """Refuse the context-only settings on a generation server; warn without a role.
+
+    ``drop_inflight_requests_on_shutdown`` lets a shutdown free the KV cache
+    pools while a request may still be receiving its KV cache, which happens
+    on generation servers only. The role is the one the server's ranks see in
+    ``TRTLLM_DISAGG_ROLE``: ``launch_server`` publishes it from
+    ``--server_role``, and the disaggregated MPI worker from its server's type.
+    Without a role, a server with a cache transceiver gets a warning that
+    names the remedy. Runs before the LLM is built, so a refused launch fails
+    before the model loads.
+
+    Args:
+        llm_args: The merged LLM arguments of the server.
+        warn: Whether to log the warning; an attached frontend repeats its
+            launcher's check without it.
+
+    Raises:
+        click.BadParameter: A setting is refused for the server's role.
+    """
+    role = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_ROLE) or None
+    if not _bool_setting(llm_args.get("drop_inflight_requests_on_shutdown")):
+        return
+    if role == "generation":
+        raise click.BadParameter(
+            "drop_inflight_requests_on_shutdown is for context servers only: "
+            "on a generation server a shutdown would free the KV cache pools "
+            "while a request may still be receiving its KV cache. Remove it "
+            "from this server's configuration.")
+    if (warn and role is None
+            and llm_args.get("cache_transceiver_config") is not None):
+        logger.warning(
+            "drop_inflight_requests_on_shutdown is set on a disaggregated "
+            "server without a role. It is meant for context servers and "
+            "refused on generation servers; launch context servers with "
+            "--server_role CONTEXT so that the role is checked.")
+
+
 def launch_server(
         host: str,
         port: int,
@@ -637,7 +687,7 @@ def launch_server(
         internal_disagg_auth_key: Optional[str] = None,
         report_addr: Optional[str] = None,
         enable_runtime_control_endpoints: bool = False,
-        runtime_control_api_key: Optional[str] = None):
+        runtime_control_api_key: Optional[str] = None) -> None:
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
@@ -649,6 +699,8 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    _check_context_only_settings(llm_args,
+                                 warn=not multi_frontend.is_attached_frontend)
     # An attached frontend gets the launcher's socket from its spawn env; the
     # launcher is its parent.
     multi_frontend_serving = None
@@ -775,7 +827,9 @@ def launch_server(
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
                     runtime_control_api_key=runtime_control_api_key,
-                    multi_frontend_serving=multi_frontend_serving)
+                    multi_frontend_serving=multi_frontend_serving,
+                    graceful_shutdown_timeout=llm.args.
+                    serve_graceful_shutdown_timeout_s)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -800,7 +854,7 @@ def launch_mm_encoder_server(
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
     allow_request_chat_template: bool = False,
-):
+) -> None:
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
@@ -811,7 +865,9 @@ def launch_mm_encoder_server(
         server_role=ServerRole.MM_ENCODER,
         metadata_server_cfg=metadata_server_cfg,
         tool_parser=None,
-        allow_request_chat_template=allow_request_chat_template)
+        allow_request_chat_template=allow_request_chat_template,
+        graceful_shutdown_timeout=mm_encoder.args.
+        serve_graceful_shutdown_timeout_s)
     uvloop.run(server(host, port))
 
 
@@ -896,7 +952,7 @@ def launch_embedding_server(
     max_queue_delay: float,
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
-):
+) -> None:
     model = llm_args["model"]
     llm_args.pop("build_config", None)
     # encode_only is forced on below; drop any value coming from --config to avoid
@@ -926,13 +982,15 @@ def launch_embedding_server(
     # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
     llm = PyTorchLLM(encode_only=True, **llm_args)
 
-    server = OpenAIServer(generator=llm,
-                          model=model,
-                          server_role=ServerRole.EMBEDDING,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None,
-                          embedding_max_queue_delay=max_queue_delay,
-                          embedding_max_queue_size=max_queue_size)
+    server = OpenAIServer(
+        generator=llm,
+        model=model,
+        server_role=ServerRole.EMBEDDING,
+        metadata_server_cfg=metadata_server_cfg,
+        tool_parser=None,
+        embedding_max_queue_delay=max_queue_delay,
+        embedding_max_queue_size=max_queue_size,
+        graceful_shutdown_timeout=llm.args.serve_graceful_shutdown_timeout_s)
     asyncio.run(server(host, port))
 
 

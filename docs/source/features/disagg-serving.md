@@ -385,6 +385,47 @@ requests that bypass the handoff retain the configured retry policy. With
 remote-tail replay disabled, ordinary disaggregated requests retain their
 configured retry policy, including the transient TCP retry budget.
 
+### Bounding the shutdown of context servers
+
+A context server can still hold requests when it is told to stop, for example
+when a benchmark client leaves after its last response. By default it waits for
+all of them: uvicorn waits for every running request handler, and the executor
+finishes every active and queued request first. Two prototype settings bound
+that wait; both are off by default.
+
+* `drop_inflight_requests_on_shutdown: true`: once shutdown is requested, the
+  executor stops with requests still active or queued instead of finishing
+  them. They get no final response. A pending KV connector load or transfer is
+  still waited for, and a request whose KV cache the generation server may
+  still be reading keeps that cache until the KV cache manager shuts down. It
+  requires the overlap scheduler off (`disable_overlap_scheduler: true`) and
+  `pipeline_parallel_size: 1`; the configuration is rejected otherwise.
+* `serve_graceful_shutdown_timeout_s: N`: after a shutdown signal, the OpenAI
+  HTTP server waits at most `N` seconds for running request handlers (uvicorn's
+  `timeout_graceful_shutdown`), then cancels them and shuts down as usual. It
+  applies to the LLM, embedding and multimodal-encoder servers of
+  `trtllm-serve`, in every frontend process; the disaggregated router keeps its
+  own `--request_timeout` for the requests it forwards.
+
+Set them in the context servers' configuration:
+
+```yaml
+disable_overlap_scheduler: true
+drop_inflight_requests_on_shutdown: true
+serve_graceful_shutdown_timeout_s: 30
+cache_transceiver_config:
+  backend: NIXL
+```
+
+`drop_inflight_requests_on_shutdown` is for context servers only: on a
+generation server, a shutdown would free the KV cache pools while a request may
+still be receiving its KV cache. `trtllm-serve` refuses it on a server launched
+with `--server_role GENERATION` and on a generation server of a disaggregated
+MPI launch. It cannot check a server launched without a role, such as the
+example above, and only warns when such a server has a cache transceiver:
+launch context servers with `--server_role CONTEXT` so that the role is
+checked.
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.

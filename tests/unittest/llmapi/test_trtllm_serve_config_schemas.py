@@ -238,6 +238,27 @@ def test_load_balancer_schema_matches_runtime(
             MoeConfig(load_balancer=load_balancer)
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("settings", "valid"),
+    [
+        ({"drop_inflight_requests_on_shutdown": True, "disable_overlap_scheduler": True}, True),
+        ({"drop_inflight_requests_on_shutdown": "always"}, False),
+        ({"serve_graceful_shutdown_timeout_s": 30}, True),
+        ({"serve_graceful_shutdown_timeout_s": None}, True),
+        ({"serve_graceful_shutdown_timeout_s": 0}, False),
+        ({"serve_graceful_shutdown_timeout_s": 1.5}, False),
+    ],
+)
+def test_shutdown_settings(
+    schemas: dict[str, dict], filename: str, settings: dict, valid: bool
+) -> None:
+    """The shutdown settings of a context server, at the top level or under context_servers."""
+    config = settings if filename == generator.SERVE_SCHEMA else {"context_servers": settings}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
     """Check literal top-level config accesses, without tracing aliases or dynamic keys."""
     function = next(

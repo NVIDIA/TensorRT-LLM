@@ -208,6 +208,41 @@ def _fill_stall_timeout_sec() -> float:
     return value
 
 
+def _resolve_drop_inflight_on_shutdown(llm_args: object, pp_size: int,
+                                       disable_overlap_scheduler: bool) -> bool:
+    """Whether a requested shutdown may drop the requests still in flight.
+
+    ``llm_args.drop_inflight_requests_on_shutdown`` asks for it. Only the
+    pp_size == 1 loop without the overlap scheduler may stop with requests in
+    flight: a pipeline-parallel loop can still have microbatches travelling
+    between ranks, whose send handles the loop cleanup waits on, and the
+    overlap loop still owes the previous batch its processing. TorchLlmArgs
+    accepts the setting only with that configuration; a value that reaches the
+    executor without it is ignored with a warning. Read through getattr, so
+    llm_args stand-ins without the field keep the drain.
+
+    Args:
+        llm_args: The executor's LLM arguments.
+        pp_size: Pipeline-parallel size of the executor.
+        disable_overlap_scheduler: Whether the executor runs the loop without
+            the overlap scheduler.
+
+    Returns:
+        True when a requested shutdown may drop the requests that are still
+        active or queued.
+    """
+    if not getattr(llm_args, "drop_inflight_requests_on_shutdown", False):
+        return False
+    if pp_size == 1 and disable_overlap_scheduler:
+        return True
+    logger.warning_once(
+        "drop_inflight_requests_on_shutdown is ignored: it needs "
+        "pp_size == 1 and disable_overlap_scheduler, but pp_size="
+        f"{pp_size} and disable_overlap_scheduler={disable_overlap_scheduler}",
+        key="executor_shutdown_drop_inflight_ignored")
+    return False
+
+
 # Environment variable to control which ranks print step logging.
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
@@ -1128,6 +1163,11 @@ class PyExecutor:
             self.kv_cache_manager.snapshot_warmup_baseline()
 
         self.is_shutdown = False
+        # Whether a requested shutdown may drop the requests still in flight.
+        # Read through getattr, so executors assembled without __init__ (unit
+        # tests) keep draining.
+        self._drop_inflight_on_shutdown = _resolve_drop_inflight_on_shutdown(
+            self.llm_args, self.dist.pp_size, self.disable_overlap_scheduler)
         # Set at the executor loops' normal-exit `break` sites, and ONLY
         # there. It answers exactly one question for _event_loop_wrapper:
         # "did event_loop() reach its own termination?" -- which decides
@@ -1136,6 +1176,8 @@ class PyExecutor:
         # rank-locally on a fatal error (e.g. a CUDA illegal address on this
         # rank alone) while peers are told nothing and the loop keeps running
         # collectives, so a crash after that point still strands them.
+        # _executor_loop also reads it once its loop ends, so that only the
+        # normal exit releases what a dropping shutdown left behind.
         self._event_loop_completed = False
         self._fatal_error: Optional[BaseException] = None
         self._kv_connector_failed = False
@@ -2620,8 +2662,48 @@ class PyExecutor:
 
     @property
     def should_stop_processing(self) -> bool:
-        return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
+        if not self.is_shutdown:
+            return False
+        if len(self.active_requests) == 0 and len(self.waiting_queue) == 0:
+            return not self._has_pending_connector_transfers()
+        # Requests are still active or queued. They are drained unless
+        # drop_inflight_requests_on_shutdown is in effect, and even then a
+        # pending connector transfer is waited for. The loop hands what they
+        # hold back through _release_requests_dropped_at_shutdown.
+        if (not getattr(self, "_drop_inflight_on_shutdown", False)
+                or self._has_pending_connector_transfers()):
+            return False
+        logger.warning_once(
+            f"shutdown requested: dropping {len(self.active_requests)} active "
+            f"and {len(self.waiting_queue)} queued requests instead of "
+            "draining them (drop_inflight_requests_on_shutdown)",
+            key="executor_shutdown_drop_inflight")
+        return True
+
+    def _release_requests_dropped_at_shutdown(self) -> None:
+        """Release what the requests dropped by a non-draining shutdown hold.
+
+        Runs once the loop has stopped. A no-op unless
+        drop_inflight_requests_on_shutdown is in effect, since a draining
+        shutdown only stops with no request left. Queued items hold no
+        executor resources and are discarded. Each active request goes through
+        ``_terminate_request``, as a finished or cancelled one does, so its KV
+        cache, sequence slot and per-request state are back with their
+        managers before ``shutdown`` tears those down. A request whose KV cache
+        the transfer fabric may still access keeps it, as it would on
+        cancellation; the KV cache manager closes that cache at its own
+        shutdown, as it does for a context still in transfer. No dropped
+        request gets a final response.
+        """
+        if not getattr(self, "_drop_inflight_on_shutdown", False):
+            return
+        while self.waiting_queue:
+            self.waiting_queue.pop_request()
+        dropped_requests = list(self.active_requests)
+        self.active_requests.clear()
+        for request in dropped_requests:
+            if not self._is_request_in_transmission(request):
+                self._terminate_request(request)
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -5837,6 +5919,12 @@ class PyExecutor:
                     self.disagg.pace_idle()
 
                 self.iter_counter += 1
+
+            # Rank-local, after the loop's last collective and once the loop
+            # has marked itself completed, so an error here is a teardown error
+            # rather than a stranded peer.
+            if getattr(self, "_event_loop_completed", False):
+                self._release_requests_dropped_at_shutdown()
 
     def _prepare_draft_requests(self):
         try:

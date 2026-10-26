@@ -250,6 +250,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
   - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
   - unittest/llmapi/apps/test_openai_protocol_chat_store.py
+  - unittest/llmapi/apps/test_openai_server_graceful_shutdown.py
   - unittest/llmapi/apps/test_openai_server_iteration_stats.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   - unittest/llmapi/apps/test_render_callers.py
@@ -304,6 +305,7 @@ l0_cpu:
   - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_serve_context_only_settings.py
   - unittest/llmapi/test_serve_multi_frontend_helpers.py
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
   - unittest/llmapi/test_serve_num_frontends_default.py
