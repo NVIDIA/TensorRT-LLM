@@ -786,10 +786,11 @@ def get_num_extra_kv_tokens(spec_config):
     return 0
 
 
-def get_draft_block_width(spec_config) -> int:
+def get_draft_block_width(spec_config, *, shift_label: bool = True) -> int:
     """Block width the worker drafting for ``spec_config`` appends per request.
 
     0 when that worker does not append a block to a paged draft KV cache.
+    ``shift_label`` selects the checkpoint's slot convention for standalone DSpark.
     """
     if spec_config is None:
         return 0
@@ -797,7 +798,7 @@ def get_draft_block_width(spec_config) -> int:
         return DFlashWorker.block_width_for(spec_config)
     if (spec_config.spec_dec_mode.is_dspark()
             and not spec_config.draft_is_embedded_in_target):
-        return DSparkWorker.block_width_for(spec_config)
+        return DSparkWorker.block_width_for(spec_config, shift_label=shift_label)
     return 0
 
 

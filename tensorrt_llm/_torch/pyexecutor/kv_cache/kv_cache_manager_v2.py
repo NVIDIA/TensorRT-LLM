@@ -649,18 +649,27 @@ def _estimate_swa_cache_size(
     return size_per_token, size_per_request
 
 
-def _get_shared_draft_block_width(spec_config, layer_specs) -> int:
-    """Block width of the drafter whose layers share this manager, else 0."""
+def _get_shared_draft_block_width(
+    spec_config, layer_specs, shared_draft_block_width: Optional[int] = None
+) -> int:
+    """Block width of the drafter whose layers share this manager, else 0.
+
+    The creator supplies the checkpoint-resolved width when available.
+    """
     from tensorrt_llm._torch.speculative import get_draft_block_width
 
     if layer_specs is not None and any(
         layer.owner is KVCacheLayerOwner.DRAFT for layer in layer_specs
     ):
+        if shared_draft_block_width is not None:
+            return shared_draft_block_width
         return get_draft_block_width(spec_config)
     return 0
 
 
-def _get_kv_alloc_extra_tokens(spec_config, layer_specs) -> int:
+def _get_kv_alloc_extra_tokens(
+    spec_config, layer_specs, shared_draft_block_width: Optional[int] = None
+) -> int:
     """Tokens each request is allocated beyond its history, for spec decoding.
 
     ``get_num_extra_kv_tokens`` is the position-side count. When the drafter's
@@ -671,12 +680,16 @@ def _get_kv_alloc_extra_tokens(spec_config, layer_specs) -> int:
 
     return max(
         get_num_extra_kv_tokens(spec_config),
-        _get_shared_draft_block_width(spec_config, layer_specs),
+        _get_shared_draft_block_width(spec_config, layer_specs, shared_draft_block_width),
     )
 
 
 def _get_generation_kv_capacity(
-    spec_config, *, is_draft: bool, layer_specs=None
+    spec_config,
+    *,
+    is_draft: bool,
+    layer_specs=None,
+    shared_draft_block_width: Optional[int] = None,
 ) -> tuple[int, int]:
     """Return draft-token reserve and total capacity headroom over history."""
     if spec_config is None:
@@ -691,7 +704,7 @@ def _get_generation_kv_capacity(
         reserve = max(reserve, draft_loop_tokens)
     dynamic_reserve = reserve - spec_config.max_total_draft_tokens
     headroom = (
-        _get_kv_alloc_extra_tokens(spec_config, layer_specs)
+        _get_kv_alloc_extra_tokens(spec_config, layer_specs, shared_draft_block_width)
         + spec_config.tokens_per_gen_step
         + dynamic_reserve
     )
@@ -1561,6 +1574,7 @@ class KVCacheManagerV2(BaseResourceManager):
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1726,7 +1740,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self._shared_draft_block_width = _get_shared_draft_block_width(
-            spec_config, self.layer_specs
+            spec_config, self.layer_specs, shared_draft_block_width
         )
         # Mirror V1: expose max_draft_len so the native disagg AuxBuffer
         # (_make_aux_buffer's getattr fallback) is sized for MTP/spec decoding.
@@ -1755,7 +1769,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
             _get_generation_kv_capacity(
-                spec_config, is_draft=self.is_draft, layer_specs=self.layer_specs
+                spec_config,
+                is_draft=self.is_draft,
+                layer_specs=self.layer_specs,
+                shared_draft_block_width=self._shared_draft_block_width,
             )
         )
 
@@ -7106,6 +7123,7 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ):
         if layer_specs is not None:
@@ -7141,7 +7159,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 max_seq_len,
             )
         _, generation_capacity_headroom = _get_generation_kv_capacity(
-            spec_config, is_draft=is_draft, layer_specs=layer_specs
+            spec_config,
+            is_draft=is_draft,
+            layer_specs=layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
         (
             context_size_per_token,
@@ -7224,6 +7245,7 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
     ) -> Optional[tuple[List[tuple[int, int, int]], int]]:
         """Per-local-layer ``(layer_size, retained_tokens, intercept_tokens)``
         plus the block-rounded full-sequence token count.
@@ -7327,7 +7349,10 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             retained_windows = list(covered_windows)
         _, generation_capacity_headroom = _get_generation_kv_capacity(
-            spec_config, is_draft=is_draft, layer_specs=layer_specs
+            spec_config,
+            is_draft=is_draft,
+            layer_specs=layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
         full_tokens = (
             math.ceil((max_seq_len + generation_capacity_headroom) / tokens_per_block)
@@ -7372,6 +7397,7 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ) -> Optional[int]:
         """Slope-funded pool bytes ONE max-length request pins in this manager.
@@ -7405,6 +7431,7 @@ class KVCacheManagerV2(BaseResourceManager):
             spec_config=spec_config,
             is_draft=is_draft,
             layer_specs=layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
         if layer_tokens is None:
             return None
@@ -7434,6 +7461,7 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ) -> Optional[int]:
         """Allocator quota ONE max-length request makes this manager insist on.
@@ -7469,6 +7497,7 @@ class KVCacheManagerV2(BaseResourceManager):
             spec_config=spec_config,
             is_draft=is_draft,
             layer_specs=layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
         if layer_tokens is None:
             return None

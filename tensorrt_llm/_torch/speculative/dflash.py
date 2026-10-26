@@ -1152,6 +1152,28 @@ class DFlashWorker(SpecWorkerBase):
             logger.info("DFlash: draft KV cache manager replaced, rebinding the ctx cache.")
             self._ctx_buf_inited = False
 
+        # checkpoint's trained block width
+        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            self.max_draft_len + 1
+        )
+        # what the draft forward actually computes
+        self._compute_block_size = self._draft_block_width(draft_model)
+        if self._compute_block_size > self._resolved_block_size:
+            slack = self._compute_block_size - self.max_draft_len
+            raise ValueError(
+                f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
+                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
+                f"Current max_draft_len={self.max_draft_len}."
+            )
+        if self._ctx_unified_cache:
+            reserved = getattr(draft_kv_cache_manager, "_shared_draft_block_width", 0)
+            if self._compute_block_size > reserved:
+                raise ValueError(
+                    f"Drafter block width {self._compute_block_size} exceeds the "
+                    f"{reserved} positions reserved by the shared KV cache manager. "
+                    "The manager must reserve the drafter's resolved block width."
+                )
+
         # Recorded even when the buffers stay private, so that the estimation
         # pass falling back to the arena still rebinds once the real pool lands.
         self._ctx_kv_manager = draft_kv_cache_manager
@@ -1219,20 +1241,6 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
         self._req_ctx_pos = {}
-
-        # checkpoint's trained block width
-        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
-            self.max_draft_len + 1
-        )
-        # what the draft forward actually computes
-        self._compute_block_size = self._draft_block_width(draft_model)
-        if self._compute_block_size > self._resolved_block_size:
-            slack = self._compute_block_size - self.max_draft_len
-            raise ValueError(
-                f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
-                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
-                f"Current max_draft_len={self.max_draft_len}."
-            )
 
         # +block_size slack lets each backend append the per-iteration noise
         # K/V after the accumulated request context.

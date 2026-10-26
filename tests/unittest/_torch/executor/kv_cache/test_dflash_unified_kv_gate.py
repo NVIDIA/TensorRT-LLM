@@ -15,6 +15,7 @@
 """Selection of the unified target+DFlash KV cache layout."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import click
 import pytest
@@ -23,6 +24,7 @@ import yaml
 
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -90,6 +92,60 @@ def test_matching_draft_layout_unifies(is_disagg):
     draft = _model_config(kv_heads=8, head_dim=128)
 
     assert _creator(is_disagg=is_disagg, target=target, draft=draft)._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+@pytest.mark.parametrize("shift_label, expected_width", [(True, 7), (False, 8)])
+def test_dspark_checkpoint_width_reaches_shared_cache_cost_and_construction(
+    monkeypatch, is_disagg, shift_label, expected_width
+):
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    layout = _model_config(kv_heads=8, head_dim=128)
+    layout.is_generation = True
+    creator = _creator(is_disagg=is_disagg, target=layout, draft=layout)
+    creator._speculative_config.spec_dec_mode = SimpleNamespace(
+        is_dflash=lambda: False, is_dspark=lambda: True, is_external_drafter=lambda: True
+    )
+    creator._speculative_config.max_draft_len = 7
+    creator._speculative_config.draft_is_embedded_in_target = False
+    creator._model_engine.model.draft_model = SimpleNamespace(_dspark_shift_label=shift_label)
+    creator._kv_cache_config = KvCacheConfig()
+    creator._tokens_per_block = 32
+    creator._max_batch_size = 4
+    creator._max_num_tokens = 4096
+    creator._max_beam_width = 1
+    creator._sparse_attention_config = None
+    creator._kv_connector_manager = None
+    creator._execution_stream = None
+    creator._disable_overlap_scheduler = True
+    creator._skip_est = True
+    creator._llm_args.kv_cache_config = creator._kv_cache_config
+    monkeypatch.setattr(creator, "_get_model_kv_cache_manager_cls", lambda *args: KVCacheManagerV2)
+    monkeypatch.setattr(creator, "_enable_kv_cache_stats", lambda: False)
+
+    class RecordingManager(KVCacheManagerV2):
+        get_cache_size_per_token = Mock(return_value=(1, 0))
+        get_cache_bytes_per_request = Mock(return_value=1)
+        get_cache_quota_per_request = Mock(return_value=1)
+
+    assert creator._should_unify_dflash_kv_cache()
+    assert not creator._should_create_separate_draft_kv_cache()
+    creator._per_manager_cache_cost(RecordingManager, layout, include_request_cost=True)
+    create_manager = Mock(return_value=SimpleNamespace(max_seq_len=4096))
+    monkeypatch.setattr(_util, "_create_kv_cache_manager", create_manager)
+    creator._create_kv_cache_manager(creator._model_engine)
+
+    runtime_specs = create_manager.call_args.kwargs["layer_specs"]
+    for call in (
+        RecordingManager.get_cache_size_per_token,
+        RecordingManager.get_cache_bytes_per_request,
+        RecordingManager.get_cache_quota_per_request,
+        create_manager,
+    ):
+        assert call.call_count == 1
+        assert call.call_args.kwargs["shared_draft_block_width"] == expected_width
+        assert call.call_args.kwargs["layer_specs"] == runtime_specs
 
 
 def test_mismatched_draft_kv_heads_unify_only_in_aggregated_serving() -> None:

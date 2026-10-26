@@ -54,6 +54,7 @@ from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     DFlashDecodingConfig,
+    DSparkDecodingConfig,
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
@@ -4001,7 +4002,14 @@ def test_storage_pool_group_count_matches_manager(
 
 
 @pytest.mark.parametrize("disagg", [False, True], ids=["aggregated", "disaggregated"])
-def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(disagg: bool) -> None:
+@pytest.mark.parametrize(
+    "spec_config_cls,shared_draft_block_width",
+    [(DFlashDecodingConfig, None), (DSparkDecodingConfig, 7), (DSparkDecodingConfig, 8)],
+    ids=["dflash", "dspark_shifted", "dspark_unshifted"],
+)
+def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(
+    disagg: bool, spec_config_cls: type, shared_draft_block_width: int | None
+) -> None:
     """The drafter appends its block after the context, so its pages must reach it.
 
     After a decode step accepts every draft token the context is ``prompt + K +
@@ -4012,9 +4020,9 @@ def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(disagg
         pytest.skip("requires CUDA")
     torch.cuda.init()
     max_draft_len = 7
-    block_width = max_draft_len + 1
+    block_width = shared_draft_block_width or max_draft_len + 1
     tokens_per_block = 32
-    prompt_len = 49
+    prompt_len = 2 * tokens_per_block - (max_draft_len + 1) - block_width + 1
     target = KVCacheLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
@@ -4048,7 +4056,8 @@ def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(disagg
         mapping=Mapping(),
         dtype=DataType.FP8,
         layer_specs=layer_specs,
-        spec_config=DFlashDecodingConfig(max_draft_len=max_draft_len, speculative_model="draft"),
+        spec_config=spec_config_cls(max_draft_len=max_draft_len, speculative_model="draft"),
+        shared_draft_block_width=shared_draft_block_width,
         vocab_size=4096,
         enable_stats=False,
     )
@@ -4061,6 +4070,8 @@ def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(disagg
         is_disagg_generation_init_state=disagg,
     )
     try:
+        assert manager._shared_draft_block_width == block_width
+        assert manager._generation_kv_capacity_headroom == max_draft_len + 1 + block_width
         if disagg:
             request.py_draft_tokens = []
             request.is_disagg_generation_transmission_complete = False

@@ -52,9 +52,9 @@ from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
-from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
-                           get_num_spec_layers, get_spec_decoder,
-                           should_use_separate_draft_kv_cache)
+from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
+                           get_num_extra_kv_tokens, get_num_spec_layers,
+                           get_spec_decoder, should_use_separate_draft_kv_cache)
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
@@ -1144,6 +1144,8 @@ class KvCacheCreator:
             extra_kwargs[
                 "layer_specs"] = self._build_unified_dflash_layer_specs(
                     kv_cache_config)
+            extra_kwargs.update(
+                shared_draft_block_width=self._unified_drafter_block_width())
         if not is_draft:
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
@@ -2111,9 +2113,11 @@ class KvCacheCreator:
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         self._check_shared_draft_kv_request()
         unified_layer_specs = None
+        shared_draft_block_width = None
         if self._should_unify_dflash_kv_cache():
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 kv_cache_config)
+            shared_draft_block_width = self._unified_drafter_block_width()
             logger.info(
                 f"{self._unified_drafter_name()}: target and draft KV layers "
                 "share one KV cache manager "
@@ -2144,6 +2148,7 @@ class KvCacheCreator:
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             layer_specs=unified_layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
 
         if not self._skip_est:
@@ -2227,6 +2232,13 @@ class KvCacheCreator:
             draft_model = getattr(self._model_engine.model, "draft_model", None)
             backend = getattr(draft_model, "dflash_attention_backend", None)
         return backend
+
+    def _unified_drafter_block_width(self) -> int:
+        """Use the loaded checkpoint's slot convention for sizing and allocation."""
+        draft_model = getattr(self._model_engine.model, "draft_model", None)
+        shift_label = getattr(draft_model, "_dspark_shift_label", False)
+        return get_draft_block_width(self._speculative_config,
+                                     shift_label=shift_label)
 
     def _unified_drafter_name(self) -> str:
         return ("DSpark" if self._speculative_config.spec_dec_mode.is_dspark()
@@ -3594,8 +3606,8 @@ def _create_kv_cache_manager(
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
-        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None
-) -> KVCacheManager:
+        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -3749,6 +3761,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         manager_extra_kwargs["layer_specs"] = layer_specs
+        manager_extra_kwargs[
+            "shared_draft_block_width"] = shared_draft_block_width
         # Vocab size also enables multimodal event decoding and its per-block
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:
