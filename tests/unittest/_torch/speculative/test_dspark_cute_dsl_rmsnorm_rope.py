@@ -293,3 +293,45 @@ def test_fused_dspark_rmsnorm_rope_rejects_missing_weight() -> None:
     x, _, freqs = _make_inputs(2, 5, 512, 64, 1, seed=12)
     with pytest.raises(ValueError, match="needs a weight when apply_weight is set"):
         cute_dsl_dspark_rmsnorm_rope(x, None, freqs, 1, 64, 1e-6, True, True, False)
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@torch.no_grad()
+def test_mla_rmsnorm_rope_pool_write_matches_staged_write(batch: int):
+    """TLLM_DSPARK_MLA_SPLIT_QKV_STREAMS stores the block latents straight into the pool.
+
+    Bitwise what the staged path writes: _rmsnorm_rope_batched, then the scatter
+    at the block fixup's pages / offsets.
+    """
+    from tensorrt_llm._torch.models import modeling_dspark
+
+    block_size, kv_lora_rank, rope_dim, page_size, num_pages = 8, 512, 64, 32, 24
+    head_dim = kv_lora_rank + rope_dim
+    torch.manual_seed(batch)
+    latent = torch.randn(batch, block_size, head_dim, dtype=torch.bfloat16, device="cuda")
+    weight = (1 + 0.02 * torch.randn(kv_lora_rank, device="cuda")).to(torch.bfloat16)
+    positions = torch.randint(0, 4096, (batch, block_size), device="cuda")
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, rope_dim, 2, device="cuda").float() / rope_dim))
+    freqs_cis = torch.polar(
+        torch.ones_like(positions[..., None].float() * inv_freq),
+        positions[..., None].float() * inv_freq,
+    )
+    page_tables = torch.randperm(num_pages, device="cuda")[: batch * 3].view(batch, 3).long()
+    ctx_len = torch.randint(0, 2 * page_size - block_size, (batch,), device="cuda")
+    fixup = modeling_dspark._build_mla_block_fixup(ctx_len, page_tables, block_size, page_size)
+
+    expected = torch.zeros(
+        num_pages, 1, 1, page_size, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    staged = modeling_dspark._rmsnorm_rope_batched(
+        latent, weight, 1e-6, rope_dim, freqs_cis, norm_dim=kv_lora_rank
+    )
+    expected[:, 0, 0][fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = staged.reshape(
+        -1, head_dim
+    )
+
+    actual = torch.zeros_like(expected)
+    assert modeling_dspark._rmsnorm_rope_pool_write(
+        latent, weight, 1e-6, rope_dim, freqs_cis, actual, fixup, kv_lora_rank
+    )
+    assert torch.equal(actual, expected)
