@@ -883,16 +883,18 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
             tile_idx += 1
     tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
 
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 16 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
@@ -975,16 +977,18 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     )
 
     max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 16 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
@@ -1085,16 +1089,18 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
             tile_idx += 1
     tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
 
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 32 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size * 2, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
@@ -2817,13 +2823,17 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     assert preparation_calls == []
 
 
-@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream"])
+@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream", "too_many_tokens"])
 def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
-    """Without an aux stream, NVFP4, or with the kill switch off, the async
-    quantization is the synchronous one and hands back no event to join."""
+    """Without an aux stream, NVFP4, with the kill switch off, or for a batch
+    above the token cap (prefill), the async quantization is the synchronous
+    one and hands back no event to join."""
     from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
 
     monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", reason != "disabled")
+    monkeypatch.setattr(
+        fused_moe_cute_dsl, "ASYNC_INPUT_QUANT_MAX_TOKENS", 1 if reason == "too_many_tokens" else 2
+    )
     calls = []
     backend = SimpleNamespace(
         has_nvfp4=reason != "not_nvfp4",
@@ -2836,6 +2846,32 @@ def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
 
     assert x_q is x and x_sf is None and event is None
     assert calls == [False]
+
+
+@pytest.mark.parametrize("num_tokens, reaches_aux_stream_check", [(1024, True), (1025, False)])
+def test_quantize_input_async_token_cap_boundary(
+    monkeypatch, num_tokens: int, reaches_aux_stream_check: bool
+):
+    """With the production cap, a 1024-token batch is still eligible for the
+    aux stream and a 1025-token batch (prefill) is quantized synchronously."""
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", True)
+    assert fused_moe_cute_dsl.ASYNC_INPUT_QUANT_MAX_TOKENS == 1024
+    aux_stream_checks = []
+    backend = SimpleNamespace(
+        has_nvfp4=True,
+        quantize_input=lambda x, post_quant_comm: (x, None),
+        # Declining the aux stream keeps the test on CPU; whether the check is
+        # reached shows which side of the cap the batch is on.
+        _has_moe_output_memset_aux_stream=lambda: aux_stream_checks.append(1) or False,
+    )
+    x = torch.empty(num_tokens, 4)
+
+    x_q, x_sf, event = fused_moe_cute_dsl.CuteDslFusedMoE.quantize_input_async(backend, x)
+
+    assert x_q is x and x_sf is None and event is None
+    assert bool(aux_stream_checks) == reaches_aux_stream_check
 
 
 def test_join_pending_x_ready_waits_once():

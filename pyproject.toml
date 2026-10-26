@@ -40,6 +40,9 @@ fix = true
 force-exclude = true
 exclude = [
     "**3rdparty/**",
+    # Preserve vendored FlashInfer KDA sources as recorded in the vendor lock.
+    "tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda/kda_chunked_bt16.py",
+    "tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda/kda_chunked_bt16_small_bh.py",
     "tensorrt_llm/_torch/attention/backends/prims_ts/**",
     "tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/**",
     "triton_kernels/**",
@@ -856,7 +859,6 @@ files = [
     "tensorrt_llm/_torch/pyexecutor/sampler/logprobs.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/sampler_features.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/seed_manager.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/two_model_spec_dec.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/finish_reasons.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/top_p_decay.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/penalties.py",

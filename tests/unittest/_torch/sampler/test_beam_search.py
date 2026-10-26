@@ -41,8 +41,9 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearchEarlyStop, BeamSearchMetadata,
-    BeamSearchParams, BeamSearchStep, CBAGroupHost, CBAState, _gather_beam_path,
-    _prepare_beam_history_cba, beam_search_sampling_batch_cba, finalize_beam)
+    BeamSearchParams, BeamSearchStep, CBAGroupHost, CBAState,
+    _assemble_final_beams, _gather_beam_path, _prepare_beam_history_cba,
+    beam_search_sampling_batch_cba, finalize_beam)
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import \
     LlmRequest as CppLlmRequest
@@ -1776,10 +1777,12 @@ def test_beam_search_cba_reorders_stop_window():
         m.cache_indirection[0, b, :] = b
     m.cum_log_probs[0] = torch.tensor([-5.0, -1.0])
     # window rows distinguishable per beam
-    stop_window = torch.zeros((3, 1, K), dtype=torch.int32)
+    allocation = torch.zeros(2 * 3 * K, dtype=torch.int32)
+    stop_window = allocation[:3 * K].view(3, 1, K)
     stop_window[:, 0, 0] = 100
     stop_window[:, 0, 1] = 200
-    m.stop_past_tokens = stop_window
+    m.stop_words_metadata = torch.tensor([[allocation.data_ptr(), 0, 0, 3, K]],
+                                         dtype=torch.int64)
 
     # beam1 dominates: both slots descend from beam 1
     logits = torch.full((K, vocab), -50.0)
@@ -2014,7 +2017,8 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     assert request.py_beam_width == max(beam_width_array)
 
     # Exercise the real beam admission checks with unrelated cache, transport,
-    # token-range, sampler, and budget validation disabled in the executor stub.
+    # token-range, sampler, model, and budget validation disabled in the
+    # executor stub.
     executor = types.SimpleNamespace(
         _is_kv_manager_v2=True,
         max_beam_width=request.py_beam_width,
@@ -2023,6 +2027,7 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
         _configure_csa2_remote_tail=lambda _request: None,
         _validate_token_id_range=lambda _request: None,
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
+        model_engine=types.SimpleNamespace(model=None),
         _validate_request_budget=lambda _request: None,
     )
     validate = functools.partial(
@@ -2205,6 +2210,7 @@ def test_cba_finalize_merges_pool_and_orders_by_score():
 
     cba_group = CBAGroupHost(
         pos={0: 0},
+        token_base=0,
         should_stop=torch.tensor([True]),
         cache_indirection=cache_indirection,
         original_tokens=original_tokens,
@@ -2284,6 +2290,7 @@ def test_cba_finalize_collects_beams_a_widening_step_produced():
     # An empty pool: every output beam has to come from the live ones.
     cba_group = CBAGroupHost(
         pos={0: 0},
+        token_base=0,
         should_stop=torch.tensor([True]),
         cache_indirection=cache_indirection,
         original_tokens=original_tokens,
@@ -2309,6 +2316,152 @@ def test_cba_finalize_collects_beams_a_widening_step_produced():
     assert history.cum_logprobs is not None
     torch.testing.assert_close(history.cum_logprobs,
                                torch.tensor([4.0, 3.0, 2.0, 1.0]))
+
+
+def _reference_assemble_final_beams(order, all_normed, pool_width, width,
+                                    num_generated_tokens, cba_tokens,
+                                    cba_lengths, cba_cum, active_path,
+                                    active_cum, cba_log_probs, active_lp_path):
+    """Per-beam loop the vectorized _assemble_final_beams replaces."""
+    num_beams = order.size(0)
+    tokens = torch.full((num_beams, width),
+                        BEAM_SEARCH_PAD_TOKEN,
+                        dtype=torch.int32)
+    cum_logprobs = torch.zeros((num_beams, ), dtype=torch.float32)
+    log_probs = None
+    if cba_log_probs is not None:
+        log_probs = torch.zeros((num_beams, width), dtype=torch.float32)
+    for out_idx, merged_idx in enumerate(order.tolist()):
+        if not torch.isfinite(all_normed[merged_idx]):
+            continue
+        if merged_idx < pool_width:
+            entry_len = int(cba_lengths[merged_idx].item())
+            tokens[out_idx, :entry_len] = cba_tokens[merged_idx, :entry_len]
+            cum_logprobs[out_idx] = cba_cum[merged_idx]
+            if log_probs is not None:
+                log_probs[out_idx, :entry_len] = cba_log_probs[
+                    merged_idx, :entry_len]
+        else:
+            active_idx = merged_idx - pool_width
+            tokens[out_idx, :num_generated_tokens] = active_path[active_idx]
+            cum_logprobs[out_idx] = active_cum[active_idx]
+            if log_probs is not None:
+                log_probs[
+                    out_idx, :num_generated_tokens] = active_lp_path[active_idx]
+    return tokens, cum_logprobs, log_probs
+
+
+@pytest.mark.parametrize("with_log_probs", [False, True])
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_assemble_final_beams_matches_reference(seed, with_log_probs):
+    """The vectorized final-beam assembly reproduces the per-beam loop.
+
+    Random pools mix finished entries of varying length, unused (-inf) pool
+    slots and live beams (some harvested to -inf), including the under-filled
+    case where fewer finite candidates exist than output beams so some rows
+    must stay padded.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    pool_width = int(torch.randint(1, 6, (1, ), generator=gen))
+    active_width = int(torch.randint(1, 6, (1, ), generator=gen))
+    num_generated = int(torch.randint(1, 5, (1, ), generator=gen))
+    snap_width = num_generated + int(torch.randint(0, 3, (1, ), generator=gen))
+    num_beams = int(
+        torch.randint(1, pool_width + active_width + 1, (1, ), generator=gen))
+
+    cba_lengths = torch.randint(0,
+                                snap_width + 1, (pool_width, ),
+                                generator=gen).to(torch.int32)
+    cba_normed = torch.randn(pool_width, generator=gen)
+    cba_normed[cba_lengths == 0] = float("-inf")
+    cba_cum = torch.randn(pool_width, generator=gen)
+    cba_tokens = torch.randint(0, 1000, (pool_width, snap_width),
+                               generator=gen).to(torch.int32)
+    active_path = torch.randint(0,
+                                1000, (active_width, num_generated),
+                                generator=gen).to(torch.int32)
+    active_cum = torch.randn(active_width, generator=gen)
+    active_cum[torch.rand(active_width, generator=gen) < 0.5] = float("-inf")
+    all_normed = torch.cat([cba_normed, active_cum])
+    order = torch.argsort(all_normed, descending=True)[:num_beams]
+    width = max(num_generated, int(cba_lengths.max().item()))
+
+    cba_log_probs = active_lp_path = None
+    if with_log_probs:
+        cba_log_probs = torch.randn(pool_width, snap_width, generator=gen)
+        active_lp_path = torch.randn(active_width, num_generated, generator=gen)
+
+    kwargs = dict(order=order,
+                  all_normed=all_normed,
+                  pool_width=pool_width,
+                  width=width,
+                  num_generated_tokens=num_generated,
+                  cba_tokens=cba_tokens,
+                  cba_lengths=cba_lengths,
+                  cba_cum=cba_cum,
+                  active_path=active_path,
+                  active_cum=active_cum,
+                  cba_log_probs=cba_log_probs,
+                  active_lp_path=active_lp_path)
+    tokens, cum, lps = _assemble_final_beams(**kwargs)  # type: ignore
+    ref_tokens, ref_cum, ref_lps = _reference_assemble_final_beams(**kwargs)
+    torch.testing.assert_close(tokens, ref_tokens)
+    torch.testing.assert_close(cum, ref_cum)
+    if with_log_probs:
+        torch.testing.assert_close(lps, ref_lps)
+    else:
+        assert lps is None and ref_lps is None
+
+
+def test_cba_finalize_reads_snapshot_from_token_base():
+    """The group snapshot may start at the smallest prompt length.
+
+    prepare_cba_group_host copies cache_indirection / original_tokens from
+    ``token_base`` (the group's minimum prompt length) rather than position 0;
+    the builder must offset its generated-region slice accordingly.
+    """
+    num_beams = 2
+    num_generated = 3
+    request = _vbws_request(None, max_beam_width=num_beams)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.py_decoding_iter = num_generated
+    request.decoding_iter = num_generated
+    request.py_seq_slot = 0
+    prompt_len = request.py_prompt_len
+    request.set_generated_tokens([[0] * (num_generated - 1)] * num_beams)
+    total = prompt_len + num_generated
+    # Snapshot starting two positions before the prompt end: the generated
+    # window sits at columns [2, 2 + num_generated).
+    token_base = prompt_len - 2
+    snap = total - token_base
+    cache_indirection = (torch.arange(num_beams,
+                                      dtype=torch.int64).view(-1, 1).expand(
+                                          -1, snap).contiguous().unsqueeze(0))
+    original_tokens = torch.zeros((1, num_beams, snap), dtype=torch.int32)
+    generated = torch.tensor([[31, 32, 33], [41, 42, 43]], dtype=torch.int32)
+    original_tokens[0, :, 2:] = generated
+    cba_group = CBAGroupHost(
+        pos={0: 0},
+        token_base=token_base,
+        should_stop=torch.tensor([True]),
+        cache_indirection=cache_indirection,
+        original_tokens=original_tokens,
+        cum=torch.tensor([[2.0, 1.0]]),
+        cba_tokens=torch.full((1, num_beams, num_generated),
+                              BEAM_SEARCH_PAD_TOKEN,
+                              dtype=torch.int32),
+        cba_cum=torch.zeros((1, num_beams)),
+        cba_normed=torch.full((1, num_beams), float("-inf")),
+        cba_lengths=torch.zeros((1, num_beams), dtype=torch.int32),
+        original_log_probs=None,
+        cba_log_probs=None,
+    )
+    builder = _prepare_beam_history_cba(request, cba_group=cba_group)
+    assert builder is not None
+    history = builder()
+    assert history is not None
+    torch.testing.assert_close(history.tokens, generated)
+    torch.testing.assert_close(history.cum_logprobs, torch.tensor([2.0, 1.0]))
 
 
 def test_finish_beams():

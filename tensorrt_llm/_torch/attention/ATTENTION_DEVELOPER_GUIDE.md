@@ -233,6 +233,24 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
+The contiguous block-sparse path also consumes the SageAttention recipe in
+`AttentionForwardArgs`. Prediction sees the original Q/K/V. The attention core
+then quantizes the Q/K/V of a block-sparse call before FMHA selection, with
+TensorRT-LLM's Sage quantization kernel (`attention/kernels/sage_quant.py`),
+and passes the result in `AttentionForwardArgs.sage_quantized`. Q/K get
+per-block scales and V per-sequence channel scales; the summaries of proxy
+routes get one scale per K mean and reuse the original V channel scales and K
+mean. `PrimsTSBlockSparseFmha` serves Sage only with these inputs and passes
+all scales to PrimTS; the attention op ignores them and quantizes dense
+SageAttention inside its kernels. The recipe and quantized dtypes are part of
+the plan key. Paged block-sparse attention rejects Sage. With
+`sage_attn_smooth_v`, V and its summaries also subtract the per-sequence V
+mean, which PrimTS adds back to the output. The attention op cannot, so the
+core also quantizes dense contiguous calls with V smoothing, and
+`PrimsTSBlockSparseFmha` serves dense calls with core-quantized inputs through
+a dense plan; the attention op serves the rest without V smoothing and logs a
+warning once.
+
 `PrimsTSBlockSparseFmha` keeps its planned wrappers in the attention metadata
 (`TrtllmAttentionMetadata.fmha_plan_caches`), like the FlashInfer wrappers and
 the MSA plans. Every layer that runs with one metadata object plans each static
@@ -724,7 +742,7 @@ Working rules:
 | `tensorrt_llm/_torch/attention/qk_norm_attention.py` | QK-norm attention module logic and fused QK-norm/RoPE/gate dispatch |
 | `tensorrt_llm/_torch/attention/cross_attention.py` | Encoder-decoder cross-attention module logic and cross-KV cache reuse |
 | `tensorrt_llm/_torch/attention/rotary_embedding.py` | Unfused RoPE and mRoPE modules shared across the attention stack |
-| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and unfused fallbacks |
+| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and decide what to do when a kernel does not apply |
 | `tensorrt_llm/_torch/attention/backends/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention/backends/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention/backends/trtllm.py` | TRTLLM backend execution and metadata |
