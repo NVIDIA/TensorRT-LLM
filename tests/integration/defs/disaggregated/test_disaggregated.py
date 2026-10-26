@@ -646,16 +646,17 @@ def run_client_tests(example_dir,
                         "Using `asyncio` in Python"
                     ]
                 elif "qwen3_32b_fp8" in test_desc:
-                    # https://nvbugs/6566734: the greedy completion of the raw
-                    # asyncio prompt is near-tied between answering the question
-                    # and continuing it; both are valid non-garbage outputs.
-                    expected_strings = [
-                        "The capital of Germany is Berlin",
-                        [
-                            "Asyncio in Python is a library",
-                            "I have read that it is used for asynchronous programming"
-                        ]
-                    ]
+                    # The greedy continuation of the raw asyncio prompt has
+                    # near-tied tokens that flip with the GPU type and with
+                    # the ctx/gen TP sizes (https://nvbugs/6566734,
+                    # https://nvbugs/6770977). Match case-insensitively on the
+                    # prompt's own keywords instead of an exact phrase.
+                    lowered_content = content.lower()
+                    assert "berlin" in lowered_content, (
+                        f"Expected 'Berlin' not found in {output_file}")
+                    assert "asyncio" in lowered_content, (
+                        f"Expected 'asyncio' not found in {output_file}")
+                    expected_strings = []
                 else:
                     expected_strings = [
                         "The capital of Germany is Berlin",
@@ -2990,11 +2991,14 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
     model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    # Cold-cache startup on B200 takes 544-700s, mostly autotuner warmup, past
+    # the 300s default (https://nvbugs/6888251).
     run_disaggregated_test(disaggregated_example_root,
                            "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=900)
 
 
 @pytest.mark.timeout(12600)
