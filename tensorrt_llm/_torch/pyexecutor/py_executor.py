@@ -210,9 +210,7 @@ def resolve_spec_dec_batch_wait_defaults(
         return None
     if getattr(model_engine, "cuda_graph_config", None) is None:
         return None
-    if (getattr(model_engine, "prefill_cuda_graph_backend",
-                PrefillCudaGraphBackend.DISABLED)
-            != PrefillCudaGraphBackend.DISABLED):
+    if llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
         return None
     return SPEC_DEC_CTX_COALESCE_ITERS, SPEC_DEC_CTX_COALESCE_MAX_TOKENS_RATIO
 

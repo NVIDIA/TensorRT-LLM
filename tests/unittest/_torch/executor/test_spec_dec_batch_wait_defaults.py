@@ -19,16 +19,11 @@ from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend, TorchLlmArgs
 _DEFAULT = (SPEC_DEC_CTX_COALESCE_ITERS, SPEC_DEC_CTX_COALESCE_MAX_TOKENS_RATIO)
 
 
-def _engine(
-    mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
-    cuda_graph=True,
-    prefill_backend=PrefillCudaGraphBackend.DISABLED,
-):
+def _engine(mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL, cuda_graph=True):
     spec_config = None if mode is None else SimpleNamespace(spec_dec_mode=mode)
     return SimpleNamespace(
         spec_config=spec_config,
         cuda_graph_config=object() if cuda_graph else None,
-        prefill_cuda_graph_backend=prefill_backend,
     )
 
 
@@ -63,7 +58,6 @@ def test_explicit_user_batch_wait_config_is_respected(user_kwargs):
         _engine(mode=SpeculativeDecodingMode.NGRAM),
         _engine(mode=SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL),
         _engine(cuda_graph=False),
-        _engine(prefill_backend=PrefillCudaGraphBackend.PIECEWISE),
     ],
     ids=[
         "no_spec",
@@ -72,12 +66,18 @@ def test_explicit_user_batch_wait_config_is_respected(user_kwargs):
         "ngram",
         "draft_target",
         "no_cuda_graph",
-        "prefill_graph",
     ],
 )
 def test_not_applied_outside_one_model_eagle3_with_eager_prefill(engine):
     llm_args = TorchLlmArgs(model="dummy")
     assert resolve_spec_dec_batch_wait_defaults(llm_args, engine, False) is None
+
+
+def test_not_applied_with_prefill_cuda_graph():
+    llm_args = TorchLlmArgs(
+        model="dummy", prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE
+    )
+    assert resolve_spec_dec_batch_wait_defaults(llm_args, _engine(), False) is None
 
 
 def test_not_applied_with_attention_dp():
