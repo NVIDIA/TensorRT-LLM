@@ -111,6 +111,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/models/test_qwen3_5_dense_mlp_quant.py
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
