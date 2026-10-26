@@ -624,7 +624,7 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
         reasoning = message.reasoning_content or message.reasoning
         if reasoning:
             content.append(AnthropicThinkingBlock(thinking=reasoning))
-        if message.content:
+        if message.content and message.content.strip():
             content.append(AnthropicTextBlock(text=message.content))
         for tool_call in message.tool_calls:
             try:
@@ -733,6 +733,14 @@ class AnthropicStreamReframer:
         # Whether this stream emitted any tool_use block, which decides the
         # terminating stop_reason; see finish().
         self.emitted_tool_use = False
+        # Whitespace-only text waiting for text that is more than whitespace.
+        # Anthropic clients drop whitespace-only text blocks when they send a
+        # turn back (the API rejects them), so such a block would make the
+        # replayed turn differ from the one served. The model's layout between
+        # blocks (the newlines before a tool call, say) is held here instead:
+        # it opens a text block only together with the text that follows it,
+        # and is dropped when another kind of block opens or the stream ends.
+        self.pending_whitespace = ""
         self.stop_reason: AnthropicStopReason = "end_turn"
         self.stop_sequence: Optional[str] = None
         self.final_usage: Optional[AnthropicUsage] = None
@@ -748,6 +756,8 @@ class AnthropicStreamReframer:
         return [anthropic_sse(event)]
 
     def _open_block(self, block: Any, block_type: str) -> List[str]:
+        if block_type != "text":
+            self.pending_whitespace = ""
         frames = self._close_block()
         self.block_index += 1
         self.open_block_type = block_type
@@ -937,12 +947,18 @@ class AnthropicStreamReframer:
                         )
                     )
                 )
-            if delta.content:
+            text = delta.content
+            if text and self.open_block_type != "text":
+                text = self.pending_whitespace + text
+                self.pending_whitespace = "" if text.strip() else text
+                if self.pending_whitespace:
+                    text = ""
+            if text:
                 frames.extend(self._ensure_block("text"))
                 frames.append(
                     anthropic_sse(
                         AnthropicContentBlockDeltaEvent(
-                            index=self.block_index, delta=AnthropicTextDelta(text=delta.content)
+                            index=self.block_index, delta=AnthropicTextDelta(text=text)
                         )
                     )
                 )
