@@ -1925,6 +1925,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             params.mla_param->quant_q_buf = mFP8ContextMLA ? fp8QBuf : nullptr;
             params.mla_param->quant_k_buf = mFP8ContextMLA ? workspaceViews.fp8KBuf : nullptr;
             params.mla_param->quant_v_buf = mFP8ContextMLA ? workspaceViews.fp8VBuf : nullptr;
+            params.mla_param->v_token_stride_elements = 0;
+            if (params.v_stride_in_bytes != 0)
+            {
+                TLLM_CHECK_WITH_INFO(
+                    params.v_stride_in_bytes > 0 && params.v_stride_in_bytes % static_cast<int64_t>(sizeof(T)) == 0,
+                    "MLA Context: V token stride must be a positive multiple of the element size");
+                params.mla_param->v_token_stride_elements = params.v_stride_in_bytes / static_cast<int64_t>(sizeof(T));
+            }
             // Set additional scales for context phase
             params.mla_param->quant_scale_o = params.attention_output_orig_quant;
             params.mla_param->quant_scale_q = params.kv_scale_orig_quant;
@@ -2093,6 +2101,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 fmhaParams.qPtr = attention_input;
                 fmhaParams.kPtr = params.k_ptr;
                 fmhaParams.vPtr = params.v_ptr;
+                fmhaParams.vStrideInBytes = params.v_stride_in_bytes;
             }
         }
         else if (useSageAttnSeparateQkv)

@@ -212,7 +212,6 @@ async def _preprocess(monkeypatch, store_flag):
     resources = SimpleNamespace(extension=SimpleNamespace(serialize_tool=lambda tool: tool))
     monkeypatch.setattr(ru, "parse_chat_messages_coroutines", fake_parse)
     monkeypatch.setattr(ru, "RenderResources", SimpleNamespace(from_parts=lambda **kw: resources))
-    monkeypatch.setattr(ru, "legacy_render_enabled", lambda: False)
     monkeypatch.setattr(ru, "render_conversation", fake_render)
     monkeypatch.setattr(ru, "resolve_top_level_model_type", lambda cfg: "llama")
     monkeypatch.setattr(ru, "add_thinking_budget_logits_processor", lambda *a, **k: None)

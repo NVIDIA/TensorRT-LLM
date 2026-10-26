@@ -883,6 +883,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                                     None)
         self.py_end_id: Optional[int] = kwargs.pop("end_id", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
+        self.py_lora_ckpt_source: str | None = kwargs.pop(
+            "py_lora_ckpt_source", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
@@ -1731,6 +1733,8 @@ def executor_request_to_llm_request(
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
         py_lora_path=getattr(executor_request, "py_lora_path", None),
+        py_lora_ckpt_source=getattr(executor_request, "py_lora_ckpt_source",
+                                    None),
         return_log_probs=executor_request.output_config.return_log_probs,
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.

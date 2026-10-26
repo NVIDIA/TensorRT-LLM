@@ -2863,15 +2863,19 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "libraries,available,use_native",
+    "libraries,available,extra_pages_only,use_native",
     [
-        ("flashinfer_trtllm_gen,fallback", True, True),
-        ("fallback,flashinfer_trtllm_gen", True, False),
-        ("fallback", True, False),
-        ("flashinfer_trtllm_gen,fallback", False, False),
+        ("flashinfer_trtllm_gen,fallback", True, False, True),
+        ("fallback,flashinfer_trtllm_gen", True, False, False),
+        ("fallback", True, False, False),
+        ("flashinfer_trtllm_gen,fallback", False, False, False),
+        # SM107: the library serves only extra page sizes; dense layers keep SDPA.
+        ("flashinfer_trtllm_gen,fallback", True, True, False),
     ],
 )
-def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, available, use_native):
+def test_minimax_m3_dense_backend_library_order(
+    monkeypatch, libraries, available, extra_pages_only, use_native
+):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -2892,6 +2896,7 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
         "is_available",
         classmethod(lambda cls, attn: available),
     )
+    monkeypatch.setattr(model_module, "get_sm_version", lambda: 107 if extra_pages_only else 100)
     layer = SimpleNamespace(
         attn=legacy,
         layer_idx=0,
@@ -2909,7 +2914,7 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
     )
     assert layer.attn is (native if use_native else legacy)
     assert layer.support_fused_qkv is use_native
-    if libraries == "flashinfer_trtllm_gen,fallback" and available:
+    if libraries == "flashinfer_trtllm_gen,fallback" and available and not extra_pages_only:
         construct.assert_called_once()
         assert construct.call_args.kwargs["pos_embd_params"] is None
     else:

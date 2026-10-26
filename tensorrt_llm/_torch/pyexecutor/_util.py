@@ -15,6 +15,7 @@
 import copy
 import dataclasses
 import os
+from contextlib import ExitStack
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
@@ -64,6 +65,8 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
+from .engine.lora import make_lora_model_config
+from .engine.multimodal import is_multimodal, use_mrope
 from .guided_decoder import GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
@@ -1392,7 +1395,7 @@ class KvCacheCreator:
                                          beam_width=max_beam_width, ),
                                      output_config=trtllm.OutputConfig(),
                                      end_id=-1)
-            if self._model_engine.use_mrope:
+            if use_mrope(self._model_engine.model):
                 request.py_multimodal_data = {
                     "mrope_config": {
                         "mrope_position_ids":
@@ -1583,7 +1586,7 @@ class KvCacheCreator:
 
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
-                                self._model_engine._max_cuda_graph_batch_size)
+                                self._model_engine.max_cuda_graph_batch_size)
         # Round up the max seq len to the block size
         max_seq_len_blocks = ceil_div(self._model_engine.max_seq_len + 1,
                                       self._tokens_per_block)
@@ -1788,7 +1791,8 @@ class KvCacheCreator:
             if py_executor.dist.mapping.rank == 0:
                 req_ids = py_executor.enqueue_requests(self._dummy_reqs)
             req_ids = py_executor.dist.broadcast(req_ids, root=0)
-            py_executor.is_warmup = True
+            warmup = ExitStack()
+            warmup.enter_context(py_executor.warmup_scope())
             py_executor.start_worker()
             try:
                 responses = py_executor.await_responses(req_ids)
@@ -1830,7 +1834,7 @@ class KvCacheCreator:
                 allocated_bytes = kv_stats.allocated_bytes + (
                     kv_stats_draft.allocated_bytes
                     if kv_stats_draft is not None else 0)
-                py_executor.is_warmup = False
+                warmup.close()
                 py_executor.shutdown_for_kv_cache_estimation()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
@@ -2076,23 +2080,21 @@ class KvCacheCreator:
 
         if not self._skip_est:
             # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
-            if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
-                # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
-                if kv_cache_manager is not None:
-                    if kv_cache_manager.max_seq_len < self._max_seq_len:
-                        self._dummy_reqs = self._create_dummy_context_requests(
-                            max(
-                                1, self._net_max_seq_len - 1 -
-                                (self._max_seq_len -
-                                 kv_cache_manager.max_seq_len)))
-                    self._max_seq_len = kv_cache_manager.max_seq_len
+            # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
+            if kv_cache_manager is not None:
+                if kv_cache_manager.max_seq_len < self._max_seq_len:
+                    self._dummy_reqs = self._create_dummy_context_requests(
+                        max(
+                            1, self._net_max_seq_len - 1 -
+                            (self._max_seq_len - kv_cache_manager.max_seq_len)))
+                self._max_seq_len = kv_cache_manager.max_seq_len
 
-                # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
-                if kv_cache_manager is not None:
-                    if kv_cache_manager.max_seq_len < self._max_seq_len:
-                        self._dummy_reqs = self._create_dummy_context_requests(
-                            max(1, kv_cache_manager.max_seq_len - 1))
-                    self._max_seq_len = kv_cache_manager.max_seq_len
+            # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
+            if kv_cache_manager is not None:
+                if kv_cache_manager.max_seq_len < self._max_seq_len:
+                    self._dummy_reqs = self._create_dummy_context_requests(
+                        max(1, kv_cache_manager.max_seq_len - 1))
+                self._max_seq_len = kv_cache_manager.max_seq_len
         else:
             if kv_cache_manager is not None:
                 self._max_seq_len = kv_cache_manager.max_seq_len
@@ -2364,7 +2366,7 @@ class KvCacheCreator:
         return _create_kv_cache_manager(
             model_engine=None,
             max_cuda_graph_batch_size=self._model_engine.
-            _max_cuda_graph_batch_size,
+            max_cuda_graph_batch_size,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=draft_mapping,
             kv_cache_config=draft_kv_config,
@@ -3319,7 +3321,7 @@ def _create_kv_cache_manager(
         _model_config = model_engine.model.model_config
 
     if dtype is None:
-        dtype = model_engine.dtype
+        dtype = model_engine.model.config.torch_dtype
 
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
@@ -3427,7 +3429,7 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["max_cuda_graph_batch_size"] = (
-            model_engine._max_cuda_graph_batch_size
+            model_engine.max_cuda_graph_batch_size
             if model_engine is not None else max_cuda_graph_batch_size)
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
@@ -3441,7 +3443,8 @@ def _create_kv_cache_manager(
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:
         # a text sub-config alone cannot identify a multimodal deployment.
-        needs_multimodal_keys = model_engine is None or model_engine.is_multimodal
+        needs_multimodal_keys = model_engine is None or is_multimodal(
+            model_engine.model, model_engine.input_processor)
         manager_extra_kwargs["vocab_size"] = (resolve_vocab_size(config) if
                                               needs_multimodal_keys else None)
         if (needs_multimodal_keys and manager_extra_kwargs["vocab_size"] is None
@@ -4036,7 +4039,7 @@ def resolve_max_num_sequences(model_engine,
                                      llm_args.disable_overlap_scheduler,
                                      enable_overlap_headroom=getattr(
                                          model_engine,
-                                         "_enable_overlap_headroom", False))
+                                         "enable_overlap_headroom", False))
 
 
 def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
@@ -4179,6 +4182,7 @@ def create_py_executor_instance(
 
     peft_cache_manager = None
     if lora_config is not None:
+        lora_owner = model_engine.initialize_lora_owner()
         # TODO: Refactor dimension resolution into a LoraModuleDimensions
         # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
@@ -4187,7 +4191,7 @@ def create_py_executor_instance(
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
             initial_lora_data_type = _get_initial_lora_data_type(
-                load_torch_lora(lora_config))
+                load_torch_lora(lora_config, owner=lora_owner))
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -4312,21 +4316,25 @@ def create_py_executor_instance(
             rank=dist.mapping.rank,
             gpus_per_node=dist.mapping.gpus_per_node,
         )
+        lora_model_config = make_lora_model_config(
+            model_engine.model,
+            target_modules,
+            lora_config.trtllm_modules_to_hf_modules,
+            lora_config.swap_gate_up_proj_lora_b_weight,
+            owner=lora_owner,
+        )
+        model_engine.set_lora_model_config(lora_model_config)
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config_model,
             lora_config=lora_config,
             model_config=model_binding_config,
+            lora_model_config=lora_model_config,
             world_config=world_config,
             execution_stream=execution_stream,
-            lora_target_modules=target_modules,
             initial_data_type=initial_lora_data_type,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
-        model_engine.set_lora_model_config(
-            target_modules, lora_config.trtllm_modules_to_hf_modules,
-            lora_config.swap_gate_up_proj_lora_b_weight)
-        if isinstance(model_engine, PyTorchModelEngine):
-            model_engine._init_cuda_graph_lora_manager(lora_config)
+        model_engine.init_cuda_graph_lora_manager(lora_config)
 
     validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
@@ -4463,7 +4471,7 @@ def create_py_executor_instance(
                 reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
-    if (getattr(model_engine, "mm_encoder_item_scheduling_enabled", False)
+    if (model_engine.mm_encoder_item_scheduling_enabled
             and model_engine.mapping.is_first_pp_rank()):
         # Wrap the LLM scheduler with atomic MM item budgeting. ModelEngine
         # already validated model-capability-dependent feature combinations.
@@ -4559,6 +4567,13 @@ def create_py_executor_instance(
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
         kv_pool_rebalance_config.check_interval,
+        enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
+        enable_scheduler_aware_adp_dummy=should_enable_scheduler_aware_adp_dummy(
+            getattr(config, "model_type", None), mapping,
+            llm_args.disable_overlap_scheduler),
+        enable_non_overlap_adp_forward_intent=(
+            should_enable_non_overlap_adp_forward_intent(
+                mapping, llm_args.disable_overlap_scheduler)),
     )
 
 
