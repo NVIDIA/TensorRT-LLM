@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from .config import _FP4_MLA_PAGE_TABLE_TILE_SIZE, FP4_MLA_TOKENS_PER_BLOCK, _ceil_div
+from .packed_plan import _launch_fp4_mla_packed_plan, _PackedPlanGeometry
 
 
 @triton.jit
@@ -268,6 +269,103 @@ def populate_fp4_mla_generation_lengths(
         generation_lens,
         num_gen,
         num_gen_tokens // num_gen,
+        BLOCK=block,
+        num_warps=4,
+    )
+
+
+@triton.jit(
+    do_not_specialize=["num_tokens", "tokens_per_seq"],
+    do_not_specialize_on_alignment=["num_tokens", "tokens_per_seq"],
+)
+def _helix_spec_buffers_kernel(
+    positions_ptr,
+    local_slots_ptr,
+    kv_bounds_ptr,
+    kv_lens_ptr,
+    num_tokens,
+    tokens_per_seq,
+    tokens_per_block,
+    cp_size,
+    cp_rank,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < num_tokens
+    position = tl.load(positions_ptr + offsets, mask=mask, other=0)
+    # Rank-local prefix length of the first g global tokens: ledger page b lives
+    # on CP rank b % cp_size, so count the full ledgers plus this rank's clamped
+    # share of the partial one (mirrors KVCacheManagerV2._helix_local_len).
+    ledger = tokens_per_block * cp_size
+    rank_base = cp_rank * tokens_per_block
+    full_before = position // ledger
+    local_before = full_before * tokens_per_block + tl.minimum(
+        tl.maximum(position - full_before * ledger - rank_base, 0), tokens_per_block
+    )
+    after = position + 1
+    full_after = after // ledger
+    bound = full_after * tokens_per_block + tl.minimum(
+        tl.maximum(after - full_after * ledger - rank_base, 0), tokens_per_block
+    )
+    owned = (position // tokens_per_block) % cp_size == cp_rank
+    tl.store(local_slots_ptr + offsets, tl.where(owned, local_before, -1), mask=mask)
+    tl.store(kv_bounds_ptr + offsets, bound, mask=mask)
+    # The last token of each verify group sets its sequence's rank-local KV length.
+    last_of_seq = offsets % tokens_per_seq == tokens_per_seq - 1
+    tl.store(kv_lens_ptr + offsets // tokens_per_seq, bound, mask=mask & last_of_seq)
+
+
+def populate_helix_spec_buffers(
+    positions: torch.Tensor,
+    local_slots: torch.Tensor,
+    kv_bounds: torch.Tensor,
+    kv_lens: torch.Tensor,
+    *,
+    num_tokens: int,
+    tokens_per_seq: int,
+    tokens_per_block: int,
+    cp_size: int,
+    cp_rank: int,
+) -> None:
+    """Derive the Helix speculative per-token buffers in one launch.
+
+    For generation token ``t`` at global position ``positions[t]``:
+    ``local_slots[t]`` is its rank-local KV write slot (-1 when another CP rank
+    owns the page), ``kv_bounds[t]`` the rank-local KV entries it attends to
+    (the local length of ``position + 1``) and ``kv_lens[s]`` the bound of
+    sequence ``s``'s last token. Static shapes, safe under CUDA graph capture.
+    """
+    if num_tokens <= 0:
+        return
+    if tokens_per_seq <= 0 or num_tokens % tokens_per_seq != 0:
+        raise ValueError(
+            f"Helix verify groups must be uniform: {num_tokens} tokens for groups of "
+            f"{tokens_per_seq}."
+        )
+    if tokens_per_block <= 0 or cp_size <= 0 or not 0 <= cp_rank < cp_size:
+        raise ValueError("Helix spec buffers need a positive page size and a valid CP rank.")
+    num_seqs = num_tokens // tokens_per_seq
+    tensors = (positions, local_slots, kv_bounds, kv_lens)
+    if any(tensor.ndim != 1 or tensor.stride(0) != 1 for tensor in tensors):
+        raise ValueError("Helix spec buffers must be contiguous and one-dimensional.")
+    if any(tensor.dtype != torch.int32 for tensor in tensors):
+        raise TypeError("Helix spec buffers must use int32.")
+    if any(not tensor.is_cuda or tensor.device != positions.device for tensor in tensors):
+        raise ValueError("Helix spec buffers must be CUDA tensors on one device.")
+    if any(tensor.numel() < num_tokens for tensor in tensors[:3]) or kv_lens.numel() < num_seqs:
+        raise ValueError("Helix spec buffers are too small for the generation tokens.")
+
+    block = 256
+    _helix_spec_buffers_kernel[(triton.cdiv(num_tokens, block),)](
+        positions,
+        local_slots,
+        kv_bounds,
+        kv_lens,
+        num_tokens,
+        tokens_per_seq,
+        tokens_per_block,
+        cp_size,
+        cp_rank,
         BLOCK=block,
         num_warps=4,
     )
@@ -643,11 +741,21 @@ def _fp4_mla_generation_num_blocks_device(metadata: Any) -> torch.Tensor:
 
 
 def _fp4_mla_uniform_generation_lengths(
-    metadata: Any, num_gen_tokens: int, num_gen: int
+    metadata: Any,
+    num_gen_tokens: int,
+    num_gen: int,
+    plan_geometry: _PackedPlanGeometry | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return preallocated CUDA generation KV and append lengths."""
+    """Return preallocated CUDA generation KV and append lengths.
+
+    With ``plan_geometry`` the launch that writes the lengths also writes the
+    step's packed split plan (one CuTe DSL kernel instead of two launches), and
+    a stale plan is rewritten even when the lengths are already current.
+    """
     if num_gen <= 0 or num_gen_tokens % num_gen != 0:
         raise RuntimeError("FP4 MLA generation requires a non-empty uniform request batch.")
+    if plan_geometry is not None and plan_geometry.num_requests != num_gen:
+        raise RuntimeError("FP4 MLA packed plan geometry does not match the generation batch.")
 
     num_contexts = metadata.num_contexts
     num_seqs = metadata.num_seqs
@@ -680,20 +788,40 @@ def _fp4_mla_uniform_generation_lengths(
         and metadata.fp4_mla_state.generation_lengths_num_seqs == num_gen
         and metadata.fp4_mla_state.generation_lengths_num_contexts == num_contexts
     )
+    plan_pending = (
+        plan_geometry is not None
+        and plan_geometry.key is not None
+        and metadata.fp4_mla_state.packed_plan_key != plan_geometry.key
+    )
     if not precomputed:
-        populate_fp4_mla_generation_lengths(
-            kv_lens_gen,
-            prompt_lens_gen,
-            corrected_kv_lens[:num_gen],
-            generation_lens[:num_gen],
-            num_gen_tokens=num_gen_tokens,
-            num_gen=num_gen,
-        )
+        if plan_pending:
+            _launch_fp4_mla_packed_plan(
+                plan_geometry,
+                kv_lens_gen,
+                metadata,
+                generation_lengths=(
+                    prompt_lens_gen,
+                    corrected_kv_lens[:num_gen],
+                    generation_lens[:num_gen],
+                    num_gen_tokens // num_gen,
+                ),
+            )
+        else:
+            populate_fp4_mla_generation_lengths(
+                kv_lens_gen,
+                prompt_lens_gen,
+                corrected_kv_lens[:num_gen],
+                generation_lens[:num_gen],
+                num_gen_tokens=num_gen_tokens,
+                num_gen=num_gen,
+            )
         metadata.fp4_mla_state.generation_lengths_num_tokens = num_gen_tokens
         metadata.fp4_mla_state.generation_lengths_num_seqs = num_gen
         metadata.fp4_mla_state.generation_lengths_num_contexts = num_contexts
         if record_for_capture:
             metadata.fp4_mla_state.generation_lengths_capture_recorded = True
+    elif plan_pending:
+        _launch_fp4_mla_packed_plan(plan_geometry, corrected_kv_lens[:num_gen], metadata)
     return corrected_kv_lens[:num_gen], generation_lens[:num_gen]
 
 

@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -257,6 +258,36 @@ class ExternalCommMoEScheduler(MoEScheduler):
         return isinstance(self.moe.comm, NVLinkOneSided)
 
     # ------------------------------------------------------------------
+    # Async input quantization
+    # ------------------------------------------------------------------
+    def _should_quantize_input_async(self, x: torch.Tensor) -> bool:
+        """Whether to fork the input quantization onto the backend's aux stream.
+
+        Backends providing ``quantize_input_async`` (CuteDSL NVFP4) can quantize
+        ``x`` on an aux stream so it overlaps routing (top-k) and the backend's
+        ``moe_sort`` on the main stream; at small decode batches those
+        latency-bound kernels otherwise serialize (~25 us per layer at batch 8
+        on GB300). The fork and join add stream switches, event record/wait and
+        ``record_stream`` calls on the host, so, like
+        ``maybe_execute_in_parallel``, it only runs under multi-stream (set by
+        the CUDA graph runner) or while a CUDA graph is being captured, where
+        the host work is not replayed. Eager forwards are host-bound and
+        quantize on the main stream.
+
+        Requires that nothing modifies ``x`` before quantization (no
+        ``apply_router_weight_on_input``) and that no comm strategy decides the
+        quantize/dispatch order.
+        """
+        moe = self.moe
+        return (
+            moe.comm is None
+            and not moe.apply_router_weight_on_input
+            and not isinstance(x, Fp4QuantizedTensor)
+            and hasattr(moe.backend, "quantize_input_async")
+            and (do_multi_stream() or torch.cuda.is_current_stream_capturing())
+        )
+
+    # ------------------------------------------------------------------
     # DeepGemm workspace allocation
     # ------------------------------------------------------------------
     def _prepare_workspace_deepgemm(
@@ -407,21 +438,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
-        # Async input quantization (backends providing quantize_input_async,
-        # currently CuteDSL NVFP4): quantize x on the MoE aux stream now so it
-        # overlaps routing (top-k) and the backend's moe_sort on the main
-        # stream -- at decode batch 8 these three latency-bound kernels
-        # otherwise serialize to ~25 us per layer. Only when nothing modifies
-        # x before quantization (no apply_router_weight_on_input) and no comm
-        # strategy decides the quantize/dispatch order.
+        # Async input quantization: see _should_quantize_input_async.
         async_quant = None
         x_ready_event = None
-        if (
-            moe.comm is None
-            and not moe.apply_router_weight_on_input
-            and not isinstance(x, Fp4QuantizedTensor)
-            and hasattr(moe.backend, "quantize_input_async")
-        ):
+        if self._should_quantize_input_async(x):
             # The quantization stream joins input_ready_event itself.
             async_quant = moe.backend.quantize_input_async(x, input_ready_event)
             input_ready_event = None
@@ -1201,9 +1221,32 @@ class FusedCommMoEScheduler(MoEScheduler):
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
-        if len(outputs) == 1:
-            return outputs[0]
-        return torch.cat(outputs, dim=0)
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+        return self._as_rank_partial_if_reduced_externally(output)
+
+    def _as_rank_partial_if_reduced_externally(self, output: torch.Tensor) -> torch.Tensor:
+        """Match the external-comm output contract under attention TP (TEP).
+
+        With attention TP and ``reduce_results=False``, an external-comm
+        backend returns a rank partial that the caller all-reduces across the
+        TP group, usually together with the shared-expert partial. The fused
+        kernel instead returns the globally combined routed output on every
+        rank, so that same all-reduce would sum it ``tp_size`` times. Keep it
+        on TP rank 0 and return zeros elsewhere; the caller's all-reduce then
+        restores it exactly. Callers built with
+        ``accepts_global_routed_output=True`` compose the global output
+        themselves and receive it unchanged.
+        """
+        moe = self.moe
+        if (
+            moe.parallel_size <= 1
+            or moe.use_dp
+            or moe.reduce_results
+            or moe.accepts_global_routed_output
+            or moe.mapping.tp_rank == 0
+        ):
+            return output
+        return torch.zeros_like(output)
 
     def _strip_adp_padding(
         self,

@@ -16,17 +16,24 @@ rather than a checkpoint fact, so the targets check it at construction
 The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The
 targets are text-only: they load no vision tower and refuse image input.
+
+Under ``modeling_v2='default'`` a target that ``route`` returns is used only
+where ``enabled_by_default`` allows it: the serving roles it was measured in.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget
+from ..._router_index import DeploymentRole, NoTarget, engine_kv_cache_quant_algo, routes
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # The GPU architectures these targets are written for: the tp4 / tp8 decode
 # kernels (the tcgen05 GEMVs, the fused MoE engines, the attention megakernels
@@ -138,21 +145,19 @@ def _eagle3_one_model_or_none(spec_config: Optional[Any]) -> bool:
     )
 
 
+@routes("MiniMaxM3SparseForConditionalGeneration")
 def route(
-    pretrained_config: Any,
-    mapping: Any,
-    compute_capability: Tuple[int, int],
-    spec_config: Optional[Any],
-    kv_cache_quant_algo: Optional[Any],
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
-
-    ``kv_cache_quant_algo`` is the KV-cache algorithm the engine will run with
-    (see ``_router_index._kv_cache_quant_algo``), not the checkpoint's alone.
 
     Each target is imported where it is returned, so declining costs no import
     of modeling code.
     """
+    pretrained_config = model_config.pretrained_config
+    mapping = model_config.mapping
+    spec_config = model_config.spec_config
+    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
     text_config = getattr(pretrained_config, "text_config", None)
     shape = (
         None
@@ -269,3 +274,23 @@ def route(
         "(Rubin) with 2, 4 or 8 ranks, of tensor-parallel attention and experts, with one-model Eagle3 or no "
         "speculative decoding, and an FP8 or NVFP4 KV cache"
     )
+
+
+# The serving roles each target is enabled in under modeling_v2='default': the deployments it was measured in.
+_DEFAULT_ROLES = {
+    # GB300: the generation side of disaggregated serving.
+    "ModelingV2MiniMaxM3Nvfp4Sm103Tp4": (DeploymentRole.GENERATION,),
+    "ModelingV2MiniMaxM3Nvfp4Sm103Tp8": (DeploymentRole.GENERATION,),
+}
+
+
+def enabled_by_default(target: type, role: DeploymentRole) -> Optional[str]:
+    """Why ``target`` stays off under ``modeling_v2='default'`` for an engine in ``role``, or None when it is on.
+
+    ``auto`` and ``require`` still reach a target wherever ``route`` returns it.
+    """
+    roles = _DEFAULT_ROLES.get(target.__name__, ())
+    if role in roles:
+        return None
+    measured = " or ".join(r.value for r in roles) or "no role"
+    return f"{role.value} serving; {target.__name__} is enabled by default for {measured} serving"

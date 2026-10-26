@@ -19,8 +19,11 @@ _E4M3_MAX = 448.0
 
 def _cast_saturates() -> bool:
     """Whether this torch's E4M3 cast maps every out-of-range value, infinities included, to +-448."""
-    probe = torch.tensor([449.0, 463.0, 464.0, 1e4, float("inf"), -464.0, -float("inf")])
-    want = torch.tensor([448.0, 448.0, 448.0, 448.0, 448.0, -448.0, -448.0])
+    # An explicit device: the first import can run under a default-device context (meta while a model is built).
+    probe = torch.tensor(
+        [449.0, 463.0, 464.0, 1e4, float("inf"), -464.0, -float("inf")], device="cpu"
+    )
+    want = torch.tensor([448.0, 448.0, 448.0, 448.0, 448.0, -448.0, -448.0], device="cpu")
     return torch.equal(probe.to(torch.float8_e4m3fn).float(), want)
 
 

@@ -8,7 +8,7 @@ import pytest
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
-import tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl as cute_moe
+import tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 as cute_moe
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.activation import SwigluBiasActivation
@@ -70,7 +70,7 @@ def test_m3_swiglu_bias_resolves_to_cutedsl_on_sm107(monkeypatch) -> None:
     monkeypatch.setattr(cute_moe, "_RUBIN_DETERMINISTIC_FC2", True)
     report = _resolve(107)
     assert not report.degraded, report
-    assert impl_class_for(report) is cute_moe.CuteDslFusedMoE
+    assert impl_class_for(report) is cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl
 
 
 @pytest.mark.cpu_only
@@ -86,7 +86,7 @@ def test_swiglu_bias_declined_outside_the_deterministic_rubin_path(monkeypatch, 
         activation=_M3_ACT,
         **_SHAPE,
     )
-    verdict = cute_moe.CuteDslFusedMoE.can_implement(problem, _deployment(sm))
+    verdict = cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, _deployment(sm))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
@@ -108,4 +108,4 @@ def test_m3_create_moe_builds_cutedsl_on_this_gpu() -> None:
             layer_idx=0,
             **_SHAPE,
         )
-    assert isinstance(moe.backend, cute_moe.CuteDslFusedMoE), type(moe.backend)
+    assert isinstance(moe.backend, cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl), type(moe.backend)

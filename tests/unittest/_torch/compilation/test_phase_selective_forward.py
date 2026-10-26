@@ -35,7 +35,7 @@ def _create_compile_restricted_runner(
 ) -> DecoderRunner:
     runner = object.__new__(DecoderRunner)
     runner._config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
-    runner.model = SimpleNamespace(model=model)
+    runner._model = SimpleNamespace(model=model)
     return runner
 
 
@@ -43,7 +43,7 @@ def _create_compile_restricted_runner(
 @pytest.mark.parametrize("enabled", [False, True])
 def test_engine_passes_compile_policy_to_decoder_runner(enabled: bool) -> None:
     engine = Mock()
-    engine._compile_only_piecewise_graphs = enabled
+    engine.llm_args.torch_compile_config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
     config = PyTorchModelEngine._decoder_runner_config(engine)
     runner_type = Mock()
 
@@ -155,7 +155,7 @@ def test_decoder_runner_bypass_requires_compile_only_option() -> None:
 def test_decoder_runner_without_compile_restriction() -> None:
     runner = object.__new__(DecoderRunner)
     runner._config = SimpleNamespace(compile_only_piecewise_graphs=False)
-    runner.model = torch.nn.Identity()
+    runner._model = torch.nn.Identity()
     with runner._maybe_bypass_torch_compile(bypass=True):
         pass
 
@@ -194,20 +194,18 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
         runner = DecoderRunner(
             model,
             config,
-            input_processor=Mock(),
             model_caller=Mock(),
             mapping=Mock(),
             dist=None,
             moe_load_balancer=None,
             sparse_attention_config=None,
-            torch_compile_backend=None,
+            attention_runtime_features=Mock(),
             get_runtime_tokens_per_gen_step=Mock(),
             warmup_timer=Mock(),
             iter_states={},
             metrics={},
-            kv_cache_manager_key=Mock(),
         )
-        assert runner.model.model is model.model
+        assert runner._model.model is model.model
 
 
 def test_decoder_runner_nested_bypass_restores_after_exception() -> None:

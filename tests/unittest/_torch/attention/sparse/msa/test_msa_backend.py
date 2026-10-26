@@ -23,9 +23,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
 )
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
-    msa_backend as msa_backend_module,
-)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
     fused_write_layer_caches,
     fused_write_layer_caches_nvfp4,
@@ -44,9 +41,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_spa
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
     MiniMaxM3MsaSparseAttentionMetadata,
     MsaDecodeSpan,
-    gather_page_ranges,
-    proxy_segment_page_ranges,
-    proxy_segment_rows,
 )
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -887,9 +881,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
         msa_prefill_proxy_plan = (False, 0, 2, {}, None)
         _msa_prefill_identity = None
         msa_prefill_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
-        msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
-        # Unsegmented proxy plan: the proxy indexes the plain page table.
-        msa_proxy_page_table = msa_kv_indices
+        msa_prefill_proxy_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
         msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
@@ -1010,9 +1002,7 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
         msa_prefill_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_worst_case_max_k_tiles = 8
-        msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
-        # Unsegmented proxy plan: the proxy indexes the plain page table.
-        msa_proxy_page_table = msa_kv_indices
+        msa_prefill_proxy_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
         msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_kv_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
@@ -1071,6 +1061,7 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
     )
 
     assert result.shape == (num_tokens, 1, 16)
+    assert captured["kv_indices"] is metadata.msa_prefill_proxy_kv_indices
     assert captured["gen_token_first"] == expected_gen_first
     assert captured["ctx_rows"] == expected_ctx_rows
     # Set together with the rest of the scorer's inputs, so it says whether the
@@ -1159,9 +1150,6 @@ def test_build_kv_page_indices_matches_first_slot_of_each_page():
     row holds at its page boundaries, since both use the manager's
     tokens_per_block as the page size. Rows are ragged (0-padded block ids,
     global and non-contiguous) and one request has no KV at all."""
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
-        build_kv_page_indices,
-    )
 
     page_size = 8
     block_ids = torch.tensor(
@@ -1699,7 +1687,6 @@ def _mixed_batch_sparse_gqa_case(*, page_size, head_dim, num_kv_heads, group, to
     logical block would not pass.
     """
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
-        build_kv_page_indices,
         per_token_valid_blocks,
     )
 
@@ -2438,48 +2425,3 @@ def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
     for backing in (k_backing, v_backing, ksf_backing, vsf_backing):
         assert torch.count_nonzero(backing[0]).item() == 0
         assert torch.count_nonzero(backing[-1]).item() == 0
-
-
-@pytest.mark.parametrize(
-    "sm_version,enabled,expected",
-    [(107, True, True), (107, False, False), (103, True, False), (100, True, False)],
-)
-def test_proxy_segmented_only_on_sm107(monkeypatch, sm_version, enabled, expected):
-    """The segmented, split indexer proxy runs on SM107 only, behind its constant."""
-    monkeypatch.setattr(msa_backend_module, "get_sm_version", lambda: sm_version)
-    monkeypatch.setattr(msa_backend_module, "_SM107_PROXY_AUTO_KV_SPLITS", enabled)
-    assert msa_backend_module._proxy_segmented() is expected
-
-
-def test_proxy_segment_rows_keep_each_tokens_causal_range():
-    """Segments tile each request's query tokens in order and keep every token's key range."""
-    # A 300-token chunk over 1000 cached tokens, an empty row, and a 5-token chunk.
-    qo = torch.tensor([300, 0, 5], dtype=torch.int32)
-    kv = torch.tensor([1300, 40, 85], dtype=torch.int32)
-    off = kv - qo
-    seg_qo, seg_kv, seg_off, seg_src = proxy_segment_rows(qo, kv, off, 128)
-    assert seg_qo.tolist() == [128, 128, 44, 5]
-    assert seg_kv.tolist() == [1128, 1256, 1300, 85]
-    assert seg_off.tolist() == [1000, 1128, 1256, 80]
-    assert seg_src.tolist() == [0, 0, 0, 2]
-    assert seg_qo.dtype == seg_kv.dtype == seg_off.dtype == torch.int32
-    # Each segment sees exactly its own tokens beyond its offset (causal key range kept).
-    assert (seg_kv - seg_off).tolist() == seg_qo.tolist()
-    assert int(seg_qo.sum()) == int(qo.sum())
-
-
-def test_proxy_segment_page_table_matches_per_segment_build():
-    """The device-gathered segmented page table equals a per-segment host build."""
-    page = 128
-    qo = torch.tensor([300, 0, 5, 130], dtype=torch.int32)
-    kv = torch.tensor([1300, 40, 85, 600], dtype=torch.int32)
-    seg_qo, seg_kv, seg_off, seg_src = proxy_segment_rows(qo, kv, kv - qo, page)
-    block_ids = torch.randperm(4 * 16, dtype=torch.int32).view(4, 16)
-    flat = build_kv_page_indices(block_ids, kv, page)
-    expected = build_kv_page_indices(block_ids.index_select(0, seg_src), seg_kv, page)
-    starts, counts = proxy_segment_page_ranges(kv, seg_kv, seg_src, page)
-    total = int(counts.sum())
-    out = torch.full((total + 7,), -1, dtype=flat.dtype)
-    gather_page_ranges(flat, starts, counts, total, out)
-    assert torch.equal(out[:total], expected)
-    assert (out[total:] == -1).all()

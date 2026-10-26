@@ -100,3 +100,11 @@ def test_fp8_e4m3_saturate_takes_the_cast_only_path_here(monkeypatch) -> None:
     assert _cuda_kernels(lambda: paged_cache.fp8_e4m3_saturate(x)) == 1
     monkeypatch.setattr(paged_cache, "_CAST_SATURATES", False)
     assert _cuda_kernels(lambda: paged_cache.fp8_e4m3_saturate(x)) == 2
+
+
+@pytest.mark.parametrize("device", ["meta", "cuda"])
+def test_cast_probe_ignores_the_default_device(device) -> None:
+    """The import-time probe runs on the CPU even under a default-device context, as when the module is first
+    imported while a model is built on the meta device."""
+    with torch.device(device):
+        assert paged_cache._cast_saturates() == paged_cache._CAST_SATURATES

@@ -16,7 +16,7 @@ from _torch.moe.moe_test_utils import MoeBackendType
 from _torch.moe.quantize_utils import get_test_quant_params
 from _torch.moe.test_moe_backend import create_test_backend, run_backend_moe
 
-import tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl as cute_moe
+import tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 as cute_moe
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.utils import ActivationType

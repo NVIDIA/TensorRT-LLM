@@ -66,7 +66,7 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import MsaIndexer, cutedsl_score_runner
+from .msa_indexer import MsaIndexer, cutedsl_score_runner, segmented_proxy_plan
 
 # The short-prefill identity table is materialized with a plain copy, so the sparse prefill that follows the layer's
 # producer (which can trigger its dependents before its last Q/KV stores) never starts before those stores land.
@@ -139,29 +139,11 @@ def _fill_unused_slots(buf: torch.Tensor, start: int) -> None:
     h2d_cache.fill_tail_pool_shared(buf, start, -1)
 
 
-# SM107: run the indexer proxy (the fmha_sm100 max-score pass) as rows of at most
-# _PROXY_SEGMENT_TOKENS query tokens planned with fmha_sm100's own split-KV choice, instead of
-# one row per request and one split. The proxy writes one max score per (index head, key tile,
-# query token) and no attention output, and each token's scores depend only on that token's
-# query and its causal key range. Cutting a request's chunk into consecutive rows of the same
-# sequence and splitting their key ranges across CTAs therefore gives bitwise-identical scores,
-# while a chunk over a long cached prefix spreads across the GPU instead of a few CTAs (rows
-# longer than the 128-token query tile cannot be split at all). False keeps one row per request
-# and num_kv_splits=1.
+# SM107: an unsegmented indexer proxy plan (the fmha_sm100 max-score pass; segmented_proxy_plan
+# covers the segmented one) takes fmha_sm100's own split-KV choice instead of one split. The proxy
+# writes one max score per (index head, key tile, query token) and no attention output, so any key
+# split gives bitwise-identical scores. False keeps num_kv_splits=1.
 _SM107_PROXY_AUTO_KV_SPLITS = True
-# fmha_sm100's 128-token query tile, the largest that admits split-KV.
-_PROXY_SEGMENT_TOKENS = 128
-
-
-def _proxy_segmented() -> bool:
-    """Whether this GPU runs the prefill indexer proxy segmented and split."""
-    if _SM107_PROXY_AUTO_KV_SPLITS and get_sm_version() == 107:
-        logger.info_once(
-            "MSA indexer proxy: segmented rows with planner-chosen split-KV (SM107)",
-            key="msa_proxy_auto_kv_splits",
-        )
-        return True
-    return False
 
 
 # SM107: a proxy plan over at most _PROXY_FEW_ROWS_MAX_ROWS rows (small chunks appended to a long
@@ -179,12 +161,13 @@ def _sm_count(device_index: int) -> int:
 
 
 def proxy_kv_splits(num_rows: int, device: torch.device) -> int:
-    """num_kv_splits for a proxy plan over num_rows rows: -1 (the planner's choice) unless SM107 few-row."""
-    if (
-        not _SM107_PROXY_FEW_ROWS_KV_SPLITS
-        or get_sm_version() != 107
-        or num_rows > _PROXY_FEW_ROWS_MAX_ROWS
-    ):
+    """num_kv_splits for an unsegmented proxy plan over num_rows rows.
+
+    1 off SM107; on SM107 -1 (the planner's choice), or SM count // rows for a few-row plan.
+    """
+    if not _SM107_PROXY_AUTO_KV_SPLITS or get_sm_version() != 107:
+        return 1
+    if not _SM107_PROXY_FEW_ROWS_KV_SPLITS or num_rows > _PROXY_FEW_ROWS_MAX_ROWS:
         return -1
     splits = max(1, _sm_count(device.index or 0) // max(num_rows, 1))
     logger.info_once(
@@ -192,70 +175,6 @@ def proxy_kv_splits(num_rows: int, device: torch.device) -> int:
         key="msa_proxy_few_rows_kv_splits",
     )
     return splits
-
-
-def proxy_segment_rows(
-    qo_lens_cpu: torch.Tensor,
-    kv_lens_cpu: torch.Tensor,
-    qo_offset_cpu: torch.Tensor,
-    segment_tokens: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Cut each request's query rows into consecutive rows of at most segment_tokens.
-
-    Segment j of a request covers its query tokens [j * segment_tokens, end) and keeps the
-    causal key range those tokens see: the request's kv_len shortened by the tokens after the
-    segment, and its qo_offset advanced to the segment's first token. Requests with no query
-    tokens contribute no rows. Returns host int32 (qo_lens, kv_lens, qo_offset) and the int64
-    source request of every segment, in token order.
-    """
-    seg_qo, seg_kv, seg_off, seg_src = [], [], [], []
-    for row, (q, kv, off) in enumerate(
-        zip(qo_lens_cpu.tolist(), kv_lens_cpu.tolist(), qo_offset_cpu.tolist())
-    ):
-        for start in range(0, q, segment_tokens):
-            end = min(start + segment_tokens, q)
-            seg_qo.append(end - start)
-            seg_kv.append(kv - (q - end))
-            seg_off.append(off + start)
-            seg_src.append(row)
-    as_i32 = lambda values: torch.tensor(values, dtype=torch.int32)  # noqa: E731
-    return (
-        as_i32(seg_qo),
-        as_i32(seg_kv),
-        as_i32(seg_off),
-        torch.tensor(seg_src, dtype=torch.long),
-    )
-
-
-def proxy_segment_page_ranges(
-    kv_lens_cpu: torch.Tensor, seg_kv: torch.Tensor, seg_src: torch.Tensor, page_size: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Locate each segment's pages in the flat per-request page table (build_kv_page_indices).
-
-    Request r's pages start at the sum of the earlier requests' page counts, and a segment
-    needs the first ceil(seg_kv / page_size) of them. Returns host int64 (starts, counts).
-    """
-    pages = ((kv_lens_cpu.to(torch.long) + (page_size - 1)) // page_size).clamp_(min=0)
-    request_start = torch.cumsum(pages, 0) - pages
-    counts = (seg_kv.to(torch.long) + (page_size - 1)) // page_size
-    return request_start.index_select(0, seg_src), counts
-
-
-def gather_page_ranges(
-    flat: torch.Tensor, starts: torch.Tensor, counts: torch.Tensor, total: int, out: torch.Tensor
-) -> None:
-    """Write the concatenation of flat[start : start + count] for every range to out[:total].
-
-    Runs on flat's device with no host synchronization: the index is expanded on the device
-    from the per-range starts and counts, so only those two short vectors are copied over.
-    """
-    device = flat.device
-    starts = maybe_pin_memory(starts).to(device, non_blocking=True)
-    counts = maybe_pin_memory(counts).to(device, non_blocking=True)
-    range_first = torch.cumsum(counts, 0) - counts
-    index = torch.repeat_interleave(starts - range_first, counts, output_size=total)
-    index += torch.arange(total, device=device)
-    torch.index_select(flat, 0, index, out=out[:total])
 
 
 class MsaDecodeSpan(NamedTuple):
@@ -314,12 +233,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         dict[int, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]
     ] = None
     msa_kv_indices: Optional[torch.Tensor] = None
-    # The flattened page table of this step's segmented proxy rows (see proxy_segment_rows):
-    # one copy of a request's page prefix per segment. Staged only on steps whose proxy plan
-    # is segmented; _msa_proxy_segments holds those rows for _build_step_plans.
-    msa_proxy_kv_indices: Optional[torch.Tensor] = None
-    _msa_proxy_segments: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
-    _msa_proxy_segmented_plan: bool = False
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
     # Decode-step preparation the model opted into (RuntimeHooks.msa).
@@ -368,6 +281,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # never captured. Built once per step in prepare() and reused by every
     # layer.
     _msa_prefill_proxy_plan: Optional[tuple] = None
+    _msa_prefill_proxy_kv_indices: Optional[torch.Tensor] = None
     _msa_prefill_gqa_plan: Optional[tuple] = None
     _msa_prefill_dense_plan: Optional[tuple] = None
     # Per-token valid-block count for the prefill-side indexer proxy. It is
@@ -457,16 +371,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # whatever rows the CuTe DSL scorer did not take. See _msa_attn_plan_rows
     # and _msa_proxy_plan_rows.
     @property
-    def msa_proxy_page_table(self) -> Optional[torch.Tensor]:
-        """The flattened page table the indexer proxy plan of this step indexes."""
-        if self._msa_proxy_segmented_plan:
-            return self.msa_proxy_kv_indices
-        return self.msa_kv_indices
-
-    @property
     def msa_prefill_proxy_plan(self) -> Optional[tuple]:
         """Prebuilt indexer proxy plan for this step's fmha_sm100 rows."""
         return self._msa_prefill_proxy_plan
+
+    @property
+    def msa_prefill_proxy_kv_indices(self) -> Optional[torch.Tensor]:
+        """Flattened page table msa_prefill_proxy_plan reads; see segmented_proxy_plan."""
+        kv_indices = self._msa_prefill_proxy_kv_indices
+        return self.msa_kv_indices if kv_indices is None else kv_indices
 
     @property
     def msa_prefill_gqa_plan(self) -> Optional[tuple]:
@@ -640,17 +553,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        if _proxy_segmented():
-            # Every segment repeats its request's page prefix: at most one segment per
-            # _PROXY_SEGMENT_TOKENS new tokens plus one partial segment per request.
-            max_segments = -(-max_num_tokens // _PROXY_SEGMENT_TOKENS) + max_num_sequences
-            self.msa_proxy_kv_indices = self.get_empty(
-                buffers,
-                (max_segments * max_blocks_per_seq,),
-                cache_name="msa_proxy_kv_indices",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
         self.msa_block_table = self.get_empty(
             buffers,
             (max_num_sequences, max_blocks_per_seq),
@@ -1183,6 +1085,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         per-step tensors.
         """
         self._msa_prefill_proxy_plan = None
+        self._msa_prefill_proxy_kv_indices = None
         self._msa_prefill_gqa_plan = None
         self._msa_prefill_dense_plan = None
         self._msa_prefill_n_valid_blocks = None
@@ -1266,30 +1169,29 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
         # branch; output_maxscore feeds the indexer's top-k block selection.
         # A short pure-prefill step selects every valid block, so it needs none.
-        proxy_kwargs = dict(num_qo_heads=num_index_heads, num_kv_heads=1, output_maxscore=True)
-        segments = None if short_prefill else self._msa_proxy_segments
-        self._msa_proxy_segmented_plan = segments is not None
-        if segments is not None:
-            seg_qo, seg_kv, seg_off = segments
-            self._msa_prefill_proxy_plan = fmha_sm100.fmha_sm100_plan(
-                seg_qo,
-                seg_kv,
-                qo_offset=seg_off,
-                page_size=page_size,
-                num_kv_splits=proxy_kv_splits(int(seg_qo.shape[0]), _cache_device(self)),
-                causal=True,
-                **proxy_kwargs,
-            )
+        # Otherwise its rows are a batch prefix, so their pages prefix msa_kv_indices.
+        proxy_rows = None if short_prefill else self._msa_proxy_plan_rows()
+        segmented = proxy_rows is not None and segmented_proxy_plan(
+            fmha_sm100,
+            qo_lens_cpu[: proxy_rows[1]],
+            qo_offset_cpu[: proxy_rows[1]],
+            num_index_heads=num_index_heads,
+            page_size=page_size,
+            kv_indices=self.msa_kv_indices,
+        )
+        if segmented:
+            self._msa_prefill_proxy_plan, self._msa_prefill_proxy_kv_indices = segmented
         else:
-            proxy_rows = None if short_prefill else self._msa_proxy_plan_rows()
             self._msa_prefill_proxy_plan = plan_for(
                 proxy_rows,
                 num_kv_splits=(
-                    proxy_kv_splits(proxy_rows[1] - proxy_rows[0], _cache_device(self))
-                    if proxy_rows is not None and self.msa_proxy_kv_indices is not None
-                    else 1
+                    1
+                    if proxy_rows is None
+                    else proxy_kv_splits(proxy_rows[1] - proxy_rows[0], _cache_device(self))
                 ),
-                **proxy_kwargs,
+                num_qo_heads=num_index_heads,
+                num_kv_heads=1,
+                output_maxscore=True,
             )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
@@ -1327,47 +1229,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 table = torch.where(ar[None, :] < dev_buf[:total_q, None], ar[None, :], -1)
                 self._msa_prefill_identity = table
 
-    def _stage_proxy_segments(self, page_size: int, needs_flat_page_table: bool) -> None:
-        """Stage the segmented proxy rows and their page table, where they change anything.
-
-        Only on SM107 (see _SM107_PROXY_AUTO_KV_SPLITS) and only when some proxy row has more
-        query tokens than one segment: otherwise the segments are the requests themselves and
-        the plain page table already serves the proxy.
-
-        The segmented page table is gathered on the device from msa_kv_indices, which the
-        caller has just staged. Segmented steps have context rows, so they are never a replay
-        of a captured decode graph and no step-input pack defers that copy past this gather.
-        """
-        self._msa_proxy_segments = None
-        if self.msa_proxy_kv_indices is None or not needs_flat_page_table:
-            return
-        rows = self._msa_proxy_plan_rows()
-        if rows is None:
-            return
-        first, last = rows
-        qo_lens = self.msa_qo_lens_cpu[first:last]
-        if int(qo_lens.max()) <= _PROXY_SEGMENT_TOKENS:
-            return
-        # Proxy rows are always a batch prefix, so they index msa_kv_indices from its start.
-        assert first == 0, "the indexer proxy covers a prefix of the batch"
-        kv_lens = self.msa_kv_lens_cpu[first:last]
-        seg_qo, seg_kv, seg_off, seg_src = proxy_segment_rows(
-            qo_lens, kv_lens, self.msa_qo_offset_cpu[first:last], _PROXY_SEGMENT_TOKENS
-        )
-        starts, counts = proxy_segment_page_ranges(kv_lens, seg_kv, seg_src, page_size)
-        total = int(counts.sum())
-        if total > self.msa_proxy_kv_indices.shape[0]:
-            raise ValueError(
-                f"MSA proxy kv_indices buffer ({self.msa_proxy_kv_indices.shape[0]}) is "
-                f"smaller than the step's segmented page count ({total})."
-            )
-        gather_page_ranges(self.msa_kv_indices, starts, counts, total, self.msa_proxy_kv_indices)
-        self._msa_proxy_segments = (
-            maybe_pin_memory(seg_qo),
-            maybe_pin_memory(seg_kv),
-            maybe_pin_memory(seg_off),
-        )
-
     def _build_msa_fields(self) -> None:
         """Populate the MSA cache-write buffers for this step.
 
@@ -1377,7 +1238,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         decoding the inputs for on_update_kv_lens are staged as well.
         """
         self._msa_fields_ready = False
-        self._msa_proxy_segments = None
         # Set again below once this step's live slots are staged; until then the forward fills nothing.
         self._msa_tail_start = None
         if not self._msa_buffers_ready:
@@ -1464,7 +1324,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             _fill_unused_slots(self.msa_out_cache_loc, total_new_tokens)
         if kv_indices is not None:
             step_inputs.copy_(self.msa_kv_indices[: int(kv_indices.shape[0])], kv_indices)
-        self._stage_proxy_segments(page_size, needs_flat_page_table)
 
         # 2-D page table and per-request length for the decode kernels,
         # from the same host block ids the flat page table was built from.
@@ -1953,7 +1812,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             idx_q_view,
             idx_k_cache,
             idx_sm_scale=idx_sm_scale,
-            kv_indices=metadata.msa_proxy_page_table,
+            kv_indices=metadata.msa_prefill_proxy_kv_indices,
             qo_lens_cpu=metadata.msa_qo_lens_cpu,
             kv_lens_cpu=metadata.msa_kv_lens_cpu,
             qo_offset_cpu=metadata.msa_qo_offset_cpu,

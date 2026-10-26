@@ -32,14 +32,23 @@ from pydantic import ValidationError
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    _RESOLVED_MODES,
+    DISAGG_ROLE_ENV,
+    DeploymentRole,
     ModelingV2Mode,
+    NoTarget,
+    deployment_role,
     modeling_v2_resolve,
     resolved_mode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import (
+    routing as qwen4_exp_routing,
 )
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
@@ -177,7 +186,8 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
 
 @pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
 def test_off_resolves_nothing(mode):
-    """The default must be indistinguishable from modeling_v2 not existing.
+    """The default must be indistinguishable from modeling_v2 not existing for an architecture whose routing module
+    enables nothing by default.
 
     Leaving the argument alone and an explicit "off" have to behave
     identically: the common case is that nobody has heard of this package.
@@ -451,6 +461,71 @@ def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
         _llm_args("yes")
 
 
+def test_the_default_mode_is_default():
+    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "default"
+
+
+def test_no_target_is_a_value_error():
+    """A refusal is the ValueError ``require`` has always raised, so callers that catch ValueError still do."""
+    assert issubclass(NoTarget, ValueError)
+
+
+@pytest.mark.parametrize(
+    ("transceiver", "env", "role"),
+    [
+        (False, None, DeploymentRole.AGGREGATED),
+        (False, "generation", DeploymentRole.AGGREGATED),
+        (True, "generation", DeploymentRole.GENERATION),
+        (True, "gen0", DeploymentRole.GENERATION),
+        (True, "context", DeploymentRole.CONTEXT),
+        (True, "ctx1", DeploymentRole.CONTEXT),
+        (True, None, DeploymentRole.UNKNOWN),
+        (True, "coordinator", DeploymentRole.UNKNOWN),
+    ],
+)
+def test_deployment_role(monkeypatch, transceiver, env, role):
+    """No cache transceiver is aggregated serving; a disaggregated worker's side is the launcher's role variable."""
+    if env is None:
+        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(DISAGG_ROLE_ENV, env)
+    kwargs = dict(cache_transceiver_config=CacheTransceiverConfig()) if transceiver else {}
+    assert deployment_role(_llm_args(**kwargs)) is role
+
+
+class _RefusingTarget:
+    """A target that refuses its runtime at construction."""
+
+    def __init__(self, config):
+        raise NoTarget("this runtime is not the one the target is written for")
+
+
+class _BuiltIn:
+    def __init__(self, config):
+        self.config = config
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_a_refusal_at_construction_falls_back_unless_required(monkeypatch, mode):
+    """A target's construction-time refusal builds the built-in implementation under ``auto`` (the mode
+    ``default`` records) and is the error under ``require``."""
+    import tensorrt_llm._torch.models.modeling_auto as modeling_auto
+
+    monkeypatch.setattr(modeling_auto, "get_registered_model_class", lambda arch: _BuiltIn)
+    monkeypatch.setitem(_RESOLVED_MODES, _RefusingTarget, ModelingV2Mode(mode))
+    config = replace(_model_config(_gpt_oss_config()), modeling_v2_target=_RefusingTarget)
+    config.extra_attrs["nvfp4_gemm_allowed_backends"] = ["cutlass"]
+    if mode == "require":
+        with pytest.raises(NoTarget, match="not the one the target is written for"):
+            AutoModelForCausalLM.from_config(config)
+        return
+    model = AutoModelForCausalLM.from_config(config)
+    assert isinstance(model, _BuiltIn)
+    assert model.config.modeling_v2_target is None
+    # The loader's settings reach the built-in model.
+    assert model.config.extra_attrs["nvfp4_gemm_allowed_backends"] == ["cutlass"]
+
+
 # --- speculative decoding is an identity criterion ------------------------------
 
 
@@ -632,13 +707,17 @@ def test_minimax_m3_route_picks_the_target_by_architecture_and_width(
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
     monkeypatch.setattr(routing, "_quant_algo", lambda _config: QuantAlgo.MIXED_PRECISION)
 
-    pretrained = types.SimpleNamespace(text_config=_m3_text_config())
-    mapping = Mapping(**mapping_kwargs)
+    model_config = types.SimpleNamespace(
+        pretrained_config=types.SimpleNamespace(text_config=_m3_text_config()),
+        mapping=Mapping(**mapping_kwargs),
+        spec_config=None,
+    )
+    llm_args = _m3_llm_args("auto", "nvfp4")
     if target is None:
         with pytest.raises(NoTarget, match="sm107 \\(Rubin\\) with 2, 4 or 8 ranks"):
-            routing.route(pretrained, mapping, capability, None, QuantAlgo.NVFP4)
+            routing.route(model_config, llm_args, capability)
         return
-    resolved = routing.route(pretrained, mapping, capability, None, QuantAlgo.NVFP4)
+    resolved = routing.route(model_config, llm_args, capability)
     directory, name = target.split(".")
     assert resolved.__module__ == f"{_M3_TARGETS}.{directory}.modeling"
     assert resolved.__name__ == name
@@ -659,11 +738,13 @@ def test_minimax_m3_route_takes_the_released_checkpoint(monkeypatch, spec, tp):
         else SimpleNamespace(spec_dec_mode=SimpleNamespace(name="EAGLE3_ONE_MODEL"))
     )
     target = routing.route(
-        SimpleNamespace(text_config=_m3_text_config()),
-        Mapping(world_size=tp, tp_size=tp, moe_tp_size=tp, moe_ep_size=1),
+        SimpleNamespace(
+            pretrained_config=SimpleNamespace(text_config=_m3_text_config()),
+            mapping=Mapping(world_size=tp, tp_size=tp, moe_tp_size=tp, moe_ep_size=1),
+            spec_config=spec_config,
+        ),
+        _m3_llm_args("auto", "nvfp4"),
         routing._SM,
-        spec_config,
-        QuantAlgo.NVFP4,
     )
     assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
 
@@ -707,11 +788,13 @@ def test_minimax_m3_route_declines_another_rope_base_or_sparse_layout(monkeypatc
     assert routing._layout_mismatch(text_config) == reason
     with pytest.raises(NoTarget, match=reason.split(";")[0]):
         routing.route(
-            SimpleNamespace(text_config=text_config),
-            Mapping(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1),
+            SimpleNamespace(
+                pretrained_config=SimpleNamespace(text_config=text_config),
+                mapping=Mapping(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1),
+                spec_config=None,
+            ),
+            _m3_llm_args("auto", "nvfp4"),
             routing._SM,
-            None,
-            QuantAlgo.NVFP4,
         )
 
 
@@ -740,11 +823,13 @@ def test_minimax_m3_rubin_route_declines_another_layout(monkeypatch, mapping_kwa
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     with pytest.raises(NoTarget, match="sparse attention layers other than 3-59|rope_theta"):
         routing.route(
-            SimpleNamespace(text_config=_m3_text_config(**layout)),
-            Mapping(**mapping_kwargs),
+            SimpleNamespace(
+                pretrained_config=SimpleNamespace(text_config=_m3_text_config(**layout)),
+                mapping=Mapping(**mapping_kwargs),
+                spec_config=None,
+            ),
+            _m3_llm_args("auto", "nvfp4"),
             routing._SM_RUBIN,
-            None,
-            QuantAlgo.NVFP4,
         )
 
 
@@ -869,6 +954,61 @@ def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
     assert target.__name__ == "ModelingV2MiniMaxM3Nvfp4Sm103Tp4"
 
 
+def _m3_default_args(monkeypatch, role, kv_dtype="nvfp4"):
+    """modeling_v2 left at its default, for an engine serving ``role``."""
+    if role == "aggregated":
+        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
+        return _llm_args("default", kv_cache_config=dict(dtype=kv_dtype))
+    if role is None:
+        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(DISAGG_ROLE_ENV, role)
+    return _llm_args(
+        "default",
+        kv_cache_config=dict(dtype=kv_dtype),
+        cache_transceiver_config=CacheTransceiverConfig(),
+    )
+
+
+@pytest.mark.usefixtures("_minimax_m3_sm")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_minimax_m3_default_enables_the_generation_side(monkeypatch, tp):
+    """With modeling_v2 left alone, the GB300 targets serve the generation side of disaggregated serving, the
+    deployment they were measured in, and record ``auto`` (so a later refusal falls back)."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    config = _m3_resolve_config(_m3_sparse(), None, tp)
+    target = modeling_v2_resolve(config, _m3_default_args(monkeypatch, "generation"))
+    assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
+    assert resolved_mode(target) is ModelingV2Mode.AUTO
+
+
+@pytest.mark.usefixtures("_minimax_m3_sm")
+@pytest.mark.parametrize(
+    "role", ["aggregated", "context", None], ids=["aggregated", "context", "unknown"]
+)
+def test_minimax_m3_default_keeps_other_roles_on_the_builtin_model(monkeypatch, role):
+    """Aggregated serving, the context side and a disaggregated worker of unknown side build the built-in model
+    by default; ``auto`` still takes the target there."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    config = _m3_resolve_config(_m3_sparse(), None)
+    assert modeling_v2_resolve(config, _m3_default_args(monkeypatch, role)) is None
+    assert modeling_v2_resolve(config, _m3_llm_args("auto", "nvfp4")) is not None
+
+
+@pytest.mark.usefixtures("_minimax_m3_sm")
+def test_minimax_m3_default_falls_back_where_route_declines(monkeypatch):
+    """By default a deployment no target fits (here a BF16 KV cache) builds the built-in model, as under auto."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)
+    assert modeling_v2_resolve(config, _m3_default_args(monkeypatch, "generation", "auto")) is None
+
+
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
 
 _QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.modeling."
@@ -884,13 +1024,23 @@ def _qwen4_exp_sm(_on_sm10x):
 @pytest.mark.usefixtures("_qwen4_exp_sm")
 @pytest.mark.parametrize(
     "spec_config",
-    [None, MTPDecodingConfig(max_draft_len=1), MTPDecodingConfig(max_draft_len=3)],
-    ids=["no-spec", "mtp1", "mtp3"],
+    [
+        None,
+        MTPDecodingConfig(max_draft_len=1),
+        MTPDecodingConfig(max_draft_len=3),
+        MTPDecodingConfig(max_draft_len=7),
+    ],
+    ids=["no-spec", "mtp1", "mtp3", "mtp7"],
 )
-def test_qwen4_exp_tp1_matches(spec_config):
+def test_qwen4_exp_tp1_matches(monkeypatch, spec_config):
+    # mtp7 needs the GDN cached replay, which TRTLLM_USE_GDN_REPLAY=0 turns off.
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
     config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
-    target = modeling_v2_resolve(config, _llm_args("require"))
-    assert _qualified(target).startswith(_QWEN4_EXP_TARGET)
+    # The recurrent-state cache at either dtype the target serves; `auto` is bf16 here.
+    for dtype in ("float32", "bfloat16", "auto"):
+        kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype=dtype)
+        target = modeling_v2_resolve(config, _llm_args("require", kv_cache_config=kv_cache_config))
+        assert _qualified(target).startswith(_QWEN4_EXP_TARGET), dtype
 
 
 def _mtp(max_draft_len=3, **attributes):
@@ -907,14 +1057,14 @@ def _mtp(max_draft_len=3, **attributes):
     "spec_config",
     [
         _NGRAM,
-        MTPDecodingConfig(max_draft_len=4),
+        MTPDecodingConfig(max_draft_len=8),
         MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True),
         _mtp(max_total_draft_tokens=5),
         _mtp(num_nextn_predict_layers=2),
     ],
     ids=[
         "ngram",
-        "draft4",
+        "draft8",
         "vanilla-mtp",
         "max-total-draft",
         "two-predictors",
@@ -941,9 +1091,177 @@ def test_qwen4_exp_on_two_ranks_does_not_match():
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
-def test_qwen4_exp_with_an_fp8_kv_cache_does_not_match():
+def test_qwen4_exp_with_an_fp8_ds_mla_kv_cache_does_not_match():
+    """fp8_ds_mla is FP8 to the loader but selects the packed sparse-MLA cache layout."""
     config = _model_config(_qwen4_exp_config())
-    args = dict(kv_cache_config=KvCacheConfig(dtype="fp8"))
+    args = dict(kv_cache_config=KvCacheConfig(dtype="fp8_ds_mla"))
     assert modeling_v2_resolve(config, _llm_args("auto", **args)) is None
     with pytest.raises(ValueError, match="KV cache"):
         modeling_v2_resolve(config, _llm_args("require", **args))
+
+
+# --- qwen4_exp: engine choices the constructor would refuse -----------------------
+
+
+def _declined(config, llm_args_kwargs=None, match=None):
+    """``auto`` falls back to the built-in model and ``require`` says why."""
+    kwargs = llm_args_kwargs or {}
+    assert modeling_v2_resolve(config, _llm_args("auto", **kwargs)) is None
+    with pytest.raises(ValueError, match=match):
+        modeling_v2_resolve(config, _llm_args("require", **kwargs))
+
+
+def _claimed(config, llm_args_kwargs=None):
+    target = modeling_v2_resolve(config, _llm_args("require", **(llm_args_kwargs or {})))
+    assert _qualified(target).startswith(_QWEN4_EXP_TARGET)
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("algo", ["fp8", "nvfp4"])
+def test_qwen4_exp_quantized_kv_cache_dtypes_match(algo):
+    _claimed(_model_config(_qwen4_exp_config()), dict(kv_cache_config=KvCacheConfig(dtype=algo)))
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("algo", [QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
+def test_qwen4_exp_other_kv_cache_algorithms_are_declined(algo):
+    choices = qwen4_exp_routing.engine_choices(
+        _model_config(_qwen4_exp_config()), _llm_args("auto")
+    )
+    with pytest.raises(NoTarget, match="KV cache"):
+        qwen4_exp_routing._check_engine(None, algo, choices)
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_piecewise_prefill_cuda_graph_falls_back():
+    config = _model_config(_qwen4_exp_config())
+    _declined(config, dict(prefill_cuda_graph_backend="piecewise"), match="piecewise")
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("backend", ["disabled", "breakable"])
+def test_qwen4_exp_matches_without_or_with_the_breakable_prefill_cuda_graph(backend):
+    _claimed(
+        _model_config(_qwen4_exp_config()),
+        dict(prefill_cuda_graph_backend=backend),
+    )
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("backend", ["CUTLASS", "TRITON", "DEEPGEMM", "VANILLA"])
+def test_qwen4_exp_unimplemented_moe_backend_falls_back(backend):
+    config = replace(_model_config(_qwen4_exp_config()), moe_backend_requested=backend)
+    _declined(config, match="moe_config.backend")
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("backend", ["AUTO", "TRTLLM", "CUTEDSL"])
+def test_qwen4_exp_implemented_moe_backend_matches(backend):
+    _claimed(replace(_model_config(_qwen4_exp_config()), moe_backend_requested=backend))
+
+
+@pytest.mark.parametrize(
+    "spec_kwargs",
+    [
+        dict(max_concurrency=8),
+        dict(draft_len_schedule={4: 3, 8: 1}),
+        dict(acceptance_rate_threshold=0.5),
+    ],
+    ids=["max-concurrency", "draft-len-schedule", "acceptance-rate"],
+)
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_runtime_draft_length_falls_back(spec_kwargs):
+    """The verify step runs at one width; a draft length that changes at runtime
+    would trip the width assert in the first reduced step."""
+    spec = MTPDecodingConfig(max_draft_len=3, **spec_kwargs)
+    _declined(_model_config(_qwen4_exp_config(), spec_config=spec), match="draft length")
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("max_draft_len", [4, 7])
+def test_qwen4_exp_draft_beyond_three_needs_the_cached_replay(monkeypatch, max_draft_len):
+    """The legacy per-step recurrent states are certified at up to three drafted tokens and
+    hold one fp32 state per verify row."""
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(
+        _qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=max_draft_len)
+    )
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float32")
+    _declined(config, dict(kv_cache_config=kv_cache_config), match="TRTLLM_USE_GDN_REPLAY=0")
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY")
+    _claimed(config, dict(kv_cache_config=kv_cache_config))
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_legacy_verify_matches_up_to_three_drafted_tokens(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
+    _claimed(config, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32")))
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("max_draft_len", [4, 7])
+def test_qwen4_exp_cutedsl_declines_drafts_beyond_three(monkeypatch, max_draft_len):
+    """The CuteDSL expert entries capture up to 128 rows (32 requests of 4 verify rows)."""
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float32")
+    spec = MTPDecodingConfig(max_draft_len=max_draft_len)
+    cutedsl = replace(
+        _model_config(_qwen4_exp_config(), spec_config=spec), moe_backend_requested="CUTEDSL"
+    )
+    _declined(cutedsl, dict(kv_cache_config=kv_cache_config), match="CUTEDSL")
+    _claimed(
+        _model_config(_qwen4_exp_config(), spec_config=spec), dict(kv_cache_config=kv_cache_config)
+    )
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_cutedsl_matches_up_to_three_drafted_tokens(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    spec = MTPDecodingConfig(max_draft_len=3)
+    cutedsl = replace(
+        _model_config(_qwen4_exp_config(), spec_config=spec), moe_backend_requested="CUTEDSL"
+    )
+    _claimed(cutedsl, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32")))
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16", "auto"])
+def test_qwen4_exp_mtp_matches_a_float32_or_bfloat16_state_cache(monkeypatch, dtype):
+    """GDN cached replay runs on either checkpoint dtype; `auto` resolves to bf16 here."""
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
+    _claimed(config, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype=dtype)))
+
+
+@pytest.mark.parametrize(
+    "spec_config", [None, MTPDecodingConfig(max_draft_len=3)], ids=["no-spec", "mtp3"]
+)
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_declines_a_float16_state_cache(monkeypatch, spec_config):
+    """The engine's replay gate accepts fp16; the target's pool contract does not."""
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float16")
+    _declined(config, dict(kv_cache_config=kv_cache_config), match="recurrent-state cache")
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_mtp_on_a_float16_state_cache_declines_with_replay_off(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
+    kv_cache_config = KvCacheConfig(mamba_ssm_cache_dtype="float16")
+    _declined(config, dict(kv_cache_config=kv_cache_config), match="recurrent-state cache")
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_mtp_on_a_bf16_state_cache_matches_with_replay_off(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
+    _claimed(config)
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_no_speculation_matches_the_default_state_cache(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    _claimed(_model_config(_qwen4_exp_config()))

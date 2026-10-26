@@ -16,6 +16,9 @@ import asyncio
 import os
 from typing import Callable, Optional
 
+from fastapi import HTTPException
+
+from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
@@ -29,20 +32,67 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     DisaggregatedParams,
     DisaggScheduleStyle,
+    ModelList,
+    PromptTokensDetails,
+    ResponsesRequest,
+    ResponsesResponse,
     UCompletionRequest,
     UCompletionResponse,
+    UsageInfo,
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
     done_generator,
+    responses_done_generator,
 )
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
 
 # Finish reasons for which a GEN handoff is still pending; any other reason means
 # the CTX request already completed and the disagg KV-cache handoff was never set up.
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
+
+
+def _ctx_handoff_slots(response: UCompletionResponse) -> list:
+    """The parts of a context response that carry the KV-cache handoff.
+
+    ``choices`` for completions and chat; a Responses response carries it at the
+    top level. Each exposes ``disaggregated_params`` and ``finish_reason``.
+    """
+    if isinstance(response, ResponsesResponse):
+        return [response]
+    return list(response.choices)
+
+
+def _ctx_usage_info(response: UCompletionResponse) -> Optional[UsageInfo]:
+    """The context phase's usage as the ``UsageInfo`` that ``ctx_usage`` expects.
+
+    The Responses API reports ``ResponseUsage``; its cached count is one only
+    the context phase can measure.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None or isinstance(usage, UsageInfo):
+        return usage
+    cached = getattr(usage, "input_tokens_details", None)
+    return UsageInfo(
+        prompt_tokens=usage.input_tokens,
+        completion_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=getattr(cached, "cached_tokens", 0) or 0
+        ),
+    )
+
+
+def _drop_ctx_handoff(response: UCompletionResponse) -> None:
+    """Strip the handoff from a context response that goes to the client."""
+    for slot in _ctx_handoff_slots(response):
+        slot.disaggregated_params = None
+    if isinstance(response, ResponsesResponse):
+        response.prompt_token_ids = None
+        response.prompt_token_ids_b64 = None
+        response.finish_reason = None
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -119,6 +169,23 @@ class OpenAIDisaggregatedService(OpenAIService):
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
+    async def _next_ctx_server(self) -> str:
+        """A context worker, round-robin, for requests the proxy cannot serve."""
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        servers = self._ctx_router.servers
+        if not servers:
+            raise RuntimeError("No context servers are available")
+        server = servers[self._count_tokens_rr_counter % len(servers)]
+        self._count_tokens_rr_counter += 1
+        return server
+
+    async def get_model(self) -> ModelList:
+        """Report the model as a worker serves it; the proxy holds none."""
+        return await self._ctx_client.get_json(
+            "v1/models", ModelList, await self._next_ctx_server()
+        )
+
     async def anthropic_count_tokens(
         self, request: AnthropicCountTokensRequest
     ) -> AnthropicCountTokensResponse:
@@ -128,25 +195,49 @@ class OpenAIDisaggregatedService(OpenAIService):
         to happen on a worker. Context workers are the ones that tokenize
         prompts, so the count they return is the one that will actually be used.
         """
-        if not await self.is_ready():
-            raise RuntimeError("Cluster is not ready")
-        servers = self._ctx_router.servers
-        if not servers:
-            raise RuntimeError("No context servers are available")
-        server = servers[self._count_tokens_rr_counter % len(servers)]
-        self._count_tokens_rr_counter += 1
         return await self._ctx_client.post_json(
             "v1/messages/count_tokens",
             request,
             AnthropicCountTokensResponse,
-            server,
+            await self._next_ctx_server(),
         )
+
+    async def openai_responses(
+        self, request: ResponsesRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+
+        # Stored responses are per worker and unreachable through this proxy.
+        if request.previous_response_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "'previous_response_id' is not supported on a disaggregated "
+                    "server: responses are stored per worker and this request "
+                    "may not reach the worker that holds it. Send the prior "
+                    "turns in 'input' instead."
+                ),
+            )
+        if "store" in request.model_fields_set and request.store:
+            logger.warning_once(
+                "'store' is ignored on a disaggregated server; nothing is persisted.",
+                key="disagg_responses_store_ignored",
+            )
+        request.store = False
+        # The generation worker must consume the prompt the context worker
+        # prefilled, so only the context response may supply prompt ids.
+        request.prompt_token_ids = None
+        request.prompt_token_ids_b64 = None
+
+        return await self._send_disagg_request(request, hooks)
 
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
         # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
 
+        arrival_time = self._get_arrival_time(hooks)
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -179,7 +270,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                     ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
                 await self._verify_ctx_response(ctx_response)
-                ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
+                ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
+                    0
+                ].disaggregated_params
                 if ctx_response_disagg_params.disagg_request_id is not None:
                     disagg_request_id = ctx_response_disagg_params.disagg_request_id
                     if hooks:
@@ -204,6 +297,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id
                 )
                 gen_reservation_id = disagg_request_id
+            self._stamp_orig_elapsed(gen_req, arrival_time)
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
             )
@@ -216,17 +310,37 @@ class OpenAIDisaggregatedService(OpenAIService):
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator
+                if isinstance(ctx_response, ResponsesResponse):
+                    # Responses has no "[DONE]"; replay the finished response.
+                    return responses_done_generator(ctx_response)
                 return done_generator()
             return ctx_response
 
+    @staticmethod
+    def _get_arrival_time(hooks: Optional[ResponseHooks]) -> float:
+        """The HTTP middleware's arrival stamp, else now, on its global steady clock."""
+        arrival_time = getattr(hooks, "request_arrival_time", None)
+        if isinstance(arrival_time, (int, float)) and arrival_time > 0:
+            return float(arrival_time)
+        return get_global_steady_clock_now_in_seconds()
+
+    @staticmethod
+    def _stamp_orig_elapsed(gen_req: UCompletionRequest, arrival_time: float) -> None:
+        """A duration rather than a timestamp, so no cross-host clock sync is needed."""
+        params = gen_req.disaggregated_params
+        if params is None:
+            return
+        params.orig_elapsed_s = max(0.0, get_global_steady_clock_now_in_seconds() - arrival_time)
+
     def _need_gen(self, response: UCompletionResponse) -> bool:
         if response:
-            params = response.choices[0].disaggregated_params
+            slot = _ctx_handoff_slots(response)[0]
+            params = slot.disaggregated_params
             if params is not None and params.remote_tail_start is not None:
                 return True
-        if response and response.choices[0].finish_reason not in _GEN_PENDING_FINISH_REASONS:
-            del response.choices[0].disaggregated_params
-            return False
+            if slot.finish_reason not in _GEN_PENDING_FINISH_REASONS:
+                _drop_ctx_handoff(response)
+                return False
         return True
 
     def _get_ctx_request(
@@ -263,14 +377,14 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
         if ctx_response:
-            request.disaggregated_params = ctx_response.choices[0].disaggregated_params
+            request.disaggregated_params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
-            request.disaggregated_params.ctx_usage = ctx_response.usage
+            request.disaggregated_params.ctx_usage = _ctx_usage_info(ctx_response)
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
-            elif isinstance(request, ChatCompletionRequest):
+            elif isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
                 # Relay the base64 token-id string verbatim (no int-list
                 # materialization on the orchestrator loop), else the int array.
                 if ctx_response.prompt_token_ids_b64 is not None:
@@ -284,6 +398,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 # for harmony/multimodal workers (model type is fixed per deploy).
                 if (
                     self._strip_gen_message_history
+                    and isinstance(request, ChatCompletionRequest)
                     and request.messages
                     and len(request.messages) > 1
                 ):
@@ -393,7 +508,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
-            for idx, choice in enumerate(ctx_response.choices):
+            for idx, choice in enumerate(_ctx_handoff_slots(ctx_response)):
                 if choice.disaggregated_params is None:
                     raise ValueError(
                         f"Context server choice {idx} did not return disaggregated params."
@@ -449,6 +564,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             ctx_server_info=ctx_server_info,
         )
         self._strip_gen_subagent_affinity(gen_req)
+        # No orig_elapsed_s before the context phase: GEN admission keeps it FCFS.
 
         if request.stream and need_ctx:
             # For streaming gen_first requests, the gen client returns a lazy
