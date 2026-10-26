@@ -30,12 +30,11 @@ if TYPE_CHECKING:
     from ._layout import ManagerLayout
 
 
-def slots_per_fetch(layout: ManagerLayout, tokens_per_fetch: int) -> dict[int, int]:
-    """Slots per device pool group that any whole-block range of at most ``tokens_per_fetch`` tokens can
-    need: ``ceil(tokens_per_fetch / tpb)`` per layer group, with a window at most its sink blocks plus
-    ``ceil(window / tpb)``. ``ValueError`` if ``tokens_per_fetch < 1``, ``TypeError`` if not an int."""
+def slots_per_fetch(layout: ManagerLayout, guaranteed_fetch_tokens: int) -> dict[int, int]:
+    """Slots per device pool group any whole-block range of at most ``guaranteed_fetch_tokens``
+    tokens can need; ``ValueError`` if that is below 1, ``TypeError`` if it is not an int."""
     tpb = int(layout.tokens_per_block)
-    target = -(-_integer("tokens_per_fetch", tokens_per_fetch) // tpb)
+    target = -(-_integer("guaranteed_fetch_tokens", guaranteed_fetch_tokens) // tpb)
     slots: dict[int, int] = {}
     for lg, group in enumerate(layout.pool_group_of):
         blocks = target
@@ -49,24 +48,23 @@ def slots_per_fetch(layout: ManagerLayout, tokens_per_fetch: int) -> dict[int, i
 
 
 def slot_counts(layout: ManagerLayout, options: StagingOptions) -> dict[int, int]:
-    """Slots per device pool group: ``planned_fetches`` fetches, or ``max_bytes`` split by each group's
-    share of one fetch and rounded down to whole slots. ``ValueError`` if ``max_bytes`` is below
-    one fetch, so every group holds at least one fetch's slots."""
-    slots = slots_per_fetch(layout, options.tokens_per_fetch)
+    """Slots per device pool group: ``capacity_in_fetches`` fetches, or ``max_bytes`` split by each
+    group's share of one fetch in whole slots; ``ValueError`` for ``max_bytes`` below a fetch."""
+    slots = slots_per_fetch(layout, options.guaranteed_fetch_tokens)
     fetch_bytes_by_pool_group = {g: slots[g] * int(layout.page_bytes[g]) for g in slots}
     bytes_per_fetch = sum(fetch_bytes_by_pool_group.values())
     if bytes_per_fetch < 1:
         raise ValueError("the KV cache manager has no pages to stage")
-    nbytes = options.planned_fetches * bytes_per_fetch
+    nbytes = options.capacity_in_fetches * bytes_per_fetch
     if options.max_bytes is not None:
         if options.max_bytes < bytes_per_fetch:
             raise ValueError(
-                f"max_bytes of {options.max_bytes} is below one fetch of {options.tokens_per_fetch} "
+                f"max_bytes of {options.max_bytes} is below one fetch of {options.guaranteed_fetch_tokens} "
                 f"tokens, which needs {bytes_per_fetch} bytes"
             )
         nbytes = min(nbytes, options.max_bytes)
     # Each group's share of the bytes is its share of one fetch, so a cap keeps every group's
-    # slots of one fetch; uncapped, a group gets exactly planned_fetches times its slots.
+    # slots of one fetch; uncapped, a group gets exactly capacity_in_fetches times its slots.
     return {
         g: (nbytes * fetch_bytes_by_pool_group[g] // bytes_per_fetch) // int(layout.page_bytes[g])
         for g in slots
@@ -148,10 +146,8 @@ class SlotQueue:
         return self._num_slots[group]
 
     def check_fits_capacity(self, counts: Mapping[int, int]) -> None:
-        """Validate total capacity, not current free runs or queue position; queue nothing.
-
-        ``ValueError`` for an unknown group or more slots than a group holds.
-        """
+        """Validate total capacity without queueing; free runs and queue position are ignored.
+        Raise ValueError for an unknown group or a count exceeding its capacity."""
         self._checked_counts(counts)
 
     def enqueue(self, counts: Mapping[int, int]) -> int:
@@ -189,7 +185,6 @@ class SlotQueue:
     def give_back(self, runs: SlotRuns) -> None:
         """Return one lease's slots, all or none. ``ValueError`` for a run not held (freed twice or
         never granted)."""
-        # Every run is checked before any is returned, so a bad one returns none.
         for g, (start, count) in runs.by_pool_group.items():
             alloc = self._allocators.get(g)
             if alloc is None:
