@@ -390,13 +390,18 @@ def test_multiple_overlap():
     )
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
     overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
+    # CP rank 1 of 2 holds the odd logical pages, which the peer's CP ranks 1
+    # and 3 of 4 hold (round-robin pages), on TP ranks 2-3 and PP ranks 1-2.
+    ranks = [25, 27, 29, 31, 41, 43, 45, 47]
     expected_overlap = PeerOverlap(
         overlap_pp_size=2,
         overlap_tp_size=2,
         overlap_cp_size=2,
         duplicate_head_factor=1,
         peer_duplicate_head_factor=2,
-        ranks=[26, 27, 30, 31, 42, 43, 46, 47],
+        ranks=ranks,
+        rank_wide_ranks=ranks,
+        uniform_writers=False,
     )
     assert overlap == expected_overlap
 

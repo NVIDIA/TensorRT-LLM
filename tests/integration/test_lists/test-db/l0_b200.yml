@@ -301,6 +301,7 @@ l0_b200:
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
   - unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_retains_configured_number_of_conversation_turns
   - unittest/_torch/executor/kv_cache/test_kvcm2_integration.py::test_helix_retention_uses_rank_local_ranges
+  - unittest/_torch/executor/kv_cache/test_kv_cache_owner_allocation.py -k "not coherent and not diverges"
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_capacity_only_connector_accepts_multigroup_retention[kv_cache_manager_v2]

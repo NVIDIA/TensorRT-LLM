@@ -315,6 +315,7 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         num_kv_heads_per_layer=[1, 1],
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
         get_disagg_role_layouts=lambda: {},
+        get_disagg_owner_layouts=lambda: None,
     )
 
 

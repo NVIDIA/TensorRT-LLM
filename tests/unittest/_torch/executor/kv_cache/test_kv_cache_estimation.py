@@ -405,7 +405,9 @@ def _make_creator(
     c._speculative_config = None
     c._dummy_reqs = dummy_reqs
 
-    c._mapping = Mock(enable_attention_dp=enable_attention_dp, tp_size=tp_size, cp_config={})
+    c._mapping = Mock(
+        enable_attention_dp=enable_attention_dp, tp_size=tp_size, cp_size=1, cp_config={}
+    )
 
     c._llm_args = Mock(disable_overlap_scheduler=True)
 

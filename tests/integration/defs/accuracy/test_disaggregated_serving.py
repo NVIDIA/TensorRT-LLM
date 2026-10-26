@@ -1650,8 +1650,11 @@ class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
     DRAFT_PATH = f"{llm_models_root()}/Qwen3-8B-DFlash-b16"
     MAX_DRAFT_LEN = 15
 
-    @pytest.mark.skip_less_device(2)
-    def test_gsm8k_1p1d_unified_draft_kv(self):
+    def _run_unified_draft_kv(self,
+                              test_key,
+                              ctx_parallel=None,
+                              gen_parallel=None,
+                              gen_instances=1):
         """DFlash draft KV travels with the target KV from ctx to gen.
 
         The drafter's layers share the target's KV cache manager, so the
@@ -1686,9 +1689,14 @@ class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
             },
             "speculative_config": speculative_config,
         }
-        ctx_server_config = {**common_server_config, "cuda_graph_config": None}
+        ctx_server_config = {
+            **common_server_config,
+            **(ctx_parallel or {}),
+            "cuda_graph_config": None,
+        }
         gen_server_config = {
             **common_server_config,
+            **(gen_parallel or {}),
             "cuda_graph_config": {
                 "max_batch_size": 16,
                 "enable_padding": True,
@@ -1704,7 +1712,7 @@ class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1
+                "num_instances": gen_instances
             },
         }
         with launch_disaggregated_llm(
@@ -1724,11 +1732,23 @@ class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
             # Drafting from an empty prompt context costs ~17% acceptance
             # length on this model, well below the 95% floor.
             acceptance_length = compute_disagg_acceptance_length(llm.serve_url)
-            print(f"[AL] test_gsm8k_1p1d_unified_draft_kv "
+            print(f"[AL] {test_key} "
                   f"acceptance_length = {acceptance_length:.3f}")
-            assert_acceptance_length(
-                "TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv",
-                acceptance_length)
+            assert_acceptance_length(test_key, acceptance_length)
+
+    @pytest.mark.skip_less_device(2)
+    def test_gsm8k_1p1d_unified_draft_kv(self):
+        self._run_unified_draft_kv(
+            "TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv")
+
+    @pytest.mark.skip_less_device(8)
+    def test_gsm8k_tp4_to_2x_tp2_unified_draft_kv(self):
+        """Each generation rank takes its heads of both models from two context ranks."""
+        self._run_unified_draft_kv(
+            "TestQwen3_8BDFlash::test_gsm8k_tp4_to_2x_tp2_unified_draft_kv",
+            ctx_parallel={"tensor_parallel_size": 4},
+            gen_parallel={"tensor_parallel_size": 2},
+            gen_instances=2)
 
 
 @skip_pre_blackwell

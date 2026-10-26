@@ -186,6 +186,11 @@ def _make_projection_sender() -> Sender:
     }
     registrar.peer_extractor.return_value = extractor
     registrar.get_kv_map.return_value = mapper
+    # Every view follows the rank-wide mappings, so pages split only under rank-wide CP.
+    registrar.view_rank_infos.return_value = {}
+    registrar.splits_pages.side_effect = lambda peer: (
+        peer.cp_size > 1 or registrar.self_rank_info.cp_size > 1
+    )
 
     sender = Sender.__new__(Sender)
     sender._registrar = registrar
@@ -303,7 +308,9 @@ def _projection_task_for(start_block: int, end_block: int) -> KVSendTask:
 def test_context_parallelism_is_refused_only_for_a_piece_short_of_the_prompt():
     """The guard only fires for a piece short of the whole prompt; a sole whole-prompt piece passes."""
     sender = _make_projection_sender()
+    # Both sides on CP rank 0 of 2 list the same pages, so their tables pair entry by entry.
     sender._registrar.self_rank_info = SimpleNamespace(cp_size=2, cp_rank=0)
+    sender._registrar.get_peer_rank_info.return_value.cp_size = 2
 
     sender._build_kv_write_meta(_projection_task_for(0, 8), _make_projection_req_info())
     with pytest.raises(ValueError, match="context parallelism"):

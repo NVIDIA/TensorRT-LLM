@@ -129,6 +129,10 @@ TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv:
   ref_al: 4.062
   min_al: 3.859
 
+TestQwen3_8BDFlash::test_gsm8k_tp4_to_2x_tp2_unified_draft_kv:
+  ref_al: 4.072
+  min_al: 3.869
+
 # Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::
 # test_mtp1_gsm8k_and_acceptance. Keyed by target and variant for the same
 # reason as the ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry above.
