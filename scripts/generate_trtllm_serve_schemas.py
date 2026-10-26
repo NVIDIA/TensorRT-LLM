@@ -190,6 +190,12 @@ def generate_serve_schema() -> dict:
             "then": {"properties": {"copy_mode": {"enum": ["batched", None]}}},
         },
     ]
+    # Mirror DwdpConfig._validate_expert_partition(): both fields 0 (or absent), or both positive.
+    pair = ("num_experts_per_worker", "num_prefetch_experts")
+    dwdp["anyOf"] = [
+        {"properties": {name: {"const": 0} for name in pair}},
+        {"properties": {name: {"minimum": 1} for name in pair}, "required": list(pair)},
+    ]
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

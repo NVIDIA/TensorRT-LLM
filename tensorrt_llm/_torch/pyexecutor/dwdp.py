@@ -44,7 +44,7 @@ from __future__ import annotations
 import traceback
 import weakref
 from types import TracebackType
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -55,6 +55,7 @@ from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.modules.dwdp import (
     DenseDWDP,
     DWDPWeightManager,
+    ExpertPartition,
     StoreDwdpGroup,
     dwdp_global_rank,
     fabric_gather,
@@ -295,18 +296,10 @@ class DwdpManager:
         self.num_groups = config.num_groups
         self.num_prefetch_experts = config.num_prefetch_experts
 
-        # Per-rank expert range. ``num_prefetch_experts`` is the rank-to-rank
-        # stride and ``num_experts_per_worker`` is the (uniform across ranks)
-        # storage chunk size. When the user requests redundancy
-        # (``num_prefetch_experts < num_experts_per_worker``) consecutive
-        # ranks' ranges overlap; when the partition is non-uniform (e.g.
-        # dwdp_size = 3 over 256 experts) the tail rank's
-        # ``[start, end)`` runs past ``num_experts`` and is later capped at
-        # weight-load time. ``_init_dwdp_expert_layout`` reads
-        # ``start_expert_id`` to install the correct ``slot_start`` /
-        # ``slot_end`` on every fused MoE backend before ``create_weights``.
-        self.start_expert_id = self.dwdp_rank * self.num_prefetch_experts
-        self.end_expert_id = self.start_expert_id + self.num_experts_per_worker
+        # One expert partition per expert count: ``expert_partition`` computes
+        # it when a MoE layer of that count is built. DwdpConfig accepts the
+        # two partition fields only when both are 0 or both are positive.
+        self._expert_partitions: Dict[int, ExpertPartition] = {}
 
         # The expert transfer: an explicit copy_mode overrides contention_opt and
         # TRTLLM_DWDP_PREFETCH_GATHER (a copy_mode gather without its op raises
@@ -482,6 +475,47 @@ class DwdpManager:
             raise cleanup_error.with_traceback(cleanup_traceback)
 
     # ------------------------------------------------------------------
+    # Expert partition
+    # ------------------------------------------------------------------
+
+    def expert_partition(self, num_experts: int) -> ExpertPartition:
+        """The expert partition of the DWDP group for MoE layers of ``num_experts`` routed experts.
+
+        Computed from ``DwdpConfig`` with ``ExpertPartition.from_config``, which ``setup_dwdp``
+        repeats and checks across the group; pure (no collective) and cached per expert count.
+        ``MoE._init_dwdp_expert_layout`` sizes every MoE layer DWDP manages from it before
+        ``create_weights``.
+
+        Raises:
+            ValueError: The config gives no valid partition of ``num_experts`` experts, raised
+                the same way on every rank while the model is built.
+        """
+        partition = self._expert_partitions.get(num_experts)
+        if partition is not None:
+            return partition
+        partition = ExpertPartition.from_config(
+            num_experts=num_experts,
+            dwdp_size=self.dwdp_size,
+            num_experts_per_worker=self.num_experts_per_worker,
+            num_prefetch_experts=self.num_prefetch_experts,
+        )
+        self._expert_partitions[num_experts] = partition
+        start, end = partition.range_of(self.dwdp_rank)
+        logger.info(
+            f"[DwdpManager] DWDP rank {self.dwdp_rank} of {self.dwdp_size} stores routed experts "
+            f"[{start}, {end}): {end - start} of {num_experts} ({partition.describe()})"
+        )
+        return partition
+
+    def local_expert_range(self, num_experts: int) -> Tuple[int, int]:
+        """``(start, end)`` of the routed experts this rank stores, of ``num_experts`` per layer.
+
+        Raises:
+            ValueError: As ``expert_partition``.
+        """
+        return self.expert_partition(num_experts).range_of(self.dwdp_rank)
+
+    # ------------------------------------------------------------------
     # Layer registration (SSOT) + setup
     # ------------------------------------------------------------------
 
@@ -550,11 +584,18 @@ class DwdpManager:
                 raised before any expert or dense setup work. Also raised
                 when the weight manager does not run on the copy stream and
                 transfer dense DWDP was set up with, and when dense DWDP
-                moved an expert weight the transport takes over.
+                moved an expert weight the transport takes over.  The expert
+                setup raises it on every rank after the same collective when
+                the DWDP group disagrees on the expert partition, when another
+                rank failed in the transport or in a later step before the
+                vote, or when the ranks' small expert parameters do not fit
+                together; a failure in the backend fixup after the vote raises
+                on that rank only.
             DenseSetupError: Dense DWDP setup failed, or was requested on a
                 model without dense roots.
-            PrefetchRingMemoryError: The expert prefetch ring does not fit in
-                the free device memory.
+            PrefetchRingMemoryError: This rank's expert prefetch ring does not
+                fit in the free device memory (the other ranks raise a
+                RuntimeError naming this rank).
         """
         if self.dwdp_group is None:
             raise RuntimeError("DwdpManager.setup() called after cleanup()")

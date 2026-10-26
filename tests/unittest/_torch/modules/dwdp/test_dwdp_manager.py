@@ -16,9 +16,13 @@
 
 DwdpManager is a thin lifecycle layer that:
 - creates a DWDP MPI sub-communicator
+- resolves the expert partition each MoE backend is sized from
 - owns the Single Source of Truth for registered MoE layer indices
 - forwards runtime calls to the DWDPWeightManager produced by setup_dwdp
 - owns the attached DenseDwdpManager: sets dense DWDP up before setup_dwdp
+
+Also here: ConfigurableMoE's decision, once its backend exists, whether DWDP manages a MoE layer;
+a layer it does not manage keeps every expert.
 
 These tests mock out COMM_WORLD / dwdp_global_rank / setup_dwdp so the full
 lifecycle can be exercised on a single CPU without MPI / CUDA / MNNVL.
@@ -43,7 +47,12 @@ from tensorrt_llm._torch.modules.dwdp.dense.manager import (
     set_global_dense_dwdp_manager,
 )
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode, DenseSetupError
+from tensorrt_llm._torch.modules.dwdp.specs import ExpertPartition
 from tensorrt_llm._torch.modules.dwdp.weight_buffer import PrefetchRingMemoryError
+from tensorrt_llm._torch.moe.fused_moe import configurable_moe
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE
+from tensorrt_llm._torch.moe.fused_moe.routing import DefaultMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import (
     DwdpManager,
     _AttachedTransfer,
@@ -138,7 +147,9 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
 
         mock_comm_world.Create_group.assert_not_called()
 
-    def test_init_stores_fields(self, mock_comm_world, _rank, _setup):
+    def test_init_stores_fields(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, _setup: MagicMock
+    ) -> None:
         sub_comm = MagicMock()
         mock_comm_world.Create_group.return_value = sub_comm
         mock_comm_world.group.Incl.return_value = MagicMock()
@@ -154,13 +165,12 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         self.assertEqual(mgr._registered_layers, [])
         self.assertIs(mgr.dwdp_group, sub_comm)
         self.assertIsNone(mgr._weight_manager)
-        # start_expert_id / end_expert_id derive from
-        # num_prefetch_experts (stride) and num_experts_per_worker (size).
-        # rank=0: start=0, end=4.
-        self.assertEqual(mgr.start_expert_id, 0)
-        self.assertEqual(mgr.end_expert_id, 4)
+        # rank=0 of a uniform 4/4 partition of 8 experts: [0, 4).
+        self.assertEqual(mgr.local_expert_range(8), (0, 4))
 
-    def test_init_expert_range_uniform(self, mock_comm_world, _rank, _setup):
+    def test_init_expert_range_uniform(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, _setup: MagicMock
+    ) -> None:
         """Uniform partition (size == stride): each rank's range is a clean slice."""
         _configure_mock_comm_world(mock_comm_world)
         # dwdp_rank=1 with stride=4 -> start=4, end=4+4=8.
@@ -169,10 +179,11 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             dist=MagicMock(spec=MPIDist),
             mapping=_make_mapping(dwdp_size=2, dwdp_rank=1),
         )
-        self.assertEqual(mgr.start_expert_id, 4)
-        self.assertEqual(mgr.end_expert_id, 8)
+        self.assertEqual(mgr.local_expert_range(8), (4, 8))
 
-    def test_init_expert_range_redundancy(self, mock_comm_world, _rank, _setup):
+    def test_init_expert_range_redundancy(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, _setup: MagicMock
+    ) -> None:
         """Redundancy partition (size > stride): adjacent ranges overlap."""
         _configure_mock_comm_world(mock_comm_world)
         redundant_config = DwdpConfig(
@@ -181,17 +192,65 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             num_experts_per_worker=6,  # storage size
             num_prefetch_experts=4,  # stride < size -> 2-expert overlap
         )
-        # rank=0: [0, 6). rank=1 would be [4, 10) -> 2-expert overlap [4, 6).
+        # rank=0: [0, 6). rank=1: [4, 10) -> 2-expert overlap [4, 6).
         mgr = DwdpManager(
             config=redundant_config,
             dist=MagicMock(spec=MPIDist),
             mapping=_make_mapping(dwdp_size=2, dwdp_rank=0),
         )
-        self.assertEqual(mgr.start_expert_id, 0)
-        self.assertEqual(mgr.end_expert_id, 6)
+        self.assertEqual(mgr.expert_partition(10).peer_ranges, [(0, 6), (4, 10)])
         # Stored config knobs match what's plumbed into setup_dwdp.
         self.assertEqual(mgr.num_experts_per_worker, 6)
         self.assertEqual(mgr.num_prefetch_experts, 4)
+
+    # ------------------------------------------------------------------
+    # Expert partition: DwdpConfig -> the range each MoE backend is sized from
+    # ------------------------------------------------------------------
+
+    def _k3_manager(
+        self, mock_comm_world: MagicMock, size: int, stride: int, dwdp_rank: int
+    ) -> DwdpManager:
+        """DWDP rank ``dwdp_rank`` of 12 with the given partition fields."""
+        _configure_mock_comm_world(mock_comm_world)
+        config = DwdpConfig(dwdp_size=12, num_experts_per_worker=size, num_prefetch_experts=stride)
+        mapping = _make_mapping(dwdp_size=12, dwdp_rank=dwdp_rank)
+        return DwdpManager(config=config, dist=MagicMock(spec=MPIDist), mapping=mapping)
+
+    def test_config_refuses_a_half_set_or_negative_partition(self, *_mocks: MagicMock) -> None:
+        for size, stride in ((0, 74), (82, 0), (-1, -1), (-1, 4)):
+            with self.subTest(size=size, stride=stride), self.assertRaises(ValueError):
+                DwdpConfig(dwdp_size=12, num_experts_per_worker=size, num_prefetch_experts=stride)
+
+    def test_balanced_partition_is_resolved_per_expert_count(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, _setup: MagicMock
+    ) -> None:
+        mgr = self._k3_manager(mock_comm_world, 0, 0, dwdp_rank=8)
+        self.assertEqual(mgr.local_expert_range(896), (600, 674))  # 8 x 75 + 4 x 74
+        self.assertIs(mgr.expert_partition(896), mgr.expert_partition(896))
+        self.assertEqual(mgr.local_expert_range(72), (48, 54))
+
+    def test_moe_backend_is_sized_from_the_rank_range(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, _setup: MagicMock
+    ) -> None:
+        """``MoE._init_dwdp_expert_layout`` sizes a backend with exactly its rank's rows."""
+        # balanced, capped (the last rank stores 71), redundant
+        cases = (((0, 0), 8, (600, 674)), ((75, 75), 11, (825, 896)), ((82, 74), 11, (814, 896)))
+        for (size, stride), rank, (start, end) in cases:
+            with self.subTest(size=size, stride=stride):
+                set_global_dwdp_manager(self._k3_manager(mock_comm_world, size, stride, rank))
+                moe = SimpleNamespace(num_experts=896, layer_load_balancer=None)
+                MoE._init_dwdp_expert_layout(moe)
+                set_global_dwdp_manager(None)
+
+                self.assertEqual(
+                    (moe.num_slots, moe.expert_size_per_partition, moe.slot_start, moe.slot_end),
+                    (896, end - start, start, end),
+                )
+                self.assertEqual(moe.initial_local_expert_ids, list(range(start, end)))
+                self.assertEqual(moe.initial_global_assignments, list(range(896)))
+        set_global_dwdp_manager(self._k3_manager(mock_comm_world, 82, 74, dwdp_rank=0))
+        with self.assertRaises(ValueError):  # 82/74 does not fit 900 experts
+            MoE._init_dwdp_expert_layout(SimpleNamespace(num_experts=900, layer_load_balancer=None))
 
     # ------------------------------------------------------------------
     # num_groups topology validation (was a dead schema field through 1fbc0d49)
@@ -816,6 +875,140 @@ class TestDwdpManagerDenseSetup(unittest.TestCase):
                     "layer's dense copy" in message
                 ]
                 self.assertEqual(len(logged), int(slots > 2 and committed), messages)
+
+
+class _Backend:
+    """A MoE backend as ``ConfigurableMoE._decide_dwdp`` reads it."""
+
+    def __init__(self, *, supports_dwdp: bool, uses_locality_domain: bool, nvfp4: bool) -> None:
+        self.capabilities = SimpleNamespace(supports_dwdp=supports_dwdp)
+        self.uses_locality_domain = uses_locality_domain
+        quant_mode = SimpleNamespace(has_nvfp4=lambda: nvfp4)
+        self.quant_config = SimpleNamespace(layer_quant_mode=quant_mode)
+
+
+class _Layer:
+    """The ConfigurableMoE state ``_decide_dwdp`` reads and writes, with ``MoE.__init__``'s
+    layout under ``moe_ep_size`` 1: every expert."""
+
+    _decide_dwdp = ConfigurableMoE._decide_dwdp
+    _init_dwdp_expert_layout = MoE._init_dwdp_expert_layout
+
+    NUM_EXPERTS, LAYER_IDX = 896, 5
+
+    def __init__(
+        self, *, supports_dwdp: bool = True, uses_locality_domain: bool = False, nvfp4: bool = True
+    ) -> None:
+        self.backend = _Backend(
+            supports_dwdp=supports_dwdp, uses_locality_domain=uses_locality_domain, nvfp4=nvfp4
+        )
+        self.model_config = SimpleNamespace(quant_config=None)
+        self.layer_idx, self.num_experts = self.LAYER_IDX, self.NUM_EXPERTS
+        self.layer_load_balancer = None
+        self.num_slots = self.expert_size_per_partition = self.slot_end = self.NUM_EXPERTS
+        self.slot_start = 0
+        self.initial_local_expert_ids = list(range(self.NUM_EXPERTS))
+        self.initial_global_assignments = list(range(self.NUM_EXPERTS))
+
+    def layout(self) -> tuple[int, int, int, int]:
+        """``(num_slots, expert_size_per_partition, slot_start, slot_end)``."""
+        return self.num_slots, self.expert_size_per_partition, self.slot_start, self.slot_end
+
+
+class _MinimalMoE(MoE):
+    """A MoE layer without kernels, to run ``MoE.__init__`` alone."""
+
+    @classmethod
+    def can_implement(cls, p: object, d: object) -> None:
+        raise NotImplementedError
+
+    def quantize_input(self, x: torch.Tensor, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    def run_moe(self, ctx: object, *, workspace: object = None) -> None:
+        raise NotImplementedError
+
+    def forward_impl(self, x: torch.Tensor, router_logits: torch.Tensor, **kwargs: object) -> None:
+        raise NotImplementedError
+
+
+class TestConfigurableMoEDwdpDecision(unittest.TestCase):
+    """Whether DWDP manages a MoE layer is decided once its backend exists.
+
+    A layer it manages is sized to this rank's range of the expert partition and registered; any
+    other layer keeps every expert, with one warning naming the layer and the reason.
+    """
+
+    def setUp(self) -> None:
+        _clear_global_managers()
+        self.addCleanup(_clear_global_managers)
+        # DWDP rank 8 of a balanced DWDP12: 8 x 75 + 4 x 74 experts.
+        self.manager = MagicMock(dwdp_rank=8)
+        self.manager.expert_partition.return_value = ExpertPartition.balanced(
+            num_experts=_Layer.NUM_EXPERTS, dwdp_size=12
+        )
+        self.warning = _start(self, patch.object(configurable_moe.logger, "warning"))
+
+    def test_an_eligible_layer_is_sized_to_its_range_and_registered(self) -> None:
+        set_global_dwdp_manager(self.manager)
+        layer = _Layer()
+
+        layer._decide_dwdp()
+
+        self.assertTrue(layer.enable_dwdp)
+        self.assertEqual(layer.layout(), (896, 74, 600, 674))
+        self.assertEqual(layer.initial_local_expert_ids, list(range(600, 674)))
+        self.manager.add_layer.assert_called_once_with(layer_idx=_Layer.LAYER_IDX)
+        self.warning.assert_not_called()
+
+    def test_a_layer_dwdp_cannot_manage_keeps_every_expert(self) -> None:
+        set_global_dwdp_manager(self.manager)
+        cases = {
+            "does not support DWDP": dict(supports_dwdp=False),
+            "uses locality domains": dict(uses_locality_domain=True),
+            "is not NVFP4-quantized": dict(nvfp4=False),  # e.g. a BF16 MTP layer
+        }
+        for reason, backend in cases.items():
+            with self.subTest(reason):
+                self.manager.reset_mock()
+                self.warning.reset_mock()
+                layer = _Layer(**backend)
+
+                layer._decide_dwdp()
+
+                self.assertFalse(layer.enable_dwdp)
+                self.assertEqual(layer.layout(), (896, 896, 0, 896))
+                self.manager.add_layer.assert_not_called()
+                self.manager.expert_partition.assert_not_called()
+                self.warning.assert_called_once()
+                message = self.warning.call_args.args[0]
+                self.assertIn("MoE layer 5 (_Backend) keeps all 896 experts on every rank", message)
+                self.assertIn(reason, message)
+
+    def test_without_a_dwdp_manager_nothing_changes(self) -> None:
+        layer = _Layer()
+
+        layer._decide_dwdp()
+
+        self.assertFalse(layer.enable_dwdp)
+        self.assertEqual(layer.layout(), (896, 896, 0, 896))
+        self.warning.assert_not_called()
+
+    def test_moe_init_alone_keeps_every_expert(self) -> None:
+        """Only ConfigurableMoE's decision sizes a layer: a backend built by ``MoE.__init__``,
+        wrapped or not, keeps the layout of ``moe_ep_size`` 1."""
+        set_global_dwdp_manager(self.manager)
+
+        moe = _MinimalMoE(
+            routing_method=DefaultMoeRoutingMethod(top_k=2),
+            num_experts=8,
+            hidden_size=16,
+            intermediate_size=32,
+            init_load_balancer=False,
+        )
+
+        self.assertEqual((moe.expert_size_per_partition, moe.slot_start, moe.slot_end), (8, 0, 8))
+        self.manager.expert_partition.assert_not_called()
 
 
 if __name__ == "__main__":

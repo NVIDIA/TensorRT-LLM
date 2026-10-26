@@ -1907,6 +1907,32 @@
           }
         }
       ],
+      "anyOf": [
+        {
+          "properties": {
+            "num_experts_per_worker": {
+              "const": 0
+            },
+            "num_prefetch_experts": {
+              "const": 0
+            }
+          }
+        },
+        {
+          "properties": {
+            "num_experts_per_worker": {
+              "minimum": 1
+            },
+            "num_prefetch_experts": {
+              "minimum": 1
+            }
+          },
+          "required": [
+            "num_experts_per_worker",
+            "num_prefetch_experts"
+          ]
+        }
+      ],
       "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).\n\nDense DWDP (enable_dense) also shards the replicated dense weights of the\nMoE decoder layers, over the DWDP group or, without expert DWDP\n(enable_experts=False), over the attention-DP ranks of one instance.",
       "properties": {
         "contention_opt": {
@@ -1956,7 +1982,8 @@
         },
         "num_experts_per_worker": {
           "default": 0,
-          "description": "The number of experts per worker.",
+          "description": "The number of routed experts each worker stores in a strided expert partition, where worker r stores the experts from r * num_prefetch_experts. Leave both fields at 0 (the default) for the balanced partition: every worker stores floor or ceil of num_experts / dwdp_size contiguous experts, and no expert is stored twice.",
+          "minimum": 0,
           "title": "Num Experts Per Worker",
           "type": "integer"
         },
@@ -1968,7 +1995,8 @@
         },
         "num_prefetch_experts": {
           "default": 0,
-          "description": "The number of prefetch experts per worker.",
+          "description": "The stride between the first experts of consecutive workers in a strided expert partition (not a number of prefetched experts). Equal to num_experts_per_worker for disjoint ranges, smaller for ranges that overlap. Leave both fields at 0 for the balanced partition.",
+          "minimum": 0,
           "title": "Num Prefetch Experts",
           "type": "integer"
         },

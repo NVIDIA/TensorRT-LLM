@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -97,12 +97,14 @@ class MappingBase:
         # DWDP override: when dwdp_size > 1, decouple the fused-MoE EP layout
         # from DWDP. Setting ``moe_ep_size = 1`` makes the fused MoE backend
         # see a single (full) expert table; the DWDP-specific layout
-        # (``slot_start`` / ``slot_end`` / ``expert_size_per_partition``) is
-        # installed by ``_init_dwdp_expert_layout`` at the end of
-        # ``MoE.__init__`` using ``DwdpManager.start_expert_id`` and
-        # ``num_experts_per_worker``. This is what unlocks dwdp_size values
-        # that do not divide ``num_experts`` evenly (e.g. dwdp_size = 3, 5)
-        # and the IPC-era redundancy mode where adjacent peer ranges overlap.
+        # (``slot_start`` / ``slot_end`` / ``expert_size_per_partition``) of a
+        # MoE layer DWDP manages is installed by ``_init_dwdp_expert_layout``,
+        # which ``ConfigurableMoE`` calls once its backend exists, from this
+        # rank's range of the DWDP group's ``ExpertPartition``
+        # (``DwdpManager.expert_partition``): the balanced
+        # partition of any dwdp_size (e.g. 8 x 75 + 4 x 74 experts over
+        # dwdp_size = 12), a strided one with a capped last range, or a
+        # redundant one whose adjacent ranges overlap.
         # Record whether the caller explicitly requested a MoE TP/EP split
         # (the -1 sentinels mean "auto"). Model code (e.g. Kimi K3) uses this
         # to distinguish an explicit ``moe_tensor_parallel_size`` /

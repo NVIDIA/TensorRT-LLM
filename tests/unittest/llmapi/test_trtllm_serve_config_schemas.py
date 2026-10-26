@@ -146,6 +146,13 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {"dwdp_config": {"num_experts_per_worker": 0, "num_prefetch_experts": 0}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"dwdp_config": {"num_experts_per_worker": -1}}, False),
+        (generator.SERVE_SCHEMA, {"dwdp_config": {"num_prefetch_experts": -1}}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
@@ -157,6 +164,11 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             True,
         ),
         (generator.DISAGG_SCHEMA, {"context_servers": {"env_overrides": {"FLAG": 1}}}, True),
+        (
+            generator.DISAGG_SCHEMA,
+            {"context_servers": {"dwdp_config": {"dwdp_size": 12, "num_experts_per_worker": -1}}},
+            False,
+        ),
         (
             generator.DISAGG_SCHEMA,
             {"context_servers": {"moe_config": {"backend_typo": "CUTLASS"}}},
@@ -619,6 +631,39 @@ def test_disagg_node_id_matches_runtime(schemas: dict[str, dict]) -> None:
         validator.validate({"node_id": value})
     for value in (-1, maximum + 1):
         assert not validator.is_valid({"node_id": value})
+
+
+@pytest.mark.parametrize(
+    ("partition", "valid"),
+    [
+        ({}, True),
+        ({"num_experts_per_worker": 0, "num_prefetch_experts": 0}, True),
+        ({"num_experts_per_worker": 1, "num_prefetch_experts": 1}, True),
+        ({"num_experts_per_worker": 2, "num_prefetch_experts": 1}, True),
+        ({"num_experts_per_worker": 1}, False),
+        ({"num_prefetch_experts": 1}, False),
+        ({"num_experts_per_worker": 0, "num_prefetch_experts": 1}, False),
+        ({"num_experts_per_worker": 1, "num_prefetch_experts": 0}, False),
+    ],
+)
+def test_dwdp_expert_partition_matches_runtime(
+    schemas: dict[str, dict], partition: dict[str, int], valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import DwdpConfig
+
+    if valid:
+        DwdpConfig(**partition)
+    else:
+        with pytest.raises(ValueError, match="set both"):
+            DwdpConfig(**partition)
+
+    config = {"dwdp_config": partition}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section
 
 
 def test_runtime_only_union_does_not_disable_validation() -> None:

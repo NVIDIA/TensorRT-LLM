@@ -75,12 +75,17 @@ DWDP is wrapper-owned lifecycle, not a scheduler or backend variant:
 
 ```text
 Executor construction
-  → register eligible MoE layer indices
+  → ConfigurableMoE decides, once its backend exists, whether DWDP manages
+    the layer (CuTeDSL, NVFP4, no locality domain): a managed layer is sized
+    to this rank's ExpertPartition range and registered; any other layer
+    keeps the full expert table and logs one warning
   → after weight loading: DwdpManager.setup
       → dense DWDP first (models with dense roots): setup collectives #1-#6;
         the commit frees the replicated dense weights
-      → then expert DWDP: VMM transport + composite VA + page pool (the
-        prefetch ring), on the copy stream dense DWDP runs on
+      → then expert DWDP: partition handshake, VMM transport + composite VA
+        + page pool (the prefetch ring), on the copy stream dense DWDP runs
+        on, weight manager, then the vote that exchanges the small expert
+        parameters (_exchange_expert_scalars) and the backend fixup
       → the committed dense runtime goes to the attached DenseDwdpManager
 
 PyExecutor forward start
@@ -109,6 +114,18 @@ allocations on GB200, composite mappings, page pool, copy stream, and event
 protocol. `ConfigurableMoE` owns wait/bind/record placement so those calls
 happen once per layer rather than once per scheduler chunk. Schedulers must not
 perform DWDP lifecycle calls.
+
+`ExpertPartition` (`modules/dwdp/specs.py`) is the only source of every
+rank's expert range `[start, end)`. `DwdpManager.expert_partition` computes it
+from `DwdpConfig`, `dwdp_size` and the layer's expert count;
+`MoE._init_dwdp_expert_layout` sets a managed layer's `slot_start`,
+`slot_end` and `expert_size_per_partition` from it before the backend sync and
+`create_weights`, and `setup_dwdp` and the transport read the same table. Ranks
+may store different counts: the balanced default stores `floor` or `ceil` of
+`num_experts / dwdp_size` experts per rank. `ConfigurableMoE._decide_dwdp`
+makes the decision, since eligibility needs the backend; `MoE.__init__` leaves
+every layer with the full table. After setup, `fixup_moe_backends` widens a
+managed layer to the composite-VA view (`ep_size = 1`, `[0, num_experts)`).
 
 Dense DWDP (`dwdp_config.enable_dense`, which row-shards the replicated dense
 weights of the MoE decoder layers the same way) is owned by `DenseDwdpManager`

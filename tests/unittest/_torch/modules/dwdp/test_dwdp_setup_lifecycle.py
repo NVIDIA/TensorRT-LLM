@@ -45,10 +45,9 @@ def _mapping():
     return SimpleNamespace(dwdp_enabled=True, dwdp_rank=0, dwdp_size=2)
 
 
-def _setup_mocks(stack: ExitStack):
+def _setup_mocks(stack: ExitStack) -> tuple[MagicMock, MagicMock, MagicMock]:
     transport = MagicMock()
     transport.get_handle_set.return_value = MagicMock()
-    transport.get_peer_ranges.return_value = [(0, 2), (2, 4)]
     transport.get_peer_views.return_value = {}
     weight_buffer = MagicMock()
     weight_manager = MagicMock()
@@ -67,14 +66,10 @@ def _setup_mocks(stack: ExitStack):
     stack.enter_context(
         patch.object(dwdp_setup_module, "build_weight_specs", return_value=MagicMock())
     )
+    stack.enter_context(patch.object(dwdp_setup_module, "_agree_on_partition"))
     stack.enter_context(
-        patch.object(
-            dwdp_setup_module,
-            "_get_first_spec",
-            return_value=SimpleNamespace(local_experts=2),
-        )
+        patch.object(dwdp_setup_module, "get_allocation_granularity", return_value=2 << 20)
     )
-    stack.enter_context(patch.object(dwdp_setup_module, "_validate_partition_config"))
     stack.enter_context(
         patch.object(dwdp_setup_module.DWDPTransport, "create", return_value=transport)
     )
@@ -85,8 +80,18 @@ def _setup_mocks(stack: ExitStack):
     stack.enter_context(
         patch.object(dwdp_setup_module, "DWDPWeightManager", return_value=weight_manager)
     )
+    stack.enter_context(
+        patch.object(dwdp_setup_module, "_exchange_expert_scalars", side_effect=_vote)
+    )
     stack.enter_context(patch.object(dwdp_setup_module, "fixup_moe_backends"))
     return transport, weight_buffer, weight_manager
+
+
+def _vote(*_args: object, error: Exception | None = None, **_kwargs: object) -> dict:
+    """Stands in for ``_exchange_expert_scalars``: a rank that failed raises its own error there."""
+    if error is not None:
+        raise error
+    return {}
 
 
 def _run_setup(**kwargs: object) -> DWDPWeightManager | None:

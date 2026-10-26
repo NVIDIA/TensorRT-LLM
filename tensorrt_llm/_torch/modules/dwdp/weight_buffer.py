@@ -419,20 +419,16 @@ class WeightBuffer:
             [ pre_region | mnnvl_region | post_region ]
               (page pool)  (MNNVL handle)  (page pool)
 
-        - pre_region  : page-pool fabric pages for remote experts [0, local_start)
+        - pre_region  : page-pool pages for remote experts [0, local_start)
         - mnnvl_region: zero-copy mapping of the MNNVL fabric handle
                         (contains local experts [local_start, local_end))
-        - post_region : page-pool fabric pages for remote experts [local_end, N)
+        - post_region : page-pool pages for remote experts [local_end, N)
 
-        Routing table budget (GB200):
-            ~928 total entries
-            - 696 used by Transport (3 peers × 4 weights × 58 layers, persistent)
-            - 232 used here (1 entry per weight per layer, persistent for lifetime)
-            = exactly 928 = 0 remaining.
-
-        We achieve 1 routing entry per weight by calling set_access ONCE on the
-        full composite VA (va_base, total_size).  Calling it three times
-        (once per sub-region) would consume 696 entries here, exhausting the table.
+        The page-pool pages are local ``CU_MEM_HANDLE_TYPE_NONE`` handles
+        (``PagePool``); only the MNNVL region is a fabric handle.  The three
+        regions are mapped back to back into one reservation, and one
+        set_access call covers the full composite VA (va_base, total_size)
+        instead of one call per region.
         """
         weight_specs = self._layer_weight_specs[layer_idx]
         buf_slot = self.buffer_index_for_layer(layer_idx)
@@ -490,10 +486,8 @@ class WeightBuffer:
                     page_pool_offset += layout.post_pages
 
                 # --- Single set_access for the ENTIRE composite VA ---
-                # One cuMemSetAccess call = 1 routing table entry consumed.
-                # This is critical: calling it per sub-region would consume 3
-                # entries per weight per layer (696 total) and exhaust the
-                # routing table on top of Transport's 696 persistent entries.
+                # One call covers the whole reservation instead of one call
+                # per region.
                 set_access(va_base, layout.total_size, self._device_id)
 
                 # --- Create full [num_experts, ...] tensor view ---
@@ -504,7 +498,7 @@ class WeightBuffer:
                 #
                 # When pool_granularity > granularity, pre_size may be larger
                 # than page_start due to rounding.  The difference is
-                # pre_padding bytes of unused pool-backed space at the end of
+                # pre_padding bytes of unused pool-backed space at the start of
                 # the pre-region.  The tensor view must start at
                 # va_base + pre_padding so that expert index 0 maps to the
                 # correct physical memory:
@@ -659,25 +653,6 @@ class WeightBuffer:
             Data offset in bytes.
         """
         return self.get_layout(layer_idx, name).data_offset
-
-    def compute_peer_data_offset(self, layer_idx: int, name: str, peer_local_start: int) -> int:
-        """Compute data_offset for a peer rank given their local_start.
-
-        layer_idx is required because different layers may have
-        different expert_bytes, affecting page alignment.
-
-        Args:
-            layer_idx: Layer index.
-            name: Weight name.
-            peer_local_start: The peer rank's local_start expert index.
-
-        Returns:
-            Data offset in bytes for the peer.
-        """
-        layout = self.get_layout(layer_idx, name)
-        peer_start_bytes = peer_local_start * layout.expert_bytes
-        peer_page_start = (peer_start_bytes // self._granularity) * self._granularity
-        return peer_start_bytes - peer_page_start
 
     # --- Layout queries (diagnostics, tests) ---
 

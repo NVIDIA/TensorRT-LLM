@@ -100,8 +100,8 @@ The four fields are:
 
 - `dwdp_size`: the number of GPUs in each DWDP group
 - `num_groups`: the number of DWDP groups; total context workers = `num_groups * dwdp_size`
-- `num_experts_per_worker`: the number of experts each worker keeps locally
-- `num_prefetch_experts`: the number of experts each worker fetches from each peer rank
+- `num_experts_per_worker`: the number of experts each worker keeps locally in a strided partition; leave it and `num_prefetch_experts` at 0 (the default) for the balanced partition, where each worker keeps `floor` or `ceil` of `num_experts / dwdp_size` experts
+- `num_prefetch_experts`: in a strided partition, the stride between the first experts of consecutive workers, so that worker `r` keeps the experts `[r * num_prefetch_experts, r * num_prefetch_experts + num_experts_per_worker)`; it is not a count of prefetched experts
 
 Together, these fields define the DWDP group structure and how experts are split between local residency and remote prefetch before inference starts.
 

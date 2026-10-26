@@ -5836,10 +5836,22 @@ class DwdpConfig(StrictBaseModel):
         default=1,
         description=
         "The number of DWDP groups. Total workers = num_groups * dwdp_size.")
-    num_experts_per_worker: int = Field(
-        default=0, description="The number of experts per worker.")
-    num_prefetch_experts: int = Field(
-        default=0, description="The number of prefetch experts per worker.")
+    num_experts_per_worker: NonNegativeInt = Field(
+        default=0,
+        description=
+        "The number of routed experts each worker stores in a strided expert "
+        "partition, where worker r stores the experts from "
+        "r * num_prefetch_experts. Leave both fields at 0 (the default) for "
+        "the balanced partition: every worker stores floor or ceil of "
+        "num_experts / dwdp_size contiguous experts, and no expert is stored "
+        "twice.")
+    num_prefetch_experts: NonNegativeInt = Field(
+        default=0,
+        description=
+        "The stride between the first experts of consecutive workers in a "
+        "strided expert partition (not a number of prefetched experts). Equal "
+        "to num_experts_per_worker for disjoint ranges, smaller for ranges "
+        "that overlap. Leave both fields at 0 for the balanced partition.")
     contention_opt: bool = Field(
         default=False,
         description=
@@ -5888,6 +5900,22 @@ class DwdpConfig(StrictBaseModel):
                 "DwdpConfig: contention_opt=True selects batched copies, but "
                 f"copy_mode={self.copy_mode!r}; set copy_mode='batched' or "
                 "leave contention_opt off.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_expert_partition(self) -> 'DwdpConfig':
+        """Both partition fields 0 (balanced) or both positive (strided).
+
+        Whether a strided pair fits the model's routed experts is checked
+        when the model is built, where their count is known.
+        """
+        size = self.num_experts_per_worker
+        stride = self.num_prefetch_experts
+        if (size == 0) != (stride == 0):
+            raise ValueError(
+                f"DwdpConfig: num_experts_per_worker={size} and "
+                f"num_prefetch_experts={stride}: set both (a strided expert "
+                f"partition) or leave both at 0 (the balanced partition).")
         return self
 
 

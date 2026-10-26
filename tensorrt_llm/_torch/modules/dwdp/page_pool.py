@@ -15,12 +15,13 @@
 
 """Page pool for the DWDP remote prefetch slots.
 
-The page pool manages per-page fabric handles for the remote regions of the
+The page pool manages per-page handles for the remote regions of the
 composite buffer. One pool per prefetch slot (``DwdpConfig.num_prefetch_slots``,
 two by default).
 
-Each pool is a list of page-sized fabric handles that can be mapped at different
-VA positions for different layers. Pages are reused across layers in the same slot:
+Each pool is a list of page-sized local (``CU_MEM_HANDLE_TYPE_NONE``) handles
+that can be mapped at different VA positions for different layers. Pages are
+reused across layers in the same slot:
     - Layer 3 (buf_idx=0): pool[0] pages 0..K for pre/post regions
     - Layer 5 (buf_idx=0): SAME pool[0] pages (slot reuse)
     - Layer 4 (buf_idx=1): pool[1] pages 0..M
@@ -28,10 +29,9 @@ VA positions for different layers. Pages are reused across layers in the same sl
 This naturally handles heterogeneous layers: each layer maps exactly the pages
 it needs, even if remote sizes differ across layers.
 
-Verified on GB200:
-    - Per-page fabric handles composited into one VA: PASS
-    - Same page handles reused across layers: PASS
-    - Non-fabric handles cannot be mapped: FAIL (not supported on GB200)
+The pages are never exported: they are mapped next to the fabric handle of a
+weight's local experts in one VA reservation, and one set_access covers the
+whole reservation.
 """
 
 from __future__ import annotations
@@ -51,10 +51,10 @@ from .vmm import (
 
 
 class PagePool:
-    """Pool of per-page fabric handles for the remote prefetch slots.
+    """Pool of per-page local handles for the remote prefetch slots.
 
-    One pool per prefetch slot. Each pool is a list
-    of page-sized fabric handles. Different layers map these pages at
+    One pool per prefetch slot. Each pool is a list of page-sized
+    ``CU_MEM_HANDLE_TYPE_NONE`` handles. Different layers map these pages at
     different VA positions within their composite VA.
 
     Pages are reused across layers in the same slot:
@@ -65,9 +65,8 @@ class PagePool:
     Pool page size vs VMM granularity:
         Each pool handle is ``page_size`` bytes (default 8 * granularity =
         16MB on GB200).  Larger pool pages reduce the number of cuMemMap
-        calls by 8x, avoiding the CUDA driver internal tracking limit
-        (~130K mappings per process) that causes OOM when 4 processes share
-        a GB200 node with 2MB pages.
+        calls and live mappings by 8x.  With 2MB pages, 4 processes on a
+        GB200 node run out of memory at ~130K live mappings per process.
 
     Attributes:
         device_id: CUDA device ordinal.
