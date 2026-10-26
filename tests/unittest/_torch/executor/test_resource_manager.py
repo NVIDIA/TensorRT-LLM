@@ -1263,6 +1263,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=self.create_peft_cache_config(),
             lora_config=LoraConfig(lora_ckpt_source=server_ckpt_source),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
         peft_cache_manager.impl = MagicMock()
         peft_cache_manager.impl.is_task_cached.return_value = False
