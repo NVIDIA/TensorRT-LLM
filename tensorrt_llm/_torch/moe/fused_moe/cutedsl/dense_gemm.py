@@ -377,8 +377,9 @@ class TrtllmCutedslDenseGemmNvfp4Impl(MoEImplBase):
             enable_alltoall: Whether alltoall communication is enabled
 
         Note:
-            The implementation is controlled by TRTLLM_MOE_FUSED_FC2_ALPHA env var (default: enabled).
-            When enabled, fc2_alpha is fused into FC1's alpha_post with scalar fc2_alpha_max in FC2.
+            The implementation is controlled by TRTLLM_MOE_FUSED_FC2_ALPHA env var (default: disabled).
+            When enabled, fc2_alpha is fused into FC1's alpha_post with scalar fc2_alpha_max in FC2;
+            this path has a known accuracy issue under TP.
             When disabled, uses the original per-token per-expert fc2_alpha in FC2.
         """
         assert self.has_nvfp4
