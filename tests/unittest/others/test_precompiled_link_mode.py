@@ -221,3 +221,18 @@ def test_skew_check_is_skipped_outside_a_repo(warn_on_build_skew, monkeypatch, c
     warn_on_build_skew("/src")
 
     assert "Cannot check for build skew" in capfd.readouterr().out
+
+
+def test_vendored_msa_sources_stay_source_owned():
+    skip = _load("should_skip_precompiled_package_data")
+    msa = "tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/"
+    for tracked in (
+        "fmha_sm100/csrc/include/plan.cuh",
+        "fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu",
+        "fmha_sm100/LICENSE",
+        "prefill_bf16x/NOTICE",
+    ):
+        assert skip(msa + tracked), tracked
+    # The CUTLASS headers build_wheel.py stages are build output, so they still come from the wheel.
+    assert not skip(msa + "fmha_sm100/cutlass/include/cutlass/cutlass.h")
+    assert not skip("tensorrt_llm/libs/libtensorrt_llm.so")

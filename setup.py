@@ -246,13 +246,18 @@ def download_precompiled(workspace: str, version: str) -> str:
 def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
-    Precompiled wheels own native bits. Source owns telemetry schemas and the
-    OpenEngine contract. Skip those wheel files so Python-only edits layer over
-    old wheels and tracked bindings from the current checkout remain authoritative.
+    Precompiled wheels own native bits. Source owns telemetry schemas, the
+    OpenEngine contract and the vendored MSA kernel sources (all but the CUTLASS
+    headers build_wheel.py stages). Skip those wheel files so Python-only edits
+    layer over old wheels and tracked files from the current checkout remain
+    authoritative.
     """
     filename = filename.replace("\\", "/")
     if filename.startswith("tensorrt_llm/usage/schemas/"):
         return filename.endswith(".json")
+    msa = "tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/"
+    if filename.startswith(msa):
+        return not filename.startswith(msa + "fmha_sm100/cutlass/")
     return filename.startswith((
         "tensorrt_llm/grpc/openengine/_generated/",
         "tensorrt_llm/grpc/openengine/proto/",
