@@ -635,8 +635,8 @@ def test_gdn_attaches_only_static_fp8_scale():
 
 @pytest.mark.parametrize("ring_mode", [False, True], ids=["triton", "flashinfer_ring"])
 def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
-    from tensorrt_llm._torch.modules.mamba import gdn_mixer
     from tensorrt_llm._torch.modules.fla.cache_manager import ReplayStateUpdateMetadata
+    from tensorrt_llm._torch.modules.mamba import gdn_mixer
 
     layer = gdn_mixer.Qwen3NextGatedDeltaNet.__new__(gdn_mixer.Qwen3NextGatedDeltaNet)
     torch.nn.Module.__init__(layer)

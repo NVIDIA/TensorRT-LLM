@@ -15,6 +15,11 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    ReplayStateUpdateMetadata,
+    _advance_replay_state,
+    _advance_ring_start,
+)
 from tensorrt_llm._torch.modules.fla.cached_replay import (
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
@@ -22,11 +27,6 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     FLASHINFER_REPLAY_RING_SIZE,
     flashinfer_cached_replay_update,
     is_flashinfer_cached_replay_available,
-)
-from tensorrt_llm._torch.modules.fla.cache_manager import (
-    ReplayStateUpdateMetadata,
-    _advance_replay_state,
-    _advance_ring_start,
 )
 
 skip_unsupported = pytest.mark.skipif(
