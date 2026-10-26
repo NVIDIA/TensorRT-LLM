@@ -2086,7 +2086,9 @@ def test_request_data_for_a_cleared_session_is_failed_not_parked(retried: bool) 
         slice_id=0,
     )
 
-    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"receiver", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
 
     sender._save_peer_req_info.assert_not_called()
     sender._send_failed_result_to_receiver.assert_called_once_with(info)
@@ -2108,7 +2110,9 @@ def test_request_data_for_a_session_not_yet_created_is_still_parked() -> None:
         unique_rid=110,
     )
 
-    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"receiver", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
 
     sender._save_peer_req_info.assert_called_once_with(info)
     sender._send_failed_result_to_receiver.assert_not_called()
@@ -2134,7 +2138,9 @@ def test_retried_request_data_for_a_live_session_is_failed_not_parked() -> None:
         slice_id=0,
     )
 
-    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"receiver", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
 
     sender._save_peer_req_info.assert_not_called()
     sender._send_failed_result_to_receiver.assert_called_once_with(info)
@@ -2168,6 +2174,8 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
 
     def publish(task: KVRecvTask) -> None:
         task.expected_transfers = 1
+        task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {3: None})
+        task._kv_result_report_tokens = {3: _KV_RESULT_REPORT_TOKEN}
         session.mark_transferring(task.slice_id)
 
     receiver.dispatch_task = publish
@@ -2191,7 +2199,9 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
         slice_id=0,
     )
 
-    sender._respond_with_kv(b"gen", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"gen", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
     (reply,) = [call.args[0] for call in dealer.send.call_args_list]
     receiver._process_kv_agent_result(b"ctx", reply)
 
@@ -2237,6 +2247,8 @@ def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
 
     def publish(task: KVRecvTask) -> None:
         task.expected_transfers = 2
+        task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {3: None, 4: None})
+        task._kv_result_report_tokens = {3: _KV_RESULT_REPORT_TOKEN, 4: _KV_RESULT_REPORT_TOKEN}
         session.mark_transferring(task.slice_id)
 
     receiver.dispatch_task = publish
@@ -2258,7 +2270,9 @@ def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
         unique_rid=rid,
         slice_id=0,
     )
-    sender._respond_with_kv(b"gen", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"gen", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
     (reply,) = [call.args[0] for call in dealer.send.call_args_list]
     receiver._process_kv_agent_result(b"ctx", reply)
 
@@ -2306,7 +2320,10 @@ def test_failed_receive_is_kept_until_every_writer_has_reported(
 
     result = AgentResult.SUCCESS if sibling == "succeeds" else AgentResult.FAILED
     receiver._process_kv_agent_result(
-        b"ctx", transfer_mod._make_kv_result_msg(4, rid, 0, True, result)
+        b"ctx",
+        transfer_mod._make_kv_result_msg(
+            4, rid, 0, True, result, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+        ),
     )
     assert not session.failed_receive_awaits_writers()
     assert transceiver.check_gen_transfer_status(None) == ([], [rid], [])
@@ -2344,7 +2361,10 @@ def test_cancel_does_not_free_a_failed_receive_before_its_writers_stop(
     assert rid in receiver._sessions
 
     receiver._process_kv_agent_result(
-        b"ctx", transfer_mod._make_kv_result_msg(4, rid, 0, True, AgentResult.SUCCESS)
+        b"ctx",
+        transfer_mod._make_kv_result_msg(
+            4, rid, 0, True, AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+        ),
     )
     assert not session.has_transferring_tasks()
     if canceller == "local":
@@ -2424,6 +2444,7 @@ def test_stale_request_data_is_answered_when_swept_without_attention_dp(
         block_ids_per_layer_groups=[],
         unique_rid=rid,
         slice_id=0,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     sender._peer_requests = {rid: {info.instance_rank: info}}
     sender._peer_requests_timestamps = {rid: clock["t"]}
@@ -2435,7 +2456,9 @@ def test_stale_request_data_is_answered_when_swept_without_attention_dp(
     while not sender._send_task_queues[0].empty():
         queued.append(sender._send_task_queues[0].get_nowait())
     if answered:
-        make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
+        make_result.assert_called_once_with(
+            5, rid, 0, True, AgentResult.FAILED, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+        )
         assert queued == [("gen", [MessageType.KV_AGENT_RESULT, b"failed"])]
     else:
         make_result.assert_not_called()
@@ -3650,7 +3673,7 @@ def test_receiver_rejects_peer_on_another_protocol_version_at_registration(
         def send(self, message: list[bytes]) -> None:
             self.sent.append(message)
 
-        def receive(self) -> list[bytes]:
+        def receive(self, timeout_ms: int | None = None) -> list[bytes]:
             return [peer_bytes]
 
         def stop(self) -> None:
@@ -3658,6 +3681,10 @@ def test_receiver_rejects_peer_on_another_protocol_version_at_registration(
 
     monkeypatch.setattr(transfer_mod, "ZMQMessenger", _InfoMessenger)
     receiver = object.__new__(Receiver)
+    receiver._sessions_lock = threading.Lock()
+    receiver._shutdown = True
+    receiver._rank_info_auth_key = None
+    receiver._rank_info_timeout_s = 60.0
     receiver._incompatible_peers = {}
     receiver._sender_ep_instance_map = {}
     receiver._dealers = {}

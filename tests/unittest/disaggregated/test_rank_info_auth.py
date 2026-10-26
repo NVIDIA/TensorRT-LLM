@@ -11,6 +11,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger
+from tensorrt_llm._torch.disaggregation.native.rank_info import NATIVE_TRANSFER_PROTOCOL_VERSION
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     _RANK_INFO_CHALLENGE_TTL_S,
     MessageType,
@@ -115,7 +116,7 @@ def test_receiver_rank_info_exchange(key):
     receiver._extract_info_endpoint = Mock(return_value=_ENDPOINT)
     receiver._should_register_peer = Mock(return_value=True)
     receiver._registrar = Mock()
-    sender_info = Mock(sender_endpoints=[])
+    sender_info = Mock(sender_endpoints=[], protocol_version=NATIVE_TRANSFER_PROTOCOL_VERSION)
     messenger = Mock()
     messenger.receive.side_effect = (
         [[MessageType.AUTHENTICATION_CHALLENGE, b"n" * 32], [b"rank-info"]]
