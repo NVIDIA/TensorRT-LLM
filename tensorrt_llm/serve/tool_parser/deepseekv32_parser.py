@@ -90,6 +90,9 @@ class DeepSeekV32Parser(BaseToolParser):
         self._in_calls_block = False
         # Set while an increment re-reads what its last invoke left behind.
         self._reading_rest = False
+        # Buffer index from which an invoke end tag could still appear. Text
+        # before it was already searched without completing an invoke.
+        self._end_search_start = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -232,6 +235,7 @@ class DeepSeekV32Parser(BaseToolParser):
                 self._in_calls_block = False
                 current_text = current_text[closing + len(self.eot_token) :]
                 self._buffer = current_text
+                self._end_search_start = 0
                 ends_with_partial_token = any(
                     self._ends_with_partial_token(current_text, token) for token in partial_tokens
                 )
@@ -243,6 +247,7 @@ class DeepSeekV32Parser(BaseToolParser):
             # finish(), shows what follows.
             held = "" if self._in_calls_block else self._separator_prefix_at_end(normal_text)
             self._buffer = held
+            self._end_search_start = 0
             normal_text = normal_text[: len(normal_text) - len(held)]
             for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
                 normal_text = normal_text.replace(e_token, "")
@@ -255,6 +260,7 @@ class DeepSeekV32Parser(BaseToolParser):
         if normal_text:
             current_text = current_text[prefix_len:]
             self._buffer = current_text
+            self._end_search_start = max(0, self._end_search_start - prefix_len)
         if has_tool_call:
             if self._in_calls_block and not normal_text.strip():
                 # The separator before the next invoke.
@@ -269,6 +275,16 @@ class DeepSeekV32Parser(BaseToolParser):
         all_calls: list[ToolCallItem] = []
         invokes_exhausted = False
         try:
+            # An open invoke is handled once its end tag arrives, so the buffer is
+            # searched again only when new text holds one. This keeps a long tool
+            # call from being rescanned on every increment.
+            if (
+                self._INVOKE_HEADER_PREFIX in current_text
+                and current_text.find(self.invoke_end_token, self._end_search_start) == -1
+            ):
+                self._end_search_start = max(0, len(current_text) - len(self.invoke_end_token) + 1)
+                return StreamingParseResult(normal_text=normal_text)
+
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
@@ -301,12 +317,12 @@ class DeepSeekV32Parser(BaseToolParser):
                 # Don't pre-allocate arrays until we actually complete a tool call
                 # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
 
-                # Parse current parameters from XML/JSON
-                current_params = self._parse_parameters_from_xml(invoke_content)
-                current_args_json = json.dumps(current_params, ensure_ascii=False)
-
                 # Check if tool call is complete (has closing tag)
                 if is_tool_end:
+                    # Parse current parameters from XML/JSON
+                    current_params = self._parse_parameters_from_xml(invoke_content)
+                    current_args_json = json.dumps(current_params, ensure_ascii=False)
+
                     # Only emit the tool call when it's complete (saw </｜DSML｜invoke>)
                     # This ensures each function returns at most once
                     calls_for_this_invoke: list[ToolCallItem] = []
@@ -386,6 +402,11 @@ class DeepSeekV32Parser(BaseToolParser):
                     self._reading_rest = False
                 normal_text += rest.normal_text
                 all_calls.extend(rest.calls)
+            self._end_search_start = (
+                0
+                if invokes_exhausted
+                else max(0, len(self._buffer) - len(self.invoke_end_token) + 1)
+            )
             return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:

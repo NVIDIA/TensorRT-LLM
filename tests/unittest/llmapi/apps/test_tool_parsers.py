@@ -3303,6 +3303,64 @@ def test_deepseek_streaming_prefix_is_delta_independent(
         assert names == ["get_weather"], f"{deltas!r} called {names!r}"
 
 
+def _deepseek_long_call(parser_cls: type[BaseToolParser],
+                        location: str) -> tuple[str, str, list[str]]:
+    """Split a get_weather call for streaming.
+
+    Returns the markup before the arguments, the arguments, and the tokens
+    after them.
+    """
+    if parser_cls is DeepSeekV3Parser:
+        return ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+                "get_weather\n```json\n", json.dumps({"location": location}),
+                ["\n```", "<｜tool▁call▁end｜>", "<｜tool▁calls▁end｜>"])
+    if parser_cls is DeepSeekV31Parser:
+        return (
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>",
+            json.dumps({"location":
+                        location}), ["<｜tool▁call▁end｜>", "<｜tool▁calls▁end｜>"])
+    parser = parser_cls()
+    dsml = "<｜DSML｜ " if parser_cls is DeepSeekV41Parser else "<｜DSML｜"
+    close = dsml.replace("<", "</")
+    return (parser.bot_token + f'{dsml}invoke name="get_weather">'
+            f'{dsml}parameter name="location" string="true">', location,
+            [f"{close}parameter>", f"{close}invoke>", parser.eot_token])
+
+
+@pytest.mark.parametrize("parser_cls", [
+    DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser,
+    DeepSeekV41Parser
+])
+def test_deepseek_long_tool_call_streams_in_linear_time(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser]) -> None:
+    """A 64k-character argument streamed four characters per delta.
+
+    A linear parse takes about a second; one that rescans the buffer on every
+    increment takes tens of seconds, well past the bound.
+    """
+    location = "\n".join(["if (a > b) { p->x = q; } // ok"] * 2048)
+    head, body, tail = _deepseek_long_call(parser_cls, location)
+    deltas = [head] + [body[i:i + 4] for i in range(0, len(body), 4)] + tail
+    parser = parser_cls()
+    names, arguments = [], ""
+    start = time.monotonic()
+
+    for delta in deltas:
+        result = parser.parse_streaming_increment(delta, sample_tools)
+        names += [call.name for call in result.calls if call.name]
+        arguments += "".join(call.parameters for call in result.calls)
+
+    assert time.monotonic() - start < 10
+    assert names == ["get_weather"]
+    assert json.loads(arguments) == {"location": location}
+    whole = parser_cls().detect_and_parse("".join(deltas), sample_tools)
+    assert [(call.name, json.loads(call.parameters))
+            for call in whole.calls] == [("get_weather", {
+                "location": location
+            })]
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================

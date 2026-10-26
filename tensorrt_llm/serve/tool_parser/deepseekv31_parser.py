@@ -15,6 +15,9 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 
 from .utils import is_complete_json
 
+_TOOL_SEP = "<｜tool▁sep｜>"
+_TOOL_CALL_END = "<｜tool▁call▁end｜>"
+
 
 class DeepSeekV31Parser(BaseToolParser):
     (
@@ -55,6 +58,12 @@ class DeepSeekV31Parser(BaseToolParser):
         self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)<｜tool▁call▁end｜>"
         self._last_arguments = ""
         self.current_tool_id = -1
+        # Streaming state of the current call's arguments, see _stream_arguments.
+        # An _args_start of -1 means the pattern match reads the arguments.
+        self._start_arguments(-1)
+        # Buffer index from which a tool separator could still appear. Text
+        # before it was already searched.
+        self._sep_search_start = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -106,6 +115,7 @@ class DeepSeekV31Parser(BaseToolParser):
                 return StreamingParseResult()
             normal_text = current_text
             self._buffer = ""
+            self._sep_search_start = 0
             for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
                 normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text)
@@ -117,12 +127,27 @@ class DeepSeekV31Parser(BaseToolParser):
         if normal_text:
             current_text = current_text[prefix_len:]
             self._buffer = current_text
+            self._sep_search_start = max(0, self._sep_search_start - prefix_len)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
         try:
+            # The pattern below matches only once a separator arrives, and while
+            # the arguments of a call stream, a new separator is what changes its
+            # match. Without one in the new text, the arguments are read from
+            # the new text alone, so a long tool call is not rescanned on every
+            # increment.
+            if current_text.find(_TOOL_SEP, self._sep_search_start) == -1:
+                self._sep_search_start = max(0, len(current_text) - len(_TOOL_SEP) + 1)
+                if self.current_tool_name_sent and self._args_start != -1:
+                    return self._stream_arguments(current_text, normal_text)
+                if not self.current_tool_name_sent:
+                    return StreamingParseResult(normal_text=normal_text)
+            elif self.current_tool_name_sent:
+                self._args_start = -1
+
             partial_match = re.search(
                 pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*?)(<｜tool▁call▁end｜>|$)",
                 string=current_text,
@@ -159,6 +184,7 @@ class DeepSeekV31Parser(BaseToolParser):
                         "name": func_name,
                         "arguments": {},
                     }
+                    self._start_arguments(partial_match.start(2))
                 else:
                     argument_diff = (
                         func_args_raw[len(self._last_arguments) :]
@@ -196,13 +222,111 @@ class DeepSeekV31Parser(BaseToolParser):
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
+                        self._sep_search_start = 0
                         return result
+            else:
+                self._sep_search_start = max(0, len(current_text) - len(_TOOL_SEP) + 1)
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=normal_text + current_text)
+
+    def _start_arguments(self, args_start: int) -> None:
+        """Start reading the arguments of a call at buffer index `args_start`."""
+        self._args_start = args_start
+        self._args_sent_end = args_start
+        self._sep_search_start = args_start
+        self._end_search_start = args_start
+        self._args_depth = 0
+        self._args_in_string = False
+        self._args_escaped = False
+
+    def _stream_arguments(self, current_text: str, normal_text: str) -> StreamingParseResult:
+        """Stream the arguments of the current call from the text that arrived.
+
+        Gives the same result as matching the whole buffer: the arguments run
+        from the separator to the first call end token (or the buffer end) and
+        are sent without surrounding whitespace.
+        """
+        calls: list[ToolCallItem] = []
+        end_idx = current_text.find(_TOOL_CALL_END, self._end_search_start)
+        if end_idx == -1:
+            args_end = len(current_text)
+            self._end_search_start = max(
+                self._args_start, len(current_text) - len(_TOOL_CALL_END) + 1
+            )
+        else:
+            args_end = end_idx
+            self._end_search_start = end_idx
+
+        if not self._last_arguments:
+            while self._args_sent_end < args_end and current_text[self._args_sent_end].isspace():
+                self._args_sent_end += 1
+        while args_end > self._args_sent_end and current_text[args_end - 1].isspace():
+            args_end -= 1
+
+        argument_diff = current_text[self._args_sent_end : args_end]
+        if argument_diff:
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=None,
+                    parameters=argument_diff,
+                )
+            )
+            self._last_arguments += argument_diff
+            self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+            self._args_sent_end = args_end
+            self._track_json_nesting(argument_diff)
+
+        # The arguments can only be complete JSON while no string or bracket
+        # is open, so the full parse runs only then.
+        if (
+            not self._args_in_string
+            and self._args_depth <= 0
+            and is_complete_json(self._last_arguments)
+        ):
+            # Update the stored arguments
+            try:
+                parsed_args = json.loads(self._last_arguments)
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed_args
+            except json.JSONDecodeError:
+                pass
+
+            # Remove the completed tool call from buffer, keep any remaining content
+            if end_idx != -1:
+                self._buffer = current_text[end_idx + len(_TOOL_CALL_END) :]
+            else:
+                self._buffer = ""
+            self._sep_search_start = 0
+            self._args_start = -1
+
+            result = StreamingParseResult(normal_text=normal_text, calls=calls)
+            self.current_tool_id += 1
+            self._last_arguments = ""
+            self.current_tool_name_sent = False
+            return result
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _track_json_nesting(self, text: str) -> None:
+        """Update the open-string and bracket-depth state of the sent arguments."""
+        for char in text:
+            if self._args_in_string:
+                if self._args_escaped:
+                    self._args_escaped = False
+                elif char == "\\":
+                    self._args_escaped = True
+                elif char == '"':
+                    self._args_in_string = False
+            elif char == '"':
+                self._args_in_string = True
+            elif char in "{[":
+                self._args_depth += 1
+            elif char in "}]":
+                self._args_depth -= 1
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
