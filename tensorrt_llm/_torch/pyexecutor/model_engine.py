@@ -38,8 +38,8 @@ from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..distributed.ops import MNNVLAllReduce
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
+from ..models.multimodal import is_multimodal_model
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
@@ -382,8 +382,7 @@ class PyTorchModelEngine(ModelEngine):
             self.encoder_max_num_tokens = mm_item_scheduler.encoder_max_num_tokens
             self.mm_encoder_output_budget_bytes = mm_item_scheduler.output_budget_bytes
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
-        if isinstance(self.model,
-                      MultimodalModelMixin) and mapping.is_first_pp_rank():
+        if is_multimodal_model(self.model) and mapping.is_first_pp_rank():
             multimodal_config = self.model.model_config.multimodal_config
             reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
                                     if self.model.encoder_cache_active else 0)
@@ -391,8 +390,7 @@ class PyTorchModelEngine(ModelEngine):
                 self.mm_encoder_output_budget_bytes or 0,
                 reuse_capacity_bytes,
             )
-            self.model._initialize_multimodal_encoder_cache(
-                cache_capacity_bytes)
+            self.model.initialize_multimodal_encoder_cache(cache_capacity_bytes)
         setup_mm_encoder_attn_metadata(
             self.model, self.input_processor, self.encoder_max_num_tokens,
             mm_item_scheduler.attention_metadata_capacity
@@ -991,7 +989,7 @@ class PyTorchModelEngine(ModelEngine):
                 and isinstance(decoder_model, DecoderModelForCausalLM)
                 and getattr(self.model, "mm_encoder", None) is None):
             return
-        if (isinstance(self.model, MultimodalModelMixin) or isinstance(
+        if (is_multimodal_model(self.model) or isinstance(
                 self.input_processor, BaseMultimodalInputProcessor)):
             raise ValueError(
                 "breakable prefill CUDA graph does not support multimodal models"
@@ -1007,7 +1005,7 @@ class PyTorchModelEngine(ModelEngine):
             return
         if self._mm_item_scheduler is None:
             raise TypeError(
-                "Item-level MM scheduling requires MultimodalModelMixin")
+                "Item-level MM scheduling requires SupportsMultimodal")
         self._mm_item_scheduler.forward_items(requests, scheduled_items)
 
     @property
@@ -1015,11 +1013,11 @@ class PyTorchModelEngine(ModelEngine):
         """Return the model-owned encoder-output cache used by this engine."""
         # Whole-model torch.compile wraps the model after its cache is created.
         model = getattr(self.model, "_orig_mod", self.model)
-        if not isinstance(model, MultimodalModelMixin):
+        if not is_multimodal_model(model):
             return None
         if self._mm_item_scheduler is None and not model.encoder_cache_active:
             return None
-        return model._multimodal_encoder_cache
+        return model.multimodal_encoder_cache
 
     def get_mm_encoder_item_cache_keys(
             self, request: LlmRequest) -> Optional[List[Hashable]]:

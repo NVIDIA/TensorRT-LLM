@@ -5,7 +5,7 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -2324,7 +2324,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         return self.llm.infer_max_seq_len()
 
     def encode_multimodal_inputs(self,
-                                 multimodal_params: List[MultimodalParams],
+                                 multimodal_params: Sequence[MultimodalParams],
                                  **encoder_kwargs: Any) -> torch.Tensor:
         """Uniform encoder entry (``MultimodalModelMixin`` contract).
 

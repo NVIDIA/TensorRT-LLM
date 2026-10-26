@@ -1150,7 +1150,7 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
         self.config = self.model_config.pretrained_config
 
     def encode_multimodal_inputs(
-        self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
+        self, multimodal_params: Sequence[MultimodalParams], **encoder_kwargs: Any
     ) -> torch.Tensor:
         if self.mm_encoder is None:
             raise ValueError("Raw multimodal inputs require a local multimodal encoder.")

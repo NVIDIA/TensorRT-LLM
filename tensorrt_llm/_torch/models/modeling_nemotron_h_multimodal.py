@@ -3478,7 +3478,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         )
 
     def encode_multimodal_inputs(
-        self, multimodal_params: List[MultimodalParams], **_: Any
+        self, multimodal_params: Sequence[MultimodalParams], **_: Any
     ) -> torch.Tensor:
         # Raw encoder hook per the `MultimodalModelMixin` contract. Cache
         # bookkeeping belongs to callers (`_get_or_encode_multimodal_embeddings`,

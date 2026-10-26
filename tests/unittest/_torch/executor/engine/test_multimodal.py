@@ -19,6 +19,9 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
 )
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     MultimodalItemScheduler,
+    is_multimodal,
+    mm_encoder_cache_enabled,
+    mm_item_scheduling_enabled,
     resolve_bytes_per_mm_encoder_embedding,
     resolve_mm_encoder_output_budget,
     setup_mm_encoder_attn_metadata,
@@ -33,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     make_mm_encoder_transient_cache_key,
     release_consumed_mm_items,
 )
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalParams,
@@ -378,6 +382,54 @@ def _bind_items(mm_item_scheduler: MultimodalItemScheduler, request, *, row_byte
             cache_key, rows * row_bytes, retain_after_release=False
         )
         state.set_item_cache_key(item_idx, cache_key, ready=False)
+
+
+def test_item_scheduler_accepts_model_contract_without_mixin_inheritance() -> None:
+    class _Model(SimpleNamespace):
+        supports_multimodal = True
+
+    encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+    model = _Model(
+        supports_mm_encoder_item_scheduling=True,
+        encoder_cache_active=True,
+        embedding_dtype=torch.float32,
+        multimodal_encoder_cache=TensorLRUCache(1024),
+        prepare_multimodal_encoder_inputs=Mock(return_value=[(encoder_input, [1], "audio")]),
+        forward_multimodal_encoder_items=Mock(return_value=[torch.tensor([[3.0, 4.0]])]),
+    )
+    args = SimpleNamespace(
+        multimodal_config=MultimodalConfig(),
+        disable_mm_encoder=False,
+        pipeline_parallel_size=1,
+    )
+    assert not isinstance(model, MultimodalModelMixin)
+    assert is_multimodal(model, None)
+    assert mm_item_scheduling_enabled(args, model)
+    assert mm_encoder_cache_enabled(model)
+    scheduler = MultimodalItemScheduler(model=model, bytes_per_embedding=8)
+    assert scheduler.encoder_cache is model.multimodal_encoder_cache
+
+    request = make_llm_request(
+        1,
+        {
+            "audio": {"input_features": torch.empty(1, 4)},
+            "multimodal_embedding_lengths": [1],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                item_refs=[("audio", 0)],
+                encoder_token_lengths=[4],
+                output_embedding_lengths=[1],
+            ),
+        },
+    )
+    initialize_multimodal_encoder_request(request, max_num_tokens=16)
+    _bind_items(scheduler, request)
+    scheduler.forward_items([request], {request.request_id: [0]})
+
+    model.prepare_multimodal_encoder_inputs.assert_called_once()
+    model.forward_multimodal_encoder_items.assert_called_once_with([(encoder_input, [1], "audio")])
+    cache_key = request.py_mm_encoder_state.item_cache_keys[0]
+    torch.testing.assert_close(scheduler.encoder_cache.get(cache_key), torch.tensor([[3.0, 4.0]]))
+    assert is_multimodal_encoder_ready(request)
 
 
 def test_qwen3_output_budget_uses_post_merge_embedding_capacity() -> None:

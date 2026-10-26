@@ -11,6 +11,7 @@ Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 3. [Step-by-Step Guide](#step-by-step-guide)
     1. [Model Configuration](#model-configuration)
     2. [Model Definition](#model-definition)
+        1. [Multimodal Models](#multimodal-models)
     3. [Weight Loading](#weight-loading)
     4. [Model Registration](#model-registration)
         1. [Core Models](#core-models)
@@ -127,6 +128,34 @@ Optionally, you may replace the native PyTorch modules with our implementations 
 - `RMSNorm` (in `tensorrt_llm/_torch/modules/rms_norm.py`): Enables performant RMS norm.
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
+
+#### Multimodal Models
+
+`tensorrt_llm._torch.models.multimodal.SupportsMultimodal` defines the model-facing
+multimodal contract. Reuse `MultimodalModelMixin` for its common implementation;
+the executor depends on the contract rather than requiring that inheritance.
+An independent implementation opts in with `supports_multimodal = True` and must
+provide the same methods and attributes. The marker is an explicit declaration,
+not runtime signature validation, and does not enable optional features.
+
+- Declare encoder caching and item scheduling separately. Item scheduling also
+  requires processor item metadata and a compatible runtime configuration.
+- Report encoder parallel modes and attention backends per enabled logical
+  encoder using the config-only class hooks. Their empty defaults declare no
+  support; concrete integrations supply their supported sets.
+- Keep the existing `MultimodalParams` input and tensor return contracts.
+  Selected-item preparation runs before H2D, and item outputs retain selection
+  order. The pending batching refactor updates the return contract separately.
+- Expose the existing model-owned cache through `multimodal_encoder_cache` and
+  `initialize_multimodal_encoder_cache()`. The latter preserves the mixin's
+  existing initialization hook. Item scheduling and persistent reuse share this
+  cache; they do not create separate owners.
+
+`EncoderGroup` continues to describe modalities that share an encoder call.
+`MultimodalEncoderMixin` continues to provide native encoder attention metadata
+and graph integration. Processor prompt expansion and disaggregated transport
+retain their existing interfaces; implementing this Protocol does not enable a
+new model, modality, encoder backend, or E/P path by itself.
 
 ### Weight Loading
 

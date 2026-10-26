@@ -49,7 +49,7 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.multimodal import is_multimodal_model
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
@@ -1413,7 +1413,7 @@ class KvCacheCreator:
 
     def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
         """Build one processed MM encoder batch at its scheduling limits."""
-        if not isinstance(self._model_engine.model, MultimodalModelMixin):
+        if not is_multimodal_model(self._model_engine.model):
             return []
         if isinstance(
                 self._profiling_stage_data,
