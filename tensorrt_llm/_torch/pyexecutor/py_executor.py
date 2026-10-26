@@ -134,9 +134,12 @@ _UNBOUNDED_STATS_MAX_LEN = -1
 _V2_RETENTION_IGNORED_LOG_KEY = "kv_cache_manager_v2_retention_config_ignored"
 
 # Waiting context requests have their host-tier prefix prefetched to the GPU off the
-# execution stream and are admitted after a short, rank-agreed hold. Kill switch.
-_KV_GPU_PREFETCH = os.environ.get("TRTLLM_M31_DISABLE_KV_GPU_PREFETCH",
-                                  "0") != "1"
+# execution stream and are admitted after a short, rank-agreed hold. A model opt-in
+# (RuntimeHooks.kv_gpu_prefetch), armed by _arm_runtime_opt_ins; kill switch
+# TRTLLM_M31_DISABLE_KV_GPU_PREFETCH=1.
+_KV_GPU_PREFETCH_KILLED = os.environ.get("TRTLLM_M31_DISABLE_KV_GPU_PREFETCH",
+                                         "0") == "1"
+_KV_GPU_PREFETCH = False
 _KV_GPU_PREFETCH_MAX = int(os.environ.get("TRTLLM_M31_KV_GPU_PREFETCH_MAX",
                                           "2"))
 _KV_GPU_PREFETCH_BYTES_PER_STEP = int(1.5e9)
@@ -394,8 +397,13 @@ def _arm_runtime_opt_ins(hooks: RuntimeHooks) -> bool:
 
     All are off for a model that declares none: the SM107 MXFP8 GEMM
     tactic table (the GEMM runner does not know the model, so it is armed
-    here), the MSA saturating E4M3 casts and the late-compile detector.
+    here), the MSA saturating E4M3 casts, the host-tier KV prefix prefetch,
+    the context-only int32 prompt tokens, the MSA NVFP4 sparse-prefill fork,
+    the indexer proxy max-score buffer reuse, the context one-hot draft-prob
+    index_fill, the DFlash host-side context allocation and the late-compile
+    detector. Each keeps its TRTLLM_M31_DISABLE_* kill switch.
     """
+    global _KV_GPU_PREFETCH
     if hooks.mxfp8_pinned_tactics:
         # Imported on use: only an opted-in model needs the table.
         from tensorrt_llm._torch.custom_ops import mxfp8_cute_pinned_tactics
@@ -404,6 +412,24 @@ def _arm_runtime_opt_ins(hooks: RuntimeHooks) -> bool:
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import \
             paged_cache
         paged_cache.arm_fp8_saturation()
+    if hooks.kv_gpu_prefetch:
+        _KV_GPU_PREFETCH = not _KV_GPU_PREFETCH_KILLED
+    if hooks.context_token_array:
+        from . import llm_request
+        llm_request.arm_context_token_array()
+    if hooks.msa_prefill_fork:
+        from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
+        msa_prefill.arm_prefill_fork()
+    if hooks.proxy_ms_reuse:
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import \
+            msa_indexer
+        msa_indexer.arm_proxy_ms_reuse()
+    if hooks.context_onehot_index_fill:
+        from tensorrt_llm._torch.speculative import interface
+        interface.arm_onehot_index_fill()
+    if hooks.dflash_host_ctx_alloc:
+        from tensorrt_llm._torch.speculative import dflash
+        dflash.arm_host_ctx_alloc()
     return hooks.late_compile_detect
 
 
@@ -4085,8 +4111,10 @@ class PyExecutor:
 
     def _kv_gpu_prefetch_state(self) -> str:
         """Whether the host-tier prefix prefetch runs in this executor, and if not, why."""
-        if not _KV_GPU_PREFETCH:
+        if _KV_GPU_PREFETCH_KILLED:
             return "disabled (kill switch)"
+        if not _KV_GPU_PREFETCH:
+            return "inactive (the model does not opt in)"
         if not self._is_kv_manager_v2:
             return "inactive (KV cache manager v1)"
         if not self.kv_cache_manager.enable_block_reuse:

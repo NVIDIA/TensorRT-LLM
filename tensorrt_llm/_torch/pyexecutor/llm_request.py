@@ -1531,13 +1531,20 @@ def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
 
 
 # Hand the prompt tokens to LlmRequest as the executor request's int32 array (one copy each way) instead of a
-# list[int] round trip, O(ISL) Python objects under the GIL. On by default for context-only requests (a disaggregated
-# context server); TRTLLM_M31_ENABLE_L1_TOKEN_ARRAY=1 extends it to every request type. Kill switch (wins):
+# list[int] round trip, O(ISL) Python objects under the GIL. A model opt-in (RuntimeHooks.context_token_array),
+# armed by the executor (arm_context_token_array): context-only requests (a disaggregated context server);
+# TRTLLM_M31_ENABLE_L1_TOKEN_ARRAY=1 extends it to every request type. Kill switch (wins):
 # TRTLLM_M31_DISABLE_L1_TOKEN_ARRAY=1.
-_L1_TOKEN_ARRAY = os.environ.get("TRTLLM_M31_DISABLE_L1_TOKEN_ARRAY",
-                                 "0") != "1"
+_L1_TOKEN_ARRAY = False
 _L1_ALL_REQUESTS = os.environ.get("TRTLLM_M31_ENABLE_L1_TOKEN_ARRAY",
                                   "0") == "1"
+
+
+def arm_context_token_array() -> None:
+    """Take the int32 prompt-token path in this process (RuntimeHooks.context_token_array), unless killed."""
+    global _L1_TOKEN_ARRAY
+    _L1_TOKEN_ARRAY = os.environ.get("TRTLLM_M31_DISABLE_L1_TOKEN_ARRAY",
+                                     "0") != "1"
 
 
 def _l1_input_tokens(executor_request: ExecutorRequest):

@@ -9,6 +9,7 @@ import pytest
 
 import tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 as kvm
 import tensorrt_llm._torch.pyexecutor.py_executor as pe
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 
 pytestmark = pytest.mark.cpu_only
 
@@ -104,8 +105,15 @@ def test_prefetch_failure_means_no_hold():
     cache.close.assert_called_once()
 
 
-def test_kill_switch_default_on():
-    assert pe._KV_GPU_PREFETCH is True
+@pytest.mark.parametrize(
+    "opt_in,killed,armed", [(False, False, False), (True, False, True), (True, True, False)]
+)
+def test_prefetch_is_a_model_opt_in(monkeypatch, opt_in, killed, armed):
+    # Off unless the model opts in (RuntimeHooks.kv_gpu_prefetch); the kill switch wins over the opt-in.
+    monkeypatch.setattr(pe, "_KV_GPU_PREFETCH", False)
+    monkeypatch.setattr(pe, "_KV_GPU_PREFETCH_KILLED", killed)
+    pe._arm_runtime_opt_ins(RuntimeHooks(kv_gpu_prefetch=opt_in))
+    assert pe._KV_GPU_PREFETCH is armed
 
 
 @pytest.mark.parametrize("hold", [0, 1, 3])

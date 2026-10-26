@@ -834,6 +834,9 @@ def _arm_kv_cache_opt_ins(hooks) -> None:
     if hooks.draft_pool_fixes:
         from .kv_cache import kv_cache_manager_v2
         kv_cache_manager_v2.arm_draft_pool_fixes()
+    if hooks.draft_kv_reserve_guard:
+        from .kv_cache import kv_cache_manager_v2
+        kv_cache_manager_v2.arm_draft_kv_reserve_guard()
     if hooks.msa_kv_cache_fixes:
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import \
             cache_manager as msa_cache_manager

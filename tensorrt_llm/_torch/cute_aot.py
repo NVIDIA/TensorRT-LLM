@@ -56,6 +56,17 @@ _loaded: Dict[Tuple[str, str], Any] = {}
 _counts = {"loaded": 0, "compiled": 0}
 
 
+# Shipped objects are served only after a model that ships them arms the loader (``arm``, at target routing, before
+# the model builds its kernels); until then every key compiles in-process with no lookup, export or log line.
+_armed = False
+
+
+def arm() -> None:
+    """Serve shipped objects (and export, with ``TRTLLM_M31_CUTE_AOT_EXPORT_DIR``) in this process."""
+    global _armed
+    _armed = True
+
+
 def _disabled() -> bool:
     return os.environ.get(DISABLE_ENV, "0").strip().lower() in ("1", "true", "on", "yes")
 
@@ -170,6 +181,12 @@ def compile_or_load(
 ) -> Any:
     """The compiled function of ``key`` built from ``sources``: the shipped object when there is one, else
     ``compile_fn()``."""
+    if not _armed:
+        with _lock:
+            cached = _loaded.get(("", key))
+            if cached is None:
+                cached = _loaded[("", key)] = compile_fn()
+            return cached
     tool = toolchain()
     key = full_key(key, sources)
     with _lock:

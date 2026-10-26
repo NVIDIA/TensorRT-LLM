@@ -1808,9 +1808,17 @@ def _padded_gen_draft_tokens(spec_metadata: SpecMetadata, num_gens: int,
 
 
 # Context one-hot draft-prob rows are written with index_fill_ (non-blocking) instead
-# of an advanced-index put that synchronizes the host with the GPU. Kill switch.
-_ONEHOT_INDEX_FILL = os.environ.get("TRTLLM_M31_DISABLE_ONEHOT_INDEX_FILL",
-                                    "0") != "1"
+# of an advanced-index put that synchronizes the host with the GPU. A model opt-in
+# (RuntimeHooks.context_onehot_index_fill), armed by the executor
+# (arm_onehot_index_fill); kill switch TRTLLM_M31_DISABLE_ONEHOT_INDEX_FILL=1.
+_ONEHOT_INDEX_FILL = False
+
+
+def arm_onehot_index_fill() -> None:
+    """Write the context one-hot rows with index_fill_ in this process (RuntimeHooks.context_onehot_index_fill)."""
+    global _ONEHOT_INDEX_FILL
+    _ONEHOT_INDEX_FILL = os.environ.get("TRTLLM_M31_DISABLE_ONEHOT_INDEX_FILL",
+                                        "0") != "1"
 
 
 class SpecWorkerBase(nn.Module, ABC):
