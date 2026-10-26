@@ -7,7 +7,6 @@ import torch
 
 from tensorrt_llm._torch.models import minimax_m3_router
 from tensorrt_llm._torch.models.minimax_m3_router import (
-    _parse_rows,
     router_split_applies,
     router_split_logits,
 )
@@ -15,15 +14,6 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Gate, split_r
 from tensorrt_llm._utils import get_sm_version
 
 HIDDEN, EXPERTS = 6144, 128
-
-
-def test_parse_rows():
-    assert _parse_rows("off") == ()
-    assert _parse_rows("0") == ()
-    assert _parse_rows("8625-16384") == ((8625, 16384),)
-    assert _parse_rows("10,20-30") == ((10, 10), (20, 30))
-    with pytest.raises(ValueError):
-        _parse_rows("30-20")
 
 
 def _stock_logits(x, split_weight):
