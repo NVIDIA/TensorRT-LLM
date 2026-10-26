@@ -73,7 +73,7 @@ def _make_creator(
     c._cache_transceiver_config = None
     c._speculative_config = None
     c._mapping = Mock()
-    c._model_engine = Mock()
+    c._model_engine = Mock(cuda_graph_batch_sizes=[], cuda_graph_padding_enabled=False)
     c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
     c._disable_overlap_scheduler = False
 
