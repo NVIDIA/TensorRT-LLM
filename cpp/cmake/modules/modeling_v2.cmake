@@ -31,7 +31,7 @@ names (snake_case); directories are their camelCase form:
 
   add_modeling_v2_family(<family>)
   add_modeling_v2_shared(<family> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])
-  add_modeling_v2_target(<family> <target> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])
+  add_modeling_v2_target(<family> <target> ARCHS ... [SOURCES ...] [DEPS ...] [REQUIRES ...])
 
 ARCHS     NN, NNa or NNf. Each is intersected with the build's requested
           architectures, the way flash_mla and deep_ep choose theirs; a target
@@ -39,7 +39,12 @@ ARCHS     NN, NNa or NNf. Each is intersected with the build's requested
           does not carry it.
 SOURCES   Paths or globs relative to the target directory (shared/ for
           add_modeling_v2_shared). .cu files are compiled for ARCHS without
-          torch; .cpp files are the torch bindings.
+          torch; .cpp files are the torch bindings. A target without SOURCES
+          has no directory and no code of its own: it runs its family's
+          shared code, and declaring it is what makes the library carry it.
+          Source properties the family's CMakeLists.txt sets with
+          set_source_files_properties (e.g. COMPILE_OPTIONS) apply to shared
+          and target sources alike.
 DEPS      From a closed list: cublas, cublaslt, cuda_driver, internal_cutlass,
           nccl, trtllm_gen_fmha_interface.
 REQUIRES  Build features: MULTI_DEVICE, NVSHMEM. Unmet requirements skip the
@@ -370,6 +375,20 @@ function(
     endif()
   endforeach()
 
+  # Shared code is assembled from the modeling_v2 directory, where source
+  # properties the family set in its own directory are not visible.
+  get_property(family_dir GLOBAL PROPERTY MODELING_V2_${family}_SOURCE_DIR)
+  foreach(source IN LISTS cu_sources cpp_sources)
+    foreach(property COMPILE_OPTIONS COMPILE_DEFINITIONS)
+      get_source_file_property(value "${source}" DIRECTORY "${family_dir}"
+                                                           ${property})
+      if(value)
+        set_source_files_properties("${source}" PROPERTIES ${property}
+                                                           "${value}")
+      endif()
+    endforeach()
+  endforeach()
+
   set(definitions
       TRTLLM_MV2_TORCH_NS=${torch_ns} TRTLLM_MV2_FAMILY_TORCH_NS=mv2_${family}
       TRTLLM_MV2_SCOPE=${scope})
@@ -454,19 +473,28 @@ function(add_modeling_v2_target family target)
   cmake_parse_arguments(PARSE_ARGV 2 arg "" "" "ARCHS;SOURCES;DEPS;REQUIRES")
   _modeling_v2_require_family("${family}")
   _modeling_v2_check_target_name("${target}")
-  if(NOT arg_ARCHS OR NOT arg_SOURCES)
+  if(NOT arg_ARCHS)
     message(
       FATAL_ERROR
-        "modeling_v2: add_modeling_v2_target(${family} ${target}) needs ARCHS and SOURCES"
-    )
+        "modeling_v2: add_modeling_v2_target(${family} ${target}) needs ARCHS")
   endif()
   _modeling_v2_check_deps(${arg_DEPS})
   _modeling_v2_camel(target_dir_name "${target}")
   set(target_dir "${CMAKE_CURRENT_SOURCE_DIR}/${target_dir_name}")
-  if(NOT IS_DIRECTORY "${target_dir}")
+  if(arg_SOURCES AND NOT IS_DIRECTORY "${target_dir}")
     message(
       FATAL_ERROR
         "modeling_v2: target '${target}' must live in directory ${target_dir}")
+  endif()
+  if(NOT arg_SOURCES)
+    get_property(has_shared GLOBAL PROPERTY MODELING_V2_${family}_HAS_SHARED)
+    if(NOT has_shared)
+      message(
+        FATAL_ERROR
+          "modeling_v2: target '${family}/${target}' has no SOURCES, so it runs "
+          "its family's shared code; declare add_modeling_v2_shared(${family} ...) "
+          "before it")
+    endif()
   endif()
 
   get_property(targets GLOBAL PROPERTY MODELING_V2_${family}_TARGETS)
@@ -489,21 +517,43 @@ function(add_modeling_v2_target family target)
 
   _modeling_v2_skip_reason(reason "${family}" "${target}" "${arg_ARCHS}"
                            "${arg_REQUIRES}")
+  if(reason STREQUAL "" AND NOT arg_SOURCES)
+    # A target without code of its own runs only where its shared code builds.
+    get_property(shared_archs_declared GLOBAL
+                 PROPERTY MODELING_V2_${family}_SHARED_ARCHS)
+    get_property(shared_requires GLOBAL
+                 PROPERTY MODELING_V2_${family}_SHARED_REQUIRES)
+    _modeling_v2_unmet_requirements(unmet ${shared_requires})
+    _modeling_v2_resolve_archs(shared_archs DECLARED ${shared_archs_declared})
+    if(NOT unmet STREQUAL "")
+      set(reason "its family's shared code is not built: ${unmet}")
+    elseif(NOT shared_archs)
+      set(reason "its family's shared code declares ${shared_archs_declared}")
+    endif()
+  endif()
   if(NOT reason STREQUAL "")
     message(STATUS "modeling_v2: ${family}/${target} not built: ${reason}")
     return()
   endif()
   _modeling_v2_resolve_archs(archs DECLARED ${arg_ARCHS})
-  message(STATUS "modeling_v2: ${family}/${target} built for ${archs}")
-  _modeling_v2_expand_sources(sources "${target_dir}" ${arg_SOURCES})
-  _modeling_v2_add_objects(
-    th_modeling_v2_${family}_${target_ident}
-    "${family}"
-    "${torch_ns}"
-    "${family}::${target_ident}"
-    "${archs}"
-    "${sources}"
-    "${arg_DEPS}")
+  if(arg_SOURCES)
+    message(STATUS "modeling_v2: ${family}/${target} built for ${archs}")
+    _modeling_v2_expand_sources(sources "${target_dir}" ${arg_SOURCES})
+    _modeling_v2_add_objects(
+      th_modeling_v2_${family}_${target_ident}
+      "${family}"
+      "${torch_ns}"
+      "${family}::${target_ident}"
+      "${archs}"
+      "${sources}"
+      "${arg_DEPS}")
+  else()
+    message(
+      STATUS
+        "modeling_v2: ${family}/${target} carried for ${archs} (family shared code only)"
+    )
+    set_property(GLOBAL APPEND PROPERTY MODELING_V2_${family}_ARCHS ${archs})
+  endif()
   set_property(GLOBAL APPEND PROPERTY MODELING_V2_${family}_BUILT "${target}")
 endfunction()
 

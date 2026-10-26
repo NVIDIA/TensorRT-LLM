@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
@@ -28,9 +29,11 @@ from tensorrt_llm._torch._experimental.modeling_v2 import _native
 from tensorrt_llm._torch._experimental.modeling_v2._native import (
     NativeLoadError,
     camel,
+    family_of,
     identifier,
     library_name,
     load_family_library,
+    load_family_ops,
     load_target_ops,
     namespace_of,
     split_target_package,
@@ -48,13 +51,16 @@ def libs(monkeypatch, tmp_path):
     """An empty libs directory and a cold library cache."""
     monkeypatch.setattr(_native, "_LIBS_DIR", tmp_path)
     monkeypatch.setattr(_native, "_built_targets", {})
+    monkeypatch.setattr(_native, "_family_ops", {})
     return tmp_path
 
 
 def _install(libs: Path, monkeypatch, opens) -> None:
-    """Put a fixture library in `libs`; `opens` stands in for dlopen."""
+    """Put a fixture library in `libs`; `opens` stands in for dlopen, and no
+    fake_ops module is imported, since the stand-in defines no op."""
     (libs / library_name("fixture")).write_bytes(b"")
     monkeypatch.setattr(_native, "_open_library", lambda path, family: opens())
+    monkeypatch.setattr(_native, "_import_fakes", lambda module, family: None)
 
 
 # --- Naming ----------------------------------------------------------------------
@@ -82,6 +88,10 @@ def test_names_of_libraries_and_namespaces():
     assert split_target_package(_FIXTURE) == ("fixture", "scale_add__sm_10x__default")
     with pytest.raises(ValueError):
         split_target_package("tensorrt_llm._torch.models")
+    assert family_of(f"{_FIXTURE}.ops.elementwise.scale_add") == "fixture"
+    assert family_of(_FIXTURE.rpartition(".")[0] + ".fake_ops") == "fixture"
+    with pytest.raises(ValueError):
+        family_of("tensorrt_llm._torch._experimental.modeling_v2.models")
 
 
 # --- Decisions -----------------------------------------------------------------
@@ -118,6 +128,42 @@ def test_a_library_opens_once(libs, monkeypatch):
     assert load_family_library("fixture") == {"scale_add__sm_10x__default"}
     assert load_family_library("fixture") == {"scale_add__sm_10x__default"}
     assert len(opened) == 1
+
+
+@pytest.fixture
+def torch_ops(monkeypatch):
+    """A stand-in torch.ops holding the fixture's namespaces."""
+    ops = types.SimpleNamespace(mv2_fixture=object(), mv2_fixture_scale_add_sm_10x_default=object())
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(ops=ops))
+    return ops
+
+
+def test_opening_a_library_registers_the_family_fakes_first(libs, monkeypatch, torch_ops):
+    _install(libs, monkeypatch, lambda: frozenset({"scale_add__sm_10x__default"}))
+    imported = []
+    monkeypatch.setattr(_native, "_import_fakes", lambda module, family: imported.append(module))
+    assert load_target_ops(_FIXTURE) is torch_ops.mv2_fixture_scale_add_sm_10x_default
+    family_package = _FIXTURE.rpartition(".")[0]
+    assert imported == [f"{family_package}.fake_ops", f"{_FIXTURE}.fake_ops"]
+
+
+def test_family_ops_are_the_family_namespace_and_load_once(libs, monkeypatch, torch_ops):
+    opened = []
+
+    def opens():
+        opened.append(1)
+        return frozenset({"scale_add__sm_10x__default"})
+
+    _install(libs, monkeypatch, opens)
+    module = f"{_FIXTURE}.ops.elementwise.scale_add"
+    assert load_family_ops(module) is torch_ops.mv2_fixture
+    assert load_family_ops(module) is torch_ops.mv2_fixture
+    assert len(opened) == 1
+
+
+def test_family_ops_of_a_family_this_installation_lacks_are_no_target(libs):
+    with pytest.raises(NoTarget, match="has no libth_modeling_v2_fixture.so"):
+        load_family_ops(f"{_FIXTURE}.ops.elementwise.scale_add")
 
 
 def test_windows_has_no_native_targets(libs, monkeypatch):

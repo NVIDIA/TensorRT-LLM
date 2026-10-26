@@ -124,6 +124,39 @@ The example below adds an op to target `foo_nvfp4__sm_103__tp4` of family
 
 No stock file changes along the way.
 
+### Code the family's targets share
+
+When several targets of a family call the same op, its code goes in the
+family's `shared/` once, and its ops are in the family's torch namespace,
+`torch.ops.mv2_<family>`:
+
+```cmake
+add_modeling_v2_family(foo)
+
+add_modeling_v2_shared(
+  foo
+  ARCHS 100f
+  SOURCES kernels/*.cu ops/*.cpp
+  REQUIRES MULTI_DEVICE)
+
+# Targets with no code of their own declare no SOURCES and have no directory;
+# declaring them is what makes the family library carry them.
+add_modeling_v2_target(foo foo_nvfp4__sm_100__tp8 ARCHS 100f)
+add_modeling_v2_target(foo foo_nvfp4__sm_100__tp16 ARCHS 100f)
+```
+
+- **Fakes** of the shared ops go in the family's `models/foo/fake_ops.py`; the
+  loader imports it right after it opens the library. Use
+  `torch_namespace(family_of(__name__))` for the namespace.
+- **Callers** anywhere in the family reach the ops through
+  `load_family_ops(__name__).my_op(...)`; after the first call it is a
+  dictionary lookup.
+- **Target packages** still start with `load_target_ops(__name__)`, which is
+  where routing finds out whether this build carries the target.
+- **A target without code of its own** is skipped whenever the shared code is
+  (an unmet `REQUIRES`, or no matching architecture), so the library never
+  carries a target whose ops it lacks.
+
 ## CMake API
 
 The functions are defined in `cpp/cmake/modules/modeling_v2.cmake`, in the style
@@ -132,13 +165,13 @@ of `add_th_common_family`.
 | Function | What it declares |
 |---|---|
 | `add_modeling_v2_family(<family>)` | The family; call it first in the family's `CMakeLists.txt`. |
-| `add_modeling_v2_target(<family> <target> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])` | One target's code, in `<targetCamel>/`. |
+| `add_modeling_v2_target(<family> <target> ARCHS ... [SOURCES ...] [DEPS ...] [REQUIRES ...])` | One target's code, in `<targetCamel>/`; without `SOURCES`, a target that runs only its family's shared code. |
 | `add_modeling_v2_shared(<family> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])` | Code several targets of the family call, in `shared/`. Its ops are in `torch.ops.mv2_<family>`. |
 
 | Keyword | Meaning |
 |---|---|
 | `ARCHS` | `NN`, `NNa` or `NNf`, intersected with the build's requested architectures: `NN`/`NNa` build when `NN` is requested; `NNf` builds when any member of family `NN` is. This is how flash_mla and deep_ep choose their architectures. A target whose intersection is empty is **not built**: no placeholder kernels, and the configure step prints why. The declared architectures must cover the SM in the target's name; when moving existing code, keep the architectures it was gated with. |
-| `SOURCES` | Paths or globs relative to the unit's directory. `.cu` files are compiled for `ARCHS` without torch; `.cpp` files are the torch bindings. |
+| `SOURCES` | Paths or globs relative to the unit's directory. `.cu` files are compiled for `ARCHS` without torch; `.cpp` files are the torch bindings. A per-file option goes on the file itself, in the family's `CMakeLists.txt`: `set_source_files_properties(shared/kernels/x.cu PROPERTIES COMPILE_OPTIONS --use_fast_math)`. |
 | `DEPS` | `cublas`, `cublaslt`, `cuda_driver`, `internal_cutlass`, `nccl`, `trtllm_gen_fmha_interface`. Ask for anything else by extending the module. |
 | `REQUIRES` | `MULTI_DEVICE`, `NVSHMEM`. A target whose requirement the build lacks (e.g. a single-device build) is skipped and recorded. |
 

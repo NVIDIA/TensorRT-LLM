@@ -23,8 +23,12 @@ of routing, and it follows how the stock code treats its optional native modules
 * which targets a library carries it answers itself,
   ``torch.ops.mv2_<family>.built_targets()``, the way ``th_common`` answers feature
   queries; a target it does not carry is :class:`NoTarget`;
-* the target's ``fake_ops.py`` registers right after the library opens, which fails
-  if an op it declares is missing from the library.
+* the family's ``fake_ops.py`` (its shared ops) registers right after the library
+  opens, and the target's ``fake_ops.py`` right after the target is found in it;
+  either fails if an op it declares is missing from the library.
+
+Ops of a family's shared code are in ``torch.ops.mv2_<family>``; code of the family
+reaches them through :func:`load_family_ops`.
 
 ``cpp/tensorrt_llm/modeling_v2/README.md`` is the guide for authors.
 """
@@ -46,6 +50,7 @@ _MODELS_PACKAGE = f"{_PACKAGE}.models"
 _LIBS_DIR = Path(__file__).resolve().parents[3] / "libs"
 
 _built_targets: Dict[str, FrozenSet[str]] = {}
+_family_ops: Dict[str, Any] = {}
 
 
 class NativeLoadError(RuntimeError):
@@ -97,12 +102,34 @@ def split_target_package(package: str) -> Tuple[str, str]:
     return parts[0], parts[1]
 
 
+def family_of(module: str) -> str:
+    """The family of a module anywhere under ``models.<family>``."""
+    prefix = f"{_MODELS_PACKAGE}."
+    family = module[len(prefix) :].partition(".")[0] if module.startswith(prefix) else ""
+    if not family:
+        raise ValueError(f"{module!r} is not a module of a modeling_v2 family")
+    return family
+
+
 def namespace_of(package: str) -> str:
     """The torch namespace of the target package ``package``, e.g. for its fake_ops.py."""
     return torch_namespace(*split_target_package(package))
 
 
 # --- Loading ------------------------------------------------------------------
+
+
+def _import_fakes(module: str, family: str) -> None:
+    """Import a ``fake_ops`` module, if there is one; it registers fakes of ops the
+    family library must define."""
+    if importlib.util.find_spec(module) is None:
+        return
+    try:
+        importlib.import_module(module)
+    except (AttributeError, RuntimeError, ValueError) as error:
+        raise NativeLoadError(
+            f"{module} does not match the ops in {library_name(family)}: {error}"
+        ) from None
 
 
 def _open_library(path: Path, family: str) -> FrozenSet[str]:
@@ -135,6 +162,7 @@ def load_family_library(family: str) -> FrozenSet[str]:
         built = _open_library(path, family)
     except (AttributeError, OSError, RuntimeError) as error:
         raise NativeLoadError(f"{path} is installed but cannot be loaded: {error}") from None
+    _import_fakes(f"{_MODELS_PACKAGE}.{family}.fake_ops", family)
     _built_targets[family] = built
     return built
 
@@ -157,14 +185,26 @@ def load_target_ops(package: str) -> Any:
             f"TRTLLM_MODELING_V2_TARGETS excluded it); it carries {carried}"
         )
 
-    fake_ops = f"{package}.fake_ops"
-    if importlib.util.find_spec(fake_ops) is not None:
-        try:
-            importlib.import_module(fake_ops)
-        except (AttributeError, RuntimeError, ValueError) as error:
-            raise NativeLoadError(
-                f"{fake_ops} does not match the ops in {library_name(family)}: {error}"
-            ) from None
+    _import_fakes(f"{package}.fake_ops", family)
     import torch
 
     return getattr(torch.ops, torch_namespace(family, target))
+
+
+def load_family_ops(module: str) -> Any:
+    """Load the native code of the family ``module`` belongs to and return the ops of
+    its shared code, ``torch.ops.mv2_<family>``.
+
+    Call it with ``__name__`` from any module of the family, where the op is used;
+    after the first call it is a dictionary lookup. Raises like
+    :func:`load_family_library`. Whether a target is carried is
+    :func:`load_target_ops`'s check, which the target's ``__init__.py`` runs first.
+    """
+    ops = _family_ops.get(module)
+    if ops is None:
+        family = family_of(module)
+        load_family_library(family)
+        import torch
+
+        ops = _family_ops[module] = getattr(torch.ops, torch_namespace(family))
+    return ops

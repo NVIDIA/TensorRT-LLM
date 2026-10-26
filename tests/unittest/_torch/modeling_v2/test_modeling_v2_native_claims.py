@@ -228,18 +228,26 @@ _OP_DEF = re.compile(r'\bm\.def\(\s*"(\w+)\(')
 
 
 def test_every_native_op_has_a_fake():
-    """fake_ops.py doubles as the Python side's list of a target's ops: the
-    loader imports it, so an op without a fake is one torch.compile and fake
-    tracing cannot see, and a fake without an op fails the load."""
-    for family, target, _ in _targets():
-        target_dir = _families()[family] / camel(target)
+    """fake_ops.py doubles as the Python side's list of a unit's ops: the loader
+    imports it, so an op without a fake is one torch.compile and fake tracing
+    cannot see, and a fake without an op fails the load. A target's ops have
+    their fakes in the target's fake_ops.py, the family's shared ops in the
+    family's."""
+    units = [(_families()[f] / camel(t), _MODELS / f / t) for f, t, _ in _targets()]
+    units += [(d / "shared", _MODELS / f) for f, d in _families().items()]
+    for native_dir, python_dir in units:
+        if not native_dir.is_dir():
+            continue
         ops = sorted(
-            {op for p in _native_files(target_dir) for op in _OP_DEF.findall(p.read_text())}
+            {op for p in _native_files(native_dir) for op in _OP_DEF.findall(p.read_text())}
         )
         if not ops:
             continue
-        fake_ops = _MODELS / family / target / "fake_ops.py"
-        assert fake_ops.is_file(), f"{family}/{target} defines {ops} but has no fake_ops.py"
+        fake_ops = python_dir / "fake_ops.py"
+        assert fake_ops.is_file(), (
+            f"{native_dir.relative_to(_REPO)} defines {ops}, "
+            f"but {fake_ops.relative_to(_REPO)} does not exist"
+        )
         text = fake_ops.read_text()
         missing = [op for op in ops if f'::{op}"' not in text]
         assert not missing, f"{fake_ops.relative_to(_REPO)} has no fake for {missing}"

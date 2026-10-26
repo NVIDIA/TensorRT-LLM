@@ -114,6 +114,7 @@ _router_index.py    architectures[0] -> routing module. Small, stable, test-guar
 _native.py          loads a target's native code (see "Native code" below)
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
+  fake_ops.py       fakes of the family's shared native ops, if it has any
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
@@ -132,7 +133,9 @@ family's targets, whose `__init__.py` starts with
 `native_ops = load_target_ops(__name__)`. As with the stock code's optional
 native modules, a library this installation does not carry is a `NoTarget`, so
 `auto` keeps the built-in model; one that is installed but broken is a
-`NativeLoadError`, never a fallback.
+`NativeLoadError`, never a fallback. Code several targets of a family share is
+built once, in the family's `shared/`; its ops are `torch.ops.mv2_<family>`,
+which family code reaches with `load_family_ops(__name__)`.
 `cpp/tensorrt_llm/modeling_v2/README.md` is the guide, and
 `models/fixture/`, a temporary infrastructure fixture rather than a model, is
 the smallest complete example.
