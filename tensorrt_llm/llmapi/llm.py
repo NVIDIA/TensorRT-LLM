@@ -55,7 +55,7 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from ._load_balance_env import configure_moe_launch_queues
+from ._load_balance_env import LAUNCH_QUEUES_ENV, configure_moe_launch_queues
 from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, ExecutorMemoryType,
@@ -385,6 +385,7 @@ class BaseLLM:
 
         try:
             env_overrides = kwargs.get("env_overrides", None)
+            launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
             # Rebalance validation and launch-queue setup read process state.
             # Apply caller overrides before either one observes that state.
             self._process_env_overrides(env_overrides)
@@ -395,7 +396,7 @@ class BaseLLM:
                     moe_config = MoeConfig(**moe_config)
                     kwargs["moe_config"] = moe_config
                 queue_overrides = configure_moe_launch_queues(
-                    moe_config, env_overrides)
+                    moe_config, env_overrides, initial_setting=launch_queues)
                 if queue_overrides is not env_overrides:
                     kwargs["env_overrides"] = queue_overrides
                     env_overrides = queue_overrides

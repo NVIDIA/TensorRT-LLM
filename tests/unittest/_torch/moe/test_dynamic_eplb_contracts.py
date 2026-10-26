@@ -1080,6 +1080,16 @@ def test_launch_queue_is_enabled_only_for_per_layer_dynamic_mode(monkeypatch):
         module.configure_moe_launch_queues(config(), original)
     assert original == {"KEEP": "value"}
     assert _QUEUE not in test_environ
+
+    # A replayed override is too late for a context that already exists:
+    # the check reads the setting the process had before the replay.
+    test_environ[_QUEUE] = "4x"
+    with pytest.raises(RuntimeError, match="before CUDA initialization"):
+        module.configure_moe_launch_queues(config(), original, initial_setting=None)
+    assert module.configure_moe_launch_queues(config(), original, initial_setting="4x") == {
+        "KEEP": "value",
+        _QUEUE: "4x",
+    }
     assert os.environ.get(_QUEUE) == process_queue
 
 
@@ -1118,9 +1128,10 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
     user_overrides = {"USER_SETTING": "1"}
     configured = {**user_overrides, _QUEUE: "4x"}
 
-    def configure_moe_launch_queues(moe_config, env_overrides):
-        # The override must already be visible when the launch queue is configured.
-        events.append(("configure", environ.get("USER_SETTING")))
+    def configure_moe_launch_queues(moe_config, env_overrides, *, initial_setting):
+        # The override must already be visible when the launch queue is configured,
+        # while the late-init check sees the setting from before the replay.
+        events.append(("configure", environ.get("USER_SETTING"), initial_setting))
         return {**(env_overrides or {}), _QUEUE: "4x"}
 
     def runtime_init(name):
@@ -1142,11 +1153,12 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
             backend="pytorch", env_overrides=dict(user_overrides), moe_config=object()
         )
 
-    expected = [("env", "USER_SETTING", "1"), ("configure", "1")]
+    expected = [("env", "USER_SETTING", "1"), ("configure", "1", None)]
     common = {
         "os": fake_os,
         "logger": logger,
         "configure_moe_launch_queues": configure_moe_launch_queues,
+        "LAUNCH_QUEUES_ENV": _QUEUE,
     }
 
     # LLM API: argument validation is the first step that may probe CUDA.
@@ -2779,3 +2791,24 @@ def test_standard_load_balancer_unsafe_preflight_skips_destructive_cleanup():
 
     assert manager.shutdown(local_safe=True) is False
     assert calls == [("allgather", False)]
+
+
+def test_standard_load_balancer_finalizer_releases_it_as_on_main():
+    manager_cls = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/moe_load_balancer.py",
+        "MoeLoadBalancer",
+        {"__del__"},
+        {},
+    )
+    calls = []
+    manager = manager_cls()
+    manager.shutdown = lambda: calls.append("shutdown")
+
+    manager.is_shutdown = True
+    manager.__del__()
+    assert calls == []
+
+    manager.is_shutdown = False
+    manager.__del__()
+    assert calls == ["shutdown"]
+    manager.is_shutdown = True

@@ -28,7 +28,8 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
-from ..llmapi._load_balance_env import (configure_moe_launch_queues,
+from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
+                                        configure_moe_launch_queues,
                                         uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
@@ -376,6 +377,7 @@ def worker_main(
     hmac_key: bytes = b"",
 ) -> None:
 
+    launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
     if llm_args is not None and llm_args.env_overrides:
         # MPI may have cached the parent's environment before this worker was
         # spawned, so replay overrides before any rebalance state is inspected.
@@ -384,7 +386,9 @@ def worker_main(
     # Configure per-layer dynamic EPLB before MPI or CUDA state is created.
     if llm_args is not None and llm_args.backend == "pytorch":
         queue_overrides = configure_moe_launch_queues(
-            getattr(llm_args, "moe_config", None), llm_args.env_overrides)
+            getattr(llm_args, "moe_config", None),
+            llm_args.env_overrides,
+            initial_setting=launch_queues)
         if queue_overrides is not llm_args.env_overrides:
             llm_args.env_overrides = queue_overrides
 

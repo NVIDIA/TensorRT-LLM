@@ -37,7 +37,8 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
-from ..llmapi._load_balance_env import (configure_moe_launch_queues,
+from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
+                                        configure_moe_launch_queues,
                                         uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
@@ -102,11 +103,14 @@ class BaseWorker(GenerationExecutor):
         llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
         # Direct worker construction also bypasses BaseLLM/worker_main.
+        launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
         if llm_args is not None and llm_args.env_overrides:
             os.environ.update(llm_args.env_overrides)
         if llm_args is not None and llm_args.backend == "pytorch":
             queue_overrides = configure_moe_launch_queues(
-                getattr(llm_args, "moe_config", None), llm_args.env_overrides)
+                getattr(llm_args, "moe_config", None),
+                llm_args.env_overrides,
+                initial_setting=launch_queues)
             if queue_overrides is not llm_args.env_overrides:
                 llm_args.env_overrides = queue_overrides
 

@@ -916,13 +916,13 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
 
         self.next_layer_repeated_count = None
 
+    # Without per-layer dynamic EPLB, executor teardown is rank-local and this
+    # balancer is released by its own finalizer, which unlinks its shared memory.
+    shutdown_on_finalize = True
+
     def __del__(self):
-        # MPI collectives are unsafe from rank-asymmetric Python finalization.
-        # Normal worker teardown calls shutdown() explicitly on every rank.
         if not getattr(self, "is_shutdown", True):
-            logger.warning(
-                "MoeLoadBalancer was finalized before explicit collective shutdown"
-            )
+            self.shutdown()
 
     def is_static_routing(self):
         # if we don't update, then it is statistic routing.

@@ -30,7 +30,8 @@ from tensorrt_llm.executor.ray.utils import (_configure_deep_gemm_cache,
                                              control_action_decorator)
 
 from ... import TorchLlmArgs
-from ...llmapi._load_balance_env import (configure_moe_launch_queues,
+from ...llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
+                                         configure_moe_launch_queues,
                                          uses_collective_shutdown)
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
@@ -59,11 +60,14 @@ class RayWorkerWrapper:
 
     def __init__(self, worker_cls, worker_kwargs, world_size, rank):
         llm_args = worker_kwargs.get("llm_args")
+        launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
         if llm_args is not None and llm_args.env_overrides:
             os.environ.update(llm_args.env_overrides)
         if llm_args is not None and llm_args.backend == "pytorch":
             queue_overrides = configure_moe_launch_queues(
-                getattr(llm_args, "moe_config", None), llm_args.env_overrides)
+                getattr(llm_args, "moe_config", None),
+                llm_args.env_overrides,
+                initial_setting=launch_queues)
             if queue_overrides is not llm_args.env_overrides:
                 llm_args.env_overrides = queue_overrides
 

@@ -1105,14 +1105,11 @@ class ModelEngine:
         if encoder_cache is not None:
             encoder_cache.clear()
 
-    def prepare_cleanup(self,
-                        *,
-                        release_nccl_window_owners: bool = True) -> None:
+    def prepare_cleanup(self, *, release_nccl_window_owners: bool = True) -> None:
         """Release local graph captures before collective model teardown."""
         if self._cleanup_done:
             return
-        self._release_cuda_graphs(
-            release_nccl_window_owners=release_nccl_window_owners)
+        self._release_cuda_graphs(release_nccl_window_owners=release_nccl_window_owners)
 
     def shutdown_moe_load_balancer(self, *, local_safe: bool) -> bool:
         """Run the manager's rank-aligned teardown preflight and collectives."""
@@ -1121,8 +1118,7 @@ class ModelEngine:
         moe_load_balancer = getattr(self, "moe_load_balancer", None)
         if moe_load_balancer is None:
             return bool(local_safe)
-        return moe_load_balancer.shutdown(
-            local_safe=bool(local_safe)) is not False
+        return moe_load_balancer.shutdown(local_safe=bool(local_safe)) is not False
 
     def finish_cleanup(self) -> None:
         """Release rank-local model resources after collective teardown."""
@@ -1163,10 +1159,14 @@ class ModelEngine:
             # Destruction timing is not rank-symmetric; only explicit shutdown
             # releases NCCL window owners.
             self.prepare_cleanup(release_nccl_window_owners=False)
-            if getattr(self, "moe_load_balancer", None) is not None:
+            moe_load_balancer = getattr(self, "moe_load_balancer", None)
+            if moe_load_balancer is not None and not getattr(
+                moe_load_balancer, "shutdown_on_finalize", False
+            ):
                 logger.warning(
                     "Skipping collective MoE load-balancer shutdown from Python finalization; "
-                    "terminal executor shutdown must release it explicitly")
+                    "terminal executor shutdown must release it explicitly"
+                )
             self.finish_cleanup()
             return
 
@@ -1176,14 +1176,11 @@ class ModelEngine:
         except BaseException as error:  # Preserve rank alignment before surfacing it.
             prepare_error = error
 
-        manager_safe = self.shutdown_moe_load_balancer(
-            local_safe=prepare_error is None)
+        manager_safe = self.shutdown_moe_load_balancer(local_safe=prepare_error is None)
         if prepare_error is not None:
             raise prepare_error
         if not manager_safe:
-            raise RuntimeError(
-                "MoE load-balancer collective shutdown was not safe on every rank"
-            )
+            raise RuntimeError("MoE load-balancer collective shutdown was not safe on every rank")
         self.finish_cleanup()
 
     def __del__(self) -> None:

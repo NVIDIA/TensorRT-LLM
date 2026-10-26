@@ -15,10 +15,15 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .llm_args import MoeConfig
 
+LAUNCH_QUEUES_ENV = "CUDA_SCALE_LAUNCH_QUEUES"
+_FROM_ENVIRON = object()
+
 
 def configure_moe_launch_queues(
     moe_config: MoeConfig | None,
     env_overrides: dict[str, Any] | None = None,
+    *,
+    initial_setting: Any = _FROM_ENVIRON,
 ) -> dict[str, Any] | None:
     """Configure the per-layer dynamic EPLB launch queue before CUDA setup.
 
@@ -27,6 +32,11 @@ def configure_moe_launch_queues(
     CUDA has no supported operation to resize existing launch queues here.
     The late-init guard detects PyTorch initialization; external CUDA users
     must still arrange for this setting before initializing their contexts.
+
+    ``initial_setting`` is this process's ``CUDA_SCALE_LAUNCH_QUEUES`` before
+    the caller replayed ``env_overrides``: an existing CUDA context was created
+    with that value, not with the replayed one. It defaults to the current
+    environment.
     """
     if moe_config is not None:
         moe_config.resolve_load_balancer_compatibility()
@@ -34,9 +44,11 @@ def configure_moe_launch_queues(
     if getattr(load_balancer, "mode", None) != "per_layer_dynamic":
         return env_overrides
 
-    name = "CUDA_SCALE_LAUNCH_QUEUES"
+    name = LAUNCH_QUEUES_ENV
+    if initial_setting is _FROM_ENVIRON:
+        initial_setting = os.environ.get(name)
     torch = sys.modules.get("torch")
-    if os.environ.get(name) != "4x" and torch is not None and torch.cuda.is_initialized():
+    if initial_setting != "4x" and torch is not None and torch.cuda.is_initialized():
         raise RuntimeError(
             "Per-layer dynamic EPLB requires CUDA_SCALE_LAUNCH_QUEUES=4x "
             "before CUDA initialization. Restart the process with that "
