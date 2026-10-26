@@ -21,6 +21,31 @@ helper on other hardware; there is no CSA2 FMHA registration or controller.
 | SM120/121 | `CSA2FlashInfer` | FlashInfer BF16 FA2 |
 | SM90 | `CSA2FlashMLA` | FlashMLA sparse BF16 |
 
+FP8 context tiles that stage the shared E4M3 bank with 64 query heads per rank
+run `torch.ops.trtllm.csa2_sparse_context` (`cpp/tensorrt_llm/kernels/csa2SparseContext`)
+instead of the trtllm-gen context FMHA, which serves every other tile. Staging
+is unchanged; the kernel reads FP8 Q, or quantizes BF16 Q with the staging scale
+on load to the bytes the context FP8 quantizer writes, and follows the trtllm-gen
+FP8 softmax (P rounded to E4M3 after scaling by 448, FP32 row sums, sink in the
+denominator).
+
+Generation steps of at most 16 query rows per rank instead attend the
+selected rows straight from the persistent caches (`direct_decode.py`): one
+CuTe DSL launch decodes the SWA and main rows exactly into BF16 shared memory
+and attends them with the BF16 query and the sink, so neither the FP8 staging
+nor the native FMHA runs. The backend decides per tile in
+`direct_decode_applies` (generation-only forwards without context tokens,
+SM100/SM103, a geometry that fits one CTA's shared memory); every layer of such
+a forward takes it, and larger batches keep the staging path.
+
+Decode work of the indexer that does not depend on the layer's own projections runs on
+CSA2 side streams: a Full layer of a forward without context tokens projects its index
+weights on one and refreshes the paged indexer descriptors on another while the auxiliary
+stream runs the compressor (the indexer joins them through `CSA2ForwardState.index_ready`),
+and the candidate source publishes its candidates and builds its consumers' sparse logits
+schedule on the first, next to its own TopK (consumers wait for both). Every kernel and
+input stays the same, so results are bit-identical.
+
 `backend.py` contains the single sparse backend and both plain Flash helper
 classes. The opt-in packed path uses the backend's explicit `forward_packed`
 method. The module issues one attention call per real phase (all context
@@ -86,7 +111,9 @@ the compressed main latent before main-KV RoPE. Ratio-two compression reuses
 the native V4 non-overlap compressor with FP32 value/gate state and zero APE
 and, like V4, projects values and gates with the checkpoint's fused `wkv_gate`
 weight. Ratio one has an uncompressed global cache and no compression gate.
-Normalization uses the shared `RMSNorm` module; index head weights are FP32.
+Normalization uses the shared `RMSNorm` module; index head weights are FP32,
+except that candidate consumers project BF16 weights, the dtype their sparse
+MQA logits read.
 
 BF16 projection execution is the default. Optional
 `projection_quantization="mxfp8"` uses native MXFP8 linear/grouped output
@@ -109,28 +136,32 @@ SM100 decode uses native paged FP4 MQA for supported index-head geometry,
 including padding smaller head counts into native specializations. The index
 buffer is read in place: metadata derives a native block table from the owner's
 GLOBAL page table once per owner and forward, unallocated pages read page zero
-and are masked per position, and decode TopK selects directly over the paged
-logits. Candidate consumers gather their candidate columns from the same paged
-logits when the exact radix decode TopK is configured. Other hardware, and
-decode TopK variants that address columns as key positions, use bounded
-gathering with inherited MQA. Reuse layers consume logical selections from
-their index source and resolve current physical pages without recomputing
-indexer logits.
+and are masked by one validity byte per page, and decode TopK selects directly
+over the paged logits. Candidate consumers score only their published candidate
+blocks with DeepGEMM sparse MQA logits: straight from the index pages for decode
+with the exact radix TopK, which selects over the kernel's BF16 logits as they
+are, and over each context request's gathered prefix for prefill; they require
+SM100 and 32 index heads of 128D rows. Reuse layers
+consume logical selections from their index source and resolve current physical
+pages without recomputing indexer logits.
 
 CuTe DSL kernels in `kernel.py` handle the decode selection glue: one derives
-the native block table, visibility and position validity of an owner from its
-page table, one masks unbacked positions in the paged logits (or gathers
-candidate-ordered scores), one validates, maps and sorts the selected rows in
-place, and the candidate source publishes its block hierarchy (block maxima,
-pinned newest block, Top-K blocks expanded to positions). The TopK module sits
-between the mask and the finalize launch, so exact, self-sampling and temporal
-GVR TopK all select over the same masked scores; a temporal prior that lands
-on a masked column is dropped before the GVR kernel seeds its threshold.
+the native block table, visibility and page validity of an owner from its
+page table, one masks unbacked pages in the paged logits, one validates and
+sorts the selected rows in place, one maps candidate consumers' Top-K columns to
+logical positions in place, and the candidate source publishes its block
+hierarchy (block maxima over backed positions, pinned newest block, Top-K blocks
+expanded to ascending positions and DeepGEMM sparse block ids). The TopK module
+sits between the mask and the finalize launch, so exact, self-sampling and
+temporal GVR TopK all select over the same masked scores; a temporal prior that
+lands on a masked column is dropped before the GVR kernel seeds its threshold.
 
-Exact CUDA TopK is the default; short sequences whose keys all fit can
+TopK is exact by default: eligible prefill of at least 8192 score columns uses
+the single-pass self-sampling engine, narrower prefill and decode the radix
+TopK. Short sequences whose keys all fit can
 enumerate visible positions without logits or TopK. Internal `CSA2Params` also
-exposes eligible CuTe DSL exact TopK, self-sampling/temporal GVR, and CuTe paged
-MQA/emission options. Temporal
+exposes eligible CuTe DSL exact TopK, self-sampling/temporal GVR decode, and CuTe
+paged MQA/emission options. Temporal
 priors use request allocation epochs and logical positions, seed first decode
 from accepted prefill, and follow request identity across reordering. Rewind
 and multi-query verification invalidate unsafe hints. Emission state resets
@@ -217,13 +248,23 @@ separate native reconstruction acknowledgement or per-layer completion event.
 The CED prepass applies the boundary layer's collapse, normalization and
 GLOBAL/index projections to the complete encoder states before narrowing
 decoder queries. The query pass preserves those cache entries and still
-executes its attention and FFN. Replay is enabled by default and retains one
-SWA window: 128 rows at layer 20 for the released checkpoint, enlarged when
-DSpark needs a wider capture window. This policy is approximate across stacked
+executes its attention and FFN. Replay is enabled by default with a shared
+Encoder/Decoder range of 140 tokens, controlled by
+`TRTLLM_V41_BOUNDED_REPLAY_TOKENS`. This must exceed the required SWA window
+(including the embedded DSpark capture window), without a physical-ring or
+page-alignment constraint. The released checkpoint's SWA window remains 128.
+This policy is approximate across stacked
 SWA layers and requires accuracy validation. Set
 `TRTLLM_V41_DECODER_BOUNDED_REPLAY=0` for full decoder prefill. Model defaults
-enable chunked prefill and disable prefix block reuse and SWA scratch reuse;
-explicit user settings take precedence.
+enable chunked prefill and SWA scratch reuse, and disable prefix block reuse;
+explicit user settings take precedence. Scratch remains allocated for the full
+chunk, including Decoder layers whose queries are skipped. Compatible layers
+within a lifecycle share scratch; different reuse policies keep separate scratch
+allocations. Retained replay-window KV stays in ordinary pages and survives the
+Decoder metadata rebuild. A normal page reserved for DSpark also remains in use
+if its block enters a later chunk's scratch range; only blocks without normal
+pages use scratch. Full-context logits and additional-output requests run
+every context row and can use scratch in both model halves.
 
 Ordinary text requests execute the intersection of each context chunk with
 the final prompt window `[max(0, prompt_end - window), prompt_end)`. Earlier
@@ -256,8 +297,8 @@ The target publishes per-context valid capture lengths after replay exit.
 DSpark skips unwritten captures and advances its rolling window's valid length
 only by captured rows; absolute prompt positions still advance normally.
 All generation verification rows retain their original batch offsets.
-A wider embedded draft window enlarges the Decoder window
-and the maximum Encoder recovery interval together.
+A wider embedded draft window requires setting `TRTLLM_V41_BOUNDED_REPLAY_TOKENS`
+above that window for both Decoder replay and Encoder recovery.
 Decoder KV carries progress between chunks through normal cache suspension
 and resume; no HC residual/pre-mix tail is retained across forwards. Only the
 final context chunk's logits are used for sampling. Requests asking for context logits
@@ -293,9 +334,19 @@ Disaggregated remote-tail execution keeps its input counts across all layers:
 the replay rows are selected before model execution. Its existing ADP role
 requirements and restriction against speculative decoding still apply.
 
-Prefix reuse keeps required Encoder state unless
-`TRTLLM_V41_ENCODER_REPLAY=1` permits independently evictable OPTIONAL groups.
-Missing Encoder state can then be recovered with bounded replay. A complete
+Encoder bounded replay is enabled by default when Decoder bounded replay is
+enabled. Prefix reuse uses independently evictable OPTIONAL Encoder groups;
+`TRTLLM_V41_ENCODER_REPLAY=0` requires cached Encoder state instead.
+When `max_num_tokens` is no larger than the recovery window (including an
+embedded DSpark capture window), Encoder replay falls back to required Encoder
+checkpoints. The model, cache pools and memory sizing use this same decision;
+Decoder bounded replay remains enabled.
+
+Encoder groups keep REQUIRED/OPTIONAL policy even when prefix reuse is disabled;
+the global reuse switch disables lookup and publication without changing scratch
+grouping. Decoder SWA remains PRIVATE.
+
+Missing Encoder state can be recovered with bounded replay. A complete
 Encoder checkpoint can be used even for a one-token chunk if its prefix ends
 before or at the final decoder window. A hit inside that window still needs
 Encoder replay to produce the missing decoder inputs.
@@ -305,12 +356,14 @@ of Decoder replay. Partial Encoder checkpoint reuse remains future work:
 OPTIONAL coverage at a non-block-aligned Global endpoint is currently incomplete
 and triggers Encoder replay while retaining the Global hit.
 
-Encoder recovery starts at `max(0, P - R)`, where `R` includes an enlarged
-embedded DSpark capture window. Physical SWA retention is at least `R + 1`
-before speculative reserves: ordinary next-query retention would otherwise
-drop the first recovery row at some partial-block endpoints. This applies to
-all SWA page views prepared before the Decoder boundary. Pool construction and
-memory sizing share this rule; the attention window itself is unchanged.
+Encoder recovery starts at `max(0, P - R)`, using the same configured `R` as
+Decoder replay. Physical SWA retention is at least `R + 1` for Decoder layers
+and, when Encoder replay is enabled, Encoder layers, before speculative and
+reuse-backoff reserves. The extra row protects the first replay row at
+partial-block endpoints. Checkpoint coverage and pool sizing use the same
+enlarged window; the attention window itself remains unchanged. First resume
+uses the ordinary fresh-page allocation for missing OPTIONAL and PRIVATE groups,
+which covers historical replay rows without an additional native cache interface.
 The executor declares the pending Encoder replay before its first metadata
 preparation, including the active Global claim, source interval and SWA read
 floor. Historical query rows are excluded from GLOBAL/compressor source rows
@@ -321,15 +374,13 @@ or KV-length save/restore; only successful execution consumes the replay plan.
 Compressor state retains its ordinary short tail.
 
 Unsupported topology and speculative workers other than embedded DSpark retain full prefill.
-Explicit SWA scratch reuse and a late
-Engram layer retain the ordinary cache lifecycle rather than allocating private
+An Engram layer after the final KV owner retains the ordinary cache lifecycle rather than allocating private
 decoder replay pages. The executor passes ordinary context requests to the model
 only when the cache uses that lifecycle. Physical row ranges come from attention
 metadata; Encoder recovery comes from the request's resume result. There is no
 separate CED request plan, warmup flag, or decode-only flag. Engram history uses
 the ordinary input-preparation hook with the Encoder recovery start position.
-Explicit scratch reuse executes full decoder
-prefill. CUDA graph defaults are inherited from the normal model configuration.
+CUDA graph defaults are inherited from the normal model configuration.
 Engines with prefill graphs enabled retain per-chunk replay even on eager
 chunks, since a later graph may consume that chunk's Decoder history. Ordinary
 generation CUDA graphs do not disable final-window replay.
@@ -353,7 +404,9 @@ existing output contract; this does not add arbitrary hidden-state exports.
 ## Metadata, graphs and workspace
 
 `CSA2TrtllmMetadata.prepare()` resolves real request IDs, cached lengths and V2
-page converters. Layer-specific SWA/visibility, owner page tables/write slots,
+page converters. Model-driven metadata leaves an eager all-context batch's prepare
+and block-offset copy to its first CSA2 layer, and an eager context batch prepares
+the KV owner tables at its first layer with a KV owner. Layer-specific SWA/visibility, owner page tables/write slots,
 compression inputs, candidates and routing results live directly on metadata.
 `global_slot_tile()` resolves pages without a persistent token-by-context map.
 As in DeepSeek-V4, the manager converts every per-layer page table of a batch
@@ -362,9 +415,8 @@ snapshot of the batch's base page rows; the generic block-offset upload copies
 the SWA tables from it and prepare reuses the rest, checking allocations against
 the base pages. The forward resolves all layers' SWA slots and visibility in one
 launch at its first layer. Decoder boundaries raise read-only SWA floors: rows
-below them still write their SWA. Live KV-length updates refresh positions with
-tensor operations and every KV owner's GLOBAL write slots and compressed groups
-with one CuTe DSL launch; host-resident metadata uses the equivalent PyTorch
+below them still write their SWA. Live KV-length updates refresh positions and
+every KV owner's GLOBAL write slots and compressed groups in one CuTe DSL launch; host-resident metadata uses the equivalent PyTorch
 expressions. A steady generation step keeps the previous geometry and re-reads
 the page tables only when a request crosses a page.
 
@@ -397,12 +449,15 @@ conservatively reserves the full fixed capacity alongside the profiled peak.
 A decode arena may first appear after peak prefill, so its final retained bytes
 do not establish how much arena storage coexisted with that earlier peak.
 `get_workspace_bytes()` also deduplicates metadata/frame/prior storage separately
-from manager pools. The index-prefill gather declares a conservative per-token
-rate; it consumes the full compressed prefix even with chunked prefill. The
-executor's attended-KV admission cap bounds that gather independently of the
-fixed graph arena. Query-dependent logits, projection/provider/native scratch
-and the optional packed kernel's split-KV workspace still require representative
-peak-memory profiling at the actual serving geometry.
+from manager pools. The index-prefill gather consumes the full compressed
+prefix even with chunked prefill; it declares 69 bytes per gathered key for
+each query piece of a request on the native path (512 on the decoded fallback).
+The executor's attended-KV admission cap bounds that gather independently of the
+fixed graph arena. The fixed reserve also covers one prefill indexer group's FP32
+logits and candidate block maxima, bounded by the MQA logits element budget.
+Projection/provider/native scratch and the optional packed kernel's split-KV
+workspace still require representative peak-memory profiling at the actual
+serving geometry.
 
 ## Optional packed attention and remaining scope
 

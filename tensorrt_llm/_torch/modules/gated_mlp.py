@@ -488,7 +488,9 @@ class GatedMLP(nn.Module):
             h2 = self._fused_gate_up_swiglu(x)
         else:
             h1 = self.gate_up_proj(x)
-            if self._can_fuse_swiglu_fp8_quant():
+            if self._can_fuse_swiglu_fp8_quant(
+            ) and not self.down_proj.prefers_bf16_swiglu_input(
+                    h1.reshape(-1, h1.shape[-1]), self.swiglu_limit):
                 if h1.dim() > 2:
                     fused_output_shape = h1.shape[:-1]
                     h1 = h1.reshape(-1, h1.shape[-1])

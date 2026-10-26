@@ -98,6 +98,10 @@ l0_dgx_h100:
   # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
   # the file here so those compositions actually run.
   - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
+  # Same reason: the Engram table's head cut and row cut are chosen by
+  # `num_heads % tp_size`, so the two collectives that reassemble them are only both
+  # reachable at a world size larger than 2.
+  - unittest/_torch/multi_gpu/test_engram_sharding.py
   # Exercise VisualGen worker-failure containment with live CUDA allocations
   # spread across four local processes.
   - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group

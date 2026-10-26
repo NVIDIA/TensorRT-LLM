@@ -472,23 +472,53 @@ def parse_quantization_layout(
 _DECODER_BOUNDED_REPLAY_ENV = "TRTLLM_V41_DECODER_BOUNDED_REPLAY"
 
 
-def encoder_replay_enabled() -> bool:
-    """Allow independent Encoder state eviction and bounded recovery on a miss."""
-    enabled = os.environ.get("TRTLLM_V41_ENCODER_REPLAY", "0") not in ("0", "", "false", "False")
-    if enabled and not decoder_bounded_replay_enabled():
+def bounded_replay_tokens(required_window: int) -> int:
+    """Resolve the shared Encoder/Decoder replay length above required SWA coverage."""
+    name = "TRTLLM_V41_BOUNDED_REPLAY_TOKENS"
+    value = os.environ.get(name, "140")
+    try:
+        tokens = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if tokens <= required_window:
+        raise ValueError(f"{name}={tokens} must exceed the required SWA window {required_window}")
+    return tokens
+
+
+def encoder_replay_enabled(*, max_num_tokens: int | None = None, replay_window: int = 0) -> bool:
+    """Allow independent Encoder state eviction and bounded recovery on a miss.
+
+    Enabled by default when Decoder bounded replay is enabled and the token
+    budget can fit recovery rows plus at least one new token.
+    """
+    decoder_enabled = decoder_bounded_replay_enabled()
+    enabled = os.environ.get("TRTLLM_V41_ENCODER_REPLAY", "1" if decoder_enabled else "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+    if enabled and not decoder_enabled:
         raise ValueError("TRTLLM_V41_ENCODER_REPLAY requires TRTLLM_V41_DECODER_BOUNDED_REPLAY=1")
+    if enabled and max_num_tokens is not None and max_num_tokens <= replay_window:
+        logger.warning_once(
+            f"DeepSeek-V4.1 Encoder bounded replay disabled: max_num_tokens={max_num_tokens} "
+            f"cannot fit a {replay_window}-token recovery window plus a new token; "
+            "using required Encoder checkpoints."
+        )
+        return False
     return enabled
 
 
 def decoder_bounded_replay_enabled() -> bool:
     """Enable approximate bounded replay by default; 0 selects full decoder prefill.
 
-    Decoder queries retain one SWA window, enlarged for embedded DSpark captures,
+    Encoder and Decoder queries use TRTLLM_V41_BOUNDED_REPLAY_TOKENS (default 140),
     while global KV is produced from the full encoder input. Ordinary text
-    requests execute the tail of every context chunk.
-    Model defaults enable chunked prefill and disable prefix block reuse and SWA
-    scratch reuse; explicit user settings take precedence. Unsupported topologies
-    and scratch reuse retain full prefill. Full-context consumers retain all rows.
+    requests execute each context chunk's intersection with the final window.
+    Model defaults enable chunked prefill and SWA scratch reuse and disable prefix
+    block reuse; explicit user settings take precedence. Unsupported topologies
+    retain full prefill. Full-context consumers retain all rows.
     """
     return os.environ.get(_DECODER_BOUNDED_REPLAY_ENV, "1") not in ("0", "", "false", "False")
 

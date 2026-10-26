@@ -67,6 +67,7 @@ from defs.deepseek_v41_serving import model_kwargs as serving_model_kwargs
 
 # Configuration and checkpoint topology
 
+
 # The released DeepSeek-V4.1-Flash topology: 40 decoder layers + 3 DSpark stages.
 # [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
 RELEASE_RATIOS = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
@@ -1989,7 +1990,7 @@ def test_attention_dp_replay_policy_requires_uniform_layer_schedule(
     config.mapping.enable_attention_dp = attention_dp
     config.extra_attrs["bounded_replay_on_generation"] = remote_tail
 
-    expected = (20, 128) if not attention_dp or not remote_tail or allowed else (None, 0)
+    expected = (20, 140) if not attention_dp or not remote_tail or allowed else (None, 0)
     assert model._resolve_replay_policy(config) == expected
     assert model.ced_kv_precompute is (expected[0] == 20)
 
@@ -2022,7 +2023,7 @@ def test_remote_tail_attention_dp_policy_keeps_unsupported_paths_disabled(
     elif unsupported == "speculative":
         config.spec_config = SimpleNamespace(
             spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
-            draft_is_embedded_in_target=True,
+            draft_is_embedded_in_target=False,
             target_layer_ids=[10, 20],
         )
     elif unsupported == "late-engram":
@@ -2073,14 +2074,15 @@ def test_replay_uses_pool_policy_independently_of_requests(
     model._decoder_replay_reuse_warning_emitted = False
     metadata = _ReplayMetadata([257, 6], num_contexts=1)
     metadata.kv_cache_manager.enable_block_reuse = True
+    metadata.kv_cache_manager.enable_swa_scratch_reuse = True
     metadata.kv_cache_manager.has_private_swa_suffix = Mock(return_value=private_decoder)
     requests = [SimpleNamespace(py_ced_replay=None)] if pass_requests else None
     split, plan = model._plan_bounded_replay(metadata, all_rows, requests)
     metadata.kv_cache_manager.has_private_swa_suffix.assert_called_once_with(20)
     if private_decoder:
         assert split == 20
-        assert plan.replay_seq_lens.tolist() == ([257, 6] if all_rows else [128, 6])
-        assert plan.swa_floors == ([0, 0] if all_rows else [129, 0])
+        assert plan.replay_seq_lens.tolist() == ([257, 6] if all_rows else [140, 6])
+        assert plan.swa_floors == ([0, 0] if all_rows else [117, 0])
     else:
         assert split is None and plan is None
 
@@ -2114,6 +2116,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
     model._decoder_replay_reuse_warning_emitted = False
     metadata = _ReplayMetadata([257], num_contexts=1)
     metadata.mapping = Mapping(world_size=2, tp_size=2, rank=0, enable_attention_dp=True)
+    metadata.kv_cache_manager.enable_swa_scratch_reuse = True
     metadata.kv_cache_manager.has_private_swa_suffix = Mock(return_value=True)
     if mode in ("final_window", "all_empty"):
         metadata.decoder_context_ends = (1024,)
@@ -2134,12 +2137,31 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
         else local_rows
     )
     peer_rows = 0 if mode == "all_empty" else 513 if mode in ("unprepared", "decode_graph") else 128
+    # Plans that rewrite local metadata (here: row compaction) must run whatever the peers'
+    # counts are.
+    required = int(
+        mode
+        in (
+            "compact",
+            "final_window",
+            "all_empty",
+            "late_full_states",
+            "late_padding",
+            "prefill_graph",
+        )
+    )
+    plan = metadata.decoder_replay_plan
+    assert int(plan is not None and plan.updates_local_metadata) == required
+    peer_required = int(mode not in ("unprepared", "decode_graph"))
     if speculative:
         from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 
         gather = Mock(
             return_value=torch.tensor(
-                [[local_rows, decoder_rows, 6, 1, 1], [513, peer_rows, 9, 2, 2]]
+                [
+                    [local_rows, decoder_rows, required, 6, 1, 1],
+                    [513, peer_rows, peer_required, 9, 2, 2],
+                ]
             )
         )
         engine = SimpleNamespace(
@@ -2152,16 +2174,20 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
             DecoderRunner._get_all_rank_num_tokens_and_spec_counts(engine, metadata, spec)
         )
         assert spec_counts == [[6, 9], [1, 2], [1, 2]]
-        gather.assert_called_once_with([local_rows, decoder_rows, 6, 1, 1])
+        gather.assert_called_once_with([local_rows, decoder_rows, required, 6, 1, 1])
     else:
-        gather = Mock(return_value=torch.tensor([[local_rows, decoder_rows], [513, peer_rows]]))
+        gather = Mock(
+            return_value=torch.tensor(
+                [[local_rows, decoder_rows, required], [513, peer_rows, peer_required]]
+            )
+        )
         metadata.all_rank_num_tokens = get_all_rank_num_tokens(
             metadata,
             enable_attention_dp=True,
             mapping=metadata.mapping,
             dist=SimpleNamespace(tp_allgather_int64=gather),
         )
-        gather.assert_called_once_with([local_rows, decoder_rows])
+        gather.assert_called_once_with([local_rows, decoder_rows, required])
     if mode == "late_full_states":
         with pytest.raises(ValueError, match="Full token states must be requested"):
             model._plan_bounded_replay(metadata, True)
@@ -2192,6 +2218,96 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
         assert replay.scatter_replayed_rows(hidden, plan) is hidden
 
 
+def _adp_replay_rank(model, rank, case, private_decoder):
+    """One attention-DP rank's metadata after ``prepare_adp_inputs`` for a replay-plan case."""
+    if case == "final_window_chunk":
+        # The last 69 tokens of a 65093-token prompt: every row lies in the final window, so
+        # nothing is compacted, but the SWA floor still rewrites this rank's metadata.
+        metadata = _ReplayMetadata([69], num_contexts=1)
+        metadata.kv_cache_params.num_cached_tokens_per_seq = [65024]
+        metadata.decoder_context_ends = (65093,)
+    elif case == "compacting_chunk":
+        metadata = _ReplayMetadata([4096], num_contexts=1)
+        metadata.decoder_context_ends = (4096,)
+    elif case == "short_prompt":
+        metadata = _ReplayMetadata([102], num_contexts=1)
+        metadata.decoder_context_ends = (102,)
+    else:
+        assert case == "dummy_generation"
+        metadata = _ReplayMetadata([1], num_contexts=0)
+    metadata.mapping = Mapping(world_size=2, tp_size=2, rank=rank, enable_attention_dp=True)
+    metadata.kv_cache_manager.has_private_swa_suffix = Mock(return_value=private_decoder)
+    model.prepare_adp_inputs(metadata, all_token_states_required=False)
+    return metadata
+
+
+def _exchange_adp_counts(ranks):
+    """The input-count allgather of ``get_all_rank_num_tokens``, done in-process."""
+    gathered = torch.tensor([metadata.get_adp_token_counts() for metadata in ranks])
+    for metadata in ranks:
+        metadata.all_rank_num_tokens = metadata.set_adp_token_counts(gathered.T.tolist())
+
+
+def _adp_replay_model(monkeypatch):
+    from tensorrt_llm._torch import utils
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import decoder_replay as replay
+
+    model, _ = _make_policy_case()
+    model.decoder_replay_split = 20
+    model.decoder_replay_window = 128
+    # Decoder GLOBAL precomputation is what makes the decoder SWA pages request-private.
+    model.ced_kv_precompute = True
+    model._decoder_replay_observed = False
+    model._decoder_replay_reuse_warning_emitted = False
+    monkeypatch.setattr(replay, "get_per_request_prefill_cuda_graph_flag", lambda: False)
+    monkeypatch.setattr(utils, "get_per_request_prefill_cuda_graph_flag", lambda: False)
+    return model
+
+
+@pytest.mark.parametrize(
+    "first", ["final_window_chunk", "short_prompt", "compacting_chunk", "dummy_generation"]
+)
+@pytest.mark.parametrize("private_decoder", [False, True])
+def test_adp_replay_decision_is_shared_by_every_rank(monkeypatch, first, private_decoder):
+    """A rank whose plan must run (SWA floor, private decoder cache, compaction) replays the
+    decoder half, and the decoder-pass graph runs its MoE collectives at a bucket's static
+    shapes: an idle peer in a dummy step must then replay too, never run the layers eagerly.
+    """
+    model = _adp_replay_model(monkeypatch)
+    cases = (first, "dummy_generation")
+    ranks = [
+        _adp_replay_rank(model, rank, case, private_decoder) for rank, case in enumerate(cases)
+    ]
+    _exchange_adp_counts(ranks)
+    decisions = [model._plan_bounded_replay(metadata, False) for metadata in ranks]
+    splits = {split for split, _ in decisions}
+    assert len(splits) == 1, f"ranks took different decoder paths: {decisions}"
+    must_replay = any(
+        case in ("final_window_chunk", "compacting_chunk")
+        or (case == "short_prompt" and private_decoder)
+        for case in cases
+    )
+    assert splits == ({20} if must_replay else {None})
+    if must_replay:
+        counts = [plan.replay_all_rank_num_tokens for _, plan in decisions]
+        assert counts[0] == counts[1]
+        for metadata, (_, plan) in zip(ranks, decisions):
+            assert plan.saved_all_rank_num_tokens == metadata.all_rank_num_tokens
+
+
+def test_adp_replay_rejects_a_rank_without_a_plan_when_a_peer_replays(monkeypatch):
+    model = _adp_replay_model(monkeypatch)
+    replaying = _adp_replay_rank(model, 0, "final_window_chunk", private_decoder=True)
+    planless = _adp_replay_rank(model, 1, "dummy_generation", private_decoder=True)
+    planless.decoder_replay_plan = None
+    gathered = torch.tensor(
+        [replaying.get_adp_token_counts(), planless.get_adp_token_counts()]
+    ).T.tolist()
+    assert gathered[2] == [1, 0]
+    with pytest.raises(ValueError, match="decoder-half collectives would diverge"):
+        planless.set_adp_token_counts(gathered)
+
+
 @pytest.mark.parametrize(
     "chunks", [(513,), (128, 128, 128, 128, 1), (127, 129, 127, 130), (1, 127)]
 )
@@ -2214,6 +2330,46 @@ def test_final_window_replay_covers_prompt_suffix_once(chunks, window):
         assert plan.replay_num_cached[0] + plan.replay_seq_lens[0] == offset + length
         offset += length
     assert selected == list(range(prompt_end))[-window:]
+
+
+@pytest.mark.parametrize("private_decoder", [False, True])
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("chunk_size", [64, 128])
+def test_final_window_identity_chunks_preserve_swa_floor(
+    monkeypatch, private_decoder, attention_dp, chunk_size
+):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import decoder_replay as replay
+
+    monkeypatch.setattr(replay, "get_per_request_prefill_cuda_graph_flag", lambda: False)
+
+    req = SimpleNamespace(prompt_len=512, py_ced_replay=None)
+    for offset in range(0, 512, chunk_size):
+        metadata = _ReplayMetadata([chunk_size, 1], num_contexts=1)
+        metadata.mapping = SimpleNamespace(enable_attention_dp=attention_dp)
+        metadata.kv_cache_params.num_cached_tokens_per_seq = [offset, 900]
+        metadata.kv_lens_cuda = torch.tensor([offset + chunk_size, 901])
+        metadata.prepare()
+        plan = replay.plan_decoder_replay(metadata, 128, [req], private_decoder=private_decoder)
+        assert plan is not None and plan.updates_local_metadata
+        assert plan.swa_floors == [384, 0]
+        if offset >= 384:
+            assert not plan.replays_local_tokens
+            assert plan.rows.tolist() == list(range(chunk_size + 1))
+        else:
+            assert plan.replay_seq_lens.tolist() == [0, 1]
+        replay.enter_decoder_replay(metadata, plan)
+        metadata._ensure_swa_slots()
+        positions = metadata.csa2_positions
+        indices = metadata.csa2_swa_indices[0]
+        context = metadata.csa2_token_requests == 0
+        logical = positions[:, None] - 127 + torch.arange(128)
+        expected = logical.masked_fill(logical < 0, -1)
+        expected[context] = expected[context].masked_fill(logical[context] < 384, -1)
+        torch.testing.assert_close(indices, expected, atol=0, rtol=0)
+        torch.testing.assert_close(metadata.csa2_swa_write_slots[0], positions)
+        replay.exit_decoder_replay(metadata, plan)
+        assert metadata.seq_lens.tolist() == [chunk_size, 1]
+        assert metadata.kv_cache_params.num_cached_tokens_per_seq == [offset, 900]
 
 
 @pytest.mark.parametrize("full_output", [False, True])
@@ -2338,6 +2494,7 @@ def test_empty_decoder_moe_runs_expert_communication_without_local_gemms():
     module.shared_experts = Mock(side_effect=AssertionError("empty shared expert GEMM"))
     module.event_dict = {EventType.Main: None, EventType.MoeShared: None}
     module.aux_stream = None
+    module.eager_overlap_min_tokens = None
     with patch(
         "torch.ops.trtllm.dsv3_router_gemm_op", side_effect=AssertionError("empty router GEMM")
     ):
@@ -2380,12 +2537,12 @@ def test_model_boundary_preserves_full_cache_and_compacts_query_rows(
 ) -> None:
     monkeypatch.delenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", raising=False)
     torch.manual_seed(4120)
-    lengths = [129, 7, 6]
+    lengths = [141, 7, 6]
     layer, state = _make_boundary(sum(lengths))
     metadata = _ReplayMetadata(lengths, num_contexts=2)
     model, config = _make_policy_case()
     policy = DeepseekV41Model._resolve_replay_policy(model, config)
-    assert policy == (20, 128)
+    assert policy == (20, 140)
     assert model.ced_kv_precompute
     model.decoder_replay_split, model.decoder_replay_window = policy
     model._decoder_replay_observed = False
@@ -2417,7 +2574,7 @@ def test_model_boundary_preserves_full_cache_and_compacts_query_rows(
     torch.testing.assert_close(new_ids, ids[plan.rows])
     torch.testing.assert_close(new_state.residual, state.residual[plan.rows])
     torch.testing.assert_close(new_state.pre_mix, state.pre_mix[plan.rows])
-    assert metadata.seq_lens.tolist() == [128, 7, 6]
+    assert metadata.seq_lens.tolist() == [140, 7, 6]
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [1, 0, 0]
     # A later request must not see the cache-only marker from this forward.
     restored = model._exit_bounded_replay(plan, metadata, new_state.residual)
@@ -2568,6 +2725,37 @@ def test_remote_tail_destination_keeps_decoder_state(attention_dp: bool) -> None
     torch.testing.assert_close(metadata.csa2_swa_indices[0], expected_indices)
 
 
+@pytest.mark.parametrize("local_floor", [0, 8])
+def test_remote_tail_destination_mixed_context_uses_per_row_swa_floors(
+    local_floor: int,
+) -> None:
+    model, _ = _make_policy_case()
+    layer, state = _make_boundary(145)
+    model.layers[20] = layer
+    model.decoder_replay_split = 20
+    model.ced_kv_precompute = True
+    metadata = _ReplayMetadata([128, 16, 1], num_contexts=2)
+    metadata.num_generations = 1
+    metadata.kv_cache_params.num_cached_tokens_per_seq = [1024, 0, 63]
+    metadata.prepare()
+    metadata.csa2_remote_tail_mode = "destination"
+    metadata.csa2_remote_tail_starts = [1024, local_floor]
+    metadata._ensure_swa_slots()  # As the encoder's first layer does.
+    saved_indices = metadata.csa2_swa_indices[0].clone()
+
+    result, decoder_state = model._enter_remote_tail_boundary(metadata, state)
+
+    assert result is None
+    assert decoder_state is state
+    layer.self_attn.prepare_global_cache.assert_called_once()
+    expected_indices = saved_indices.clone()
+    expected_indices[:128].masked_fill_(expected_indices[:128] < 1024, -1)
+    if local_floor:
+        expected_indices[128:144].masked_fill_(expected_indices[128:144] < local_floor, -1)
+    metadata._ensure_swa_slots()  # As the first decoder layer does.
+    torch.testing.assert_close(metadata.csa2_swa_indices[0], expected_indices)
+
+
 @pytest.mark.parametrize(
     "remote_mode,is_cuda_graph", [(None, False), (None, True), ("destination", False)]
 )
@@ -2675,6 +2863,63 @@ def test_context_only_logits_do_not_call_omitted_output_head():
         processor(hidden_states, head, metadata, return_context_logits=True)
     with pytest.raises(RuntimeError, match="context-only worker"):
         head(hidden_states)
+
+
+# Closing the mHC stream with the fused boundary (all-reduce + post update + collapse + final
+# RMSNorm in one launch), and the logits processor skipping its norm for such a state.
+FINAL_CLOSE_ROWS, FINAL_CLOSE_HIDDEN = 6, 16
+
+
+def _final_close_model(monkeypatch):
+    model = v41.DeepseekV41Model.__new__(v41.DeepseekV41Model)
+    nn.Module.__init__(model)
+    model.num_hidden_layers = 2
+    last = SimpleNamespace(
+        _mhc_split=Mock(return_value=True),
+        _mhc_fused_allreduce=Mock(return_value=object()),
+    )
+    model.layers = [SimpleNamespace(), last]
+    model.norm = SimpleNamespace(weight=torch.ones(FINAL_CLOSE_HIDDEN), variance_epsilon=1e-6)
+    model._final_close_allowed = True
+    model._final_close_fused = False
+    fused = Mock(return_value=(None, torch.full((FINAL_CLOSE_ROWS, FINAL_CLOSE_HIDDEN), 7.0)))
+    monkeypatch.setattr(v41, "mhc_allreduce_post_collapse_norm", fused)
+    return model, last, fused
+
+
+def _final_close_state():
+    rows, hidden = FINAL_CLOSE_ROWS, FINAL_CLOSE_HIDDEN
+    return HCState.deferred(
+        torch.randn(rows, 4, hidden),
+        torch.rand(rows, 4, 1),
+        torch.rand(rows, 4, 4),
+        torch.randn(rows, hidden),
+        pre_mix=torch.rand(rows, 4, 1),
+        x_prev_allreduce=lambda x: x,
+    )
+
+
+@pytest.mark.cpu_only
+def test_fused_final_close(monkeypatch):
+    model, last, fused = _final_close_model(monkeypatch)
+    state = _final_close_state()
+    state.coeff_event = Mock()
+    # Not when a speculative worker reads the un-normalized final state.
+    model._final_close_allowed = False
+    assert model._fused_final_close(state) is None
+    fused.assert_not_called()
+    model._final_close_allowed = True
+
+    out = model._fused_final_close(state)
+
+    assert torch.equal(out, torch.full((FINAL_CLOSE_ROWS, FINAL_CLOSE_HIDDEN), 7.0))
+    assert model._final_close_fused
+    (x, residual, post, comb, pre, weight, eps, allreduce), _ = fused.call_args
+    assert x is state.x_prev and residual is state.residual and pre is state.pre_mix
+    assert post is state.post_mix and comb is state.comb_mix
+    assert weight is model.norm.weight and eps == model.norm.variance_epsilon
+    assert allreduce is last._mhc_fused_allreduce.return_value
+    last._mhc_split.assert_called_once_with(FINAL_CLOSE_ROWS)
 
 
 @pytest.mark.parametrize("mode", [None, "source", "destination"])
@@ -2828,6 +3073,7 @@ def test_context_only_model_keeps_exact_prefix_and_boundary_parameter_inventory(
         for name, parameter in full_model.named_parameters()
     }
     split = full_model.model.decoder_replay_split
+    num_embeddings = full_model.lm_head.num_embeddings
     assert split == 5
     assert not full_model.model.disagg_context_only
     assert "csa2_context_swa_layer_limit" not in full_model.model_config.extra_attrs
@@ -2836,6 +3082,7 @@ def test_context_only_model_keeps_exact_prefix_and_boundary_parameter_inventory(
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     model = _build_context_only_inventory_model()
     assert model.model.disagg_context_only
+    assert model.lm_head.num_embeddings == num_embeddings
     assert model.model_config.extra_attrs["csa2_context_swa_layer_limit"] == split
     assert model.model.ced_kv_precompute
     assert len(model.model.layers) == model.config.num_hidden_layers == len(V41_TINY_RATIOS)
@@ -3010,6 +3257,7 @@ def test_model_boundary_resets_routing_and_preserves_layer_guard(monkeypatch):
     model = DeepseekV41Model.__new__(DeepseekV41Model)
     torch.nn.Module.__init__(model)
     model.disagg_context_only = False
+    model.use_engram = False
     argument = object()
     outputs = []
 
@@ -3301,6 +3549,7 @@ class _MHC(nn.Module):
         pre: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        nvfp4_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         updated = self.post_mapping(x=x, residual=residual, post_layer_mix=post, comb_res_mix=comb)
         pre_own, post_own, comb_own = self.hc_coeffs(updated)

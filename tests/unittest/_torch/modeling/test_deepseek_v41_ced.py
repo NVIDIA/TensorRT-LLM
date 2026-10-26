@@ -21,6 +21,7 @@ from _deepseek_v41_test_utils import cache_config as shared_cache_config
 from _deepseek_v41_test_utils import model_and_config as global_model_and_config
 
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -109,9 +110,9 @@ def test_prepared_encoder_replay_preserves_live_speculative_endpoints(
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
     spec = DSparkDecodingConfig(max_draft_len=5)
     spec.__dict__["draft_is_embedded_in_target"] = True
-    start = 128 if recovering else 0
-    end = start + 129
-    with cache_case(config, sparse, dtype, [129, 6], [start, 128], 1, spec_config=spec) as case:
+    start = 116 if recovering else 0
+    end = start + 141
+    with cache_case(config, sparse, dtype, [141, 6], [start, 128], 1, spec_config=spec) as case:
         metadata = case[0]
         req = request(0, end)
         if recovering:
@@ -218,8 +219,8 @@ def test_dummy_forward_replays_with_or_without_requests(
                 )
             enter.assert_called_once()
             plan = enter.call_args.args[0]
-            assert plan.replay_seq_lens.tolist() == [128, 1]
-            assert plan.swa_floors == [129, 0]
+            assert plan.replay_seq_lens.tolist() == [140, 1]
+            assert plan.swa_floors == [117, 0]
         torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
 
 
@@ -239,14 +240,23 @@ def test_full_context_outputs_preserve_full_prefill(model_and_config, monkeypatc
     ):
         metadata, ids, _, buffers = case
         manager = metadata.kv_cache_manager
-        assert bool(manager._decoder_replay_window) is not scratch
+        assert manager._decoder_replay_window == 140
         initial = [buffer.clone() for buffer in buffers]
-        req = request(0, len(ids))
-        req.py_return_context_logits = True
         outputs = []
         for bounded in (False, True):
+            manager.free_resources(request(0, len(ids)))
             for buffer, saved in zip(buffers, initial):
                 buffer.copy_(saved)
+            req = LlmRequest(
+                request_id=0,
+                max_new_tokens=2,
+                input_tokens=list(range(len(ids))),
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+                return_context_logits=True,
+            )
+            assert manager.prepare_context(req)
+            assert req.context_current_position == 0
             if bounded:
                 enable_ced(model)
             else:
@@ -254,6 +264,9 @@ def test_full_context_outputs_preserve_full_prefill(model_and_config, monkeypatc
             result, start = [], 0
             for length in chunks:
                 end = start + length
+                req.context_current_position = start
+                req.context_chunk_size = length
+                assert manager.resize_context(req, length)
                 logits = run(
                     model,
                     metadata,
@@ -267,6 +280,7 @@ def test_full_context_outputs_preserve_full_prefill(model_and_config, monkeypatc
                 assert isinstance(logits, torch.Tensor)
                 assert logits.shape[0] == length
                 result.append(logits.clone())
+                assert manager.kv_cache_map[0].resize(None, end)
                 start = end
             outputs.append(torch.cat(result))
         torch.testing.assert_close(outputs[1], outputs[0], atol=0.02, rtol=0.02)
@@ -278,7 +292,7 @@ def test_full_context_logits_after_truncated_peer(model_and_config, monkeypatch)
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     with (
         torch.inference_mode(),
-        cache_case(config, sparse, dtype, [513, 257], [0, 0], 2) as case,
+        cache_case(config, sparse, dtype, [513, 257], [0, 0], 2, scratch=True) as case,
         canonical_routing(),
     ):
         metadata, ids, _, buffers = case
@@ -313,19 +327,211 @@ def test_full_context_logits_after_truncated_peer(model_and_config, monkeypatch)
         torch.testing.assert_close(actual[513:], reference[513:], atol=0.02, rtol=0.02)
 
 
-def test_dspark_verification_retains_all_generation_rows(monkeypatch):
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "chunks,full_output",
+    [
+        pytest.param((512, 256, 129), None, id="empty-decoder-chunks"),
+        pytest.param((384, 127, 130), "logits", id="chunked-full-logits"),
+        pytest.param((513,), "hidden", id="full-hidden-states"),
+    ],
+)
+def test_chunk_allocated_scratch_replay_matches_paged_continuation(
+    model_and_config, monkeypatch, chunks, full_output
+):
+    """Use scheduler-sized allocations, including empty and partial Decoder windows."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
+
+    model, config, sparse, dtype = model_and_config
+    enable_ced(model)
+    model.model.encoder_replay_enabled = True
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+    total = sum(chunks)
+    ids = torch.arange(total, device="cuda", dtype=torch.int32)
+    results = []
+    for scratch in (False, True):
+        with (
+            torch.inference_mode(),
+            cache_case(config, sparse, dtype, [1], [0], 1, reuse=True, scratch=scratch) as case,
+            canonical_routing(),
+        ):
+            metadata = case[0]
+            manager = metadata.kv_cache_manager
+            manager.free_resources(request(0, 1))
+            req = LlmRequest(
+                request_id=0,
+                max_new_tokens=2,
+                input_tokens=list(range(total)),
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+                return_context_logits=full_output == "logits",
+                additional_outputs=["hidden_states"] if full_output == "hidden" else None,
+            )
+            assert manager.prepare_context(req)
+            cache = manager.kv_cache_map[0]
+            outputs, offset = [], 0
+            for length in chunks:
+                req.context_current_position = offset
+                req.context_chunk_size = length
+                assert manager.resize_context(req, length)
+                if scratch and offset == 0:
+                    encoder = manager._layer_roles[0, 1, CSA2CacheRole.SWA]
+                    decoder = manager._layer_roles[5, 1, CSA2CacheRole.SWA]
+                    pools = [
+                        manager.layer_to_pool_mapping_dict[layer] for layer in (encoder, decoder)
+                    ]
+                    assert pools[0] != pools[1]
+                    assert all(cache.get_scratch_desc(pool).slot_ids for pool in pools)
+                    assert (
+                        manager.get_swa_buffer(0).data_ptr() != manager.get_swa_buffer(5).data_ptr()
+                    )
+                end = offset + length
+                hidden = []
+                with model.model.register_forward_hook(
+                    lambda _module, _inputs, states: hidden.append(states.clone())
+                ):
+                    output = run(
+                        model,
+                        metadata,
+                        [req],
+                        ids[offset:end],
+                        [offset],
+                        [length],
+                        1,
+                        return_context_logits=full_output == "logits",
+                    )
+                kept = length if full_output else max(0, end - max(offset, total - 140))
+                assert metadata.csa2_decoder_capture_lens == (kept,)
+                if full_output == "hidden":
+                    assert hidden[0].shape[0] == length
+                    outputs.append(hidden[0])
+                if full_output or end == total:
+                    outputs.append(output.clone())
+                req.context_current_position = end
+                assert cache.resize(None, end)
+                # Retained Decoder pages survive ordinary request suspension.
+                if kept and end < total:
+                    cache.suspend()
+                    assert manager.prepare_context(req)
+                offset = end
+            assert not cache.has_scratch_slots
+            cache.enable_swa_scratch_reuse = False
+            assert cache.resize(total + 1, total)
+            outputs.append(
+                run(
+                    model,
+                    metadata,
+                    [req],
+                    torch.tensor([7], device="cuda", dtype=torch.int32),
+                    [total],
+                    [1],
+                    0,
+                ).clone()
+            )
+            results.append(outputs)
+    for paged, scratch in zip(*results):
+        torch.testing.assert_close(scratch, paged, atol=0.02, rtol=0.02)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("reuse", [False, True])
+def test_dspark_scratch_preserves_reserved_pages(cache_config, monkeypatch, reuse):
+    """Keep reserved normal pages writable across chunks, suspension and publication."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+
+    config, sparse, dtype = cache_config
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+    spec = DSparkDecodingConfig(max_draft_len=5)
+    spec.__dict__["draft_is_embedded_in_target"] = True
+    with cache_case(
+        config, sparse, dtype, [1], [0], 1, reuse=reuse, scratch=True, spec_config=spec
+    ) as case:
+        manager = case[0].kv_cache_manager
+        manager.free_resources(request(0, 1))
+        req = LlmRequest(
+            request_id=0,
+            max_new_tokens=2,
+            input_tokens=list(range(1024)),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        assert manager.prepare_context(req)
+        cache = manager.kv_cache_map[0]
+        encoder = manager._layer_roles[0, 1, CSA2CacheRole.SWA]
+        pool = manager.layer_to_pool_mapping_dict[encoder]
+        converter = manager.impl.get_page_index_converter(encoder, CSA2CacheRole.SWA.role)
+        buffer = manager.get_buffers(0, CSA2CacheRole.SWA)
+        for offset in (0, 512):
+            req.context_current_position = offset
+            req.context_chunk_size = 512
+            assert manager.resize_context(req, 512)
+            assert cache.capacity == offset + 516
+            base = cache.get_base_page_indices(pool).tolist()
+            if offset == 0:
+                reserved_page = base[4]
+                assert reserved_page >= 0
+                reserved_index = converter([reserved_page], CSA2CacheRole.SWA.index_mode)[0]
+            else:
+                desc = cache.get_scratch_desc(pool)
+                assert desc.range.beg <= 4 < desc.range.end
+                assert base[4] == reserved_page
+                assert manager.get_cache_indices(0, 0, CSA2CacheRole.SWA)[4] == reserved_index
+                cache.suspend()
+                assert manager.prepare_context(req)
+            manager.compute_batch_page_tables([0], 1)
+            pages = manager.batch_page_table((0, CSA2CacheRole.SWA), cache.num_blocks)[0]
+            if offset:
+                assert pages[4].item() == reserved_index
+            # Write through the device table consumed by attention. Published
+            # normal pages must contain these bytes, rather than untouched storage.
+            buffer.index_fill_(0, pages[offset // 128 : (offset + 512) // 128].long(), 17)
+            req.context_current_position = offset + 512
+            if reuse:
+                manager.try_commit_blocks(req)
+            else:
+                assert cache.resize(None, offset + 512)
+        if reuse:
+            count, pages = _introspection.reuse_match_pages(
+                manager.impl, cache.reuse_scope, list(range(1024)), pool
+            )
+            assert count == 1024
+            assert pages[4] is not None
+            assert pages[4][0] == reserved_page
+            assert (buffer[reserved_index] == 17).all()
+            assert pages[5] is None  # A genuinely scratch-backed block is never published.
+
+
+@pytest.mark.parametrize(
+    "capture_window,replay_tokens",
+    [(128, None), (128, "129"), (256, "300"), (128, "128"), (256, "140"), (128, "bad")],
+)
+def test_dspark_verification_retains_all_generation_rows(
+    monkeypatch, capture_window, replay_tokens
+):
     from test_modeling_deepseekv41 import _make_policy_case, _ReplayMetadata
 
     from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41Model
 
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     model, config = _make_policy_case()
-    config.pretrained_config.sliding_window = 256
+    config.pretrained_config.sliding_window = capture_window
+    if replay_tokens is None:
+        monkeypatch.delenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", replay_tokens)
     config.spec_config = SimpleNamespace(
         spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
         draft_is_embedded_in_target=True,
         target_layer_ids=[37, 38, 39],
     )
+    if replay_tokens in ("128", "bad") or capture_window == 256 and replay_tokens == "140":
+        with pytest.raises(ValueError, match="TRTLLM_V41_BOUNDED_REPLAY_TOKENS"):
+            DeepseekV41Model._resolve_replay_policy(model, config)
+        return
     model.decoder_replay_split, model.decoder_replay_window = (
         DeepseekV41Model._resolve_replay_policy(model, config)
     )
@@ -334,9 +540,10 @@ def test_dspark_verification_retains_all_generation_rows(monkeypatch):
     metadata = _ReplayMetadata([513, 6], num_contexts=1)
     split, plan = model._plan_bounded_replay(metadata, False)
     assert split == 20
-    assert model.decoder_replay_window == 256
-    assert plan.replay_seq_lens.tolist() == [256, 6]
-    assert plan.rows.tolist() == list(range(257, 519))
+    window = int(replay_tokens or 140)
+    assert model.decoder_replay_window == window
+    assert plan.replay_seq_lens.tolist() == [window, 6]
+    assert plan.rows.tolist() == list(range(513 - window, 519))
 
 
 @skip_pre_blackwell
@@ -360,10 +567,41 @@ def test_final_window_mixed_batch_keeps_finished_context_and_generation(
             buffer.copy_(saved)
         reqs[0].prompt_len = 1024
         actual = run(model, metadata, reqs, ids, [0, 0, 0], lengths, 2)
-        assert metadata.csa2_decoder_capture_lens == (0, 128)
+        assert metadata.csa2_decoder_capture_lens == (0, 129)
         assert metadata.seq_lens.tolist() == lengths
         assert actual.shape == expected.shape == (3, 1024)
         torch.testing.assert_close(actual[1:], expected[1:], atol=0.02, rtol=0.02)
+
+
+@skip_pre_blackwell
+def test_small_token_budget_falls_back_to_required_encoder_state(cache_config, monkeypatch):
+    from _deepseek_v41_test_utils import _init_random_weights
+
+    from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
+
+    config, sparse, dtype = cache_config
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.delenv("TRTLLM_V41_ENCODER_REPLAY", raising=False)
+    config.max_num_tokens = 3
+    model = DeepseekV41ForCausalLM(config).cuda()
+    _init_random_weights(model)
+    assert not model.model.encoder_replay_enabled
+    assert model.model.decoder_replay_window == 140
+    with (
+        torch.inference_mode(),
+        cache_case(config, sparse, dtype, [3], [0], 1, reuse=True, max_num_tokens=3) as case,
+        canonical_routing(),
+    ):
+        metadata, ids, _, _ = case
+        manager = metadata.kv_cache_manager
+        assert not manager._encoder_replay_enabled
+        assert manager._encoder_reuse_policy.name == "REQUIRED"
+        assert not manager._encoder_optional_groups
+        assert manager._decoder_replay_window == 140
+        assert manager._swa_retention(0) == 128
+        output = run(model, metadata, [request(0, 3)], ids, [0], [3], 1)
+        assert output.shape == (1, 1024)
+        assert torch.isfinite(output).all()
 
 
 @skip_pre_blackwell
@@ -379,22 +617,16 @@ def test_chunked_ced_matches_independent_window_reference(
     model, config, sparse, dtype = model_and_config
     enable_ced(model)
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.delenv("TRTLLM_V41_ENCODER_REPLAY", raising=False)
     monkeypatch.setenv("TRTLLM_V41_MHC_DEFER", str(int(defer_post)))
 
     def configure_deferral(ced_enabled):
         model.model.ced_kv_precompute = ced_enabled
         with patch.object(DeepseekV4ForCausalLM, "post_load_weights"):
             model.post_load_weights()
-        for index, layer in enumerate(model.model.layers):
-            next_layer = (
-                model.model.layers[index + 1] if index + 1 < len(model.model.layers) else None
-            )
-            assert layer._v41_defer_post_mapping == bool(
-                defer_post
-                and next_layer is not None
-                and next_layer.engram is None
-                and not (ced_enabled and index + 1 == model.model.decoder_replay_split)
-            )
+        # The last layer defers into the stream close.
+        for layer in model.model.layers:
+            assert layer._v41_defer_post_mapping == defer_post
 
     window = model.model.decoder_replay_window
     total = sum(chunks)
@@ -405,8 +637,9 @@ def test_chunked_ced_matches_independent_window_reference(
         metadata, ids, _, buffers = case
         manager = metadata.kv_cache_manager
         assert manager.layout.window_size == 128
-        assert manager._swa_retention(0) == 128
-        assert manager._swa_retention(5) == window
+        # Recovery keeps its first replay row without widening the attention window.
+        assert manager._swa_retention(0) == window + 1
+        assert manager._swa_retention(5) == window + 1
         manager.enable_swa_scratch_reuse = False
         baseline = [b.clone() for b in buffers]
         req = request(0, total)
@@ -414,7 +647,7 @@ def test_chunked_ced_matches_independent_window_reference(
         with ExitStack() as stack:
             stack.enter_context(canonical_routing())
             configure_deferral(False)
-            ref = independent_window_reference(model, metadata, ids, 128, chunks=chunks).clone()
+            ref = independent_window_reference(model, metadata, ids, window, chunks=chunks).clone()
             for b, old in zip(buffers, baseline):
                 b.copy_(old)
             enable_ced(model)

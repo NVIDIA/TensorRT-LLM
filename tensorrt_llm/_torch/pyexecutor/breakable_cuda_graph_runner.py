@@ -32,8 +32,15 @@ class BreakableCUDAGraphRunner:
     CUDA_GRAPH_WARMUP_METRIC = "cuda_graph_warmup_seconds"
     CUDA_GRAPH_CAPTURE_METRIC = "cuda_graph_capture_seconds"
 
-    def __init__(self, layer_model: nn.Module) -> None:
+    def __init__(
+        self,
+        layer_model: nn.Module,
+        prepare_replay: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.layer_model = layer_model
+        # Refreshes state the captured body reads but computes outside capture, from the
+        # body's keyword inputs.
+        self._prepare_replay = prepare_replay
         self._graphs: dict[int, BreakableCUDAGraph] = {}
         self._outputs: dict[int, torch.Tensor] = {}
         self._memory_pool = None
@@ -71,12 +78,18 @@ class BreakableCUDAGraphRunner:
             raise RuntimeError(f"Cannot warm up BCG while runner is {self._state.value}")
         self._state = BreakableCUDAGraphRunnerState.WARMUP
         try:
-            for _ in range(steps):
-                engine_forward()
+            with enable_breakable_cuda_graph():
+                for _ in range(steps):
+                    engine_forward()
         finally:
             self._state = BreakableCUDAGraphRunnerState.IDLE
 
-    def capture(self, num_tokens: int, engine_forward: Callable[[], Any]) -> None:
+    def capture(
+        self,
+        num_tokens: int,
+        engine_forward: Callable[[], Any],
+        can_capture: Callable[[], bool] | None = None,
+    ) -> bool:
         """Warm up eagerly, then capture one prefill token bucket.
 
         Record each phase in metrics, replacing the previous bucket's timings.
@@ -97,6 +110,8 @@ class BreakableCUDAGraphRunner:
                 with timing_metric(self.CUDA_GRAPH_WARMUP_METRIC, self._metrics):
                     self.warmup(engine_forward)
                     torch.cuda.synchronize()
+                if can_capture is not None and not can_capture():
+                    return False
 
                 with timing_metric(self.CUDA_GRAPH_CAPTURE_METRIC, self._metrics):
                     # Every segment in the first BCG bucket must receive the same
@@ -122,6 +137,7 @@ class BreakableCUDAGraphRunner:
             assert graph is not None
             self._graphs[num_tokens] = graph
             self._outputs[num_tokens] = make_weak_ref(output)
+            return True
         except Exception:
             if graph is not None:
                 graph.reset()
@@ -209,7 +225,10 @@ class BreakableCUDAGraphRunner:
         original_forward = self.layer_model.forward
 
         def replay_forward(*args, **kwargs):
-            del args, kwargs
+            del args
+            if self._prepare_replay is not None:
+                # After the engine's in-place input corrections, as an eager body sees them.
+                self._prepare_replay(kwargs)
             return self.replay(num_tokens)
 
         self._state = BreakableCUDAGraphRunnerState.REPLAY

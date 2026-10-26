@@ -43,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     count_retiring_requests,
     is_retiring_request,
 )
+from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import AttentionDpConfig
 from tensorrt_llm.scheduling_params import SchedulingParams
@@ -94,6 +95,7 @@ def _make_request_item(req_id, num_tokens=10, target_dp_rank=None, attention_dp_
     item = MagicMock()
     item.id = req_id
     item.child_req_ids = None
+    item.num_input_tokens = None
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax
@@ -1326,6 +1328,7 @@ def _make_conv_request_item(
     item = MagicMock()
     item.id = req_id
     item.child_req_ids = None
+    item.num_input_tokens = None
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax
@@ -1714,6 +1717,70 @@ class TestConversationAwareADPRouter:
         assert all(f <= cap for f in final), final
         assert expected <= cap
         assert sum(len(v) for v in assign.values()) == 8  # nothing dropped
+
+
+class TestStrictConversationAffinity:
+    """kv_cache_routing_strict_conversation_affinity on the executor's admission
+    (waiting queue) and routing path, with two ranks that must agree."""
+
+    CAP = 2
+
+    @staticmethod
+    def _rank(tp_rank: int, strict: bool):
+        config = AttentionDpConfig(
+            kv_cache_routing_conversation_affinity=True,
+            kv_cache_routing_strict_conversation_affinity=strict,
+            kv_cache_routing_strict_affinity_max_wait_iters=2,
+        )
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_rank=tp_rank, tp_size=2),
+            has_seq_slot_headroom=False,
+            attention_dp_config=config,
+        )
+        return router, FCFSWaitingQueue()
+
+    def _iteration(self, ranks, active, arrivals):
+        """Each rank enqueues its own copy of the arrivals, then admits and routes."""
+        placements = []
+        for router, queue in ranks:
+            for req_id, conv_id in arrivals:
+                request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=1)
+                request.py_scheduling_params = None
+                request.py_conversation_params = ConversationParams(conversation_id=conv_id)
+                queue.add_request(RequestQueueItem(req_id, request))
+            admitted = get_from_waiting_queue(
+                queue,
+                len(active) * self.CAP - sum(active),
+                enable_attention_dp=True,
+                max_num_active_requests=self.CAP,
+                all_ranks_num_active_requests=active,
+                router=router,
+            )
+            states = [RankState(rank=r, num_active_requests=n) for r, n in enumerate(active)]
+            assignment, _ = router.route_requests(states, admitted, self.CAP)
+            placements.append({it.id: rank for rank, items in assignment.items() for it in items})
+        assert placements[0] == placements[1]
+        return placements[0]
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_later_turn_waits_for_its_conversation_rank(self, strict: bool) -> None:
+        ranks = [self._rank(tp_rank, strict) for tp_rank in range(2)]
+        assert self._iteration(ranks, [0, 0], [(0, "a"), (1, "b")]) == {0: 0, 1: 1}
+        # "a"'s rank is full: its next turn overflows to a rank without its prefix,
+        # unless strict, where it waits and the request behind it is admitted.
+        placed = self._iteration(ranks, [2, 1], [(10, "a"), (11, "c")])
+        if not strict:
+            assert placed == {10: 1}
+            return
+        assert placed == {11: 1}
+        assert self._iteration(ranks, [1, 1], []) == {10: 0}
+        # A new conversation ahead of a reserved turn cannot take its slot.
+        assert self._iteration(ranks, [1, 1], [(12, "d"), (13, "a")]) == {12: 1, 13: 0}
+        # After max_wait_iters passes the turn overflows; the binding stays.
+        assert self._iteration(ranks, [2, 0], [(14, "a")]) == {}
+        assert self._iteration(ranks, [2, 0], []) == {}
+        assert self._iteration(ranks, [2, 0], []) == {14: 1}
+        assert self._iteration(ranks, [0, 0], [(15, "a")]) == {15: 0}
 
 
 class TestNumInputTokens:

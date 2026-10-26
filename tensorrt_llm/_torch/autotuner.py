@@ -16,6 +16,7 @@ import ast
 import contextlib
 import copy
 import enum
+import errno
 import fcntl
 import inspect
 import itertools
@@ -33,6 +34,7 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.modules.multi_stream_utils import no_eager_forks
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
@@ -332,8 +334,12 @@ def autotune(tune_mode: bool = True,
     if autotune_enabled:
         torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
 
+    eager_forks_context = (no_eager_forks()
+                           if tune_required else contextlib.nullcontext())
+
     try:
-        yield
+        with eager_forks_context:
+            yield
     finally:
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
@@ -414,6 +420,25 @@ class AutoTunerStatistics:
                 stats_str += f"  {op}: {self.tuned_op_time_cost[op] * 1000:.4f} milliseconds\n"
 
         return stats_str
+
+
+# POSIX ESTALE and the Linux NFS client's EBADHANDLE (521).
+_STALE_HANDLE_ERRNOS = (errno.ESTALE, 521)
+
+
+def _read_cache_text(file_path: Path, attempts: int = 5) -> str:
+    """Read the cache file, retrying reads that hit a stale NFS handle."""
+    for attempt in range(attempts):
+        try:
+            with open(file_path, "r") as f:
+                return f.read()
+        except OSError as e:
+            if e.errno not in _STALE_HANDLE_ERRNOS or attempt == attempts - 1:
+                raise
+            logger.warning(
+                f"[AutoTuner] Retrying cache read of {file_path} after {e!r}")
+            time.sleep(0.2 * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 @contextlib.contextmanager
@@ -684,8 +709,7 @@ class AutoTunerProfilingCache:
         if not file_path.exists():
             return {"metadata": self._serialize_metadata()}
         try:
-            with open(file_path, "r") as f:
-                content = f.read()
+            content = _read_cache_text(file_path)
             if not content.strip():
                 return {"metadata": self._serialize_metadata()}
             return json.loads(content)
@@ -733,8 +757,7 @@ class AutoTunerProfilingCache:
         lock_path = self._lock_path_for(file_path)
         try:
             with _exclusive_cache_lock(lock_path):
-                with open(file_path, "r") as f:
-                    current_cache_contents = json.load(f)
+                current_cache_contents = json.loads(_read_cache_text(file_path))
             self._deserialize_metadata(
                 current_cache_contents.get("metadata", {}))
 
@@ -1181,6 +1204,12 @@ class AutoTuner:
                     key=(custom_op, "inference_dispatch_fine_grained"))
             return (best_runner, best_tactic)
 
+        # Collective strategies tune in lockstep, but ranks can load different
+        # caches from a shared file: tune unless every rank has the entry.
+        if self._needs_rank_agreement(
+                tuning_config.distributed_tuning_strategy):
+            is_cache_hit = self._hit_on_all_ranks(is_cache_hit)
+
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
             self._prime_cached_tactics(custom_op, runners, tuning_config,
@@ -1209,9 +1238,13 @@ class AutoTuner:
             self.stats.failed_profiling_count[custom_op] = set()
         new_tuning_failure_occurred = False
 
+        # Every rank profiles under MERGE / PARALLEL, so they agree per profile.
+        strategy = tuning_config.distributed_tuning_strategy
+        lockstep_profiles = (self._needs_rank_agreement(strategy) and strategy
+                             != DistributedTuningStrategy.BROADCAST)
+
         # Synchronize ranks before profiling
-        if self._should_current_rank_tune(
-                tuning_config.distributed_tuning_strategy):
+        if self._should_current_rank_tune(strategy):
             for p in profiles:
                 tensors = self._prepare_input_tensors(p, inputs)
                 is_cache_hit, *_ = self.profiling_cache.search_cache(
@@ -1221,6 +1254,8 @@ class AutoTuner:
                     tuning_config,
                     apply_map_to_tuning_buckets=False,
                 )
+                if lockstep_profiles:
+                    is_cache_hit = self._hit_on_all_ranks(is_cache_hit)
                 if not is_cache_hit:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
@@ -2062,6 +2097,16 @@ class AutoTuner:
     def _is_distributed(self) -> bool:
         """Check if we're in a distributed environment."""
         return self.mapping is not None and self.mapping.tp_size > 1 and self._dist is not None
+
+    def _needs_rank_agreement(self,
+                              strategy: DistributedTuningStrategy) -> bool:
+        """Whether ranks must agree on cache hits under ``strategy``."""
+        return (strategy != DistributedTuningStrategy.INDEPENDENT
+                and self._is_distributed())
+
+    def _hit_on_all_ranks(self, is_cache_hit: bool) -> bool:
+        """Whether ``is_cache_hit`` holds on every rank (host all-gather)."""
+        return all(self._dist.tp_cp_allgather(obj=bool(is_cache_hit)))
 
     def _maybe_parallelize_tactics(
             self, all_valid_tactics: List[Any],

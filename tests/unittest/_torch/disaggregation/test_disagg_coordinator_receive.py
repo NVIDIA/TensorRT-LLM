@@ -13,6 +13,7 @@ Single-rank cases run one ``CoordinatorHarness``; the multi-rank case runs one
 per rank over a ``FakeDistGroup``.
 """
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -266,15 +267,31 @@ def _batch(*generation_requests) -> ScheduledRequests:
     return batch
 
 
+def _received(h: CoordinatorHarness, *requests: "_GenRequest") -> None:
+    """Start the requests' receives through the coordinator and complete them."""
+    for req in requests:
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+    h.coordinator.receive_gen_init(list(requests))
+    for req in requests:
+        h.transceiver.finish_recv(req)
+    h.coordinator.reap_gen_receives()
+
+
 def test_completed_gen_receives_reports_only_completed_requests_in_batch_order() -> None:
-    """The query picks the transmission-complete generation requests, keeps
-    the batch order and changes nothing."""
+    """The query picks the requests whose receive the coordinator started and
+    that completed, keeps the batch order and changes nothing; a decoding
+    request in the batch is not visited, and a finished receive is not
+    reported again."""
     h = CoordinatorHarness()
     done_a, done_b = _GenRequest(1), _GenRequest(3)
-    receiving = _GenRequest(2, state=_RECEIVING)
+    receiving = _GenRequest(2, state=LlmRequestState.DISAGG_GENERATION_INIT)
     running = _GenRequest(4, state=LlmRequestState.GENERATION_IN_PROGRESS)
+    h.coordinator.receive_gen_init([receiving])
+    _received(h, done_b, done_a)
+    h.transceiver.call_log.clear()
 
-    completed = h.coordinator.completed_gen_receives(_batch(done_a, receiving, done_b, running))
+    batch = _batch(done_a, receiving, done_b, running)
+    completed = h.coordinator.completed_gen_receives(batch)
 
     assert [req.py_request_id for req in completed] == [1, 3]
     assert [req.state for req in (done_a, receiving, done_b, running)] == [
@@ -284,6 +301,8 @@ def test_completed_gen_receives_reports_only_completed_requests_in_batch_order()
         LlmRequestState.GENERATION_IN_PROGRESS,
     ]
     assert h.transceiver.call_log == []
+    assert h.coordinator.try_finish_gen_receive(done_a)
+    assert [req.py_request_id for req in h.coordinator.completed_gen_receives(batch)] == [3]
 
 
 def test_try_finish_gen_receive_hands_a_completed_request_to_generation() -> None:
@@ -381,7 +400,10 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
     events = []
     executor = _executor_over(h.coordinator, events)
     first, second = _GenRequest(1, events=events), _GenRequest(2, events=events)
-    receiving = _GenRequest(3, events=events, state=_RECEIVING)
+    receiving = _GenRequest(3, events=events, state=LlmRequestState.DISAGG_GENERATION_INIT)
+    h.coordinator.receive_gen_init([receiving])
+    _received(h, first, second)
+    h.transceiver.call_log.clear()
 
     executor._prepare_disagg_gen_transmission_complete(_batch(first, receiving, second))
 
@@ -391,7 +413,6 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
         ("finish", 1, True),
         ("token", 1),
         ("logprobs", 1),
-        ("finish", 3, False),
         ("finish", 2, True),
         ("token", 2),
         ("logprobs", 2),
@@ -410,18 +431,23 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
 @pytest.mark.parametrize("coordinator_kind", ["real", "noop"])
 def test_receive_tail_does_nothing_without_a_completed_receive(coordinator_kind) -> None:
     """With nothing to finish the batch-level preparation is skipped and no
-    request is asked; the no-op coordinator reports nothing to finish even
-    for a request that claims to be complete."""
+    request is asked: a receive still in flight is not finished, a request
+    that reports itself complete but whose receive this coordinator never
+    started is not visited, and the no-op coordinator reports nothing."""
     events = []
     if coordinator_kind == "real":
-        coordinator = CoordinatorHarness().coordinator
-        request = _GenRequest(1, events=events, state=_RECEIVING)
+        h = CoordinatorHarness()
+        coordinator = h.coordinator
+        receiving = _GenRequest(2, events=events, state=LlmRequestState.DISAGG_GENERATION_INIT)
+        coordinator.receive_gen_init([receiving])
+        request = _GenRequest(1, events=events)
     else:
         coordinator = NoopDisaggCoordinator()
         request = _GenRequest(1, events=events)
     executor = _executor_over(coordinator, events)
+    batch = _batch(request, receiving) if coordinator_kind == "real" else _batch(request)
 
-    executor._prepare_disagg_gen_transmission_complete(_batch(request))
+    executor._prepare_disagg_gen_transmission_complete(batch)
 
     assert events == []
     assert request.new_tokens == []
@@ -438,6 +464,8 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
     events = []
     executor = _executor_over(h.coordinator, events)
     first, second = _GenRequest(1, events=events), _GenRequest(2, events=events)
+    _received(h, first, second)
+    h.transceiver.call_log.clear()
     executor.active_requests = [first, second]
 
     def raise_in_sampler(_requests):
@@ -461,7 +489,70 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
         ("finish", 1, False),
         ("finish", 2, False),
     ]
+    assert h.coordinator.completed_gen_receives(_batch(first, second)) == []
     assert [req.state for req in (first, second)] == [LlmRequestState.GENERATION_COMPLETE] * 2
     assert h.transceiver.call_log == []
     assert [req.new_tokens for req in (first, second)] == [[], []]
     assert [req.decoding_iter for req in (first, second)] == [0, 0]
+
+
+# -- first-token responses under attention DP ---------------------------------
+
+
+def _adp_response_executor(dist) -> PyExecutor:
+    """Bare ADP rank whose first-token, flush and response-gather paths run for real."""
+    executor = object.__new__(PyExecutor)
+    executor.dist = dist
+    dist.mapping = SimpleNamespace(tp_group=[0, 1])
+    executor.enable_attention_dp = True
+    executor.gather_all_responses = False
+    executor.should_exclude_last_generation_logits = False
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor.response_cv = threading.Condition()
+    executor.responses = {}
+    executor.result_wait_queues = {}
+    return executor
+
+
+def _first_token_request(rid: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=rid,
+        py_decoding_iter=1,
+        py_disaggregated_params=None,
+        create_response=lambda _fast_logits, _rank: f"first token {rid}",
+    )
+
+
+@pytest.mark.parametrize("ride_transfer_flush", [False, True])
+def test_first_token_responses_ride_the_iterations_transfer_flush(ride_transfer_flush) -> None:
+    """Under multi-rank attention DP the overlap loop's first-token responses
+    ride the iteration's transfer-response flush: one response gather per
+    iteration instead of two, and rank 0 publishes the same responses."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    executors = [_adp_response_executor(group.rank(rank)) for rank in range(2)]
+    executors[1]._pending_transfer_responses.append((9, "transfer error 9"))
+    batches = [
+        SimpleNamespace(generation_requests=[_first_token_request(1)]),
+        SimpleNamespace(generation_requests=[_first_token_request(2), _first_token_request(3)]),
+    ]
+
+    def iteration(rank: int) -> None:
+        executor = executors[rank]
+        executor._handle_first_token_response(
+            batches[rank], ride_transfer_flush=ride_transfer_flush
+        )
+        executor._flush_pending_transfer_responses()
+
+    group.run(iteration)
+
+    gathers = [name for name, _ in group.rank(0).calls]
+    assert gathers == ["tp_gather"] * (1 if ride_transfer_flush else 2)
+    assert executors[0].responses == {
+        1: ["first token 1"],
+        2: ["first token 2"],
+        3: ["first token 3"],
+        9: ["transfer error 9"],
+    }
+    assert executors[1].responses == {}
+    assert all(not executor._pending_transfer_responses for executor in executors)

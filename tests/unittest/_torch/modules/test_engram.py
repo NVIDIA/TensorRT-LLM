@@ -21,10 +21,13 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from cuda.bindings import driver as cuda
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.models import modeling_deepseekv41 as v41
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
+from tensorrt_llm._torch.modules.engram import _host_memory as host_memory
 from tensorrt_llm._torch.modules.engram import engram as engram_module
 from tensorrt_llm._torch.modules.engram import functional as engram_functional
 from tensorrt_llm._torch.modules.engram.projection import EngramFp8Projection
@@ -316,3 +319,147 @@ def test_v41_engram_gate_parity(monkeypatch: pytest.MonkeyPatch, add_residual: b
     v41.DeepseekV41ForCausalLM.release_request_state(model, 41)
     assert 41 not in generation._pending_history_seeds
     assert 41 not in generation._history_row_of
+
+
+def _check_host_numa(tensor: torch.Tensor) -> None:
+    """``tensor`` is pinned and, with host-NUMA VMM, mapped on the GPU's host NUMA node."""
+    assert tensor.device.type == "cpu" and tensor.is_pinned()
+    numa_node = engram_module.host_numa_node(torch.cuda.current_device())
+    if numa_node is None:
+        return
+    _, handle = cuda.cuMemRetainAllocationHandle(tensor.data_ptr())
+    _, properties = cuda.cuMemGetAllocationPropertiesFromHandle(handle)
+    cuda.cuMemRelease(handle)
+    assert properties.location.type == cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
+    assert properties.location.id == numa_node
+
+
+def _sharded_lookup_reference(
+    table: engram_module.ShardedFp8MultiHeadEmbedding, indices: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize owned rows on the host; row shards return zero for unowned rows."""
+    heads = slice(table.head_start, table.head_start + table.num_local_heads)
+    index = indices[:, heads].cpu() + table.offsets.cpu()
+    if not table.shard_heads:
+        owned = (index >= table.vocab_start_idx) & (index < table.vocab_end_idx)
+        index = torch.where(owned, index - table.vocab_start_idx, 0)
+    scale = torch.exp2(table.scale.view(torch.uint8).float() - 127)
+    rows = table.weight.float() * scale.repeat_interleave(table.block_size, dim=1)
+    values = rows[index]
+    if not table.shard_heads:
+        values = torch.where(owned[..., None], values, 0)
+    return values.to(table.dtype)
+
+
+def _host_table(
+    buckets: list[int], tp_size: int, tp_rank: int, device: int = 0, *, check_numa: bool = True
+) -> engram_module.ShardedFp8MultiHeadEmbedding:
+    """Build, move and fill a table whose weight and scale shards stay in host memory."""
+    with torch.device(f"cuda:{device}"):
+        table = engram_module.ShardedFp8MultiHeadEmbedding(
+            buckets, 128, dtype=torch.bfloat16, tp_size=tp_size, tp_rank=tp_rank
+        )
+    pointers = (table.weight.data_ptr(), table.scale.data_ptr())
+    table.cuda(device)
+    assert pointers == (table.weight.data_ptr(), table.scale.data_ptr())
+    if check_numa:
+        _check_host_numa(table.weight)
+        _check_host_numa(table.scale)
+    rows = sum(buckets)
+    table.load_weights(
+        [
+            {
+                "weight": torch.randn(rows, 128).to(torch.float8_e4m3fn),
+                "scale": torch.randint(120, 135, (rows, 4), dtype=torch.uint8).view(
+                    torch.float8_e8m0fnu
+                ),
+            }
+        ]
+    )
+    # The device view aliases the host table instead of copying it.
+    weight_view, scale_view = table.storage()
+    assert weight_view.device == scale_view.device == torch.device("cuda", device)
+    assert weight_view.data_ptr() == table.weight.data_ptr()
+    assert scale_view.data_ptr() == table.scale.data_ptr()
+    return table
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA lookup requires CUDA")
+@pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
+@pytest.mark.parametrize(
+    "num_heads,tp_size,tp_rank",
+    [(4, 1, 0), (4, 2, 1), (3, 2, 1)],
+    ids=["unsharded", "head_shard", "row_shard"],
+)
+@torch.no_grad()
+def test_sharded_fp8_lookup_host_tables(
+    num_heads: int, tp_size: int, tp_rank: int, background: bool
+) -> None:
+    """Host tables map on the GPU's host NUMA node and look up exactly."""
+    torch.manual_seed(7)
+    buckets = [16411 + 6 * head for head in range(num_heads)]
+    table = _host_table(buckets, tp_size, tp_rank)
+    assert table.shard_heads == (tp_size > 1 and num_heads % tp_size == 0)
+    indices = torch.stack([torch.randint(0, n, (517,)) for n in buckets], dim=1).cuda()
+    actual = table(indices, background=background)
+    torch.cuda.synchronize()
+    expected = _sharded_lookup_reference(table, indices)
+    assert expected.count_nonzero() > 0
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA lookup requires CUDA")
+@pytest.mark.parametrize("device", [0, 2], ids=["gpu0", "gpu2"])
+@pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
+@pytest.mark.parametrize("num_heads", [4, 3], ids=["head_shard", "row_shard"])
+@torch.no_grad()
+def test_sharded_fp8_lookup_after_host_numa_oom(
+    monkeypatch: pytest.MonkeyPatch, num_heads: int, background: bool, device: int
+) -> None:
+    """An injected local NUMA OOM preserves exact host-table lookup for both shard layouts."""
+    if torch.cuda.device_count() <= device:
+        pytest.skip(f"needs GPU {device}")
+    if host_memory.host_numa_node(device) is None:
+        pytest.skip("host NUMA VMM is unavailable")
+    create = Mock(return_value=(cuda.CUresult.CUDA_ERROR_OUT_OF_MEMORY,))
+    monkeypatch.setattr(cuda, "cuMemCreate", create)
+    torch.manual_seed(11)
+    buckets = [16411 + 6 * head for head in range(num_heads)]
+    with torch.cuda.device(device):
+        table = _host_table(buckets, tp_size=2, tp_rank=1, device=device, check_numa=False)
+        assert create.call_count == 2
+        assert table.weight.is_pinned() and table.scale.is_pinned()
+        indices = torch.stack([torch.randint(0, n, (517,)) for n in buckets], dim=1).cuda()
+        actual = table(indices, background=background)
+        torch.cuda.synchronize()
+    expected = _sharded_lookup_reference(table, indices)
+    assert expected.count_nonzero() > 0
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
+@torch.no_grad()
+def test_sharded_fp8_lookup_host_tables_second_device() -> None:
+    """A table mapped for a non-default device is gathered there without a copy."""
+    torch.manual_seed(9)
+    buckets = [16411 + 6 * head for head in range(4)]
+    with torch.cuda.device(1):
+        table = _host_table(buckets, tp_size=2, tp_rank=1, device=1)
+        indices = torch.stack([torch.randint(0, n, (301,)) for n in buckets], dim=1).cuda()
+        actual = table(indices, background=True)
+        torch.cuda.synchronize()
+    torch.testing.assert_close(
+        actual.cpu(), _sharded_lookup_reference(table, indices), rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="page-locked host memory requires CUDA")
+def test_sharded_fp8_tables_materialize_after_meta_init() -> None:
+    """Meta-init construction defers the host tables until the model moves."""
+    with MetaInitMode():
+        table = engram_module.ShardedFp8MultiHeadEmbedding([16411] * 4, 128, dtype=torch.bfloat16)
+    assert table.weight.is_meta and table.scale.is_meta
+    table.cuda()
+    assert table.offsets.is_cuda
+    _check_host_numa(table.weight)
+    _check_host_numa(table.scale)

@@ -333,6 +333,46 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
 }
 
 
+# Static defaults for the SM103 DeepSeek-V4.1-Flash shapes at DEP2/4/8/16: from
+# _SM103_DSV41_FLASH_MIN_TOKENS_PER_RANK up, the phase-interleaved cluster-4 schedule is as fast as or
+# faster than the token-bucket fallback at every token count, so the key omits max_tokens_per_rank
+# (index 7 of the runner key) and covers each of those buckets.
+_SM103_DSV41_FLASH_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
+    (
+        103,
+        world_size,
+        6,
+        384 // world_size,
+        5120,
+        2304,
+        4608,
+        str(torch.bfloat16),
+        True,
+        10.0,
+        None,
+        None,
+        False,
+        "bf16",
+        None,
+        None,
+    ): (
+        [256, 128, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        2,
+        1,
+        (1, 4),
+    )
+    for world_size in (2, 4, 8, 16)
+}
+# Decode buckets keep the token-bucket tactic, which leaves fewer end-to-end stall bursts.
+_SM103_DSV41_FLASH_MIN_TOKENS_PER_RANK = 512
+
+
 # ---------------------------------------------------------------------------
 # Curated tuning space with staged-store and mixed-CGA candidates, filtered through
 # ``validate_megamoe_tactic``. MUST be identical on every EP rank: the MERGE
@@ -546,6 +586,14 @@ def _megamoe_problem_key(
     )
 
 
+def _shape_tuned_megamoe_tactic(problem_key: Tuple) -> Optional[Tuple]:
+    """Static default tactic of a measured runner key, or None."""
+    tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key)
+    if tactic is None and problem_key[7] >= _SM103_DSV41_FLASH_MIN_TOKENS_PER_RANK:
+        tactic = _SM103_DSV41_FLASH_DEFAULT_TACTICS.get(problem_key[:7] + problem_key[8:])
+    return tactic
+
+
 def _default_megamoe_tactic_for_problem(
     *,
     sm_version: int,
@@ -581,7 +629,7 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
         apply_topk_in_fc1=problem_key[9],
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
-        shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key),
+        shape_tuned_tactic=_shape_tuned_megamoe_tactic(problem_key),
     )
 
 
@@ -1990,7 +2038,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
-            default_tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id())
+            default_tactic = _shape_tuned_megamoe_tactic(self.unique_id())
             if default_tactic is not None and default_tactic not in candidates:
                 candidates.append(default_tactic)
             return candidates

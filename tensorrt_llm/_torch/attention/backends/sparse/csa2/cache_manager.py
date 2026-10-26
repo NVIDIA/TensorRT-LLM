@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import replace
@@ -13,19 +13,21 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from cuda.bindings import runtime as cudart
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.host_staging import copy_host_to_device
+from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     GPU_LEVEL,
     KVCacheManagerV2,
     Role,
-    _estimate_full_attn_size_per_token,
-    _estimate_swa_cache_size,
+    _estimate_cache_size_components,
     _fill_kv_pages,
+    _get_generation_kv_capacity,
 )
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
+from tensorrt_llm._utils import CUASSERT, TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.logger import logger
@@ -39,7 +41,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
 )
 
-from .....configs.deepseek_v41 import decoder_bounded_replay_enabled, encoder_replay_enabled
+from .....configs.deepseek_v41 import (
+    bounded_replay_tokens,
+    decoder_bounded_replay_enabled,
+    encoder_replay_enabled,
+)
 from .params import CSA2Layout
 from .quantization import (
     INDEX_DATA_BYTES,
@@ -49,6 +55,40 @@ from .quantization import (
     store_layer_rows,
     store_rows,
 )
+
+
+def _same_conversion_inputs(current, previous) -> bool:
+    """Whether two ``(rows, caches, page-storage versions, scratch, SWA destination)``
+    conversion inputs match.
+
+    Holding the previous caches and destination keeps their identities from being reused.
+    """
+    if previous is None:
+        return False
+    rows, caches, versions, scratch, destination = current
+    previous_rows, previous_caches, previous_versions, previous_scratch, previous_destination = (
+        previous
+    )
+    if (
+        versions != previous_versions
+        or (destination is None) != (previous_destination is None)
+        or (
+            destination is not None
+            and (destination.data_ptr(), destination.shape, destination.stride())
+            != (
+                previous_destination.data_ptr(),
+                previous_destination.shape,
+                previous_destination.stride(),
+            )
+        )
+        or len(caches) != len(previous_caches)
+        or any(cache is not other for cache, other in zip(caches, previous_caches))
+        or not np.array_equal(rows, previous_rows)
+    ):
+        return False
+    if scratch is None or previous_scratch is None:
+        return scratch is previous_scratch
+    return all(np.array_equal(a, b) for a, b in zip(scratch, previous_scratch))
 
 
 def _validate_context_swa_layer_limit(limit: int | None, num_layers: int) -> None:
@@ -65,7 +105,7 @@ if TYPE_CHECKING:
     from .....pyexecutor.llm_request import LlmRequest
 
 
-def _get_decoder_replay_window(
+def _get_replay_capture_window(
     layout: CSA2Layout,
     num_layers: int,
     mapping: Mapping,
@@ -73,13 +113,9 @@ def _get_decoder_replay_window(
     pretrained_config: PretrainedConfig | None,
     spec_config: SpeculativeConfig | None,
 ) -> int:
-    """Resolve the same replay window for pool construction and memory sizing."""
+    """Required SWA coverage, including embedded DSpark captures."""
     owners = [layer for layer in layout.kv_source_layer_ids if layer < num_layers]
-    if (
-        not decoder_bounded_replay_enabled()
-        or not owners
-        or (kv_cache_config is not None and kv_cache_config.enable_swa_scratch_reuse)
-    ):
+    if not decoder_bounded_replay_enabled() or not owners:
         return 0
     last_owner = max(owners)
     if layout.compress_ratios[last_owner] != 1 or any(
@@ -95,16 +131,70 @@ def _get_decoder_replay_window(
 
 
 def _swa_cache_window(
-    swa_window: int, decoder_window: int, *, is_decoder: bool, encoder_replay: bool
+    swa_window: int,
+    replay_window: int,
+    *,
+    is_decoder: bool,
+    encoder_replay: bool,
+    remote_tail: bool = False,
 ) -> int:
-    """Physical retention before speculative reserves; attention still uses SWA width."""
-    if encoder_replay and decoder_window > 0:
-        # Next-query retention starts at P + 1 - window. Recovery starts at
-        # P - decoder_window, so retain one extra row, including for wider
-        # DSpark captures. Encoder metadata prepares writable views for all
-        # layers before the Decoder boundary narrows its queries.
-        return max(swa_window, decoder_window + 1)
-    return max(swa_window, decoder_window) if is_decoder else swa_window
+    """Retain writable replay rows and any remote handoff lookback."""
+    if remote_tail and not is_decoder and replay_window > 0:
+        # Preserve the handoff lookback reserve and next-query boundary protection.
+        return swa_window + replay_window + 1
+    if replay_window > 0 and (encoder_replay or is_decoder):
+        # The extra row protects the replay start at partial-block endpoints.
+        return max(swa_window, replay_window + 1)
+    return swa_window
+
+
+def _cache_size_layer_components(
+    layout: CSA2Layout,
+    layers: Sequence[int],
+    replay_window: int,
+    encoder_replay: bool,
+    reserve: int,
+    swa_layer_limit: int | None,
+    *,
+    remote_tail: bool = False,
+) -> tuple[list[int], list[int | None], list[int]]:
+    """Match packed layer geometry and reuse-policy scratch groups for sizing."""
+    owners = [layer for layer in layout.kv_source_layer_ids if layer in layers]
+    encoder_policy = (
+        AttentionReusePolicy.OPTIONAL
+        if replay_window and encoder_replay
+        else AttentionReusePolicy.REQUIRED
+    )
+    sizes, windows, scratch_groups = [], [], []
+    for layer in layers:
+        decoder = bool(owners) and layer >= max(owners)
+        if swa_layer_limit is None or layer < swa_layer_limit:
+            sizes.append(528)
+            windows.append(
+                _swa_cache_window(
+                    layout.window_size,
+                    replay_window,
+                    is_decoder=decoder,
+                    encoder_replay=encoder_replay,
+                    remote_tail=remote_tail,
+                )
+                + reserve
+            )
+            scratch_groups.append(
+                (
+                    AttentionReusePolicy.PRIVATE if replay_window and decoder else encoder_policy
+                ).value
+            )
+        if layer in owners:
+            ratio = layout.compress_ratios[layer]
+            sizes.append((MAIN_ROW_BYTES + INDEX_ROW_BYTES) // ratio)
+            windows.append(None)
+            scratch_groups.append(AttentionReusePolicy.REQUIRED.value)
+            if ratio == 2:
+                sizes.append(4096)
+                windows.append(2 + reserve)
+                scratch_groups.append(encoder_policy.value)
+    return sizes, windows, scratch_groups
 
 
 class CSA2CacheRole(Enum):
@@ -153,6 +243,9 @@ class CSA2CacheManager(KVCacheManagerV2):
     Logical buffer identities include model layer, compression ratio and role.
     SWA belongs to the uncompressed family regardless of the layer's GLOBAL ratio.
     """
+
+    # A list while a deferring context prepare runs: block-offset copies are recorded for it.
+    _deferred_block_offsets: list | None = None
 
     def __init__(
         self,
@@ -226,24 +319,22 @@ class CSA2CacheManager(KVCacheManagerV2):
                 else None
             ),
         )
-        self._encoder_replay_enabled = encoder_replay_enabled()
+        capture_window = _get_replay_capture_window(
+            self.layout, num_layers, mapping, kv_cache_config, pretrained_config, spec_config
+        )
+        self._decoder_replay_window = bounded_replay_tokens(capture_window) if capture_window else 0
+        self._encoder_replay_enabled = encoder_replay_enabled(
+            max_num_tokens=kwargs.get("max_num_tokens", 8192),
+            replay_window=max(self.layout.window_size, self._decoder_replay_window),
+        )
         self._encoder_reuse_policy = (
-            AttentionReusePolicy.PRIVATE
-            if not kv_cache_config.enable_block_reuse
-            else AttentionReusePolicy.OPTIONAL
+            AttentionReusePolicy.OPTIONAL
             if self._encoder_replay_enabled
             else AttentionReusePolicy.REQUIRED
         )
-        self._decoder_replay_window = _get_decoder_replay_window(
-            self.layout, num_layers, mapping, kv_cache_config, pretrained_config, spec_config
-        )
         self._encoder_optional_groups: tuple[int, ...] = ()
-        if self._encoder_replay_enabled:
-            if kwargs.get("max_num_tokens") is not None and kwargs["max_num_tokens"] <= max(
-                self.layout.window_size, self._decoder_replay_window
-            ):
-                raise ValueError("Encoder recovery requires max_num_tokens > window_size")
         self._global_buffers: dict[tuple[int, int, CSA2CacheRole], torch.Tensor] = {}
+        self._pool_views = {}
         super().__init__(
             kv_cache_config,
             kv_cache_type,
@@ -306,6 +397,15 @@ class CSA2CacheManager(KVCacheManagerV2):
     def _context_reuse_tokens(self, req, reuse_limit: int | None = None):
         from .....pyexecutor.ced_replay import requires_full_decoder_prefill
 
+        remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
+        if remote_tail_start is not None:
+            # The destination may reuse the whole transferred prefix. The
+            # source must execute its final prefix token to finish context and
+            # materialize any Encoder recovery before handing off at S.
+            limit = remote_tail_start
+            if getattr(req, "py_csa2_remote_tail_mode", None) == "source":
+                limit = max(0, limit - 1)
+            reuse_limit = limit if reuse_limit is None else min(reuse_limit, limit)
         if req.is_disagg_generation_init_state:
             # The context worker supplies missing working pages, including the
             # private Decoder window. No local prefill/HC replay is needed.
@@ -345,6 +445,11 @@ class CSA2CacheManager(KVCacheManagerV2):
                 if cache.reuse_status[group].complete
             ]
             return self._resume_and_restore(req.py_request_id, cache, groups)
+
+        if getattr(req, "py_csa2_remote_tail_mode", None) == "destination":
+            # Transfer supplies the Encoder lookback; local reuse status does
+            # not describe the working pages received from the context worker.
+            return super()._resume_context_cache(req, cache)
 
         reused = cache.num_committed_tokens
         groups = None
@@ -406,6 +511,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             is_decoder=bool(self.layout.kv_source_layer_ids)
             and layer >= max(self.layout.kv_source_layer_ids),
             encoder_replay=self._encoder_replay_enabled,
+            remote_tail=getattr(self, "bounded_replay_on_generation", False),
         )
         return self._window(window)
 
@@ -420,6 +526,10 @@ class CSA2CacheManager(KVCacheManagerV2):
         """Distinguish a recycled request ID from its previous cache lifetime."""
         return self._csa2_request_epochs[request_id]
 
+    def request_epochs(self, request_ids) -> tuple[int, ...]:
+        """``request_epoch`` of each of ``request_ids``."""
+        return tuple(map(self._csa2_request_epochs.__getitem__, request_ids))
+
     def free_resources(self, request, pin_on_release=False):
         request.py_ced_replay = None
         super().free_resources(request, pin_on_release=pin_on_release)
@@ -430,7 +540,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             return
         if not self._csa2_linear_speculation:
             raise ValueError("CSA2 verification requires configured chain rewind capacity")
-        if any(length > self.max_draft_len + 1 for length in lengths[num_contexts:]):
+        if max(lengths[num_contexts:], default=0) > self.max_draft_len + 1:
             raise ValueError("CSA2 verification exceeds its reserved rewind window")
 
     def update_resources(self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None):
@@ -454,9 +564,8 @@ class CSA2CacheManager(KVCacheManagerV2):
         """Return required writable query intervals for bounded reconstruction.
 
         The GLOBAL prefix must already be restored by the caller. Native V2
-        matching is unchanged. Ordinary W-token next-query retention may omit
-        the first replay token at C-W; allocate every row in the returned range
-        explicitly rather than assuming the restored trailing window suffices.
+        matching is unchanged. SWA retention includes the first replay row at
+        C-R; the caller prepares every row in the returned range for writes.
         """
         suffix_lengths = (
             [0] * len(cached_prefix_lengths) if suffix_lengths is None else suffix_lengths
@@ -464,7 +573,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         if len(suffix_lengths) != len(cached_prefix_lengths):
             raise ValueError("CSA2 replay prefixes and suffixes must have matching request counts")
         window = self.layout.window_size
-        if self._encoder_replay_enabled and not decoder:
+        if decoder or self._encoder_replay_enabled:
             window = max(window, self._decoder_replay_window)
         result = []
         for prefix, suffix in zip(cached_prefix_lengths, suffix_lengths):
@@ -495,24 +604,47 @@ class CSA2CacheManager(KVCacheManagerV2):
     def _window(self, base: int) -> int:
         return base + self.max_draft_len + self.reuse_match_backoff
 
+    def _runtime_cache_size_layer_components(self) -> tuple[list[int], list[int | None], list[int]]:
+        return _cache_size_layer_components(
+            self.layout,
+            self.pp_layers,
+            self._decoder_replay_window,
+            self._encoder_replay_enabled,
+            self.max_draft_len + self.reuse_match_backoff,
+            getattr(self, "context_swa_layer_limit", None),
+            remote_tail=getattr(self, "bounded_replay_on_generation", False),
+        )
+
     def _get_runtime_cache_size_layer_components(self):
-        sizes, windows = [], []
-        for layer in self.pp_layers:
-            if self.has_swa_cache(layer):
-                sizes.append(528)
-                windows.append(self._swa_retention(layer))
-            if layer in self.layout.kv_source_layer_ids:
-                ratio = self.layout.compress_ratios[layer]
-                sizes.append((MAIN_ROW_BYTES + INDEX_ROW_BYTES) // ratio)
-                windows.append(None)
-                if ratio == 2:
-                    # One lifecycle group: count both equally-sized state buffers.
-                    sizes.append(4096)
-                    windows.append(self._window(2))
+        sizes, windows, _ = self._runtime_cache_size_layer_components()
         return sizes, windows
 
+    def _get_runtime_cache_size_scratch_group_keys(self) -> list[int]:
+        return self._runtime_cache_size_layer_components()[2]
+
     def _get_typical_seq_len(self, kv_cache_config):
-        return kv_cache_config.avg_seq_len or self.max_seq_len
+        typical = kv_cache_config.avg_seq_len or self.max_seq_len
+        quota = kv_cache_config.max_gpu_total_bytes
+        if not quota:
+            return typical
+        layer_sizes, windows, scratch_keys = self._runtime_cache_size_layer_components()
+        _, per_token, per_request = _estimate_cache_size_components(
+            layer_sizes,
+            windows,
+            self.tokens_per_block,
+            scratch=self.enable_swa_scratch_reuse,
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            scratch_group_keys=scratch_keys,
+        )
+        if not per_token:  # No GLOBAL pool: nothing scales with the length.
+            return typical
+        # SWA and compressor state cost a fixed amount per request, GLOBAL a length-proportional one. A split
+        # for a full batch of `typical`-length requests that the quota cannot hold caps admission at the
+        # window-bounded pools while shorter requests leave GLOBAL idle; split for the length at which a full
+        # batch fits instead.
+        resumable = quota * kv_cache_config.max_util_for_resume
+        fitting = (resumable / self._get_generation_request_capacity() - per_request) / per_token
+        return int(min(typical, max(fitting, self.tokens_per_block)))
 
     def get_layer_bytes_per_token(self, local_layer_idx, data_role):
         # Replaced by the packed declarative layer configuration below.
@@ -632,20 +764,33 @@ class CSA2CacheManager(KVCacheManagerV2):
             rows, width, dtype = self.tokens_per_block, 528, DataType.UINT8
         else:
             rows, width, dtype = self.tokens_per_block, 512, DataType.FLOAT
-        return convert_to_torch_tensor(TensorWrapper(addr, dtype, (upper, rows, width)))
+        # Wrapping a pool costs a tensor construction, so equal views are reused.
+        # A view made in inference mode is an inference tensor, which cannot be
+        # updated in place outside it.
+        key = (addr, dtype, upper, rows, width, torch.is_inference_mode_enabled())
+        if key not in self._pool_views:
+            self._pool_views[key] = convert_to_torch_tensor(
+                TensorWrapper(addr, dtype, (upper, rows, width))
+            )
+        return self._pool_views[key]
 
     def has_private_swa_suffix(self, first_layer: int) -> bool:
         """Whether every SWA layer from this boundary uses PRIVATE storage."""
-        layers = [
-            layer for layer in self.pp_layers if layer >= first_layer and self.has_swa_cache(layer)
-        ]
-        return bool(layers) and all(
-            self.impl.init_config.layers[
-                self._cache_layer_id(layer, CSA2CacheRole.SWA)
-            ].reuse_policy
-            == AttentionReusePolicy.PRIVATE
-            for layer in layers
-        )
+        known = self.__dict__.setdefault("_private_swa_suffix", {})
+        if first_layer not in known:
+            layers = [
+                layer
+                for layer in self.pp_layers
+                if layer >= first_layer and self.has_swa_cache(layer)
+            ]
+            # Each init_config access copies the whole configuration.
+            config_layers = self.impl.init_config.layers
+            known[first_layer] = bool(layers) and all(
+                config_layers[self._cache_layer_id(layer, CSA2CacheRole.SWA)].reuse_policy
+                == AttentionReusePolicy.PRIVATE
+                for layer in layers
+            )
+        return known[first_layer]
 
     def get_swa_buffer(self, layer_idx: int) -> torch.Tensor:
         return self.get_buffers(layer_idx, CSA2CacheRole.SWA).view(-1, 528)
@@ -687,29 +832,6 @@ class CSA2CacheManager(KVCacheManagerV2):
         if rows % INDEX_PAGE_ROWS:
             raise ValueError("CSA2 GLOBAL pages must hold whole native index pages")
         return rows // INDEX_PAGE_ROWS
-
-    def gather_indexer_keys(
-        self, layer_idx: int, slots: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather exact FP4 bytes with the shared native paged-cache gather kernel.
-
-        Slots are logical index rows; the kernel reads the page-footer layout
-        through explicit data and scale byte offsets, as the DSA indexer does.
-        """
-        if slots.ndim != 1 or slots.dtype != torch.int64 or not slots.is_cuda:
-            raise ValueError("CSA2 index gathering requires one-dimensional CUDA int64 slots")
-        from .quantization import index_slot_offsets
-
-        pages = self.get_index_pages(layer_idx)
-        capacity = pages.shape[0] * INDEX_PAGE_ROWS
-        valid = (slots >= 0) & (slots < capacity)
-        data_offsets, scale_offsets = index_slot_offsets(slots.clamp(0, max(capacity - 1, 0)))
-        data, scales = torch.ops.trtllm.indexer_k_cache_gather_op(
-            pages, data_offsets.contiguous(), scale_offsets.contiguous(), 0, slots.numel(), 64
-        )
-        data = torch.where(valid[:, None], data.view(torch.int8), 0)
-        scales = torch.where(valid[:, None], scales.view(torch.int32), 0)
-        return data, scales
 
     def write_swa(self, layer_idx, slots, values, transform=None) -> None:
         store_rows(self.get_swa_buffer(layer_idx), slots, values, "swa", transform)
@@ -795,13 +917,21 @@ class CSA2CacheManager(KVCacheManagerV2):
             cache.get_scratch_desc(pool_id),
         )
 
-    def compute_batch_page_tables(self, request_ids, num_contexts) -> None:
+    def compute_batch_page_tables(
+        self, request_ids, num_contexts, swa_out=None, page_versions=None
+    ) -> None:
         """Convert every per-layer page table of the batch with one kernel.
 
         Like DeepSeek-V4's sliding block tables, one kernel writes int32
         ``[tables, requests, blocks]`` on the device, including the SWA scratch
-        mappings, from a host snapshot of the batch's base rows of each distinct
-        pool. ``batch_page_table`` and ``batch_pages_allocated`` read the result.
+        mappings, from a device snapshot of the host base rows of every pool.
+        ``batch_page_table`` and ``batch_pages_allocated`` read the result. With
+        ``swa_out`` (int32 ``[SWA tables, requests, width]``, unit column stride),
+        the leading SWA tables go there instead, and ``batch_page_table`` must not
+        read them. A generation-only batch with unchanged conversion inputs and
+        ``swa_out`` keeps the previous tables; otherwise only the live columns are
+        converted and the rest of ``swa_out`` is BAD_PAGE_INDEX. ``page_versions`` are the
+        requests' page-storage versions when the caller has already read them.
         """
         from . import kernel
 
@@ -813,18 +943,61 @@ class CSA2CacheManager(KVCacheManagerV2):
             return
         rows = self.index_mapper.get_copy_index(list(request_ids), num_contexts, 1)
         self._batch_rows = rows.numpy().copy()
-        # Snapshot the batch's base rows now: the host rewrites (and releases)
-        # them for later batches before this step's device work runs.
-        snapshot = self.host_kv_cache_block_offsets.numpy()[
-            self._scratch_pools[:, None], self._batch_rows[None], 0
-        ]
-        device_base = self._device_base_rows[: snapshot.size].view(snapshot.shape)
-        copy_host_to_device(
-            self._host_staging, "base_rows", device_base, torch.from_numpy(snapshot)
-        )
         scratch = self._scratch_descriptors(request_ids)
         if scratch is not None:
             self._batch_scratch = scratch[0]
+        caches = [self.kv_cache_map[request_id] for request_id in request_ids]
+        inputs = None
+        if not num_contexts:
+            if page_versions is None:
+                page_versions = [cache.page_storage_version for cache in caches]
+            inputs = (self._batch_rows, caches, list(page_versions), scratch, swa_out)
+            if _same_conversion_inputs(inputs, self._batch_conversion_inputs):
+                # The previous conversion recorded this event.
+                torch.cuda.current_stream().wait_event(self._base_rows_read[self._base_rows_slot])
+                return
+        self._batch_conversion_inputs = None
+        live = self._live_columns(caches, scratch)
+        width = max(live.max(), self._table_live[:count].max())
+        if swa_out is None:
+            width = max(width, self._swa_table_live[:count].max())
+        width = int(width)
+        written = 0 if swa_out is None else min(width, swa_out.shape[-1])
+        if not width:
+            if swa_out is not None:
+                swa_out.fill_(BAD_PAGE_INDEX)
+            self._batch_conversion_inputs = inputs
+            return
+        # Snapshot the base rows now: the host rewrites (and releases) them for
+        # later batches before this step's device work runs. The copy engine
+        # takes the snapshot while the host waits.
+        slot = self._base_rows_slot = 1 - self._base_rows_slot
+        device_base = self._device_base_rows[slot]
+        self._base_rows_stream.wait_event(self._base_rows_read[slot])
+        host = self.host_kv_cache_block_offsets
+        row_bytes = host.shape[-1] * host.element_size()
+        # One copy of the first ``width`` columns of rows 0..max(row) of every pool.
+        copy = cudart.cudaMemcpy3DParms()
+        copy.srcPtr = cudart.make_cudaPitchedPtr(
+            host.data_ptr(), host.stride(1) * host.element_size(), row_bytes, host.shape[1]
+        )
+        copy.dstPtr = cudart.make_cudaPitchedPtr(
+            device_base.data_ptr(), row_bytes, row_bytes, device_base.shape[1]
+        )
+        copy.extent = cudart.make_cudaExtent(
+            width * host.element_size(), int(self._batch_rows.max()) + 1, host.shape[0]
+        )
+        copy.kind = cudart.cudaMemcpyKind.cudaMemcpyHostToDevice
+        CUASSERT(cudart.cudaMemcpy3DAsync(copy, self._base_rows_stream.cuda_stream))
+        self._base_rows_stream.synchronize()
+        device_rows = self._device_batch_rows[:count]
+        copy_host_to_device(
+            self._host_staging,
+            "batch_rows",
+            device_rows,
+            torch.from_numpy(self._batch_rows),
+        )
+        if scratch is not None:
             staged = []
             for key, value in zip(("scratch_ranges", "scratch_slots"), scratch):
                 buffer = self._device_scratch.get(key)
@@ -835,13 +1008,32 @@ class CSA2CacheManager(KVCacheManagerV2):
                 staged.append(buffer[: value.size].view(value.shape))
                 copy_host_to_device(self._host_staging, key, staged[-1], torch.from_numpy(value))
             scratch = staged
+        scratch_ranges, scratch_slots = scratch or (None, None)
         kernel.convert_page_tables(
             device_base,
+            device_rows,
             self._device_batch_page_params,
-            self._batch_page_tables,
+            self._batch_page_tables[..., :width],
             BAD_PAGE_INDEX,
-            *(scratch or ()),
+            scratch_ranges,
+            scratch_slots,
+            low_out=None if swa_out is None else swa_out[..., :written],
         )
+        self._base_rows_read[slot].record()
+        self._table_live[:count] = live
+        if swa_out is None:
+            self._swa_table_live[:count] = live
+        else:
+            swa_out[..., written:].fill_(BAD_PAGE_INDEX)
+        self._batch_conversion_inputs = inputs
+
+    def _live_columns(self, caches, scratch) -> np.ndarray:
+        """Per batch row, the page-table columns that can map a page (blocks and scratch)."""
+        width = self.host_kv_cache_block_offsets.shape[-1]
+        live = np.minimum([cache.num_blocks for cache in caches], width)
+        if scratch is not None:
+            live = np.maximum(live, np.minimum(scratch[0][..., 1].max(axis=0), width))
+        return live
 
     def _scratch_descriptors(self, request_ids):
         """Host int32 ``[pools, requests, 2]`` scratch ranges and ``[pools, requests, n]``
@@ -873,6 +1065,12 @@ class CSA2CacheManager(KVCacheManagerV2):
         """Converted int32 ``[requests, width]`` table of ``spec`` for the last computed batch."""
         return self._batch_page_tables[self._batch_page_index[spec], :, :width]
 
+    def batch_page_table_key(self, spec) -> tuple:
+        """Conversion of ``spec``'s batch page table: specs with equal keys read the same base
+        rows of the same pool with the same scale, offset and scratch geometry, so their converted
+        tables are equal for every batch."""
+        return tuple(int(v) for v in self._batch_page_params[self._batch_page_index[spec]])
+
     def batch_pages_allocated(self, specs, rows, columns, width: int) -> np.ndarray:
         """Whether each batch ``(rows, columns)`` page of ``specs`` is mapped, as bool ``[specs, n]``.
 
@@ -887,10 +1085,14 @@ class CSA2CacheManager(KVCacheManagerV2):
         limit = min(width, base.shape[-1])
         if not rows.size or limit == 0:
             return np.zeros((len(specs), rows.size), dtype=bool)
-        pools, inverse = np.unique(
-            self._batch_page_params[[self._batch_page_index[spec] for spec in specs], 3],
-            return_inverse=True,
-        )
+        key = tuple(specs)
+        groups = self._batch_page_pools.get(key)
+        if groups is None:
+            groups = self._batch_page_pools[key] = np.unique(
+                self._batch_page_params[[self._batch_page_index[spec] for spec in specs], 3],
+                return_inverse=True,
+            )
+        pools, inverse = groups
         pages = base[
             self._scratch_pools[pools, None],
             self._batch_rows[rows][None],
@@ -1003,41 +1205,66 @@ class CSA2CacheManager(KVCacheManagerV2):
         capacity = self.host_kv_cache_block_offsets.shape[1]
         self._batch_page_index = {spec: i for i, spec in enumerate(specs)}
         self._batch_page_params = params
-        # The device kernel reads a [distinct pools, requests, blocks] snapshot.
-        device_params = params.copy()
-        device_params[:, 0] = params[:, 3]
+        self._batch_page_pools = {}
         # Initialize on the stream every consumer runs on: the manager is
         # built on the default stream while forwards run on the non-blocking
         # execution stream, which would not wait for this work.
         with torch.cuda.stream(self._stream):
-            self._device_batch_page_params = torch.from_numpy(device_params).to(device)
-            self._device_batch_page_tables = torch.empty(
-                (len(specs), capacity, self.max_blocks_per_seq), dtype=torch.int32, device=device
-            )
-            self._device_base_rows = torch.empty(
-                len(self._scratch_pools) * capacity * self.max_blocks_per_seq,
+            self._device_batch_page_params = torch.from_numpy(params).to(device)
+            self._device_batch_page_tables = torch.full(
+                (len(specs), capacity, self.max_blocks_per_seq),
+                BAD_PAGE_INDEX,
                 dtype=torch.int32,
                 device=device,
             )
+            # Two device copies of the host base rows, so a batch's copy never
+            # overwrites the rows the previous batch's conversion may still read.
+            self._device_base_rows = [
+                torch.empty(
+                    (self.num_pools, capacity, self.max_blocks_per_seq),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for _ in range(2)
+            ]
+            self._device_batch_rows = torch.empty(capacity, dtype=torch.int32, device=device)
+        self._base_rows_slot = 0
+        self._base_rows_read = [torch.cuda.Event(), torch.cuda.Event()]
+        self._base_rows_stream = private_stream(device.index, "csa2_copy")
         self._device_scratch = {}
+        self._batch_conversion_inputs = None
+        # Per table row, the columns that may differ from BAD_PAGE_INDEX: of the
+        # tables every conversion writes, and of the SWA tables when they stay here.
+        self._table_live = np.zeros(capacity, dtype=np.int64)
+        self._swa_table_live = np.zeros(capacity, dtype=np.int64)
 
     def copy_batch_block_offsets(
         self, dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks=None
     ):
+        if self._deferred_block_offsets is not None:
+            self._deferred_block_offsets.append(
+                (dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks)
+            )
+            return
         # Invalidate before any validation/fill/copy can fail.
         self._swa_publication = None
         if beam_width != 1:
             raise ValueError("CSA2 supports beam width one")
-        # Every per-layer table of the batch is converted at once; the SWA
-        # tables are copied here and prepare_csa2 reuses the rest. Padding
-        # rows up to num_seqs stay BAD_PAGE_INDEX.
-        self.compute_batch_page_tables(request_ids, num_contexts)
-        tables = self._batch_page_tables
-        width = min(dst_tensor.shape[-1], tables.shape[-1])
-        dst_tensor.fill_(BAD_PAGE_INDEX)
+        # Every per-layer table of the batch is converted at once, the SWA
+        # tables straight into dst_tensor; prepare_csa2 reuses the rest. The
+        # rest of dst_tensor, padding rows up to num_seqs included, is
+        # BAD_PAGE_INDEX.
         # Context-only caches keep SWA for a prefix of the layers only.
         swa_layers = sum(self.has_swa_cache(layer) for layer in self.pp_layers)
-        dst_tensor[:swa_layers, : len(request_ids), 0, :width].copy_(tables[:swa_layers, :, :width])
+        count = len(request_ids)
+        width = min(dst_tensor.shape[-1], self.max_blocks_per_seq)
+        dst_tensor[:, count:].fill_(BAD_PAGE_INDEX)
+        dst_tensor[swa_layers:, :count].fill_(BAD_PAGE_INDEX)
+        dst_tensor[:swa_layers, :count, 1:].fill_(BAD_PAGE_INDEX)
+        dst_tensor[:swa_layers, :count, 0, width:].fill_(BAD_PAGE_INDEX)
+        self.compute_batch_page_tables(
+            request_ids, num_contexts, swa_out=dst_tensor[:swa_layers, :count, 0, :width]
+        )
         if self._swa_publication_token is not None:
             self._swa_publication = (
                 dst_tensor,
@@ -1206,6 +1433,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         *,
         tokens_per_block,
         max_batch_size=0,
+        max_num_tokens=0,
         spec_config=None,
         kv_cache_config=None,
         **kwargs,
@@ -1221,8 +1449,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         num_layers = kwargs.get("num_layers") or model_config.get_num_attention_layers()
         limit = getattr(model_config, "extra_attrs", {}).get("csa2_context_swa_layer_limit")
         _validate_context_swa_layer_limit(limit, num_layers)
-        owners = [layer for layer in layout.kv_source_layer_ids if layer < num_layers]
-        decoder_window = _get_decoder_replay_window(
+        capture_window = _get_replay_capture_window(
             layout,
             num_layers,
             mapping,
@@ -1230,27 +1457,37 @@ class CSA2CacheManager(KVCacheManagerV2):
             model_config.pretrained_config,
             spec_config,
         )
-        encoder_replay = encoder_replay_enabled()
-        sizes, windows = [], []
-        for layer, ratio in enumerate(layout.compress_ratios[:num_layers]):
-            if limit is None or layer < limit:
-                sizes.append(528)
-                window = _swa_cache_window(
-                    layout.window_size,
-                    decoder_window,
-                    is_decoder=bool(owners) and layer >= max(owners),
-                    encoder_replay=encoder_replay,
-                )
-                windows.append(window + reserve)
-            if layer in layout.kv_source_layer_ids:
-                sizes.append((MAIN_ROW_BYTES + INDEX_ROW_BYTES) // ratio)
-                windows.append(None)
-                if ratio == 2:
-                    sizes.append(4096)
-                    windows.append(2 + reserve)
-        per_token, fixed = _estimate_swa_cache_size(
-            sizes, windows, tokens_per_block, context=False, scratch=False
+        replay_window = bounded_replay_tokens(capture_window) if capture_window else 0
+        encoder_replay = encoder_replay_enabled(
+            max_num_tokens=max_num_tokens or getattr(model_config, "max_num_tokens", None),
+            replay_window=max(layout.window_size, replay_window),
         )
-        return _estimate_full_attn_size_per_token(
-            sizes, windows
-        ) + per_token, fixed * max_batch_size
+        sizes, windows, scratch_groups = _cache_size_layer_components(
+            layout,
+            range(num_layers),
+            replay_window,
+            encoder_replay,
+            reserve,
+            limit,
+            remote_tail=bool(
+                getattr(model_config, "extra_attrs", {}).get("bounded_replay_on_generation", False)
+            ),
+        )
+        _, headroom = _get_generation_kv_capacity(
+            spec_config, is_draft=kwargs.get("is_draft", False)
+        )
+        context_size, generation_size, generation_fixed = _estimate_cache_size_components(
+            sizes,
+            windows,
+            tokens_per_block,
+            scratch=bool(
+                kv_cache_config is not None
+                and kv_cache_config.enable_swa_scratch_reuse
+                and not kwargs.get("is_draft", False)
+            ),
+            generation_capacity_headroom=headroom,
+            scratch_group_keys=scratch_groups,
+        )
+        return generation_size, (
+            generation_fixed * max_batch_size + (context_size - generation_size) * max_num_tokens
+        )

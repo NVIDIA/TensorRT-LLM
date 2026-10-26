@@ -27,6 +27,7 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
+    from ...host_staging import HostUploader
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
@@ -130,6 +131,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
     beam_width: int = 1
+
+    # Set by the runner that owns this metadata: per-step uploads go through it.
+    host_uploader: Optional["HostUploader"] = None
 
     # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
@@ -969,6 +973,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
              self.max_num_requests, self.prompt_lens_cuda_runtime,
              self.host_request_types_runtime) = saved
 
+    def _copy_to_device(self, key: str, destination: torch.Tensor,
+                        value: torch.Tensor) -> None:
+        """Copy host ``value`` into ``destination`` at this point of the current stream."""
+        if self.host_uploader is not None:
+            self.host_uploader.upload(key, value, destination)
+        else:
+            destination.copy_(maybe_pin_memory(value), non_blocking=True)
+
     def prepare(self) -> None:
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
@@ -997,8 +1009,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        self._copy_to_device("prompt_lens",
+                             self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs])
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1051,9 +1064,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        self._copy_to_device("kv_lens", self.kv_lens_cuda[:self.num_seqs],
+                             kv_lens[:self.num_seqs])
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.

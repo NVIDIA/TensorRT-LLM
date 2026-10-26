@@ -791,6 +791,46 @@ def test_autotuner_tuning_configs():
     runner_0([x, w], tactic=deserialized_tactic)
 
 
+def test_load_cache_retries_stale_nfs_handle(monkeypatch):
+    """A cache read that hits a stale NFS handle is retried, not fatal."""
+    import builtins
+    import errno
+
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    key = "('op_nfs', 'R', '0', ((1, 128),))"
+    doc = {
+        "metadata": cache._serialize_metadata(),
+        "shared": {},
+        "rank_0": {
+            key: {
+                "runner_id": 0,
+                "tactic": "3",
+                "min_time": 0.001
+            }
+        },
+    }
+    temp_dir = tempfile.TemporaryDirectory()
+    cache_path = os.path.join(temp_dir.name, "nfs_cache.json")
+    with open(cache_path, "w") as f:
+        json.dump(doc, f)
+
+    real_open = builtins.open
+    failures = {"left": 2}
+
+    def flaky_open(file, mode="r", *args, **kwargs):
+        if str(file) == cache_path and "r" in mode and failures["left"] > 0:
+            failures["left"] -= 1
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    monkeypatch.setattr(autotuner.time, "sleep", lambda _: None)
+    cache.load_cache(cache_path, rank=0)
+    assert failures["left"] == 0
+    assert cache.cache[("op_nfs", "R", "0", ((1, 128), ))][1] == 3
+
+
 def test_load_cache_skips_non_literal_tactic():
     """Regression: a non-literal tactic repr must be skipped on load, not crash it.
 
@@ -1198,6 +1238,71 @@ def test_autotuner_distributed_strategy(strategy, mpi_pool_executor):
     )
     for r in results:
         assert r is True
+
+
+def _rank_disagreeing_cache_worker(world_size, strategy, seeded_rank):
+    """Only ``seeded_rank`` starts with the cache entry; tuning must not deadlock."""
+    rank = tensorrt_llm.mpi_rank()
+    mapping = Mapping(world_size=world_size,
+                      rank=rank,
+                      tp_size=world_size,
+                      pp_size=1)
+    dist = Distributed.get(mapping)
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(mapping)
+
+    x = torch.randn(16, 32, device='cuda')
+    w = torch.randn(32, 64, device='cuda')
+    runner = DistributedGemmRunner(prefer_tactics=[0, 1, 2, 3])
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+    custom_op = f"test_rank_disagreeing_cache_{strategy.value}"
+    if rank == seeded_rank:
+        key = tuner.profiling_cache.get_cache_key(custom_op, runner,
+                                                  (x.size(), w.size()), config)
+        tuner.profiling_cache[key] = (0, 2, 1e-9)
+
+    with autotune():
+        _, tactic = tuner.choose_one(custom_op=custom_op,
+                                     runners=[runner],
+                                     tuning_config=config,
+                                     inputs=[x, w])
+    tactics = dist.tp_cp_allgather(obj=tactic)
+    dist.barrier()
+    return rank, tactics
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("seeded_rank", [0, 1])
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        DistributedTuningStrategy.BROADCAST,
+        DistributedTuningStrategy.INDEPENDENT,
+        DistributedTuningStrategy.MERGE,
+        DistributedTuningStrategy.PARALLEL,
+    ],
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_rank_disagreeing_cache_does_not_deadlock(strategy, seeded_rank,
+                                                  mpi_pool_executor):
+    world_size = 2
+    results = list(
+        mpi_pool_executor.map(_rank_disagreeing_cache_worker,
+                              *zip(*[(world_size, strategy, seeded_rank)] *
+                                   world_size),
+                              timeout=300))
+    assert len(results) == world_size
+    for rank, tactics in results:
+        if strategy == DistributedTuningStrategy.INDEPENDENT:
+            # The seeded rank keeps its cached tactic; the others tune (odd = fast).
+            assert tactics[seeded_rank] == 2, tactics
+            assert all(t % 2 == 1 for r, t in enumerate(tactics)
+                       if r != seeded_rank), tactics
+        else:
+            assert len(set(tactics)) == 1, f"ranks disagree: {tactics}"
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])

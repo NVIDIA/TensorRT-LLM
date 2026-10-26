@@ -187,11 +187,12 @@ def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
 
 
 class RemoteTailPhase(Enum):
-    """Fleet-wide GEN phase for conditional disaggregation with attention DP."""
+    """Fleet-wide GEN admission for remote-tail attention DP."""
 
     NONE = "none"
     CONTEXT = "context"
     DECODE = "decode"
+    MIXED = "mixed"
 
 
 class ScheduledRequests:

@@ -1,17 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import functools
 import threading
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any, Optional, TypeVar
 
 import torch
+from cuda.bindings import runtime as cudart
+
+from tensorrt_llm._utils import CUASSERT
+
+_T0 = TypeVar("_T0")
+_T1 = TypeVar("_T1")
+_R = TypeVar("_R")
 
 
-class do_multi_stream_local(threading.local):
+class _MultiStreamLocal(threading.local):
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.do_multi_stream = False
+        self.eager_forks = True
 
 
-_local = do_multi_stream_local()
+_local = _MultiStreamLocal()
 
 
 def set_do_multi_stream(enable: bool):
@@ -32,6 +45,50 @@ def with_multi_stream(enable: bool):
         set_do_multi_stream(prev_do_multi_stream)
 
 
+@functools.cache
+def private_stream(device: int, purpose: str) -> torch.cuda.ExternalStream:
+    """A non-blocking stream per ``purpose``: a ``torch.cuda.Stream`` comes from a
+    pool and can alias the execution stream."""
+    with torch.cuda.device(device):
+        (stream, ) = CUASSERT(
+            cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking))
+    return torch.cuda.ExternalStream(int(stream), device=device)
+
+
+@contextmanager
+def no_eager_forks() -> Iterator[None]:
+    """Disable the eager forks of maybe_execute_in_parallel_and_combine().
+
+    Tuning contexts enter it, so that no op is profiled on the aux stream next
+    to the other branch, with its buffers left in that stream's pool.
+    """
+    prev_eager_forks = _local.eager_forks
+    _local.eager_forks = False
+    try:
+        yield
+    finally:
+        _local.eager_forks = prev_eager_forks
+
+
+def _run_in_parallel(fn0: Callable[[], _T0], fn1: Callable[[], _T1],
+                     event0: torch.cuda.Event, event1: torch.cuda.Event,
+                     aux_stream: torch.cuda.Stream | None,
+                     fork: bool) -> tuple[_T0, _T1]:
+    if fork:
+        event0.record()
+        result0 = fn0()
+
+        with torch.cuda.stream(aux_stream):
+            event0.wait()
+            result1 = fn1()
+            event1.record()
+        event1.wait()
+    else:
+        result0 = fn0()
+        result1 = fn1()
+    return (result0, result1)
+
+
 def maybe_execute_in_parallel(
         fn0: Callable,
         fn1: Callable,
@@ -45,6 +102,8 @@ def maybe_execute_in_parallel(
     This design is mainly for low latency use case. It needs to be improved for max throughput
     use case.
     For simplicity, fn0 and fn1 do not support inputs.
+    aux_stream does not wait for the later use of fn1's results; use
+    maybe_execute_in_parallel_and_combine() when it must.
 
     Args:
         fn0 (Callable): callable for the default stream
@@ -65,17 +124,49 @@ def maybe_execute_in_parallel(
 
     multi_stream = (do_multi_stream() and aux_stream is not None and
                     not (disable_on_compile and torch.compiler.is_compiling()))
+    return _run_in_parallel(fn0, fn1, event0, event1, aux_stream, multi_stream)
 
-    if multi_stream:
-        event0.record()
-        result0 = fn0()
 
-        with torch.cuda.stream(aux_stream):
-            event0.wait()
-            result1 = fn1()
-            event1.record()
-        event1.wait()
+def maybe_execute_in_parallel_and_combine(
+        fn0: Callable[[], _T0],
+        fn1: Callable[[], _T1],
+        combine: Callable[[_T0, _T1], _R],
+        event0: torch.cuda.Event,
+        event1: torch.cuda.Event,
+        aux_stream: torch.cuda.Stream | None = None,
+        *,
+        fork_in_eager: bool | torch.SymBool = False) -> _R:
+    """Run fn0 and fn1 like maybe_execute_in_parallel(), then return
+    combine(result0, result1).
+
+    Also forks when fork_in_eager is set, unless tracing, capturing or within
+    no_eager_forks(). combine is the last use of fn1's results and must not
+    return or alias them: after it, aux_stream waits for the calling stream,
+    so their memory is not reused or released early.
+
+    Args:
+        fn0, fn1, event0, event1, aux_stream: as in maybe_execute_in_parallel().
+        combine (Callable): called on the calling stream with both results.
+        fork_in_eager (bool | torch.SymBool): also fork in eager mode.
+    """
+
+    if aux_stream is None:
+        fork = order = False
+    elif torch.compiler.is_compiling():
+        # fork_in_eager may be symbolic while tracing; don't evaluate it.
+        fork, order = do_multi_stream(), False
     else:
-        result0 = fn0()
-        result1 = fn1()
-    return (result0, result1)
+        multi_stream = do_multi_stream()
+        eager = fork_in_eager and _local.eager_forks
+        capturing = ((multi_stream or eager)
+                     and torch.cuda.is_current_stream_capturing())
+        fork = multi_stream or (eager and not capturing)
+        order = fork and not capturing
+
+    result0, result1 = _run_in_parallel(fn0, fn1, event0, event1, aux_stream,
+                                        fork)
+    result = combine(result0, result1)
+    if order:
+        event0.record()
+        event0.wait(aux_stream)
+    return result

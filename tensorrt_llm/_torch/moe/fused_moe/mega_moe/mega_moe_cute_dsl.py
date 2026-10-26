@@ -105,6 +105,7 @@ from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
+    MoEFusedRouteQuant,
     MoEProblem,
     MoERejectReason,
     MoERunContext,
@@ -115,6 +116,10 @@ from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ....cute_dsl_kernels.blackwell.dsv4_route_quant import dsv4_route_nvfp4_quant
+    from ....cute_dsl_kernels.blackwell.megamoe_stage_inputs import stage_megamoe_inputs
 
 __all__ = [
     "MegaMoECuteDsl",
@@ -601,6 +606,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             for architecture in architectures
         )
         self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
+        # The fused launch writes unpadded scale rows, so only shapes without SF padding fuse.
+        self._fuses_route_quant = (
+            self.routing_method.sqrt_softplus_bias_selection
+            and megamoe_activation_sf_bytes_per_row(self.hidden_size) == self.hidden_size // 16
+        )
 
         # Cross-rank combine wire format is selected with
         # MEGAMOE_COMBINE_FORMAT (default bf16). It MUST be rank-identical:
@@ -685,14 +695,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._weights_loaded = False
         self._weights_created = False
         self.quant_method = None
-        # Per-instance staging cache (key -> {tensor name: tensor}) and
-        # last-staged-T tracker; together they implement the always-pad-
-        # to-max_T launch contract by refreshing only the rows that
-        # changed between calls. ``_last_staged_T`` is keyed by bucket max_T:
-        # each bucket's staging buffer has its own row-reset history (a shared
-        # scalar would reset the wrong buffer when buckets alternate).
+        # Staging buffers per adaptive bucket (key -> {tensor name: tensor}).
         self._local_staging_cache: Dict[Tuple, Dict[str, torch.Tensor]] = {}
-        self._last_staged_T: Dict[int, int] = {}
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -1147,6 +1151,23 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # MoE-contract methods
     # ------------------------------------------------------------------
+    def try_fused_route_quant(
+        self, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> Optional[MoEFusedRouteQuant]:
+        """Sqrt-softplus routing and NVFP4 input quantization in one launch."""
+        if not self._fuses_route_quant:
+            return None
+        ids, weights, x_fp4, x_sf, _ = dsv4_route_nvfp4_quant(
+            router_logits,
+            self.routing_method.e_score_correction_bias,
+            x,
+            self.fc31_input_scale,
+            self.routing_method.top_k,
+            self.routing_method.routed_scaling_factor,
+            torch.float32,
+        )
+        return MoEFusedRouteQuant(ids, weights, x_fp4, x_sf)
+
     def quantize_input(
         self,
         x: Union[torch.Tensor, "Fp4QuantizedTensor"],
@@ -1212,10 +1233,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     ) -> torch.Tensor:
         """Run the fused MegaMoE CuteDSL kernel on pre-quantized inputs.
 
-        Keeps the scheduler's ``int32`` token-selected experts on SM107 and
-        delegates the staging + kernel launch to :meth:`_run_moe`, which
-        returns the reduced ``(T, hidden)`` output. Other architectures keep
-        the existing ``int64`` kernel ABI.
+        Delegates the staging + kernel launch to :meth:`_run_moe`; staging widens
+        the ``int32`` expert ids to the kernel's index type.
         """
         del workspace  # The symmetric buffer is this backend's own workspace.
         x = ctx.x
@@ -1254,7 +1273,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         top_k = int(token_selected_experts.shape[-1])
         device = x.device
 
-        topk_idx = token_selected_experts.to(self._topk_idx_dtype).contiguous()
+        topk_idx = token_selected_experts.to(torch.int32).contiguous()
         topk_weights_f32 = token_final_scales.to(torch.float32).contiguous()
 
         return self._run_moe(
@@ -1433,55 +1452,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             topk_idx_local=staging["topk_idx"],
         )
 
-    def _stage_inputs(
-        self,
-        *,
-        bufs: _MegaMoeBuffers,
-        x: torch.Tensor,
-        x_sf: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_tokens: int,
-        top_k: int,
-        stage_activation: bool,
-    ) -> None:
-        """Copy live rows of the user-domain inputs into the kernel's
-        pre-allocated buffers and refresh the padded tail.
-
-        Same code for single-rank (writes land in local CUDA) and
-        multi-rank (writes land in symmetric heap regions visible to
-        peers). The buffer source is selected upstream by
-        :meth:`_acquire_buffers`.
-
-        Tail policy:
-
-          * ``topk_idx_local``: always ``-1`` outside live rows.
-            Allocated as ``-1`` once in ``_ensure_local_staging``;
-            only the rows we previously wrote (``[num_tokens,
-            last_T)``) need resetting. New tail rows
-            ``[last_T, max_T)`` already hold ``-1`` from prior calls.
-          * ``topk_weights``: always ``0.0`` outside live rows. The
-            combine kernel writes one cell per
-            ``(token, k in [0, top_k))`` regardless of the
-            ``topk_idx == -1`` mask, so a stale non-zero weight in
-            the tail could corrupt the combine reduction (especially
-            on peer ranks via NVLink). One cheap zero kernel covers
-            it.
-        """
-        max_T = bufs.topk_idx_local.shape[0]
-        last_T = self._last_staged_T.get(max_T)
-        if last_T is not None and last_T > num_tokens:
-            bufs.topk_idx_local[num_tokens:last_T].fill_(-1)
-        if num_tokens > 0:
-            bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
-            if stage_activation:
-                bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
-                bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
-            bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
-        if num_tokens < max_T:
-            bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
-        self._last_staged_T[max_T] = num_tokens
-
     def _launch_megamoe_kernel(
         self,
         *,
@@ -1658,15 +1628,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 output_dtype=output_dtype,
                 launch_max_T=max_T,
             )
-            self._stage_inputs(
-                bufs=bufs,
-                x=None,
-                x_sf=None,
-                topk_idx=None,
-                topk_weights=None,
-                num_tokens=0,
-                top_k=top_k,
-                stage_activation=False,
+            stage_megamoe_inputs(
+                torch.empty((0, top_k), dtype=torch.int32, device=device),
+                torch.empty((0, top_k), dtype=torch.float32, device=device),
+                bufs.topk_idx_local,
+                bufs.topk_weights,
             )
             self._launch_megamoe_kernel(
                 activation=bufs.activation,
@@ -1786,15 +1752,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and topk_weights.data_ptr() % 16 == 0
         )
         if not use_direct_routing_inputs:
-            self._stage_inputs(
-                bufs=bufs,
-                x=x,
-                x_sf=x_sf,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                num_tokens=num_tokens,
-                top_k=top_k,
-                stage_activation=not use_direct_inputs,
+            stage_megamoe_inputs(
+                topk_idx,
+                topk_weights,
+                bufs.topk_idx_local,
+                bufs.topk_weights,
+                x=None if use_direct_inputs else x,
+                x_sf=None if use_direct_inputs else x_sf,
+                act_buffer=bufs.activation,
+                sf_buffer=bufs.activation_sf,
             )
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,

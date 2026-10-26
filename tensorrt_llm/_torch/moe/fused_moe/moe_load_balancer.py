@@ -1016,6 +1016,8 @@ moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
     'DeepseekV32ForCausalLM',
     'DeepseekV4ForCausalLM',
+    'DeepseekV41ForCausalLM',
+    'DeepseekV41ForConditionalGeneration',
     'GlmMoeDsaForCausalLM',
     'GptOssForCausalLM',
     'KimiK25ForConditionalGeneration',

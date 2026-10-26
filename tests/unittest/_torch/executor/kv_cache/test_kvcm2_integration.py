@@ -1387,6 +1387,26 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     assert request.py_request_id not in manager._allocated_draft_lens
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("chunk_size", [0, 16])
+def test_settle_context_cursor_with_unaligned_reused_prefix(chunk_size: int) -> None:
+    request = LlmRequest(
+        request_id=38,
+        max_new_tokens=4,
+        input_tokens=[0] * 476,
+        sampling_config=SamplingConfig(1),
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 348
+    request.context_chunk_size = chunk_size
+
+    kv_cache_v2_module._settle_context_cursor(request, 348, 128)
+
+    assert request.prepopulated_prompt_len == 348
+    assert request.context_current_position == 348
+    assert request.context_chunk_size == 128
+
+
 def _revert_context_request(request_id: int) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,
@@ -1441,6 +1461,25 @@ def test_context_revert_shrinks_in_place_when_history_fits() -> None:
     request.set_prepopulated_prompt_len.assert_not_called()
     assert request.context_current_position == 256
     assert request.context_chunk_size == 192
+
+
+def test_swa_scratch_budget_separates_reuse_policies() -> None:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+
+    # Identical window/layout groups still own independent physical scratch.
+    sizes, windows = [528] * 4, [129] * 4
+    groups = [AttentionReusePolicy.OPTIONAL] * 2 + [AttentionReusePolicy.PRIVATE] * 2
+    combined = kv_cache_v2_module._estimate_swa_cache_size(
+        sizes, windows, 128, context=True, scratch=True, scratch_group_keys=groups
+    )
+    separate = [
+        kv_cache_v2_module._estimate_swa_cache_size(
+            sizes[:2], windows[:2], 128, context=True, scratch=True
+        )
+        for _ in range(2)
+    ]
+    assert combined == tuple(sum(cost[i] for cost in separate) for i in range(2))
+    assert combined[0] == 528 * 2
 
 
 def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> None:
@@ -1725,6 +1764,73 @@ def test_external_draft_estimated_quota_supports_allocation_and_resume(
     finally:
         for cache in caches:
             cache.close()
+        manager.shutdown()
+
+
+def test_retired_long_cache_returns_its_pages_and_clears_its_page_table() -> None:
+    """A finished long request retires in one native call: its pages return to the pool, its
+    page-table rows read BAD, and the next request re-allocates every page."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    tokens_per_block = 32
+    prompt_len = 64 * tokens_per_block + 5
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=64 << 20),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=131072,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+    )
+
+    def gen_init(request_id: int) -> _ContextRequest:
+        request = _ContextRequest(
+            request_id,
+            list(range(prompt_len)),
+            prompt_len,
+            f"conv-{request_id}",
+            use_conversation_params=False,
+            is_disagg_generation_init_state=True,
+        )
+        request.py_draft_tokens = []
+        request.is_first_context_chunk = True
+        assert manager.prepare_disagg_gen_init(request)
+        return request
+
+    def table(request_id: int) -> np.ndarray:
+        index = manager.index_mapper.get_index(request_id)
+        return manager.host_kv_cache_block_offsets[:, index, 0].numpy().copy()
+
+    try:
+        free_before = sum(item.free for item in manager.impl.get_storage_statistics())
+        first = gen_init(1)
+        index = manager.index_mapper.get_index(first.py_request_id)
+        held = table(first.py_request_id)
+        num_blocks = -(-prompt_len // tokens_per_block)
+        assert (held[:, :num_blocks] >= 0).all()
+        assert sum(item.free for item in manager.impl.get_storage_statistics()) < free_before
+
+        manager.free_resources(first)
+        torch.cuda.synchronize()
+        assert first.py_request_id not in manager.kv_cache_map
+        assert (
+            manager.host_kv_cache_block_offsets[:, index, 0, :num_blocks] == BAD_PAGE_INDEX
+        ).all()
+        assert sum(item.free for item in manager.impl.get_storage_statistics()) == free_before
+
+        second = gen_init(2)
+        reused = table(second.py_request_id)
+        assert (reused[:, :num_blocks] >= 0).all()
+        assert sorted(reused[:, :num_blocks].ravel()) == sorted(held[:, :num_blocks].ravel())
+        manager.free_resources(second)
+        torch.cuda.synchronize()
+        assert sum(item.free for item in manager.impl.get_storage_statistics()) == free_before
+    finally:
         manager.shutdown()
 
 
@@ -3383,3 +3489,443 @@ def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
 
     assert len(fake_logger.messages) == 1
     assert "unavailable" in fake_logger.messages[0]
+
+
+class TestLongPrefillDemotion:
+    """TLLM_V2_CTX_DEMOTE_*: a real router estimates uncached prefill, and the real V2
+    scheduler and manager run chunked context iterations."""
+
+    BLOCK = 32
+    BUDGET = 128
+    HISTORY = list(range(1000, 1640))
+
+    @pytest.fixture
+    def manager(self):
+        if not torch.cuda.is_available():
+            pytest.skip("requires CUDA")
+        torch.cuda.init()
+        manager = KVCacheManagerV2(
+            KvCacheConfig(enable_block_reuse=True, max_tokens=8192, host_cache_size=0),
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=4,
+            head_dim=64,
+            tokens_per_block=self.BLOCK,
+            max_seq_len=2048,
+            max_batch_size=8,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=32000,
+        )
+        try:
+            yield manager
+        finally:
+            manager.shutdown()
+
+    def _scheduler(self, manager, threshold, max_iters=0):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+        from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
+
+        env = {
+            "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": str(threshold),
+            "TLLM_V2_CTX_DEMOTE_MAX_ITERS": str(max_iters),
+        }
+        with patch.dict(os.environ, env):
+            return KVCacheV2Scheduler(
+                max_batch_size=8,
+                max_num_tokens=self.BUDGET,
+                kv_cache_manager=manager,
+                scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+                ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, self.BLOCK),
+            )
+
+    @staticmethod
+    def _route(router, turns):
+        """Route (id, conversation, prompt) turns and convert them as the executor does."""
+        from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+        from tensorrt_llm._torch.pyexecutor.llm_request import executor_request_to_llm_request
+        from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+        from tensorrt_llm.bindings import executor as trtllm
+
+        items = []
+        for request_id, conversation_id, prompt in turns:
+            request = trtllm.Request(input_token_ids=prompt, max_tokens=1)
+            request.py_scheduling_params = None
+            request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
+            items.append(RequestQueueItem(request_id, request))
+        router.route_requests([RankState(rank=0)], items, max_num_active_requests=8)
+        return [executor_request_to_llm_request(it.id, it.request, [], False) for it in items]
+
+    @staticmethod
+    def _iteration(scheduler, manager, active):
+        """Schedule, then advance and commit what ran; finished prefills leave ``active``."""
+        output = scheduler.schedule_request(active, set())
+        batch = ScheduledRequests()
+        for request in output.context_requests:
+            batch.append_context_request(request)
+        manager.prepare_resources(batch)
+        chunks = {r.py_request_id: r.context_chunk_size for r in output.context_requests}
+        for request in output.context_requests:
+            request.move_to_next_context_chunk()
+        manager.update_context_resources(batch)
+        for request in output.context_requests:
+            if request.context_remaining_length == 0:
+                manager.free_resources(request)
+                active.remove(request)
+        return chunks
+
+    def _cold_and_reuse_turn(self, manager, first_id):
+        """A seeded conversation, then a cold 640-token first turn ahead of a 64-token reuse turn."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import ConversationAwareADPRouter
+
+        # The router publishes estimates only while demotion is on.
+        with patch.dict(os.environ, {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1"}):
+            router = ConversationAwareADPRouter(dist=SimpleNamespace(tp_rank=0, tp_size=1))
+        seed = self._route(router, [(first_id, f"conv-{first_id}", self.HISTORY)])
+        plain = self._scheduler(manager, threshold=0)
+        while seed:
+            self._iteration(plain, manager, seed)
+        cold, turn = self._route(
+            router,
+            [
+                (first_id + 1, f"cold-{first_id}", list(range(5000, 5640))),
+                (first_id + 2, f"conv-{first_id}", self.HISTORY + list(range(1640, 1704))),
+            ],
+        )
+        assert (cold.py_uncached_prefill_tokens, turn.py_uncached_prefill_tokens) == (640, 64)
+        return router, cold, turn
+
+    def test_fcfs_without_demotion(self, manager) -> None:
+        _, cold, turn = self._cold_and_reuse_turn(manager, 10)
+        assert self._iteration(self._scheduler(manager, 0), manager, [cold, turn]) == {
+            11: self.BUDGET
+        }
+        manager.free_resources(cold)
+
+    def test_long_prefill_waits_until_its_remainder_is_short(self, manager) -> None:
+        router, cold, turn = self._cold_and_reuse_turn(manager, 20)
+        scheduler = self._scheduler(manager, threshold=256)
+        active = [cold, turn]
+        # The reuse turn runs first; the cold prefill takes what is left.
+        assert self._iteration(scheduler, manager, active) == {22: 64, 21: 64}
+        while cold.context_remaining_length > 256:
+            assert self._iteration(scheduler, manager, active) == {21: self.BUDGET}
+        # Its exact remainder is under the threshold, so a new reuse turn queues behind it.
+        (late,) = self._route(router, [(23, "conv-20", self.HISTORY + list(range(1640, 1736)))])
+        active.append(late)
+        assert self._iteration(scheduler, manager, active) == {21: self.BUDGET}
+        for request in active:
+            manager.free_resources(request)
+
+    def test_aging_releases_a_demoted_prefill_for_good(self, manager) -> None:
+        router, cold, turn = self._cold_and_reuse_turn(manager, 30)
+        scheduler = self._scheduler(manager, threshold=256, max_iters=1)
+        active = [cold, turn]
+        assert self._iteration(scheduler, manager, active) == {32: 64, 31: 64}
+        (late,) = self._route(router, [(33, "conv-30", self.HISTORY + list(range(1640, 1800)))])
+        active.append(late)
+        # Demoted once, then released: it keeps arrival order while still long.
+        for _ in range(2):
+            assert self._iteration(scheduler, manager, active) == {31: self.BUDGET}
+        for request in active:
+            manager.free_resources(request)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_disk_tier_from_config_keeps_evicted_prefixes(tmp_path) -> None:
+    """kv_cache_config.disk_cache_size/_path build a real disk tier that keeps evicted
+    prefixes for reuse; a tier the filesystem cannot hold fails at startup, naming it."""
+    torch.cuda.init()
+
+    def make_manager(disk_cache_size):
+        return KVCacheManagerV2(
+            KvCacheConfig(
+                enable_block_reuse=True,
+                max_gpu_total_bytes=4 << 20,
+                host_cache_size=0,
+                disk_cache_size=disk_cache_size,
+                disk_cache_path=str(tmp_path),
+            ),
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=4,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=512,
+            max_batch_size=4,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=32000,
+        )
+
+    manager = make_manager(64 << 20)
+    try:
+        assert [type(tier) for tier in manager.impl.init_config.cache_tiers] == [
+            GpuCacheTierConfig,
+            DiskCacheTierConfig,
+        ]
+        first = _ContextRequest(1, list(range(512)), 512, "conv-1")
+        _run_context(manager, first)
+        manager.free_resources(first)
+        # Fill the GPU pool with other prompts so the first prompt's blocks go to disk.
+        disk = manager.impl.get_storage_statistics(CacheLevel(1))
+        request_id = 2
+        while all(stats.free == stats.total for stats in disk):
+            other = _ContextRequest(
+                request_id, [request_id * 1000 + i for i in range(512)], 512, f"conv-{request_id}"
+            )
+            _run_context(manager, other)
+            manager.free_resources(other)
+            request_id += 1
+            assert request_id < 64, "the GPU pool never spilled to the disk tier"
+            disk = manager.impl.get_storage_statistics(CacheLevel(1))
+        assert manager.probe_prefix_match_length(list(range(511))) >= 256
+    finally:
+        manager.shutdown()
+
+    free = os.statvfs(tmp_path).f_bavail * os.statvfs(tmp_path).f_frsize
+    with pytest.raises(RuntimeError, match=f"KV cache disk tier: {tmp_path} has"):
+        make_manager(free + (1 << 30))
+
+
+def _anonymous_pages_per_numa_node() -> dict[str, dict[int, int]]:
+    """Resident pages per NUMA node of each anonymous mapping, from /proc/self/numa_maps."""
+    mappings = {}
+    with open("/proc/self/numa_maps") as numa_maps:
+        for line in numa_maps:
+            fields = line.split()
+            if any(item.startswith("file=") for item in fields):
+                continue
+            pages = {}
+            for item in fields[2:]:
+                if item.startswith("N") and "=" in item:
+                    node, count = item[1:].split("=")
+                    pages[int(node)] = int(count)
+            mappings[fields[0]] = pages
+    return mappings
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bind", [False, True])
+def test_host_tier_bound_to_gpu_numa_node(bind: bool) -> None:
+    """kv_cache_config.host_cache_bind_to_gpu_numa_node allocates the real host tier on the
+    GPU's host NUMA node even while the building thread prefers another node."""
+    import ctypes
+    import platform
+
+    from cuda.bindings import driver as cuda
+
+    torch.cuda.init()
+    attribute = cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID
+    result, gpu_node = cuda.cuDeviceGetAttribute(attribute, torch.cuda.current_device())
+    nodes = sorted(
+        int(name[4:])
+        for name in os.listdir("/sys/devices/system/node")
+        if name.startswith("node") and os.path.getsize(f"/sys/devices/system/node/{name}/cpulist")
+    )
+    other = next((node for node in nodes if node != gpu_node), None)
+    if result != cuda.CUresult.CUDA_SUCCESS or gpu_node < 0 or other is None:
+        pytest.skip("needs a GPU with a host NUMA node on a multi-node host")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    set_mempolicy = {"aarch64": 237, "x86_64": 238}[platform.machine()]
+    mask = (ctypes.c_ulong * 64)()
+    mask[other // 64] = 1 << (other % 64)
+    mpol_preferred = 1
+    assert libc.syscall(set_mempolicy, mpol_preferred, mask, 64 * 64 + 1) == 0
+    manager = None
+    before = _anonymous_pages_per_numa_node()
+    try:
+        manager = KVCacheManagerV2(
+            KvCacheConfig(
+                max_gpu_total_bytes=64 << 20,
+                host_cache_size=256 << 20,
+                host_cache_bind_to_gpu_numa_node=bind,
+            ),
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=4,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=512,
+            max_batch_size=4,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=32000,
+        )
+        # The host tier is the one new mapping as large as its 256 MiB quota.
+        page_bytes = os.sysconf("SC_PAGE_SIZE")
+        (pages,) = [
+            pages
+            for address, pages in _anonymous_pages_per_numa_node().items()
+            if address not in before and sum(pages.values()) * page_bytes >= 256 << 20
+        ]
+        assert max(pages, key=pages.get) == (gpu_node if bind else other), pages
+    finally:
+        assert libc.syscall(set_mempolicy, 0, None, 0) == 0
+        if manager is not None:
+            manager.shutdown()
+
+
+class TestVetoedContextChunk:
+    """An attention-DP batch whose forward pass is vetoed gives back the context
+    capacity the V2 scheduler grew, so a started request rescheduled with another
+    chunk satisfies SWA scratch (capacity == history before any resize)."""
+
+    BLOCK = 32
+
+    @pytest.fixture
+    def manager(self):
+        if not torch.cuda.is_available():
+            pytest.skip("requires CUDA")
+        torch.cuda.init()
+        manager = KVCacheManagerV2(
+            KvCacheConfig(
+                enable_block_reuse=True,
+                block_reuse_config=BlockReuseConfig(policy="per_conversation", max_num_turns=5),
+                max_tokens=8192,
+                host_cache_size=0,
+                max_attention_window=[64, 2048],
+                enable_swa_scratch_reuse=True,
+            ),
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=4,
+            head_dim=64,
+            tokens_per_block=self.BLOCK,
+            max_seq_len=2048,
+            max_batch_size=8,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=32000,
+        )
+        try:
+            yield manager
+        finally:
+            manager.shutdown()
+
+    def _scheduler(self, manager, budget, demotion_tokens=0):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+        from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
+
+        with patch.dict(os.environ, {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": str(demotion_tokens)}):
+            return KVCacheV2Scheduler(
+                max_batch_size=8,
+                max_num_tokens=budget,
+                kv_cache_manager=manager,
+                scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+                ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, self.BLOCK),
+            )
+
+    @staticmethod
+    def _request(request_id, prompt_len, conversation_id, estimate=None):
+        request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=[request_id * 10000 + i for i in range(prompt_len)],
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+        )
+        request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
+        request.py_uncached_prefill_tokens = estimate
+        return request
+
+    @staticmethod
+    def _run(manager, output):
+        """The forward pass ran: advance the scheduled chunks and commit them."""
+        batch = ScheduledRequests()
+        for request in output.context_requests:
+            batch.append_context_request(request)
+        manager.prepare_resources(batch)
+        for request in output.context_requests:
+            request.move_to_next_context_chunk()
+        manager.update_context_resources(batch)
+
+    @staticmethod
+    def _veto(manager, output):
+        """Another attention-DP rank had nothing to run, so this batch is skipped."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        executor = SimpleNamespace(
+            _is_kv_manager_v2=True, kv_cache_manager=manager, enable_joint_kv_cache_reuse=False
+        )
+        batch = ScheduledRequests()
+        for request in output.context_requests:
+            batch.append_context_request(request)
+        PyExecutor._revert_unexecuted_alloc(executor, batch)
+
+    def test_chunk_dropped_after_scheduling_is_given_back(self, manager) -> None:
+        """A chunk the scheduler grew but _schedule drops (here the KV-length cap) gives the growth
+        back, so the next iteration's different chunk resizes from capacity == history."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        scheduler = self._scheduler(manager, 256)
+        short_turn = self._request(1, 96, "short", estimate=96)
+        long_turn = self._request(2, 1500, "long", estimate=1500)
+        self._run(manager, scheduler.schedule_request([long_turn], set()))
+        assert long_turn.context_current_position == 256
+
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_manager = manager
+        executor.scheduler = scheduler
+        executor.active_requests = [short_turn, long_turn]
+        executor.inflight_req_ids = set()
+        executor.is_encoder_decoder = False
+        executor.enable_attention_dp = False
+        executor.enable_batch_waiting = False
+        executor._is_kv_manager_v2 = True
+        executor.enable_joint_kv_cache_reuse = False
+        executor._cap_context_by_total_kv_len = lambda requests: [
+            r for r in requests if r.py_request_id != long_turn.py_request_id
+        ]
+        scheduled, _, _ = PyExecutor._schedule(executor)
+        assert long_turn.py_request_id not in [r.py_request_id for r in scheduled.context_requests]
+
+        cache = manager.kv_cache_map[long_turn.py_request_id]
+        assert cache.capacity == cache.history_length == long_turn.context_current_position
+
+        # Next iteration the dropped request gets a different (smaller) chunk than the one it lost.
+        output = self._scheduler(manager, 128).schedule_request([long_turn], set())
+        assert [r.context_chunk_size for r in output.context_requests] == [128]
+        self._run(manager, output)
+        assert cache.capacity == cache.history_length == long_turn.context_current_position == 384
+        for request in (short_turn, long_turn):
+            manager.free_resources(request)
+
+    @pytest.mark.parametrize("order", ["fcfs", "demotion"])
+    def test_rescheduled_with_another_chunk_after_a_veto(self, manager, order) -> None:
+        budget = 256
+        scheduler = self._scheduler(manager, budget, 512 if order == "demotion" else 0)
+        long_turn = self._request(1, 1500, "long", estimate=1500)
+        active = [long_turn]
+        self._run(manager, scheduler.schedule_request(active, set()))
+        assert long_turn.context_current_position == budget
+
+        output = scheduler.schedule_request(active, set())
+        assert [r.py_request_id for r in output.context_requests] == [1]
+        self._veto(manager, output)
+        cache = manager.kv_cache_map[long_turn.py_request_id]
+        assert cache.capacity == cache.history_length == long_turn.context_current_position
+
+        # A short turn arrives while the batch was vetoed; with demotion it runs first and
+        # the long prefill gets a smaller chunk than the one that was vetoed.
+        short_turn = self._request(2, 96, "short", estimate=96)
+        active.append(short_turn)
+        output = scheduler.schedule_request(active, set())
+        chunks = {r.py_request_id: r.context_chunk_size for r in output.context_requests}
+        if order == "demotion":
+            assert chunks == {1: budget - 96, 2: 96}
+        else:
+            assert chunks == {1: budget}
+        self._run(manager, output)
+        assert long_turn.context_current_position == budget + chunks[1]
+        assert cache.capacity == cache.history_length
+
+        # The next growth resizes from capacity == history, as SWA scratch requires.
+        active = [long_turn]
+        output = scheduler.schedule_request(active, set())
+        assert [r.py_request_id for r in output.context_requests] == [1]
+        self._run(manager, output)
+        assert cache.capacity == cache.history_length == long_turn.context_current_position
+        for request in (long_turn, short_turn):
+            manager.free_resources(request)

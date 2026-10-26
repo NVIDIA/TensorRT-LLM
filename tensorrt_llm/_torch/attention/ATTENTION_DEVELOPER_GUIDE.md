@@ -305,17 +305,21 @@ NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
 so it also returns `False` from
 `runtime_workspace_is_chunked_prefill_bounded`.
 
-CSA2 also gathers the complete compressed prefix during index prefill and
-declares a conservative gather rate even with chunked prefill. Its native
+CSA2 also gathers the complete compressed prefix during index prefill, even
+with chunked prefill: on the native SM100 path 69 bytes per gathered key (E2M1
+data, scale word, validity) for each query piece a request splits into, and a
+conservative 512 bytes per key on the decoded fallback. Its native
 index descriptor/radix arena follows maximum batch, draft width and sequence
 length, so it declares a separate fixed reserve for an eager arena and, when
 enabled, a shared CUDA graph arena. The estimator conservatively reserves the
 full arena capacity alongside the profiled peak: a decode arena may first be
 allocated after peak prefill, so its final retained bytes cannot safely be
-subtracted from that earlier peak.
+subtracted from that earlier peak. The fixed reserve also covers one prefill
+indexer group's FP32 logits, whose width follows the attended prefix; the MQA
+logits element budget and the step's query rows bound them.
 The attended-KV admission cap applies to the prefix gather, independently of
-the fixed graph arena. Projection, native/provider scratch and transient logits
-still require representative peak-memory profiling.
+the fixed graph arena. Projection and native/provider scratch still require
+representative peak-memory profiling.
 
 ### 2.4 Capability reference
 

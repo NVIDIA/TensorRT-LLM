@@ -764,6 +764,10 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora),
+            samples_from_vocab_shards=(
+                isinstance(self.model,
+                           (DecoderModelForCausalLM, MultimodalModelMixin))
+                and self.model.samples_from_vocab_shards),
             **extra_fields,
         )
 

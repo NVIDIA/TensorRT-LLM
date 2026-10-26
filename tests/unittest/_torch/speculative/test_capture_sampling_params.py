@@ -100,9 +100,12 @@ def _request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
             top_k=top_k,
             top_p=top_p,
             min_p=min_p,
+            seed=None,
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
+        py_spec_sampling_params=None,
+        py_logits_post_processors=None,
     )
 
 
@@ -112,6 +115,7 @@ def _fake_meta():
         is_ragged_verify=False,
         dummy_slot_row=0,
         group_all_greedy_sample=None,
+        samples_from_vocab_shards=False,
     )
 
 
@@ -202,6 +206,7 @@ def _populate_meta(mode, draft_len=1):
         is_ragged_verify=False,
         dummy_slot_row=0,
         group_all_greedy_sample=None,
+        samples_from_vocab_shards=False,
         max_num_requests=4,
         max_draft_len=draft_len,
         max_total_draft_tokens=draft_len,

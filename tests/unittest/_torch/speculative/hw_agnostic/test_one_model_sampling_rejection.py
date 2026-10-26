@@ -26,6 +26,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.speculative.spec_sampler_base import (
     UNSUPPORTED_BAD_WORDS_MSG,
     UNSUPPORTED_EMBEDDING_BIAS_MSG,
+    UNSUPPORTED_LOGITS_PROCESSOR_MSG,
     UNSUPPORTED_MIN_LENGTH_MSG,
     UNSUPPORTED_MIN_P_MSG,
     UNSUPPORTED_NO_REPEAT_NGRAM_MSG,
@@ -181,6 +182,23 @@ def test_executor_side_check_still_rejects(name, fields, expected):
     with pytest.raises(ValueError) as excinfo:
         SpecSampler._validate_unsupported_logits_processors(request)
     assert str(excinfo.value) == expected
+
+
+@pytest.mark.cpu_only
+def test_logits_processor_is_rejected_on_both_paths():
+    # Tokens are accepted inside the forward, before the executor runs any logits processor.
+    params = SamplingParams(logits_processor=lambda *args: None)
+    assert one_model_sampling_rejection_reason(params) == UNSUPPORTED_LOGITS_PROCESSOR_MSG
+    request = types.SimpleNamespace(
+        py_min_length=None,
+        py_bad_words=None,
+        py_no_repeat_ngram_size=None,
+        py_embedding_bias=None,
+        py_logits_post_processors=[lambda *args: None],
+    )
+    with pytest.raises(ValueError) as excinfo:
+        SpecSampler._validate_unsupported_logits_processors(request)
+    assert str(excinfo.value) == UNSUPPORTED_LOGITS_PROCESSOR_MSG
 
 
 @pytest.mark.cpu_only

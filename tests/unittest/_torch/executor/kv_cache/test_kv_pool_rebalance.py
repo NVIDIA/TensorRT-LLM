@@ -936,7 +936,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # Per-iteration no-ops.
     exe._handle_control_request = MagicMock()
     exe._pad_attention_dp_dummy_request = MagicMock()
-    exe._revert_gen_alloc = MagicMock()
+    exe._revert_unexecuted_alloc = MagicMock()
     exe._add_inflight_ids = MagicMock()
     exe._handle_dynamic_draft_len = MagicMock()
     exe.resource_manager = MagicMock()
@@ -1052,7 +1052,7 @@ class TestPpLoopDrainWiring:
 
         # Two drain iterations queued nothing, the third one did.
         exe._forward_step_inter_pp.assert_called_once()
-        assert exe._revert_gen_alloc.call_count == 2
+        assert exe._revert_unexecuted_alloc.call_count == 2
         assert exe.micro_batches == [None, None]
 
         # And the rebalance ran exactly once, at the end of the drain.
@@ -1070,7 +1070,7 @@ class TestPpLoopDrainWiring:
         with pytest.raises(_ReachedForward):
             PyExecutor._executor_loop_pp(exe)
 
-        assert exe._revert_gen_alloc.call_count == 4
+        assert exe._revert_unexecuted_alloc.call_count == 4
         exe._rebalance_kv_pools_now.assert_called_once()
 
     def test_no_drain_is_started_while_one_is_pending(self, monkeypatch):

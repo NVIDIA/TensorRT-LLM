@@ -20,8 +20,8 @@ import importlib
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Any, Callable, ClassVar, Dict, List, Mapping, NamedTuple,
-                    Optional, Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Mapping,
+                    NamedTuple, Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -44,6 +44,9 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          hexdigest_to_int32, validate_mm_inputs)
 from .multimodal_data import serialize_item
 from .prefix_token_cache import create_prefix_token_cache
+
+if TYPE_CHECKING:
+    from ..llmapi.llm_args import PromptTokenCacheConfig
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -254,6 +257,9 @@ class BaseMultimodalInputProcessor(ABC):
     # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
+
+    # Whether the subclass takes `prompt_token_cache_config` in `__init__`.
+    supports_prompt_token_cache: ClassVar[bool] = False
 
     def get_mm_encoder_item_metadata(
         self,
@@ -1141,6 +1147,7 @@ def create_input_processor(
     checkpoint_format: Optional[str] = "HF",
     trust_remote_code: bool = True,
     enable_tokenization_cache: bool = False,
+    prompt_token_cache_config: Optional["PromptTokenCacheConfig"] = None,
     **kwargs,
 ) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
@@ -1156,6 +1163,8 @@ def create_input_processor(
             the tokenization of recent prompts. Ignored for model-specific
             (multimodal) input processors unless they set
             ``supports_tokenization_cache``.
+        prompt_token_cache_config: Node-shared prompt token cache, passed to
+            input processors that set ``supports_prompt_token_cache``.
         **kwargs: Additional arguments passed to input processor constructors
             (e.g., video_pruning_rate for multimodal models).
 
@@ -1206,6 +1215,15 @@ def create_input_processor(
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
+            if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
+                    and input_processor_cls.supports_prompt_token_cache):
+                kwargs["prompt_token_cache_config"] = prompt_token_cache_config
+                if prompt_token_cache_config is not None and enable_tokenization_cache:
+                    kwargs.pop("enable_tokenization_cache", None)
+                    logger.warning(
+                        "prompt_token_cache_config takes precedence over "
+                        f"enable_tokenization_cache for {input_processor_cls.__name__}."
+                    )
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that

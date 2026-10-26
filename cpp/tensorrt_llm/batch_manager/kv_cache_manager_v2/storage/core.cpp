@@ -93,7 +93,11 @@ Slot SlotAllocator::allocate()
         throw OutOfPagesError("SlotAllocator: no free slots");
     }
     scrubEvents();
+    return takeFreeSlot();
+}
 
+Slot SlotAllocator::takeFreeSlot()
+{
     Slot slot;
     if (mNumReadyRecycledSlots > 0)
     {
@@ -130,9 +134,11 @@ std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
     }
     std::vector<Slot> result;
     result.reserve(slotCountToSizeT(numSlots));
+    // Slots released together share one event, so one readiness scan serves the whole batch.
+    scrubEvents();
     for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
     {
-        result.push_back(allocate());
+        result.push_back(takeFreeSlot());
     }
     return result;
 }
@@ -160,7 +166,8 @@ void SlotAllocator::release(Slot slot)
     {
         mOverflowSlots.push_back(std::move(slot));
     }
-    scrubEvents();
+    // Readiness is scanned at the next allocation: a request releases all its slots under one
+    // event, which would otherwise be queried once per slot.
     TLLM_CHECK_DEBUG(check());
 }
 
@@ -354,9 +361,9 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
-HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots)
+HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, std::optional<int> numaNode)
     : SlotPoolBase(slotSize)
-    , mHostMem(alignedSize(numSlots))
+    , mHostMem(alignedSize(numSlots), numaNode)
 {
 }
 
@@ -583,12 +590,13 @@ GpuPoolGroup::GpuPoolGroup(
 // HostPoolGroup
 // ---------------------------------------------------------------------------
 
-HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList)
+HostPoolGroup::HostPoolGroup(
+    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::optional<int> numaNode)
     : PoolGroupBase(numSlots)
 {
     for (size_t sz : slotSizeList)
     {
-        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots));
+        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, numaNode));
     }
 }
 
@@ -656,15 +664,15 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 // HostCacheLevelStorage
 // ---------------------------------------------------------------------------
 
-HostCacheLevelStorage::HostCacheLevelStorage(
-    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
+HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<int> numaNode)
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
         mPoolGroups.push_back(
-            std::make_unique<HostPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList()));
+            std::make_unique<HostPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), numaNode));
     }
 }
 
@@ -704,7 +712,7 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {
-                return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList);
+                return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList, cfg.numaNode);
             }
             else
             {

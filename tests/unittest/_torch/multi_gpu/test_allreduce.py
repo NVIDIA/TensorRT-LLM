@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import pickle
 import sys
 import traceback
@@ -23,12 +24,17 @@ from mpi4py import MPI
 from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
                                              MiniMaxAllReduceRMS, MoEAllReduce,
                                              MoEAllReduceParams)
+from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.mhc.mhc_lowm import (
+    LamportAllReduce, MnnvlLamportAllReduce, MoeUnfinalized,
+    mhc_allreduce_post_collapse_norm, mhc_post_collapse_norm)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
 
@@ -926,5 +932,144 @@ def test_minimax_allreduce_rms_qk(mpi_pool_executor, non_contiguous_input):
                 k_input, rms_weights_q, rms_weights_k, eps,
                 non_contiguous_input)] * tensor_parallel_size),
     )
+    for r in results:
+        assert r is True
+
+
+# DeepSeek-V4.1 split mHC boundary that all-reduces the sublayer output in its own launch.
+MHC_HIDDEN = 5120
+MHC_NORM_EPS = 1e-20
+
+
+def _mhc_inputs(m: int, seed: int, rank: int):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    res = torch.randn(m, 4, MHC_HIDDEN, generator=gen, device="cuda").bfloat16()
+    post = 2 * torch.sigmoid(torch.randn(m, 4, generator=gen, device="cuda"))
+    comb = torch.softmax(torch.randn(m, 4, 4, generator=gen, device="cuda"), -1)
+    pre = torch.sigmoid(torch.randn(m, 4, generator=gen, device="cuda")) + 1e-6
+    weight = (
+        1 +
+        0.1 * torch.randn(MHC_HIDDEN, generator=gen, device="cuda")).bfloat16()
+    gen_x = torch.Generator(device="cuda").manual_seed(seed * 100 + rank + 1)
+    x = torch.randn(m, MHC_HIDDEN, generator=gen_x, device="cuda").bfloat16()
+    # Exact zeros of both signs (-0.0 is the Lamport "not yet written" marker).
+    x[:, :16] = 0.0
+    x[:, 16:32] = -0.0
+    # -0.0 next to a nonzero value in one 32-bit word.
+    x[:, 32:40] = torch.tensor([1.0, -0.0, -0.0, 2.0, -0.0, 0.0, 0.0,
+                                -0.0]).bfloat16()
+    return x, res, post, comb, pre, weight
+
+
+def _mhc_moe_inputs(m: int, seed: int, rank: int, top_k: int = 6):
+    """An un-finalized MoE partial (shared expert + gathered expert rows) and the boundary operands.
+
+    Expert rows of multiples of 1/16 and power-of-two routing weights make every product and the
+    FP32 sum of the routed rows exact, so any summation order gives ``finalize()``'s bits.
+    """
+    x, res, post, comb, pre, weight = _mhc_inputs(m, seed, rank)
+    gen = torch.Generator(device="cuda").manual_seed(seed * 100 + rank + 7)
+    rows = m * top_k + 7
+    fc2 = torch.randint(
+        -128, 128,
+        (rows, MHC_HIDDEN), generator=gen, device="cuda").bfloat16() / 16
+    perm = torch.randperm(rows, generator=gen,
+                          device="cuda")[:m * top_k].view(m, top_k)
+    scales = 2.0**torch.randint(-2, 2, (m, top_k), generator=gen,
+                                device="cuda").float()
+    parts = MoeUnfinalized(shared=x,
+                           fc2=fc2,
+                           scales=scales,
+                           perm=perm.to(torch.int32).contiguous())
+    return parts, res, post, comb, pre, weight
+
+
+@torch.inference_mode()
+def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
+    """Fused boundary vs the library all-reduce + boundary, eager and replayed, interleaved with
+    library all-reduces on the same workspace."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=rank)
+        if mnnvl:
+            # The MNNVL protocol on one node (fabric memory replaced by POSIX handles).
+            os.environ["TLLM_TEST_MNNVL"] = "1"
+            allreduce = AllReduce(mapping=mapping,
+                                  strategy=AllReduceStrategy.MNNVL,
+                                  dtype=torch.bfloat16)
+            assert allreduce.mnnvl_allreduce is not None
+            lamport = MnnvlLamportAllReduce(mapping)
+        else:
+            allreduce = AllReduce(mapping=mapping,
+                                  strategy=AllReduceStrategy.ONESHOT,
+                                  dtype=torch.bfloat16)
+            lamport = LamportAllReduce(get_allreduce_workspace(mapping), rank,
+                                       tp_size)
+
+        def reference(x, res, post, comb, pre, weight):
+            return mhc_post_collapse_norm(allreduce(x), res, post, comb, pre,
+                                          weight, MHC_NORM_EPS)
+
+        def fused(x, res, post, comb, pre, weight):
+            return mhc_allreduce_post_collapse_norm(x, res, post, comb, pre,
+                                                    weight, MHC_NORM_EPS,
+                                                    lamport)
+
+        # Interleaved with library all-reduces of other sizes: both advance the same triple buffer.
+        for m in (1, 24):
+            args = _mhc_inputs(m, m, rank)
+            want = reference(*args)
+            for g, w in zip(fused(*args), want):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+        # CUDA graph replay, fused launches around a library all-reduce.
+        args1, args2 = _mhc_inputs(6, 7, rank), _mhc_inputs(6, 8, rank)
+        want1, want2 = reference(*args1), reference(*args2)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            fused(*args1)
+            allreduce(args2[0])
+            fused(*args2)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out1 = fused(*args1)
+            allreduce(args2[0])
+            out2 = fused(*args2)
+        for _ in range(20):
+            graph.replay()
+        torch.cuda.synchronize()
+        for got, want in ((out1, want1), (out2, want2)):
+            for g, w in zip(got, want):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+        # The MoE-finalize input.
+        parts, *args = _mhc_moe_inputs(24, 324, rank)
+        want = reference(parts.finalize(), *args)
+        for g, w in zip(fused(parts, *args), want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="needs 2 SM100/SM103 GPUs",
+)
+# MNNVL: the fabric-memory workspace of a TP group spanning trays.
+@pytest.mark.parametrize("mnnvl", [False, True], ids=["ipc", "mnnvl"])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mhc_allreduce_boundary_matches_allreduce_then_boundary(
+        mpi_pool_executor, mnnvl):
+    if mnnvl and not MnnvlMemory.supports_mnnvl():
+        pytest.skip("needs MNNVL memory")
+    tp_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(run_mhc_allreduce_boundary_single_rank,
+                                    *zip(*[(tp_size, mnnvl)] * tp_size))
     for r in results:
         assert r is True

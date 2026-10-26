@@ -10,7 +10,8 @@ import cutlass.cute as cute
 import torch
 
 from ..._utils import get_sm_version
-from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
+from ..cute_dsl_kernels.blackwell.dspark.rmsnorm_rope import (
+    DSparkBackfillKernel,
     DSparkRMSNormRoPECacheWriteKernel,
     DSparkRMSNormRoPEDraftBlockKernel,
     DSparkRMSNormRoPEKernel,
@@ -20,10 +21,11 @@ _DSV4_DSPARK_HEAD_DIM = 512
 _DSV4_DSPARK_ROPE_DIM = 64
 _DSV4_DSPARK_WINDOW_SIZE = 128
 _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
-_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
+_DSV4_DSPARK_BLOCK_SIZES = tuple(range(1, _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE + 1))
 _DSV4_DSPARK_ARCH_BY_SM = {
     100: "sm_100",
     103: "sm_103",
+    107: "sm_107",
 }
 
 
@@ -338,6 +340,51 @@ def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
 
 
 @functools.cache
+def _compile_dspark_backfill(num_stages: int, eps: float):
+    tokens = cute.sym_int()
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (cute.sym_int(), _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
+    )
+    weight_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (num_stages, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
+    )
+    freqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (cute.sym_int(), _DSV4_DSPARK_ROPE_DIM // 2, 2),
+        stride_order=(2, 1, 0),
+    )
+    mask_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8, (tokens,), stride_order=(0,))
+    positions_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64, (tokens,), stride_order=(0,)
+    )
+    slots_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64, (cute.sym_int(),), stride_order=(0,)
+    )
+    windows_fake = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (cute.sym_int(), num_stages, _DSV4_DSPARK_WINDOW_SIZE, _DSV4_DSPARK_HEAD_DIM),
+        stride=(cute.sym_int64(), cute.sym_int64(), _DSV4_DSPARK_HEAD_DIM, 1),
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = DSparkBackfillKernel(
+        _DSV4_DSPARK_HEAD_DIM, _DSV4_DSPARK_ROPE_DIM, eps, _DSV4_DSPARK_WINDOW_SIZE, num_stages
+    )
+    return cute.compile(
+        kernel,
+        x_fake,
+        weight_fake,
+        freqs_fake,
+        mask_fake,
+        positions_fake,
+        slots_fake,
+        windows_fake,
+        cutlass.Int32(1),
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@functools.cache
 def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
@@ -600,3 +647,52 @@ def _(
 ) -> torch.Tensor:
     del weight, freqs, eps
     return x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
+
+
+@torch.library.custom_op(
+    "trtllm::cute_dsl_dspark_backfill",
+    mutates_args=("windows",),
+    device_types="cuda",
+)
+def cute_dsl_dspark_backfill(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    mask: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    windows: torch.Tensor,
+    eps: float,
+) -> None:
+    """Write the RMSNorm/RoPE of each valid ``[G, M]`` interim token's per-stage K/V into its window.
+
+    ``kv`` is ``[G, M, num_stages * head_dim]``, ``weight`` the stacked
+    ``[num_stages, head_dim]`` K/V norms, ``freqs`` the ``[positions, rope_dim // 2, 2]``
+    RoPE table and ``windows`` ``[N, num_stages, window_size, head_dim]``.
+    Rows with a false ``mask`` are left untouched.
+    """
+    compiled = _compile_dspark_backfill(weight.shape[0], eps)
+    compiled(
+        kv.view(-1, _DSV4_DSPARK_HEAD_DIM),
+        weight,
+        freqs,
+        mask.view(-1).view(torch.uint8),
+        positions.view(-1),
+        slots,
+        windows,
+        mask.shape[1],
+    )
+
+
+@torch.library.register_fake("trtllm::cute_dsl_dspark_backfill")
+def _(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    mask: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    windows: torch.Tensor,
+    eps: float,
+) -> None:
+    return None

@@ -22,6 +22,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.pyexecutor._util import _mamba_conv_layout_kwargs, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -860,6 +861,10 @@ class Runner:
             else:
                 run_moe_orig = None
 
+            # A fused route+quant backend would bypass the replaced `routing_method.apply`.
+            if isinstance(moe_module, ConfigurableMoE):
+                moe_module.backend.try_fused_route_quant = lambda x, router_logits: None
+
             # Replace `forward_impl` to ensure that routing results are replaced
             forward_impl_orig = moe_module.forward_impl
             moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
@@ -874,6 +879,8 @@ class Runner:
                 moe_module.routing_method.apply = apply_method_orig
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
+                if isinstance(moe_module, ConfigurableMoE):
+                    del moe_module.backend.try_fused_route_quant
                 moe_module.forward_impl = forward_impl_orig
 
     @staticmethod

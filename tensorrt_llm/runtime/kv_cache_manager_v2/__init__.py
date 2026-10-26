@@ -141,6 +141,7 @@ KVCacheUpdatedData = _cpp.KVCacheUpdatedData
 KvCacheStatus = _cpp.KvCacheStatus
 LogicError = _cpp.LogicError
 OutOfMemoryError = _cpp.OutOfMemoryError
+DiskOOMError = _cpp.DiskOOMError
 OutOfPagesError = _cpp.OutOfPagesError
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
@@ -283,6 +284,7 @@ __all__ = [
     "AttnLifeCycle",
     "CorruptedError",
     "CuError",
+    "DiskOOMError",
     "OutOfMemoryError",
     "_KVCache",
     "create_default_kv_cache_cold_page_codec",

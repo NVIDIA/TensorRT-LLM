@@ -112,6 +112,7 @@ def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
     return types.SimpleNamespace(
         num_stages=num_stages,
         block_size=5,
+        supports_greedy_token_reuse=False,
         _attn_params={
             "window_size": window_size,
             "head_dim": head_dim,
@@ -147,6 +148,24 @@ def test_worker_lazy_init_window_buffers():
     assert id(worker._kv_windows) == buf_id
 
 
+def test_worker_prewarms_actual_heads(monkeypatch):
+    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as attention_op
+    import tensorrt_llm._torch.cute_dsl_utils as cute_dsl_utils
+
+    calls = []
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(
+        attention_op,
+        "warmup_fused_dsv4_dspark_attention",
+        lambda block, eps, num_heads: calls.append((block, eps, num_heads)),
+    )
+    worker = _make_worker()
+    draft_model = _fake_draft_model(head_dim=512)
+    draft_model._attn_params["n_heads"] = 64
+    worker._lazy_init(draft_model, _make_metadata(max_num_requests=2))
+    assert calls == [(5, 1e-6, 64)]
+
+
 def test_worker_rejects_mismatched_block_size():
     worker = _make_worker()
     draft_model = _fake_draft_model()
@@ -176,6 +195,35 @@ def test_worker_slot_assignment_and_reset():
     assert int(worker._valid_len[s0b]) == 0
     assert not bool(worker._position_initialized[s0b])
     assert float(worker._kv_windows[s0b].abs().sum()) == 0.0
+
+
+def test_slot_churn_does_not_synchronize_with_the_device():
+    """Requests joining and leaving clear their slots without a host-device sync."""
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+    meta.request_ids = [100, 101]
+    meta.num_generations = 2
+    meta.prepare()
+    leaving = worker._req_to_slot[100]
+    worker._ctx_len[leaving] = 42
+    worker._kv_windows[leaving].fill_(1.0)
+    torch.cuda.synchronize()
+
+    meta.request_ids = [101, 102]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        meta.prepare()  # frees request 100's slot and assigns request 102 one
+        worker._assign_slot(103, reset=True)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    for slot in (leaving, worker._req_to_slot[102], worker._req_to_slot[103]):
+        assert int(worker._ctx_len[slot]) == 0
+        assert int(worker._valid_len[slot]) == 0
+        assert not bool(worker._position_initialized[slot])
+        assert torch.count_nonzero(worker._kv_windows[slot]) == 0
 
 
 def test_worker_slot_exhaustion_preserves_live_request():
@@ -509,20 +557,34 @@ class _RecordingDraftModel:
 
     def __init__(self):
         self.forward_calls = []
+        self.window_calls = []
 
-    def write_context_windows_batched(self, *args):
-        pass
+    def project_captured_rows(self, captured, row_index):
+        # Identity projection: the recorded contexts are the captured rows themselves.
+        return captured[row_index]
+
+    def write_context_windows_batched(
+        self, main_hidden, positions, slots, mask, kv_windows, main_x=None
+    ):
+        self.window_calls.append(
+            {
+                "main_hidden": main_x.clone(),
+                "positions": positions.clone(),
+                "mask": mask.clone(),
+            }
+        )
 
     def forward_batched(self, main_hidden, bonus, start_pos, **kwargs):
+        context = kwargs["main_x"]
         self.forward_calls.append(
             {
-                "main_hidden": main_hidden.clone(),
+                "main_hidden": context.clone(),
                 "bonus": bonus.clone(),
                 "start_pos": start_pos.clone(),
                 "valid_len": kwargs["valid_len"].clone(),
             }
         )
-        logits = torch.zeros(main_hidden.shape[0], self.block_size, 8, device=main_hidden.device)
+        logits = torch.zeros(context.shape[0], self.block_size, 8, device=context.device)
         return None, None, logits
 
 
@@ -531,12 +593,17 @@ def test_generation_state_cuda_graph_bootstrap_and_replay():
     worker = _make_worker()
     worker._lazy_init(_fake_draft_model(window_size=8), _make_metadata(max_num_requests=2))
     slots = torch.tensor([0, 1], device="cuda", dtype=torch.long)
-    num_accepted = torch.tensor([1, 2], device="cuda", dtype=torch.long)
-    input_positions = torch.tensor([4016, 87], device="cuda", dtype=torch.long)
+    accepted = torch.zeros(2, 3, device="cuda", dtype=torch.int32)
+    num_accepted = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    positions = torch.tensor([4016, 0, 0, 87, 0, 0], device="cuda", dtype=torch.long)
 
+    def advance():
+        worker._advance_generation_state(slots, accepted, num_accepted, positions, 0, 6)
+
+    advance()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        worker._advance_generation_state(slots, num_accepted, input_positions)
+        advance()
 
     worker._ctx_len[slots] = 0
     worker._valid_len[slots] = 0
@@ -558,12 +625,17 @@ def test_generation_state_resets_scratch_row_on_every_cuda_graph_replay():
     worker._lazy_init(_fake_draft_model(window_size=8), _make_metadata(max_num_requests=2))
     scratch = worker._scratch_slot
     slots = torch.tensor([scratch], device="cuda", dtype=torch.long)
-    num_accepted = torch.tensor([1], device="cuda", dtype=torch.long)
-    input_positions = torch.tensor([4016], device="cuda", dtype=torch.long)
+    accepted = torch.zeros(1, 2, device="cuda", dtype=torch.int32)
+    num_accepted = torch.tensor([1], device="cuda", dtype=torch.int32)
+    positions = torch.tensor([4016, 0], device="cuda", dtype=torch.long)
 
+    def advance():
+        worker._advance_generation_state(slots, accepted, num_accepted, positions, 0, 2)
+
+    advance()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        worker._advance_generation_state(slots, num_accepted, input_positions)
+        advance()
 
     graph.replay()
     assert worker._ctx_len[scratch].item() == 4017
@@ -654,6 +726,11 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     second_call = draft_model.forward_calls[-1]
     torch.testing.assert_close(second_call["main_hidden"][0], captured[1])
     torch.testing.assert_close(second_call["main_hidden"][1], captured[target_width + 2])
+    window_call = draft_model.window_calls[-1]
+    assert window_call["mask"].tolist() == [[True] + [False] * 4, [True] * 2 + [False] * 3]
+    assert window_call["positions"].tolist() == [list(range(4018, 4023)), list(range(89, 94))]
+    rows = torch.tensor([list(range(5)), list(range(6, 11))], device="cuda")
+    torch.testing.assert_close(window_call["main_hidden"], captured[rows])
     assert second_call["start_pos"].tolist() == [4019, 91]
     assert second_call["valid_len"].tolist() == [3, 4]
     assert worker._valid_len[slots].tolist() == [3, 4]
@@ -1021,12 +1098,17 @@ def test_position_bound_holds_across_cuda_graph_replays():
     assert cap == (64 + 5 + 5 + 3) - 1 - 5  # == table length - 1 - block_size
 
     slots = torch.tensor([0], device="cuda", dtype=torch.long)
-    num_accepted = torch.tensor([6], device="cuda", dtype=torch.long)
-    input_positions = torch.tensor([cap - 3], device="cuda", dtype=torch.long)
+    accepted = torch.zeros(1, 6, device="cuda", dtype=torch.int32)
+    num_accepted = torch.tensor([6], device="cuda", dtype=torch.int32)
+    positions = torch.tensor([cap - 3, 0, 0, 0, 0, 0], device="cuda", dtype=torch.long)
 
+    def advance():
+        worker._advance_generation_state(slots, accepted, num_accepted, positions, 0, 6)
+
+    advance()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        worker._advance_generation_state(slots, num_accepted, input_positions)
+        advance()
 
     worker._ctx_len[slots] = 0
     worker._position_initialized[slots] = False
@@ -1069,13 +1151,10 @@ def test_freqs_table_prefers_the_runtime_ceiling_over_the_config_cap(mocker):
     assert len(model._freqs_table_cache) == 2
 
 
-def test_prepare_resets_the_scratch_row_every_iteration():
+def test_scratch_row_restarts_every_forward_after_prepare():
     """The throwaway row must not carry an absolute position between forwards.
 
-    It has no prefill to seed it and no completion to free it, so without this
-    reset ``_advance_generation_state``'s unconditional advance leaves its
-    position climbing across CUDA-graph shapes and iterations until it indexes
-    past the RoPE table.
+    The generation advance restarts it in every forward; prepare() leaves it alone.
     """
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 
@@ -1084,24 +1163,27 @@ def test_prepare_resets_the_scratch_row_every_iteration():
     worker._lazy_init(_fake_draft_model(), meta)
     meta._dspark_worker = worker
     scratch = worker._scratch_slot
-
-    # State a previous padding / ADP-idle forward left behind.
-    worker._ctx_len[scratch] = 4096
-    worker._valid_len[scratch] = 8
-    worker._position_initialized[scratch] = True
-
     live = worker._assign_slot(100, reset=True)
     worker._ctx_len[live] = 17
     worker._valid_len[live] = 5
     worker._position_initialized[live] = True
 
     meta.request_ids = [100, CUDA_GRAPH_DUMMY_REQUEST_ID]
-    meta.prepare()
-
-    assert int(worker._ctx_len[scratch]) == 0
-    assert int(worker._valid_len[scratch]) == 0
-    assert not bool(worker._position_initialized[scratch])
-    # A live request's own state is bounded by its lifetime and must survive.
-    assert int(worker._ctx_len[live]) == 17
-    assert int(worker._valid_len[live]) == 5
-    assert bool(worker._position_initialized[live])
+    meta.num_generations = 2
+    slots = torch.tensor([live, scratch], device="cuda")
+    accepted = torch.zeros(2, 2, device="cuda", dtype=torch.int32)
+    num_accepted = torch.tensor([2, 2], device="cuda", dtype=torch.int32)
+    positions = torch.tensor([4096, 0, 4096, 0], device="cuda", dtype=torch.long)
+    for _ in range(3):
+        meta.prepare()
+        assert worker._batch_to_slot[:2].tolist() == [live, scratch]
+        start_pos = worker._advance_generation_state(
+            slots, accepted, num_accepted, positions, 0, 4
+        )[2]
+        # The padding row bootstraps from its input position every time.
+        assert start_pos[1].item() == 4098
+        assert int(worker._ctx_len[scratch]) == 4098
+        assert int(worker._valid_len[scratch]) == 2
+    # A live request's own state is bounded by its lifetime and keeps advancing.
+    assert int(worker._ctx_len[live]) == 17 + 3 * 2
+    assert int(worker._valid_len[live]) == 5 + 3 * 2

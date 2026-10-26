@@ -268,17 +268,23 @@ def check_mxfp4_flashinfer_shape(
     )
 
 
-def nvfp4_needs_padded_method(activation_type: ActivationType, has_alpha_constant: bool) -> bool:
+def nvfp4_needs_padded_method(
+    activation_type: ActivationType,
+    has_alpha_constant: bool,
+    intermediate_size_per_partition: int | None,
+) -> bool:
     """Whether NVFP4 needs the padded quant method rather than the base one.
 
     One definition read from two sides -- ``can_implement`` asks it of the
     problem, ``_get_quant_method`` of the instance -- so that a configuration
-    cannot be admitted by one and laid out by the other.
+    cannot be admitted by one and laid out by the other. An unknown shard
+    size leaves only the activation requirements to check.
     """
-    return has_alpha_constant or activation_type in (
-        ActivationType.SiTu,
-        ActivationType.Relu2,
-        ActivationType.Silu,
+    # Each logical TP shard must meet the scale-shuffle row alignment.
+    return (
+        (intermediate_size_per_partition is not None and intermediate_size_per_partition % 128 != 0)
+        or has_alpha_constant
+        or activation_type in (ActivationType.SiTu, ActivationType.Relu2, ActivationType.Silu)
     )
 
 

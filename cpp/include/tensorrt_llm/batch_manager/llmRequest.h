@@ -143,7 +143,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, bool trackUniqueTokens = true)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -188,6 +188,7 @@ public:
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSalt(std::move(cacheSalt))
         , mAgentHierarchy(std::move(agent_hierarchy))
+        , mTrackUniqueTokens(trackUniqueTokens)
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -546,6 +547,7 @@ public:
     /// @return A vector of UniqueTokens for this beam index, includes the prompt
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens(SizeType32 beam) const
     {
+        TLLM_CHECK_WITH_INFO(mTrackUniqueTokens, "Request %lu was created without unique tokens.", mRequestId);
         return mUniqueTokens.at(beam);
     }
 
@@ -553,7 +555,14 @@ public:
     /// @return A vector of vector of UniqueTokens.
     [[nodiscard]] BeamUniqueTokens const& getUniqueTokens() const
     {
+        TLLM_CHECK_WITH_INFO(mTrackUniqueTokens, "Request %lu was created without unique tokens.", mRequestId);
         return mUniqueTokens;
+    }
+
+    /// @brief Whether the request keeps the (token, extra id) sequence that block reuse keys on.
+    [[nodiscard]] bool tracksUniqueTokens() const noexcept
+    {
+        return mTrackUniqueTokens;
     }
 
     /// @brief Get all extra input token ids
@@ -671,8 +680,11 @@ public:
     {
         mLastTokens[beam] = token;
         mTokens.at(beam).push_back(token);
-        // New token's extra id is 0
-        mUniqueTokens.at(beam).push_back({token, 0});
+        if (mTrackUniqueTokens)
+        {
+            // New token's extra id is 0
+            mUniqueTokens.at(beam).push_back({token, 0});
+        }
         return getNumTokens(beam);
     }
 
@@ -687,8 +699,11 @@ public:
         {
             auto const outputId = beamTokens[beam];
             mTokens.at(beam).push_back(outputId);
-            // New token's extra id is 0
-            mUniqueTokens.at(beam).push_back({outputId, 0});
+            if (mTrackUniqueTokens)
+            {
+                // New token's extra id is 0
+                mUniqueTokens.at(beam).push_back({outputId, 0});
+            }
         }
     }
 
@@ -722,6 +737,10 @@ public:
             auto& beamTokens = mTokens[beamId];
             beamTokens.resize(mPromptLen);
             beamTokens.insert(beamTokens.end(), generatedBeamTokens[beamId].begin(), generatedBeamTokens[beamId].end());
+            if (!mTrackUniqueTokens)
+            {
+                continue;
+            }
             auto& beamUniqueTokens = mUniqueTokens[beamId];
             beamUniqueTokens.resize(mPromptLen);
             for (auto const token : generatedBeamTokens[beamId])
@@ -780,8 +799,10 @@ public:
             {
                 auto& beamTokens = mTokens.at(beam);
                 beamTokens.resize(mPromptLen);
-                auto& beamUniqueTokens = mUniqueTokens.at(beam);
-                beamUniqueTokens.resize(mPromptLen);
+                if (mTrackUniqueTokens)
+                {
+                    mUniqueTokens.at(beam).resize(mPromptLen);
+                }
                 if (returnLogProbs())
                 {
                     mLogProbs.at(beam).clear();
@@ -795,8 +816,10 @@ public:
             {
                 auto& beamTokens = mTokens.at(beam);
                 beamTokens.resize(newPromptLen);
-                auto& beamUniqueTokens = mUniqueTokens.at(beam);
-                beamUniqueTokens.resize(newPromptLen);
+                if (mTrackUniqueTokens)
+                {
+                    mUniqueTokens.at(beam).resize(newPromptLen);
+                }
 
                 if (returnLogProbs())
                 {
@@ -2012,37 +2035,12 @@ protected:
 
     std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
+    // Without block reuse nothing reads mUniqueTokens, so a request can skip building it.
+    bool mTrackUniqueTokens{true};
+
 private:
-    void adoptContextPhaseDraftTokens()
+    void initializeUniqueTokens(VecTokens const& inputTokens)
     {
-        if (hasDraftTokens() || !mContextPhaseParams.has_value())
-        {
-            return;
-        }
-
-        auto const& draftTokens = mContextPhaseParams.value().getDraftTokens();
-        if (draftTokens.has_value() && !draftTokens->empty())
-        {
-            mDraftTokens = std::make_shared<VecTokens>(*draftTokens);
-        }
-    }
-
-    void initialize(
-        VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
-    {
-        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
-        {
-            mState = LlmRequestState::kDISAGG_GENERATION_INIT;
-        }
-
-        // Scatter the input tokens to other beam
-        mTokens = BeamTokens(mSamplingConfig.getBeamWidth(), inputTokens);
-        // A request may legitimately have no input tokens on this rank (e.g. an "empty" Helix CP rank that owns zero KV
-        // blocks for the sequence). Guard against calling .back() on an empty vector (undefined behavior).
-        mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.getBeamWidth())
-                                          : VecTokens(mSamplingConfig.getBeamWidth(), inputTokens.back());
-
-        // Init mUniqueTokens
         VecUniqueTokens uniqueTokens{inputTokens.size()};
         if (mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value())
         {
@@ -2066,6 +2064,54 @@ private:
                 });
         }
         mUniqueTokens = BeamUniqueTokens(mSamplingConfig.getBeamWidth(), uniqueTokens);
+    }
+
+    void adoptContextPhaseDraftTokens()
+    {
+        if (hasDraftTokens() || !mContextPhaseParams.has_value())
+        {
+            return;
+        }
+
+        auto const& draftTokens = mContextPhaseParams.value().getDraftTokens();
+        if (draftTokens.has_value() && !draftTokens->empty())
+        {
+            mDraftTokens = std::make_shared<VecTokens>(*draftTokens);
+        }
+    }
+
+    void initialize(
+        VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
+    {
+        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
+        {
+            mState = LlmRequestState::kDISAGG_GENERATION_INIT;
+        }
+
+        // Scatter the input tokens to other beam. Room for the generated tokens, up to what the first one would
+        // allocate anyway, keeps that token from copying the prompt.
+        auto const promptLen = inputTokens.size();
+        auto const capacity
+            = promptLen + std::min(promptLen, static_cast<std::size_t>(std::max<SizeType32>(mMaxNewTokens, 0)));
+        mTokens = BeamTokens(mSamplingConfig.getBeamWidth());
+        for (auto& beamTokens : mTokens)
+        {
+            beamTokens.reserve(capacity);
+            beamTokens.assign(inputTokens.cbegin(), inputTokens.cend());
+        }
+        // A request may legitimately have no input tokens on this rank (e.g. an "empty" Helix CP rank that owns zero KV
+        // blocks for the sequence). Guard against calling .back() on an empty vector (undefined behavior).
+        mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.getBeamWidth())
+                                          : VecTokens(mSamplingConfig.getBeamWidth(), inputTokens.back());
+
+        if (mTrackUniqueTokens)
+        {
+            initializeUniqueTokens(inputTokens);
+        }
+        else
+        {
+            mUniqueTokens = BeamUniqueTokens(mSamplingConfig.getBeamWidth());
+        }
 
         // Init mEncoderUniqueTokens
         // TODO: use real extra id instead of default zero value
@@ -2164,7 +2210,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, bool trackUniqueTokens = true)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, std::move(promptEmbeddingTable), promptVocabSize,
             multimodalHashes.has_value()
@@ -2200,7 +2246,7 @@ public:
             multimodalRunLengths.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(cacheSalt))
+            std::move(cacheSalt), trackUniqueTokens)
     {
     }
 

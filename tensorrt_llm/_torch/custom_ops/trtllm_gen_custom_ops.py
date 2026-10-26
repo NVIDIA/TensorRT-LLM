@@ -495,10 +495,12 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
-        self,
-        inputs: List[torch.Tensor],
-        tactic: List[int] = [-1, -1],
-        output: Optional[torch.Tensor] = None,
+            self,
+            inputs: List[torch.Tensor],
+            tactic: List[int] = [-1, -1],
+            output: Optional[torch.Tensor] = None,
+            routing_tables: Optional[torch.Tensor] = None,
+            routing_tiles: Tuple[int, ...] = (),
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -516,7 +518,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output,
+            routing_tables, list(routing_tiles))
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -648,38 +651,44 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
-def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
-                               routing_bias: Optional[torch.Tensor],
-                               hidden_states: torch.Tensor,
-                               hidden_states_scale: torch.Tensor,
-                               gemm1_weights: torch.Tensor,
-                               gemm1_weights_scale: torch.Tensor,
-                               gemm1_bias: torch.Tensor,
-                               gemm1_alpha: torch.Tensor,
-                               gemm1_beta: torch.Tensor,
-                               gemm1_clamp_limit: torch.Tensor,
-                               gemm2_weights: torch.Tensor,
-                               gemm2_weights_scale: torch.Tensor,
-                               gemm2_bias: torch.Tensor,
-                               output1_scale_scalar: torch.Tensor,
-                               output1_scale_gate_scalar: torch.Tensor,
-                               output2_scale_scalar: torch.Tensor,
-                               num_experts: int,
-                               top_k: int,
-                               n_group: Optional[int],
-                               topk_group: Optional[int],
-                               intermediate_size: int,
-                               local_expert_offset: int,
-                               local_num_experts: int,
-                               routed_scaling_factor: Optional[float],
-                               routing_method_type: int,
-                               do_finalize: bool,
-                               act_type: int = ActType_TrtllmGen.SwiGlu.value,
-                               topk_weights: Optional[torch.Tensor] = None,
-                               topk_ids: Optional[torch.Tensor] = None,
-                               output: Optional[torch.Tensor] = None,
-                               tune_max_num_tokens: int = 8192,
-                               use_dp: bool = False) -> List[torch.Tensor]:
+def fp4_block_scale_moe_runner(
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: torch.Tensor,
+        gemm1_alpha: torch.Tensor,
+        gemm1_beta: torch.Tensor,
+        gemm1_clamp_limit: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        gemm2_bias: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        do_finalize: bool,
+        act_type: int = ActType_TrtllmGen.SwiGlu.value,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
+        routing_tables: Optional[torch.Tensor] = None,
+        routing_tiles: Optional[List[int]] = None) -> List[torch.Tensor]:
+    """``routing_tables`` replace the routing kernel for tactics of the tiles in
+    ``routing_tiles``. Unfinalized, a run on them returns an empty ``[0, tile]``
+    permutation: the permutation is row 0 of that tile's table."""
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -755,7 +764,9 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
     result = kernel_runner(
         input_tensors,
         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
-        output=output)
+        output=output,
+        routing_tables=routing_tables,
+        routing_tiles=tuple(routing_tiles or ()))
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
@@ -823,7 +834,9 @@ def _(routing_logits,
       topk_ids: Optional[torch.Tensor] = None,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
-      use_dp: bool = False) -> List[torch.Tensor]:
+      use_dp: bool = False,
+      routing_tables: Optional[torch.Tensor] = None,
+      routing_tiles: Optional[List[int]] = None) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2

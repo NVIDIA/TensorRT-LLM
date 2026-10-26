@@ -413,6 +413,22 @@ def _register_fake():
         # to allocate and nothing to return.
         return None
 
+    @torch.library.register_fake("trtllm::csa2_sparse_context")
+    def _(bank: torch.Tensor,
+          q: torch.Tensor,
+          q_scale: Optional[torch.Tensor],
+          indices: torch.Tensor,
+          lens: torch.Tensor,
+          bmm1_scale: torch.Tensor,
+          bmm2_scale: torch.Tensor,
+          attn_sinks: Optional[torch.Tensor],
+          output: torch.Tensor,
+          output_scale: Optional[torch.Tensor] = None,
+          positions: Optional[torch.Tensor] = None,
+          rope_cos_sin: Optional[torch.Tensor] = None) -> None:
+        # Writes ``output`` (and ``output_scale``) in place.
+        return None
+
     @torch.library.register_fake("trtllm::minimax_m3_fp8_indexer_qk_norm_rope")
     def minimax_m3_fp8_indexer_qk_norm_rope_fake(
         qk: torch.Tensor,
@@ -1394,6 +1410,11 @@ def _register_fake():
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
                                                             dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::alltoallv_tokens")
+    def _(input: torch.Tensor, counts: list[int], group: list[int],
+          rank: int) -> torch.Tensor:
+        return input.new_empty((len(group), counts[rank], input.shape[1]))
 
     @torch.library.register_fake("trtllm::alltoall_helix")
     def _(input_list, group, num_lists):

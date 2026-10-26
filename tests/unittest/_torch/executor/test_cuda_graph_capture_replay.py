@@ -639,3 +639,47 @@ class TestCaptureAllowedGate:
                 raise _Boom()
 
         assert runner._capture_allowed is False
+
+
+class TestStagedReplayInputs:
+    """The one-launch staging writes what the copy path writes."""
+
+    @pytest.mark.parametrize("with_offsets", [False, True], ids=["plain", "offsets"])
+    def test_replay_inputs_match_the_copy_path(self, monkeypatch, with_offsets):
+        launches = []
+        stage = cuda_graph_runner_module.stage_replay_inputs
+        monkeypatch.setattr(
+            cuda_graph_runner_module,
+            "stage_replay_inputs",
+            lambda *args: launches.append(stage(*args)) or launches[-1],
+        )
+        batch_size = 4
+        runner = create_mock_cuda_graph_runner(batch_size, max_num_tokens=batch_size)
+        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        num_tokens = runner._get_num_tokens_for_key(key)
+        attn_metadata = SimpleNamespace(num_ctx_tokens=0)
+        seen = []
+        runner.register_pre_replay_hook(
+            lambda key, count, tensors, inputs: seen.append(tensors["position_ids"].clone())
+        )
+
+        def inputs(value):
+            tokens = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+            return {
+                "attn_metadata": attn_metadata,
+                "input_ids": tokens + value,
+                "position_ids": (tokens * 3 + value).view(1, num_tokens),
+            }
+
+        runner.capture(key, lambda current: current["input_ids"].clone(), inputs(1))
+        for buffer in runner.shared_static_tensors.values():
+            buffer.fill_(SENTINEL)
+        offsets = torch.arange(num_tokens, device="cuda", dtype=torch.int32) - 2
+        current = inputs(7)
+        runner.replay(key, current, position_id_offsets=offsets if with_offsets else None)
+        static = runner.shared_static_tensors
+        assert torch.equal(static["input_ids"][:num_tokens], current["input_ids"])
+        assert torch.equal(static["position_ids"][..., :num_tokens], current["position_ids"])
+        expected = current["position_ids"] + offsets if with_offsets else current["position_ids"]
+        assert torch.equal(seen[-1], expected)
+        assert launches == [True]

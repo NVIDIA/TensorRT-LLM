@@ -17,7 +17,10 @@ from tensorrt_llm._torch.modules.low_m_gemm import (
     LOW_M_GEMM_OPT_IN_ATTR,
     LowMGemmDispatcher,
     _parse_enabled,
+    lowm_fp8_supported,
+    mxfp8_lowm_linear,
 )
+from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
 from tensorrt_llm._utils import is_sm_100f
 
 # ---------------------------------------------------------------------------
@@ -31,6 +34,10 @@ _skip_no_cuda = pytest.mark.skipif(
 _skip_non_sm10x = pytest.mark.skipif(
     torch.cuda.device_count() == 0 or not is_sm_100f(),
     reason="requires SM10x GPU (SM100/SM103)",
+)
+_skip_no_lowm_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not lowm_fp8_supported(),
+    reason="needs SM100/SM103",
 )
 
 # ---------------------------------------------------------------------------
@@ -432,3 +439,22 @@ def test_runner_get_valid_tactics_returns_serialisable_tuples(monkeypatch) -> No
     for t in tactics:
         assert isinstance(t, tuple) and len(t) == 4
         assert all(isinstance(v, int) for v in t)
+
+
+# Small-M FP8 warp-MMA GEMM (CuTe DSL) against a dequantized reference. Its split-output, grouped and
+# RoPE variants serve DSpark's TP attention, which test_dspark_cute_dsl_attention.py covers.
+
+
+@_skip_no_lowm_fp8
+@pytest.mark.parametrize("m", [1, 64])
+def test_fp8_lowm_matches_dequant_reference(m):
+    n, k = 1792, 5120
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(115, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    ref = x.float() @ dequant_mxfp8_weight(w, s).t()
+    # BF16 output rounding only: the kernel accumulates the exact dequantized products in FP32.
+    torch.testing.assert_close(
+        mxfp8_lowm_linear(x, w, s).float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+    )

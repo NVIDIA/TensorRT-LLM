@@ -31,6 +31,47 @@ from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
 
 
 @pytest.mark.skipif(
+    getSMVersion() not in (100, 103) or not IS_CUTLASS_DSL_AVAILABLE,
+    reason="The small-M kernel needs CuTe DSL on SM100/SM103",
+)
+@pytest.mark.parametrize("m", [1, 6, 12, 64])
+@pytest.mark.parametrize("k, n", [(5120, 2304), (1152, 5120), (5120, 4608),
+                                  (2304, 5120)])
+def test_fp8_block_scale_small_m_matches_reference(m, k, n):
+    """The small-M tactic equals the dequantized product; the race may pick either path."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+        FP8BlockScaleGemmRunner, fp8_block_scale_gemm_autotuned)
+
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+    b_fp8, b_sf = per_block_cast_to_fp8_e8m0(b)
+    dequantized = b_fp8.float() * b_sf.repeat_interleave(
+        128, 0)[:n].repeat_interleave(128, 1)[:, :k]
+    reference = (a.double() @ dequantized.double().t()).float()
+    packed = fp8_utils.transform_sf_into_required_layout(b_sf,
+                                                         mn=n,
+                                                         k=k,
+                                                         recipe=(1, 128, 128),
+                                                         is_sfa=False)
+
+    runner = FP8BlockScaleGemmRunner(torch.bfloat16)
+    inputs = [a, b_fp8, packed, b_sf]
+    assert runner.small_m_applies(inputs)
+    torch.testing.assert_close(runner(inputs, tactic=0).float(),
+                               reference,
+                               rtol=1e-2,
+                               atol=1e-2)
+
+    AutoTuner.get().clear_cache()
+    with autotune():
+        tuned = fp8_block_scale_gemm_autotuned(*inputs)
+    served = fp8_block_scale_gemm_autotuned(*inputs)
+    torch.testing.assert_close(served, tuned, rtol=0, atol=0)
+    assert calc_diff(served, reference) < 1e-2
+
+
+@pytest.mark.skipif(
     not isSM100Family(),
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
 )

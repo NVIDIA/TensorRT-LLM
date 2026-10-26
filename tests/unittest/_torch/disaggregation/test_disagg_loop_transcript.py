@@ -21,6 +21,7 @@ executed-batch and lifecycle transcripts, which do not exist yet.
 
 import inspect
 import queue
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -54,6 +55,7 @@ _COLLECTIVE_COORDINATOR_CALLS = {
     "poll_gen_transfers",  # gen transfer status consensus
     "poll_progress_when_idle",  # ctx transfer status consensus
     "receive_gen_init",  # async receive polls gen status consensus
+    "start_deferred_gen_receives",  # async receive polls gen status consensus
     "reap_context_sends",  # ctx transfer status consensus
     "handle_timeouts_synced",  # tp_allgather_int64 under ADP
 }
@@ -129,6 +131,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.enable_early_first_token_response = False
     executor.drafter = None
     executor.model_engine = None
+    executor._overlap_loop_stream = nullcontext
     executor.previous_batch = None
     executor.active_requests = []
     executor.waiting_queue = []
@@ -155,7 +158,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
         "_pad_empty_attention_dp_batch",
         "_terminate_requests",
         "_pause_requests",
-        "_revert_gen_alloc",
+        "_revert_unexecuted_alloc",
         "_finalize_adp_dummy_allocation",
         "_wait_for_model_engine_input_copy",
         "_enqueue_responses",
@@ -208,11 +211,13 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
 
 _SCHEDULE_HEAD = [
     ("handle_errors_synced",),
+    ("start_deferred_gen_receives",),
     ("prepare_context_schedulable", []),
     ("poll_gen_transfers",),
     ("check_transfer_timeouts",),
     ("admit", []),
-    ("receive_gen_init", []),
+    # No step is in flight in an idle iteration, so no receive is deferred.
+    ("receive_gen_init", [], "defer=False"),
     ("poll_progress_when_idle",),
 ]
 # Non-PP loops flush at loop exit; the PP loop does not.
@@ -248,6 +253,7 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
     PyExecutor._executor_loop_overlap(executor)
 
     idle_pass = _SCHEDULE_HEAD + [
+        ("start_deferred_gen_receives",),
         ("flush_pending_transfer_responses",),
         ("handle_timeouts_synced",),
         ("check_transfer_timeouts", "only_with_context_sends=True"),

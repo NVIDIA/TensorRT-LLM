@@ -307,6 +307,11 @@ class KvCacheTransceiver(ABC):
         """Return whether this runtime consumes the C++ CacheTransBuffer budget."""
         return True
 
+    @property
+    def reads_unique_tokens(self) -> bool:
+        """Return whether this runtime reads a request's unique tokens (its block-reuse key)."""
+        return True
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest) -> None:
         """Start sending ``req``'s KV cache to the requesting instance.

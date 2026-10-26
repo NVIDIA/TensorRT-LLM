@@ -9,8 +9,6 @@
 # value fixed here would silently diverge from production the next time the
 # derivation changes (see disagg_config_ctxtp4_gentp4_deepseek_v41.yaml):
 #   sparse_attention_config   auto-derived from architectures[0].
-#   kv_cache_config.dtype     the CSA2 TRTLLM backend stages BF16 KV and rejects
-#                             anything but auto/bfloat16.
 #   tokens_per_block          model default (128 == sliding_window).
 #   moe_config.backend        V4.1's experts are MXFP4; the model selects its
 #                             own MoE path.
@@ -20,6 +18,9 @@
 #                             tolerates (FailOnRecompileLimitHit), which crashes
 #                             the server; an explicit short list avoids that.
 #   custom_tokenizer          production serving uses the V4.1 chat renderer.
+#   kv_cache_config.dtype     fp8 makes the CSA2 TRTLLM backend stage E4M3 KV
+#                             for attention; the persistent CSA2 cache formats
+#                             are fixed and do not change with it.
 # Speculative decoding: V4.1 rejects MTP; only its embedded DSpark stages are
 # supported, so the spec case below uses DSpark with the target checkpoint as
 # `speculative_model`. Accepted tokens are forced so `d_al` is a constant and
@@ -49,6 +50,7 @@ server_configs:
       enable_padding: true
       batch_sizes: [1, 2, 4, 8]
     kv_cache_config:
+      dtype: "fp8"
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
     client_configs:
@@ -81,6 +83,7 @@ server_configs:
       enable_padding: true
       batch_sizes: [1, 2, 4, 8, 16, 32]
     kv_cache_config:
+      dtype: "fp8"
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
     client_configs:
@@ -110,6 +113,7 @@ server_configs:
       enable_padding: true
       batch_sizes: [1, 2, 4, 8]
     kv_cache_config:
+      dtype: "fp8"
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
     speculative_config:

@@ -2195,6 +2195,70 @@ class TestDeepSeekV41(LlmapiAccuracyTestHarness):
             assert acceptance_length >= 3.0, (
                 f"DSpark acceptance length {acceptance_length:.3f} < 3.0")
 
+    @pytest.mark.threadleak(enabled=False)
+    def test_breakable_prefill_cuda_graph(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Breakable prefill graphs give eager prefill's greedy tokens on DEP4.
+
+        The 128-token prompt fills a captured bucket and replays the whole-prefill graph;
+        the 1,500-token one runs eagerly with the decoder pass from its own graphs.
+        """
+        world_size = get_mpi_world_size()
+        available_gpus = get_device_count() if world_size == 1 else world_size
+        if available_gpus < 4:
+            pytest.skip("Requires at least 4 GPUs")
+
+        for name in tuple(os.environ):
+            if name.startswith("TRTLLM_V41_"):
+                monkeypatch.delenv(name)
+
+        # Text keeps the greedy choices well apart; graph and eager rounding differ slightly.
+        text = (
+            "TensorRT-LLM accelerates reliable large language model inference "
+            "with efficient attention, parallelism, and CUDA graphs. ") * 100
+        sampling_params = SamplingParams(max_tokens=8,
+                                         min_tokens=8,
+                                         temperature=0,
+                                         ignore_eos=True,
+                                         detokenize=False,
+                                         add_special_tokens=False)
+
+        def run(backend):
+            with LLM(
+                    self.MODEL_PATH + "-NVFP4",
+                    tensor_parallel_size=4,
+                    moe_expert_parallel_size=4,
+                    gpus_per_node=4,
+                    enable_attention_dp=True,
+                    custom_tokenizer="deepseek_v41",
+                    trust_remote_code=True,
+                    # Breakable prefill graphs serve the checkpoint text-only.
+                    disable_mm_encoder=True,
+                    max_seq_len=4096,
+                    max_num_tokens=2048,
+                    max_batch_size=8,
+                    cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                                      enable_padding=True),
+                    moe_config=MoeConfig(backend="TRTLLM"),
+                    kv_cache_config=KvCacheConfig(dtype="fp8",
+                                                  enable_block_reuse=False,
+                                                  tokens_per_block=128,
+                                                  max_tokens=65536,
+                                                  free_gpu_memory_fraction=0.5),
+                    sparse_attention_config={"algorithm": "csa2"},
+                    prefill_cuda_graph_backend=backend,
+                    prefill_capture_num_tokens=[128, 256, 512, 1024]) as llm:
+                text_ids = llm.tokenizer.encode(text, add_special_tokens=False)
+                token_ids = []
+                for prompt in (text_ids[:128], text_ids[:1500]):
+                    output = llm.generate_async(
+                        prompt, sampling_params=sampling_params).result()
+                    token_ids.append(output.outputs[0].token_ids)
+                return token_ids
+
+        assert run(PrefillCudaGraphBackend.BREAKABLE) == run(
+            PrefillCudaGraphBackend.DISABLED)
+
 
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
     "Solve the problem carefully. End your response with a final line exactly "

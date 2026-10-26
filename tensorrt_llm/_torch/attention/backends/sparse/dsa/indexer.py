@@ -1470,6 +1470,7 @@ class Indexer(nn.Module):
         cu_seqlen_ke: torch.Tensor,
         q_scale: Optional[torch.Tensor],
         clean_logits: bool = True,
+        max_seqlen_k: int = 0,
     ) -> torch.Tensor:
         """Dispatch fp8_mqa_logits vs fp8_fp4_mqa_logits based on use_fp4.
 
@@ -1483,6 +1484,9 @@ class Indexer(nn.Module):
         when the consumer never reads outside that window (the custom
         indexer_topk_prefill kernel); the torch topk fallback scans the full
         padded row and needs the fill.
+
+        max_seqlen_k > 0 returns compressed logits of shape [q, max_seqlen_k]
+        whose column j is key ks + j of that row.
         """
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
@@ -1504,6 +1508,9 @@ class Indexer(nn.Module):
                 # rounding either to BF16 can change the exact Top-K selection.
                 logits = (dots.relu() * weights.float().unsqueeze(-1)).sum(1)
                 columns = torch.arange(k.shape[0], device=q.device)[None, :]
+                if max_seqlen_k > 0:
+                    columns = cu_seqlen_ks[:, None] + torch.arange(max_seqlen_k, device=q.device)
+                    logits = logits.gather(1, columns.clamp(0, k.shape[0] - 1))
                 return logits.masked_fill(
                     (columns < cu_seqlen_ks[:, None]) | (columns >= cu_seqlen_ke[:, None]),
                     -torch.inf,
@@ -1528,6 +1535,7 @@ class Indexer(nn.Module):
                 cu_seqlen_ks,
                 cu_seqlen_ke,
                 clean_logits=clean_logits,
+                max_seqlen_k=max_seqlen_k,
             )
         return fp8_mqa_logits(
             q_fp8,
@@ -1536,6 +1544,7 @@ class Indexer(nn.Module):
             cu_seqlen_ks,
             cu_seqlen_ke,
             clean_logits=clean_logits,
+            max_seqlen_k=max_seqlen_k,
         )
 
     def _call_paged_mqa_logits(

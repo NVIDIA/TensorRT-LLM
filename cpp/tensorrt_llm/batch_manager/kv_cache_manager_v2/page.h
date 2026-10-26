@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
+#include "kv_cache_manager_v2/utils/smallVector.h"
 
 #include <functional>
 #include <optional>
@@ -35,9 +36,14 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Forward declarations to break circular includes.
 class StorageManager;
 class KvCache;
+class UncommittedPage;
 class PageHolder;
 class UniqPageLock;
 class SharedPageLock;
+
+//! One allocation for the pages a request creates together, with their holders and locks, so
+//! that walking a request's pages stays local in memory however long the process has run.
+using PageSlab = SlabArena<UncommittedPage, PageHolder, UniqPageLock>;
 
 // ---------------------------------------------------------------------------
 // Page — base class for all KV-cache pages.
@@ -71,8 +77,8 @@ public:
         return nodeRef.has_value();
     }
 
-    // Prevent the page from being dropped (returns/creates a PageHolder).
-    SharedPtr<PageHolder> hold();
+    // Prevent the page from being dropped (returns/creates a PageHolder, in `slab` when given).
+    SharedPtr<PageHolder> hold(PageSlab* slab = nullptr);
 
     //! Return the lock destination for read-only use, preserving pages already at the hot GPU level.
     //! Cold sparse pages use host memory; callers must force writable pages to GPU.
@@ -80,8 +86,8 @@ public:
 
     // Acquire a shared lock at the current level. The caller handles any migration.
     // skip_wait: caller guarantees the page is ready on kvCache's stream.
-    SharedPageLock lock(
-        KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
+    SharedPageLock lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle,
+        bool skipWait = false, PageSlab* slab = nullptr);
 };
 
 // ---------------------------------------------------------------------------
@@ -170,9 +176,9 @@ public:
     PageHolder(PageHolder const&) = delete;
     PageHolder& operator=(PageHolder const&) = delete;
 
-    // Acquire a shared lock (creates or reuses the UniqPageLock).
-    SharedPageLock lock(
-        KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
+    // Acquire a shared lock (creates or reuses the UniqPageLock, creating it in `slab` when given).
+    SharedPageLock lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle,
+        bool skipWait = false, PageSlab* slab = nullptr);
 
     SharedPtr<Page> page;
     WeakPtr<UniqPageLock> uniqLock; // non-null → LOCKED
@@ -224,19 +230,24 @@ public:
     //! Publish a GPU/host handoff to every owner and return the fenced source slot. Caller holds the API lock.
     [[nodiscard]] Slot moveToCacheLevel(CacheLevel destination, Slot&& slot);
 
-    std::vector<LockOwner> const& owners() const noexcept
+    // A request-private page has one owner and at most the page's ready event plus one finish
+    // event; only shared prefix pages spill to the heap.
+    using FinishEvents = SmallVector<CachedCudaEvent, 2>;
+    using Owners = SmallVector<LockOwner, 1>;
+
+    Owners const& owners() const noexcept
     {
         return mOwners;
     }
 
     SharedPtr<PageHolder> holder;
-    std::vector<CachedCudaEvent> finishEvents;
+    FinishEvents finishEvents;
 
 private:
     friend class SharedPageLock;
     void removeOwner(LockOwner const& owner);
 
-    std::vector<LockOwner> mOwners;
+    Owners mOwners;
 };
 
 // ---------------------------------------------------------------------------
@@ -257,8 +268,9 @@ public:
     SharedPageLock(SharedPageLock const&) = delete;
     SharedPageLock& operator=(SharedPageLock const&) = delete;
 
-    // Explicitly release the lock (called by destructor if not already released).
-    SharedPtr<Page> unlock();
+    // Explicitly release the lock (called by destructor if not already released). With
+    // keepPageIndex the owner's page-index entry is left for the owner to invalidate in bulk.
+    SharedPtr<Page> unlock(bool keepPageIndex = false);
 
     [[nodiscard]] SharedPtr<Page> const& page() const;
 

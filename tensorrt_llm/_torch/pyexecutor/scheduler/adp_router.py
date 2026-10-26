@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
@@ -62,6 +63,13 @@ def _num_input_tokens(request) -> int:
     if isinstance(num_input_tokens, int):
         return num_input_tokens
     return len(getattr(request, "input_token_ids", []))
+
+
+def _item_num_input_tokens(req_item: RequestQueueItem) -> int:
+    """Prompt length of a queued request, also when it travels without its prompt."""
+    if req_item.num_input_tokens is not None:
+        return req_item.num_input_tokens
+    return _num_input_tokens(req_item.request)
 
 
 def is_retiring_request(request) -> bool:
@@ -206,10 +214,20 @@ class ADPRouter(ABC):
     """
 
     needs_prefix_matches: bool = False
+    # Whether routing reads prompt token ids; if not, ranks receive only the prompts they own.
+    reads_prompt_tokens: bool = False
 
     def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = False):
         self.dist = dist
         self.exclude_retiring_requests = has_seq_slot_headroom
+
+    def admission_rank(self, req_item: RequestQueueItem) -> Optional[int]:
+        """The only rank a waiting request may be admitted on, or ``None`` for any.
+
+        A request whose admission rank is full stays queued; the answer must
+        depend only on state every rank holds identically.
+        """
+        return None
 
     @classmethod
     def create(
@@ -251,6 +269,10 @@ class ADPRouter(ABC):
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
                 new_conv_placement=attention_dp_config.kv_cache_routing_new_conv_placement,
+                strict_affinity=attention_dp_config.kv_cache_routing_strict_conversation_affinity,
+                strict_affinity_max_wait_iters=(
+                    attention_dp_config.kv_cache_routing_strict_affinity_max_wait_iters
+                ),
             )
 
         if (
@@ -522,7 +544,7 @@ class DefaultADPRouter(ADPRouter):
 
         heapq.heapify(all_ranks_new_requests_heap)
 
-        counted = [(_num_input_tokens(item.request), item) for item in new_requests]
+        counted = [(_item_num_input_tokens(item), item) for item in new_requests]
         counted.sort(key=lambda item: item[0], reverse=True)
 
         for token_count, req_item in counted:
@@ -564,6 +586,7 @@ class KVCacheAwareADPRouter(ADPRouter):
     """
 
     needs_prefix_matches: bool = True
+    reads_prompt_tokens: bool = True
 
     def __init__(
         self,
@@ -749,8 +772,7 @@ class KVCacheAwareADPRouter(ADPRouter):
                 all_ranks_num_active_requests[target_dp_rank] += 1
                 # Keep token tally in sync with the soft-balancing phase.
                 effective = max(
-                    _num_input_tokens(req_item.request)
-                    - self._match_len(target_dp_rank, req_item.id),
+                    _item_num_input_tokens(req_item) - self._match_len(target_dp_rank, req_item.id),
                     0,
                 )
                 all_ranks_num_active_tokens[target_dp_rank] += effective
@@ -795,7 +817,7 @@ class KVCacheAwareADPRouter(ADPRouter):
             if not eligible_ranks:
                 break
 
-            req_tokens = _num_input_tokens(req_item.request)
+            req_tokens = _item_num_input_tokens(req_item)
             req_id = req_item.id
 
             # Shuffle eligible ranks per decision so score ties fall to a
@@ -866,6 +888,16 @@ class ConversationAwareADPRouter(ADPRouter):
     the same ``conversation_id`` returns to that rank, keeping the conversation's
     KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
     back to the same ``new_conv_placement`` policy.
+
+    With ``strict_affinity`` a later turn whose rank is full waits in the queue
+    instead of overflowing to a rank without its prefix, for at most
+    ``strict_affinity_max_wait_iters`` iterations (0: no limit).
+
+    While long-prefill demotion is on (``TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS``), every
+    routed request gets ``py_uncached_prefill_tokens``: a conversation's prompt
+    grows by appending, so a later turn adds ``prompt_len`` minus the previous
+    turn's prompt, which its rank caches; a first turn or a prompt that shrank adds
+    its whole prompt.
     """
 
     # Default LRU cap on the conversation->rank map (entries are ~tens of
@@ -879,9 +911,19 @@ class ConversationAwareADPRouter(ADPRouter):
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
         new_conv_placement: str = "round_robin",
+        strict_affinity: bool = False,
+        strict_affinity_max_wait_iters: int = 0,
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        self._strict_affinity = strict_affinity
+        self._strict_affinity_max_wait_iters = strict_affinity_max_wait_iters
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
+        # Last prompt length per conversation, under the same LRU cap; kept only while
+        # the V2 scheduler's long-prefill demotion consumes the estimate.
+        self._publish_uncached_estimate = (
+            int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0")) > 0
+        )
+        self._conv_last_prompt_len: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
@@ -921,12 +963,44 @@ class ConversationAwareADPRouter(ADPRouter):
             return None
         return conversation_params.conversation_id
 
+    def admission_rank(self, req_item: RequestQueueItem) -> Optional[int]:
+        """Under strict affinity, the rank of the request's conversation."""
+        if not self._strict_affinity or (
+            self._strict_affinity_max_wait_iters
+            and req_item.admission_wait_iters >= self._strict_affinity_max_wait_iters
+        ):
+            return None
+        conv_id = self._conversation_id(req_item)
+        return None if conv_id is None else self._conv_to_rank.get(conv_id)
+
     def _record_target_rank(self, conv_id: str, rank: int) -> None:
         """Bind/refresh the rank a conversation is pinned to (LRU-touch + evict)."""
         self._conv_to_rank[conv_id] = rank
         self._conv_to_rank.move_to_end(conv_id)
         while len(self._conv_to_rank) > self._max_sessions:
             self._conv_to_rank.popitem(last=False)
+
+    def _publish_uncached_prefill_estimate(self, req_item: RequestQueueItem) -> None:
+        """Set ``py_uncached_prefill_tokens`` on the request (see the class docstring)."""
+        request = req_item.request
+        if request is None:
+            return
+        prompt_len = _item_num_input_tokens(req_item)
+        # A sub-agent shares its parent's routing key but has its own prompt history.
+        conversation_params = request.py_conversation_params
+        conv_id = getattr(conversation_params, "conversation_id", None)
+        if conv_id is None:
+            conv_id = self._conversation_id(req_item)
+        estimate = prompt_len
+        if conv_id is not None:
+            previous = self._conv_last_prompt_len.get(conv_id)
+            if previous is not None and previous <= prompt_len:
+                estimate = prompt_len - previous
+            self._conv_last_prompt_len[conv_id] = prompt_len
+            self._conv_last_prompt_len.move_to_end(conv_id)
+            while len(self._conv_last_prompt_len) > self._max_sessions:
+                self._conv_last_prompt_len.popitem(last=False)
+        request.py_uncached_prefill_tokens = estimate
 
     def _assign_new_conversation_explicit_dp_ranks(
         self,
@@ -983,11 +1057,26 @@ class ConversationAwareADPRouter(ADPRouter):
             return scheduling_params.attention_dp_relax
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
+        if self._publish_uncached_estimate:
+            for req_item in sorted_requests:
+                self._publish_uncached_prefill_estimate(req_item)
+
+        # 0) Admission reserved a slot on its conversation's rank for each
+        #    strict-affinity turn: place those before anything can take it.
+        unreserved = []
+        for req_item in sorted_requests:
+            rank = self.admission_rank(req_item)
+            if rank is None or all_ranks_num_active_requests[rank] >= max_num_active_requests:
+                unreserved.append(req_item)
+                continue
+            all_ranks_new_requests[rank].append(req_item)
+            all_ranks_num_active_requests[rank] += 1
+            self._record_target_rank(self._conversation_id(req_item), rank)
 
         # 1) Honour an explicit attention_dp_rank for a new conversation and
         #    record that placement. Existing conversations keep their binding.
         remaining_unscheduled = self._assign_new_conversation_explicit_dp_ranks(
-            sorted_requests,
+            unreserved,
             all_ranks_new_requests,
             all_ranks_num_active_requests,
             max_num_active_requests,
@@ -1000,7 +1089,7 @@ class ConversationAwareADPRouter(ADPRouter):
             token_load = [0] * tp_size
             for state in all_rank_states:
                 token_load[state.rank] = state.num_active_tokens + sum(
-                    _num_input_tokens(item.request) for item in all_ranks_new_requests[state.rank]
+                    _item_num_input_tokens(item) for item in all_ranks_new_requests[state.rank]
                 )
 
         # 2) Soft cap for spreading new conversations across ranks, clamped to
@@ -1079,7 +1168,7 @@ class ConversationAwareADPRouter(ADPRouter):
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
             if self._new_conv_placement == "least_tokens":
-                token_load[rank] += _num_input_tokens(req_item.request)
+                token_load[rank] += _item_num_input_tokens(req_item)
 
         # Sticky returns use the hard cap, so a rank may now exceed the pre-loop
         # soft `expected`. Re-bump so the returned value covers the actual

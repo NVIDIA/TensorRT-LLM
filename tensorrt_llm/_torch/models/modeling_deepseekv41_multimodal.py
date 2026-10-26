@@ -74,6 +74,10 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
         return self.llm
 
     @property
+    def samples_from_vocab_shards(self) -> bool:
+        return self.llm.samples_from_vocab_shards
+
+    @property
     def model(self):
         return self.llm.model
 

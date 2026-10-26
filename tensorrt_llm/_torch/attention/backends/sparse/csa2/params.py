@@ -41,6 +41,11 @@ class CSA2Layer:
             return CSA2Mode.REINDEX
         return CSA2Mode.REUSE
 
+    @property
+    def consumes_candidates(self) -> bool:
+        """A Reindex layer that selects among the candidate source's published candidates."""
+        return self.mode == CSA2Mode.REINDEX and self.candidate_source is not None
+
 
 @dataclass(frozen=True)
 class CSA2Layout:
@@ -58,6 +63,9 @@ class CSA2Layout:
     candidate_block_size: int = 8
     index_topk: int = 512
     window_size: int = 128
+    # Indexer query geometry; it selects the indexer's MQA kernels and packing.
+    index_heads: int = 32
+    index_head_dim: int = 128
 
     @classmethod
     def from_hf_config(cls, config: object) -> CSA2Layout:
@@ -70,8 +78,10 @@ class CSA2Layout:
             else getattr(config, "text_config", config)
         )
 
-        def value(name: str):
-            return text[name] if isinstance(text, dict) else getattr(text, name)
+        def value(name: str, default=None):
+            if isinstance(text, dict):
+                return text.get(name, default) if default is not None else text[name]
+            return getattr(text, name, default) if default is not None else getattr(text, name)
 
         return cls(
             tuple(value("compress_ratios")),
@@ -82,6 +92,8 @@ class CSA2Layout:
             value("candidate_block_size"),
             value("index_topk"),
             value("sliding_window"),
+            value("index_n_heads", cls.index_heads),
+            value("index_head_dim", cls.index_head_dim),
         )
 
     def __post_init__(self) -> None:
@@ -168,12 +180,6 @@ class CSA2Params(SparseParams):
     # that path and is rejected elsewhere rather than silently downgraded, and
     # ``False`` pins BF16 staging.
     use_fp8_staging: bool | None = None
-    # Score only the published candidate blocks in candidate-consuming (Reindex)
-    # indexer layers with DeepGEMM's sparse MQA-logits kernels (SM100, MXFP4
-    # index rows). Falls back to dense logits plus candidate masking when the
-    # kernels or the geometry are unavailable, and is moot while the candidate
-    # pool covers every admitted position.
-    use_sparse_candidate_logits: bool = True
 
     def __post_init__(self) -> None:
         if self.fuse_packed_output_rope and not self.use_packed_sparse_attention:
@@ -206,6 +212,19 @@ class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     row indices; -1 denotes padding. topk_indices addresses main_pool.
     """
 
+    # Decode may prepare Q on another stream while this stream publishes KV.
+    query_ready: torch.cuda.Event | None = None
+    # With a Q amax word, staging may reduce the selected rows before ``query_ready`` and
+    # wait only to finalize the scale. Layers that run the indexer meanwhile keep waiting first.
+    late_query_ready: bool = False
+    # Unit-scale FP8 Q from the projection epilogue; staging resolves its live scale.
+    projected_quant_q: torch.Tensor | None = None
+    # Context: ``projected_quant_q`` is final at unit scale and no BF16 Q exists. Only the
+    # fused context kernel consumes it, folding the staged KV scale alone into BMM1.
+    projected_q_unit_scale: bool = False
+    # Generation: int32 FP32 bits of amax(|Q|) raised with ``projected_quant_q``, which then
+    # is all of Q staging reads; the scale derivation consumes and clears it.
+    projected_q_amax: torch.Tensor | None = None
     swa_pool: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
     main_pool: torch.Tensor | None = None
@@ -254,9 +273,18 @@ class CSA2ForwardState:
     index_k: torch.Tensor | None = None
     output_position_ids: torch.Tensor | None = None
     output_rotary_cos_sin: torch.Tensor | None = None
+    # (data, scale, positions, cos/sin) of the grouped128 o_a projection's FP8 input: the fused
+    # context kernel writes data and scale instead of the BF16 output and sets output_fp8_written.
+    output_fp8: tuple[torch.Tensor, ...] | None = None
+    output_fp8_written: bool = False
+    # (positions, cos/sin) when the query still awaits its RoPE, which the direct decode applies.
+    query_rope: tuple[torch.Tensor, torch.Tensor] | None = None
     swa_transform: RowTransform | None = None
     main_transform: RowTransform | None = None
     index_transform: RowTransform | None = None
+    # Recorded on a side stream after the index weights and the paged indexer descriptors;
+    # the indexer waits for it before scoring.
+    index_ready: torch.cuda.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -264,3 +292,5 @@ class CSA2MetadataParams(SparseMetadataParams):
     """Checkpoint layout shared by runtime metadata and cache ownership."""
 
     layout: CSA2Layout
+    indexer_max_chunk_size: int = 32768
+    q_split_threshold: int = 8192

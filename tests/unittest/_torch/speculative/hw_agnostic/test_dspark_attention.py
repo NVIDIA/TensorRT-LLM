@@ -66,7 +66,7 @@ def test_rmsnorm_rope_fallback_applies_weight_without_rmsnorm(monkeypatch):
 
 def test_rmsnorm_rope_skips_frequency_view_on_unsupported_arch(monkeypatch):
     monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_AVAILABLE", True)
-    monkeypatch.setattr(dspark_attention, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(dspark_attention, "_get_dspark_arch_str", lambda: None, raising=False)
     view_as_real = Mock(side_effect=AssertionError("frequency view should be skipped"))
     monkeypatch.setattr(torch, "view_as_real", view_as_real)
     x = torch.randn(2, 3, 64, dtype=torch.bfloat16)

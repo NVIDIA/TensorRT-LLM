@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
@@ -15,7 +13,6 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.mapping import Mapping
 
 try:
     from tensorrt_llm.deep_gemm import (
@@ -32,14 +29,24 @@ except ImportError:  # The bundled DeepGEMM predates the sparse indexer kernels
 from ..dsa.indexer import _INDEXER_MQA_LOGITS_ELEM_BUDGET, Indexer, _split_prefill_queries
 from ..dsa.params import DSAParams
 from ..params import use_self_sampling_gvr
+from .decode_select import (
+    fused_consumer_topk_supported,
+    fused_decode_select_,
+    fused_decode_select_supported,
+    select_mapped_consumer_topk_,
+)
 from .kernel import (
+    candidate_block_max_,
     dsl_available,
+    expand_candidates_,
     finalize_selection_,
     gather_candidate_scores,
+    gather_prefix_keys_,
+    map_selection_,
     mask_logits_,
-    publish_candidates_,
+    mask_packed_logits_,
 )
-from .metadata import CSA2TrtllmMetadata
+from .metadata import CSA2IndexerGroup, CSA2TrtllmMetadata, csa2_side_stream
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
 from .quantization import (
     INDEX_DATA_BYTES,
@@ -48,45 +55,19 @@ from .quantization import (
     pack_index_queries_split,
 )
 
-
-@dataclass
-class _ChunkInputs:
-    """Packed owner keys and logical bounds for one CSA2 query tile."""
-
-    k_data: torch.Tensor
-    k_scale: torch.Tensor
-    row_starts: torch.Tensor
-    row_ends: torch.Tensor
-    logical_positions: Optional[torch.Tensor] = None
-    visible_lengths: Optional[torch.Tensor] = None
-    # DeepGEMM sparse MQA logits: per-row sorted sparse block ids, the logical
-    # position of every sparse-logits column and the number of valid leading columns
-    sparse_indices: Optional[torch.Tensor] = None
-    sparse_positions: Optional[torch.Tensor] = None
-    sparse_counts: Optional[torch.Tensor] = None
-    # Every row's domain is column ``[0, width)`` of the logits (one shared K
-    # prefix), so selection reads the logits in place without a column gather.
-    shared_columns: bool = False
-
-
-@dataclass
-class _QueryChunk:
-    """Lazy K preparation, after request-level TP splitting for candidate K."""
-
-    token_start: int
-    token_end: int
-    k_token_count: int
-    load: Optional[Callable[[], _ChunkInputs]] = None
-    load_tile: Optional[Callable[[int, int], _ChunkInputs]] = None
-    keys_per_query: int = 0
-    max_query_tokens: Optional[int] = None
-    is_prefill: bool = True
+# Prefill scores narrower than this keep the exact radix TopK.
+_SELF_SAMPLING_PREFILL_MIN_COLUMNS = 8192
+# Candidate publications with at most this many query rows use the cluster radix TopK.
+_CANDIDATE_CLUSTER_TOPK_MAX_ROWS = 64
+# The self-sampling GVR decode engine runs one CTA per row. On the candidate source, whose rows
+# are twice as long, larger decode batches select with the exact radix Top-K.
+_DECODE_GVR_SOURCE_MAX_ROWS = 256
 
 
 class CSA2Indexer(Indexer):
     """Prepare owner-cache candidates and publish CSA2 logical selections.
 
-    This subclass owns chunk loading, candidate workspace limits and routing
+    This subclass owns prefix gathering, candidate workspace limits and routing
     publication. It reuses the base indexer's MQA dispatch, TP query partition
     calculation and TopK module. Cache writes and layer ordering belong to the
     backend.
@@ -130,16 +111,27 @@ class CSA2Indexer(Indexer):
         if not torch.cuda.is_available():
             exact = TopKImplementation.TORCH
         prefill, decode = exact, exact
-        if compatible and self.options.enable_heuristic_topk:
-            if self.options.use_self_sampling_topk and use_self_sampling_gvr(
+        self_sampling = (
+            compatible
+            and self.options.use_self_sampling_topk
+            and use_self_sampling_gvr(
                 enable_heuristic_topk=True,
                 use_self_sampling_topk=True,
                 index_topk=self.index_topk,
                 compress_ratio=1,
                 is_cute_dsl_available=True,
                 sm_version=sm,
-            ):
-                prefill = decode = TopKImplementation.CUTE_DSL_GVR
+            )
+        )
+        if self_sampling:
+            # The self-sampling engine is exact, so prefill uses it without heuristic decode.
+            prefill = TopKImplementation.CUTE_DSL_GVR
+        if compatible and self.options.enable_heuristic_topk:
+            if self_sampling:
+                # Candidate consumers rank candidate-ordered columns, which are
+                # not key positions; their decode TopK stays exact radix.
+                if not layer.consumes_candidates:
+                    decode = TopKImplementation.CUTE_DSL_GVR
             elif (
                 not self.options.use_self_sampling_topk
                 and layer.mode == CSA2Mode.FULL
@@ -150,19 +142,20 @@ class CSA2Indexer(Indexer):
         self.top_k.prefill_implementation = prefill
         self.top_k.decode_implementation = decode
         self.top_k.gvr_self_sampling = self.options.use_self_sampling_topk
+        self._exact_top_k = exact
+        self.narrow_prefill_top_k = (
+            TopK(self.index_topk, prefill_implementation=exact) if prefill != exact else None
+        )
         self.candidate_top_k: TopK | None = None
-        # DeepGEMM's sparse MQA logits score only the published candidate blocks
-        # in candidate consumers. They need SM100, 32 heads of 128D MXFP4 rows
-        # and candidate blocks that are multiples of 16 or 8 positions; other
-        # geometries gather each query's candidate rows for the dense kernels.
+        # Candidate consumers score only the published candidate blocks with
+        # DeepGEMM's sparse MQA logits: SM100, 32 heads of 128D MXFP4 rows and
+        # candidate blocks that are multiples of 16 or 8 positions.
         self.sparse_block = next(
             (block for block in (16, 8) if layout.candidate_block_size % block == 0), 0
         )
         self.use_sparse_candidates = bool(
-            self.options.use_sparse_candidate_logits
-            and _HAS_SPARSE_MQA_LOGITS
-            and layer.mode == CSA2Mode.REINDEX
-            and layer.candidate_source not in (None, layer_idx)
+            _HAS_SPARSE_MQA_LOGITS
+            and layer.consumes_candidates
             and 100 <= sm < 110
             and heads == 32
             and head_dim == 128
@@ -177,12 +170,18 @@ class CSA2Indexer(Indexer):
         # only its caller-owned publication tensor follows the current bound.
         count = self.layout.candidate_topk_blocks
         if self.candidate_top_k is None:
+            torch_reference = self.top_k.prefill_implementation == TopKImplementation.TORCH
             self.candidate_top_k = TopK(
                 count,
                 prefill_implementation=(
+                    TopKImplementation.TORCH if torch_reference else TopKImplementation.CUDA_RADIX
+                ),
+                # Up to _CANDIDATE_CLUSTER_TOPK_MAX_ROWS rows select with the multi-CTA
+                # (cluster) radix kernel, which splits each wide row over several CTAs.
+                decode_implementation=(
                     TopKImplementation.TORCH
-                    if self.top_k.prefill_implementation == TopKImplementation.TORCH
-                    else TopKImplementation.CUDA_RADIX
+                    if torch_reference
+                    else TopKImplementation.CUTE_DSL_RADIX
                 ),
             )
         elif self.candidate_top_k.top_k != count:
@@ -233,21 +232,39 @@ class CSA2Indexer(Indexer):
         if row_starts is None and is_prefill:
             row_starts = self._constant_rows(count, 0, scores.device)
         selector = self.candidate_top_k if candidate else self.top_k
+        if (
+            is_prefill
+            and not candidate
+            and self.narrow_prefill_top_k is not None
+            and width < _SELF_SAMPLING_PREFILL_MIN_COLUMNS
+        ):
+            selector = self.narrow_prefill_top_k
         if selector is None or output_indices.shape[1] != selector.top_k:
             raise ValueError("CSA2 TopK output must match its configured selection domain")
+        if (
+            not is_prefill
+            and selector.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+            and selector.gvr_self_sampling
+            and count > _DECODE_GVR_SOURCE_MAX_ROWS
+            and self.layout.layer(self.layer_idx).candidate_source == self.layer_idx
+        ):
+            selector = self._decode_radix_selector(selector)
         implementation = (
             selector.prefill_implementation if is_prefill else selector.decode_implementation
         )
         if implementation in (TopKImplementation.CUTE_DSL_RADIX, TopKImplementation.CUTE_DSL_GVR):
-            # Exact DSL uses wide vector copies; pad storage without extending
+            # Exact DSL uses 32-byte vector copies; pad storage without extending
             # row bounds. Self-sampling also benefits from this native layout.
+            vector = 32 // scores.element_size()
             if (
                 scores.stride(1) != 1
-                or scores.stride(0) % 8
+                or scores.stride(0) % vector
                 or scores.data_ptr() % 32
-                or scores.shape[1] % 8
+                or scores.shape[1] % vector
             ):
-                scores = F.pad(scores.contiguous(), (0, -scores.shape[1] % 8), value=-torch.inf)
+                scores = F.pad(
+                    scores.contiguous(), (0, -scores.shape[1] % vector), value=-torch.inf
+                )
         if not is_prefill:
             return selector(
                 scores,
@@ -269,17 +286,26 @@ class CSA2Indexer(Indexer):
             scores, output_indices, is_prefill=True, row_starts=row_starts, row_ends=row_ends
         )
 
+    def _decode_radix_selector(self, selector: TopK) -> TopK:
+        """Exact radix decode Top-K standing in for the self-sampling GVR engine on the candidate
+        source's decode batches above ``_DECODE_GVR_SOURCE_MAX_ROWS`` rows."""
+        radix = self.__dict__.get("_decode_radix_top_k")
+        if radix is None or radix.top_k != selector.top_k:
+            radix = TopK(
+                selector.top_k,
+                prefill_implementation=self._exact_top_k,
+                decode_implementation=self._exact_top_k,
+                compress_ratio=selector.compress_ratio,
+            )
+            # A plain attribute: the stand-in holds no state worth registering.
+            self.__dict__["_decode_radix_top_k"] = radix
+        return radix
+
     def _select_all_visible(
-        self,
-        positions: torch.Tensor,
-        visible: torch.Tensor,
-        row_limits: torch.Tensor,
-        output: torch.Tensor,
+        self, positions: torch.Tensor, visible: torch.Tensor, output: torch.Tensor
     ) -> torch.Tensor:
         """Select every valid logical candidate once its cardinality is bounded by K."""
-        offsets = torch.arange(positions.shape[1], device=positions.device)[None, :]
         valid = (positions >= 0) & (positions < visible[:, None])
-        valid &= offsets < row_limits[:, None]
         sentinel = torch.iinfo(torch.int64).max
         selected = torch.where(valid, positions.long(), sentinel).sort(-1).values
         selected = torch.where(selected == sentinel, -1, selected).to(torch.int32)
@@ -287,135 +313,191 @@ class CSA2Indexer(Indexer):
         output.copy_(F.pad(selected, (0, self.index_topk - selected.shape[1]), value=-1))
         return output
 
-    def forward_prepared(
+    def _gather_prefix(
         self,
+        metadata: CSA2TrtllmMetadata,
+        kv_source: int,
+        descriptors: torch.Tensor,
+        keys: int,
+        rows: int,
+        visible: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Concatenate the prepared pieces' compressed prefixes in one launch.
+
+        Returns ``keys`` gathered keys, their scales and validity and the
+        ``[5, rows]`` row bounds of ``gather_prefix_keys_``.
+        """
+        device = visible.device
+        data = torch.empty((keys, INDEX_DATA_BYTES), dtype=torch.int8, device=device)
+        scales = torch.empty(keys, dtype=torch.int32, device=device)
+        valid = torch.empty(keys, dtype=torch.bool, device=device)
+        bounds = torch.empty((5, rows), dtype=torch.int32, device=device)
+        gather_prefix_keys_(
+            metadata.kv_cache_manager.get_index_pages(kv_source),
+            metadata.csa2_global_page_tables[kv_source],
+            visible,
+            descriptors,
+            metadata.csa2_global_page_sizes[kv_source],
+            metadata.csa2_global_max_positions[kv_source],
+            data,
+            scales,
+            valid,
+            bounds,
+        )
+        return data, scales, valid, bounds
+
+    def _run_packed_group(
+        self,
+        metadata: CSA2TrtllmMetadata,
+        kv_source: int,
+        group: CSA2IndexerGroup,
         q_data: torch.Tensor,
-        k_data: torch.Tensor,
-        k_scale: torch.Tensor,
         weights: torch.Tensor,
+        q_scale: torch.Tensor,
+        visible: torch.Tensor,
+        output: torch.Tensor,
+        publish: Optional[Callable[..., None]],
+        sharded: tuple[torch.Tensor, ...],
+        radix: tuple[torch.Tensor, torch.Tensor] | None,
+        prior: Optional[torch.Tensor],
+        prior_start: int,
+    ) -> None:
+        """Score a prepared group's queries against their own compressed prefixes in one call.
+
+        As in the DSA indexer, each query row is bounded to its request's keys
+        up to its visible length, so DeepGEMM's compressed logits column ``j``
+        is logical position ``j`` and TopK writes the selected positions
+        directly. Attention staging skips a selection without an allocated
+        page. ``publish`` receives a candidate source's logits before selection.
+        TP-split prefill groups are gathered with the ``sharded`` rows.
+        """
+        first, last, lo, hi = group.first, group.last, group.lo, group.hi
+        if group.width <= 0 and group.sizes is None:
+            output[first:last].fill_(-1)
+            return
+        if group.keys > 0:
+            keys, scales, valid, rows = self._gather_prefix(
+                metadata, kv_source, group.descriptors, group.keys, hi - lo, visible
+            )
+            row_starts, row_ends, row_lengths, row_widths, zeros = rows.unbind(0)
+            logits = self._call_mqa_logits(
+                q_data[lo:hi],
+                keys,
+                scales,
+                weights[lo:hi],
+                row_starts,
+                row_ends,
+                q_scale[lo:hi],
+                clean_logits=False,
+                max_seqlen_k=-(-group.width // 8) * 8,
+            )
+            mask_packed_logits_(logits, valid, row_starts, row_lengths)
+            if publish is not None:
+                publish(logits, valid, 0, lo, row_starts, row_ends, row_widths)
+            if group.is_prefill:
+                self.select_prepared_scores(logits, output[lo:hi], zeros, row_lengths)
+            else:
+                local_prior = (
+                    prior[lo - prior_start : hi - prior_start] if prior is not None else None
+                )
+                if local_prior is not None:
+                    safe = local_prior.long().clamp(0, logits.shape[1] - 1)
+                    backed = (local_prior >= 0) & (local_prior < row_lengths[:, None])
+                    backed &= logits.gather(1, safe) > -torch.inf
+                    local_prior = torch.where(backed, local_prior, -1)
+                self.select_prepared_scores(
+                    logits,
+                    output[lo:hi],
+                    None,
+                    row_lengths,
+                    is_prefill=False,
+                    radix_aux_indices=radix[0][lo:hi],
+                    radix_aux_logits=radix[1][lo:hi],
+                    gvr_prior_indices=local_prior,
+                )
+            finalize_selection_(
+                output[lo:hi],
+                logits.shape[1],
+                valid=valid,
+                row_starts=row_starts,
+                row_lengths=row_lengths,
+            )
+        if group.sizes is not None:
+            tensors = (output, *sharded)
+            gathered = allgather(
+                [tensor[lo:hi] for tensor in tensors], metadata.mapping, dim=0, sizes=group.sizes
+            )
+            for tensor, value in zip(tensors, gathered):
+                tensor[first:last] = value
+
+    def _publish_block_candidates(
+        self,
+        logits: torch.Tensor,
+        valid: torch.Tensor,
+        valid_stride: int,
+        visible: torch.Tensor,
+        query_start: int,
         row_starts: torch.Tensor,
         row_ends: torch.Tensor,
-        output_indices: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        *,
-        logical_positions: Optional[torch.Tensor] = None,
-        visible_lengths: Optional[torch.Tensor] = None,
-        score_hook: Optional[Callable[[torch.Tensor], None]] = None,
-        is_prefill: bool = True,
-        radix_aux_indices: Optional[torch.Tensor] = None,
-        radix_aux_logits: Optional[torch.Tensor] = None,
-        gvr_prior_indices: Optional[torch.Tensor] = None,
-        sparse_indices: Optional[torch.Tensor] = None,
-        sparse_positions: Optional[torch.Tensor] = None,
-        sparse_counts: Optional[torch.Tensor] = None,
-        shared_columns: bool = False,
-    ) -> torch.Tensor:
-        """CSA2 logical selection over the shared quantized MQA kernels.
+        row_widths: torch.Tensor,
+        output: torch.Tensor,
+        sparse_ids: torch.Tensor | None,
+        sparse_counts: torch.Tensor | None,
+        page: int = 1,
+    ) -> None:
+        """Publish candidate blocks: block maxima, block TopK, ascending positions.
 
-        Q is [queries, heads, data_dim], K is [keys, data_dim]. FP4 data
-        contains packed E2M1 bytes; Q/K scales contain one int32 word of
-        four UE8M0 bytes per 128D vector. FP8 retains the ordinary DSA
-        scale contract. Row bounds are int32 [queries] in the shared K axis.
-        Output is caller-owned int32 [queries, top_k].
-
-        Without a logical map the output preserves DSA's row-local, unsorted
-        offsets and its no-clean logits fast path. With a [queries, candidates]
-        logical map, each map starts at its row's K start. Invalid/future
-        candidates are masked before the optional hook. The output contains
-        sorted logical positions followed by -1 padding. The hook can publish
-        hierarchical candidate information, but cannot change request/cache
-        ownership or bypass this instance's QK/TopK dispatch.
+        Row ``q`` scores logits columns ``[0, row_ends[q] - row_starts[q])``
+        where ``valid[q * valid_stride + (row_starts[q] + column) // page]`` is set;
+        its blocks span ``row_widths[q]`` positions and the newest visible block is
+        always selected. ``output`` and the sparse outputs are the rows'
+        publication targets.
         """
-        count = q_data.shape[0]
-        if not is_prefill and logical_positions is None:
-            logical_positions = torch.arange(k_data.shape[0], device=q_data.device).expand(
-                count, -1
-            )
-            visible_lengths = row_ends - row_starts
-        if output_indices.shape != (count, self.index_topk):
-            raise ValueError("Prepared indexer output must match query rows and configured Top-K")
-        if score_hook is not None and logical_positions is None:
-            raise ValueError("A score hook requires explicit logical candidate positions")
-        if logical_positions is not None:
-            if logical_positions.ndim != 2 or logical_positions.shape[0] != count:
-                raise ValueError("Logical candidates must have one row per query")
-            if visible_lengths is None or visible_lengths.shape != (count,):
-                raise ValueError("Logical candidates require per-query visibility lengths")
-        if count == 0 or k_data.shape[0] == 0:
-            if score_hook is not None:
-                score_hook(
-                    torch.full(
-                        logical_positions.shape,
-                        -torch.inf,
-                        dtype=torch.float32,
-                        device=q_data.device,
-                    )
-                )
-            return output_indices.fill_(-1)
-        if (
-            self.options.skip_indexer_for_short_seqs
-            and sparse_indices is None
-            and logical_positions is not None
-            and logical_positions.shape[1] <= self.index_topk
-            and score_hook is None
-        ):
-            return self._select_all_visible(
-                logical_positions,
-                visible_lengths,
-                row_ends - row_starts,
-                output_indices,
-            )
-        if sparse_indices is not None:
-            # Score only the candidate blocks; the columns follow the published
-            # candidate order, whose valid entries form a per-row prefix.
-            logits = self._sparse_candidate_logits(
-                q_data,
-                q_scale,
-                weights,
-                sparse_indices,
-                keys=(k_data, k_scale),
-                valid_counts=sparse_counts.reshape(-1),
-            )
-            return self._select_mapped_logits(
-                logits,
-                None,
-                None,
-                sparse_positions,
-                visible_lengths,
-                output_indices,
-                None,
-                is_prefill,
-                radix_aux_indices,
-                radix_aux_logits,
-                gvr_prior_indices,
-                valid_counts=sparse_counts,
-            )
-        logits = self._call_mqa_logits(
-            q_data,
-            k_data,
-            k_scale,
-            weights,
-            row_starts,
-            row_ends,
-            q_scale,
-            clean_logits=logical_positions is not None,
+        block_size = self.layout.candidate_block_size
+        count = logits.shape[0]
+        blocks = torch.empty(
+            (count, -(-logits.shape[1] // block_size)), dtype=torch.float32, device=logits.device
         )
-        if logical_positions is None:
-            return self.select_prepared_scores(logits, output_indices, row_starts, row_ends)
-        if shared_columns:
-            row_starts = row_ends = None
-        return self._select_mapped_logits(
+        block_counts = torch.empty(count, dtype=torch.int32, device=logits.device)
+        candidate_block_max_(
             logits,
+            valid,
+            valid_stride,
+            visible,
+            query_start,
             row_starts,
             row_ends,
-            logical_positions,
-            visible_lengths,
-            output_indices,
-            score_hook,
-            is_prefill,
-            radix_aux_indices,
-            radix_aux_logits,
-            gvr_prior_indices,
+            row_widths,
+            blocks,
+            block_counts,
+            block_size,
+            page,
+        )
+        selected = torch.empty(
+            (count, self.candidate_top_k.top_k), dtype=torch.int32, device=logits.device
+        )
+        self.select_prepared_scores(
+            blocks,
+            selected,
+            None,
+            block_counts,
+            candidate=True,
+            is_prefill=(
+                count > _CANDIDATE_CLUSTER_TOPK_MAX_ROWS
+                or blocks.shape[1] <= self.candidate_top_k.top_k
+            ),
+        )
+        expand_candidates_(
+            selected,
+            blocks,
+            visible,
+            query_start,
+            row_widths,
+            output,
+            block_size,
+            sparse_ids,
+            sparse_counts,
+            self.sparse_block if sparse_ids is not None else 0,
         )
 
     def _invalidate_emission_holes(self, bad_rows: torch.Tensor) -> None:
@@ -445,98 +527,40 @@ class CSA2Indexer(Indexer):
     def _select_mapped_logits(
         self,
         logits: torch.Tensor,
-        row_starts: Optional[torch.Tensor],
-        row_ends: Optional[torch.Tensor],
         logical_positions: torch.Tensor,
-        visible_lengths: torch.Tensor,
         output_indices: torch.Tensor,
-        score_hook: Optional[Callable[[torch.Tensor], None]],
-        is_prefill: bool = True,
+        valid_counts: torch.Tensor,
+        is_prefill: bool,
         radix_aux_indices: Optional[torch.Tensor] = None,
         radix_aux_logits: Optional[torch.Tensor] = None,
-        gvr_prior_indices: Optional[torch.Tensor] = None,
-        valid_counts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Select over logits whose columns map to ``logical_positions``.
+        """Select over sparse candidate logits whose columns map to ``logical_positions``.
 
-        ``row_starts``/``row_ends`` bound each row inside ``logits``; ``None``
-        means every column of ``logits`` is that row's domain (candidate-ordered
-        scores), which skips the column gather entirely. With ``valid_counts``
-        the candidate source already made each row's valid columns its leading
-        ones (sparse candidate logits), so the Top-K is bounded by the counts
-        instead of masking.
+        Each row's valid columns are its leading ``valid_counts`` ones and
+        bound the TopK. Decode rows that the radix-select takes in one CTA run it and the
+        mapping in one launch (``select_mapped_consumer_topk_``).
         """
-        width = logical_positions.shape[1]
-        if valid_counts is not None:
-            scores, local_ends = logits, valid_counts
-            if gvr_prior_indices is not None:
-                prior = gvr_prior_indices.long()
-                gvr_prior_indices = torch.where(
-                    (prior >= 0) & (prior < valid_counts[:, None]), gvr_prior_indices, -1
-                )
-        else:
-            offsets = torch.arange(width, device=logits.device)
-            if row_starts is None and row_ends is None and logits.shape[1] == width:
-                scores = logits
-                valid = logical_positions >= 0
-            else:
-                if row_starts is None:
-                    row_starts = self._constant_rows(logits.shape[0], 0, logits.device)
-                if row_ends is None:
-                    row_ends = self._constant_rows(logits.shape[0], logits.shape[1], logits.device)
-                columns = row_starts.long()[:, None] + offsets
-                in_bounds = (columns >= 0) & (columns < row_ends[:, None])
-                in_bounds &= columns < logits.shape[1]
-                scores = logits.gather(1, columns.clamp(0, logits.shape[1] - 1))
-                valid = in_bounds & (logical_positions >= 0)
-            valid &= logical_positions < visible_lengths[:, None]
-            # The logits are this call's own transient: mask them in place so
-            # the boolean mask is the only full-width temporary.
-            scores.masked_fill_(~valid, -torch.inf)
-            if gvr_prior_indices is not None:
-                if width:
-                    prior = gvr_prior_indices.long()
-                    prior_valid = (prior >= 0) & (prior < width)
-                    prior_valid &= valid.gather(1, prior.clamp(0, width - 1))
-                    gvr_prior_indices = torch.where(prior_valid, gvr_prior_indices, -1)
-                else:
-                    gvr_prior_indices = torch.full_like(gvr_prior_indices, -1)
-            if not is_prefill and self.options.use_gvr_emission and self.top_k._gvr_emission_armed:
-                bad_rows = (
-                    (offsets[None, :] < visible_lengths[:, None]) & (logical_positions < 0)
-                ).any(dim=1)
-                self._invalidate_emission_holes(bad_rows)
-            if score_hook is not None:
-                score_hook(scores)
-            local_ends = None
-            if row_starts is not None and row_ends is not None:
-                local_ends = (row_ends - row_starts).clamp(min=0, max=width)
+        if (
+            not is_prefill
+            and self.top_k.decode_implementation == TopKImplementation.CUTE_DSL_RADIX
+            and output_indices.shape[1] == self.top_k.top_k
+            and logical_positions.is_contiguous()
+            and output_indices.is_contiguous()
+            and fused_consumer_topk_supported(logits, output_indices.shape[1])
+        ):
+            return select_mapped_consumer_topk_(
+                logits, valid_counts, logical_positions, output_indices
+            )
         self.select_prepared_scores(
-            scores,
+            logits,
             output_indices,
             None,
-            local_ends,
+            valid_counts,
             is_prefill=is_prefill,
             radix_aux_indices=radix_aux_indices,
             radix_aux_logits=radix_aux_logits,
-            gvr_prior_indices=gvr_prior_indices,
         )
-        if width == 0:
-            return output_indices
-        if valid_counts is None and scores.is_cuda and dsl_available():
-            return finalize_selection_(
-                output_indices, width, scores=scores, positions=logical_positions
-            )
-        selected_offsets = output_indices.long()
-        safe_offsets = selected_offsets.clamp(0, width - 1)
-        selected_valid = (selected_offsets >= 0) & (selected_offsets < width)
-        if valid_counts is None:
-            selected_valid &= scores.gather(1, safe_offsets) > -torch.inf
-        selected = logical_positions.gather(1, safe_offsets).long()
-        sentinel = torch.iinfo(torch.int64).max
-        selected = torch.where(selected_valid, selected, sentinel).sort(-1).values
-        output_indices.copy_(torch.where(selected == sentinel, -1, selected).to(torch.int32))
-        return output_indices
+        return map_selection_(output_indices, logical_positions, valid_counts)
 
     def _select_paged_logits(
         self,
@@ -544,8 +568,8 @@ class CSA2Indexer(Indexer):
         logits: torch.Tensor,
         candidates: Optional[torch.Tensor],
         output_indices: torch.Tensor,
-        score_hook: Optional[Callable[[torch.Tensor], None]],
         gvr_prior_indices: Optional[torch.Tensor],
+        after_mask: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         """Decode selection over in-place paged logits, as the DSA decode indexer does.
 
@@ -553,20 +577,39 @@ class CSA2Indexer(Indexer):
         Positions that are not visible or whose page is unallocated are masked
         by one CuTe launch; with ``candidates`` the same launch gathers the
         candidate columns instead. TopK runs over the masked scores, then one
-        CuTe launch validates, sorts and pads the selection with ``-1``.
+        CuTe launch validates, sorts and pads the selection with ``-1``. Without
+        candidates, ``fused_decode_select_`` does all three in one launch for small
+        decode tiles.
         """
-        valid = metadata.csa2_indexer_valid_positions
+        valid = metadata.csa2_indexer_valid_pages
         visible = metadata.csa2_indexer_visible_lengths
         width = logits.shape[1]
         if width == 0 or (candidates is not None and candidates.shape[1] == 0):
             return output_indices.fill_(-1)
         if candidates is None:
-            mask_logits_(logits, valid)
+            if (
+                gvr_prior_indices is None
+                and not self.top_k._gvr_emission_armed
+                and fused_decode_select_supported(logits, output_indices.shape[1])
+            ):
+                # The candidate publication scores validated, visible columns only, so it reads
+                # the logits unmasked as well.
+                if after_mask is not None:
+                    after_mask()
+                return fused_decode_select_(logits, valid, visible, output_indices, INDEX_PAGE_ROWS)
+            mask_logits_(logits, valid, row_lengths=visible)
+            if after_mask is not None:
+                after_mask()
             scores, positions, row_ends = logits, None, visible
             if gvr_prior_indices is not None:
                 # A prior on a masked column would seed the GVR threshold with -inf.
                 prior = gvr_prior_indices.long().clamp(0, width - 1)
-                backed = valid.gather(1, prior) & (gvr_prior_indices >= 0) & (prior < width)
+                backed = (
+                    valid.gather(1, prior // INDEX_PAGE_ROWS)
+                    & (gvr_prior_indices >= 0)
+                    & (gvr_prior_indices < width)
+                    & (gvr_prior_indices < visible[:, None])
+                )
                 gvr_prior_indices = torch.where(backed, gvr_prior_indices, -1)
         else:
             scores = torch.empty(candidates.shape, dtype=torch.float32, device=logits.device)
@@ -577,10 +620,8 @@ class CSA2Indexer(Indexer):
             # Raw emission ran over every visible column, including the ones
             # backed by unallocated pages that were masked above.
             offsets = torch.arange(width, device=logits.device)
-            holes = (offsets[None, :] < visible[:, None]) & ~valid[:, :width]
+            holes = (offsets[None, :] < visible[:, None]) & ~valid[:, offsets // INDEX_PAGE_ROWS]
             self._invalidate_emission_holes(holes.any(dim=1))
-        if score_hook is not None:
-            score_hook(scores)
         self.select_prepared_scores(
             scores,
             output_indices,
@@ -592,287 +633,9 @@ class CSA2Indexer(Indexer):
             gvr_prior_indices=gvr_prior_indices,
         )
         if positions is None:
-            return finalize_selection_(output_indices, width, valid=valid)
+            return finalize_selection_(output_indices, width, valid=valid, row_lengths=visible)
         return finalize_selection_(
             output_indices, positions.shape[1], scores=scores, positions=positions
-        )
-
-    def _run_csa2_chunks(
-        self,
-        chunks: list[_QueryChunk],
-        q_data: torch.Tensor,
-        weights: torch.Tensor,
-        q_scale: Optional[torch.Tensor],
-        output: torch.Tensor,
-        mapping: Optional[Mapping],
-        q_split_threshold: int,
-        score_hook: Optional[Callable[[torch.Tensor, int, int], None]] = None,
-        auxiliary_outputs: tuple[torch.Tensor, ...] = (),
-        radix_aux_indices: Optional[torch.Tensor] = None,
-        radix_aux_logits: Optional[torch.Tensor] = None,
-        gvr_prior_indices: Optional[torch.Tensor] = None,
-        prior_query_start: int = 0,
-        sharded_outputs: tuple[torch.Tensor, ...] = (),
-    ) -> None:
-        """Execute CSA2 owner-prefix or candidate chunks and publish all routing outputs.
-
-        ``sharded_outputs`` are per-query rows filled by the score hook; they are
-        gathered across TP ranks together with ``output`` and ``auxiliary_outputs``.
-        """
-        for chunk in chunks:
-            count = chunk.token_end - chunk.token_start
-            if count < 0 or chunk.token_start < 0 or chunk.token_end > q_data.shape[0]:
-                raise ValueError("Indexer chunk query bounds are outside the projected batch")
-            if count == 0 or chunk.k_token_count <= 0:
-                output[chunk.token_start : chunk.token_end].fill_(-1)
-                for auxiliary in auxiliary_outputs:
-                    auxiliary[chunk.token_start : chunk.token_end].fill_(-1)
-                continue
-            if (chunk.load is None) == (chunk.load_tile is None):
-                raise ValueError("Indexer chunks require exactly one shared or tiled K loader")
-            local_start, local_end, sizes = _split_prefill_queries(
-                count, mapping, q_split_threshold if chunk.is_prefill else -1
-            )
-            shared = chunk.load() if chunk.load is not None else None
-            budget = _INDEXER_MQA_LOGITS_ELEM_BUDGET
-            if self.use_fp4 and (
-                self.head_dim != 128 or not q_data.is_cuda or get_sm_version() < 100
-            ):
-                # The decoded fallback also materializes per-head dot products.
-                budget = max(1, budget // self.n_heads)
-            if chunk.load_tile is not None:
-                if chunk.keys_per_query <= 0:
-                    raise ValueError("Tiled candidate K loaders require a per-query key bound")
-                tile_size = max(1, math.isqrt(budget // chunk.keys_per_query))
-            elif chunk.keys_per_query > 0:
-                # Shared keys, but each query scores only its candidate columns
-                tile_size = max(1, budget // chunk.keys_per_query)
-            else:
-                tile_size = max(1, budget // max(1, chunk.k_token_count))
-            if chunk.max_query_tokens is not None:
-                if chunk.max_query_tokens <= 0:
-                    raise ValueError("Indexer query tile capacity must be positive")
-                tile_size = min(tile_size, chunk.max_query_tokens)
-            for offset in range(local_start, local_end, tile_size):
-                stop = min(offset + tile_size, local_end)
-                first, last = chunk.token_start + offset, chunk.token_start + stop
-                if shared is None:
-                    inputs = chunk.load_tile(first, last)
-                    row_slice = slice(None)
-                else:
-                    inputs = shared
-                    row_slice = slice(offset, stop)
-                logical = (
-                    inputs.logical_positions[row_slice]
-                    if inputs.logical_positions is not None
-                    else None
-                )
-                visible = (
-                    inputs.visible_lengths[row_slice]
-                    if inputs.visible_lengths is not None
-                    else None
-                )
-                hook = None
-                if score_hook is not None:
-
-                    def hook(scores, first=first, last=last):
-                        score_hook(scores, first, last)
-
-                self.forward_prepared(
-                    q_data[first:last],
-                    inputs.k_data,
-                    inputs.k_scale,
-                    weights[first:last],
-                    inputs.row_starts[row_slice],
-                    inputs.row_ends[row_slice],
-                    output[first:last],
-                    q_scale[first:last] if q_scale is not None else None,
-                    logical_positions=logical,
-                    visible_lengths=visible,
-                    sparse_indices=(
-                        inputs.sparse_indices[row_slice]
-                        if inputs.sparse_indices is not None
-                        else None
-                    ),
-                    sparse_positions=(
-                        inputs.sparse_positions[row_slice]
-                        if inputs.sparse_positions is not None
-                        else None
-                    ),
-                    sparse_counts=(
-                        inputs.sparse_counts[row_slice]
-                        if inputs.sparse_counts is not None
-                        else None
-                    ),
-                    is_prefill=chunk.is_prefill,
-                    shared_columns=inputs.shared_columns and inputs.sparse_indices is None,
-                    score_hook=hook,
-                    radix_aux_indices=radix_aux_indices[first:last]
-                    if radix_aux_indices is not None
-                    else None,
-                    radix_aux_logits=radix_aux_logits[first:last]
-                    if radix_aux_logits is not None
-                    else None,
-                    gvr_prior_indices=(
-                        gvr_prior_indices[first - prior_query_start : last - prior_query_start]
-                        if gvr_prior_indices is not None and not chunk.is_prefill
-                        else None
-                    ),
-                )
-            if sizes is not None:
-                first, last = chunk.token_start + local_start, chunk.token_start + local_end
-                tensors = (output, *auxiliary_outputs, *sharded_outputs)
-                gathered = allgather(
-                    [tensor[first:last] for tensor in tensors], mapping, dim=0, sizes=sizes
-                )
-                for tensor, value in zip(tensors, gathered):
-                    tensor[chunk.token_start : chunk.token_end] = value
-
-    def _publish_target(
-        self, results: dict[int, torch.Tensor], width: int, start: int, total_queries: int, device
-    ) -> torch.Tensor:
-        """The layer's full-query int32 publication buffer, allocated by the first tile."""
-        if start == 0 and self.layer_idx not in results:
-            results[self.layer_idx] = torch.empty(
-                (total_queries, width), dtype=torch.int32, device=device
-            )
-        target = results.get(self.layer_idx)
-        if target is None or target.shape != (total_queries, width):
-            raise ValueError("CSA2 selection tiles must retain their full-query shape and order")
-        return target
-
-    def _publish_tile(
-        self,
-        results: dict[int, torch.Tensor],
-        value: torch.Tensor,
-        start: int,
-        total_queries: int,
-    ) -> None:
-        if start == 0 and self.layer_idx not in results:
-            results[self.layer_idx] = torch.empty(
-                (total_queries, value.shape[1]), dtype=value.dtype, device=value.device
-            )
-        target = results.get(self.layer_idx)
-        if target is None or target.shape != (total_queries, value.shape[1]):
-            raise ValueError("CSA2 selection tiles must retain their full-query shape and order")
-        target[start : start + value.shape[0]].copy_(value)
-
-    def _publish_candidates(
-        self,
-        scores: torch.Tensor,
-        visible: torch.Tensor,
-        results: dict[int, torch.Tensor],
-        start: int,
-        total_queries: int,
-        candidate_width: int | None = None,
-        sparse_blocks: dict[int, torch.Tensor] | None = None,
-        sparse_counts: dict[int, torch.Tensor] | None = None,
-    ) -> None:
-        """CSA2-only block hierarchy; native selection stays in the base class.
-
-        Candidates are published in ascending block order, so every row's valid
-        positions form a prefix of its columns: the newest block is always
-        selected and is the only one that can extend past the visible length.
-        With ``sparse_blocks``/``sparse_counts`` the same selection is also
-        published as the DeepGEMM sparse-logits inputs: sorted, unique sparse
-        block ids padded by repeating the last valid one, and the number of valid
-        leading columns per row.
-        """
-        count, width = scores.shape
-        block_size = self.layout.candidate_block_size
-        device = scores.device
-        if self.candidate_top_k is None:
-            raise RuntimeError("Configure CSA2 candidate TopK from admitted geometry first")
-        # CUDA radix and TORCH prefill put min(K, N) selections before the -1
-        # tail; the published row covers those blocks plus caller padding.
-        selected_blocks = min(self.candidate_top_k.top_k, -(-width // block_size))
-        if scores.is_cuda and dsl_available():
-            # One CuTe launch publishes the candidate positions in ascending
-            # block order and, when requested, the sparse-logits block ids and
-            # valid-column counts of the same selection.
-            selected_width = selected_blocks * block_size
-            published_width = selected_width if candidate_width is None else candidate_width
-            if published_width < selected_width:
-                raise ValueError(
-                    "CSA2 candidate publication cannot truncate its scored block domain"
-                )
-            rows = slice(start, start + count)
-            target = self._publish_target(results, published_width, start, total_queries, device)
-            sparse_block = (
-                self.sparse_block if sparse_blocks is not None and sparse_counts is not None else 0
-            )
-            ids = counts = None
-            if sparse_block:
-                ids = self._publish_target(
-                    sparse_blocks, published_width // sparse_block, start, total_queries, device
-                )[rows]
-                counts = self._publish_target(sparse_counts, 1, start, total_queries, device)[
-                    rows
-                ].reshape(-1)
-            if publish_candidates_(
-                scores.float(),
-                visible,
-                target[rows],
-                self.candidate_top_k.top_k,
-                block_size,
-                ids,
-                counts,
-                sparse_block,
-            ):
-                return
-        padded = F.pad(scores, (0, -width % block_size), value=-torch.inf)
-        blocks = padded.reshape(count, padded.shape[1] // block_size, block_size).amax(-1)
-        latest = (visible - 1) // block_size
-        block_ids = torch.arange(blocks.shape[1], device=device)
-        blocks = blocks.masked_fill(block_ids[None, :] == latest[:, None], torch.inf)
-        if selected_blocks == blocks.shape[1]:
-            # Every block is selected: publish in position order without a TopK.
-            selected = block_ids[None, :].expand(count, -1).int()
-        else:
-            selected = torch.empty(
-                (count, self.candidate_top_k.top_k), dtype=torch.int32, device=device
-            )
-            self.select_prepared_scores(blocks, selected, None, None, candidate=True)
-            selected = selected[:, :selected_blocks]
-        sentinel = torch.iinfo(torch.int32).max
-        reachable = selected >= 0
-        if blocks.shape[1]:
-            safe = selected.long().clamp(0, blocks.shape[1] - 1)
-            reachable &= blocks.gather(1, safe) > -torch.inf
-        ordered = torch.where(reachable, selected, sentinel).sort(dim=1).values
-        # Positions fit int32; the published buffer lives for the whole forward
-        # and is read by every consuming layer, so keep it half the size of int64.
-        candidates = ordered[..., None] * block_size + torch.arange(
-            block_size, dtype=torch.int32, device=device
-        )
-        valid = (ordered != sentinel)[..., None] & (candidates < visible[:, None, None])
-        valid &= candidates < width
-        candidates = torch.where(valid, candidates, -1).flatten(1)
-        selected_width = selected_blocks * block_size
-        published_width = selected_width if candidate_width is None else candidate_width
-        if published_width < selected_width:
-            raise ValueError("CSA2 candidate publication cannot truncate its scored block domain")
-        candidates = F.pad(candidates, (0, published_width - selected_width), value=-1)
-        self._publish_tile(results, candidates, start, total_queries)
-        if sparse_blocks is None or sparse_counts is None:
-            return
-        sparse_block = self.sparse_block
-        ratio = block_size // sparse_block
-        num_valid = (ordered != sentinel).sum(dim=1, keepdim=True)
-        last = ordered.gather(1, (num_valid - 1).clamp_min(0))
-        last = torch.where(num_valid > 0, last, 0) * ratio + (ratio - 1)
-        sparse_ids = torch.where(ordered == sentinel, last, ordered * ratio + (ratio - 1))
-        if ratio > 1:
-            sparse_ids = (
-                sparse_ids[..., None]
-                - torch.arange(ratio - 1, -1, -1, dtype=torch.int32, device=device)
-            ).flatten(1)
-        tail = published_width // sparse_block - sparse_ids.shape[1]
-        if tail > 0:
-            sparse_ids = torch.cat((sparse_ids, last.expand(-1, tail)), dim=1)
-        self._publish_tile(sparse_blocks, sparse_ids, start, total_queries)
-        self._publish_tile(
-            sparse_counts, (candidates >= 0).sum(dim=1, keepdim=True).int(), start, total_queries
         )
 
     def forward(self, state: CSA2ForwardState, query_start: int, count: int) -> torch.Tensor:
@@ -886,6 +649,9 @@ class CSA2Indexer(Indexer):
         manager = metadata.kv_cache_manager
         if manager is None or state.index_q is None or state.index_weights is None:
             raise ValueError("CSA2 indexer requires an owner cache, queries and head weights")
+        # The model stream joins the layer's side-stream work (index weights, paged
+        # descriptors) only where it first reads it (``_join_index_ready``).
+        self.__dict__["_pending_index_ready"] = getattr(state, "index_ready", None)
         total_queries = state.swa_kv.shape[0]
         if query_start != 0 or count != total_queries:
             raise ValueError("CSA2 indexer must run once for the complete model query batch")
@@ -912,15 +678,29 @@ class CSA2Indexer(Indexer):
                 )
             q_data = state.index_q.contiguous().view(torch.int8)
             q_scale = state.index_q_scale.contiguous()
-        return self.sparse_attn_indexer(
+        weights = state.index_weights
+        # Candidate consumers score with BF16 weights only (sparse MQA logits).
+        if not self.layout.layer(self.layer_idx).consumes_candidates:
+            if weights.dtype != torch.float32:
+                self._join_index_ready()  # The FP32 cast reads the side stream's weights.
+            weights = weights.float()
+        logical = self.sparse_attn_indexer(
             metadata,
             state.swa_kv,
             q_data,
             None,
             None,
-            state.index_weights.float(),
+            weights,
             q_scale=q_scale,
         )
+        self._join_index_ready()
+        return logical
+
+    def _join_index_ready(self) -> None:
+        """Make the current stream wait for this layer's side-stream indexer inputs, once."""
+        ready = self.__dict__.pop("_pending_index_ready", None)
+        if ready is not None:
+            torch.cuda.current_stream().wait_event(ready)
 
     def _paged_mqa_logits(
         self,
@@ -950,45 +730,18 @@ class CSA2Indexer(Indexer):
                 metadata.csa2_indexer_max_seq_len,
                 **(emission_kwargs or {}),
             )
+        # Queries of one request share its block table row.
+        next_n = metadata.csa2_indexer_next_n
+        requests = q_data.shape[0] // next_n
         return self._call_paged_mqa_logits(
-            q_data,
+            q_data.view(requests, next_n, *q_data.shape[2:]),
             metadata.csa2_indexer_k_cache,
             weights,
-            metadata.csa2_indexer_context_lengths,
-            metadata.csa2_indexer_block_table,
+            metadata.csa2_indexer_context_lengths.view(requests, next_n),
+            metadata.csa2_indexer_block_table.view(requests, next_n, -1)[:, 0],
             metadata.csa2_indexer_scheduler_metadata,
             metadata.csa2_indexer_max_seq_len,
-            q_scale,
-        )
-
-    def _consumes_candidates(self) -> bool:
-        """This layer restricts its selection to another layer's published candidates.
-
-        The layout guarantees that candidate consumers read the candidate
-        source's uncompressed keys, so candidate positions index this layer's
-        own key rows.
-        """
-        layer = self.layout.layer(self.layer_idx)
-        return (
-            layer.mode == CSA2Mode.REINDEX
-            and layer.candidate_source is not None
-            and layer.candidate_source != self.layer_idx
-        )
-
-    def _plain_exact_decode_topk(self) -> bool:
-        """Decode TopK selects over plain scores without position-space priors.
-
-        Heuristic TopK, GVR emission and temporal priors address columns as
-        key positions; candidate-ordered columns would misapply them.
-        """
-        return (
-            self.top_k.decode_implementation
-            in (TopKImplementation.CUDA_RADIX, TopKImplementation.CUTE_DSL_RADIX)
-            and not self.options.enable_heuristic_topk
-            and not self.options.use_gvr_emission
-            and not self.options.use_cute_dsl_paged_mqa_logits
-            and not self.top_k.needs_gvr_prior
-            and not self.top_k._gvr_emission_armed
+            q_scale.view(requests, next_n, -1),
         )
 
     def _candidate_prefill_tile_size(self, candidate_width: int) -> int:
@@ -1002,7 +755,6 @@ class CSA2Indexer(Indexer):
         return max(
             1,
             min(
-                512,
                 _INDEXER_MQA_LOGITS_ELEM_BUDGET // max(1, candidate_width),
                 (512 << 20) // max(1, 14 * candidate_width),
             ),
@@ -1028,7 +780,9 @@ class CSA2Indexer(Indexer):
         Decode passes the ``paged`` descriptors from ``prepare_sparse_indexer``
         (pages, block table, candidate counts, row -> request map, and the per-forward
         schedule shared by every consumer layer, or None to build one).
-        Returns fp32 ``[rows, blocks * sparse_block]`` logits in candidate order.
+        Returns ``[rows, blocks * sparse_block]`` logits in candidate order: the
+        kernel's BF16 for a CuTe DSL decode TopK, which selects over them directly,
+        and FP32 otherwise.
         """
         count = q_data.shape[0]
         num_blocks = sparse_indices.shape[1]
@@ -1077,7 +831,11 @@ class CSA2Indexer(Indexer):
                 num_blocks,
                 self.sparse_block,
             )
-        return logits.float()
+            if self.top_k.decode_implementation == TopKImplementation.CUTE_DSL_RADIX:
+                return logits
+        # A one-row .float() would keep DeepGEMM's padded row stride without the
+        # padding; the self-sampling prefill TopK widens rows to their stride.
+        return logits.to(torch.float32, memory_format=torch.contiguous_format)
 
     def sparse_attn_indexer(
         self,
@@ -1097,25 +855,25 @@ class CSA2Indexer(Indexer):
         """
         if is_generation is not None:
             raise ValueError("CSA2 prediction requires the complete model query batch")
-        manager = metadata.kv_cache_manager
+        if not (q_fp8.is_cuda and dsl_available()):
+            raise RuntimeError("CSA2 indexer requires CUDA and the CuTe DSL")
         count = hidden_states.shape[0]
         layer = self.layout.layer(self.layer_idx)
         visible = metadata.csa2_visible_lengths[self.layer_idx]
         max_positions = metadata.csa2_global_max_positions[layer.kv_source]
-        logical = torch.empty((count, self.index_topk), dtype=torch.int32, device=q_fp8.device)
+        device = q_fp8.device
+        logical = torch.empty((count, self.index_topk), dtype=torch.int32, device=device)
         metadata.csa2_indices[self.layer_idx] = logical
         prior = None
-        if q_fp8.is_cuda and self.top_k.needs_gvr_prior:
+        if self.top_k.needs_gvr_prior:
             metadata.register_indexer_reset(
                 self.layer_idx, lambda: self.top_k.reset_gvr_emission_rows(slice(None))
             )
             prior = metadata.prepare_indexer_prior(self.layer_idx, self.index_topk)
-        candidates = None
-        sparse_blocks = sparse_counts = None
-        auxiliary = sharded = ()
-        score_hook = None
-        sparse_logits = self.use_sparse_candidates and q_fp8.is_cuda
-        if layer.candidate_source is not None and layer.candidate_source != self.layer_idx:
+        candidates = sparse_blocks = sparse_counts = None
+        sharded = ()
+        publish = None
+        if layer.consumes_candidates:
             candidates = metadata.csa2_candidates.get(layer.candidate_source)
             if candidates is None or candidates.ndim != 2 or candidates.shape[0] != count:
                 raise ValueError(
@@ -1123,59 +881,60 @@ class CSA2Indexer(Indexer):
                 )
             sparse_blocks = metadata.csa2_candidate_blocks.get(layer.candidate_source)
             sparse_counts = metadata.csa2_candidate_counts.get(layer.candidate_source)
-            sparse_logits = (
-                sparse_logits
-                and sparse_blocks is not None
-                and sparse_counts is not None
-                and 0 < sparse_blocks.shape[1] <= 4096
-                and sparse_blocks.shape[1] % 4 == 0
-                and sparse_blocks.shape[1] * self.sparse_block == candidates.shape[1]
-            )
-            if sparse_logits:
-                sparse_counts = sparse_counts.reshape(-1)
+            metadata.wait_candidates(layer.candidate_source)
+            if not (self.use_sparse_candidates and 0 < sparse_blocks.shape[1] <= 4096):
+                raise ValueError(
+                    "CSA2 candidate consumers require DeepGEMM sparse MQA logits over the "
+                    "source's aligned sparse-block publication (SM100, 32 heads of 128D rows)"
+                )
+            sparse_counts = sparse_counts.reshape(-1)
         elif layer.candidate_source == self.layer_idx:
             self._configure_candidate_topk(max_positions)
             block_size = self.layout.candidate_block_size
             candidate_width = (
                 min(self.layout.candidate_topk_blocks, -(-max_positions // block_size)) * block_size
             )
-            published = torch.full(
-                (count, candidate_width), -1, dtype=torch.int32, device=q_fp8.device
-            )
+            if self.sparse_block:
+                # Sparse MQA logits need a multiple of 4 sparse blocks per row; the
+                # padded tail stays -1 with no valid columns.
+                align = 4 * self.sparse_block
+                candidate_width = -(-candidate_width // align) * align
+            published = torch.full((count, candidate_width), -1, dtype=torch.int32, device=device)
             metadata.csa2_candidates[self.layer_idx] = published
-            auxiliary = (published,)
-            sparse_block = self.sparse_block
-            if sparse_block:
-                # Rows no chunk scores keep block 0 and zero valid columns; gathered
-                # across TP ranks with the candidates.
-                metadata.csa2_candidate_blocks[self.layer_idx] = torch.zeros(
-                    (count, candidate_width // sparse_block), dtype=torch.int32, device=q_fp8.device
+            sharded = (published,)
+            blocks = counts = None
+            if self.sparse_block:
+                # Rows without a scored key keep block 0 and zero valid columns.
+                blocks = torch.zeros(
+                    (count, candidate_width // self.sparse_block), dtype=torch.int32, device=device
                 )
-                metadata.csa2_candidate_counts[self.layer_idx] = torch.zeros(
-                    (count, 1), dtype=torch.int32, device=q_fp8.device
-                )
-                sharded = (
-                    metadata.csa2_candidate_blocks[self.layer_idx],
-                    metadata.csa2_candidate_counts[self.layer_idx],
-                )
+                counts = torch.zeros((count, 1), dtype=torch.int32, device=device)
+                metadata.csa2_candidate_blocks[self.layer_idx] = blocks
+                metadata.csa2_candidate_counts[self.layer_idx] = counts
+                sharded = (published, blocks, counts)
 
-            def score_hook(scores: torch.Tensor, start: int, end: int) -> None:
-                self._publish_candidates(
-                    scores,
-                    visible[start:end],
-                    metadata.csa2_candidates,
-                    start,
-                    count,
-                    candidate_width,
-                    metadata.csa2_candidate_blocks if sparse_block else None,
-                    metadata.csa2_candidate_counts if sparse_block else None,
+            def publish(
+                logits, valid, valid_stride, first, row_starts, row_ends, row_widths, page=1
+            ):
+                rows = slice(first, first + logits.shape[0])
+                self._publish_block_candidates(
+                    logits,
+                    valid,
+                    valid_stride,
+                    visible,
+                    first,
+                    row_starts,
+                    row_ends,
+                    row_widths,
+                    published[rows],
+                    blocks[rows] if blocks is not None else None,
+                    counts.view(-1)[rows] if counts is not None else None,
+                    page,
                 )
 
         # Host prefix bounds are valid for eager execution only. A graph must
         # admit every future replay's visibility, so use its configured bound.
-        graph_mode = metadata.is_cuda_graph or (
-            q_fp8.is_cuda and torch.cuda.is_current_stream_capturing()
-        )
+        graph_mode = metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing()
         short_bound = (
             max_positions
             if graph_mode
@@ -1193,195 +952,81 @@ class CSA2Indexer(Indexer):
         )
         if (
             self.options.skip_indexer_for_short_seqs
-            and score_hook is None
+            and publish is None
             and short_bound <= self.index_topk
         ):
             positions = (
                 candidates
                 if candidates is not None
-                else torch.arange(short_bound, device=q_fp8.device).expand(count, -1)
+                else torch.arange(short_bound, device=device).expand(count, -1)
             )
             slots = metadata.global_slot_tile(self.layer_idx, 0, count, positions)
             positions = torch.where(slots >= 0, positions, -1)
-            self._select_all_visible(
-                positions,
-                visible,
-                torch.full((count,), positions.shape[1], dtype=torch.int32, device=q_fp8.device),
-                logical,
-            )
+            self._select_all_visible(positions, visible, logical)
             if prior is not None:
                 metadata.publish_indexer_prior(self.layer_idx, logical)
             return logical
 
-        def candidate_tile(start: int, end: int) -> _ChunkInputs:
-            positions = candidates[start:end]
-            slots = metadata.global_slot_tile(self.layer_idx, start, end, positions)
-            keys, scales = manager.gather_indexer_keys(layer.kv_source, slots.flatten())
-            width = positions.shape[1]
-            starts = torch.arange(end - start, dtype=torch.int32, device=q_fp8.device) * width
-            return _ChunkInputs(
-                keys,
-                scales,
-                starts,
-                starts + width,
-                torch.where(slots >= 0, positions, -1),
-                visible[start:end],
-            )
-
-        def shared_keys(start: int, end: int, width: int) -> _ChunkInputs:
-            # A request's compressed prefix is gathered once and shared by all
-            # query tiles. Cached and newly published keys have the same owner.
-            positions = torch.arange(width, device=q_fp8.device)
-            slots = metadata.global_slot_tile(self.layer_idx, start, start + 1, positions[None, :])[
-                0
-            ]
-            keys, scales = manager.gather_indexer_keys(layer.kv_source, slots)
-            starts = torch.zeros(end - start, dtype=torch.int32, device=q_fp8.device)
-            logical_positions = torch.where(slots >= 0, positions, -1).expand(end - start, -1)
-            return _ChunkInputs(
-                keys,
-                scales,
-                starts,
-                torch.full_like(starts, width),
-                logical_positions,
-                visible[start:end],
-                shared_columns=True,
-            )
-
-        ranges = metadata.csa2_request_query_ranges
-        num_contexts = metadata.csa2_num_context_requests
-        decode_start = ranges[num_contexts][0] if num_contexts < len(ranges) else count
-        # Heuristic and GVR TopK address columns as key positions, so only
-        # exact TopK may select over candidate-ordered columns.
-        candidate_decode = (
-            candidates is not None
-            and candidates.shape[1] > 0
-            and all(begin < end for begin, end in ranges[num_contexts:])
-            and sparse_logits
-            and self._plain_exact_decode_topk()
+        # Everything below may read the side stream's index weights and paged descriptors.
+        self._join_index_ready()
+        decode_start, native_decode = self._native_decode(metadata, count)
+        paged = (
+            metadata.prepare_indexer(self.layer_idx, batch_queries=self._batch_paged_queries())
+            if native_decode
+            else None
         )
-        native_decode = (
-            (candidates is None or candidate_decode)
-            and decode_start < count
-            and q_fp8.is_cuda
-            and dsl_available()
-            and 100 <= get_sm_version() < 110
-            and 1 <= self.n_heads <= 64
-            and self.head_dim == 128
-        )
-        paged = metadata.prepare_indexer(self.layer_idx) if native_decode else None
         sparse_descriptors = None
         if paged is not None and candidates is not None:
             # Sparse paged logits read the native index pages in place
             sparse_descriptors = metadata.prepare_sparse_indexer(self.layer_idx, self.sparse_block)
             if sparse_descriptors is None:
                 paged = None
-        chunks = []
-        for request, (begin, end) in enumerate(ranges):
-            is_prefill = request < num_contexts
-            if candidates is not None:
-                if is_prefill and sparse_logits:
-                    # Gather the request's prefix once and score only each
-                    # query's candidate blocks in it.
-                    width = min(
-                        max_positions, metadata.csa2_request_start_positions[request] + end - begin
-                    )
-
-                    def load_shared(begin=begin, end=end, width=width):
-                        inputs = shared_keys(begin, end, width)
-                        inputs.sparse_indices = sparse_blocks[begin:end]
-                        inputs.sparse_positions = candidates[begin:end]
-                        inputs.sparse_counts = sparse_counts[begin:end]
-                        return inputs
-
-                    chunks.append(
-                        _QueryChunk(
-                            begin,
-                            end,
-                            width,
-                            load=load_shared,
-                            keys_per_query=candidates.shape[1],
-                            max_query_tokens=self._candidate_prefill_tile_size(candidates.shape[1]),
-                        )
-                    )
-                    continue
-                if not is_prefill and paged is not None:
-                    continue
-                # Without the sparse kernels, gather each query's candidate rows
-                # and score them densely. Split across ranks before gathering;
-                # the CSA2 runner bounds the Q-by-(Q*candidates) transient.
-                chunks.append(
-                    _QueryChunk(
-                        begin,
-                        end,
-                        candidates.shape[1],
-                        load_tile=candidate_tile,
-                        keys_per_query=candidates.shape[1],
-                        max_query_tokens=16,
-                        is_prefill=is_prefill,
-                    )
+        if candidates is None:
+            # As in DSA: gathered prefixes, compressed MQA logits, row-bounded TopK.
+            if decode_start < count and paged is None and not metadata.csa2_indexer_decode_planned:
+                raise ValueError("CSA2 metadata planned no packed groups for these decode rows")
+            # Exact radix decode scratch for decode rows outside the native paged path
+            radix = None
+            if decode_start < count and paged is None:
+                radix_indices = torch.empty(
+                    (count, 10, self.index_topk), dtype=torch.int32, device=device
                 )
-                continue
-            if not is_prefill and paged is not None:
-                continue
-            chunk_size = metadata.indexer_max_chunk_size
-            for start in range(begin, end, chunk_size):
-                stop = min(start + chunk_size, end)
-                # Decode graphs must continue seeing newly published keys as
-                # visibility grows. Warmup uses this same admitted bound.
-                width = (
-                    max_positions
-                    if not is_prefill or metadata.is_cuda_graph
-                    else min(
-                        max_positions,
-                        (metadata.csa2_request_start_positions[request] + stop - begin)
-                        // layer.compress_ratio,
+                radix = (radix_indices, torch.empty_like(radix_indices, dtype=torch.float32))
+            for group in metadata.csa2_indexer_groups[layer.kv_source]:
+                if group.is_prefill or paged is None:
+                    self._run_packed_group(
+                        metadata,
+                        layer.kv_source,
+                        group,
+                        q_fp8,
+                        weights,
+                        q_scale,
+                        visible,
+                        logical,
+                        publish,
+                        sharded,
+                        radix,
+                        prior,
+                        decode_start,
                     )
+        else:
+            if decode_start < count and paged is None:
+                raise ValueError(
+                    "CSA2 candidate-consumer decode rows need the native paged sparse decode"
                 )
-                chunks.append(
-                    _QueryChunk(
-                        start,
-                        stop,
-                        width,
-                        load=lambda start=start, stop=stop, width=width: shared_keys(
-                            start, stop, width
-                        ),
-                        is_prefill=is_prefill,
-                    )
-                )
-        # Exact radix decode scratch is also needed by non-native candidate
-        # paths. Its rows correspond to model queries, not FMHA staging tiles.
-        radix_indices = radix_logits = None
-        if any(not chunk.is_prefill for chunk in chunks):
-            radix_indices = torch.empty(
-                (count, 10, self.index_topk), dtype=torch.int32, device=q_fp8.device
+            self._run_candidate_prefill(
+                metadata,
+                layer.kv_source,
+                candidates,
+                sparse_blocks,
+                sparse_counts,
+                q_fp8,
+                weights,
+                q_scale,
+                visible,
+                logical,
             )
-            radix_logits = torch.empty_like(radix_indices, dtype=torch.float32)
-        self._run_csa2_chunks(
-            chunks,
-            q_fp8,
-            weights,
-            q_scale,
-            logical,
-            metadata.mapping,
-            metadata.indexer_q_split_threshold,
-            score_hook,
-            auxiliary,
-            radix_indices,
-            radix_logits,
-            prior,
-            decode_start,
-            sharded_outputs=sharded,
-        )
         if paged is not None:
-            decode_count = count - decode_start
-            hook = None
-            if score_hook is not None:
-
-                def hook(scores: torch.Tensor) -> None:
-                    score_hook(scores, decode_start, count)
-
-            decode_visible = metadata.csa2_indexer_visible_lengths
             if candidates is not None:
                 # Score only the published candidate blocks straight from the index pages
                 scores = self._sparse_candidate_logits(
@@ -1393,57 +1038,218 @@ class CSA2Indexer(Indexer):
                 )
                 self._select_mapped_logits(
                     scores,
-                    None,
-                    None,
                     candidates[decode_start:],
-                    decode_visible,
                     logical[decode_start:],
-                    None,
+                    sparse_counts[decode_start:],
                     is_prefill=False,
                     radix_aux_indices=metadata.csa2_indexer_radix_aux_indices,
                     radix_aux_logits=metadata.csa2_indexer_radix_aux_logits,
-                    gvr_prior_indices=prior,
-                    valid_counts=sparse_counts[decode_start:],
                 )
-                if prior is not None:
-                    metadata.publish_indexer_prior(self.layer_idx, logical)
-                return logical
-            decode_scale = (
-                q_scale[decode_start:]
-                .contiguous()
-                .view(torch.int32)
-                .reshape(decode_count, 1, self.n_heads)
-            )
-            emission_kwargs = {}
-            if (
-                self.options.use_gvr_emission
-                and prior is not None
-                and metadata.csa2_indexer_max_seq_len % 8 == 0
-            ):
-                emission_kwargs = self.top_k.prepare_gvr_emission(
-                    decode_count,
-                    metadata.csa2_indexer_max_seq_len,
-                    torch.cuda.get_device_properties(q_fp8.device).multi_processor_count,
-                    metadata.csa2_indexer_prior_capacity[self.layer_idx],
+            else:
+                self._paged_decode(
+                    metadata, q_fp8, weights, q_scale, logical, decode_start, prior, publish
                 )
-            logits = self._paged_mqa_logits(
-                metadata,
-                q_fp8[decode_start:].unsqueeze(1),
-                weights[decode_start:],
-                decode_scale,
-                emission_kwargs=emission_kwargs,
-            )
-            self._select_paged_logits(
-                metadata,
-                logits,
-                None,
-                logical[decode_start:],
-                hook,
-                prior,
-            )
+        if publish is not None and paged is not None and self._feeds_sparse_consumers():
+            # This forward's candidate consumers share one sparse logits schedule over the
+            # candidates just published: build it on the side stream now, not in the first
+            # consumer's chain.
+            metadata.prebuild_sparse_schedule(self.layer_idx, self.sparse_block)
         if prior is not None:
             metadata.publish_indexer_prior(self.layer_idx, logical)
         return logical
+
+    def _native_decode(self, metadata: CSA2TrtllmMetadata, count: int) -> tuple[int, bool]:
+        """(first decode row, whether the decode rows take the native paged path)."""
+        ranges = metadata.csa2_request_query_ranges
+        num_contexts = metadata.csa2_num_context_requests
+        decode_start = ranges[num_contexts][0] if num_contexts < len(ranges) else count
+        native = (
+            decode_start < count
+            and 100 <= get_sm_version() < 110
+            and 1 <= self.n_heads <= 64
+            and self.head_dim == 128
+        )
+        return decode_start, native
+
+    def _batch_paged_queries(self) -> bool:
+        return not (self.options.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE)
+
+    def prepare_paged_descriptors(self, metadata: CSA2TrtllmMetadata, count: int) -> None:
+        """Bind, and once per owner and forward refresh, the paged indexer descriptors
+        ``sparse_attn_indexer`` uses for ``count`` query rows, ahead of it: they depend only on
+        the step's page tables and visible lengths, so a Full layer derives them on a side
+        stream while it projects, and its indexer then finds them current."""
+        if self._native_decode(metadata, count)[1]:
+            metadata.prepare_indexer(self.layer_idx, batch_queries=self._batch_paged_queries())
+
+    def _feeds_sparse_consumers(self) -> bool:
+        """Whether this candidate source's consumers score its published blocks with the paged
+        sparse logits (their ``use_sparse_candidates``)."""
+        layers = range(len(self.layout.compress_ratios))
+        return (
+            _HAS_SPARSE_MQA_LOGITS
+            and 100 <= get_sm_version() < 110
+            and self.n_heads == 32
+            and self.head_dim == 128
+            and self.sparse_block > 0
+            and any(
+                self.layout.layer(i).mode == CSA2Mode.REINDEX
+                and self.layout.layer(i).candidate_source == self.layer_idx
+                for i in layers
+            )
+        )
+
+    def _run_candidate_prefill(
+        self,
+        metadata: CSA2TrtllmMetadata,
+        kv_source: int,
+        candidates: torch.Tensor,
+        sparse_blocks: torch.Tensor,
+        sparse_counts: torch.Tensor,
+        q_data: torch.Tensor,
+        weights: torch.Tensor,
+        q_scale: torch.Tensor,
+        visible: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Score each context request's candidate blocks in its gathered prefix.
+
+        Query tiles of the request's TP-local rows score with DeepGEMM sparse
+        logits; TP-split requests are gathered afterwards.
+        """
+        tile = self._candidate_prefill_tile_size(candidates.shape[1])
+        for request in range(metadata.csa2_num_context_requests):
+            begin, end = metadata.csa2_request_query_ranges[request]
+            if begin == end:
+                continue
+            descriptors, width = metadata.csa2_indexer_prefixes[(kv_source, request)]
+            local_start, local_end, sizes = _split_prefill_queries(
+                end - begin, metadata.mapping, metadata.indexer_q_split_threshold
+            )
+            keys, scales, _, _ = self._gather_prefix(
+                metadata, kv_source, descriptors, width, end - begin, visible
+            )
+            for first in range(begin + local_start, begin + local_end, tile):
+                last = min(first + tile, begin + local_end)
+                logits = self._sparse_candidate_logits(
+                    q_data[first:last],
+                    q_scale[first:last],
+                    weights[first:last],
+                    sparse_blocks[first:last],
+                    keys=(keys, scales),
+                    valid_counts=sparse_counts[first:last].reshape(-1),
+                )
+                self._select_mapped_logits(
+                    logits,
+                    candidates[first:last],
+                    output[first:last],
+                    sparse_counts[first:last],
+                    True,
+                )
+            if sizes is not None:
+                output[begin:end] = allgather(
+                    output[begin + local_start : begin + local_end],
+                    metadata.mapping,
+                    dim=0,
+                    sizes=sizes,
+                )
+
+    def _paged_decode(
+        self,
+        metadata: CSA2TrtllmMetadata,
+        q_data: torch.Tensor,
+        weights: torch.Tensor,
+        q_scale: torch.Tensor,
+        output: torch.Tensor,
+        decode_start: int,
+        prior: Optional[torch.Tensor],
+        publish: Optional[Callable[..., None]],
+    ) -> None:
+        """Native paged decode, as in the DSA decode indexer.
+
+        Column ``p`` of the paged logits is logical compressed position ``p``,
+        so TopK writes the selected positions directly; attention staging skips
+        any selection without a backed, visible row.
+        """
+        decode_count = q_data.shape[0] - decode_start
+        decode_scale = (
+            q_scale[decode_start:]
+            .contiguous()
+            .view(torch.int32)
+            .reshape(decode_count, 1, self.n_heads)
+        )
+        emission_kwargs = {}
+        if self.options.use_gvr_emission and prior is not None:
+            emission_kwargs = self.top_k.prepare_gvr_emission(
+                decode_count,
+                metadata.csa2_indexer_max_seq_len,
+                torch.cuda.get_device_properties(q_data.device).multi_processor_count,
+                metadata.csa2_indexer_prior_capacity[self.layer_idx],
+            )
+        logits = self._paged_mqa_logits(
+            metadata,
+            q_data[decode_start:].unsqueeze(1),
+            weights[decode_start:],
+            decode_scale,
+            emission_kwargs=emission_kwargs,
+        )
+        if logits.shape[1] == 0:
+            output[decode_start:].fill_(-1)
+            return
+        after_mask = None
+        if publish is not None:
+            valid = metadata.csa2_indexer_valid_pages
+            visible = metadata.csa2_indexer_visible_lengths
+            zeros = self._constant_rows(decode_count, 0, logits.device)
+
+            # Rows score and publish only their visible prefix, not the arena width.
+            def publish_decode():
+                publish(
+                    logits,
+                    valid,
+                    valid.stride(0),
+                    decode_start,
+                    zeros,
+                    visible,
+                    visible,
+                    INDEX_PAGE_ROWS,
+                )
+
+            # Only later consumer layers read the candidates: publish them on the side stream,
+            # next to this layer's own TopK. The block maxima score validated, visible columns
+            # only, which the selection's masking leaves as they are, and the TopK only reads
+            # the logits.
+            def after_mask():
+                self._publish_on_side_stream(
+                    metadata, publish_decode, (logits, valid, zeros, visible)
+                )
+
+        self._select_paged_logits(
+            metadata, logits, None, output[decode_start:], prior, after_mask=after_mask
+        )
+
+    def _publish_on_side_stream(self, metadata, run, tensors) -> None:
+        """Run this source's candidate publication on the CSA2 side stream after the calling
+        stream's work so far; consumers of this forward wait for it (``wait_candidates``)."""
+        current = torch.cuda.current_stream()
+        side = csa2_side_stream(current.device)
+        ready = torch.cuda.Event()
+        ready.record(current)
+        with torch.cuda.stream(side):
+            side.wait_event(ready)
+            for tensor in tensors:
+                tensor.record_stream(side)
+            for tensor in (
+                metadata.csa2_candidates.get(self.layer_idx),
+                metadata.csa2_candidate_blocks.get(self.layer_idx),
+                metadata.csa2_candidate_counts.get(self.layer_idx),
+            ):
+                if tensor is not None:
+                    tensor.record_stream(side)
+            run()
+            done = torch.cuda.Event()
+            done.record(side)
+        metadata.publish_candidates_event(self.layer_idx, done)
 
 
 def prewarm_sparse_candidate_kernels(
@@ -1463,8 +1269,7 @@ def prewarm_sparse_candidate_kernels(
         (
             index
             for index in layout.index_source_layer_ids
-            if layout.layer(index).mode == CSA2Mode.REINDEX
-            and layout.layer(index).candidate_source not in (None, index)
+            if layout.layer(index).consumes_candidates
         ),
         None,
     )

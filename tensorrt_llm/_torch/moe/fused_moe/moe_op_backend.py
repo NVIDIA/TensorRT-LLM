@@ -41,6 +41,8 @@ import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
+from .impl_contract import MoERoutingTables
+
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
@@ -170,8 +172,12 @@ class MoEOpBackend:
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        routing_tables: Optional[MoERoutingTables] = None,
     ) -> List[torch.Tensor]:
-        """Run FP4 block scale MoE computation."""
+        """Run FP4 block scale MoE computation.
+
+        ``routing_tables`` replace the kernel's routing pass for tactics of their tiles.
+        """
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -336,6 +342,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        routing_tables=None,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -446,6 +453,8 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    routing_tables=None if routing_tables is None else routing_tables.tables,
+                    routing_tiles=None if routing_tables is None else list(routing_tables.tiles),
                 )
                 if not do_finalize:
                     return outputs
@@ -785,7 +794,10 @@ class FlashinferOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        routing_tables=None,
     ):
+        # Only the native provider builds routing tables.
+        assert routing_tables is None
         # The framework hands the scales over token-major 2-D as
         # ``quantize_input`` produced them, which is exactly what the
         # FlashInfer API asserts (``shape[0] == num_tokens``). No reshape.

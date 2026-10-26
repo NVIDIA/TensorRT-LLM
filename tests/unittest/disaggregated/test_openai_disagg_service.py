@@ -530,10 +530,11 @@ async def test_subagent_affinity_http_worker_adp_placement(
             conversation = kwargs["conversation_params"]
             scheduling = kwargs["scheduling_params"]
             item = SimpleNamespace(
+                num_input_tokens=3,
                 request=SimpleNamespace(
                     py_conversation_params=conversation,
                     py_scheduling_params=scheduling,
-                )
+                ),
             )
             assignments, _ = router.route_requests(states, [item], max_num_active_requests=32)
             rank = next(rank for rank, items in assignments.items() if items)

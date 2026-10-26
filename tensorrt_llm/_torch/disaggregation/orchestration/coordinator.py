@@ -29,6 +29,13 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 
+# A started receive stays tracked until its request leaves these states.
+_RECEIVE_STATES = (
+    LlmRequestState.DISAGG_GENERATION_INIT,
+    LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+)
+
+
 def is_gen_only_no_context_benchmark() -> bool:
     """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
     return os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
@@ -114,6 +121,10 @@ class DisaggTransferCoordinator:
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
+        # Prepared gen-init requests whose receive waits for start_deferred_gen_receives.
+        self._deferred_gen_receives: List[LlmRequest] = []
+        # Gen-init requests whose receive was started and not yet finished, by request id.
+        self._started_gen_receives: dict[int, LlmRequest] = {}
 
     # -- loop head -----------------------------------------------------------
 
@@ -321,12 +332,23 @@ class DisaggTransferCoordinator:
         )
 
     @nvtx_range("receive_gen_init")
-    def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
+    def receive_gen_init(self, admitted: List[LlmRequest], defer: bool = False) -> None:
         """Prepare executor resources for the admitted gen-init requests, then
-        start their KV receive in the configured transfer mode."""
+        start their KV receive in the configured transfer mode.
+
+        ``defer`` says a forward step is in flight: asynchronous receives that
+        wait for KV admission work queued behind it are then posted by
+        ``start_deferred_gen_receives``.
+        """
         if not admitted:
             return
+        if defer and self._is_kv_manager_v2 and uses_async_gen_transfer():
+            self._effects.prepare_gen_resources(admitted)
+            self._deferred_gen_receives.extend(admitted)
+            return
+        self._wait_gen_receive_ready(admitted)
         self._effects.prepare_gen_resources(admitted)
+        self._started_gen_receives.update((req.py_request_id, req) for req in admitted)
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -344,6 +366,31 @@ class DisaggTransferCoordinator:
             self._check_transfer_errors("generation requests")
             return
 
+        self._start_gen_receives(admitted)
+
+    @nvtx_range("start_deferred_gen_receives")
+    def start_deferred_gen_receives(self) -> None:
+        """Post the receives deferred by ``receive_gen_init(defer=True)``.
+
+        Must run before the next scheduling pass, which would otherwise admit
+        the prepared requests again.
+        """
+        if not self._deferred_gen_receives:
+            return
+        deferred, self._deferred_gen_receives = self._deferred_gen_receives, []
+        # A request failed since its preparation no longer owns its pages; the
+        # status poll still runs, as it would have for the whole batch.
+        admitted = [req for req in deferred if req.state == LlmRequestState.DISAGG_GENERATION_INIT]
+        self._wait_gen_receive_ready(admitted)
+        self._started_gen_receives.update((req.py_request_id, req) for req in admitted)
+        self._start_gen_receives(admitted)
+
+    def _wait_gen_receive_ready(self, requests: List[LlmRequest]) -> None:
+        # A remote write does not follow stream order, so it waits for the pages' admission work.
+        if self._is_kv_manager_v2:
+            self._kv_cache_manager.wait_disagg_receive_ready(requests)
+
+    def _start_gen_receives(self, admitted: List[LlmRequest]) -> None:
         for req in admitted:
             self._transceiver.request_and_receive_async(req)
 
@@ -377,16 +424,24 @@ class DisaggTransferCoordinator:
     # -- batch execution -----------------------------------------------------
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
-        """Generation requests in the batch whose KV receive has completed.
+        """Generation requests in the batch whose KV receive has completed, in batch order.
 
         Read-only: the executor prepares batch-level resources for these
         requests while they are still transmission-complete, then calls
-        ``try_finish_gen_receive`` for each request in the batch.
+        ``try_finish_gen_receive`` for each of them. Only requests with a
+        started receive are visited, not the whole batch.
         """
+        started = self._started_gen_receives
+        completed = set()
+        for request_id, req in list(started.items()):
+            if req.is_disagg_generation_transmission_complete:
+                completed.add(request_id)
+            elif req.state not in _RECEIVE_STATES:
+                del started[request_id]
+        if not completed:
+            return []
         return [
-            req
-            for req in scheduled_batch.generation_requests
-            if req.is_disagg_generation_transmission_complete
+            req for req in scheduled_batch.generation_requests if req.py_request_id in completed
         ]
 
     def try_finish_gen_receive(self, request: LlmRequest) -> bool:
@@ -398,6 +453,7 @@ class DisaggTransferCoordinator:
         """
         if not request.is_disagg_generation_transmission_complete:
             return False
+        self._started_gen_receives.pop(request.py_request_id, None)
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
         # commit_blocks_for_reuse requires the position to be at the prompt end.
         request.context_current_position = request.prompt_len
@@ -808,7 +864,10 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     ) -> None:
         return None
 
-    def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
+    def receive_gen_init(self, admitted: List[LlmRequest], defer: bool = False) -> None:
+        return None
+
+    def start_deferred_gen_receives(self) -> None:
         return None
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:

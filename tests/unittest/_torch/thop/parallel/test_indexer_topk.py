@@ -994,6 +994,63 @@ def test_cute_dsl_radix_topk_decode_single_pass_multi_cta_cluster(
     )
 
 
+def _lowest_column_top_k(logits, lengths, top_k):
+    """Each row's top_k columns by value, ties lowest column first (as a sorted list)."""
+    rows = []
+    for row, length in enumerate(lengths.tolist()):
+        values = logits[row, :length].float()
+        rows.append(torch.sort(-values, stable=True).indices[:top_k].sort().values)
+    return rows
+
+
+# radix select (single-CTA, multi-CTA and cluster): ties at the k-th value are admitted lowest
+# column first, so the selection does not depend on thread or CTA arrival order.
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("use_cluster", [False, True])
+def test_cute_dsl_radix_select_admits_ties_lowest_column_first(use_cluster):
+    runner = (
+        cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner
+        if use_cluster
+        else cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner
+    )
+    top_k, batch_size, num_tokens, dtype = 512, 6, 16387, torch.bfloat16
+    torch.manual_seed(2026)
+    # Few distinct values: hundreds of keys tie at each row's k-th value.
+    logits = torch.randint(0, 48, (batch_size, num_tokens), device="cuda").to(dtype)
+    seq_lens = torch.tensor(
+        [num_tokens, num_tokens - 1, num_tokens // 2 + 5, 3 * top_k + 1, num_tokens, top_k + 7],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    expected = _lowest_column_top_k(logits, seq_lens, top_k)
+
+    def select(rows):
+        indices = runner.forward(
+            input_values=logits[rows].clone(),  # 32-byte aligned rows of a fresh tensor
+            seq_lens=seq_lens[rows].clone(),
+            top_k=top_k,
+            next_n=1,
+            return_val=False,
+            num_copy_bits=256,
+            chunk_size=4096,
+        )[0]
+        if indices is None:
+            pytest.skip("Problem size exceeds cluster kernel capacity")
+        torch.cuda.synchronize()
+        return indices
+
+    whole = select(slice(None))
+    for row in range(batch_size):
+        torch.testing.assert_close(whole[row].sort().values.long(), expected[row].long())
+    # Repeated launches and a different launch shape (single rows) select the same columns.
+    for _ in range(3):
+        assert torch.equal(select(slice(None)).sort(dim=1).values, whole.sort(dim=1).values)
+    for row in (0, 3):
+        alone = select(slice(row, row + 1))
+        assert torch.equal(alone[0].sort().values, whole[row].sort().values)
+
+
 # radix filter single-pass multi-cta test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell

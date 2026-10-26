@@ -678,6 +678,12 @@ class MultimodalModelMixin:
         """Return the inner language model's padded vocabulary size."""
         return self.language_model.vocab_size_padded
 
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        """Whether the inner model's speculative worker samples greedy and temperature-only
+        target rows from vocabulary shards; wrappers of such a model override this."""
+        return False
+
     def infer_max_seq_len(self) -> int:
         """Return the inner language model's maximum sequence length."""
         return self.language_model.infer_max_seq_len()

@@ -54,14 +54,21 @@ class FlashinferTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
     def _check_shape(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility | None:
         """Alignment gate, and only for the padded quant method.
 
-        The unpadded ``NVFP4TRTLLMGenFusedMoEBaseMethod`` lays out any shape,
-        so it is admitted unconditionally.
+        The unpadded ``NVFP4TRTLLMGenFusedMoEBaseMethod`` does not require
+        this additional provider-specific alignment check.
 
         The alignments are the padded method's *class* attributes, not what
         ``resolve_alignments`` would pick for this shape. Reading the resolved
         values would reject shapes this provider currently serves.
         """
-        if not nvfp4_needs_padded_method(p.activation_type, "alpha" in p.activation_constants):
+        intermediate_size_per_partition = (
+            p.intermediate_size // d.tp_size if p.intermediate_size is not None else None
+        )
+        if not nvfp4_needs_padded_method(
+            p.activation_type,
+            "alpha" in p.activation_constants,
+            intermediate_size_per_partition,
+        ):
             return None
         return check_mxfp4_flashinfer_shape(
             cls,

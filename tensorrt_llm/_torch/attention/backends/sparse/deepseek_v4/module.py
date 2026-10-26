@@ -315,7 +315,10 @@ def project_sparse_attn_output(
     position_ids: Optional[torch.Tensor] = None,
     attn_metadata: Optional[AttentionMetadata] = None,
     all_reduce_params: Optional["AllReduceParams"] = None,
+    prequantized: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
+    """``prequantized``: the FP8 data and scales the inverse-RoPE quantization below would make of
+    ``attn_output``, written by the attention kernel; ``attn_output`` is then not read."""
     del attn_metadata, all_reduce_params
     attn_output_tensor = attn_output[0]
     # BCG/mixed-batch epilogue fusion runs o_a_proj at the end of attention,
@@ -339,7 +342,7 @@ def project_sparse_attn_output(
     )
     if fused_inv_rope_fp8:
         heads_per_group = self.num_heads_tp // self.n_local_groups
-        attn_fp8, attn_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
+        attn_fp8, attn_scale = prequantized or torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
             attn_output_tensor,
             position_ids.view(-1),
             self.inverse_rotary_emb.rotary_cos_sin,

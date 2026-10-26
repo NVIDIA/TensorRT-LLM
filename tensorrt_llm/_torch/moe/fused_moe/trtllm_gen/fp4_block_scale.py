@@ -179,9 +179,21 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
+            routing_tables=ctx.routing_tables,
         )
 
         if not k.do_finalize:
+            if k.token_final_scales is not None:
+                # With routing weights passed in, the runner combines with those and leaves its
+                # own expert_weights output unwritten: hand the caller the ones it used.
+                outputs = [outputs[0], k.token_final_scales, outputs[2]]
+            if ctx.routing_tables is not None and outputs[2].numel() == 0:
+                # The runner ran on the routing tables: its empty [0, tile] placeholder names the
+                # tile whose table holds the permutation.
+                tables = ctx.routing_tables
+                permutation = tables.tables[tables.tiles.index(outputs[2].shape[1]), 0]
+                weights = outputs[1]
+                outputs = [outputs[0], weights, permutation[: weights.numel()].view(weights.shape)]
             return self._unfinalized(outputs)
 
         # When output is provided, use it directly as the result
@@ -224,7 +236,9 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
         # runs after this, so keying off the tensor would make the method
         # depend on *when* it is asked for.
         needs_padded_method = nvfp4_needs_padded_method(
-            self.activation_type, self.act_alpha is not None
+            self.activation_type,
+            self.act_alpha is not None,
+            self.intermediate_size_per_partition,
         )
         return (
             NVFP4TRTLLMGenFusedMoEMethod()

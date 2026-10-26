@@ -68,6 +68,7 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
         # runtime serves rather than max_position_embeddings. A real
         # ModelConfig always carries it, so the helper reads it unguarded.
         max_seq_len=8192,
+        use_low_precision_moe_combine=False,
         pretrained_config=SimpleNamespace(num_hidden_layers=num_hidden_layers),
     )
 

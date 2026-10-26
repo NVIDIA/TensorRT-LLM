@@ -942,6 +942,7 @@ class TestBenchmarkFillAdmissionFlowControl:
         ex.benchmark_req_queues_size = 32
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = 8
+        ex.adp_router = None
 
         ex.dist = Mock()
         ex.dist.tp_size = tp_size
@@ -1133,6 +1134,7 @@ def _make_router(cls_path: str, tp_size: int = 4):
 def _make_unscheduled_request_item(req_id=None):
     """Create a mock RequestQueueItem with no py_scheduling_params."""
     req_item = Mock()
+    req_item.num_input_tokens = None
     req_item.request.py_scheduling_params = None
     req_item.request.input_token_ids = [1, 2, 3]
     req_item.id = req_id if req_id is not None else id(req_item)
@@ -1357,7 +1359,7 @@ class TestFailFastDuringBenchmarkFill:
 
         assert result is not None
         ex.disagg.admit.assert_called_once_with(candidates)
-        ex.disagg.receive_gen_init.assert_called_once_with([admitted_req])
+        ex.disagg.receive_gen_init.assert_called_once_with([admitted_req], defer=False)
         ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
@@ -1390,7 +1392,7 @@ class TestFailFastDuringBenchmarkFill:
             "that transfer admission temporarily deferred"
         )
         ex.disagg.admit.assert_called_once_with([fitting_req])
-        ex.disagg.receive_gen_init.assert_called_once_with([])
+        ex.disagg.receive_gen_init.assert_called_once_with([], defer=False)
         ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
@@ -1669,6 +1671,7 @@ class TestFillPhaseEndToEnd:
         ex.enable_attention_dp = True
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = self.MAX_BATCH_SIZE
+        ex.adp_router = None
         ex.dist = Mock(rank=0, tp_size=self.TP_SIZE)
         ex.dist.tp_allreduce.return_value = 0
         ex.dist.tp_allgather.return_value = [(0, False)] * self.TP_SIZE

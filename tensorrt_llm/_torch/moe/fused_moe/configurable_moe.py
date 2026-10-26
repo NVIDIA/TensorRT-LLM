@@ -563,7 +563,7 @@ class ConfigurableMoE(MoE):
         Side effects:
             - May switch self.comm to AllGather if current strategy cannot be used
 
-        Note: This method does NOT create strategy if None (creation happens lazily elsewhere).
+        Note: This method does NOT create strategy if None.
               It only validates and potentially falls back existing AllToAll strategies.
 
         """
@@ -875,6 +875,11 @@ class ConfigurableMoE(MoE):
             return False
         # Simplified check - AllGather strategy means no alltoall
         return not isinstance(self.comm, AllGatherReduceScatter)
+
+    @property
+    def has_comm_strategy(self) -> bool:
+        """Whether ``self.comm`` holds a strategy; decided at construction."""
+        return self.comm is not None
 
     @property
     def _weights_created(self):

@@ -73,3 +73,25 @@ def install_cutlass_dsl_compatibility() -> None:
             setattr(cute.core, name, getattr(cute, name))
     if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
         cute.make_fragment = cute.make_rmem_tensor
+
+
+class _GraphSafeDlpack:
+    """DLPack export of a tensor without the stream synchronization (CUDA-graph capture safe)."""
+
+    def __init__(self, tensor):
+        # Parameters may require grad, which DLPack refuses.
+        self._tensor = tensor.detach()
+
+    def __dlpack__(self, stream=None):
+        return self._tensor.__dlpack__(stream=-1)
+
+    def __dlpack_device__(self):
+        return self._tensor.__dlpack_device__()
+
+
+def graph_safe_from_dlpack(tensor, assumed_align: int = 16):
+    """``cutlass.cute.runtime.from_dlpack`` of ``tensor`` without the DLPack export's stream
+    synchronization, so it can run during CUDA-graph capture."""
+    from cutlass.cute.runtime import from_dlpack
+
+    return from_dlpack(_GraphSafeDlpack(tensor), assumed_align=assumed_align)

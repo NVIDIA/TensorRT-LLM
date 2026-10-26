@@ -869,6 +869,11 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         """
         return False
 
+    @property
+    def has_comm_strategy(self) -> bool:
+        """ has_comm_strategy (bool): whether the layer holds a communication strategy """
+        return False
+
     def can_use_deep_ep_direct_metadata(
             self, supports_post_quant_dispatch: bool) -> bool:
         """Return whether this backend instance can consume DeepEP counts directly.

@@ -266,6 +266,9 @@ class FilteredTopKKernelVarlen:
         # Subclasses set to True to subtract row_start from absolute indices before
         # writing output (used in prefill where row_start may be non-zero).
         self.subtract_row_start_on_output = False
+        # Vectors whose least coarse key the coarse histogram pass keeps in SMEM (0: none),
+        # so the filter pass loads only the vectors that reach the threshold bin.
+        self.key_cache_vectors = 0
 
     def _compute_smem_input_size(self) -> int:
         return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=1)
@@ -638,6 +641,71 @@ class FilteredTopKKernelVarlen:
                         atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
 
     @cute.jit
+    def _filter_and_histogram_all_vectors_coarse(self, tidx, aligned_size, vector_args):
+        """``_filter_and_histogram_vector_coarse`` over every vector of the row, thread ``tidx``
+        taking every ``num_threads_per_cta``-th."""
+        ic = tidx * cutlass.Int32(self.vec_size)
+        while ic + cutlass.Int32(self.vec_size - 1) < aligned_size:
+            self._filter_and_histogram_vector_coarse(ic, *vector_args)
+            ic = ic + cutlass.Int32(self.num_threads_per_cta * self.vec_size)
+
+    @cute.jit
+    def _filter_and_histogram_vector_coarse(
+        self,
+        ic,
+        threshold_bin,
+        s_counter,
+        s_indices,
+        s_input_idx,
+        s_input_val,
+        s_num_input,
+        s_histogram,
+        g_num_input,
+        buffer,
+        _copy_atom,
+        scan_frag,
+        _aligned_base,
+        vec_start,
+        s_overflow_flag,
+    ):
+        """Coarse-filter the vector at element offset ``ic`` of the vec-aligned segment."""
+        _elem_bytes = self.dtype.width // 8
+        _align_bytes = self.num_copy_bits // 8
+        vec_size = self.vec_size
+        cute.copy(
+            _copy_atom,
+            cute.make_tensor(
+                cute.make_ptr(
+                    self.dtype,
+                    _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
+                    cute.AddressSpace.gmem,
+                    assumed_align=_align_bytes,
+                ),
+                cute.make_layout((vec_size,)),
+            ),
+            scan_frag,
+        )
+        for j in cutlass.range_constexpr(vec_size):
+            raw_input = scan_frag[j]
+            bin_val = self.to_coarse_key(raw_input)
+            idx = self.index_type(vec_start + ic + cutlass.Int32(j))
+            self._filter_and_histogram_per_elem_coarse(
+                bin_val,
+                threshold_bin,
+                idx,
+                raw_input,
+                s_counter,
+                s_indices,
+                s_input_idx,
+                s_input_val,
+                s_num_input,
+                s_histogram,
+                g_num_input,
+                buffer,
+                s_overflow_flag,
+            )
+
+    @cute.jit
     def _filter_and_histogram_coarse(
         self,
         tidx,
@@ -661,55 +729,45 @@ class FilteredTopKKernelVarlen:
         left_start,
         left_size,
         s_overflow_flag,
+        listed=None,
     ):
         """Reset histogram, filter all input elements through three loops, then barrier.
 
-        Covers vec-aligned GMEM, prologue scalar, and left scalar segments.
+        Covers vec-aligned GMEM, prologue scalar, and left scalar segments. With
+        ``listed`` in ``[0, filtered_topk_smem_input_size]``, the vec-aligned segment
+        covers only the ``listed`` vectors whose indices are in ``s_input_idx[1]``.
         """
-        _elem_bytes = self.dtype.width // 8
-        _align_bytes = self.num_copy_bits // 8
-        _step_vec = self.num_threads_per_cta * self.vec_size
         cute.arch.barrier()
         for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
             s_histogram[_hi] = 0
         cute.arch.barrier()
 
         vec_size = self.vec_size
-        ic = tidx * cutlass.Int32(vec_size)
-        while ic + cutlass.Int32(vec_size - 1) < aligned_size:
-            cute.copy(
-                _copy_atom,
-                cute.make_tensor(
-                    cute.make_ptr(
-                        self.dtype,
-                        _aligned_base + cutlass.Int64(ic) * cutlass.Int64(_elem_bytes),
-                        cute.AddressSpace.gmem,
-                        assumed_align=_align_bytes,
-                    ),
-                    cute.make_layout((vec_size,)),
-                ),
-                scan_frag,
-            )
-            for j in cutlass.range_constexpr(vec_size):
-                raw_input = scan_frag[j]
-                bin_val = self.to_coarse_key(raw_input)
-                idx = self.index_type(vec_start + ic + cutlass.Int32(j))
-                self._filter_and_histogram_per_elem_coarse(
-                    bin_val,
-                    threshold_bin,
-                    idx,
-                    raw_input,
-                    s_counter,
-                    s_indices,
-                    s_input_idx,
-                    s_input_val,
-                    s_num_input,
-                    s_histogram,
-                    g_num_input,
-                    buffer,
-                    s_overflow_flag,
-                )
-            ic = ic + cutlass.Int32(_step_vec)
+        vector_args = (
+            threshold_bin,
+            s_counter,
+            s_indices,
+            s_input_idx,
+            s_input_val,
+            s_num_input,
+            s_histogram,
+            g_num_input,
+            buffer,
+            _copy_atom,
+            scan_frag,
+            _aligned_base,
+            vec_start,
+            s_overflow_flag,
+        )
+        if cutlass.const_expr(listed is None):
+            self._filter_and_histogram_all_vectors_coarse(tidx, aligned_size, vector_args)
+        else:
+            if listed <= self.filtered_topk_smem_input_size:
+                for i in range(tidx, listed, self.num_threads_per_cta):
+                    ic = cutlass.Int32(cutlass.Uint32(s_input_idx[1, i])) * cutlass.Int32(vec_size)
+                    self._filter_and_histogram_vector_coarse(ic, *vector_args)
+            else:
+                self._filter_and_histogram_all_vectors_coarse(tidx, aligned_size, vector_args)
 
         for j in range(tidx, prologue_elems, self.num_threads_per_cta):
             col_idx = cutlass.Int32(row_start + j)
@@ -1608,6 +1666,8 @@ class FilteredTopKKernelVarlen:
         need_cluster_sync=False,
         s_hist_merged=None,
         cta_in_group=0,
+        s_vec_key=None,
+        s_list_count=None,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm.
 
@@ -1751,6 +1811,9 @@ class FilteredTopKKernelVarlen:
             if cutlass.const_expr(self.enable_reread):
                 if tidx == 0:
                     s_overflow_flag[0] = 0
+            if cutlass.const_expr(s_vec_key is not None):
+                if tidx == 0:
+                    s_list_count[0] = 0
             cute.arch.barrier()
 
             # 1.1 Build histogram
@@ -1769,9 +1832,17 @@ class FilteredTopKKernelVarlen:
                     ),
                     scan_frag,
                 )
+                if cutlass.const_expr(s_vec_key is not None):
+                    vec_key = cutlass.Int32(self.radix - 1)
                 for j in cutlass.range_constexpr(vec_size):
                     bin_val = self.to_coarse_key(scan_frag[j])
                     atomicAdd(s_histogram.iterator + cutlass.Int32(bin_val), val_one)
+                    if cutlass.const_expr(s_vec_key is not None):
+                        vec_key = cutlass.min(vec_key, cutlass.Int32(bin_val))
+                if cutlass.const_expr(s_vec_key is not None):
+                    vec = ic // cutlass.Int32(vec_size)
+                    if vec < self.key_cache_vectors:
+                        s_vec_key[vec] = cutlass.Uint8(vec_key)
                 ic = ic + cutlass.Int32(_step_vec)
 
             # for initial scalar load part.
@@ -1883,6 +1954,25 @@ class FilteredTopKKernelVarlen:
                     left_size,
                 )
             else:
+                # Vectors whose least coarse key is above the threshold bin hold no element the
+                # filter keeps: list the others (and the uncached ones) for it to load, unless the
+                # elements at or above the threshold bin fill more vectors than the list holds.
+                listed = None
+                if cutlass.const_expr(s_vec_key is not None):
+                    listed = cutlass.Int32(self.filtered_topk_smem_input_size + 1)
+                    if s_histogram[threshold_bin] <= self.filtered_topk_smem_input_size * vec_size:
+                        for v in range(
+                            tidx, aligned_size // cutlass.Int32(vec_size), self.num_threads_per_cta
+                        ):
+                            take = cutlass.Boolean(True)
+                            if v < self.key_cache_vectors:
+                                take = cutlass.Int32(s_vec_key[v]) <= threshold_bin
+                            if take:
+                                pos = atomicAdd(s_list_count.iterator, val_one)
+                                if pos < self.filtered_topk_smem_input_size:
+                                    s_input_idx[1, pos] = self.index_type(v)
+                        cute.arch.barrier()
+                        listed = s_list_count[0]
                 self._filter_and_histogram_coarse(
                     tidx,
                     threshold_bin,
@@ -1905,6 +1995,7 @@ class FilteredTopKKernelVarlen:
                     left_start,
                     left_size,
                     s_overflow_flag,
+                    listed,
                 )
 
                 # Phase 2: Refinement rounds

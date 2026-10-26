@@ -75,7 +75,8 @@ add_th_common_family(
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
-  trtllmGenQKVProcessOp.cpp)
+  trtllmGenQKVProcessOp.cpp
+  csa2SparseContextOp.cpp)
 
 add_th_common_family(
   th_common_gemm_quant

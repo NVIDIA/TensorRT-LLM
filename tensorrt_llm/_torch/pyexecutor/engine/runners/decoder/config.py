@@ -48,3 +48,5 @@ class DecoderRunnerConfig(RunnerConfig):
     mm_encoder_cache_enabled: bool
     enable_autotuner: bool
     cuda_graph_specialize_lora: bool
+    # The one-engine worker samples greedy and temperature-only target rows from vocabulary shards.
+    samples_from_vocab_shards: bool

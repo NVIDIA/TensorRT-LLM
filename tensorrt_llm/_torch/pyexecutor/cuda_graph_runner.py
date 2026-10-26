@@ -28,6 +28,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import LlmRequest, get_draft_token_length
+from .replay_inputs import stage_replay_inputs
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -76,6 +77,9 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+    # Spec one-engine sampler: temperature-only rows sampled from vocabulary shards
+    # record the Gumbel-max exchange instead of the general sampling kernels.
+    is_all_temperature_only: bool = False
 
 
 def _save_spec_decode_capture_state(
@@ -391,6 +395,8 @@ class CUDAGraphRunner:
         # this field (non-one-engine paths or non-spec batches).
         is_all_greedy_sample = bool(
             getattr(spec_metadata, "is_all_greedy_sample", True))
+        is_all_temperature_only = (spec_metadata is not None
+                                   and spec_metadata.is_all_temperature_only)
 
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
@@ -430,7 +436,8 @@ class CUDAGraphRunner:
                        context_query_len=context_query_len,
                        num_encoder_tokens=num_encoder_tokens,
                        peft_cache_data_type=peft_cache_data_type,
-                       use_lora_graph=use_lora_graph)
+                       use_lora_graph=use_lora_graph,
+                       is_all_temperature_only=is_all_temperature_only)
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
@@ -816,9 +823,27 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
-
         position_ids = current_inputs["position_ids"]
+        # Hooks get their own corrected positions: the captured preprocessing
+        # corrects the static ones itself.
+        hook_positions = None
+        if self._pre_replay_hooks and position_id_offsets is not None:
+            assert current_inputs["attn_metadata"].num_ctx_tokens == 0, (
+                "Pre-replay position offsets require a generation-only batch")
+            if self._pre_replay_position_ids is None:
+                self._pre_replay_position_ids = torch.empty_like(
+                    static_tensors["position_ids"])
+            hook_positions = self._pre_replay_position_ids[..., :seqlen]
+        staged = (not self.config.use_mrope
+                  and tuple(position_ids.shape) == (1, seqlen)
+                  and stage_replay_inputs(
+                      static_tensors["input_ids"][:seqlen], input_ids,
+                      static_tensors["position_ids"][:, :seqlen], position_ids,
+                      hook_positions, None if hook_positions is None else
+                      position_id_offsets[:seqlen]))
+        if not staged:
+            static_tensors["input_ids"][:seqlen].copy_(input_ids)
+
         if self.config.use_mrope:
             expected_position_ids_shape = (3, 1, seqlen)
             if tuple(position_ids.shape) != expected_position_ids_shape:
@@ -863,7 +888,8 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            if not staged:
+                static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
@@ -889,18 +915,11 @@ class CUDAGraphRunner:
 
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
-            if position_id_offsets is not None:
-                assert current_inputs["attn_metadata"].num_ctx_tokens == 0, (
-                    "Pre-replay position offsets require a generation-only batch"
-                )
-                # Captured preprocessing owns the in-place position update.
-                if self._pre_replay_position_ids is None:
-                    self._pre_replay_position_ids = torch.empty_like(
-                        static_tensors["position_ids"])
-                hook_positions = self._pre_replay_position_ids[..., :seqlen]
-                torch.add(static_tensors["position_ids"][..., :seqlen],
-                          position_id_offsets[:seqlen],
-                          out=hook_positions)
+            if hook_positions is not None:
+                if not staged:
+                    torch.add(static_tensors["position_ids"][..., :seqlen],
+                              position_id_offsets[:seqlen],
+                              out=hook_positions)
                 hook_tensors = dict(static_tensors, position_ids=hook_positions)
             for hook in self._pre_replay_hooks:
                 hook(key, seqlen, hook_tensors, current_inputs)

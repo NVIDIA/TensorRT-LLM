@@ -16,6 +16,7 @@ MoE routing, n-gram hashing and collapsed-logit processing reuse the shared code
 
 import copy
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, cast
 
@@ -23,6 +24,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -44,6 +46,7 @@ from ..attention.backends.sparse.csa2.params import CSA2Mode
 from ..configs.deepseek_v41 import (
     DeepseekV41QuantLayout,
     assert_weight_layout,
+    bounded_replay_tokens,
     decoder_bounded_replay_enabled,
     disagg_context_decoder_skipping_enabled,
     encoder_replay_enabled,
@@ -54,10 +57,19 @@ from ..model_config import ModelConfig
 from ..modules.engram import Engram, ShardedFp8MultiHeadEmbedding, engram_gate
 from ..modules.engram.projection import EngramFp8Projection
 from ..modules.mhc.hyper_connection import HCState, mHC
+from ..modules.mhc.mhc_lowm import (
+    MoeUnfinalized,
+    mhc_allreduce_post_collapse_norm,
+    mhc_lamport_allreduce,
+    mhc_split_enabled,
+)
+from ..modules.multi_stream_utils import do_multi_stream
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
 from ..speculative.dspark import DSparkSpecMetadata
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, MxFp8QuantizedTensor
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
+from .deepseekv41_decoder_graph import DecoderPassGraph, DecoderPassRows
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
@@ -157,14 +169,66 @@ class DeepseekV41Attention(CSA2Attention):
         self.reduce_output = reduce_output
         self.o_b_proj.reduce_output = reduce_output
 
-    def forward(self, position_ids, hidden_states, attn_metadata, all_reduce_params=None, **kwargs):
+    def forward(
+        self,
+        position_ids,
+        hidden_states,
+        attn_metadata,
+        all_reduce_params=None,
+        hidden_states_mxfp8=None,
+        row_split: DecoderPassRows | None = None,
+        **kwargs,
+    ):
+        """``row_split`` (decoder-pass graphs) keeps the row-wise projections in the graph."""
         if kwargs.get("lora_params") is not None:
             raise NotImplementedError("DeepSeek-V4.1 CSA2 does not implement attention LoRA")
-        # The original sparse O-LoRA helper did not consume all_reduce_params;
-        # TP reduction remains owned by the row-parallel output projection.
-        return super().forward(
-            hidden_states, position_ids.reshape(-1).to(torch.int32), attn_metadata
+        # TP reduction is owned by the row-parallel output projection; ``enable_allreduce=False``
+        # (plain path only) returns this rank's partial sum for a consumer that reduces it.
+        positions = position_ids.reshape(-1).to(torch.int32)
+        if row_split is not None:
+            projected = self.project_rows(hidden_states, positions)
+            attended = torch.empty_like(projected[0])
+
+            def attend_live_rows(*args):
+                self.attend_rows(*args, row_split.attn_metadata, row_split.rows)
+
+            eager_on_graph(attend_live_rows)(hidden_states, positions, *projected, attended)
+            return self._project_output(attended, positions)
+        if is_in_breakable_cuda_graph():
+            # Keep the graph's padded shape while CSA2 consumes only live query rows.
+            output = torch.empty_like(hidden_states)
+
+            def forward_real_rows(states, positions, destination):
+                real_tokens = attn_metadata.num_tokens
+                if real_tokens > states.shape[0]:
+                    raise ValueError("CSA2 query rows exceed the padded graph input")
+                if real_tokens:
+                    destination[:real_tokens].copy_(
+                        super(DeepseekV41Attention, self).forward(
+                            states[:real_tokens], positions[:real_tokens], attn_metadata
+                        )
+                    )
+                if real_tokens < destination.shape[0]:
+                    destination[real_tokens:].zero_()
+
+            eager_on_graph(forward_real_rows)(hidden_states, positions, output)
+            return output
+        partial = (
+            all_reduce_params is not None
+            and not all_reduce_params.enable_allreduce
+            and self.o_b_proj.reduce_output
         )
+        if not partial:
+            return super().forward(
+                hidden_states, positions, attn_metadata, hidden_states_mxfp8=hidden_states_mxfp8
+            )
+        self.o_b_proj.reduce_output = False
+        try:
+            return super().forward(
+                hidden_states, positions, attn_metadata, hidden_states_mxfp8=hidden_states_mxfp8
+            )
+        finally:
+            self.o_b_proj.reduce_output = True
 
     def load_weights(self, weights):
         """Load one complete attention subtree with exact key coverage."""
@@ -222,9 +286,32 @@ class DeepseekV41Attention(CSA2Attention):
 
 @dataclass(frozen=True)
 class _AttentionDPEngramEmbeddings:
+    """This rank's table shard looked up for every rank's tokens, in global order."""
+
     embeddings: torch.Tensor
     local_start: int
     local_num_tokens: int
+    all_rank_num_tokens: tuple[int, ...]
+
+
+# Context-overlap schedule measured on GB300: Engram layer -> (the layer whose attention issues
+# its exchange and projection, its lookup's CTA cap or None for half the SMs).
+_ENGRAM_CONTEXT_SCHEDULE = {1: (0, None), 14: (6, 32)}
+# Batches with fewer tokens on the busiest rank, decode included, keep the model-stream path.
+_ENGRAM_CONTEXT_MIN_TOKENS = 256
+
+
+@dataclass(frozen=True)
+class _StagedEngramLookup:
+    """Packed MXFP8 table rows of every attention-DP rank's tokens."""
+
+    rows: torch.Tensor
+    all_rank_num_tokens: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _PrecomputedEngramKV:
+    kv: torch.Tensor
 
 
 class DeepseekV41Engram(Engram):
@@ -261,6 +348,7 @@ class DeepseekV41Engram(Engram):
             stream=stream,
         )
         self.register_buffer("_gate_norm_product", None, persistent=False)
+        self._context_lookup_event = torch.cuda.Event() if stream is not None else None
 
         # Row shards use the model's all-reduce strategy; head shards use all-gather.
         self.embed_all_reduce = None
@@ -271,8 +359,15 @@ class DeepseekV41Engram(Engram):
                 embedding_mapping = copy.copy(mapping)
                 embedding_mapping.enable_attention_dp = False
             self.embed_all_reduce = AllReduce(
-                mapping=embedding_mapping, strategy=allreduce_strategy
+                mapping=embedding_mapping, strategy=allreduce_strategy, dtype=config.dtype
             )
+        # Attention-DP head shards can send each rank only its tokens' rows; the exchange needs
+        # the MPI-created TP communicator.
+        self.exchanges_token_rows = (
+            self.enable_attention_dp
+            and self.multi_head_embedding.shard_heads
+            and not mpi_disabled()
+        )
 
     @torch.no_grad()
     def cache_derived_state(self) -> None:
@@ -345,6 +440,21 @@ class DeepseekV41Engram(Engram):
             return allgather(embeddings, self.mapping, dim=-1)
         return embeddings
 
+    def _local_token_embeddings(self, lookup: _AttentionDPEngramEmbeddings) -> torch.Tensor:
+        """Combine every table shard's rows of this rank's tokens into ``[T, H * D]``; an idle
+        rank still sends its shard's rows."""
+        rows = lookup.embeddings
+        if not rows.shape[0]:
+            return rows
+        if self.exchanges_token_rows:
+            shards = torch.ops.trtllm.alltoallv_tokens(
+                rows, list(lookup.all_rank_num_tokens), self.mapping.tp_group, self.tp_rank
+            )
+            # Source-major shards concatenate in head order.
+            return torch.cat(shards.unbind(), dim=-1)
+        combined = self._combine_embeddings(rows)
+        return combined.narrow(0, lookup.local_start, lookup.local_num_tokens)
+
     def precompute(
         self,
         hash_indices: torch.Tensor,
@@ -363,6 +473,20 @@ class DeepseekV41Engram(Engram):
 
         Attention DP gathers token rows before lookup and retains the local span.
         """
+        hash_indices, local_start, local_num_tokens = self._gather_hash_indices(
+            hash_indices, all_rank_num_tokens
+        )
+        embeddings = self._lookup_embeddings(hash_indices, dtype)
+        if self.enable_attention_dp:
+            return _AttentionDPEngramEmbeddings(
+                embeddings, local_start, local_num_tokens, tuple(all_rank_num_tokens)
+            )
+        return embeddings
+
+    def _gather_hash_indices(
+        self, hash_indices: torch.Tensor, all_rank_num_tokens: list[int] | None
+    ) -> tuple[torch.Tensor, int, int]:
+        """Gather the same global token order on every table shard."""
         local_start = 0
         local_num_tokens = hash_indices.shape[0]
         if self.enable_attention_dp:
@@ -382,11 +506,43 @@ class DeepseekV41Engram(Engram):
                 hash_indices = allgather(
                     hash_indices, self.mapping, dim=0, sizes=all_rank_num_tokens
                 )
+        return hash_indices, local_start, local_num_tokens
 
-        embeddings = self._lookup_embeddings(hash_indices, dtype)
-        if self.enable_attention_dp:
-            return _AttentionDPEngramEmbeddings(embeddings, local_start, local_num_tokens)
-        return embeddings
+    def precompute_lookup(
+        self,
+        hash_indices: torch.Tensor,
+        all_rank_num_tokens: list[int],
+        max_ctas: int | None = None,
+    ) -> _StagedEngramLookup:
+        """Look up packed MXFP8 rows of every attention-DP rank's tokens on the Engram stream.
+
+        Hash rows are gathered on the caller's stream, which orders the model's collectives.
+        """
+        hash_indices, _, _ = self._gather_hash_indices(hash_indices, all_rank_num_tokens)
+        caller_stream = torch.cuda.current_stream()
+        self.stream.wait_stream(caller_stream)
+        hash_indices.record_stream(self.stream)
+        with torch.cuda.stream(self.stream):
+            rows = self.multi_head_embedding.forward_packed(hash_indices, max_ctas)
+            self._context_lookup_event.record()
+        rows.record_stream(caller_stream)
+        return _StagedEngramLookup(rows, tuple(all_rank_num_tokens))
+
+    def project_lookup(self, lookup: _StagedEngramLookup) -> _PrecomputedEngramKV:
+        """Send each rank its tokens' rows on the caller's stream, then project them on the
+        Engram stream; ``sync_event`` marks the projection's completion."""
+        caller_stream = torch.cuda.current_stream()
+        caller_stream.wait_event(self._context_lookup_event)
+        rows = torch.ops.trtllm.alltoallv_tokens(
+            lookup.rows, list(lookup.all_rank_num_tokens), self.mapping.tp_group, self.tp_rank
+        )
+        self.stream.wait_stream(caller_stream)
+        rows.record_stream(self.stream)
+        with torch.cuda.stream(self.stream):
+            kv = self.kv_proj.forward_packed(rows)
+            self.sync_event.record()
+        kv.record_stream(caller_stream)
+        return _PrecomputedEngramKV(kv)
 
     def _lookup_embeddings(
         self, hash_indices: torch.Tensor, dtype: torch.dtype | None
@@ -430,7 +586,7 @@ class DeepseekV41Engram(Engram):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        embeddings: torch.Tensor | _AttentionDPEngramEmbeddings,
+        embeddings: torch.Tensor | _AttentionDPEngramEmbeddings | _PrecomputedEngramKV,
         conv_state: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         *,
@@ -449,17 +605,15 @@ class DeepseekV41Engram(Engram):
                 "DeepSeek-V4.1's Engram has no convolution, so there is no conv "
                 "state to carry across decode steps."
             )
+        if isinstance(embeddings, _PrecomputedEngramKV):
+            precomputed_kv = embeddings.kv
         if precomputed_kv is None:
             if isinstance(embeddings, _AttentionDPEngramEmbeddings):
                 if embeddings.local_num_tokens != hidden_states.shape[0]:
                     raise ValueError(
                         "Attention-DP Engram local token count does not match hidden states."
                     )
-                # An idle rank still contributes its table shard to active ranks.
-                combined = embeddings.embeddings
-                if combined.shape[0]:
-                    combined = self._combine_embeddings(combined)
-                embeddings = combined.narrow(0, embeddings.local_start, embeddings.local_num_tokens)
+                embeddings = self._local_token_embeddings(embeddings)
             else:
                 if self.enable_attention_dp:
                     raise ValueError("Attention-DP Engram requires globally prefetched embeddings.")
@@ -469,6 +623,8 @@ class DeepseekV41Engram(Engram):
             kv = self.kv_proj(embeddings)
         else:
             kv = precomputed_kv
+            if hidden_states.shape[0] == 0:
+                return hidden_states if add_residual else torch.zeros_like(hidden_states)
         output = engram_gate(
             hidden_states,
             kv,
@@ -517,6 +673,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             norm_eps=config.rms_norm_eps,
             sinkhorn_eps=hc_eps,
             post_mult_value=2.0,
+            single_pass_boundary=True,
         )
 
     def _make_engram(self, layer_idx: int, engram_config, vocab_sizes_flat, stream):
@@ -536,11 +693,59 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         self.disable_attn_allreduce = not self.self_attn.reduce_output
         # Override even environment-enabled V4 fusion: it cannot consume lagged pre.
         self.enable_fused_hc = False
+        # Attention TP without attention DP: every rank computes this layer's residual stream, so
+        # its mHC boundaries must give the same bits on every rank.
+        replicated = self.mapping.tp_size > 1 and not self.mapping.enable_attention_dp
+        self.hc_attn.replicated = replicated
+        self.hc_ffn.replicated = replicated
         self.defer_post_mapping = False
         # V4.1's own cross-layer deferral: hand hc_ffn.post_mapping to the next layer,
         # whose fused lagged entry (mHC.fused_hc_lagged) absorbs it. Set by
         # DeepseekV41ForCausalLM.post_load_weights once the neighbours are known.
         self._v41_defer_post_mapping = False
+        # Whether the FFN boundary also writes the NVFP4 input of the routed experts; set by
+        # DeepseekV41ForCausalLM.post_load_weights once the MoE backend is built.
+        self._moe_nvfp4_input = False
+        # Split boundaries (mHC.split_hc_lagged): coefficients on their own stream.
+        aux_stream_dict = args[2] if len(args) > 2 else kwargs.get("aux_stream_dict")
+        self._mhc_coeff_stream = (aux_stream_dict or {}).get(AuxStreamType.MhcCoefficients)
+        self._mhc_attn_events = (torch.cuda.Event(), torch.cuda.Event())
+        self._mhc_ffn_events = (torch.cuda.Event(), torch.cuda.Event())
+        # Split boundaries that all-reduce the sublayer output themselves (resolved lazily).
+        self._mhc_lamport = None
+        self._mhc_lamport_resolved = False
+
+    def _mhc_split(self, num_tokens: int) -> bool:
+        """Split this layer's boundaries: decode-sized rows under CUDA-graph multi-stream.
+
+        The critical half then runs in one launch and the coefficients overlap the sublayer on
+        the coefficient stream; without multi-stream they would serialize, and the fused
+        boundary is faster.
+        """
+        return (
+            self._mhc_coeff_stream is not None
+            and do_multi_stream()
+            and mhc_split_enabled(num_tokens, self.hidden_size, self.hc_attn.mult)
+        )
+
+    def _mhc_fused_allreduce(self):
+        """Workspace for split boundaries that all-reduce the sublayer output in their own launch.
+
+        Not under breakable CUDA graphs, whose attention path always reduces its output.
+        """
+        if is_in_breakable_cuda_graph():
+            return None
+        if not self._mhc_lamport_resolved:
+            self._mhc_lamport = mhc_lamport_allreduce(
+                self.mapping, self.model_config.allreduce_strategy
+            )
+            self._mhc_lamport_resolved = True
+        return self._mhc_lamport
+
+    def _moe_supports_unfinalized(self) -> bool:
+        """Whether the routed experts can hand back their rows before the top-k combine."""
+        experts = self.mlp.experts
+        return getattr(experts, "backend", experts).supports_unfinalized_output()
 
     def _decoder_global_input(self, hc_state: HCState) -> torch.Tensor:
         """Use the ordinary fused boundary's collapse/norm and BF16 rounding."""
@@ -567,6 +772,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         engram_embeddings=None,
         image_mask: Optional[torch.Tensor] = None,
         precomputed_engram_kv: torch.Tensor | None = None,
+        after_attention_callback: Callable[[], None] | None = None,
         **kwargs,
     ) -> HCState:
         """Run Engram, attention and MoE with lagged mHC coefficients.
@@ -575,10 +781,14 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         incoming pre, then apply the sublayer and post update to that same residual.
         Carry the FFN's pre to the next block in the returned HCState.
         """
+        # Coefficients the previous layer's split FFN boundary left on the coefficient stream.
+        hc_state.wait_coefficients()
         residual = hc_state.residual
         pre_mix = hc_state.pre_mix
 
         if residual.shape[0] == 0:
+            if after_attention_callback is not None:
+                after_attention_callback()
             # An ADP peer still participates in each MoE collective when other
             # ranks have Decoder queries. Local attention and mHC have no rows.
             if self.mapping.enable_attention_dp and any(attn_metadata.all_rank_num_tokens or ()):
@@ -592,18 +802,40 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 )
             return HCState.resolved(residual, pre_mix=pre_mix)
 
-        # Engram and DSpark capture need the residual before the fused entry.
+        capture_this_layer = spec_metadata is not None and spec_metadata.is_layer_capture(
+            self.layer_idx
+        )
+        dspark_capture = capture_this_layer and spec_metadata.spec_dec_mode.is_dspark()
+        # Engram and non-DSpark capture need the residual before the fused entry. DSpark captures
+        # the fused entry's residual, which is the post update bit for bit.
         deferred = hc_state.is_deferred
         needs_resolved = (self.engram is not None and engram_embeddings is not None) or (
-            spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx)
+            capture_this_layer and not dspark_capture
         )
         if deferred and needs_resolved:
-            residual = self.hc_attn.post_mapping(
-                x=hc_state.x_prev,
-                residual=residual,
-                post_layer_mix=hc_state.post_mix,
-                comb_res_mix=hc_state.comb_mix,
+            allreduce = (
+                self._mhc_fused_allreduce() if hc_state.x_prev_allreduce is not None else None
             )
+            if allreduce is not None:
+                # All-reduce and post-map the previous MoE partial in one boundary launch; its
+                # collapse output is not used.
+                residual, _ = mhc_allreduce_post_collapse_norm(
+                    hc_state.x_prev,
+                    residual,
+                    hc_state.post_mix,
+                    hc_state.comb_mix,
+                    pre_mix,
+                    self.input_layernorm.weight,
+                    self.input_layernorm.variance_epsilon,
+                    allreduce,
+                )
+            else:
+                residual = self.hc_attn.post_mapping(
+                    x=hc_state.reduced_x_prev(),
+                    residual=residual,
+                    post_layer_mix=hc_state.post_mix,
+                    comb_res_mix=hc_state.comb_mix,
+                )
             deferred = False
 
         # Engram updates both the mHC coefficient input and post-update residual.
@@ -616,36 +848,60 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 precomputed_kv=precomputed_engram_kv,
             )
 
-        capture_this_layer = spec_metadata is not None and spec_metadata.is_layer_capture(
-            self.layer_idx
-        )
-        if capture_this_layer and spec_metadata.spec_dec_mode.is_dspark():
-            # Capture the post-Engram entry state, not V4's post-MoE state.
-            # DSpark averages the mult axis of the flat [N, mult * hidden] stream.
-            capture_rows = getattr(attn_metadata, "csa2_replay_query_rows", None)
-            capture_input = residual.reshape(residual.shape[0], -1)
-            if capture_rows is None:
-                spec_metadata.maybe_capture_hidden_states(self.layer_idx, capture_input, None)
-            else:
-                cast("DSparkSpecMetadata", spec_metadata).maybe_capture_hidden_states(
-                    self.layer_idx, capture_input, None, row_indices=capture_rows
-                )
-
         # --- attention sublayer -------------------------------------------
-        # C++ fused boundary (GEMM + bigfuse with the lagged pre-mix and the input RMSNorm
-        # folded in); the GEMM backend (FMA / tcgen05 TF32) is the autotuner's per-M choice.
-        if deferred:
+        # Fused boundary: lagged pre-mix with the input RMSNorm folded in
+        # (mHC.fused_hc_lagged / pre_mapping_lagged). Decode-sized rows under multi-stream split
+        # it: post update + collapse + RMSNorm in one launch, the coefficients on the coefficient
+        # stream until the next boundary (mHC.split_hc_lagged).
+        split = self._mhc_split(residual.shape[0])
+        # Split boundaries can also all-reduce the sublayer output in their own launch.
+        lamport = self._mhc_fused_allreduce() if split else None
+        attn_coeff_event = None
+        # The entry boundary (split or single-pass) also emits the MXFP8 input of the fused
+        # query/SWA projection.
+        layer_input_mxfp8 = None
+        if split:
+            entry_allreduce = None
+            x_prev = None
+            if deferred:
+                if lamport is not None and hc_state.x_prev_allreduce is not None:
+                    x_prev, entry_allreduce = hc_state.x_prev, lamport
+                else:
+                    x_prev = hc_state.reduced_x_prev()
+            mxfp8 = self.self_attn.takes_mxfp8_input
+            boundary = self.hc_attn.split_hc_lagged(
+                x_prev,
+                residual,
+                hc_state.post_mix if deferred else None,
+                hc_state.comb_mix if deferred else None,
+                pre_mix,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                coeff_stream=self._mhc_coeff_stream,
+                events=self._mhc_attn_events,
+                allreduce=entry_allreduce,
+                mxfp8=mxfp8,
+            )
+            residual, attn_pre, post_mix, comb_mix, layer_input, attn_coeff_event = boundary[:6]
+            if mxfp8:
+                layer_input_mxfp8 = MxFp8QuantizedTensor(*boundary[6], is_sf_swizzled=True)
+        elif deferred:
             # Previous layer's post update + this boundary in one fused pair; `residual`
             # becomes the materialized stream that this layer's post_mapping needs.
-            residual, attn_pre, post_mix, comb_mix, layer_input = self.hc_attn.fused_hc_lagged(
-                hc_state.x_prev,
+            mxfp8 = self.self_attn.takes_mxfp8_input
+            boundary = self.hc_attn.fused_hc_lagged(
+                hc_state.reduced_x_prev(),
                 residual,
                 hc_state.post_mix,
                 hc_state.comb_mix,
                 pre_mix,
                 norm_weight=self.input_layernorm.weight,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                mxfp8=mxfp8,
             )
+            residual, attn_pre, post_mix, comb_mix, layer_input = boundary[:5]
+            if mxfp8 and boundary[5] is not None:
+                layer_input_mxfp8 = MxFp8QuantizedTensor(*boundary[5], is_sf_swizzled=True)
         else:
             attn_pre, post_mix, comb_mix, layer_input = self.hc_attn.pre_mapping_lagged(
                 residual,
@@ -653,23 +909,84 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 norm_weight=self.input_layernorm.weight,
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
+        capture_done = None
+        if dspark_capture:
+            # Capture the post-Engram entry state, not V4's post-MoE state, beside the attention.
+            # DSpark averages the mult axis of the flat [N, mult * hidden] stream.
+            capture_done = cast("DSparkSpecMetadata", spec_metadata).capture_on_side_stream(
+                self.layer_idx,
+                residual.reshape(residual.shape[0], -1),
+                getattr(attn_metadata, "csa2_replay_query_rows", None),
+            )
         x_attn = self.self_attn(
             position_ids=position_ids,
             hidden_states=layer_input,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
+            hidden_states_mxfp8=layer_input_mxfp8,
+            # The split boundary's critical half prefetches its residual before its PDL wait,
+            # so the all-reduce may let it launch at its start.
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_attn_allreduce and lamport is None,
+                trigger_completion_at_end=not split,
+            ),
             **kwargs,
         )
+        if after_attention_callback is not None:
+            after_attention_callback()
+        if capture_done is not None:
+            torch.cuda.current_stream().wait_event(capture_done)
         # Attention's post update + FFN boundary + post_attention RMSNorm in one fused pair.
-        residual, ffn_pre, post_mix, comb_mix, layer_input = self.hc_ffn.fused_hc_lagged(
-            x_attn,
-            residual,
-            post_mix,
-            comb_mix,
-            attn_pre,
-            norm_weight=self.post_attention_layernorm.weight,
-            norm_eps=self.post_attention_layernorm.variance_epsilon,
+        ffn_coeff_event = None
+        nvfp4_scale = (
+            self.mlp.experts.backend.fc31_input_scale.view(1) if self._moe_nvfp4_input else None
         )
+        if split:
+            if attn_coeff_event is not None:
+                torch.cuda.current_stream().wait_event(attn_coeff_event)
+            residual, ffn_pre, post_mix, comb_mix, layer_input, ffn_coeff_event = (
+                self.hc_ffn.split_hc_lagged(
+                    x_attn,
+                    residual,
+                    post_mix,
+                    comb_mix,
+                    attn_pre,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                    coeff_stream=self._mhc_coeff_stream,
+                    events=self._mhc_ffn_events,
+                    allreduce=lamport,
+                    nvfp4_scale=nvfp4_scale,
+                )
+            )
+        else:
+            residual, ffn_pre, post_mix, comb_mix, layer_input = self.hc_ffn.fused_hc_lagged(
+                x_attn,
+                residual,
+                post_mix,
+                comb_mix,
+                attn_pre,
+                norm_weight=self.post_attention_layernorm.weight,
+                norm_eps=self.post_attention_layernorm.variance_epsilon,
+                nvfp4_scale=nvfp4_scale,
+            )
+        # The next layer's split entry prefetches like the FFN boundary above, or all-reduces
+        # the MoE output itself.
+        self._moe_ar_trigger_at_end = not (split and self._v41_defer_post_mapping)
+        moe_allreduce = getattr(self.mlp, "allreduce", None)
+        moe_partial = (
+            lamport is not None and self._v41_defer_post_mapping and moe_allreduce is not None
+        )
+        # The next boundary can also combine the un-finalized expert rows, unless the next layer
+        # materializes its residual first (a capture layer).
+        moe_unfinalized = (
+            moe_partial
+            and self._moe_supports_unfinalized()
+            and not (
+                spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx + 1)
+            )
+        )
+        self._moe_ar_skip = moe_partial
+        self._moe_unfinalized = moe_unfinalized
         x_ffn = self.forward_MoE(
             hidden_states=layer_input,
             attn_metadata=attn_metadata,
@@ -678,10 +995,35 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             hidden_states_normalized=True,
             **({"image_mask": image_mask} if image_mask is not None else {}),
         )
+        self._moe_unfinalized = False
+        if moe_unfinalized:
+            shared_out, fc2_out, expert_scales, permuted_idx = x_ffn
+            x_ffn = MoeUnfinalized(
+                shared=shared_out,
+                fc2=fc2_out,
+                scales=expert_scales.view(shared_out.shape[0], -1),
+                perm=permuted_idx.view(shared_out.shape[0], -1),
+            )
         if self._v41_defer_post_mapping:
             # Defer hc_ffn.post_mapping into the next layer's fused entry boundary; the
             # next layer materializes it itself if it cannot absorb it (see forward entry).
-            return HCState.deferred(residual, post_mix, comb_mix, x_ffn, pre_mix=ffn_pre)
+            return HCState.deferred(
+                residual,
+                post_mix,
+                comb_mix,
+                x_ffn,
+                pre_mix=ffn_pre,
+                coeff_event=ffn_coeff_event,
+                x_prev_allreduce=(
+                    (lambda parts: moe_allreduce(parts.finalize()))
+                    if moe_unfinalized
+                    else moe_allreduce
+                    if moe_partial
+                    else None
+                ),
+            )
+        if ffn_coeff_event is not None:
+            torch.cuda.current_stream().wait_event(ffn_coeff_event)
         residual = self.hc_ffn.post_mapping(
             x=x_ffn,
             residual=residual,
@@ -707,6 +1049,14 @@ class DeepseekV41Model(DeepseekV4Model):
 
     decoder_layer_cls = DeepseekV41DecoderLayer
     uses_hc_head = False
+    splits_mhc_boundaries = True
+    # Whether this forward may / did close the stream with the fused boundary.
+    _final_close_allowed = False
+    _final_close_fused = False
+    # Class default so a model built without __init__ (unit-test stubs) has no Engram.
+    use_engram = False
+    # Models built without __init__ (test stubs) run the decoder pass eagerly.
+    _decoder_pass_graph: DecoderPassGraph | None = None
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         super().__init__(model_config, *args, **kwargs)
@@ -716,7 +1066,9 @@ class DeepseekV41Model(DeepseekV4Model):
         self.decoder_replay_split, self.decoder_replay_window = self._resolve_replay_policy(
             model_config
         )
-        self.encoder_replay_enabled = encoder_replay_enabled()
+        self.encoder_replay_enabled = encoder_replay_enabled(
+            max_num_tokens=model_config.max_num_tokens, replay_window=self.decoder_replay_window
+        )
         if self.encoder_replay_enabled and (
             self.decoder_replay_split is None or not self.ced_kv_precompute
         ):
@@ -734,6 +1086,16 @@ class DeepseekV41Model(DeepseekV4Model):
             and model_config.pretrained_config.hidden_size == 5120
             else {}
         )
+        self._engram_context_overlap = self._supports_engram_context_overlap(model_config)
+        schedule = _ENGRAM_CONTEXT_SCHEDULE if self._engram_context_overlap else {}
+        layers = list(schedule)
+        # A lookup starts on the Engram stream after the previous Engram layer's projection.
+        self._engram_lookup_start = {
+            layer: 0 if previous is None else schedule[previous][0] + 1
+            for previous, layer in zip([None, *layers], layers)
+        }
+        self._engram_lookup_ctas = {layer: ctas for layer, (_, ctas) in schedule.items()}
+        self._engram_projection_layers = {after: layer for layer, (after, _) in schedule.items()}
         bounded_replay_on_generation = model_config.extra_attrs.get(
             "bounded_replay_on_generation", False
         )
@@ -756,6 +1118,23 @@ class DeepseekV41Model(DeepseekV4Model):
                 f"after the prompt prefix, and generation workers replay the final "
                 f"{self.decoder_replay_window} prompt tokens through the full model. "
                 "Set bounded_replay_on_generation=false to disable."
+            )
+        # With breakable prefill CUDA graphs, attention DP replays the decoder pass from its
+        # own graphs. Everything that could decline a forward is fixed here, so every rank
+        # takes the same path.
+        if (
+            model_config.extra_attrs.get("breakable_prefill_cuda_graph", False)
+            and mapping.enable_attention_dp
+            and self.decoder_replay_split is not None
+            and not self.disagg_remote_tail_replay
+            and model_config.spec_config is None
+            and all(
+                layer.self_attn.supports_row_split
+                for layer in self.layers[self.decoder_replay_split : self.num_hidden_layers]
+            )
+        ):
+            self._decoder_pass_graph = DecoderPassGraph(
+                self._run_decoder_pass, self.decoder_replay_window
             )
 
     def _precompute_engram_kv(
@@ -782,6 +1161,12 @@ class DeepseekV41Model(DeepseekV4Model):
         spec_metadata = kwargs.get("spec_metadata")
         if isinstance(spec_metadata, DSparkSpecMetadata):
             spec_metadata.context_capture_lens = None
+        # The fused close normalizes the final state, so it is off when a speculative worker
+        # captures the final hidden state (layer -1).
+        is_capture = getattr(spec_metadata, "is_layer_capture", None)
+        self._final_close_allowed = is_capture is None or not is_capture(-1)
+        self._final_close_fused = False
+        attn_metadata.mhc_final_normalized = False
         if self.disagg_context_only:
             mode = getattr(attn_metadata, "csa2_remote_tail_mode", None)
             if mode not in (None, "source"):
@@ -800,7 +1185,25 @@ class DeepseekV41Model(DeepseekV4Model):
         ):
             kwargs.pop("context_requests", None)
             requests = None
-        output = super().forward(attn_metadata, *args, **kwargs)
+        engram_streams = []
+        # FIXME: Investigate intermittent startup failures with eager Engram side-stream
+        # execution when BCG is enabled and remote-tail and attention DP are disabled.
+        if self.use_engram and is_in_breakable_cuda_graph():
+            # BCG uses the model stream; eager prefill and decode-only batches retain Engram's stream.
+            for layer_id in self.engram_layer_ids:
+                engram = self.layers[layer_id].engram
+                if engram is not None and engram.stream is not None:
+                    engram_streams.append((engram, engram.stream, engram.sync_event))
+                    engram.stream = None
+                    engram.sync_event = None
+        try:
+            output = super().forward(attn_metadata, *args, **kwargs)
+        finally:
+            for engram, stream, event in engram_streams:
+                engram.stream = stream
+                engram.sync_event = event
+        # The logits processor skips its norm for a state the fused close normalized.
+        attn_metadata.mhc_final_normalized = self._final_close_fused
         if isinstance(spec_metadata, DSparkSpecMetadata):
             spec_metadata.context_capture_lens = attn_metadata.csa2_decoder_capture_lens
         if requests and self.encoder_replay_enabled:
@@ -841,16 +1244,69 @@ class DeepseekV41Model(DeepseekV4Model):
             **({"token_mask": token_mask[:real_num_tokens]} if token_mask is not None else {}),
         )
 
+    def _supports_engram_context_overlap(self, model_config: ModelConfig[PretrainedConfig]) -> bool:
+        """Whether context batches can overlap the Engram layers' work with the model stream."""
+        return (
+            model_config.mapping.tp_size == 2
+            and self.use_engram
+            and self.engram_layer_ids == list(_ENGRAM_CONTEXT_SCHEDULE)
+            and all(
+                self.layers[layer_id].engram.exchanges_token_rows
+                and self.layers[layer_id].engram.kv_proj.supports_packed_input()
+                for layer_id in self.engram_layer_ids
+            )
+        )
+
+    def _use_engram_context_overlap(self, attn_metadata: CSA2TrtllmMetadata) -> bool:
+        """Whether this batch overlaps the Engram layers' work with the model stream. Every
+        attention-DP rank decides alike, because all of them join the token exchanges."""
+        return (
+            self._engram_context_overlap
+            # Breakable graphs detach the Engram streams and run on the model stream.
+            and not is_in_breakable_cuda_graph()
+            and max(attn_metadata.all_rank_num_tokens) > _ENGRAM_CONTEXT_MIN_TOKENS
+        )
+
+    def _engram_precompute_start_layer(
+        self, layer_id: int, attn_metadata: CSA2TrtllmMetadata
+    ) -> int:
+        if self._use_engram_context_overlap(attn_metadata):
+            return self._engram_lookup_start[layer_id]
+        return 0
+
     def _precompute_engram(
         self,
         layer_id: int,
         hash_indices: torch.Tensor,
         dtype: torch.dtype,
         attn_metadata: CSA2TrtllmMetadata,
-    ) -> torch.Tensor | _AttentionDPEngramEmbeddings:
-        return self.layers[layer_id].engram.precompute(
+    ) -> torch.Tensor | _AttentionDPEngramEmbeddings | _StagedEngramLookup:
+        engram = self.layers[layer_id].engram
+        if self._use_engram_context_overlap(attn_metadata):
+            return engram.precompute_lookup(
+                hash_indices,
+                attn_metadata.all_rank_num_tokens,
+                max_ctas=self._engram_lookup_ctas[layer_id],
+            )
+        return engram.precompute(
             hash_indices, dtype=dtype, all_rank_num_tokens=attn_metadata.all_rank_num_tokens
         )
+
+    def _engram_after_attention_callback(
+        self,
+        layer_idx: int,
+        embeddings: dict[int, Any],
+        attn_metadata: CSA2TrtllmMetadata,
+    ) -> Callable[[], None] | None:
+        target = self._engram_projection_layers.get(layer_idx)
+        if target is None or not self._use_engram_context_overlap(attn_metadata):
+            return None
+        lookup = embeddings[target]
+
+        def project() -> None:
+            embeddings[target] = self.layers[target].engram.project_lookup(lookup)
+
+        return project
 
     def _resolve_replay_policy(
         self, model_config: ModelConfig[PretrainedConfig]
@@ -901,8 +1357,12 @@ class DeepseekV41Model(DeepseekV4Model):
         if mapping.enable_attention_dp and model_config.extra_attrs.get(
             "bounded_replay_on_generation", False
         ):
-            if spec_config is not None:
-                return refuse("attention-DP remote-tail replay requires speculative decoding off")
+            if spec_config is not None and not (
+                spec_config.spec_dec_mode.is_dspark() and spec_config.draft_is_embedded_in_target
+            ):
+                return refuse(
+                    "attention-DP remote-tail replay requires embedded DSpark speculation"
+                )
             # An idle context rank must stop at the same layer as active ranks,
             # otherwise their MoE collectives diverge. Pruned context workers
             # force source routing even for warmup and dummy batches; generation
@@ -976,6 +1436,7 @@ class DeepseekV41Model(DeepseekV4Model):
                     "the embedded DSpark window or validated entry-capture layers are unknown"
                 )
             window = max(window, draft_window)
+        window = bounded_replay_tokens(window)
         logger.info(
             f"DeepSeek-V4.1 decoder bounded replay enabled: layers {split}-"
             f"{self.num_hidden_layers - 1} replay over a {window}-token window "
@@ -1034,9 +1495,11 @@ class DeepseekV41Model(DeepseekV4Model):
                         "before exchanging ADP token counts."
                     )
         else:
-            plan = self._make_bounded_replay_plan(
-                attn_metadata, all_token_states_required, requests
-            )
+            plan = getattr(attn_metadata, "decoder_replay_plan", None)
+            if plan is None:
+                plan = self._make_bounded_replay_plan(
+                    attn_metadata, all_token_states_required, requests
+                )
         if plan is None:
             return None, None
         if plan.replays_local_tokens and not self._decoder_replay_observed:
@@ -1068,13 +1531,13 @@ class DeepseekV41Model(DeepseekV4Model):
 
         if (
             self.decoder_replay_split is None
+            or (is_in_breakable_cuda_graph() and self.disagg_remote_tail_replay)
             or (
                 attn_metadata.mapping is not None
                 and attn_metadata.mapping.enable_attention_dp
                 and self.disagg_remote_tail_replay
             )
             or getattr(attn_metadata, "csa2_remote_tail_mode", None) is not None
-            or getattr(attn_metadata.kv_cache_manager, "enable_swa_scratch_reuse", False)
         ):
             return None
         allow_replay = not all_token_states_required or bool(
@@ -1105,13 +1568,40 @@ class DeepseekV41Model(DeepseekV4Model):
         if not self.disagg_remote_tail_replay:
             return None
         mode = getattr(attn_metadata, "csa2_remote_tail_mode", None)
-        return self.decoder_replay_split if mode in ("source", "destination") else None
+        if mode in ("source", "destination") or (
+            is_in_breakable_cuda_graph() and not self.disagg_context_only
+        ):
+            return self.decoder_replay_split
+        return None
 
     def _enter_remote_tail_boundary(
         self, attn_metadata, hc_state: HCState
     ) -> tuple[torch.Tensor | None, HCState]:
         """Materialize boundary GLOBAL and either finish the source or enter replay."""
         hc_state = self._resolve_hc_state(hc_state)
+        if is_in_breakable_cuda_graph() and not self.disagg_context_only:
+
+            def prepare_destination(residual: torch.Tensor, pre_mix: torch.Tensor) -> None:
+                attn_metadata.csa2_precomputed_kv_layers.clear()
+                mode = attn_metadata.csa2_remote_tail_mode
+                if mode is None:
+                    return
+                if mode != "destination":
+                    raise ValueError(f"unknown CSA2 remote-tail mode {mode!r}")
+                real_tokens = attn_metadata.num_tokens
+                if real_tokens > residual.shape[0]:
+                    raise ValueError("CSA2 remote-tail rows exceed the padded graph input")
+                if self.ced_kv_precompute:
+                    prepare_ced_global_kv(
+                        self.layers[self.decoder_replay_split],
+                        HCState.resolved(residual[:real_tokens], pre_mix=pre_mix[:real_tokens]),
+                        attn_metadata,
+                    )
+                enter_remote_tail_decoder(attn_metadata, attn_metadata.csa2_remote_tail_starts)
+
+            eager_on_graph(prepare_destination)(hc_state.residual, hc_state.pre_mix)
+            return None, hc_state
+
         collapsed = None
         if self.ced_kv_precompute:
             collapsed = prepare_ced_global_kv(
@@ -1164,6 +1654,43 @@ class DeepseekV41Model(DeepseekV4Model):
             ),
         )
 
+    def _run_replayed_layers(
+        self, start, attn_metadata, position_ids, input_ids, hc_state, **layer_kwargs
+    ):
+        """Run the decoder pass at a graph bucket's shape when one fits, else eagerly."""
+        graph = self._decoder_pass_graph
+        bucket = (
+            None if graph is None or is_in_breakable_cuda_graph() else graph.select(attn_metadata)
+        )
+        if bucket is None:
+            return super()._run_replayed_layers(
+                start, attn_metadata, position_ids, input_ids, hc_state, **layer_kwargs
+            )
+        # No speculative inputs: the graph exists only without speculative decoding.
+        return graph.run(
+            bucket,
+            attn_metadata,
+            self._resolve_hc_state(hc_state),
+            position_ids,
+            input_ids,
+            image_mask=layer_kwargs.get("image_mask"),
+        )
+
+    def _run_decoder_pass(
+        self, position_ids, input_ids, hc_state, attn_metadata, row_split, image_mask=None
+    ):
+        """The body of the decoder-pass graph."""
+        for layer in self.layers[self.decoder_replay_split : self.num_hidden_layers]:
+            hc_state = layer(
+                position_ids=position_ids,
+                hc_state=hc_state,
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                row_split=row_split,
+                **({"image_mask": image_mask} if image_mask is not None else {}),
+            )
+        return self._resolve_hc_state(hc_state)
+
     def _exit_bounded_replay(self, plan, attn_metadata, hidden_states):
         """Restore the output layout and metadata after successful Decoder execution."""
         hidden_states = scatter_replayed_rows(hidden_states, plan)
@@ -1176,10 +1703,11 @@ class DeepseekV41Model(DeepseekV4Model):
 
     def _resolve_hc_state(self, hc_state: HCState) -> HCState:
         """Materialize a deferred post update using any layer's parameter-free mapping."""
+        hc_state.wait_coefficients()
         if not hc_state.is_deferred:
             return hc_state
         residual = self.layers[0].hc_attn.post_mapping(
-            x=hc_state.x_prev,
+            x=hc_state.reduced_x_prev(),
             residual=hc_state.residual,
             post_layer_mix=hc_state.post_mix,
             comb_res_mix=hc_state.comb_mix,
@@ -1212,10 +1740,47 @@ class DeepseekV41Model(DeepseekV4Model):
         with the same coefficients every other sublayer boundary uses, rather
         than V4's separately-parameterized ``hc_head``. Returns plain
         ``[N, hidden]``; ``DeepseekV4LogitsProcessor`` then applies ``norm`` and
-        the head, matching ``head(norm(h))``.
+        the head, matching ``head(norm(h))``, unless ``_fused_final_close`` returns
+        ``norm(h)`` itself.
         """
+        normalized = self._fused_final_close(hc_state)
+        if normalized is not None:
+            return normalized
         hc_state = self._resolve_hc_state(hc_state)
         return mHC.collapse(hc_state.residual, hc_state.pre_mix)
+
+    def _fused_final_close(self, hc_state: HCState) -> Optional[torch.Tensor]:
+        """``norm(h)`` from one boundary launch (all-reduce of the last MoE partial, post
+        update, collapse with the last ``pre``, final RMSNorm), or None where it does not apply:
+        the forward reads the un-normalized final state (``_final_close_allowed``), or the last
+        layer left no partial for an in-boundary all-reduce."""
+        if (
+            not self._final_close_allowed
+            or not hc_state.is_deferred
+            or hc_state.x_prev_allreduce is None
+            or hc_state.pre_mix is None
+        ):
+            return None
+        rows = hc_state.residual.shape[0]
+        last = self.layers[self.num_hidden_layers - 1]
+        if not last._mhc_split(rows):
+            return None
+        allreduce = last._mhc_fused_allreduce()
+        if allreduce is None:
+            return None
+        hc_state.wait_coefficients()
+        _, normalized = mhc_allreduce_post_collapse_norm(
+            hc_state.x_prev,
+            hc_state.residual,
+            hc_state.post_mix,
+            hc_state.comb_mix,
+            hc_state.pre_mix,
+            self.norm.weight,
+            self.norm.variance_epsilon,
+            allreduce,
+        )
+        self._final_close_fused = True
+        return normalized
 
     # The descriptor fields a *constructed* layer observably owns. Everything
     # else on ``DeepseekV41LayerDescriptor`` is either bookkeeping only the
@@ -2326,7 +2891,10 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             else:
                 self.model.layers[index] = _OmittedContextDecoder()
         self.model.norm = _OmittedContextDecoder()
+        num_embeddings = self.lm_head.num_embeddings
         self.lm_head = _OmittedContextDecoder()
+        # Token-range validation needs vocabulary metadata, not output weights.
+        self.lm_head.num_embeddings = num_embeddings
         self.epilogue = [self.lm_head]
         self.logits_processor = _ContextOnlyLogitsProcessor(self.config.vocab_size)
         # Publish the validated execution boundary only after pruning. The
@@ -2350,22 +2918,24 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     def post_load_weights(self):
         super().post_load_weights()
         # Cross-layer deferral of hc_ffn.post_mapping into the next layer's fused lagged
-        # entry (mHC.fused_hc_lagged): one fewer kernel per layer at decode. Not across an
-        # engram entry, the CED boundary (both need a materialized residual), or the final layer;
-        # TRTLLM_V41_MHC_DEFER=0 turns it off for A/B.
+        # entry (mHC.fused_hc_lagged): one fewer kernel per layer at decode. An engram entry and
+        # the replay boundaries materialize the state themselves. Except in a context-only model,
+        # the final layer defers into the fused stream close (DeepseekV41Model._fused_final_close),
+        # which materializes the state itself where it does not apply. TRTLLM_V41_MHC_DEFER=0
+        # turns deferral off for A/B.
         defer_ok = os.environ.get("TRTLLM_V41_MHC_DEFER", "1").lower() not in ("0", "false")
         defer_ok = defer_ok and not self.model_config.mapping.has_pp()
         layers = self._post_load_decoder_layers()
+        # The NVFP4 MoEs consume their input as fp4_quantize(x, fc31_input_scale) writes it,
+        # which the FFN boundary can produce alongside the BF16 router input.
+        nvfp4_moe = self.model_config.moe_backend in ("CUTEDSL", "TRTLLM")
         for idx, layer in enumerate(layers):
-            next_layer = layers[idx + 1] if idx + 1 < len(layers) else None
-            layer._v41_defer_post_mapping = bool(
-                defer_ok
-                and next_layer is not None
-                and getattr(next_layer, "engram", None) is None
-                and not (
-                    self.model.ced_kv_precompute and idx + 1 == self.model.decoder_replay_split
-                )
+            layer._moe_nvfp4_input = nvfp4_moe and layer.mlp.experts.has_nvfp4
+            layer._v41_defer_post_mapping = defer_ok and (
+                idx + 1 < len(layers) or not self.model.disagg_context_only
             )
+            # Look up the all-reduce workspace now rather than during CUDA-graph capture.
+            layer._mhc_fused_allreduce()
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         # Both of these are refusals rather than silent degradations: each one
@@ -2417,6 +2987,25 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             all_token_states_required=all_token_states_required,
             requests=requests,
         )
+
+    def prepare_breakable_cuda_graph_replay(self, inputs: dict[str, Any]) -> None:
+        """Refresh mutable model state before replay skips the Python model body."""
+        if inputs.get("multimodal_params") or inputs.get("image_mask") is not None:
+            raise ValueError(
+                "DeepSeek-V4.1 breakable CUDA graph replay does not support multimodal inputs: "
+                "Engram image masks are not refreshed during replay"
+            )
+        attn_metadata = inputs["attn_metadata"]
+        attn_metadata.begin_model_forward()
+        if self.model.use_engram and self.model.engram_hash_provider is not None:
+            input_ids = inputs["input_ids"]
+            self.model._compute_engram_hashes(
+                input_ids,
+                inputs.get("position_ids"),
+                attn_metadata,
+                padded_num_tokens=input_ids.numel(),
+                refresh=True,
+            )
 
     def prepare_request_inputs(
         self, scheduled_requests, attn_metadata, promoted_context_request_ids=frozenset()
@@ -2491,12 +3080,12 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        """Default to cached-context MLA and addressable SWA pages for replay.
+        """Default to cached-context MLA and SWA scratch reuse for replay.
 
-        Scratch reuse rotates a small SWA buffer across prefill chunks; replay
-        needs paged window positions that remain addressable after metadata is
-        rebuilt. Cross-request prefix reuse retains required Encoder checkpoints
-        unless Encoder replay permits independent eviction and recomputation.
+        Scratch covers temporary chunk KV; retained replay-window pages stay
+        addressable when Decoder metadata is rebuilt. Cross-request prefix reuse
+        retains required Encoder checkpoints unless Encoder replay permits
+        independent eviction and recomputation.
         Deferred execution keeps prefix reuse disabled by default.
 
         A replay deployment also needs ``enable_chunked_prefill=True`` to enable
@@ -2510,9 +3099,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         defaults["kv_cache_config"].pop("dtype", None)
         if decoder_bounded_replay_enabled():
             defaults["enable_chunked_prefill"] = True
-            defaults.setdefault("kv_cache_config", {}).update(
-                enable_block_reuse=False, enable_swa_scratch_reuse=False
-            )
+            defaults.setdefault("kv_cache_config", {})["enable_block_reuse"] = False
         return defaults
 
     def forward(

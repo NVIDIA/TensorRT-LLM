@@ -44,7 +44,7 @@
 # This file is copied and modified from cutlass example https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/blockwise_gemm/blockwise_gemm.py
 
 import math
-from typing import Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -52,6 +52,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
@@ -165,6 +166,7 @@ class Sm100BlockwiseGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        mxfp8_out: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockwise dense GEMM kernel.
 
@@ -187,9 +189,14 @@ class Sm100BlockwiseGemmKernel:
         :type use_2cta_instrs: bool
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
+        :param mxfp8_out: Quantize each BF16 output row's 32-column epilogue slices to MXFP8
+            into ``c_fp8`` with UE8M0 scales in ``c_scale``, laid out as the CUTLASS 128x4
+            activation scales of a ``[M, N * L]`` operand, and skip the BF16 store.
+        :type mxfp8_out: bool
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
+        self.mxfp8_out = mxfp8_out
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -319,6 +326,15 @@ class Sm100BlockwiseGemmKernel:
             self.c_layout,
             self.c_dtype,
         )
+        if self.mxfp8_out and (
+            self.c_layout != utils.LayoutEnum.ROW_MAJOR
+            or self.c_dtype != cutlass.BFloat16
+            or cute.size(self.epi_tile[0]) != 128
+            or cute.size(self.epi_tile[1]) != 32
+        ):
+            raise ValueError("MXFP8 output requires row-major BF16 with 128x32 epilogue tiles")
+        # The epilogue stages E4M3 in shared memory when it quantizes the output.
+        self.c_smem_dtype = cutlass.Float8E4M3FN if self.mxfp8_out else self.c_dtype
 
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
@@ -333,7 +349,7 @@ class Sm100BlockwiseGemmKernel:
             self.a_dtype,
             self.b_dtype,
             self.epi_tile,
-            self.c_dtype,
+            self.c_smem_dtype,
             self.c_layout,
             self.sfa_dtype,
             self.sfb_dtype,
@@ -357,7 +373,7 @@ class Sm100BlockwiseGemmKernel:
             self.num_ab_stage,
         )
         self.c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.c_dtype,
+            self.c_smem_dtype,
             self.c_layout,
             self.epi_tile,
             self.num_c_stage,
@@ -401,6 +417,8 @@ class Sm100BlockwiseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        c_fp8: Optional[cute.Tensor] = None,
+        c_scale: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -425,6 +443,11 @@ class Sm100BlockwiseGemmKernel:
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
+        :param c_fp8: E4M3 output with the layout of ``c`` (``mxfp8_out`` only); ``c`` then
+            only describes the output shape and is not written
+        :type c_fp8: cute.Tensor
+        :param c_scale: Flat UE8M0 output scales (``mxfp8_out`` only)
+        :type c_scale: cute.Tensor
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
         # Setup static attributes before smem/grid/tma computation
@@ -440,6 +463,8 @@ class Sm100BlockwiseGemmKernel:
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
+        if cutlass.const_expr(self.mxfp8_out and (c_fp8 is None or c_scale is None)):
+            raise ValueError("MXFP8 output requires the E4M3 output and its scale tensor")
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
@@ -491,7 +516,7 @@ class Sm100BlockwiseGemmKernel:
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
-            c,
+            c_fp8 if cutlass.const_expr(self.mxfp8_out) else c,
             epi_smem_layout,
             c_cta_v_layout,
         )
@@ -555,7 +580,7 @@ class Sm100BlockwiseGemmKernel:
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.c_dtype,
+                    self.c_smem_dtype,
                     c_smem_size,
                 ],
                 self.buffer_align_bytes,
@@ -592,6 +617,7 @@ class Sm100BlockwiseGemmKernel:
             tma_tensor_b,
             tma_atom_c,
             tma_tensor_c,
+            c_scale,
             tensor_sfa,
             tensor_sfb,
             self.cluster_layout_vmnk,
@@ -624,6 +650,7 @@ class Sm100BlockwiseGemmKernel:
         mB_nkl: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
+        mCScale: Optional[cute.Tensor],
         mSFA_mkl: cute.Tensor,
         mSFB_nkl: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
@@ -1683,9 +1710,28 @@ class Sm100BlockwiseGemmKernel:
             bSG_sC = None
             bSG_gC_partitioned = None
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
-            tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
-                tiled_copy_t2r, tTR_rC, epi_tidx, sC
-            )
+            if cutlass.const_expr(self.mxfp8_out):
+                # BF16 values are rounded and scaled in registers, then staged as E4M3.
+                tiled_copy_r2s = cute.make_tiled_copy_D(
+                    sm100_utils.get_smem_store_op(
+                        self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
+                    ),
+                    tiled_copy_t2r,
+                )
+                tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+                tTR_rCFp8 = cute.make_rmem_tensor(tTR_rAcc.shape, cutlass.Float8E4M3FN)
+                tiled_copy_r2s_fp8 = cute.make_tiled_copy_D(
+                    cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
+                    ),
+                    tiled_copy_t2r,
+                )
+                tRS_sC = tiled_copy_r2s_fp8.get_slice(epi_tidx).partition_D(sC)
+                tRS_rCFp8 = tiled_copy_r2s_fp8.retile(tTR_rCFp8)
+            else:
+                tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
+                    tiled_copy_t2r, tTR_rC, epi_tidx, sC
+                )
             (
                 tma_atom_c,
                 bSG_sC,
@@ -1789,11 +1835,28 @@ class Sm100BlockwiseGemmKernel:
                     #
                     num_prev_subtiles = num_prev_subtiles + 1
                     c_buffer = num_prev_subtiles % self.num_c_stage
-                    cute.copy(
-                        tiled_copy_r2s,
-                        tRS_rC,
-                        tRS_sC[(None, None, None, c_buffer)],
-                    )
+                    if cutlass.const_expr(self.mxfp8_out):
+                        self._mxfp8_out_transform(
+                            tRS_rC,
+                            tile_info[0] * self.cta_tile_shape_mnk[0] + epi_tidx,
+                            tile_info[1] * self.cta_tile_shape_mnk[1]
+                            + subtile_idx * cute.size(epi_tile[1]),
+                            tile_info[2],
+                            mC_mnl,
+                            mCScale,
+                        )
+                        tRS_rCFp8.store(tRS_rC.load().to(cutlass.Float8E4M3FN))
+                        cute.copy(
+                            tiled_copy_r2s_fp8,
+                            tRS_rCFp8,
+                            tRS_sC[(None, None, None, c_buffer)],
+                        )
+                    else:
+                        cute.copy(
+                            tiled_copy_r2s,
+                            tRS_rC,
+                            tRS_sC[(None, None, None, c_buffer)],
+                        )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
                         "async.shared",
@@ -1845,6 +1908,61 @@ class Sm100BlockwiseGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+
+    @cute.jit
+    def _mxfp8_out_transform(
+        self,
+        rC: cute.Tensor,
+        row: cutlass.Int32,
+        column: cutlass.Int32,
+        tile_l: cutlass.Int32,
+        mC: cute.Tensor,
+        scales: cute.Tensor,
+    ):
+        """Scale this thread's 32 BF16 values of ``row`` to E4M3 range and store their UE8M0 byte.
+
+        The values start at ``column`` of group ``tile_l``; scaling by a power of two keeps
+        them exact in BF16, so the E4M3 conversion rounds exactly as ``mxfp8_quantize`` of
+        the BF16 output. Rows past M up to the next multiple of 128 store a zero scale;
+        rows beyond, and columns past the group's N, store none.
+        """
+        width = mC.shape[1]
+        block = (tile_l * width + column) // 32
+        values = cute.make_tensor(rC.iterator, cute.make_layout(32))
+        amax = cutlass.Float32(0.0)
+        for index in cutlass.range_constexpr(32):
+            value = values[index].to(cutlass.Float32)
+            amax = cute.arch.fmax(amax, cute.arch.fmax(value, -value))
+        bits = cutlass.Uint32(
+            llvm.bitcast(cutlass.Uint32.mlir_type, (amax * cutlass.Float32(1.0 / 448.0)).ir_value())
+        )
+        exponent = (bits >> 23) & cutlass.Uint32(255)
+        if bits & cutlass.Uint32(0x7FFFFF) != cutlass.Uint32(0):
+            exponent = exponent + cutlass.Uint32(1)
+        if exponent > cutlass.Uint32(254):
+            exponent = cutlass.Uint32(254)
+        reciprocal = cutlass.Float32(
+            llvm.bitcast(
+                cutlass.Float32.mlir_type, ((cutlass.Uint32(254) - exponent) << 23).ir_value()
+            )
+        )
+        if amax == cutlass.Float32(0.0):
+            reciprocal = cutlass.Float32(0.0)
+        for index in cutlass.range_constexpr(32):
+            values[index] = (values[index].to(cutlass.Float32) * reciprocal).to(cutlass.BFloat16)
+        if row >= mC.shape[0]:
+            exponent = cutlass.Uint32(0)
+        blocks = width * mC.shape[2] // 32
+        offset = (
+            (row // 128) * blocks * 128
+            + (block // 4) * 512
+            + (row % 32) * 16
+            + ((row % 128) // 32) * 4
+            + block % 4
+        )
+        # A cluster may run tiles past the group's columns; their scales stay unwritten.
+        if (row < (mC.shape[0] + 127) // 128 * 128) & (column < width):
+            scales[offset] = cutlass.Uint8(exponent)
 
     def acc_update_tmem_copy_and_partition(
         self,
