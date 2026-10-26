@@ -423,20 +423,18 @@ def _failing_gen_scheduler(enable_recompute_pause: bool, ladder_calls: list) -> 
     )
     sched._has_pending_connector_load = lambda req: False
     sched._suspend_request = lambda req: ladder_calls.append("self_suspend")
+    sched._clear_request_runtime_state = types.MethodType(
+        KVCacheV2Scheduler._clear_request_runtime_state, sched
+    )
     return sched
 
 
-def _schedule_failing_gen(sched: SimpleNamespace):
+def _schedule_failing_gen(sched: SimpleNamespace, req: SimpleNamespace):
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
         KVCacheV2Scheduler,
         _RecomputePauseState,
     )
 
-    req = SimpleNamespace(
-        py_request_id=7,
-        get_beam_width_by_iter=lambda for_next_iteration: 1,
-        py_draft_tokens=None,
-    )
     return KVCacheV2Scheduler._try_schedule_generation(
         sched,
         req,
@@ -452,27 +450,39 @@ def _schedule_failing_gen(sched: SimpleNamespace):
     )
 
 
+def _gen_request() -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=7,
+        get_beam_width_by_iter=lambda for_next_iteration: 1,
+        py_draft_tokens=None,
+        py_batch_idx=3,
+    )
+
+
 def test_scheduler_allocation_failure_raises_under_disagg_helix() -> None:
     """A disaggregated helix generation server cannot replay a prefill, so a
     generation allocation failure raises instead of entering eviction."""
     ladder_calls = []
     sched = _failing_gen_scheduler(enable_recompute_pause=False, ladder_calls=ladder_calls)
     with pytest.raises(RuntimeError, match="cannot preempt"):
-        _schedule_failing_gen(sched)
+        _schedule_failing_gen(sched, _gen_request())
     assert ladder_calls == []
 
 
 def test_scheduler_allocation_failure_preempts_under_agg_helix() -> None:
     """Aggregated helix can replay a prefill and has a single hot GPU pool,
     where suspending frees nothing, so a generation allocation failure goes
-    straight to recompute-pause."""
+    straight to recompute-pause. The request sits out the step without being
+    suspended, so its stale batch index must still be cleared."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
 
     ladder_calls = []
     sched = _failing_gen_scheduler(enable_recompute_pause=True, ladder_calls=ladder_calls)
-    action, *_ = _schedule_failing_gen(sched)
+    req = _gen_request()
+    action, *_ = _schedule_failing_gen(sched, req)
     assert action is ScheduleAction.STOP
     assert ladder_calls == ["recompute_pause"]
+    assert req.py_batch_idx is None
 
 
 def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:

@@ -2289,6 +2289,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # so pool pressure is relieved by preemption, as in the connector
             # case.
             host_quota = 0
+            logger.info(
+                "KV cache manager v2 host tier disabled: aggregated helix runs "
+                "GPU-only and relieves KV pressure by recompute pause."
+            )
         elif connector_registers_pages and kv_cache_config.host_cache_size is None:
             # A connector holds device addresses for its pages, and evicting a
             # page to another tier reassigns its GPU slot underneath it. The

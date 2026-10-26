@@ -480,6 +480,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # prevents PEFT adapter eviction failures when gen requests hold
         # adapters that can't be evicted mid-iteration.
         pending_ctx: RequestList = []
+        # Index of each pending context request in requests_list.
+        pending_ctx_index: dict[int, int] = {}
 
         # Pre-claim PEFT pages for GENERATION_TO_COMPLETE requests.
         # In the overlap executor these requests are no longer scheduled
@@ -560,6 +562,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 # Defer to phase 2 so gen PEFT budget is settled first.
                 pending_ctx.append(req)
+                pending_ctx_index[req.py_request_id] = req_it
                 req_it += 1
                 continue
 
@@ -630,7 +633,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     if other.py_request_id in demoted_ids:
                         protected.add(other.py_request_id)
             return self._try_preempt_for_pages(
-                requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids, req
+                requests_list,
+                protected,
+                inflight_request_ids,
+                recompute_paused,
+                preempted_ids,
+                pending_ctx_index[req.py_request_id],
             )
 
         # --- Phase 2: schedule deferred context / encoder requests ---
@@ -1698,14 +1706,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not success:
             if self.has_cp_helix:
                 if not self.enable_recompute_pause:
-                    # A disaggregated helix generation server cannot replay a
-                    # prefill, and suspending to a lower tier is not validated
-                    # under helix, so fail instead of stalling.
+                    # Without recompute pause (e.g. a disaggregated generation
+                    # server, which cannot replay a prefill) there is no way to
+                    # free pages, and suspending to a lower tier is not
+                    # validated under helix, so fail instead of stalling.
                     raise RuntimeError(
                         f"[V2Scheduler] KV allocation failed for helix request "
-                        f"{req.py_request_id}; a disaggregated helix generation "
-                        f"server cannot preempt a request, since it cannot "
-                        f"replay the prefill. Increase "
+                        f"{req.py_request_id}; recompute pause is disabled "
+                        f"(e.g. on a disaggregated generation server, which "
+                        f"cannot replay the prefill), so the scheduler cannot "
+                        f"preempt a request. Increase "
                         f"kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
                         f"or max_tokens (GLOBAL tokens across CP ranks, not "
                         f"per-rank), or reduce concurrency."
@@ -1737,14 +1747,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Self-eviction: suspend this gen request to free its
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
-        # that frees no pages. Under aggregated helix's single hot GPU pool
-        # suspending frees nothing either, and an active request stays
-        # eligible for preemption on behalf of a context request.
-        if (
-            not self.has_cp_helix
-            and self.kv_cache_manager.is_request_active(req.py_request_id)
-            and not self._has_pending_connector_load(req)
-        ):
+        # that frees no pages.
+        if self.has_cp_helix:
+            # Suspending frees nothing in aggregated helix's single hot GPU
+            # pool. The request still sits out this step, so clear its stale
+            # batch index.
+            self._clear_request_runtime_state(req)
+        elif self.kv_cache_manager.is_request_active(
+            req.py_request_id
+        ) and not self._has_pending_connector_load(req):
             logger.debug(
                 f"[V2Scheduler] Self-evicting request {req.py_request_id} "
                 f"(state={req.state.name}) to free GPU pages"
@@ -1815,7 +1826,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         inflight_request_ids: set[int],
         recompute_paused: RequestList,
         preempted_ids: set[int],
-        requester: LlmRequest,
+        requester_idx: int,
     ) -> bool:
         """Release one started request's KV cache so another can allocate.
 
@@ -1846,7 +1857,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # Only requests behind the requester, as the generation ladder
             # does: an older victim would retake the pages on the next pass
             # and preempt the requester in turn.
-            stop = next(i for i, r in enumerate(requests_list) if r is requester)
+            stop = requester_idx
         for i in range(len(requests_list) - 1, stop, -1):
             victim = requests_list[i]
             if victim.py_request_id in protected_ids:
