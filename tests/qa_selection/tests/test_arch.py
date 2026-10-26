@@ -28,6 +28,7 @@ the one test whose gate it is about:
 from mocks import ArchCases, MarkerCases
 
 
+# A named machine is decided without touching hardware / Mark conditions are never evaluated
 def test_pre_blackwell_gate(selection):
     """`skip_pre_blackwell` is `sm < 100`: fires on H100, not on B200.
 

@@ -18,7 +18,8 @@
     -> pytest --collect-only -p qa_selection.plugin --machine=H100 test_arch_cases.py
 
     run.selected          the node ids the run kept, in collection order
-    run.record            <machine>.json, when the run named --selection-out-dir={out}
+    run.record            <machine>.json, when the run named --selection-out-dir={out};
+                          local.json when it named no machine
     run.outcome(nodeid)   one test's entry in that record
     run.ids(rung)         one rung's published identifier list
     run.written           every file name the run left in its output directory
@@ -26,7 +27,7 @@
 
 `selection.refuse(...)` is the same call for a run that must fail as a usage
 error; it returns the same object, with `run.result` for the message.
-`selection.without_plugin(...)` runs the same command without `-p`.
+`selection.seed(name, content)` writes a file into `{out}` before a run.
 
 Options pass through as the literal strings a user types. `{out}` is the one
 substitution: it expands to a directory belonging to that run.
@@ -36,7 +37,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List
 
 import pytest
 
@@ -72,7 +73,7 @@ class SelectionRun:
     def __init__(
         self,
         command: str,
-        machine: Optional[str],
+        machine: str,
         path: Path,
         out_dir: Path,
         result: pytest.RunResult,
@@ -152,6 +153,8 @@ class SelectionHarness:
     OUT_DIR = "out"
     OUT_PLACEHOLDER = "{out}"
     MACHINE_OPTION = "--machine="
+    #: The record name of a run that names no machine.
+    LOCAL = "local"
 
     #: Deselecting every candidate still writes a full record, and pytest
     #: reports it as `NO_TESTS_COLLECTED`. A usage error is `USAGE_ERROR` and
@@ -164,10 +167,6 @@ class SelectionHarness:
     def run(self, case: str, *options: str) -> SelectionRun:
         """Collect `case` under `options`, failing loudly if the run could not."""
         return self.completed(self.invoke(case, *options))
-
-    def without_plugin(self, case: str, *options: str) -> SelectionRun:
-        """The same collection with the plugin not loaded: `-p` is not passed."""
-        return self.completed(self.invoke(case, *options, plugin=False))
 
     def refuse(self, case: str, *options: str) -> SelectionRun:
         """Run `case` under `options`, requiring a usage error rather than a selection."""
@@ -184,10 +183,9 @@ class SelectionHarness:
         )
         return run
 
-    def invoke(self, case: str, *options: str, plugin: bool = True) -> SelectionRun:
+    def invoke(self, case: str, *options: str) -> SelectionRun:
         """Run the command line and collect every observation, asserting nothing."""
-        loaded = ["-p", self.PLUGIN] if plugin else []
-        argv = [self.MODE, *loaded, *map(self.expand, options), self.stage(case)]
+        argv = [self.MODE, "-p", self.PLUGIN, *map(self.expand, options), self.stage(case)]
         kept = KeptNodeIds()
         result = self.pytester.runpytest(*argv, plugins=[kept])
         return SelectionRun(
@@ -210,14 +208,21 @@ class SelectionHarness:
         """Where `{out}` points: a directory of this run's own."""
         return self.pytester.path / self.OUT_DIR
 
+    def seed(self, name: str, content: str) -> Path:
+        """Write `content` to `name` in the output directory, before the run reads it."""
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        path = self.out_dir / name
+        path.write_text(content, encoding="utf-8")
+        return path
+
     def expand(self, option: str) -> str:
         """Substitute `{out}`, leaving every other option byte-identical."""
         return option.replace(self.OUT_PLACEHOLDER, str(self.out_dir))
 
     @classmethod
-    def machine_in(cls, options: Iterable[str]) -> Optional[str]:
-        """The machine `--machine=` names, or None when the run named none."""
+    def machine_in(cls, options: Iterable[str]) -> str:
+        """The machine `--machine=` names, or `local` when the run named none."""
         for option in options:
             if option.startswith(cls.MACHINE_OPTION):
                 return option[len(cls.MACHINE_OPTION) :]
-        return None
+        return cls.LOCAL

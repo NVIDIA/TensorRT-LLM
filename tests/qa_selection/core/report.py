@@ -19,8 +19,9 @@
     ArtifactNames.written_by(machine, ladder)                -> every file a run writes
     ArtifactNames.orphans_in(out_dir, machine, ladder)       -> this machine's stale files
 
-`<machine>.json` holds the counts and each test's outcome; `<machine>-<rung>gpu.ids`
-holds one rung's selected node ids, one per line.
+`<machine>.json` holds the profile decided for, the counts and each test's
+outcome; `<machine>-<rung>gpu.ids` holds one rung's selected node ids, one per
+line.
 """
 
 from __future__ import annotations
@@ -116,6 +117,7 @@ class SelectionReport:
         """The record, as written to `<machine>.json`."""
         record: Dict[str, object] = {
             "machine": self.machine,
+            "profile": self.profile.to_mapping(),
             "max_gpu_per_node": self.profile.max_gpu_per_node,
             "ladder": list(self.ladder),
             "source_revision": self.source_revision,

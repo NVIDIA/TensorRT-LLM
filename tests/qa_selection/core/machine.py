@@ -99,6 +99,9 @@ class MachineCheck:
 class MachineProfile:
     """One machine's facts, as the skip rules read them."""
 
+    # The facts a catalogue entry states besides its optional `ladder`.
+    FIELDS = ("sm", "device_name", "device_memory_mib", "max_gpu_per_node", "cpu_arch")
+
     name: str
     sm: int
     device_name: str
@@ -128,6 +131,10 @@ class MachineProfile:
             f"{where}: ladder {ladder} must end at max_gpu_per_node {profile.max_gpu_per_node}",
         )
         return dataclasses.replace(profile, ladder=tuple(ladder))
+
+    def to_mapping(self) -> Dict[str, Any]:
+        """The facts as a catalogue entry states them, without `ladder`."""
+        return {field: getattr(self, field) for field in self.FIELDS}
 
     @property
     def default_ladder(self) -> Ladder:
