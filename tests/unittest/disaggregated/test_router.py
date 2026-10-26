@@ -2008,6 +2008,45 @@ async def test_conversation_router_late_bind_new_turn_passes_head_waiting_for_an
 
 
 @pytest.mark.asyncio
+async def test_conversation_router_late_bind_server_from_metadata_takes_a_waiter(
+        monkeypatch):
+    """A server the metadata monitor discovers takes a queued turn without waiting for another request event."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1"],
+                                max_inflight_per_server=1,
+                                late_bind=True)
+    held = _make_request(conversation_id="hold")
+    assert (await router.get_next_server(held))[0] == "server1"
+    waiter = asyncio.create_task(
+        router.get_next_server(_make_request(conversation_id="sess-A")))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    async def fetch_live_servers():
+        return {"k1": "server1", "k2": "server2"}
+
+    async def check_servers_health(server_key_map):
+        return list(server_key_map.values())
+
+    async def prepare_server(server):
+        return None
+
+    monkeypatch.setattr(router, "fetch_live_servers", fetch_live_servers)
+    monkeypatch.setattr(router, "check_servers_health", check_servers_health)
+    monkeypatch.setattr(router, "_filter_servers_by_role",
+                        lambda servers, server_key_map: servers)
+    monkeypatch.setattr(router, "_prepare_server", prepare_server)
+    monitor = asyncio.create_task(router._monitor_servers(poll_interval=3600))
+    try:
+        server, _ = await asyncio.wait_for(waiter, 1)
+        assert server == "server2"
+    finally:
+        monitor.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await monitor
+
+
+@pytest.mark.asyncio
 async def test_conversation_router_late_bind_prefers_pin_when_it_frees():
     router = ConversationRouter(server_role=None,
                                 servers=["server1", "server2"],

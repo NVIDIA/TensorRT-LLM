@@ -376,6 +376,12 @@ class Router(ABC):
             new_servers: The new server list
         """
 
+    async def _after_servers_updated(self):
+        """Called after a server list change once its new servers are prepared, with the lock held.
+
+        Override in subclasses that hold requests waiting for a server.
+        """
+
     @property
     def servers(self) -> List[str]:
         return self._servers
@@ -460,6 +466,7 @@ class Router(ABC):
                 old_servers = self._servers.copy()
                 self._servers = [*old_servers, server]
                 self._on_servers_updated(old_servers, self._servers)
+                await self._after_servers_updated()
         logger.debug(
             f"Added server {server}, {self._server_role.name} current server list: {self._servers}"
         )
@@ -475,6 +482,7 @@ class Router(ABC):
                 old_server for old_server in old_servers if old_server != server
             ]
             self._on_servers_updated(old_servers, self._servers)
+            await self._after_servers_updated()
         self._prepared_ready_servers.discard(server)
         self._server_info.pop(server, None)
         logger.debug(
@@ -570,6 +578,7 @@ class Router(ABC):
                             if server not in old_servers:
                                 await self._prepare_server(server)
                                 logger.info(f"Server {server} is added")
+                        await self._after_servers_updated()
                     else:
                         logger.debug(
                             f"No change in {self._server_role} server list: {len(self._servers)} servers"
@@ -1605,19 +1614,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             fut.set_result(server)
         self._waiters = kept
 
-    async def add_server(self, server: str) -> bool:
-        added = await super().add_server(server)
+    async def _after_servers_updated(self):
         if self._late_bind:
-            async with self._lock:
-                await self._late_bind_dispatch()
-        return added
-
-    async def remove_server(self, server: str):
-        await super().remove_server(server)
-        if self._late_bind:
-            # Waiters left without a candidate fail now rather than at the next completion.
-            async with self._lock:
-                await self._late_bind_dispatch()
+            # A new server can take waiters now; waiters left without a candidate fail now rather than at the next
+            # completion.
+            await self._late_bind_dispatch()
 
     def _maybe_log_pin_counts(self):
         now = time.monotonic()
