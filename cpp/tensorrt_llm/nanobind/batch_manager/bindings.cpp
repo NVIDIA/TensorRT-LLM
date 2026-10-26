@@ -406,10 +406,10 @@ void initBindings(nb::module_& m)
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
                 auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
 
-                // input_tokens: a 1-D contiguous int32 ndarray is memcpy'd (no per-element
+                // input_tokens: a 1-D contiguous int32 host ndarray is memcpy'd (no per-element
                 // PyLong cast, O(ISL) under the GIL); anything else uses the sequence cast.
                 std::vector<tb::LlmRequest::TokenIdType> input_tokens;
-                nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig> input_tokens_arr;
+                nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> input_tokens_arr;
                 if (nb::try_cast(input_tokens_obj, input_tokens_arr, /*convert=*/false))
                 {
                     input_tokens.resize(input_tokens_arr.shape(0));
