@@ -29,7 +29,7 @@ from mpi4py.futures import MPIPoolExecutor
 from pytest_mock import MockerFixture
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 
 # isort: off
 from tensorrt_llm.llmapi import (

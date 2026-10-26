@@ -479,18 +479,18 @@ def test_scheduler_spin_bound_follows_the_warmup_guard_until_shutdown(monkeypatc
     bound = manager.get_scheduler_spin_bound()
 
     assert manager.get_scheduler_spin_bound() is bound
-    assert bound.cycles() == 8_000_000_000
+    assert bound.cycles() == 300 * 2_000_000_000
     tuner.is_tuning_mode = True
     assert bound.cycles() == 1800 * 2_000_000_000
     tuner.is_tuning_mode = False
     guard.set_warmup(True)
     assert bound.cycles() == 1800 * 2_000_000_000
     guard.set_warmup(False)
-    assert bound.cycles() == 8_000_000_000
+    assert bound.cycles() == 300 * 2_000_000_000
     assert manager.shutdown()
     guard.set_warmup(True)
     # A released bound no longer follows the guard.
-    assert bound.cycles() == 8_000_000_000
+    assert bound.cycles() == 300 * 2_000_000_000
 
 
 def test_per_layer_dynamic_manager_shares_the_base_lifecycle_only():

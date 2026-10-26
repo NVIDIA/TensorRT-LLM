@@ -16,13 +16,16 @@ from ..geometry import MAX_EP, MIN_EP, hierarchy_group_sizes
 MAX_EXPERTS = 384
 MAX_CTAS = 128
 MAX_BROADCASTS = MAX_EXPERTS
+# Nominal clock64 rate that converts a timeout in seconds to SM cycles, as the
+# MoE all-to-all kernels assume.
+ASSUMED_CLOCK_HZ = 2_000_000_000
 # Default bound, in SM clock cycles, of the scheduler's grid barrier and
 # cross-rank waits; a timeout records a status flag. Each launch takes its bound
-# as an argument, so callers can allow more peer skew while ranks warm up.
-SPIN_CYCLES = 8_000_000_000
-# Nominal clock64 rate that converts a timeout in seconds to SM cycles, as the
-# MoE all-to-all kernels assume. SPIN_CYCLES is about 4 s at this rate.
-ASSUMED_CLOCK_HZ = 2_000_000_000
+# as an argument, so callers can allow more peer skew while ranks warm up. The
+# default matches NVLinkOneSided's 300 s serving timeout, so a transient stall
+# on one rank does not trap every EP rank; TRTLLM_MOE_COMM_TIMEOUT_SEC can set
+# a shorter bound.
+SPIN_CYCLES = 300 * ASSUMED_CLOCK_HZ
 
 
 def spin_cycles_for_timeout(seconds: int | None) -> int:
