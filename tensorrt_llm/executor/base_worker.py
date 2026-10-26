@@ -37,7 +37,8 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
-from ..llmapi._load_balance_env import configure_moe_launch_queues
+from ..llmapi._load_balance_env import (configure_moe_launch_queues,
+                                        uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -1077,6 +1078,9 @@ class BaseWorker(GenerationExecutor):
     def shutdown(self):
         if self.doing_shutdown:
             return
+        if not uses_collective_shutdown(getattr(self, "llm_args", None)):
+            self._shutdown_rank_local()
+            return
         self.doing_shutdown = True
 
         try:
@@ -1119,8 +1123,26 @@ class BaseWorker(GenerationExecutor):
         except BaseException:
             # Keep the engine reachable so a caller can retry a failed
             # collective terminal cleanup in this long-lived worker process.
+            # Only an explicit call retries it; see __del__.
             self.doing_shutdown = False
+            self._collective_shutdown_failed = True
             raise
+        self._collective_shutdown_failed = False
+
+    def _shutdown_rank_local(self):
+        """Best-effort teardown for configurations without collective EP resources."""
+        self.doing_shutdown = True
+
+        if self.engine is not None:
+            can_shutdown = getattr(self.engine, "can_shutdown", None)
+            if can_shutdown is None:
+                can_shutdown = self.engine.can_enqueue_requests
+            if can_shutdown():
+                self.engine.shutdown()
+                local_cleanup = getattr(self.engine, "local_cleanup", None)
+                if local_cleanup is not None:
+                    local_cleanup()
+                self.engine = None
 
     def get_disaggregated_params(self) -> dict:
         if self.engine is None or self.engine.kv_cache_transceiver is None:
@@ -1297,6 +1319,10 @@ class BaseWorker(GenerationExecutor):
         return exc_type is None or exc_type == self.WorkerExit
 
     def __del__(self):
+        # Finalizers run at a different time on each rank, so they must not
+        # retry a failed collective shutdown.
+        if getattr(self, "_collective_shutdown_failed", False):
+            return
         self.shutdown()
 
 

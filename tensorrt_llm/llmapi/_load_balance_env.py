@@ -47,3 +47,14 @@ def configure_moe_launch_queues(
     overrides[name] = "4x"
     os.environ[name] = "4x"
     return overrides
+
+
+def uses_collective_shutdown(llm_args: Any) -> bool:
+    """Return whether executor teardown must release EP resources collectively.
+
+    Only the per-layer dynamic EPLB fabric arena needs an all-rank release.
+    Every other configuration keeps the best-effort, rank-local teardown.
+    """
+    moe_config = getattr(llm_args, "moe_config", None)
+    load_balancer = getattr(moe_config, "load_balancer", None)
+    return getattr(load_balancer, "mode", None) == "per_layer_dynamic"

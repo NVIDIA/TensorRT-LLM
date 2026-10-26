@@ -23,6 +23,9 @@ import pytest
 pytestmark = pytest.mark.cpu_only
 
 _ROOT = Path(__file__).resolve().parents[4]
+# Worker shutdown contracts below cover the collective path, which only
+# per-layer dynamic EPLB takes.
+_PER_LAYER_DYNAMIC_SHUTDOWN = {"uses_collective_shutdown": lambda llm_args: True}
 _TORCH_ROOT = _ROOT / "tensorrt_llm/_torch"
 _QUEUE = "CUDA_SCALE_LAUNCH_QUEUES"
 _SCHEDULER_RUNTIME = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/cuda_scheduler/runtime.py"
@@ -756,10 +759,11 @@ def test_executor_terminal_cleanup_is_three_phase_and_stream_scoped(monkeypatch)
     executor_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/py_executor.py",
         "PyExecutor",
-        {"terminal_cleanup"},
+        {"terminal_cleanup", "release_rank_local_caches"},
         {
             "__name__": "tensorrt_llm._torch.pyexecutor.py_executor",
             "__package__": "tensorrt_llm._torch.pyexecutor",
+            "sys": sys,
         },
     )
 
@@ -899,7 +903,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         _ROOT / "tensorrt_llm/executor/base_worker.py",
         "BaseWorker",
         {"shutdown"},
-        {},
+        _PER_LAYER_DYNAMIC_SHUTDOWN,
     )
 
     engine = Engine()
@@ -2485,7 +2489,7 @@ def test_base_worker_finalizes_rank_follower_pyexecutor():
         _ROOT / "tensorrt_llm/executor/base_worker.py",
         "BaseWorker",
         {"shutdown"},
-        {},
+        _PER_LAYER_DYNAMIC_SHUTDOWN,
     )
     events = []
     engine = SimpleNamespace(
@@ -2565,6 +2569,7 @@ def test_mpi_worker_terminal_cleanup_failure_is_retryable(monkeypatch):
         "GenerationExecutorWorker",
         {"shutdown"},
         {
+            **_PER_LAYER_DYNAMIC_SHUTDOWN,
             "logger_debug": lambda *args, **kwargs: None,
             "mpi_rank": lambda: 0,
             "mpi_comm": lambda: SimpleNamespace(allgather=lambda value: [value]),
@@ -2622,6 +2627,7 @@ def test_ray_worker_postproc_failure_still_runs_unsafe_terminal_cleanup():
         "RayGPUWorker",
         {"shutdown"},
         {
+            **_PER_LAYER_DYNAMIC_SHUTDOWN,
             "logger": SimpleNamespace(
                 debug=lambda *args, **kwargs: None, info=lambda *args, **kwargs: None
             ),
@@ -2679,6 +2685,7 @@ def test_ray_worker_shutdown_preserves_first_error_and_attempts_all_cleanup():
         "RayGPUWorker",
         {"shutdown"},
         {
+            **_PER_LAYER_DYNAMIC_SHUTDOWN,
             "logger": SimpleNamespace(
                 debug=lambda *args, **kwargs: None, info=lambda *args, **kwargs: None
             ),
@@ -2728,6 +2735,7 @@ def test_ray_worker_partial_init_without_llm_args_still_checks_background():
         "RayGPUWorker",
         {"shutdown"},
         {
+            **_PER_LAYER_DYNAMIC_SHUTDOWN,
             "logger": SimpleNamespace(
                 debug=lambda *args, **kwargs: None, info=lambda *args, **kwargs: None
             ),

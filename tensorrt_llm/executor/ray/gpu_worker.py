@@ -30,7 +30,8 @@ from tensorrt_llm.executor.ray.utils import (_configure_deep_gemm_cache,
                                              control_action_decorator)
 
 from ... import TorchLlmArgs
-from ...llmapi._load_balance_env import configure_moe_launch_queues
+from ...llmapi._load_balance_env import (configure_moe_launch_queues,
+                                         uses_collective_shutdown)
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
 from ...llmapi.utils import configure_cpu_affinity
@@ -388,6 +389,9 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         if self.doing_shutdown:
             return
+        if not uses_collective_shutdown(getattr(self, "llm_args", None)):
+            self._shutdown_rank_local()
+            return
         self.doing_shutdown = True
         shutdown_succeeded = False
 
@@ -467,10 +471,54 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             shutdown_succeeded = True
             logger.debug(f"Worker {self.rank} shutdown done.")
         finally:
+            # A failed collective shutdown can be retried only explicitly.
+            self._collective_shutdown_failed = not shutdown_succeeded
             if not shutdown_succeeded:
                 # Preserve the engine and allow an explicit retry to finish any
                 # model-owned collective teardown that could not complete.
                 self.doing_shutdown = False
+
+    def _shutdown_rank_local(self):
+        """Best-effort teardown for configurations without collective EP resources."""
+        self.doing_shutdown = True
+
+        logger.debug(f'Worker {self.rank} shutting down...')
+
+        if hasattr(self, 'shutdown_event'):
+            self.shutdown_event.set()
+
+        if getattr(self, '_postproc_pool', None) is not None:
+            self.shutdown_postproc_workers()
+
+        if hasattr(self, 'rpc_server') and self.rpc_server is not None:
+            logger.info(f"[Rank {self.global_rank}] Shutting down RPC server")
+            try:
+                self.rpc_server.shutdown()
+            except Exception as e:
+                # Suppress errors during RPC server shutdown
+                # These can occur if the server is already closed or during cleanup
+                logger.debug(
+                    f"[Rank {self.global_rank}] Suppressed error during RPC server shutdown: {e}"
+                )
+            self.rpc_server = None
+
+        if self.engine is not None:
+            self.engine.shutdown()
+            local_cleanup = getattr(self.engine, "local_cleanup", None)
+            if local_cleanup is not None:
+                local_cleanup()
+            self.engine = None
+
+            if (self.llm_args.backend == "pytorch"
+                    and hasattr(self, "checkpoint_loader")
+                    and self.checkpoint_loader is not None):
+                self.checkpoint_loader.cleanup()
+                self.checkpoint_loader = None
+
+        # Check if there are any errors from the threads before shutdown.
+        self._handle_background_error()
+
+        logger.debug(f"Worker {self.rank} shutdown done.")
 
     def _configure_device(self):
         configure_cpu_affinity(self.device_id)

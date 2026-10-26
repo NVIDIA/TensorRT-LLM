@@ -50,7 +50,28 @@ def _extract_class(source, class_name, methods, namespace, bases=()):
     return namespace[class_name]
 
 
+_uses_collective_shutdown = _extract_function(
+    _ROOT / "tensorrt_llm/llmapi/_load_balance_env.py", "uses_collective_shutdown", {"Any": object}
+)
+
+
+def _llm_args(per_layer_dynamic=True, **fields):
+    load_balancer = SimpleNamespace(mode="per_layer_dynamic") if per_layer_dynamic else None
+    return SimpleNamespace(moe_config=SimpleNamespace(load_balancer=load_balancer), **fields)
+
+
+def test_collective_shutdown_is_limited_to_per_layer_dynamic_eplb():
+    assert _uses_collective_shutdown(_llm_args())
+    assert not _uses_collective_shutdown(_llm_args(per_layer_dynamic=False))
+    assert not _uses_collective_shutdown(SimpleNamespace(backend="pytorch"))
+    assert not _uses_collective_shutdown(None)
+
+
 class _Timeout(Exception):
+    pass
+
+
+class _ActorDied(Exception):
     pass
 
 
@@ -83,7 +104,7 @@ class _RayWorker:
 
 class _FakeRay:
     def __init__(self):
-        self.exceptions = SimpleNamespace(GetTimeoutError=_Timeout)
+        self.exceptions = SimpleNamespace(GetTimeoutError=_Timeout, RayActorError=_ActorDied)
         self.util = SimpleNamespace(remove_placement_group=lambda group: None)
         self.killed = []
 
@@ -103,13 +124,14 @@ class _FakeRay:
         return None
 
 
-def _ray_executor(ray):
+def _ray_executor(ray, per_layer_dynamic=True):
     cls = _extract_class(
         _ROOT / "tensorrt_llm/executor/ray/executor.py",
         "RayExecutor",
-        {"shutdown"},
+        {"shutdown", "_shutdown_workers_collectively"},
         {
             "ray": ray,
+            "uses_collective_shutdown": _uses_collective_shutdown,
             "time": __import__("time"),
             "logger": SimpleNamespace(
                 warning=lambda *args, **kwargs: None, debug=lambda *args, **kwargs: None
@@ -118,6 +140,7 @@ def _ray_executor(ray):
         },
     )
     executor = cls()
+    executor.worker_kwargs = {"llm_args": _llm_args(per_layer_dynamic)}
     executor._shutdown_event = threading.Event()
     executor.main_loop = None
     executor.main_loop_task_obj = None
@@ -161,6 +184,32 @@ def test_ray_shutdown_timeout_reuses_pending_ref():
 
     executor.shutdown()
     assert worker.shutdown.calls == 1
+    assert executor.workers is None
+
+
+def test_ray_dead_actor_falls_through_to_forced_teardown():
+    ray = _FakeRay()
+    dead = _RayWorker([_Ref([_ActorDied("actor died")])])
+    live = _RayWorker([_Ref([None])])
+    executor = _ray_executor(ray)
+    executor.workers = [dead, live]
+
+    executor.shutdown()
+
+    assert ray.killed == [dead, live]
+    assert executor.workers is None
+    assert executor._pending_shutdown_refs is None
+
+
+def test_ray_shutdown_without_per_layer_eplb_tears_down_best_effort():
+    ray = _FakeRay()
+    worker = _RayWorker([_Ref([RuntimeError("cleanup failed")])])
+    executor = _ray_executor(ray, per_layer_dynamic=False)
+    executor.workers = [worker]
+
+    executor.shutdown()
+
+    assert ray.killed == [worker]
     assert executor.workers is None
 
 
@@ -247,8 +296,8 @@ class _RemoteCall:
         self.calls = calls
         self.error = error
 
-    def remote(self, *, need_response):
-        self.calls.append((self.name, need_response))
+    def remote(self, *, need_response, timeout=None):
+        self.calls.append((self.name, need_response, timeout))
         if self.error is not None:
             raise self.error
 
@@ -265,35 +314,50 @@ class _RpcClient:
         return _RemoteCall("commit", self.calls)
 
     def close(self):
-        self.calls.append(("close", True))
+        self.calls.append(("close", True, None))
 
 
-def _rpc_proxy():
-    return _extract_class(
+def _rpc_proxy(per_layer_dynamic=True):
+    cls = _extract_class(
         _ROOT / "tensorrt_llm/executor/rpc_proxy.py",
         "GenerationExecutorRpcProxy",
-        {"shutdown_remote", "shutdown"},
+        {"_uses_collective_shutdown", "shutdown_remote", "shutdown", "_shutdown_rank_local"},
         {
+            "uses_collective_shutdown": _uses_collective_shutdown,
             "logger_debug": lambda *args, **kwargs: None,
             "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
             "threading": threading,
         },
     )
+    cls._COLLECTIVE_SHUTDOWN_TIMEOUT_S = 300.0
+    proxy = cls()
+    proxy.worker_kwargs = {"llm_args": _llm_args(per_layer_dynamic)}
+    return proxy
 
 
 def test_rpc_proxy_requires_cleanup_and_commit_responses():
     calls = []
-    proxy = _rpc_proxy()()
+    proxy = _rpc_proxy()
     proxy.rpc_client = _RpcClient(calls)
 
     proxy.shutdown_remote()
 
-    assert calls == [("cleanup", True), ("commit", True)]
+    assert calls == [("cleanup", True, 300.0), ("commit", True, 300.0)]
+
+
+def test_rpc_proxy_without_per_layer_eplb_sends_one_unacknowledged_shutdown():
+    calls = []
+    proxy = _rpc_proxy(per_layer_dynamic=False)
+    proxy.rpc_client = _RpcClient(calls)
+
+    proxy.shutdown_remote()
+
+    assert calls == [("cleanup", False, None)]
 
 
 def test_rpc_proxy_cleanup_failure_keeps_retry_gate_and_resources_live():
     calls = []
-    proxy = _rpc_proxy()()
+    proxy = _rpc_proxy()
     proxy._shutdown_event = threading.Event()
     proxy.rpc_client = _RpcClient(calls, RuntimeError("remote cleanup failed"))
     proxy.main_loop = None
@@ -306,7 +370,7 @@ def test_rpc_proxy_cleanup_failure_keeps_retry_gate_and_resources_live():
 
     assert not proxy._shutdown_event.is_set()
     assert proxy.mpi_session is not None
-    assert calls == [("cleanup", True)]
+    assert calls == [("cleanup", True, 300.0)]
 
 
 def test_rpc_server_completes_commit_only_after_response_send():
@@ -405,6 +469,7 @@ def test_mpi_worker_retries_symm_release_before_destroying_process_group():
             "GenerationExecutorWorker",
             {"shutdown"},
             {
+                "uses_collective_shutdown": _uses_collective_shutdown,
                 "logger_debug": lambda *args, **kwargs: None,
                 "mpi_rank": lambda: 0,
                 "mpi_comm": lambda: SimpleNamespace(allgather=lambda value: [value]),
@@ -423,7 +488,7 @@ def test_mpi_worker_retries_symm_release_before_destroying_process_group():
         worker.doing_shutdown = False
         worker.rpc_server = None
         worker.engine = engine
-        worker.llm_args = SimpleNamespace(backend="pytorch")
+        worker.llm_args = _llm_args(backend="pytorch")
         worker._handle_background_error = lambda: events.append("background")
 
         with pytest.raises(RuntimeError, match="symm release failed"):
@@ -486,6 +551,7 @@ def test_mpi_worker_peer_cleanup_failure_blocks_later_collectives():
             "GenerationExecutorWorker",
             {"shutdown"},
             {
+                "uses_collective_shutdown": _uses_collective_shutdown,
                 "logger_debug": lambda *args, **kwargs: None,
                 "mpi_rank": lambda: 0,
                 "mpi_comm": lambda: Comm(),
@@ -504,7 +570,7 @@ def test_mpi_worker_peer_cleanup_failure_blocks_later_collectives():
         worker.doing_shutdown = False
         worker.rpc_server = None
         worker.engine = engine
-        worker.llm_args = SimpleNamespace(backend="pytorch")
+        worker.llm_args = _llm_args(backend="pytorch")
         worker._handle_background_error = lambda: events.append("background")
 
         with pytest.raises(RuntimeError, match="rank 1.*peer cleanup failed"):
@@ -555,6 +621,7 @@ def test_mpi_worker_background_error_keeps_shutdown_committed(monkeypatch):
         "GenerationExecutorWorker",
         {"shutdown"},
         {
+            "uses_collective_shutdown": _uses_collective_shutdown,
             "logger_debug": lambda *args, **kwargs: None,
             "mpi_rank": lambda: 0,
             "mpi_comm": lambda: SimpleNamespace(allgather=lambda value: [value]),
@@ -572,7 +639,7 @@ def test_mpi_worker_background_error_keeps_shutdown_committed(monkeypatch):
         shutdown=lambda: None,
         terminal_cleanup=lambda *, local_safe: cleanups.append(local_safe),
     )
-    worker.llm_args = SimpleNamespace(backend="pytorch")
+    worker.llm_args = _llm_args(backend="pytorch")
 
     def background_error():
         raise RuntimeError("background")
@@ -585,3 +652,85 @@ def test_mpi_worker_background_error_keeps_shutdown_committed(monkeypatch):
     assert worker.doing_shutdown and worker.engine is None
     worker.shutdown()
     assert cleanups == [True]
+
+
+def test_mpi_worker_without_per_layer_eplb_keeps_best_effort_teardown(monkeypatch):
+    events = []
+    module_name = "test_best_effort_megamoe_symm_release"
+
+    def release_symm_buffer_cache():
+        events.append("release_symm")
+        raise RuntimeError("symm release failed")
+
+    def no_collectives():
+        raise AssertionError("rank-local teardown must not enter MPI collectives")
+
+    mega_moe = types.ModuleType(module_name)
+    mega_moe.release_symm_buffer_cache = release_symm_buffer_cache
+    fake_distributed = types.ModuleType("torch.distributed")
+    fake_distributed.is_initialized = lambda: True
+    fake_distributed.destroy_process_group = lambda: events.append("destroy_pg")
+    fake_torch = types.ModuleType("torch")
+    fake_torch.distributed = fake_distributed
+    fake_torch.cuda = SimpleNamespace(empty_cache=lambda: events.append("empty_cache"))
+    monkeypatch.setitem(sys.modules, module_name, mega_moe)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", fake_distributed)
+    worker_cls = _extract_class(
+        _ROOT / "tensorrt_llm/executor/worker.py",
+        "GenerationExecutorWorker",
+        {"shutdown", "_shutdown_rank_local"},
+        {
+            "uses_collective_shutdown": _uses_collective_shutdown,
+            "logger_debug": lambda *args, **kwargs: None,
+            "logger": SimpleNamespace(error=lambda *args, **kwargs: events.append("logged")),
+            "mpi_rank": lambda: 0,
+            "mpi_comm": no_collectives,
+            "sys": sys,
+            "_MEGA_MOE_DEEPGEMM_MODULE": module_name,
+            "gc": SimpleNamespace(collect=lambda: events.append("gc")),
+        },
+    )
+    worker = worker_cls()
+    worker.doing_shutdown = False
+    worker.rpc_server = None
+    worker.engine = SimpleNamespace(
+        can_enqueue_requests=lambda: False,
+        shutdown=lambda: events.append("engine_shutdown"),
+        local_cleanup=lambda: events.append("local_cleanup"),
+        terminal_cleanup=lambda **kwargs: events.append("terminal_cleanup"),
+    )
+    worker.llm_args = _llm_args(per_layer_dynamic=False, backend="pytorch")
+    worker._handle_background_error = lambda: events.append("background")
+
+    worker.shutdown()
+
+    assert events == [
+        "engine_shutdown",
+        "local_cleanup",
+        "release_symm",
+        "logged",
+        "destroy_pg",
+        "gc",
+        "empty_cache",
+        "background",
+    ]
+    assert worker.doing_shutdown and worker.engine is None
+
+
+def test_finalizer_does_not_retry_a_failed_collective_shutdown():
+    calls = []
+    worker_cls = _extract_class(
+        _ROOT / "tensorrt_llm/executor/base_worker.py", "BaseWorker", {"__del__"}, {}
+    )
+    worker = worker_cls()
+    worker.shutdown = lambda: calls.append("shutdown")
+
+    worker._collective_shutdown_failed = True
+    worker.__del__()
+    assert calls == []
+
+    worker._collective_shutdown_failed = False
+    worker.__del__()
+    assert calls == ["shutdown"]
+    worker.shutdown = lambda: None

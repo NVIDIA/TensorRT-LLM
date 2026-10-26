@@ -11,6 +11,7 @@ from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from .._utils import mpi_rank
+from ..llmapi._load_balance_env import uses_collective_shutdown
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
 from ..logger import set_level
@@ -105,8 +106,8 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
         logger_debug(f"[worker] RpcWorker #{mpi_rank()} is shutting down",
                      color="yellow")
         if not getattr(self, "_rpc_collective_shutdown", False):
-            super().shutdown()
             self.shutdown_event.set()
+            super().shutdown()
             return
 
         # Followers wait between attempts. Wake them only when rank zero is
@@ -187,7 +188,9 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
         )
-        worker._rpc_collective_shutdown = True
+        # Only the per-layer dynamic EPLB fabric arena needs the all-rank
+        # two-phase shutdown; other configurations keep rank-local teardown.
+        worker._rpc_collective_shutdown = uses_collective_shutdown(llm_args)
 
         if mpi_rank() != 0:
             # The non-leader worker will setup the engine immediately.
@@ -200,8 +203,9 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
             # Rank zero publishes the shutdown request. Every follower waits
             # for its broadcast sentinel, then runs the same finalize path so
             # model-owned EP collectives remain rank-aligned.
-            worker.engine.wait_shutdown()
-            while True:
+            if worker._rpc_collective_shutdown:
+                worker.engine.wait_shutdown()
+            while worker._rpc_collective_shutdown:
                 shutdown_error = None
                 try:
                     worker.shutdown()

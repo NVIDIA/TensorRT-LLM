@@ -2363,6 +2363,31 @@ class PyExecutor:
             self.dwdp_manager = None
         return True
 
+    def local_cleanup(self) -> None:
+        """Rank-local teardown for executors without collective EP resources.
+
+        Drops the terminal model snapshot so the engines release their model
+        state through their own finalizers, as before collective cleanup.
+        """
+        try:
+            self.release_rank_local_caches()
+        finally:
+            self._terminal_model_engines = ()
+
+    def release_rank_local_caches(self) -> None:
+        """Release this executor stream's shared-FC12 runners, if any were built."""
+        shared_fc12 = sys.modules.get(
+            "tensorrt_llm._torch.moe.kernels.megamoe_shared_fc12")
+        if shared_fc12 is None:
+            return
+
+        device = self.execution_stream.device
+        device_index = device.index if hasattr(device, "index") else int(device)
+        shared_fc12.release_shared_fc12_cache(
+            device_index,
+            stream_handle=int(self.execution_stream.cuda_stream),
+        )
+
     def can_enqueue_requests(self) -> bool:
         """
         Indicates if the current process is allowed to enqueue requests
