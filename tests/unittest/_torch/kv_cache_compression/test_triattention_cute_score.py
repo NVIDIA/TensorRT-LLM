@@ -337,8 +337,14 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
         scratch_sizes.append(scratch.numel())
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
     assert scratch_sizes[1] * 20 < scratch_sizes[0]
-    with mock.patch.object(torch.cuda, "mem_get_info", return_value=(0, 1)):
-        assert tri._try_score_workspace(2) is None
+    # Driver headroom must not reject an allocation the caching allocator can serve.
+    with mock.patch.object(torch.cuda, "mem_get_info", side_effect=AssertionError("driver query")):
+        for _ in range(2):
+            optional = tri._try_score_workspace(2)
+            assert optional is not None
+            del optional
+    assert tri._batch_workspace_attempts == 2
+    assert tri._batch_workspace_ooms == 0
 
     with mock.patch.object(torch.cuda, "mem_get_info") as query:
         assert tri._try_score_workspace(1) is None
@@ -402,7 +408,9 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
             allocated = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
             with (
-                mock.patch.object(torch.cuda, "mem_get_info", return_value=(2**40, 2**40)),
+                mock.patch.object(
+                    torch.cuda, "mem_get_info", side_effect=AssertionError("driver query")
+                ),
                 mock.patch.object(torch, "empty", side_effect=torch.OutOfMemoryError) as allocate,
                 mock.patch.object(
                     tri, "_execute_eviction_round", wraps=tri._execute_eviction_round
@@ -411,6 +419,10 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
                 tri._evict_due_requests(batch)
             torch.cuda.synchronize()
             allocate.assert_called_once()
+            assert (
+                tri._batch_workspace_ooms
+                == ("union", "per_head", "per_layer_perhead").index(mode) + 1
+            )
             assert execute.call_count == 2
             assert [call.args[0][0].request for call in execute.call_args_list] == requests
             assert all(
@@ -446,3 +458,36 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
     with mock.patch.object(torch, "empty", side_effect=AssertionError("admission allocated")):
         tri.on_request_init(make_request(0, py_prompt_len=7003, py_max_new_tokens=100000))
     assert tri._score_scratch.data_ptr() == ptr
+
+
+@requires_sm100
+def test_resident_selection_at_maximum_budget():
+    """The resident selector compiles, settles ties, and reuses storage at k=16384."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        TriAttentionCompressionManager,
+    )
+
+    manager = TriAttentionCompressionManager.__new__(TriAttentionCompressionManager)
+    manager.budget = 16384
+    manager._selection_rows_per_request = 1
+    # budget + beta + one token, rounded to the production 256-token alignment.
+    width = 16640
+    manager._selection_scores_rows = torch.zeros((1, width), device="cuda")
+    manager._selection_row_lengths = torch.full((1,), width, device="cuda", dtype=torch.int32)
+    manager._prompt_lengths_device = torch.tensor([17], device="cuda", dtype=torch.int32)
+    manager._provisional_rows = torch.empty((1, manager.budget), device="cuda", dtype=torch.int32)
+    manager._kept_ordinal_rows = torch.empty_like(manager._provisional_rows)
+    # Exercise the same all-equal selection input used by initialization warmup.
+    manager._select_kept_ordinals(1)
+    expected = torch.arange(17, 17 + manager.budget, device="cuda", dtype=torch.int32)[None]
+    torch.testing.assert_close(manager._kept_ordinal_rows, expected, rtol=0, atol=0)
+    scores = torch.randperm(width, device="cuda").float()[None]
+    manager._selection_scores_rows.copy_(scores)
+    expected = torch.topk(scores, manager.budget).indices.sort(dim=-1).values.int() + 17
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    manager._select_kept_ordinals(1)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() == allocated
+    torch.testing.assert_close(manager._kept_ordinal_rows, expected, rtol=0, atol=0)

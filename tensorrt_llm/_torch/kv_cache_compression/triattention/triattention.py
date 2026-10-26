@@ -104,7 +104,7 @@ def _allocate_block_offset_snapshot(
     return block_offsets_host, block_offsets_device
 
 
-_MEAN_PHASE_MAX_ROWS = 1 << 24
+_MEAN_PHASE_MAX_POSITION = 1 << 24
 
 
 class TriAttentionCompressionManager(KVCacheCompressionManager):
@@ -125,6 +125,8 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
                 f"TriAttention budget must be at most 16384 for the Blackwell TopK selector; "
                 f"got {config.budget}"
             )
+        self._batch_workspace_attempts = 0
+        self._batch_workspace_ooms = 0
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode
@@ -335,7 +337,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
             int(request.py_max_new_tokens),
             max(int(self.kv_cache_manager.max_seq_len) - int(request.py_prompt_len), 0),
         )
-        if max_position >= _MEAN_PHASE_MAX_ROWS:
+        if max_position >= _MEAN_PHASE_MAX_POSITION:
             raise ValueError("TriAttention position exceeds the exact-FP32 phase range")
 
     def on_generation_step_begin(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
@@ -429,8 +431,13 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         if score_workspace is None:
             for item in eviction_requests:
                 self._execute_eviction_round([item])
+                self._publish_eviction([item])
         else:
             self._execute_eviction_round(eviction_requests, score_workspace=score_workspace)
+            self._publish_eviction(eviction_requests)
+
+    def _publish_eviction(self, eviction_requests: Sequence[_EvictionRequest]) -> None:
+        """Publish completed compactions before another cohort can fail."""
         for item in eviction_requests:
             evicted = item.source_length - int(item.request.py_prompt_len) - self.budget
             # The manager's only channel to the runtime (feeds num_cached_tokens_per_seq).
@@ -443,22 +450,34 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         TP uses identical single-request cohorts on every rank; independent
         free-memory decisions must never change collective launch sequences.
         """
-        if request_count <= 1 or self._union_tp_mapping is not None:
+        if request_count <= 1:
+            return None
+        if self._union_tp_mapping is not None:
+            logger.info_once(
+                "TriAttention uses serial eviction for TP union to keep collective "
+                f"ordering identical across ranks (cohort size: {request_count})",
+                key="triattention_tp_serial_eviction",
+            )
             return None
         if request_count > self._request_capacity:
             raise ValueError("TriAttention eviction cohort exceeds batch capacity")
         device = self._score_scratch.device
         elements = self._score_scratch.numel() * request_count
-        # Check before allocation. The margin is shared runtime headroom, not
-        # an additional persistent reservation. A concurrent allocation may
-        # still race this check, so allocation failure also takes the fallback.
-        required_bytes = elements * self._score_scratch.element_size()
-        free_bytes, _ = torch.cuda.mem_get_info(device)
-        if required_bytes + 64 * 1024**2 > free_bytes:
-            return None
+        # Let the caching allocator reuse reserved blocks and retry allocation.
+        # Driver free memory excludes those blocks and cannot predict whether
+        # this optional allocation fits. Only allocation OOM is recoverable;
+        # no scoring or KV mutation has started here.
+        self._batch_workspace_attempts += 1
         try:
             return torch.empty(elements, dtype=torch.float32, device=device)
         except torch.OutOfMemoryError:
+            self._batch_workspace_ooms += 1
+            logger.warning_once(
+                "TriAttention batch score workspace allocation failed; using serial "
+                f"eviction for {request_count} requests "
+                f"(required bytes: {elements * self._score_scratch.element_size()})",
+                key="triattention_batch_workspace_oom",
+            )
             return None
 
     def _execute_eviction_round(
@@ -639,6 +658,8 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         rows = request_count * self._selection_rows_per_request
         # The trailing 1 is next_n: decode scores one query token per request.
         if request_count == 1:
+            # Pin the warmed resident path to this specialization: caller-owned
+            # outputs and REREAD need no spill buffer or adaptive kernel dispatch.
             from ...custom_ops.cute_dsl_custom_ops import CuteDSLTopKDecodeSingleCTARunner
 
             CuteDSLTopKDecodeSingleCTARunner.forward(

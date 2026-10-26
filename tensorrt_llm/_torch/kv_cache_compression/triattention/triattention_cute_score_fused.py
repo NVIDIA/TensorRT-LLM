@@ -1430,6 +1430,8 @@ def build_score_pipeline(
         tokens_per_block,
     )
 
+    scratch_operand_index = 13
+    normalize_scratch_operand_index = 1
     score_operands = (
         (block_offsets.view(-1), 16),
         (segment_page_offsets, 16),
@@ -1449,16 +1451,17 @@ def build_score_pipeline(
         (anchor_pool, 16),
         (tma_descriptors, 128),
     )
+    assert score_operands[scratch_operand_index][0] is score_scratch
     score_args = tuple(
         _to_cute(tensor, assumed_align=alignment) for tensor, alignment in score_operands
     )
     if compact_scores:
         score_args = (
-            *score_args[:13],
+            *score_args[:scratch_operand_index],
             make_ptr(
                 cutlass.Float32, score_scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
             ),
-            *score_args[14:],
+            *score_args[scratch_operand_index + 1 :],
         )
     tensor_specs = tuple(_tensor_spec(tensor) for tensor, _ in score_operands)
     static_geometry = (
@@ -1541,11 +1544,16 @@ def build_score_pipeline(
             (prompt_lengths, 4),
             (union_scores, 16),
         )
+        assert normalize_operands[normalize_scratch_operand_index][0] is score_scratch
         normalize_args = tuple(
             _to_cute(tensor, assumed_align=alignment) for tensor, alignment in normalize_operands
         )
         if compact_scores:
-            normalize_args = (normalize_args[0], score_args[13], *normalize_args[2:])
+            normalize_args = (
+                *normalize_args[:normalize_scratch_operand_index],
+                score_args[scratch_operand_index],
+                *normalize_args[normalize_scratch_operand_index + 1 :],
+            )
         for request_count in range(1, request_capacity + 1):
             page_shards = page_shards_by_request_count[request_count]
             config = _select_normalize_union_config(request_count, score_token_capacity, sm_count)
@@ -1611,9 +1619,17 @@ def build_score_pipeline(
                 if compact_scores
                 else _to_cute(workspace[: score_scratch.numel()], assumed_align=16)
             )
-            launch_args = (*score_args[:13], scratch_arg, *score_args[14:])
+            launch_args = (
+                *score_args[:scratch_operand_index],
+                scratch_arg,
+                *score_args[scratch_operand_index + 1 :],
+            )
             if normalize_args:
-                union_args = (normalize_args[0], scratch_arg, *normalize_args[2:])
+                union_args = (
+                    *normalize_args[:normalize_scratch_operand_index],
+                    scratch_arg,
+                    *normalize_args[normalize_scratch_operand_index + 1 :],
+                )
         compiled_scores[request_count](*launch_args, request_count, current_stream)
         if compiled_normalizers:
             compiled_normalizers[request_count](

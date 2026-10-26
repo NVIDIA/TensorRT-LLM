@@ -48,18 +48,23 @@ reading or modifying KV data; it finishes before requests are admitted.
 | Raw scores | Resident fallback for one request, all scored layers and heads. The token axis covers the bounded decode selection window plus one 128-token alignment tile, not the prompt. |
 | Selection scores, statistics, top-k outputs, move indices | Resident at configured batch capacity, reused across rounds. These buffers retain the parallel fast path without rebuilding its metadata. |
 | Target/draft page-table snapshots | Resident at configured batch and sequence capacity, including protected tails. Pinned host staging is reused only after its H2D copy completes. |
-| Optional batch raw scores | Allocated before a multi-request round when device headroom permits; released after submission back to the CUDA allocator. The resident fallback stays allocated throughout. |
+| Optional batch raw scores | Requested from the PyTorch caching allocator before a multi-request round; released after submission back to the CUDA allocator. The resident fallback stays allocated throughout. |
 
-If the optional allocation cannot fit, requests are scored, selected, and
+If the optional allocation raises `torch.OutOfMemoryError`, requests are scored, selected, and
 compacted individually using the resident storage. The single-request selector
 uses caller-owned outputs and the REREAD top-k implementation. Allocation failure
 before scoring also takes this fallback; errors after KV writes begin are not
 retried. Compression completion orders subsequent KV use, and each chunk stages
 its own metadata before reusing the scratch.
 
-Memory checks and optional allocations add CPU overhead on multi-request eviction
-steps. They do not run on decode steps where no request is due for eviction.
-Insufficient headroom trades eviction latency for bounded workspace usage.
+No driver free-memory query is made: the caching allocator can reuse reserved
+blocks. Optional allocation attempts run only on multi-request eviction steps.
+The first allocation OOM logs the cohort size and requested bytes. The manager's
+`_batch_workspace_attempts` and `_batch_workspace_ooms` counters record allocation
+attempts and OOM fallbacks; TP-union serial execution is logged separately and
+excluded from those counters. Serial fallback trades eviction latency for bounded
+workspace usage. Each completed request publishes its compressed-token count and
+resizes its caches before processing the next request.
 Auxiliary buffers still scale with the configured batch size; initialization can
 fail if the configuration's resident storage itself does not fit.
 
