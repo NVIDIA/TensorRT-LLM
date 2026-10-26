@@ -55,6 +55,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .model import MAX_NUM_TOKENS, NUM_LAYERS, BeamFullModelNvfp4Sm103Tp4
 
@@ -221,14 +222,30 @@ class VerifyTarget(_Target):
         )
 
 
+def kv_cache_quant_algo(model_config: ModelConfig) -> Optional[QuantAlgo]:
+    """The configured KV-cache algorithm: None (BF16) or FP8; raise ValueError on any other."""
+    algo = getattr(model_config.quant_config, "kv_cache_quant_algo", None)
+    if algo is None:
+        return None
+    if QuantAlgo(algo) != QuantAlgo.FP8:
+        raise ValueError(f"the Beam NVFP4 target keeps a BF16 or FP8 KV cache, not {algo}")
+    return QuantAlgo.FP8
+
+
 class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
-    """The engine-facing Beam NVFP4 full model (one rank of four)."""
+    """The engine-facing Beam NVFP4 full model (one rank of four).
+
+    The KV cache is BF16, or FP8 when the configuration's ``kv_cache_quant_algo`` is FP8
+    (``kv_cache_config.dtype="fp8"``): then the target's and the drafter's caches both hold E4M3
+    codes, each layer with its own FP32 scale from the scale table ``load_checkpoint`` takes.
+    """
 
     def __init__(self, model_config: ModelConfig):
         super().__init__()
         self.model_config = model_config
         mapping = model_config.mapping
         self.checkpoint_dir, checkpoint_config = _checkpoint_config(model_config.pretrained_config)
+        self.kv_cache_quant_algo = kv_cache_quant_algo(model_config)
         self.model = BeamFullModelNvfp4Sm103Tp4(
             checkpoint_config,
             mapping,
@@ -238,6 +255,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         self._prefill = PrefillTarget(self.model)
         self._decode = DecodeTarget(self.model)
         self.load_record: Optional[dict] = None
+        self.kv_cache_record: Optional[dict] = None
         # The native one-model pieces, built only for a speculative config.
         self.spec_config = getattr(model_config, "spec_config", None)
         self.draft_config: Optional[ModelConfig] = None
@@ -251,7 +269,8 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         logger.info(
             f"[modeling_v2] {type(self).__name__}: {NUM_LAYERS} layers, rank {mapping.rank} of "
             f"{mapping.world_size}, max {MAX_NUM_TOKENS} tokens per call, speculative decoding "
-            f"{'DFlash' if self.spec_worker is not None else 'off'}"
+            f"{'DFlash' if self.spec_worker is not None else 'off'}, KV cache "
+            f"{'FP8' if self.kv_cache_quant_algo == QuantAlgo.FP8 else 'BF16'}"
         )
 
     def _build_dflash(self, model_config: ModelConfig, checkpoint_config: dict) -> None:
@@ -285,6 +304,13 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         _set_draft_kv_cache_quant_algo(self.draft_config, model_config)
         self.draft_config.extra_attrs = model_config.extra_attrs
         check_drafter_config(self.draft_config, checkpoint_config, spec_config.target_layer_ids)
+        draft_algo = self.draft_config.quant_config.kv_cache_quant_algo
+        if (None if draft_algo is None else QuantAlgo(draft_algo)) != self.kv_cache_quant_algo:
+            raise ValueError(
+                f"the drafter's KV cache would be {draft_algo or 'BF16'} and the target's "
+                f"{self.kv_cache_quant_algo or 'BF16'}; the Beam DFlash deployment keeps both "
+                "caches in one precision"
+            )
         # The draft pages live in the engine's separate draft KV cache manager, which the
         # worker reads through its own pool views (TRTLLM draft attention).
         self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(spec_config)
@@ -292,6 +318,10 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         self.draft_model.logits_processor = DFlashSoftcapLogitsProcessor(
             dflash_final_logit_softcap(self.draft_config.pretrained_config)
         )
+        if self.kv_cache_quant_algo == QuantAlgo.FP8:
+            reason = self.draft_model.fp8_kv_cache_unsupported_reason()
+            if reason is not None:
+                raise ValueError(f"the drafter cannot keep an FP8 KV cache: {reason}")
         self.spec_worker = get_spec_worker(
             spec_config,
             model_config,
@@ -311,15 +341,61 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
     def vocab_size_padded(self) -> int:
         return self.model.vocab_size
 
-    def load_checkpoint(self, checkpoint_dir: str) -> dict:
-        """Fill every parameter from ``checkpoint_dir`` (collective; see the component's load)."""
+    def load_checkpoint(self, checkpoint_dir: str, kv_cache_scales: Optional[dict] = None) -> dict:
+        """Fill every parameter from ``checkpoint_dir`` (collective; see the component's load).
+
+        ``kv_cache_scales`` is the FP8 KV cache's scale table (``weights.read_kv_cache_scales``):
+        ``"target"`` holds one scale per logical layer of the target and, with a drafter,
+        ``"draft"`` one per draft layer. It is required with an FP8 KV cache and refused with a
+        BF16 one; the checkpoint holds no KV-cache scales of its own.
+        """
         if os.path.realpath(checkpoint_dir) != os.path.realpath(self.checkpoint_dir):
             raise ValueError(
                 f"weights from {checkpoint_dir!r} do not belong to the configuration of "
                 f"{self.checkpoint_dir!r}"
             )
+        self._check_kv_cache_scales(kv_cache_scales)
         self.load_record = self.model.load(checkpoint_dir)
+        self._apply_kv_cache_scales(kv_cache_scales)
         return self.load_record
+
+    def _check_kv_cache_scales(self, table: Optional[dict]) -> None:
+        if self.kv_cache_quant_algo != QuantAlgo.FP8:
+            if table is not None:
+                raise ValueError(
+                    "a KV-cache scale table was given, but the KV cache is BF16; select the FP8 "
+                    "KV cache (kv_cache_config.dtype='fp8') to use it"
+                )
+            return
+        if table is None:
+            raise ValueError(
+                "the FP8 KV cache needs a scale table for the target"
+                f"{' and the drafter' if self.draft_model is not None else ''}; the checkpoint "
+                "holds no KV-cache scales and none are assumed"
+            )
+        sections = ["target"] + (["draft"] if self.draft_model is not None else [])
+        missing = [s for s in sections if not table.get(s)]
+        if missing:
+            raise ValueError(f"the KV-cache scale table has no {missing} scales")
+
+    def _apply_kv_cache_scales(self, table: Optional[dict]) -> None:
+        if self.kv_cache_quant_algo != QuantAlgo.FP8:
+            self.kv_cache_record = {"dtype": "bf16"}
+            return
+        self.model.set_kv_cache_fp8(table["target"])
+        if self.draft_model is not None:
+            self.draft_model.set_kv_cache_scales(table["draft"])
+        self.kv_cache_record = {
+            "dtype": "fp8",
+            "format": "float8_e4m3fn, one FP32 scale per logical layer shared by K and V",
+            "source": table.get("source"),
+            "source_sha256": table.get("sha256"),
+            "target_scales": list(self.model.kv_cache_scales),
+            "draft_scales": (
+                list(self.draft_model.kv_cache_scales) if self.draft_model is not None else None
+            ),
+        }
+        logger.info(f"[modeling_v2] FP8 KV cache: {self.kv_cache_record}")
 
     def shared_vocabulary_modules(self) -> tuple:
         """Native ``Embedding`` and vocabulary-parallel ``LMHead`` over the target's own slices.

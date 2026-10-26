@@ -64,6 +64,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_r
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import AllReduce, allgather
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
@@ -209,6 +210,57 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self._allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
         self.usable = False
         self.load_record: Optional[dict] = None
+        self._init_kv_cache_mode()
+
+    # ------------------------------------------------------------------ KV cache mode
+
+    def _init_kv_cache_mode(self) -> None:
+        """BF16 KV cache until ``set_kv_cache_fp8``."""
+        self.kv_cache_dtype = DataType.BF16
+        self.kv_cache_scales: Optional[tuple] = None
+        self._kv_scale_quant_orig: Optional[torch.Tensor] = None
+        self._kv_scale_orig_quant: Optional[torch.Tensor] = None
+
+    def set_kv_cache_fp8(self, scales: Sequence[float]) -> None:
+        """Read and write an FP8 KV cache with one FP32 scale per logical layer, K and V alike.
+
+        ``scales[l]`` is logical layer ``l``'s scale ``s`` (every one of the model's layers,
+        finite and positive): the attention op stores ``e4m3(x * (1/s))`` and reads ``code *
+        s``, with ``kv_scale_orig_quant = [1/s]`` and ``kv_scale_quant_orig = [s]``. The cache
+        must then be an FP8 ``KVCacheManagerV2``. Fixed for the component's lifetime: a later
+        call must repeat the scales exactly (a pool's codes are only valid under them). The
+        FP32 pair the op uses must be finite and normal (``_attention.fp8_kv_scale_pairs``).
+        """
+        values = tuple(float(s) for s in scales)
+        num_layers = self.schedule.num_layers
+        if len(values) != num_layers or not all(0.0 < s < float("inf") for s in values):
+            raise ValueError(
+                f"an FP8 KV cache needs {num_layers} finite positive per-layer scales, got "
+                f"{list(values)}"
+            )
+        quant_orig, orig_quant = _attention.fp8_kv_scale_pairs(
+            values, "target KV-cache scales", device=self.device
+        )
+        if self.kv_cache_scales is not None:
+            if self.kv_cache_scales != values:
+                raise ValueError(
+                    f"the KV-cache scales are fixed at {list(self.kv_cache_scales)}; got "
+                    f"{list(values)}"
+                )
+            return
+        self._kv_scale_quant_orig = quant_orig
+        self._kv_scale_orig_quant = orig_quant
+        self.kv_cache_scales = values
+        self.kv_cache_dtype = DataType.FP8
+
+    def kv_scale_args(self, layer: int) -> Optional[tuple]:
+        """``(kv_scale_orig_quant, kv_scale_quant_orig)`` of ``layer`` for the op; None for BF16."""
+        if self.kv_cache_scales is None:
+            return None
+        return (
+            self._kv_scale_orig_quant[layer : layer + 1],
+            self._kv_scale_quant_orig[layer : layer + 1],
+        )
 
     # ------------------------------------------------------------------ storage
 
@@ -420,6 +472,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             head_dim=self.head_dim,
             generation_rows=generation_rows,
             extra_kv_tokens=extra_kv_tokens,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
         step = _attention.step_args(md, layer)
         heads, kv_heads, d = self.local_heads, self.local_kv_heads, self.head_dim
@@ -449,7 +502,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             head_size=d,
             attention_window_size=self.window if sliding else step["max_seq_len"],
             **step,
-            **_attention.call_constants(generation_rows),
+            **_attention.call_constants(generation_rows, self.kv_scale_args(layer)),
         )
         gated = beam_output_gate(
             core.view(T, heads, d), g.view(T, heads, d), self._layer(layer, "self_attn.gate_bias")

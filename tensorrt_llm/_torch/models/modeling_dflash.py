@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...functional import RotaryScalingType
 from ..attention.rotary_embedding import RotaryEmbedding
@@ -262,11 +263,47 @@ def dflash_window_gather(
     return DFlashWindowGather(positions, valid, mask, pages, safe % page_size)
 
 
+#: Largest finite magnitude of ``torch.float8_e4m3fn``.
+FP8_E4M3_MAX = 448.0
+
+
+def dflash_quantize_kv(x: torch.Tensor, kv_scale: float) -> torch.Tensor:
+    """E4M3 codes of ``x / kv_scale``: ``e4m3(clamp(fp32(x) * fp32(1 / kv_scale), +-448))``.
+
+    The write half of the drafter's FP8 KV contract; ``x * kv_scale`` read back from the codes
+    in FP32 is the stored value. The clamp saturates out-of-range values instead of leaving
+    them to the cast, whose overflow behavior differs between torch versions.
+    """
+    scaled = x.float() * (1.0 / kv_scale)
+    return scaled.clamp_(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+
+
+def dflash_store_fp8_kv(
+    layer_cache: torch.Tensor,
+    pages: torch.Tensor,
+    offsets: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_scale: float,
+) -> None:
+    """Quantize ``k``/``v`` ``[N, Hkv, D]`` and store them in one layer's FP8 HND pool.
+
+    ``layer_cache`` is ``[pages, 2, Hkv, page_size, D]`` ``float8_e4m3fn``; row ``i`` lands at
+    page ``pages[i]``, in-page slot ``offsets[i]``. The codes are copied as bytes, so the pool
+    holds exactly ``dflash_quantize_kv``'s output.
+    """
+    cache = layer_cache.view(torch.uint8)
+    pages, offsets = pages.long(), offsets.long()
+    cache[pages, 0, :, offsets] = dflash_quantize_kv(k, kv_scale).view(torch.uint8)
+    cache[pages, 1, :, offsets] = dflash_quantize_kv(v, kv_scale).view(torch.uint8)
+
+
 def dflash_windowed_block_attention(
     q: torch.Tensor,
     layer_cache: torch.Tensor,
     gather: DFlashWindowGather,
     scale: float,
+    kv_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Non-causal windowed attention of draft blocks over the HND paged pool, in torch SDPA.
 
@@ -274,10 +311,25 @@ def dflash_windowed_block_attention(
     ``[pages, 2, Hkv, page_size, D]`` holding the context and the block's own K/V. Gathers the
     ``S`` positions ``gather`` names, zeroes the invalid ones and lets ``gather.mask`` select
     each query's keys; Hq / Hkv query heads share a KV head. Returns ``[B, block_size, Hq, D]``.
+
+    ``kv_scale`` is the layer's scale over an FP8 pool (``dflash_store_fp8_kv``): the gathered
+    codes are dequantized once, in FP32 (``code * kv_scale``), and rounded to ``q``'s dtype
+    before the attention; ``None`` reads a pool already in ``q``'s dtype.
     """
     keep = gather.valid.unsqueeze(-1).unsqueeze(-1)
-    k = layer_cache[gather.pages, 0, :, gather.offsets].masked_fill(~keep, 0)
-    v = layer_cache[gather.pages, 1, :, gather.offsets].masked_fill(~keep, 0)
+    if kv_scale is None:
+        k = layer_cache[gather.pages, 0, :, gather.offsets]
+        v = layer_cache[gather.pages, 1, :, gather.offsets]
+    else:
+        if layer_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"kv_scale reads an FP8 pool, got a {layer_cache.dtype} pool")
+        codes = layer_cache.view(torch.uint8)
+        k = codes[gather.pages, 0, :, gather.offsets].view(torch.float8_e4m3fn)
+        v = codes[gather.pages, 1, :, gather.offsets].view(torch.float8_e4m3fn)
+        k = (k.float() * kv_scale).to(q.dtype)
+        v = (v.float() * kv_scale).to(q.dtype)
+    k = k.masked_fill(~keep, 0)
+    v = v.masked_fill(~keep, 0)
     out = F.scaled_dot_product_attention(
         q.transpose(1, 2),
         k.transpose(1, 2),
@@ -705,8 +757,92 @@ class DFlashForCausalLM(nn.Module):
         # non-causal block attention). Subclasses opt in.
         self._context_input_layernorm = False
         self._sliding_layers_causal = False
+        # Per-layer FP8 KV-cache scales (set_kv_cache_scales); None stores the context cache
+        # in the activation dtype.
+        self._kv_cache_scales: Optional[tuple] = None
         self._validate_gqa_shape()
         self._warn_inferred_attention_windows()
+
+    def fp8_kv_cache_unsupported_reason(self) -> Optional[str]:
+        """Why this drafter cannot keep its context cache in FP8, or None when it can.
+
+        FP8 storage is read by the TRTLLM backend's non-causal windowed block attention only
+        (``dflash_windowed_block_attention``, which dequantizes what it gathers); every layer
+        must resolve to that branch. The trtllm-gen causal and full-context decodes, FA4 and
+        VANILLA read the pool in the activation dtype.
+        """
+        if not self._uses_worker_attention_backend:
+            return f"{type(self).__name__} brings its own block decode"
+        if self.dflash_attention_backend != "TRTLLM":
+            return f"attention_backend {self.dflash_attention_backend!r} is not TRTLLM"
+        num_layers = getattr(self.config, "num_hidden_layers", None) or len(self.model.layers)
+        for layer_idx in range(num_layers):
+            causal, (window_left, window_right) = self._resolve_block_attention(layer_idx)
+            if causal or window_left < 0 or window_left != window_right:
+                return (
+                    f"draft layer {layer_idx} is not a non-causal windowed layer (causal={causal}, "
+                    f"window={window_left},{window_right})"
+                )
+        return None
+
+    def set_kv_cache_scales(self, scales) -> None:
+        """Store the context cache in FP8 with one FP32 scale per draft layer, K and V alike.
+
+        ``scales[l]`` is draft layer ``l``'s scale ``s``: a key or value ``x`` is stored as the
+        E4M3 code of ``x / s`` and read as ``code * s``. Requires a drafter whose every read
+        path supports FP8 (``fp8_kv_cache_unsupported_reason``) and an FP8 KV-cache
+        configuration. The scales are fixed for the drafter's lifetime: a later call must
+        repeat them exactly.
+        """
+        values = tuple(float(s) for s in scales)
+        num_layers = getattr(self.config, "num_hidden_layers", None) or len(self.model.layers)
+        if len(values) != num_layers or not all(0.0 < s < float("inf") for s in values):
+            raise ValueError(
+                f"FP8 draft KV cache needs {num_layers} finite positive per-layer scales, "
+                f"got {list(values)}"
+            )
+        # The FP32 factors the store (x * fp32(1 / s)) and the read (code * fp32(s)) use: a
+        # zero, subnormal or infinite one would erase or overflow every stored value.
+        read = torch.tensor(values, dtype=torch.float32)
+        write = torch.tensor([1.0 / s for s in values], dtype=torch.float32)
+        tiny = torch.finfo(torch.float32).tiny
+        usable = torch.isfinite(read) & (read >= tiny) & torch.isfinite(write) & (write >= tiny)
+        for layer, ok in enumerate(usable.tolist()):
+            if not ok:
+                raise ValueError(
+                    f"FP8 draft KV cache: layer {layer} scale {values[layer]!r} is unusable in "
+                    f"FP32 (s = {float(read[layer])!r}, 1/s = {float(write[layer])!r}; both "
+                    "must be finite and normal)"
+                )
+        quant_config = getattr(self.model_config, "quant_config", None)
+        if getattr(quant_config, "kv_cache_quant_algo", None) != QuantAlgo.FP8:
+            raise ValueError(
+                "draft KV-cache scales are given but the draft KV cache is not configured as FP8"
+            )
+        reason = self.fp8_kv_cache_unsupported_reason()
+        if reason is not None:
+            raise ValueError(f"this drafter cannot store its KV cache in FP8: {reason}")
+        if self._kv_cache_scales is not None and self._kv_cache_scales != values:
+            raise ValueError(
+                f"the draft KV-cache scales are fixed at {list(self._kv_cache_scales)}; "
+                f"got {list(values)}"
+            )
+        self._kv_cache_scales = values
+
+    @property
+    def kv_cache_scales(self) -> Optional[tuple]:
+        """Per-layer FP8 KV-cache scales, or None for a context cache in the activation dtype."""
+        return self._kv_cache_scales
+
+    @property
+    def kv_cache_storage_dtype(self) -> torch.dtype:
+        """Element type of the context cache: FP8 E4M3 with scales, else the activation dtype."""
+        if self._kv_cache_scales is not None:
+            return torch.float8_e4m3fn
+        projection = getattr(self, "fc", None)
+        if projection is None:
+            return torch.bfloat16
+        return getattr(projection, "dtype", projection.weight.dtype)
 
     def _validate_gqa_shape(self):
         """Reject a backbone the block decode cannot express.
@@ -1647,6 +1783,18 @@ class DFlashForCausalLM(nn.Module):
         cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
         cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
         seq_lens_after = cache_seqlens_i32 + block_size
+        # Per-layer scales of an FP8 context cache (TRTLLM only); None: activation dtype.
+        kv_scales = self._kv_cache_scales
+        if kv_scales is not None and (
+            self.dflash_attention_backend != "TRTLLM"
+            or ctx_kv_cache is None
+            or ctx_kv_cache[0].dtype != torch.float8_e4m3fn
+        ):
+            raise RuntimeError(
+                "the drafter's KV cache is configured as FP8, but the context cache it was "
+                f"handed is {None if ctx_kv_cache is None else ctx_kv_cache[0].dtype} on "
+                f"backend {self.dflash_attention_backend}"
+            )
 
         if is_paged:
             max_batch_size = ctx_page_table.size(0)
@@ -1684,6 +1832,16 @@ class DFlashForCausalLM(nn.Module):
                 .reshape(-1)
                 .contiguous()
             )
+            if kv_scales is not None:
+                # Where the paged append would put each block row: the row's page from its
+                # block table, and the slot within that page.
+                block_positions = append_positions.view(B, block_size).long()
+                append_pages = (
+                    block_tables.long()
+                    .gather(1, torch.div(block_positions, page_size, rounding_mode="floor"))
+                    .reshape(-1)
+                )
+                append_slots = append_positions.long() % page_size
         else:  # VANILLA
             # Slot and column that each block K/V row occupies
             self._prepare_dflash_index_buffers(
@@ -1804,25 +1962,43 @@ class DFlashForCausalLM(nn.Module):
             causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
-                trtllm_gen_ops.append_paged_kv_cache(
-                    append_key=k_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    append_value=v_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    batch_indices=append_batch_indices,
-                    positions=append_positions,
-                    paged_kv_cache=layer_cache,
-                    kv_indices=kv_indices,
-                    kv_indptr=kv_indptr,
-                    kv_last_page_len=kv_last_page_len,
-                    kv_layout="HND",
-                )
+                kv_scale = None if kv_scales is None else kv_scales[layer_idx]
+                if kv_scale is None:
+                    trtllm_gen_ops.append_paged_kv_cache(
+                        append_key=k_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        append_value=v_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        batch_indices=append_batch_indices,
+                        positions=append_positions,
+                        paged_kv_cache=layer_cache,
+                        kv_indices=kv_indices,
+                        kv_indptr=kv_indptr,
+                        kv_last_page_len=kv_last_page_len,
+                        kv_layout="HND",
+                    )
+                else:
+                    # FP8 pool: the block's K/V are quantized with the layer's scale and
+                    # stored at the same pages and slots the paged append would use.
+                    dflash_store_fp8_kv(
+                        layer_cache,
+                        append_pages,
+                        append_slots,
+                        k_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim),
+                        v_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim),
+                        kv_scale,
+                    )
                 out = torch.empty_like(Q_bshd)
                 q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
                 window_left = window_size[0]
+                if kv_scale is not None and (causal or window_left < 0):
+                    raise RuntimeError(
+                        f"draft layer {layer_idx} reads its FP8 KV cache through a trtllm-gen "
+                        "kernel without KV scales; only the non-causal windowed read is FP8"
+                    )
                 if causal:
                     trtllm_gen_ops.batch_decode_with_kv_cache(
                         query=q_flat,
@@ -1858,7 +2034,7 @@ class DFlashForCausalLM(nn.Module):
                         )
                         window_gathers[window_left] = gather
                     out = dflash_windowed_block_attention(
-                        Q_bshd, layer_cache, gather, head_dim**-0.5
+                        Q_bshd, layer_cache, gather, head_dim**-0.5, kv_scale=kv_scale
                     )
                 else:
                     cum_seq_lens_q = torch.arange(

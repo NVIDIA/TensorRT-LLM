@@ -121,9 +121,13 @@ def _mapping(**overrides):
 
 
 def test_route_claims_only_the_supported_deployment():
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
     route = routing_module("BeamForCausalLM").route
     target = route(_beam_config(), _mapping(), (10, 3), None, None)
     assert target.__name__ == "ModelingV2BeamFullModelNvfp4Sm103Tp4"
+    assert route(_beam_config(), _mapping(), (10, 3), None, QuantAlgo.FP8) is target
+    assert route(_beam_config(), _mapping(), (10, 3), _dflash(), QuantAlgo.FP8) is target
     declined = [
         (_beam_config(), _mapping(), (10, 0), None, None),
         (_beam_config(num_hidden_layers=6), _mapping(), (10, 3), None, None),
@@ -132,23 +136,30 @@ def test_route_claims_only_the_supported_deployment():
         (_beam_config(), _mapping(moe_tp_size=1, moe_ep_size=4), (10, 3), None, None),
         (_beam_config(), _mapping(enable_attention_dp=True), (10, 3), None, None),
         (_beam_config(), _mapping(), (10, 3), object(), None),
-        (_beam_config(), _mapping(), (10, 3), None, "FP8"),
+        (_beam_config(), _mapping(), (10, 3), None, QuantAlgo.NVFP4),
         (_beam_config(), _mapping(), (10, 3), None, "NVFP4"),
+        (_beam_config(), _mapping(), (10, 3), None, "fp8_ds_mla"),
     ]
     for args in declined:
-        with pytest.raises(NoTarget):
+        with pytest.raises(NoTarget, match="KV cache|compute capability"):
             route(*args)
 
 
 @pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize(
     "checkpoint_kv,runtime_kv,supported",
-    [(None, "auto", True), (None, "fp8", False), (None, "nvfp4", False), ("FP8", "auto", False)],
+    [
+        (None, "auto", True),
+        (None, "fp8", True),
+        (None, "nvfp4", False),
+        ("FP8", "auto", True),
+        (None, "fp8_ds_mla", False),
+    ],
 )
 def test_engine_resolver_honors_effective_kv_format(
     monkeypatch, mode, checkpoint_kv, runtime_kv, supported
 ):
-    """The engine's complete routing call accepts BF16 KV and refuses quantized KV."""
+    """The engine's complete routing call accepts BF16 and FP8 KV and refuses other formats."""
     monkeypatch.setattr(_router_index, "_device_compute_capability", lambda: (10, 3))
     config = SimpleNamespace(
         pretrained_config=_beam_config(),
@@ -357,3 +368,215 @@ def test_drafter_contract_refuses_another_vocabulary_or_width():
     config.pretrained_config.hidden_size = 4096
     with pytest.raises(ValueError, match="hidden_size 4096"):
         check_drafter_config(config, _TARGET_CONFIG, [4, 16, 28, 40, 46])
+
+
+# ---------------------------------------------------------------------------------------------
+# FP8 KV cache: the scale table, the launcher's selection and the target's configuration
+# ---------------------------------------------------------------------------------------------
+
+
+def _scale_table(path, target=None, draft=None, **extra):
+    table = {
+        "target": {"layers": 52, "scales": {str(i): 1.0 for i in range(52)}}
+        if target is None
+        else target,
+        **({} if draft is False else {"draft": draft or _DRAFT_SECTION}),
+        **extra,
+    }
+    path.write_text(json.dumps(table))
+    return str(path)
+
+
+_DRAFT_SECTION = {"layers": 5, "scales": {"0": 2.0, "1": 2.0, "2": 2.0, "3": 8.0, "4": 4.0}}
+
+
+def test_read_kv_cache_scales_returns_validated_per_layer_scales(tmp_path):
+    import hashlib
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.weights import (  # noqa: E501
+        read_kv_cache_scales,
+    )
+
+    path = _scale_table(tmp_path / "scales.json", format="note")
+    table = read_kv_cache_scales(path)
+    assert table["target"] == (1.0,) * 52
+    assert table["draft"] == (2.0, 2.0, 2.0, 8.0, 4.0)
+    assert table["sha256"] == hashlib.sha256((tmp_path / "scales.json").read_bytes()).hexdigest()
+    assert read_kv_cache_scales(_scale_table(tmp_path / "t.json", draft=False))["draft"] is None
+
+
+@pytest.mark.parametrize(
+    "target,draft,reason",
+    [
+        ({"layers": 52, "scales": {str(i): 1.0 for i in range(51)}}, None, "0..51"),
+        ({"layers": 52, "scales": {str(i): 1.0 for i in range(1, 53)}}, None, "0..51"),
+        (None, {"layers": 5, "scales": {"0": 2.0, "1": 2.0, "2": 0.0, "3": 8.0, "4": 4.0}}, "> 0"),
+        (None, {"layers": 5, "scales": {"0": 2, "1": -2, "2": 2, "3": 8, "4": 4}}, "> 0"),
+        (None, {"layers": 5, "scales": {"0": True, "1": 2, "2": 2, "3": 8, "4": 4}}, "> 0"),
+        (None, {"layers": 5, "scales": {"0": "2", "1": 2, "2": 2, "3": 8, "4": 4}}, "> 0"),
+        (None, {"scales": {"0": 2.0}}, "'layers'"),
+        ({}, None, "no 'target'"),
+    ],
+    ids=["missing", "shifted", "zero", "negative", "bool", "string", "no-layers", "no-target"],
+)
+def test_read_kv_cache_scales_refuses_unusable_tables(tmp_path, target, draft, reason):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.weights import (  # noqa: E501
+        read_kv_cache_scales,
+    )
+
+    path = tmp_path / "scales.json"
+    if target == {}:
+        path.write_text(json.dumps({"draft": _DRAFT_SECTION}))
+    else:
+        _scale_table(path, target=target, draft=draft)
+    with pytest.raises(ValueError, match=reason):
+        read_kv_cache_scales(str(path))
+    for bad in (float("nan"), float("inf")):
+        path.write_text(json.dumps({"target": {"layers": 1, "scales": {"0": bad}}}))
+        with pytest.raises(ValueError, match="> 0"):
+            read_kv_cache_scales(str(path))
+
+
+# Finite positive Python floats whose FP32 scale or reciprocal is zero, subnormal or infinite:
+# 1e-300 -> s = 0; 1e300 -> s = inf, 1/s = 0; 1e-40 -> subnormal s, 1/s = inf.
+_UNUSABLE_FP32_SCALES = [1e-300, 1e300, 1e-40]
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_FP32_SCALES)
+@pytest.mark.parametrize("section", ["target", "draft"])
+def test_read_kv_cache_scales_refuses_scales_unusable_in_fp32(tmp_path, section, bad):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.weights import (  # noqa: E501
+        read_kv_cache_scales,
+    )
+
+    target = {"layers": 52, "scales": {str(i): 1.0 for i in range(52)}}
+    draft = json.loads(json.dumps(_DRAFT_SECTION))
+    (target if section == "target" else draft)["scales"]["3"] = bad
+    path = _scale_table(tmp_path / "scales.json", target=target, draft=draft)
+    with pytest.raises(ValueError, match=f"{section}: layer 3 scale .* unusable in FP32"):
+        read_kv_cache_scales(path)
+
+
+def test_fp8_kv_scale_pairs_are_the_ops_fp32_factors():
+    import torch
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._attention import (
+        fp8_kv_scale_pairs,
+    )
+
+    approved = [1.0, 2.0, 2.0, 2.0, 8.0, 4.0, 0.5, 1.5]
+    s, inv = fp8_kv_scale_pairs(approved, "scales")
+    assert s.dtype == inv.dtype == torch.float32
+    assert s.tolist() == approved
+    assert inv.tolist() == [1.0, 0.5, 0.5, 0.5, 0.125, 0.25, 2.0, float(torch.tensor(1 / 1.5))]
+    for bad in _UNUSABLE_FP32_SCALES + [0.0, -1.0, float("nan"), float("inf")]:
+        with pytest.raises(ValueError, match=r"scales: layer 1 scale .* unusable in FP32"):
+            fp8_kv_scale_pairs([1.0, bad, 2.0], "scales")
+
+
+def test_target_kv_cache_fp8_refuses_scales_unusable_in_fp32():
+    import torch
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_bf16__sm_103__tp4.model import (  # noqa: E501
+        BeamCheckpointLayoutBf16Sm103Tp4,
+    )
+
+    def component():
+        layout = BeamCheckpointLayoutBf16Sm103Tp4.__new__(BeamCheckpointLayoutBf16Sm103Tp4)
+        layout.__dict__.update(schedule=SimpleNamespace(num_layers=3), device=torch.device("cpu"))
+        layout._init_kv_cache_mode()
+        return layout
+
+    for bad in _UNUSABLE_FP32_SCALES:
+        layout = component()
+        with pytest.raises(ValueError, match="target KV-cache scales: layer 2 .* unusable in FP32"):
+            layout.set_kv_cache_fp8([1.0, 2.0, bad])
+        assert layout.kv_cache_scales is None and layout.kv_scale_args(0) is None
+    layout = component()
+    layout.set_kv_cache_fp8([1.0, 2.0, 8.0])
+    orig_quant, quant_orig = layout.kv_scale_args(2)
+    assert quant_orig.tolist() == [8.0] and orig_quant.tolist() == [0.125]
+
+
+def test_launcher_selects_the_kv_cache_dtype_and_carries_the_scales(tmp_path, monkeypatch):
+    import pickle
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+        serving,
+    )
+
+    monkeypatch.setattr(serving, "load_tokenizer", lambda checkpoint: "tokenizer")
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    (drafter / "config.json").write_text("{}")
+    scales = _scale_table(tmp_path / "scales.json")
+    default = serving.llm_args("/target", max_seq_len=8192, draft_checkpoint=str(drafter))
+    assert default["kv_cache_config"].dtype == "auto"
+    assert default["checkpoint_loader"].kv_cache_scales is None
+    fp8 = serving.llm_args(
+        "/target",
+        max_seq_len=8192,
+        draft_checkpoint=str(drafter),
+        kv_cache_dtype="fp8",
+        kv_cache_scales=scales,
+    )
+    assert fp8["kv_cache_config"].dtype == "fp8"
+    assert fp8["kv_cache_config"].use_kv_cache_manager_v2
+    table = fp8["checkpoint_loader"].kv_cache_scales
+    assert table["target"] == (1.0,) * 52 and table["draft"] == (2.0, 2.0, 2.0, 8.0, 4.0)
+    # Workers rebuild the loader from its pickle: the table travels with it.
+    assert pickle.loads(pickle.dumps(fp8["checkpoint_loader"])).kv_cache_scales == table
+    assert {k: fp8[k] for k in serving.DEPLOYMENT} == serving.DEPLOYMENT
+    ordinary = serving.llm_args(
+        "/target", max_seq_len=8192, kv_cache_dtype="fp8", kv_cache_scales=scales
+    )
+    assert "speculative_config" not in ordinary
+    for kwargs, reason in [
+        ({"kv_cache_dtype": "fp8"}, "needs its scale table"),
+        ({"kv_cache_scales": scales}, "only an FP8 KV cache"),
+        ({"kv_cache_dtype": "nvfp4", "kv_cache_scales": scales}, "kv_cache_dtype must be"),
+        ({"kv_cache_dtype": "bf16"}, "kv_cache_dtype must be"),
+        (
+            {
+                "kv_cache_dtype": "fp8",
+                "kv_cache_scales": _scale_table(tmp_path / "nodraft.json", draft=False),
+                "draft_checkpoint": str(drafter),
+            },
+            "no 'draft' section",
+        ),
+    ]:
+        with pytest.raises(ValueError, match=reason):
+            serving.llm_args("/target", max_seq_len=8192, **kwargs)
+
+
+def test_target_kv_cache_mode_and_scale_table_requirements():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.modeling import (  # noqa: E501
+        ModelingV2BeamFullModelNvfp4Sm103Tp4,
+        kv_cache_quant_algo,
+    )
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    def config(algo):
+        return SimpleNamespace(quant_config=SimpleNamespace(kv_cache_quant_algo=algo))
+
+    assert kv_cache_quant_algo(config(None)) is None
+    assert kv_cache_quant_algo(config(QuantAlgo.FP8)) == QuantAlgo.FP8
+    assert kv_cache_quant_algo(config("FP8")) == QuantAlgo.FP8
+    with pytest.raises(ValueError, match="BF16 or FP8"):
+        kv_cache_quant_algo(config(QuantAlgo.NVFP4))
+
+    def target(algo, drafter):
+        model = ModelingV2BeamFullModelNvfp4Sm103Tp4.__new__(ModelingV2BeamFullModelNvfp4Sm103Tp4)
+        model.__dict__.update(kv_cache_quant_algo=algo, draft_model=drafter)
+        return model
+
+    table = {"target": (1.0,) * 52, "draft": (2.0, 2.0, 2.0, 8.0, 4.0)}
+    target(QuantAlgo.FP8, object())._check_kv_cache_scales(table)
+    target(None, object())._check_kv_cache_scales(None)
+    target(QuantAlgo.FP8, None)._check_kv_cache_scales({"target": (1.0,) * 52, "draft": None})
+    with pytest.raises(ValueError, match="needs a scale table"):
+        target(QuantAlgo.FP8, object())._check_kv_cache_scales(None)
+    with pytest.raises(ValueError, match="KV cache is BF16"):
+        target(None, None)._check_kv_cache_scales(table)
+    with pytest.raises(ValueError, match="draft"):
+        target(QuantAlgo.FP8, object())._check_kv_cache_scales({"target": (1.0,) * 52})

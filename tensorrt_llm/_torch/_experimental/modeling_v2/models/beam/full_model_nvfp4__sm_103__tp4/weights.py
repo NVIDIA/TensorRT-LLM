@@ -21,24 +21,87 @@ stays preloaded.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import os
 from typing import Any, Optional
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam._attention import fp8_kv_scale_pairs
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm.mapping import Mapping
 
 
-class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
-    """Preload the Beam NVFP4 full-model target; read a drafter's weights after it."""
+def _scale_section(table: dict, section: str, path: str) -> Optional[tuple]:
+    entry = table.get(section)
+    if entry is None:
+        return None
+    scales = entry.get("scales") if isinstance(entry, dict) else None
+    layers = entry.get("layers") if isinstance(entry, dict) else None
+    if not isinstance(scales, dict) or type(layers) is not int or layers < 1:
+        raise ValueError(f"{path}: {section!r} must hold 'layers' and a 'scales' map")
+    if sorted(scales) != sorted(str(i) for i in range(layers)):
+        raise ValueError(
+            f"{path}: {section!r} scales must name logical layers 0..{layers - 1}, got "
+            f"{sorted(scales)}"
+        )
+    values = []
+    for i in range(layers):
+        value = scales[str(i)]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{path}: {section} layer {i} scale {value!r} is not finite and > 0")
+        values.append(float(value))
+    fp8_kv_scale_pairs(values, f"{path}: {section}")
+    return tuple(values)
 
-    def __init__(self):
+
+def read_kv_cache_scales(path: str) -> dict:
+    """The FP8 KV-cache scale table in the JSON file ``path``, validated.
+
+    The file maps ``"target"`` and optionally ``"draft"`` to ``{"layers": n, "scales": {"0": s0,
+    ..., "n-1": s}}``: one finite positive scale per logical layer whose FP32 value and
+    reciprocal are finite and normal, shared by K and V (a value ``x`` is stored as
+    ``e4m3(x / s)``, read as ``code * s``). Returns ``{"target":
+    (...), "draft": (...) or None, "source": path, "sha256": <file digest>}``.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    table = json.loads(data)
+    if not isinstance(table, dict):
+        raise ValueError(f"{path}: a KV-cache scale table is a JSON object")
+    target = _scale_section(table, "target", path)
+    if target is None:
+        raise ValueError(f"{path}: the KV-cache scale table has no 'target' section")
+    return {
+        "target": target,
+        "draft": _scale_section(table, "draft", path),
+        "source": os.path.abspath(path),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
+    """Preload the Beam NVFP4 full-model target; read a drafter's weights after it.
+
+    ``kv_cache_scales`` (``read_kv_cache_scales``) is the FP8 KV cache's scale table, handed to
+    the target's ``load_checkpoint`` on every rank; None for a BF16 KV cache.
+    """
+
+    def __init__(self, kv_cache_scales: Optional[dict] = None):
         super().__init__()
         self._preloaded = False
         self._target_dir: Optional[str] = None
+        self.kv_cache_scales = kv_cache_scales
 
     def __reduce__(self):
-        # Workers rebuild the loader from its class: it carries no state before a load.
-        return (type(self), ())
+        # Workers rebuild the loader from its class and the scale table: it carries no other
+        # state before a load.
+        return (type(self), (self.kv_cache_scales,))
 
     def load_weights(self, checkpoint_dir: str, mapping: Mapping, **kwargs) -> dict[str, Any]:
         from .modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4
@@ -53,7 +116,7 @@ class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
             )
         self._preloaded = False
         self._target_dir = None
-        model.load_checkpoint(checkpoint_dir)
+        model.load_checkpoint(checkpoint_dir, kv_cache_scales=self.kv_cache_scales)
         self._target_dir = os.path.realpath(checkpoint_dir)
         self._preloaded = True
         return {}
@@ -76,4 +139,4 @@ class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
         return self._preloaded
 
 
-__all__ = ["BeamNvfp4CheckpointLoader"]
+__all__ = ["BeamNvfp4CheckpointLoader", "read_kv_cache_scales"]

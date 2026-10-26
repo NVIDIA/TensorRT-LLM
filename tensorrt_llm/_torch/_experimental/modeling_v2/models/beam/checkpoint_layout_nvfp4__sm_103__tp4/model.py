@@ -183,6 +183,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self._allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
         self.usable = False
         self.load_record: Optional[dict] = None
+        self._init_kv_cache_mode()
         #: Per sparse layer, per global expert: gate and up input scales bitwise equal.
         self._shared_fc1: dict = {}
 

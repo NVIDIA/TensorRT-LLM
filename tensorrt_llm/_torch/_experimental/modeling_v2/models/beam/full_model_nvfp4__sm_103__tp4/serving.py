@@ -25,7 +25,12 @@ at a time). It owns no scheduler, sampler, route or evaluator::
 
     python -m tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.serving \\
         --checkpoint <dir> [--draft-checkpoint <dir>] [--port 8000] [--max-seq-len 69632] \\
-        [--max-num-tokens 8192] [--max-batch-size 1] [--iter-stats]
+        [--max-num-tokens 8192] [--max-batch-size 1] [--iter-stats] \\
+        [--kv-cache-dtype {auto,fp8} [--kv-cache-scales <table.json>]]
+
+``--kv-cache-dtype fp8`` stores the target's and the drafter's KV caches as FP8 E4M3 with the
+per-layer scales of ``--kv-cache-scales`` (``weights.read_kv_cache_scales``); the default keeps
+both BF16. The launcher logs the selected mode and the table's digest.
 
 ``--draft-checkpoint`` adds DFlash speculative decoding with that DFlash 2 drafter: the native
 one-model DFlash worker with ``max_draft_len`` 7 (a verification block of eight rows), TRTLLM
@@ -206,6 +211,10 @@ def dflash_config(draft_checkpoint: str):
     )
 
 
+#: KV-cache dtypes the launcher selects: ``auto`` keeps the checkpoint's BF16 cache.
+KV_CACHE_DTYPES = ("auto", "fp8")
+
+
 def llm_args(
     checkpoint: str,
     *,
@@ -215,6 +224,8 @@ def llm_args(
     kv_cache_max_tokens: Optional[int] = None,
     iter_stats: bool = False,
     draft_checkpoint: Optional[str] = None,
+    kv_cache_dtype: str = "auto",
+    kv_cache_scales: Optional[str] = None,
 ) -> dict:
     """Native LLM API arguments of the supported deployment for ``checkpoint``.
 
@@ -222,14 +233,30 @@ def llm_args(
     ``kv_cache_max_tokens`` (default ``2 * max_seq_len``) sizes the shared KV cache.
     ``draft_checkpoint`` adds DFlash speculative decoding with that drafter
     (``dflash_config``); its draft KV pool is the engine's separate draft manager.
+    ``kv_cache_dtype`` ``"fp8"`` stores the target's and the drafter's KV caches as FP8 E4M3
+    with the per-layer scales of the JSON table ``kv_cache_scales``
+    (``weights.read_kv_cache_scales``), which it requires; ``"auto"`` (default) keeps them BF16
+    and takes no table.
     """
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
     from .model import MAX_NUM_TOKENS
-    from .weights import BeamNvfp4CheckpointLoader
+    from .weights import BeamNvfp4CheckpointLoader, read_kv_cache_scales
 
     if not 1 <= max_num_tokens <= MAX_NUM_TOKENS:
         raise ValueError(f"max_num_tokens must be in [1, {MAX_NUM_TOKENS}], got {max_num_tokens}")
+    if kv_cache_dtype not in KV_CACHE_DTYPES:
+        raise ValueError(f"kv_cache_dtype must be one of {KV_CACHE_DTYPES}, got {kv_cache_dtype!r}")
+    if (kv_cache_dtype == "fp8") != (kv_cache_scales is not None):
+        raise ValueError(
+            "an FP8 KV cache needs its scale table (kv_cache_scales), and only an FP8 KV cache "
+            f"takes one; got kv_cache_dtype={kv_cache_dtype!r}, kv_cache_scales={kv_cache_scales!r}"
+        )
+    scales = None if kv_cache_scales is None else read_kv_cache_scales(kv_cache_scales)
+    if scales is not None and draft_checkpoint is not None and scales["draft"] is None:
+        raise ValueError(
+            f"{kv_cache_scales}: the scale table has no 'draft' section for the drafter"
+        )
     args = {
         "model": checkpoint,
         "tokenizer": load_tokenizer(checkpoint),
@@ -244,8 +271,9 @@ def llm_args(
             enable_partial_reuse=False,
             use_kv_cache_manager_v2=True,
             max_tokens=kv_cache_max_tokens or 2 * max_seq_len,
+            dtype=kv_cache_dtype,
         ),
-        "checkpoint_loader": BeamNvfp4CheckpointLoader(),
+        "checkpoint_loader": BeamNvfp4CheckpointLoader(kv_cache_scales=scales),
         "reasoning_parser": PARSER_KEY,
         "enable_iter_perf_stats": iter_stats,
     }
@@ -273,25 +301,49 @@ def main(argv: Optional[list] = None) -> None:
         default=None,
         help="DFlash 2 drafter directory; without it, speculation is off",
     )
+    ap.add_argument(
+        "--kv-cache-dtype",
+        choices=KV_CACHE_DTYPES,
+        default="auto",
+        help="auto: BF16 KV caches; fp8: FP8 E4M3 target and drafter KV caches",
+    )
+    ap.add_argument(
+        "--kv-cache-scales",
+        default=None,
+        help="JSON per-layer scale table of the FP8 KV caches (required with --kv-cache-dtype fp8)",
+    )
     args = ap.parse_args(argv)
 
     from tensorrt_llm.commands.serve import launch_server
+    from tensorrt_llm.logger import logger
 
     # The capacity is the explicit max_tokens above; no estimation pass on a dry-run cache.
     os.environ.setdefault("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
     template = args.chat_template or os.path.join(args.checkpoint, "chat_template.jinja")
+    deployment = llm_args(
+        args.checkpoint,
+        max_seq_len=args.max_seq_len,
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        kv_cache_max_tokens=args.kv_cache_max_tokens,
+        iter_stats=args.iter_stats,
+        draft_checkpoint=args.draft_checkpoint,
+        kv_cache_dtype=args.kv_cache_dtype,
+        kv_cache_scales=args.kv_cache_scales,
+    )
+    scales = deployment["checkpoint_loader"].kv_cache_scales
+    logger.info(
+        "Beam launcher: KV cache "
+        + (
+            f"FP8 (target and drafter), scale table {scales['source']} sha256 {scales['sha256']}"
+            if scales is not None
+            else "BF16"
+        )
+    )
     launch_server(
         args.host,
         args.port,
-        llm_args(
-            args.checkpoint,
-            max_seq_len=args.max_seq_len,
-            max_num_tokens=args.max_num_tokens,
-            max_batch_size=args.max_batch_size,
-            kv_cache_max_tokens=args.kv_cache_max_tokens,
-            iter_stats=args.iter_stats,
-            draft_checkpoint=args.draft_checkpoint,
-        ),
+        deployment,
         chat_template=template,
         served_model_name=args.served_model_name,
         multi_frontend_enabled=False,

@@ -2201,6 +2201,15 @@ class KvCacheCreator:
         if quant_config is None or not quant_config.quant_mode.has_fp8_kv_cache(
         ):
             return effective_draft_config
+        # A drafter that writes and reads FP8 codes with its own per-layer scales
+        # (DFlashForCausalLM.set_kv_cache_scales) keeps the fp8 algo: its pool is FP8.
+        draft_model = getattr(getattr(self._model_engine, "model", None),
+                              "draft_model", None)
+        if getattr(draft_model, "kv_cache_storage_dtype",
+                   None) == torch.float8_e4m3fn:
+            logger.info("External drafter KV pool is FP8: the drafter stores "
+                        "and reads it with its own per-layer scales.")
+            return effective_draft_config
         logger.info(
             "External drafter KV pool keeps the drafter dtype; dropping "
             "the fp8 KV quant algo inherited from the target.")

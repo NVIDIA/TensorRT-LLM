@@ -29,7 +29,8 @@ of each generation request (what a speculative verifier reads), or explicit row 
 ``x`` ``[T, hidden]`` (the residual stream after the block, before the next block or the
 final norm) as soon as the block returns.
 
-The cache must be a BF16 ``KVCacheManagerV2`` holding all 52 logical layers in logical order
+The cache must be a ``KVCacheManagerV2`` of the model's KV-cache dtype (BF16, or FP8 with the
+per-layer scales of ``set_kv_cache_fp8``) holding all 52 logical layers in logical order
 with 2 kv heads of 128 per rank, a 512-token window on every sliding layer and the whole
 sequence (``max_seq_len``) on the full-attention layers 5, 11, 17, 23, 29, 35, 41, 47 and 51
 (``attention_windows``). Inputs, positions, metadata and cache are validated before any kernel
@@ -52,7 +53,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout
     BeamCheckpointLayoutNvfp4Sm103Tp4,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm.bindings import DataType
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 #: Logical decoder layers, all executed by every call.
@@ -97,9 +97,10 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
     def check_cache_manager(self, manager) -> None:
         """Raise ValueError unless ``manager`` holds every logical layer as this model needs.
 
-        Required: BF16, ``head_dim`` 128, 2 kv heads per rank on every layer, logical layers
-        0..51 in local slots 0..51, the sliding window on sliding layers and the whole sequence
-        on full-attention layers. Reads host-side manager state only.
+        Required: the model's KV-cache dtype (BF16, or FP8 after ``set_kv_cache_fp8``),
+        ``head_dim`` 128, 2 kv heads per rank on every layer, logical layers 0..51 in local
+        slots 0..51, the sliding window on sliding layers and the whole sequence on
+        full-attention layers. Reads host-side manager state only.
         """
         offsets = getattr(manager, "layer_offsets", None)
         if not isinstance(offsets, Mapping) or dict(offsets) != {
@@ -112,13 +113,14 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             )
         heads = list(getattr(manager, "num_kv_heads_per_layer", None) or [])
         if (
-            manager.dtype != DataType.BF16
+            manager.dtype != self.kv_cache_dtype
             or manager.head_dim != self.head_dim
             or heads != [self.local_kv_heads] * NUM_LAYERS
         ):
             raise ValueError(
-                f"the KV cache must be BF16 with {self.local_kv_heads} kv heads of "
-                f"{self.head_dim} per layer; got {manager.dtype}, head_dim {manager.head_dim}"
+                f"the KV cache must be {self.kv_cache_dtype.name} with {self.local_kv_heads} kv "
+                f"heads of {self.head_dim} per layer; got {manager.dtype}, head_dim "
+                f"{manager.head_dim}"
             )
         windows = list(getattr(manager, "max_attention_window_vec", None) or [])
         if len(windows) != NUM_LAYERS:
@@ -226,6 +228,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             head_dim=self.head_dim,
             generation_rows=generation_rows,
             extra_kv_tokens=extra_kv_tokens,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
         positions = position_ids.reshape(-1).to(torch.int64)
         expected = torch.cat([torch.arange(past, past + n, dtype=torch.int64) for past, n in spans])

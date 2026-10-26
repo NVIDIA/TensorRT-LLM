@@ -7449,3 +7449,185 @@ def test_beam_verify_wrong_accepted_length_is_detected():
     assert env.cached_len(0) == committed + 1 + BEAM_P
     with pytest.raises(AssertionError, match="weight off"):
         _check_block(out, committed, BEAM_WINDOW, "wrong accepted length")
+
+
+# ---------------------------------------------------------------------------------------------
+# Beam TP4 over an FP8 KV pool: the call constants of the Beam attention sublayer
+# ---------------------------------------------------------------------------------------------
+
+
+def _beam_attention_module():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+
+    return _attention
+
+
+def _beam_fp8_env(window: Optional[int], kv_scale: float) -> _PagedAttnEnv:
+    """The Beam rank geometry over an e4m3 pool written with scale ``kv_scale``."""
+    return _PagedAttnEnv(
+        num_heads=BEAM_HQ,
+        num_kv_heads=BEAM_HKV,
+        head_dim=BEAM_D,
+        tokens_per_block=32,
+        num_blocks=64,
+        max_batch=1,
+        max_blocks_per_seq=24,
+        pool_dtype=torch.float8_e4m3fn,
+        quant_mode=QUANT_MODE_FP8_KV_CACHE,
+        kv_scaling_factor=kv_scale,
+        attention_window_size=window,
+    )
+
+
+def _beam_fp8_overrides(env: _PagedAttnEnv, rows: int, read_factor: Optional[float] = None):
+    """The quantization arguments the Beam sublayer passes the op (``call_constants``) for the
+    env's scale; ``read_factor`` replaces the read-side scale (a fault control)."""
+    quant_orig = env.kv_scale_quant_orig
+    if read_factor is not None:
+        quant_orig = torch.full((1,), read_factor, dtype=torch.float32, device="cuda")
+    constants = _beam_attention_module().call_constants(rows, (env.kv_scale_orig_quant, quant_orig))
+    return {k: constants[k] for k in ("quant_mode", "kv_scale_orig_quant", "kv_scale_quant_orig")}
+
+
+def _beam_fp8_prefill(env: _PagedAttnEnv, length: int, qkv: Optional[torch.Tensor] = None):
+    env.add_request(0, length)
+    return env.call_op(
+        _beam_indicator_qkv(list(range(length))) if qkv is None else qkv,
+        [length],
+        1,
+        [0],
+        MASK_CAUSAL,
+        ctx_lens_override=[length],
+        use_paged_context_fmha=True,
+        op_overrides=_beam_fp8_overrides(env, 1),
+    )
+
+
+def _beam_fp8_step(env: _PagedAttnEnv, rows: int, read_factor: Optional[float] = None):
+    """One generation step of ``rows`` rows (1: ordinary decode, 8: verification block)."""
+    start = env.cached_len(0)
+    return env.call_op(
+        _beam_indicator_qkv(list(range(start, start + rows))),
+        [rows],
+        0,
+        [0],
+        MASK_CAUSAL,
+        ctx_lens_override=[env.prompt_lens[0]],
+        use_paged_context_fmha=True,
+        predicted_tokens_per_seq=rows,
+        op_overrides=_beam_fp8_overrides(env, rows, read_factor),
+    )
+
+
+def test_beam_call_constants_select_the_fp8_cache():
+    """BF16 keeps quant_mode 0 and no scales; FP8 sets FP8_KV_CACHE alone and passes the
+    layer's 1/s as kv_scale_orig_quant and s as kv_scale_quant_orig, unchanged."""
+    attention = _beam_attention_module()
+    bf16 = attention.call_constants(8)
+    assert (bf16["quant_mode"], bf16["kv_scale_orig_quant"], bf16["kv_scale_quant_orig"]) == (
+        0,
+        None,
+        None,
+    )
+    s = torch.full((1,), 2.0, dtype=torch.float32, device="cuda")
+    inv = 1.0 / s
+    fp8 = attention.call_constants(8, (inv, s))
+    assert fp8["quant_mode"] == QUANT_MODE_FP8_KV_CACHE == attention.QUANT_MODE_FP8_KV_CACHE
+    assert fp8["kv_scale_orig_quant"] is inv and fp8["kv_scale_quant_orig"] is s
+    assert fp8["predicted_tokens_per_seq"] == 8
+    assert {k: v for k, v in fp8.items() if k not in bf16 or bf16[k] is not v} == {
+        "quant_mode": QUANT_MODE_FP8_KV_CACHE,
+        "kv_scale_orig_quant": inv,
+        "kv_scale_quant_orig": s,
+    }
+
+
+@pytest.mark.parametrize("kv_scale", [2.0, 0.5], ids=["s2", "s0.5"])
+@pytest.mark.parametrize("accepted", [2, 3, 4], ids=["commit511", "commit512", "commit513"])
+@pytest.mark.parametrize("window", [BEAM_WINDOW, None], ids=["sliding512", "full"])
+def test_beam_fp8_verify_block_straddles_the_window_and_rolls_back(window, accepted, kv_scale):
+    """The BF16 straddle-and-rollback cell over an e4m3 pool with a non-unit scale: each row of
+    the verification blocks reads out exactly its key set (the dequantized one-hot values are
+    exact), and after the rollback the pool holds exactly the e4m3 codes of the committed
+    history and the new block."""
+    torch.manual_seed(512 + accepted)
+    env = _beam_fp8_env(window, kv_scale)
+    effective = env.attention_window_size
+    _beam_fp8_prefill(env, 508)
+    _check_block(_beam_fp8_step(env, BEAM_P), 508, effective, "first block")
+    committed = 508 + 1 + accepted
+    _rewind(env, committed)
+    _check_block(_beam_fp8_step(env, BEAM_P), committed, effective, f"after {committed}")
+    env.check_cache(0)
+
+
+@pytest.mark.parametrize("window", [BEAM_WINDOW, None], ids=["sliding512", "full"])
+def test_beam_fp8_cached_prefix_context_then_decode(window):
+    """A context chunk over a cached FP8 prefix reads the prefix from the pool (paged-context
+    FMHA), then ordinary P = 1 decode steps at 511, 512 and 513 read the FP8 history: every row
+    reads out exactly its key set."""
+    torch.manual_seed(301)
+    env = _beam_fp8_env(window, 2.0)
+    effective = env.attention_window_size
+    _beam_fp8_prefill(env, 300)
+    out = env.call_op(
+        _beam_indicator_qkv(list(range(300, 511))),
+        [211],
+        1,
+        [0],
+        MASK_CAUSAL,
+        ctx_lens_override=[211],
+        use_paged_context_fmha=True,
+        op_overrides=_beam_fp8_overrides(env, 1),
+    )
+    for row, pos in ((0, 300), (100, 400), (210, 510)):
+        _assert_beam_row_weights(out, row, pos, effective, f"prefix chunk row {row}")
+    for pos in (511, 512, 513):
+        _assert_beam_row_weights(_beam_fp8_step(env, 1), 0, pos, effective, f"decode {pos}")
+    env.check_cache(0)
+
+
+@pytest.mark.parametrize("kv_scale", [2.0, 0.5, 4.0], ids=["s2", "s0.5", "s4"])
+def test_beam_fp8_pool_bytes_match_the_scaled_codes(kv_scale):
+    """Random K/V (including values at and past the e4m3 range at the scale) appended through
+    context, a verification block and a decode step land in the pool as exactly
+    e4m3(x * (1/s)), saturated, at their positions."""
+    torch.manual_seed(int(kv_scale * 16))
+    env = _beam_fp8_env(BEAM_WINDOW, kv_scale)
+    q_w, kv_w = BEAM_HQ * BEAM_D, BEAM_HKV * BEAM_D
+    qkv = torch.randn(70, q_w + 2 * kv_w, dtype=torch.bfloat16, device="cuda") * 4
+    edge = torch.tensor([448.0, -448.0, 464.0, 500.0, -1000.0, 0.0], device="cuda")
+    qkv[:6, q_w : q_w + 6] = (edge * kv_scale).to(torch.bfloat16).view(6, 1)
+    _beam_fp8_prefill(env, 70, qkv)
+    _beam_fp8_step(env, BEAM_P)
+    _beam_fp8_step(env, 1)
+    got_k, got_v, _, _ = env.cache_pages_content(0)
+
+    def codes(x: torch.Tensor) -> torch.Tensor:
+        # The native contract at a power-of-two s: e4m3(x * (1/s)), saturated to +-448.
+        scaled = x.float() * (1.0 / kv_scale)
+        return scaled.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+
+    k_seq, v_seq = torch.cat(env.k_history[0]), torch.cat(env.v_history[0])
+    assert k_seq.shape[0] == 70 + BEAM_P + 1
+    assert torch.equal(got_k.view(torch.uint8), codes(k_seq)), "K codes differ"
+    assert torch.equal(got_v.view(torch.uint8), codes(v_seq)), "V codes differ"
+    assert int((got_k.view(torch.uint8)[:6, :, :6] & 0x7F == 0x7F).sum()) == 0, "NaN code stored"
+
+
+@pytest.mark.parametrize(
+    "fault,factor",
+    [("inverted", 0.5), ("omitted", 1.0), ("doubled", 4.0), ("wrong_layer", 8.0)],
+)
+def test_beam_fp8_wrong_read_scale_is_detected(fault, factor):
+    """Fault controls at s = 2: reading the e4m3 codes with 1/s, without dequantization, with s
+    applied twice or with another layer's scale scales every value read; the exact per-row
+    read-out that passes with the correct scale must fail."""
+    torch.manual_seed(13)
+    env = _beam_fp8_env(BEAM_WINDOW, 2.0)
+    _beam_fp8_prefill(env, 508)
+    _check_block(_beam_fp8_step(env, BEAM_P), 508, BEAM_WINDOW, "correct scale")
+    _rewind(env, 508)
+    out = _beam_fp8_step(env, BEAM_P, read_factor=factor)
+    with pytest.raises(AssertionError, match="weight off"):
+        _check_block(out, 508, BEAM_WINDOW, f"{fault} read scale")

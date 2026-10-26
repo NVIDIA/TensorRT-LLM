@@ -70,11 +70,15 @@ def route(
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
     The one target is the 52-layer NVFP4-expert checkpoint on four sm_103 ranks: attention
-    TP4, MoE TP4/EP1, PP1, BF16 KV cache, no attention data parallelism, without speculative
-    decoding or with the DFlash drafter ``speculation_refusal`` admits. ``kv_cache_quant_algo``
-    is the effective engine setting, including runtime overrides. No other engine choice in
-    ``model_config`` or ``llm_args`` selects a different target.
+    TP4, MoE TP4/EP1, PP1, a BF16 or FP8 KV cache, no attention data parallelism, without
+    speculative decoding or with the DFlash drafter ``speculation_refusal`` admits.
+    ``kv_cache_quant_algo`` is the effective engine setting, including runtime overrides; an
+    FP8 cache holds the target's and the drafter's K/V with per-layer scales the checkpoint
+    loader supplies. No other engine choice in ``model_config`` or ``llm_args`` selects a
+    different target.
     """
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
     shape = (
         pretrained_config.num_hidden_layers,
         pretrained_config.hidden_size,
@@ -96,7 +100,7 @@ def route(
         and layout == (4, 4, 1, 4, 1, False)
         and quant_algo == "NVFP4"
         and speculation is None
-        and kv_cache_quant_algo is None
+        and kv_cache_quant_algo in (None, QuantAlgo.FP8)
     ):
         from .full_model_nvfp4__sm_103__tp4.modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4
 
@@ -109,7 +113,8 @@ def route(
         f"{f' ({speculation})' if speculation else ''}; "
         f"KV cache {kv_cache_quant_algo or 'bf16'}; "
         "the one Beam target is the 52-layer NVFP4 checkpoint on sm103, attention TP4, MoE "
-        "TP4/EP1, PP1, with BF16 KV cache and without attention DP, with speculative decoding "
+        "TP4/EP1, PP1, with a BF16 or FP8 KV cache and without attention DP, with speculative "
+        "decoding "
         f"off or DFlash (TRTLLM draft attention, max_draft_len {DFLASH_MAX_DRAFT_LEN}, strict "
         "greedy verification, no overlap scheduler)"
     )

@@ -14,7 +14,7 @@ ModelingV2 explicitly; it does not fall back to the built-in model implementatio
 | Parallel layout | Attention TP4, MoE TP4/EP1, PP1; attention DP disabled |
 | Parameters and arithmetic | Packed NVFP4 experts with native W4A4 GEMMs; BF16 excluded modules/activations; FP32 routing |
 | Attention | TRTLLM backend; 512-token sliding attention and full attention according to the checkpoint's layer schedule |
-| KV cache | BF16, native `KVCacheManagerV2`, full-block prefix reuse |
+| KV cache | BF16 by default; opt-in FP8 E4M3 for target and drafter with explicit per-layer scales; native `KVCacheManagerV2`, full-block prefix reuse |
 | Generation | Native `TorchSampler` for ordinary decoding; native DFlash worker and speculative sampler for optional DFlash2 greedy decoding |
 | Execution | Eager; CUDA graphs, overlap scheduling, and chunked prefill disabled |
 | Serving | Native OpenAI-compatible server, one frontend, streaming and non-streaming text |
@@ -94,8 +94,43 @@ match the target's greedy choice on the verification logits; independent ordinar
 and speculative runs can still diverge at near ties when GEMM/collective shapes
 change. The GSM8K result below is for ordinary decoding, not DFlash2.
 
-FP8 KV, CUDA graphs, overlap scheduling, and disaggregated serving remain future
-work. The bounded eager timing measurements are not a production throughput claim.
+CUDA graphs, overlap scheduling, and disaggregated serving remain future work.
+The bounded eager timing measurements are not a production throughput claim.
+
+## Optional FP8 KV cache
+
+Add `--kv-cache-dtype fp8 --kv-cache-scales /path/to/kv-scales.json` to the
+bounded DFlash2 launch above to store both target and drafter KV caches in FP8
+E4M3. Ordinary decoding also supports this option without `--draft-checkpoint`.
+BF16 remains the default. Cache precision does not change the NVFP4 expert weights.
+
+The scale file supplies a `target` object and, when using DFlash2, a `draft`
+object. Each contains `layers` and a `scales` map keyed by every logical layer
+index as a string. Each value is a positive scale `s`, shared by K and V:
+storage quantizes `x / s`, and reads recover `code * s`. Supply scales validated
+for the selected checkpoint and workload; NVFP4 weight scales are not KV-cache
+scales. Neither checkpoint weights nor a calibrated scale artifact are included
+here. Missing scales, unsupported cache formats, and scales or reciprocals that
+are not finite normal FP32 values are rejected.
+
+Validation covers the same four-GB300, TP4, eager deployment with batches 1/4,
+prompts through 4097 tokens, and at most 64 generated tokens. KV storage halves
+at equal token capacity without a persistent BF16 shadow cache. Independent
+full-model reruns reproduced all 22 recorded FP8 outputs; generated-input tests
+exercise scaled writes/reads, window boundaries, rollback, isolation, and bad
+scale detection. This does not establish a throughput improvement.
+
+FP8 can change greedy token choices and serving responses relative to BF16 KV.
+Some native target attention outputs exceed the original FP32-reference limits
+(relative RMS 0.0314 and worst-row normalized maximum error 0.142). Isolated
+native-operator replays reproduce those outputs bitwise; query and intermediate
+probability rounding in the native FP8 kernel explains the localized deviation.
+The bounded implementation was accepted with an explicit numerical exception;
+the strict failures are retained, and no kernel correction is claimed. The
+initial diagnostic probe also has a reconstructed-source provenance limitation.
+No FP8-KV GSM8K result or general answer-quality equivalence is claimed. Evaluate
+quality and performance for the intended workload before promoting FP8 to a
+recommended default.
 
 ## Validation and regression coverage
 
@@ -153,7 +188,7 @@ registered by this change.
   built-in component implementation. The result above belongs to the routed
   ModelingV2 target, not to that built-in model path.
 
-Other GPU architectures, parallel layouts, FP8 KV cache, other speculative modes,
+Other GPU architectures, parallel layouts, other speculative modes,
 CUDA graphs, overlap scheduling, chunked prefill, tool calling, and disaggregated
 serving are not qualified by this implementation. Subsequent feature/performance
 work should preserve this functional and accuracy baseline in follow-up PRs.
