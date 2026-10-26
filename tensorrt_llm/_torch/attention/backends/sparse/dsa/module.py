@@ -87,7 +87,8 @@ def forward_context_sparse_attn(
             q, latent_cache, attn_metadata, is_generation=False
         )
         # The append kernel rotated k_pe in latent_cache: store the retained rows too.
-        store_retained_context_rows(self.mqa, attn_metadata, latent_cache)
+        if attn_metadata.retained_block_table is not None:
+            store_retained_context_rows(self.mqa, attn_metadata, latent_cache)
         return self.forward_absorption_context(
             q,
             compressed_kv,

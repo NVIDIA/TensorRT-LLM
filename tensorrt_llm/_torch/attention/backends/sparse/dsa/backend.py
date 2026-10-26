@@ -230,9 +230,15 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
                 metadata._cached_num_pool_tokens,
             )
-            overlay_retained_rows(
-                self, metadata, topk_indices, metadata._cached_req_idx_ctx, compact_indices, scratch
-            )
+            if metadata.retained_block_table is not None:
+                overlay_retained_rows(
+                    self,
+                    metadata,
+                    topk_indices,
+                    metadata._cached_req_idx_ctx,
+                    compact_indices,
+                    scratch,
+                )
             metadata.nvfp4_mla_context_fp8_scratch = scratch
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
@@ -263,14 +269,15 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
                 metadata._cached_num_pool_tokens,
             )
-            overlay_retained_rows(
-                self,
-                metadata,
-                topk_indices,
-                metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens],
-                compact_indices,
-                scratch,
-            )
+            if metadata.retained_block_table is not None:
+                overlay_retained_rows(
+                    self,
+                    metadata,
+                    topk_indices,
+                    metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens],
+                    compact_indices,
+                    scratch,
+                )
             # Static sparse MLA treats indices as offsets from kvPtr. Feed it
             # compact offsets and the FP8 scratch base; TRTLLMGen is unchanged.
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
