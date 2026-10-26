@@ -60,6 +60,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
+#include <climits>
 #include <cstdint>
 #include <optional>
 
@@ -578,6 +579,569 @@ __global__ void splitWatchKernel(uint32_t const* buf, uint32_t* firstSeen, int64
     }
 }
 
+// ----------------------------------------------------------------------------------------
+// The vocabulary-parallel head (vp_*): each rank folds only its own LM-head shard.
+//
+// Virtual thread vt of the shipped VB-thread block owns the vectors v = vt (mod VB) of the
+// whole vocabulary; rank r holds the vectors [r * shardVecs, (r + 1) * shardVecs). vp_fold
+// folds, per (row, vt), the vectors of vt that lie in this rank's shard, in increasing
+// order, with the shipped per-element statements, and publishes that partial state to
+// every rank. vp_draw combines the R partials of its vt in rank order (the vocabulary
+// order of vt's vectors), then runs the shipped first round (block reduce, scan, Philox
+// draw, claimants); every rank walks its own portion of each claimant's elements, from
+// the claimant's base plus the masses of the earlier ranks' portions, and publishes the
+// crossing it finds (or none). vp_decide takes, per claimant, the first rank in rank order
+// with a crossing, and kernel B's rule across claimants. Greedy batches: vp_fold reduces
+// torch.argmax's comparator over each CTA and vp_argmax over the ranks' CTAs.
+//
+// Exchange buffer (one copy per rank, every 32-bit word holds kSplitSentinel between
+// calls): states [ranks][stateStride] x 16 B, greedy words [ranks][greedyStride] x 8 B at
+// greedyOffset, candidates [ranks][candStride] x 4 B at candOffset. Each value is stored
+// through every publish target (the multicast address in service; every rank's copy in
+// the single-GPU emulation); every rank reads and resets its own copy.
+
+//! Ranks the vocabulary-parallel head takes.
+constexpr int kVpMaxRanks = 8;
+//! Claimants of a row whose crossings the head exchanges (in thread order).
+constexpr int kVpClaimants = 4;
+//! A candidate word: no crossing in this rank's portion.
+constexpr uint32_t kVpNone = 0x7FFFFFFEu;
+//! Most vectors of one virtual thread in one shard (the walk's shared-memory stage).
+constexpr int kVpWalkVectors = 64;
+//! Threads per CTA of vp_fold.
+constexpr int kVpFoldThreads = 128;
+//! Greedy words per (rank, row): one per vp_fold CTA, at most kSplitBlock / kVpFoldThreads.
+constexpr int kVpGreedySlots = kSplitBlock / kVpFoldThreads;
+//! vp_draw's per-row record for vp_decide: [claimants or -1 (filtered), argmax, claimant tids].
+constexpr int kVpInfoWords = 2 + kVpClaimants;
+
+struct VpParams
+{
+    //! Row parameters; vocabSize is the whole vocabulary; logits is the pending
+    //! [numRows, vocabSize] BF16 row (written by vp_draw for filtered rows only).
+    FusedSamplingParams fs;
+    //! This rank's [numRows][shardVecs] local LM-head output.
+    uint2 const* local{nullptr};
+    //! This rank's staging rows [rows][shardVecs] (fabric memory; filtered rows only).
+    uint2* staging{nullptr};
+    //! Every rank's staging buffer, in rank order (peer addresses).
+    uint2 const* stagingOf[kVpMaxRanks]{};
+    //! Exchange-buffer bases the values are stored through.
+    char* publish[kVpMaxRanks]{};
+    int numPublish{0};
+    //! This rank's copy of the exchange buffer.
+    char* copy{nullptr};
+    int* info{nullptr};
+    int* status{nullptr};
+    int64_t* greedyTokens{nullptr};
+    SplitCap cap{};
+    int rank{0};
+    int ranks{0};
+    int shardVecs{0};
+    long long stateStride{0};
+    long long greedyOffset{0};
+    long long greedyStride{0};
+    long long candOffset{0};
+    long long candStride{0};
+    unsigned long long timeoutNs{0};
+};
+
+__device__ __forceinline__ uint4* vpState(char* base, VpParams const& p, int rank, int row, int vt, int vb)
+{
+    return reinterpret_cast<uint4*>(base) + rank * p.stateStride + static_cast<long long>(row) * vb + vt;
+}
+
+__device__ __forceinline__ uint2* vpGreedy(char* base, VpParams const& p, int rank, int row, int slot)
+{
+    return reinterpret_cast<uint2*>(base + p.greedyOffset) + rank * p.greedyStride
+        + static_cast<long long>(row) * kVpGreedySlots + slot;
+}
+
+__device__ __forceinline__ uint32_t* vpCand(char* base, VpParams const& p, int rank, int row, int c)
+{
+    return reinterpret_cast<uint32_t*>(base + p.candOffset) + rank * p.candStride
+        + static_cast<long long>(row) * kVpClaimants + c;
+}
+
+__device__ __forceinline__ uint4 loadRelaxedSys4(uint4 const* address)
+{
+    uint4 v;
+    asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(address)
+                 : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void storeRelaxedSys4(uint4* address, uint4 v)
+{
+    asm volatile(
+        "st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(address), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+        : "memory");
+}
+
+__device__ __forceinline__ uint32_t loadRelaxedSys1(uint32_t const* address)
+{
+    uint32_t v;
+    asm volatile("ld.relaxed.sys.global.b32 %0, [%1];" : "=r"(v) : "l"(address) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void storeRelaxedSys1(uint32_t* address, uint32_t v)
+{
+    asm volatile("st.relaxed.sys.global.b32 [%0], %1;" ::"l"(address), "r"(v) : "memory");
+}
+
+//! Records a poll that waited past the timeout and traps (a peer that never published).
+__device__ __noinline__ void vpPollTimedOut(int* status)
+{
+    atomicOr(status, kSplitPollTimeout);
+    __threadfence_system();
+    __trap();
+}
+
+//! Spin until none of the first `words` 32-bit words at `address` is the sentinel.
+template <int WORDS>
+__device__ __forceinline__ uint4 vpAwait(void const* address, int* status, unsigned long long timeoutNs)
+{
+    unsigned long long start = 0;
+    for (int spins = 0;; ++spins)
+    {
+        uint4 v{kSplitSentinel, kSplitSentinel, kSplitSentinel, kSplitSentinel};
+        if constexpr (WORDS == 1)
+        {
+            v.x = loadRelaxedSys1(static_cast<uint32_t const*>(address));
+        }
+        else if constexpr (WORDS == 2)
+        {
+            uint2 const w = loadRelaxedSys(static_cast<uint2 const*>(address));
+            v.x = w.x;
+            v.y = w.y;
+        }
+        else
+        {
+            v = loadRelaxedSys4(static_cast<uint4 const*>(address));
+        }
+        bool ready = v.x != kSplitSentinel;
+        if constexpr (WORDS >= 2)
+        {
+            ready = ready && v.y != kSplitSentinel;
+        }
+        if constexpr (WORDS >= 3)
+        {
+            ready = ready && v.z != kSplitSentinel;
+        }
+        if (ready)
+        {
+            return v;
+        }
+        if (spins == 64)
+        {
+            start = globalTimerNs();
+        }
+        if (spins >= 64)
+        {
+            __nanosleep(64);
+            if (globalTimerNs() - start > timeoutNs)
+            {
+                vpPollTimedOut(status);
+            }
+        }
+    }
+}
+
+//! torch.argmax's comparator (GreaterOrNan): whether (a, ia) is chosen over (b, ib).
+__device__ __forceinline__ bool vpArgmaxBetter(float a, int ia, float b, int ib)
+{
+    if (isnan(a))
+    {
+        return isnan(b) ? ia < ib : true;
+    }
+    return a == b ? ia < ib : a > b;
+}
+
+struct VpMaxArg
+{
+    float value;
+    int index;
+};
+
+struct VpMaxArgOp
+{
+    __device__ __forceinline__ VpMaxArg operator()(VpMaxArg const& a, VpMaxArg const& b) const
+    {
+        return vpArgmaxBetter(a.value, a.index, b.value, b.index) ? a : b;
+    }
+};
+
+//! The first vector of virtual thread vt in the shard starting at global vector `first`, as
+//! an offset into the shard.
+__device__ __forceinline__ int vpLead(int vt, int first, int vb)
+{
+    return ((vt - first) % vb + vb) % vb;
+}
+
+//! vp_fold: grid (numRows, VB / kVpFoldThreads), kVpFoldThreads threads. PDL: waits on
+//! the LM-head GEMM before reading anything; releases its dependent after publishing.
+template <bool GREEDY, int VB>
+__global__ void __launch_bounds__(kVpFoldThreads) vpFoldKernel(VpParams p)
+{
+    gridDependencyWait();
+    int const row = blockIdx.x;
+    int const vt = blockIdx.y * kVpFoldThreads + threadIdx.x;
+    int const sv = p.shardVecs;
+    int const first = p.rank * sv;
+    int const lead = vpLead(vt, first, VB);
+    uint2 const* localRow = p.local + static_cast<size_t>(row) * sv;
+    float tempInv = 1.0f;
+    bool stage = false;
+    if constexpr (!GREEDY)
+    {
+        RowParams const rp = loadRowParams(p.fs, row);
+        tempInv = rp.tempInv;
+        stage = rp.needTopK || rp.needTopP || rp.needMinP;
+    }
+    uint2* stagingRow = p.staging + static_cast<size_t>(row) * sv;
+    OnlineSoftmax st{-FLT_MAX, 0.0f, 0};
+    VpMaxArg best{-INFINITY, INT_MAX};
+    for (int l0 = lead; l0 < sv; l0 += kSplitPrefetch * VB)
+    {
+        uint2 buf[kSplitPrefetch];
+#pragma unroll
+        for (int u = 0; u < kSplitPrefetch; ++u)
+        {
+            int const l = l0 + u * VB;
+            if (l < sv)
+            {
+                buf[u] = __ldg(localRow + l);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kSplitPrefetch; ++u)
+        {
+            int const l = l0 + u * VB;
+            if (l < sv)
+            {
+                if (stage)
+                {
+                    stagingRow[l] = buf[u];
+                }
+                __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&buf[u]);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const logit = capOf(__bfloat162float(elems[j]), p.cap);
+                    int const index = (first + l) * 4 + j;
+                    if constexpr (GREEDY)
+                    {
+                        if (vpArgmaxBetter(logit, index, best.value, best.index))
+                        {
+                            best = VpMaxArg{logit, index};
+                        }
+                    }
+                    else
+                    {
+                        st = combineOnlineSoftmax(st, OnlineSoftmax{__fmul_rn(logit, tempInv), 1.0f, index});
+                    }
+                }
+            }
+        }
+    }
+    if constexpr (GREEDY)
+    {
+        using BlockReduceMaxArg = cub::BlockReduce<VpMaxArg, kVpFoldThreads>;
+        __shared__ typename BlockReduceMaxArg::TempStorage temp;
+        VpMaxArg const cta = BlockReduceMaxArg(temp).Reduce(best, VpMaxArgOp());
+        if (threadIdx.x == 0)
+        {
+            uint2 const word = make_uint2(__float_as_uint(cta.value), static_cast<uint32_t>(cta.index));
+            for (int i = 0; i < p.numPublish; ++i)
+            {
+                *vpGreedy(p.publish[i], p, p.rank, row, blockIdx.y) = word;
+            }
+        }
+    }
+    else
+    {
+        if (stage)
+        {
+            // The staged row reaches the peers before this thread's state does.
+            __threadfence_system();
+        }
+        uint4 const word
+            = make_uint4(__float_as_uint(st.max), __float_as_uint(st.sum), static_cast<uint32_t>(st.argmax), 0u);
+        for (int i = 0; i < p.numPublish; ++i)
+        {
+            *vpState(p.publish[i], p, p.rank, row, vt, VB) = word;
+        }
+    }
+    gridDependencyTrigger();
+}
+
+//! vp_draw: one VB-thread CTA per row. PDL: waits on vp_fold before reading anything.
+template <int VB>
+__global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) vpDrawKernel(VpParams p)
+{
+    __shared__ FusedSamplingShared<VB> shared;
+    __shared__ typename cub::BlockScan<int, VB>::TempStorage scanClaims;
+    __shared__ __align__(16) float wbuf[4 * kVpWalkVectors];
+    __shared__ int sClaimTid[kVpClaimants];
+    __shared__ float sClaimStart[kVpClaimants];
+    __shared__ uint32_t sCand[kVpClaimants];
+    int const row = blockIdx.x;
+    int const tid = threadIdx.x;
+    if (tid == 0)
+    {
+        sSplitCap = p.cap;
+    }
+    __syncthreads();
+    gridDependencyWait();
+    RowParams const rp = loadRowParams(p.fs, row);
+    bool const filtered = rp.needTopK || rp.needTopP || rp.needMinP;
+    // This thread's R partial states, combined in rank order. They stay in the copy until
+    // the end of the call (a claimant reads the earlier ranks' again for its walk offset).
+    OnlineSoftmax st{-FLT_MAX, 0.0f, 0};
+    for (int r = 0; r < p.ranks; ++r)
+    {
+        uint4 const w = vpAwait<3>(vpState(p.copy, p, r, row, tid, VB), p.status, p.timeoutNs);
+        OnlineSoftmax const part{__uint_as_float(w.x), __uint_as_float(w.y), static_cast<int>(w.z)};
+        st = r == 0 ? part : combineOnlineSoftmax(st, part);
+    }
+    uint4 const sentinel4 = make_uint4(kSplitSentinel, kSplitSentinel, kSplitSentinel, kSplitSentinel);
+    int const sv = p.shardVecs;
+    int const vecCount = p.fs.vocabSize / 4;
+    int* const info = p.info + static_cast<size_t>(row) * kVpInfoWords;
+    if (filtered)
+    {
+        // Every rank staged this row before publishing its states (vp_fold); gather it
+        // into the pending row and run the shipped body on it, as kernel B does.
+        __threadfence_system();
+        __syncthreads();
+        uint2* const pendingRow
+            = reinterpret_cast<uint2*>(const_cast<void*>(p.fs.logits)) + static_cast<size_t>(row) * vecCount;
+        for (int v = tid; v < vecCount; v += VB)
+        {
+            int const r = v / sv;
+            pendingRow[v] = loadRelaxedSys(p.stagingOf[r] + static_cast<size_t>(row) * sv + (v - r * sv));
+        }
+        __syncthreads();
+        fusedSamplingBody<CapBf16, VB, true, false>(p.fs, shared);
+        for (int r = 0; r < p.ranks; ++r)
+        {
+            storeRelaxedSys4(vpState(p.copy, p, r, row, tid, VB), sentinel4);
+        }
+        if (tid < kVpClaimants)
+        {
+            for (int i = 0; i < p.numPublish; ++i)
+            {
+                *vpCand(p.publish[i], p, p.rank, row, tid) = kVpNone;
+            }
+        }
+        if (tid == 0)
+        {
+            info[0] = -1;
+        }
+        gridDependencyTrigger();
+        return;
+    }
+    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, VB>;
+    using BlockScanF = cub::BlockScan<float, VB>;
+    OnlineSoftmax const rowStats = BlockReduceOnline(shared.temp.reduceOnline).Reduce(st, OnlineSoftmaxOp());
+    if (tid == 0)
+    {
+        shared.maxScaled = rowStats.max;
+        shared.argmax = rowStats.argmax;
+    }
+    __syncthreads();
+    float const maxScaled = shared.maxScaled;
+    float const localMass = st.sum * __expf(st.max - maxScaled);
+    if (tid == 0)
+    {
+        initRowRng(p.fs, row, &shared.rejectRng);
+    }
+    __syncthreads();
+    float base = 0.0f;
+    float supportMass = 0.0f;
+    BlockScanF(shared.temp.scanF).ExclusiveSum(localMass, base, supportMass);
+    __syncthreads();
+    if (tid == 0)
+    {
+        shared.target = curand_uniform(&shared.rejectRng) * supportMass;
+    }
+    __syncthreads();
+    float const target = shared.target;
+    bool const claims = target >= base && target < base + localMass;
+    int claimIdx = 0;
+    int claimants = 0;
+    cub::BlockScan<int, VB>(scanClaims).ExclusiveSum(claims ? 1 : 0, claimIdx, claimants);
+    if (claims && claimIdx < kVpClaimants)
+    {
+        // The masses of this thread's portions on the ranks before this one.
+        float earlier = 0.0f;
+        for (int r = 0; r < p.rank; ++r)
+        {
+            uint4 const w = loadRelaxedSys4(vpState(p.copy, p, r, row, tid, VB));
+            earlier += __uint_as_float(w.y) * __expf(__uint_as_float(w.x) - maxScaled);
+        }
+        sClaimTid[claimIdx] = tid;
+        sClaimStart[claimIdx] = base + earlier;
+    }
+    for (int r = 0; r < p.ranks; ++r)
+    {
+        storeRelaxedSys4(vpState(p.copy, p, r, row, tid, VB), sentinel4);
+    }
+    __syncthreads();
+    int const first = p.rank * sv;
+    uint2 const* localRow = p.local + static_cast<size_t>(row) * sv;
+    int const walkers = min(claimants, kVpClaimants);
+    for (int c = 0; c < walkers; ++c)
+    {
+        int const walker = sClaimTid[c];
+        int const lead = vpLead(walker, first, VB);
+        int const walkVectors = lead < sv ? (sv - lead + VB - 1) / VB : 0;
+        if (tid < walkVectors)
+        {
+            uint2 const packed = __ldg(localRow + lead + tid * VB);
+            __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                wbuf[tid * 4 + j] = __expf(__fmul_rn(capOf(__bfloat162float(elems[j]), p.cap), rp.tempInv) - maxScaled);
+            }
+        }
+        __syncthreads();
+        if (tid == 0)
+        {
+            float running = sClaimStart[c];
+            uint32_t cand = kVpNone;
+            float4 const* w4 = reinterpret_cast<float4 const*>(wbuf);
+            for (int q = 0; q < walkVectors && cand == kVpNone; ++q)
+            {
+                float4 const quad = w4[q];
+                float const ws[4] = {quad.x, quad.y, quad.z, quad.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = ws[j];
+                    if (cand == kVpNone && w >= 0.0f && w > -1.0f)
+                    {
+                        running += w;
+                        if (running > target)
+                        {
+                            cand = static_cast<uint32_t>((first + lead + q * VB) * 4 + j);
+                        }
+                    }
+                }
+            }
+            sCand[c] = cand;
+        }
+        __syncthreads();
+    }
+    if (tid < kVpClaimants)
+    {
+        uint32_t const cand = tid < walkers ? sCand[tid] : kVpNone;
+        for (int i = 0; i < p.numPublish; ++i)
+        {
+            *vpCand(p.publish[i], p, p.rank, row, tid) = cand;
+        }
+    }
+    if (tid == 0)
+    {
+        info[0] = claimants;
+        info[1] = shared.argmax;
+        for (int c = 0; c < kVpClaimants; ++c)
+        {
+            info[2 + c] = c < walkers ? sClaimTid[c] : -1;
+        }
+    }
+    gridDependencyTrigger();
+}
+
+//! vp_decide: one warp per row. PDL: waits on vp_draw before reading anything.
+__global__ void __launch_bounds__(32) vpDecideKernel(VpParams p, int vb)
+{
+    gridDependencyWait();
+    int const row = blockIdx.x;
+    int const lane = threadIdx.x;
+    uint32_t mine = kVpNone;
+    if (lane < p.ranks * kVpClaimants)
+    {
+        uint32_t* const slot = vpCand(p.copy, p, lane / kVpClaimants, row, lane % kVpClaimants);
+        mine = vpAwait<1>(slot, p.status, p.timeoutNs).x;
+        storeRelaxedSys1(slot, kSplitSentinel);
+    }
+    uint32_t words[kVpMaxRanks * kVpClaimants];
+#pragma unroll
+    for (int i = 0; i < kVpMaxRanks * kVpClaimants; ++i)
+    {
+        words[i] = __shfl_sync(0xffffffffu, mine, i);
+    }
+    if (lane == 0)
+    {
+        int const* info = p.info + static_cast<size_t>(row) * kVpInfoWords;
+        int const claimants = info[0];
+        if (claimants >= 0)
+        {
+            int token = info[1];
+            unsigned long long bestKey = 0ull;
+            int const walkers = min(claimants, kVpClaimants);
+            for (int c = 0; c < walkers; ++c)
+            {
+                uint32_t cand = kVpNone;
+                for (int r = 0; r < p.ranks && cand == kVpNone; ++r)
+                {
+                    cand = words[r * kVpClaimants + c];
+                }
+                if (cand == kVpNone)
+                {
+                    continue;
+                }
+                int const walker = info[2 + c];
+                int const v = static_cast<int>(cand) / 4;
+                int const position = ((v - walker) / vb) * 4 + static_cast<int>(cand) % 4 + 1;
+                unsigned long long const key
+                    = (static_cast<unsigned long long>(position) << 32) | static_cast<unsigned long long>(walker + 1);
+                if (walkers == 1 || key > bestKey)
+                {
+                    bestKey = key;
+                    token = static_cast<int>(cand);
+                }
+            }
+            p.fs.outputTokens[row] = token;
+        }
+    }
+    gridDependencyTrigger();
+}
+
+//! vp_argmax: one warp per row; the greedy token as int64. PDL: waits on vp_fold first.
+__global__ void __launch_bounds__(32) vpArgmaxKernel(VpParams p, int slots)
+{
+    gridDependencyWait();
+    int const row = blockIdx.x;
+    int const lane = threadIdx.x;
+    VpMaxArg best{-INFINITY, INT_MAX};
+    for (int i = lane; i < p.ranks * slots; i += 32)
+    {
+        uint2* const slot = vpGreedy(p.copy, p, i / slots, row, i % slots);
+        uint4 const w = vpAwait<2>(slot, p.status, p.timeoutNs);
+        storeRelaxedSys(slot, make_uint2(kSplitSentinel, kSplitSentinel));
+        VpMaxArg const cand{__uint_as_float(w.x), static_cast<int>(w.y)};
+        best = VpMaxArgOp()(best, cand);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        VpMaxArg const other{
+            __shfl_xor_sync(0xffffffffu, best.value, offset), __shfl_xor_sync(0xffffffffu, best.index, offset)};
+        best = VpMaxArgOp()(best, other);
+    }
+    if (lane == 0)
+    {
+        p.greedyTokens[row] = static_cast<int64_t>(best.index);
+    }
+    gridDependencyTrigger();
+}
+
 } // namespace fusedSampling
 } // namespace kernels
 } // namespace tensorrt_llm
@@ -837,6 +1401,193 @@ void watch(at::Tensor const& buf, at::Tensor const& firstSeen, int64_t blocks, i
         firstSeen.numel(), static_cast<unsigned long long>(timeoutMs) * 1000000ull);
 }
 
+//! The vocabulary-parallel head's common parameters: rank geometry and the exchange buffer.
+fs::VpParams vpLayout(int64_t rank, int64_t ranks, int64_t shardVecs, int64_t copy, at::IntArrayRef publish,
+    int64_t stateStride, int64_t greedyOffset, int64_t greedyStride, int64_t candOffset, int64_t candStride,
+    int64_t timeoutS)
+{
+    TORCH_CHECK(ranks >= 1 && ranks <= fs::kVpMaxRanks && rank >= 0 && rank < ranks, "rank / ranks out of range");
+    TORCH_CHECK(publish.size() >= 1 && publish.size() <= static_cast<size_t>(fs::kVpMaxRanks), "1..8 publish targets");
+    TORCH_CHECK(shardVecs >= 1, "empty shard");
+    fs::VpParams p;
+    p.rank = static_cast<int>(rank);
+    p.ranks = static_cast<int>(ranks);
+    p.shardVecs = static_cast<int>(shardVecs);
+    p.copy = reinterpret_cast<char*>(copy);
+    for (size_t i = 0; i < publish.size(); ++i)
+    {
+        TORCH_CHECK(publish[i] % 16 == 0, "publish targets must be 16-byte aligned");
+        p.publish[i] = reinterpret_cast<char*>(publish[i]);
+    }
+    p.numPublish = static_cast<int>(publish.size());
+    TORCH_CHECK(copy % 16 == 0 && greedyOffset % 16 == 0 && candOffset % 16 == 0, "exchange regions 16-byte aligned");
+    p.stateStride = stateStride;
+    p.greedyOffset = greedyOffset;
+    p.greedyStride = greedyStride;
+    p.candOffset = candOffset;
+    p.candStride = candStride;
+    p.timeoutNs = static_cast<unsigned long long>(timeoutS) * 1000000000ull;
+    return p;
+}
+
+void checkVpRows(
+    int64_t rows, int64_t shardVecs, int64_t ranks, int64_t stateStride, int64_t greedyStride, int64_t candStride)
+{
+    TORCH_CHECK(rows >= 1 && rows <= fs::kSplitMaxRows, "1..", fs::kSplitMaxRows, " rows");
+    int const vb = fs::splitVirtualBlock(static_cast<int>(rows));
+    TORCH_CHECK((shardVecs + vb - 1) / vb <= fs::kVpWalkVectors, "shard too wide for the walk stage");
+    TORCH_CHECK(rows * vb <= stateStride, "rows exceed the state slots");
+    TORCH_CHECK(rows * fs::kVpGreedySlots <= greedyStride, "rows exceed the greedy slots");
+    TORCH_CHECK(rows * fs::kVpClaimants <= candStride, "rows exceed the candidate slots");
+    TORCH_CHECK(ranks * shardVecs * 4 <= INT32_MAX, "vocabulary too large");
+}
+
+//! vp_fold: this rank's shard folded per (row, virtual thread), published to every rank.
+void vpFold(at::Tensor const& local, at::Tensor const& temperatures, at::Tensor const& topKs, at::Tensor const& topPs,
+    at::Tensor const& minPs, int64_t staging, at::IntArrayRef publish, int64_t rank, int64_t ranks, int64_t stateStride,
+    int64_t greedyOffset, int64_t greedyStride, int64_t candStride, bool greedy, double multiplier, double invCap,
+    double cap, bool pdl)
+{
+    TORCH_CHECK(local.scalar_type() == at::kBFloat16 && local.dim() == 2 && local.is_contiguous() && local.is_cuda(),
+        "local must be a contiguous CUDA BF16 [rows, shard] tensor");
+    TORCH_CHECK(local.size(1) % 4 == 0, "the shard must be a whole number of 4-element vectors");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(local.data_ptr()) % 8 == 0, "local must be 8-byte aligned");
+    auto const rows = local.size(0);
+    auto const shardVecs = local.size(1) / 4;
+    checkVpRows(rows, shardVecs, ranks, stateStride, greedyStride, candStride);
+    at::cuda::CUDAGuard guard(local.device());
+    auto p = vpLayout(
+        rank, ranks, shardVecs, publish[0], publish, stateStride, greedyOffset, greedyStride, 0, candStride, 0);
+    p.fs.numRows = static_cast<int32_t>(rows);
+    p.fs.vocabSize = static_cast<int32_t>(ranks * shardVecs * 4);
+    if (!greedy)
+    {
+        checkRowVector(temperatures, "temperatures", at::kFloat, rows);
+        checkRowVector(topKs, "top_ks", at::kInt, rows);
+        checkRowVector(topPs, "top_ps", at::kFloat, rows);
+        checkRowVector(minPs, "min_ps", at::kFloat, rows);
+        p.fs.temperatures = temperatures.data_ptr<float>();
+        p.fs.topKs = topKs.data_ptr<int32_t>();
+        p.fs.topPs = topPs.data_ptr<float>();
+        p.fs.minPs = minPs.data_ptr<float>();
+        TORCH_CHECK(staging % 8 == 0, "staging must be 8-byte aligned");
+    }
+    p.local = reinterpret_cast<uint2 const*>(local.data_ptr());
+    p.staging = reinterpret_cast<uint2*>(staging);
+    p.cap = softCap(multiplier, invCap, cap);
+    int const vb = fs::splitVirtualBlock(static_cast<int>(rows));
+    dim3 const grid(static_cast<unsigned>(rows), vb / fs::kVpFoldThreads);
+    if (vb == fs::kSplitBlock)
+    {
+        if (greedy)
+        {
+            launch(fs::vpFoldKernel<true, fs::kSplitBlock>, grid, dim3(fs::kVpFoldThreads), pdl, p);
+        }
+        else
+        {
+            launch(fs::vpFoldKernel<false, fs::kSplitBlock>, grid, dim3(fs::kVpFoldThreads), pdl, p);
+        }
+    }
+    else if (greedy)
+    {
+        launch(fs::vpFoldKernel<true, fs::kSplitNarrowBlock>, grid, dim3(fs::kVpFoldThreads), pdl, p);
+    }
+    else
+    {
+        launch(fs::vpFoldKernel<false, fs::kSplitNarrowBlock>, grid, dim3(fs::kVpFoldThreads), pdl, p);
+    }
+}
+
+//! vp_draw: combine, reduce, scan, draw, walk this rank's portions; publishes candidates.
+//! Returns the token tensor vp_decide completes (filtered rows are written here).
+at::Tensor vpDraw(at::Tensor const& pending, at::Tensor const& local, at::Tensor const& temperatures,
+    at::Tensor const& topKs, at::Tensor const& topPs, at::Tensor const& minPs, std::optional<at::Tensor> const& seed,
+    std::optional<at::Tensor> const& offset, at::Tensor const& info, at::Tensor const& status, int64_t copy,
+    at::IntArrayRef stagingOf, at::IntArrayRef publish, int64_t rank, int64_t ranks, int64_t stateStride,
+    int64_t greedyStride, int64_t candOffset, int64_t candStride, int64_t timeoutS, double multiplier, double invCap,
+    double cap, bool pdl)
+{
+    TORCH_CHECK(pending.scalar_type() == at::kBFloat16, "pending must be BF16");
+    TORCH_CHECK(
+        local.scalar_type() == at::kBFloat16 && local.dim() == 2 && local.is_contiguous(), "local [rows, shard]");
+    at::cuda::CUDAGuard guard(pending.device());
+    auto fsParams = rowParams(pending, temperatures, topKs, topPs, minPs, seed, offset);
+    auto const rows = pending.size(0);
+    auto const shardVecs = local.size(1) / 4;
+    TORCH_CHECK(local.size(0) == rows && local.size(1) % 4 == 0 && pending.size(1) == ranks * local.size(1),
+        "pending is [rows, ranks * shard] of local [rows, shard]");
+    checkVpRows(rows, shardVecs, ranks, stateStride, greedyStride, candStride);
+    TORCH_CHECK(static_cast<int64_t>(stagingOf.size()) == ranks, "one staging address per rank");
+    TORCH_CHECK(info.is_cuda() && info.scalar_type() == at::kInt && info.is_contiguous()
+            && info.numel() >= rows * fs::kVpInfoWords,
+        "info holds kVpInfoWords int32 per row");
+    TORCH_CHECK(status.is_cuda() && status.scalar_type() == at::kInt && status.numel() >= 1, "status int32[1]");
+    auto p = vpLayout(
+        rank, ranks, shardVecs, copy, publish, stateStride, 0, greedyStride, candOffset, candStride, timeoutS);
+    p.fs = fsParams;
+    for (int64_t r = 0; r < ranks; ++r)
+    {
+        p.stagingOf[r] = reinterpret_cast<uint2 const*>(stagingOf[r]);
+    }
+    p.local = reinterpret_cast<uint2 const*>(local.data_ptr());
+    p.info = info.data_ptr<int32_t>();
+    p.status = status.data_ptr<int32_t>();
+    p.cap = softCap(multiplier, invCap, cap);
+    auto tokens = at::empty({rows}, pending.options().dtype(at::kInt));
+    p.fs.outputTokens = tokens.data_ptr<int32_t>();
+    if (fs::splitVirtualBlock(static_cast<int>(rows)) == fs::kSplitBlock)
+    {
+        launch(fs::vpDrawKernel<fs::kSplitBlock>, dim3(static_cast<unsigned>(rows)), dim3(fs::kSplitBlock), pdl, p);
+    }
+    else
+    {
+        launch(fs::vpDrawKernel<fs::kSplitNarrowBlock>, dim3(static_cast<unsigned>(rows)), dim3(fs::kSplitNarrowBlock),
+            pdl, p);
+    }
+    return tokens;
+}
+
+//! vp_decide: every rank's candidates -> the token of each unfiltered row, into `tokens`.
+void vpDecide(at::Tensor const& tokens, at::Tensor const& info, at::Tensor const& status, int64_t copy, int64_t rank,
+    int64_t ranks, int64_t shardVecs, int64_t stateStride, int64_t greedyStride, int64_t candOffset, int64_t candStride,
+    int64_t timeoutS, bool pdl)
+{
+    TORCH_CHECK(tokens.is_cuda() && tokens.scalar_type() == at::kInt && tokens.dim() == 1, "tokens int32 [rows]");
+    auto const rows = tokens.size(0);
+    checkVpRows(rows, shardVecs, ranks, stateStride, greedyStride, candStride);
+    TORCH_CHECK(info.is_cuda() && info.scalar_type() == at::kInt && info.numel() >= rows * fs::kVpInfoWords, "info");
+    TORCH_CHECK(status.is_cuda() && status.scalar_type() == at::kInt && status.numel() >= 1, "status int32[1]");
+    at::cuda::CUDAGuard guard(tokens.device());
+    int64_t const self[1] = {copy};
+    auto p = vpLayout(rank, ranks, shardVecs, copy, at::IntArrayRef(self, 1), stateStride, 0, greedyStride, candOffset,
+        candStride, timeoutS);
+    p.fs.numRows = static_cast<int32_t>(rows);
+    p.fs.outputTokens = tokens.data_ptr<int32_t>();
+    p.info = info.data_ptr<int32_t>();
+    p.status = status.data_ptr<int32_t>();
+    launch(fs::vpDecideKernel, dim3(static_cast<unsigned>(rows)), dim3(32), pdl, p,
+        fs::splitVirtualBlock(static_cast<int>(rows)));
+}
+
+//! vp_argmax: every rank's greedy words -> torch.argmax's int64 token per row.
+at::Tensor vpArgmax(at::Tensor const& status, int64_t rows, int64_t copy, int64_t rank, int64_t ranks,
+    int64_t shardVecs, int64_t stateStride, int64_t greedyOffset, int64_t greedyStride, int64_t candStride,
+    int64_t timeoutS, bool pdl)
+{
+    checkVpRows(rows, shardVecs, ranks, stateStride, greedyStride, candStride);
+    TORCH_CHECK(status.is_cuda() && status.scalar_type() == at::kInt && status.numel() >= 1, "status int32[1]");
+    at::cuda::CUDAGuard guard(status.device());
+    int64_t const self[1] = {copy};
+    auto p = vpLayout(rank, ranks, shardVecs, copy, at::IntArrayRef(self, 1), stateStride, greedyOffset, greedyStride,
+        0, candStride, timeoutS);
+    p.status = status.data_ptr<int32_t>();
+    auto tokens = at::empty({rows}, status.options().dtype(at::kLong));
+    p.greedyTokens = tokens.data_ptr<int64_t>();
+    launch(fs::vpArgmaxKernel, dim3(static_cast<unsigned>(rows)), dim3(32), pdl, p,
+        fs::splitVirtualBlock(static_cast<int>(rows)) / fs::kVpFoldThreads);
+    return tokens;
+}
+
 } // namespace
 
 TORCH_LIBRARY(musespark_open_head_sampler, m)
@@ -854,6 +1605,23 @@ TORCH_LIBRARY(musespark_open_head_sampler, m)
     m.def("ref_fold(Tensor capped, Tensor temperatures, Tensor(a!) states) -> ()");
     m.def("cap(Tensor x, float multiplier, float inv_cap, float cap) -> Tensor");
     m.def("watch(Tensor buf, Tensor(a!) first_seen, int blocks, int timeout_ms) -> ()");
+    m.def(
+        "vp_fold(Tensor local, Tensor temperatures, Tensor top_ks, Tensor top_ps, Tensor min_ps, int staging, "
+        "int[] publish, int rank, int ranks, int state_stride, int greedy_offset, int greedy_stride, "
+        "int cand_stride, bool greedy, float multiplier, float inv_cap, float cap, bool pdl) -> ()");
+    m.def(
+        "vp_draw(Tensor(a!) pending, Tensor local, Tensor temperatures, Tensor top_ks, Tensor top_ps, "
+        "Tensor min_ps, Tensor? seed, Tensor? offset, Tensor(b!) info, Tensor(c!) status, int copy, "
+        "int[] staging_of, int[] publish, int rank, int ranks, int state_stride, int greedy_stride, "
+        "int cand_offset, int cand_stride, int timeout_s, float multiplier, float inv_cap, float cap, "
+        "bool pdl) -> Tensor");
+    m.def(
+        "vp_decide(Tensor(a!) tokens, Tensor info, Tensor(b!) status, int copy, int rank, int ranks, "
+        "int shard_vecs, int state_stride, int greedy_stride, int cand_offset, int cand_stride, int timeout_s, "
+        "bool pdl) -> ()");
+    m.def(
+        "vp_argmax(Tensor(a!) status, int rows, int copy, int rank, int ranks, int shard_vecs, int state_stride, "
+        "int greedy_offset, int greedy_stride, int cand_stride, int timeout_s, bool pdl) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(musespark_open_head_sampler, CUDA, m)
@@ -864,4 +1632,8 @@ TORCH_LIBRARY_IMPL(musespark_open_head_sampler, CUDA, m)
     m.impl("ref_fold", &refFold);
     m.impl("cap", &capRows);
     m.impl("watch", &watch);
+    m.impl("vp_fold", &vpFold);
+    m.impl("vp_draw", &vpDraw);
+    m.impl("vp_decide", &vpDecide);
+    m.impl("vp_argmax", &vpArgmax);
 }
