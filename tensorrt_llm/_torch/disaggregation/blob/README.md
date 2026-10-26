@@ -18,19 +18,19 @@ KV cache manager        lends regions; keeps the region hold
 lease holder (runtime)  submits fetch / publish views; decides from the outcome; returns the
         │               lease once the attempt quiesced
         ▼
-BlobBackend             this package: cuts a view into batches, runs them on worker threads,
-        │               watches each store call until it proved its access ended
+BlobBackend             this package: checks a view, cuts it into calls and hands each to the
+        │               driver as one RowBatch; records what the driver tells of each call
         ▼
-StoreDriver             one per store SDK: registers memory, moves whole rows, answers two
-        │               questions apart (result of a row, end of access to its memory)
-        ▼
+StoreDriver             one per store SDK: registers memory, runs the store's work on threads of
+        │               its own, moves whole rows, answers two questions apart (result of a row,
+        ▼               end of access to its memory) and tells of each change through on_change
 store SDK
 ```
 
 | Module | Holds |
 |---|---|
-| `backend.py` | `BlobBackend`, `BlobAttempt`, `BlobConfig`, `RegionBinding`, `ConstructionRejected` |
-| `store.py` | the driver boundary: `StoreDriver`, the optional `RegistersRegionsTogether`, `RowIO`, `RowStatus`, `DriverCapabilities`, `DriverRejected`, `RegistrationError` |
+| `backend.py` | `BlobBackend`, `BlobAttempt`, `BlobConfig`, `DriverCallLimit`, `RegionBinding`, `ConstructionRejected` |
+| `store.py` | the driver boundary: `StoreDriver`, the optional `RegistersRegionsTogether`, `RowBatch`, `RowIO`, `OnChange`, `RowStatus`, `DriverCapabilities`, `DriverRejected`, `RegistrationError` |
 | `keys.py` | the store key encoding |
 | `../testing/` | what a driver's own CI imports from the wheel: the conformance suite, the in-memory store and drivers, the broken drivers that prove every check bites |
 
@@ -50,10 +50,8 @@ All of it is CPU-only. The files, top down:
 - `test_memory_driver.py`, `test_together_driver.py`: the conformance suite over the in-memory
   drivers, and the pairing meta-test that runs each check against a driver breaking exactly the
   rule it guards.
-- `test_blob_format.py`: keys, spans, layouts, the object trailer.
-
-A few tests end with an access the driver can never prove ended; those run in a child process
-(`cpu_fixtures.in_a_child_process`), so the process that exits is the one holding the thread.
+- `test_blob_format.py`: keys, spans, layouts, row batches, the object trailer.
+- `test_testing_isolation.py`: no engine module imports the test tooling.
 
 ## Writing a driver
 
@@ -68,14 +66,21 @@ The boundary is `store.py`; its docstrings are the specification. The rules that
 2. **Two questions, answered apart.** `poll` gives each row's logical result; `access_ended`
    says whether the operation can still touch the rows' memory. Neither implies the other. A
    row's result may land long before its access ended, and the memory is reused only on the
-   latter. `access_unprovable` is the driver's admission that it will never know.
-3. **Only READY and FAULT are verdicts.** MISS, NOT_READY, DECLINED and CANCELLED say that
+   latter. `access_unprovable` is the driver's admission that it will never know. The driver
+   tells the caller of each change through the `on_change` it was handed, after the change
+   shows through those queries; the backend never polls.
+3. **The driver owns the store's work.** `put` and `get` take a `RowBatch`, record and queue
+   it, and return without waiting on the store; the driver's own threads move the bytes, in the
+   order and at the concurrency its store wants. A batch's rows are laid out alike and never
+   name a key twice, and every span lies inside one registered extent, so a driver checks memory
+   once per extent. A driver that cannot take a call refuses it with `DriverRejected`.
+4. **Only READY and FAULT are verdicts.** MISS, NOT_READY, DECLINED and CANCELLED say that
    nothing was delivered and nothing went wrong, each under a condition the store confirmed;
    an error the driver cannot place is FAULT.
-4. **`drain` is one-way and never forces an end.** After it the driver accepts no new work;
+5. **`drain` is one-way and never forces an end.** After it the driver accepts no new work;
    it returns True only when nothing can still touch memory. `close` is allowed only after a
    True drain and with every registration revoked.
-5. **Registration comes in two shapes.** A store that takes memory a region at a time
+6. **Registration comes in two shapes.** A store that takes memory a region at a time
    implements `register` and `unregister`. A store that takes all of its memory in one step,
    as one that opens its client with it, implements `RegistersRegionsTogether` instead:
    `register_regions(specs)` returns one handle for the batch and `unregister_regions(handle)`
@@ -157,7 +162,16 @@ if not binding.live_labels():
 
 `register` raises `ConstructionRejected` only when nothing is registered and the hold is
 already released. Any other raise means a registration may be live: keep the binding, call
-`unregister()` again later, and `release_hold()` once `live_labels()` is empty.
+`try_unregister_all()` again later, and `release_hold()` once `live_labels()` is empty. The
+same holds when `BlobBackend(...)` itself raises, as when its progress thread cannot start: the
+binding its owner registered is still live, and that owner revokes and releases as after any
+failed build.
+
+Whoever opened the driver closes it, and owns it until then: after `shutdown` returned no
+labels and `release_hold()` succeeded, the driver's `close()` is the last step. While anything
+is still accessible, the owner keeps the driver, the binding and the hold alive; nothing frees
+them on its own. A store that takes all of its memory in one step revokes it in one step too,
+through `RegistersRegionsTogether`, and the same rule applies to the batch.
 
 `shutdown` returns the labels of what the backend still holds: `attempt:<n>` for an attempt
 whose access has not ended, `region:<i>` for a region still registered. It returns early once
@@ -183,23 +197,29 @@ retrying the drain and the revocation, and the hold stays with the manager until
   nothing is registered; `RegistrationError(handle=h)` says some of it may be and `h` revokes
   whatever is; any other raise means some of it may be registered with nothing to revoke it
   by, and the binding keeps the hold for good.
-- **Who closes the driver**: the one who opened it, after the backend's binding revoked
-  the registrations. The backend never calls `close`.
+- **Who closes the driver**: the one who opened it, after `shutdown` returned no labels and the
+  hold went back. The backend never calls `close`; a cleanup that did not finish keeps the owner,
+  the driver and the memory, and is retried, never skipped.
 - **`RegistrationError(handle=None)`** means the store certainly did not register the
   region. A driver that cannot tell gives the handle. A failure it has no handle for is not a
   `RegistrationError(None)`: the original exception escapes and the caller keeps the memory
   protected.
 - **Hints** reach the driver only on a fetch and only when it declares `hints`; a hint-free
   fetch keeps the hint-free call shape.
-- **Cancel** is forwarded once per started batch to a driver that declares `cancel`, and is
-  never access-end evidence.
-- **Back-pressure**: `BlobConfig.max_queued_batches` bounds the batches waiting for a worker;
-  a submission past it is refused with `SubmissionRejected`.
-- **Batch size**: `BlobBackend.batch_size(region_index)` tells a holder how many rows of a
-  region one driver call carries, so it can bound what a single call that never proves its
-  access ended would pin; `None` means no configured or driver-imposed size limit. A repeated
-  key may still split a group into several calls: a view may name one key at two addresses, and
-  a driver refuses a key that appears twice in one call.
-- **A driver out of its protocol** (a raise from `put`/`get` that is not `DriverRejected`, a
-  `poll` with the wrong row count) is fenced: nothing new reaches it, queued work concludes
-  undispatched, started work is still observed to its end.
+- **Cancel** is asked of a driver that declares `cancel`, once per call of a stopped attempt
+  whose rows have not all concluded, by the progress thread; it is never access-end evidence.
+- **No queue of its own**: every call goes to the driver as it is submitted, so the backend
+  bounds nothing and orders nothing. How many calls a store runs at once, in what order, and
+  when it refuses more (`DriverRejected`, which fails that call) is the driver's; how much to
+  submit at a time is the lease holder's admission policy. There is no backend-side cap on
+  queued work.
+- **One call per group, cut twice**: `BlobBackend.driver_call_limit(region_index)` tells a
+  holder how many rows of a region one driver call carries (the driver's `max_rows_per_op`),
+  so it can bound what a single call that never proves its access ended would pin; `None`
+  means the driver declares no limit on the rows of one call. A group is also cut at a
+  repeated object key: a view may name one key at two addresses, while a `RowBatch` carries no
+  key twice. The rows keep their order, and the outcome's masks their positions.
+- **A driver out of its protocol** (a raise from `put`/`get` that is not `DriverRejected`, no
+  handle returned, a raise from a query, a `poll` with the wrong row count) is fenced: the call
+  is held as unprovable unless its access end was recorded already, the calls of the same
+  submission after it never reach the driver, and every later submission is rejected.

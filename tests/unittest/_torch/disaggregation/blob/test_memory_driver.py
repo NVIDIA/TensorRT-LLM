@@ -20,12 +20,14 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
     Hint,
+    OnChange,
     OpHandle,
     ProbeStatus,
     RegionHandle,
     RegionLayout,
     RegionSpec,
     RegistrationError,
+    RowBatch,
     RowIO,
     RowResult,
     RowStatus,
@@ -73,7 +75,11 @@ from tensorrt_llm._torch.disaggregation.testing.memory_store import (
 )
 from tensorrt_llm._torch.disaggregation.testing.object_trailer import encode_trailer
 
-pytestmark = pytest.mark.cpu_only
+# An exception that escapes a thread fails the test.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 PREFIX = "m"  # the prefix the controlled-mode endpoints below use
 KEY_A, KEY_B, KEY_C = (key_of(label, PREFIX) for label in "ABC")
@@ -113,9 +119,13 @@ class TimeoutStore(MemoryStore):
 
 
 class CrashingStore(MemoryStore):
-    """Raises something that is not a ``StoreError`` from inside a commit, as a binding bug would."""
+    """Raises something that is not a ``StoreError`` from inside every commit and read, as a
+    binding bug would."""
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
+        raise RuntimeError("binding returned garbage")
+
+    def get(self, key: str) -> StoredObject | None:
         raise RuntimeError("binding returned garbage")
 
 
@@ -174,6 +184,10 @@ class TestMemoryDriverConformance(DriverConformance):
     driver_cls: type[MemoryDriver] = MemoryDriver
     capabilities = DEFAULT_CAPABILITIES
     background = False  # True: put/get return once recorded and a thread executes them
+    # Automatic mode runs each operation inside put/get, which the protocol forbids; the checks
+    # that hold a put or a get inside the store skip it, and TestAsyncMemoryDriverConformance runs
+    # them.
+    returns_before_the_store_answers = False
 
     def _driver(self, store: MemoryStore | None = None) -> MemoryDriver:
         # An empty store is falsy (it has a length), so test for None explicitly.
@@ -196,6 +210,11 @@ class TestMemoryDriverConformance(DriverConformance):
         store.gate.clear()
         return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
 
+    def make_blocked_put(self) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
+        store = GatedStore(held={STAGED_KEY})
+        store.gate.clear()
+        return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
+
     def make_held_key(self) -> tuple[StoreDriver, str, Unblock]:
         store = MemoryStore()
         store.begin_write(STAGED_KEY)
@@ -206,6 +225,15 @@ class TestMemoryDriverConformance(DriverConformance):
 
     def make_crash_after_record(self) -> StoreDriver:
         return self._driver(CrashingStore())
+
+    def make_driver_leaving_operations_unstarted(self) -> StoreDriver:
+        return self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
+
+    def make_results_before_access_end(
+        self,
+    ) -> tuple[StoreDriver, Callable[[OpHandle], None], Callable[[OpHandle], None]]:
+        driver = self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
+        return driver, driver.complete, driver.end_access
 
     def make_failing_presence(self) -> tuple[StoreDriver, str]:
         store = MemoryStore()
@@ -231,8 +259,8 @@ class _HintFreeSignatures(MemoryDriver):
     """A driver written before hints existed: ``get`` and ``probe`` take no hint. With
     ``hints`` undeclared the backend never passes one, so it stays a valid driver."""
 
-    def get(self, rows: Sequence[RowIO]) -> MemoryOp:  # type: ignore[override]
-        return super().get(rows)
+    def get(self, rows: RowBatch, *, on_change=None) -> MemoryOp:  # type: ignore[override]
+        return super().get(rows, on_change=on_change)
 
     def probe(self, keys: Sequence[str], budget_s: float) -> tuple[ProbeStatus, ...]:  # type: ignore[override]
         return super().probe(keys, budget_s)
@@ -246,7 +274,7 @@ class TestAsyncMemoryDriverConformance(TestMemoryDriverConformance):
     """The same driver returning handles before the store answers, as a real SDK does."""
 
     background = True
-    handles_before_completion = True
+    returns_before_the_store_answers = True
 
 
 SHARED_STORE = MemoryStore()
@@ -254,6 +282,8 @@ SHARED_STORE = MemoryStore()
 
 class TestSharedStoreConformance(DriverConformance):
     """Fresh clients of one persistent store: every check finds the previous checks' objects."""
+
+    returns_before_the_store_answers = False  # the in-memory driver's automatic mode
 
     def make_driver(self) -> StoreDriver:
         return MemoryDriver(SHARED_STORE)
@@ -263,6 +293,7 @@ class TestPoolDriverConformance(DriverConformance):
     """A driver that registered its memory once, when built; endpoints are carved out of it."""
 
     registers_on_demand = False
+    returns_before_the_store_answers = False  # the in-memory driver's automatic mode
     POOL_BYTES = 1 << 16
 
     def pool_driver(self) -> MemoryDriver:
@@ -378,7 +409,7 @@ class TestTogetherMemoryDriver:
         memory = HostBuffer(SLOT)
         handle = driver.register_regions(specs_of([memory]))
         memory.write(b"a" * SLOT, 0)
-        op = driver.put([RowIO(KEY_A, (Span(memory.address, SLOT),))])
+        op = driver.put(RowBatch.of([RowIO(KEY_A, (Span(memory.address, SLOT),))]))
         with pytest.raises(DriverRejected):
             driver.unregister_regions(handle)
         driver.transfer(op)
@@ -828,7 +859,7 @@ class TestMemoryDriver:
             RowIO(KEY_B, (Span(reader.span(0).address + 4, SLOT),)),  # overlaps row A's span
         ]
         with pytest.raises(DriverRejected):
-            driver.get(rows)
+            driver.get(RowBatch.of(rows))
         assert reader.read_row(0) == reader.read_row(1) == b"-" * SLOT
         assert statuses(driver, driver.get(reader.rows())) == [RowStatus.READY, RowStatus.READY]
 
@@ -839,7 +870,7 @@ class TestMemoryDriver:
         driver = self.make(capabilities=single)
         writer = endpoint(driver, ["A", "B"])
         with pytest.raises(DriverRejected):
-            driver.put([RowIO(KEY_A, (writer.span(0), writer.span(1)))])
+            driver.put(RowBatch.of([RowIO(KEY_A, (writer.span(0), writer.span(1)))]))
         assert statuses(driver, driver.put(writer.rows())) == [RowStatus.READY, RowStatus.READY]
 
     # Submission and drain.
@@ -889,6 +920,27 @@ class TestMemoryDriver:
         later = driver.put(writer.rows())  # nothing stale stands in the way of the next thread
         wait_until(lambda: concluded(driver.poll(later)), "the next operation", TIMEOUT)
         assert statuses(driver, later) == [RowStatus.READY, RowStatus.READY]
+        self._shutdown(driver)
+
+    def test_drain_waits_for_the_last_on_change_of_every_operation(self) -> None:
+        """A worker counts as finished only once it told of its operation: a drain that returned
+        True earlier would let the owner close the driver while the callback still queries it."""
+        driver = self.make(MemoryStore(), background=True)
+        reader = endpoint(driver, ["A"])
+        entered, release = threading.Event(), threading.Event()
+        seen: list[tuple[list[RowStatus], bool]] = []
+
+        def look(op: OpHandle) -> None:
+            entered.set()
+            assert release.wait(TIMEOUT)
+            seen.append((statuses(driver, op), driver.access_ended(op)))
+
+        driver.get(reader.rows(), on_change=look)
+        assert entered.wait(TIMEOUT)
+        assert driver.drain(0) is False  # the worker is still telling of its operation
+        release.set()
+        assert driver.drain(TIMEOUT) is True
+        assert seen == [([RowStatus.MISS], True)]
         self._shutdown(driver)
 
     def test_unregister_is_refused_while_an_operation_may_access_the_region(self) -> None:
@@ -1260,6 +1312,12 @@ def test_each_async_conformance_check_passes_the_driver_and_fails_the_one_breaki
     _run_check(_conformance(MemoryDriver, capabilities, asynchronous), check)
     with pytest.raises(CHECK_FAILED):
         _run_check(_conformance(broken, capabilities, asynchronous), check)
+    # A broken driver may claim an access ended while its own thread still runs it.
+    wait_until(
+        lambda: not any(t.name == "memory-driver-op" for t in threading.enumerate()),
+        "the broken driver's threads to finish",
+        TIMEOUT,
+    )
 
 
 @pytest.mark.parametrize("rule", sorted(BROKEN_TOGETHER_CONFORMANCE))
@@ -1307,14 +1365,16 @@ class _CannotTellAbsenceFromFailure(TogetherMemoryDriver):
             raise StoreError("the store cannot tell absence from failure")
         return result
 
-    def put(self, rows: Sequence[RowIO]) -> MemoryOp:
-        op = super().put(rows)
+    def put(self, rows: RowBatch, *, on_change: OnChange | None = None) -> MemoryOp:
+        op = super().put(rows, on_change=on_change)
         self.complete(op)
         self.end_access(op)
         return op
 
-    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> MemoryOp:
-        op = super().get(rows, hint)
+    def get(
+        self, rows: RowBatch, hint: Hint = None, *, on_change: OnChange | None = None
+    ) -> MemoryOp:
+        op = super().get(rows, hint, on_change=on_change)
         self.complete(op)
         self.gets.append(statuses(self, op))
         if RowStatus.FAULT in self.gets[-1]:
@@ -1365,7 +1425,7 @@ def test_a_row_left_unprovable_skips_the_batch_check_and_retains_the_memory(
     assert gets and all(got == [RowStatus.FAULT] for got in gets), gets
 
 
-def test_each_broken_driver_breaks_one_rule_and_names_an_existing_check() -> None:
+def test_every_check_has_a_broken_driver_and_each_driver_one_pairing() -> None:
     pairings = [
         *BROKEN_CONFORMANCE.values(),
         *BROKEN_ASYNC_CONFORMANCE.values(),
@@ -1375,6 +1435,24 @@ def test_each_broken_driver_breaks_one_rule_and_names_an_existing_check() -> Non
     memory = [cls for cls, _ in BROKEN_MEMORY.values()]
     assert len(set(conformance + memory)) == len(conformance) + len(memory)
     checks = {check for _, _, check in pairings}
-    assert checks <= {name for name in dir(DriverConformance) if name.startswith("test_")}
+    # A check no broken driver fails is one nothing proves can fail.
+    assert checks == {name for name in dir(DriverConformance) if name.startswith("test_")}
     checks = {check for _, check in BROKEN_MEMORY.values()}
     assert checks <= {name for name in dir(TestMemoryDriver) if name.startswith("test_")}
+
+
+class TestMemoryDriverOnChange:
+    @pytest.mark.parametrize("stop", ["cancel", "drain"])
+    def test_a_cancel_or_drain_shows_before_on_change_is_called(self, stop: str) -> None:
+        driver = MemoryDriver(MemoryStore(), controlled=True)
+        reader = endpoint(driver, ["A"])
+        seen: list[tuple[list[RowStatus], bool]] = []
+        op = driver.get(
+            reader.rows(),
+            on_change=lambda op: seen.append((statuses(driver, op), driver.access_ended(op))),
+        )
+        if stop == "cancel":
+            driver.cancel(op)
+        else:
+            assert driver.drain(TIMEOUT) is True
+        assert seen == [([RowStatus.CANCELLED], True)]

@@ -2,36 +2,47 @@
 # SPDX-License-Identifier: Apache-2.0
 """The blob backend: the public ``base.backend.Backend`` over a private store driver.
 
-Threads. The caller's thread validates a submission and cuts it into batches, one driver call
-each and no key twice in one: a view may name one key at two addresses, and a driver refuses a
-key that appears twice in one call. ``BlobConfig.workers`` worker threads take batches, fetches
-first, and make the driver calls.
-One progress thread observes the calls that returned before they settled and, once a shutdown was
-asked and every attempt quiesced, drains the driver and revokes the registrations. All bookkeeping
-is under one lock; neither the driver nor ``wake`` is ever called under it.
+The backend translates and keeps the books; the driver owns how its store's work runs: its queue,
+the order in which gets and puts run, and its threads. A submission is checked and cut into calls,
+one per layer group (split where the driver limits the rows of one call, and at a repeated object
+key, which no call carries twice). A call is one driver operation, its ``OpHandle``; a driver may
+split it further. Each call goes to the driver at once, on the caller's thread, as one ``put`` or
+``get`` of a ``RowBatch``: the driver only records and queues it. The backend queues nothing, so
+it has no order of its own to keep.
 
-A batch goes: queued -> taken by a worker -> its driver call returns -> settled, at once or later
-on the progress thread. It is settled once its row results are recorded and its access end is
-recorded or can never be proven ("unprovable"). An unprovable batch holds its slots for good: its
-attempt never quiesces and the regions stay registered.
+Each call carries an ``on_change`` callback, which the driver calls once the operation's rows all
+concluded, once its access ended and once it turned unprovable; it is the backend's only news of
+the call. The callback queries the operation through the driver and records what the queries
+show, on the thread the driver called it from. A record only ever adds evidence (results, an access
+end, unprovability), so records may come in any order, on any thread, more than once. All
+bookkeeping is under one lock; neither the driver nor ``wake`` is ever called under it.
 
-An attempt's outcome lands once none of its batches is queued and every started one has its
-results; it quiesces once none is queued and every started one has its access end. A cancel, a
-fetch's first fault, a publish's whole-call failure, a driver protocol violation or a shutdown
-stops it: its queued batches are dropped, and the started ones run on. A protocol violation (a
-driver raise other than ``DriverRejected``, or a wrong result count) also refuses every later
-submission.
+A call settles once its row results are recorded and its access end is recorded or can never be
+proven ("unprovable"). An unprovable call holds its slots for good: its attempt never quiesces and
+the regions stay registered.
+
+An attempt's outcome lands once every call has its results; it quiesces once every call's access
+ended. A cancel, a fetch's first fault, a publish's whole-call failure or a shutdown stops it: when
+the driver declares ``cancel``, the progress thread asks it to cancel the calls whose rows have not
+all concluded. That, and the teardown after a shutdown (draining the driver at once, revoking the
+registrations once every attempt quiesced), is all the progress thread does.
+
+A submission hands its calls over up to the first one the driver does not take, or until a
+protocol violation is recorded; the calls after that never reach the driver. A driver that breaks
+its protocol (a raise other than ``DriverRejected`` from ``put`` or ``get``, no handle, a raise
+from a query, or a wrong result count) leaves its call held as unprovable, unless the call's access
+end was recorded already, and every later submission is rejected.
 """
 
 from __future__ import annotations
 
+import functools
 import itertools
 import threading
 import time
-from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import NamedTuple, NoReturn, Protocol
+from typing import NamedTuple, NoReturn, Protocol, cast
 
 import numpy as np
 
@@ -49,22 +60,22 @@ from ..base.backend import (
     WakeFn,
 )
 from ..base.memory import MemoryKind
-from .keys import key_stem
+from .keys import check_key_prefix, key_stem
 from .store import (
     DriverRejected,
+    OnChange,
     OpHandle,
     RegionHandle,
     RegionLayout,
     RegionSpec,
     RegistersRegionsTogether,
     RegistrationError,
-    RowIO,
+    RowBatch,
     RowResult,
     RowStatus,
     Span,
     StoreDriver,
     concluded,
-    faulted,
 )
 
 __all__ = [
@@ -72,91 +83,41 @@ __all__ = [
     "BlobBackend",
     "BlobConfig",
     "ConstructionRejected",
+    "DriverCallLimit",
     "RegionBinding",
     "RegionHold",
 ]
 
-# Fetches sit on the time-to-first-token path and go first. Once this many fetch batches were taken
-# while a publish batch waited, that publish batch goes next, so publishes, whose leases pin the
-# lender's slots, never starve.
-FETCH_BATCHES_PER_PUBLISH_BATCH = 4
-PROGRESS_MIN_DELAY_S = 0.001
-PROGRESS_MAX_DELAY_S = 0.1
-# A driver call may block for long: a store may wait on its transfers without a timeout, or for as
-# long as its own transfer timeout. A call past this is logged once; its submission keeps holding
-# its slots meanwhile.
-STUCK_CALL_WARNING_S = 60.0
+# After a shutdown, the progress thread retries what is left of the teardown (an attempt not
+# quiesced yet, a drain that answered False, a revocation that failed) at an interval that starts
+# at TEARDOWN_RETRY_MIN_S, doubles up to TEARDOWN_RETRY_MAX_S, and drops back to
+# TEARDOWN_RETRY_MIN_S whenever the thread is poked.
+TEARDOWN_RETRY_MIN_S = 0.001
+TEARDOWN_RETRY_MAX_S = 0.1
 SHUTDOWN_FAULT = "blob backend shut down"
 
-_instance_ids = itertools.count()  # names each backend and binding in thread names and logs
-_Results = Sequence[RowResult] | None  # None: not concluded yet, or no new evidence
-
-
-def _warn_once(message: str, key: tuple[object, ...]) -> None:
-    """One warning per ``key`` for the process; the logger's own API is untyped."""
-    logger.warning_once(message, key=key)  # type: ignore[no-untyped-call]
-
-
-class _Observation(NamedTuple):
-    """What one look at a batch's driver call found."""
-
-    results: _Results  # one per row once concluded; None while not, or when the look failed
-    ended: bool  # the call's access to the rows' memory has ended, with evidence
-    unprovable: bool  # the driver can never prove that access ended
-    # Set when the call failed as a whole and every row carries this reason as its fault.
-    whole_call_fault: str | None = None
-    # The failure is outside the driver protocol: the backend sends the driver no more work.
-    breaks_protocol: bool = False
+# Numbers each backend and binding: it names a backend's progress thread and keys each instance's
+# warning_once calls, so one instance's warning never silences another's.
+_instance_ids = itertools.count()
 
 
 @dataclass(frozen=True)
 class BlobConfig:
-    """How the backend cuts submissions into driver calls and runs them; the ``blob`` section of a
-    store config.
+    """The ``blob`` section of a store config.
 
-    The defaults assume nothing about the driver: one worker, and no size limit of the backend's
-    own on a call; the driver's ``max_rows_per_op`` still applies, and a repeated key still splits
-    a group into several calls. How many calls to overlap and how large to make them depends on
-    the store (whether its calls block, what a call costs), so a store's values come from its
-    store config.
+    How a store's work is batched, scheduled and overlapped is its driver's own, so it is set with
+    the driver, for Mooncake in the ``mooncake`` section.
 
     Attributes:
         key_prefix: The deployment's key namespace; matches ``[A-Za-z0-9_-]{1,64}``.
-        workers: Driver calls at once, each on a backend thread of its own. A driver whose calls
-            block until their transfers end needs several to overlap them. Publishes take at most
-            ``max(1, workers - 1)`` of them, so unless there is one worker, one is always left for
-            fetches.
-        rows_per_batch: Most rows in one driver call, or None for no limit of the backend's own.
-        bytes_per_batch: Most payload bytes in one driver call, or None for no limit of the
-            backend's own; a call always carries at least one row, however large its slot. A call
-            holds its submission's slots until it returns, or for good when it can never prove its
-            access ended (``BlobBackend.batch_size``).
-        max_queued_batches: Most batches waiting for a worker, over every attempt. A submission is
-            refused (``SubmissionRejected``) while that many are queued, so a holder that submits
-            faster than the store drains meets back-pressure instead of an unbounded backlog. A
-            submission accepted below the limit may push the count past it, so no view is too
-            large to submit; the batches of a stopped attempt leave the queues at once.
     """
 
     key_prefix: str = "trtllm-kv"
-    workers: int = 1
-    rows_per_batch: int | None = None
-    bytes_per_batch: int | None = None
-    max_queued_batches: int = 256
 
     def __post_init__(self) -> None:
         if not isinstance(self.key_prefix, str):
             raise ValueError(f"key_prefix must be a str, got {self.key_prefix!r}")
-        key_stem(self.key_prefix)
-        for name in ("workers", "max_queued_batches"):
-            if not _is_count(getattr(self, name)):
-                raise ValueError(
-                    f"{name} must be an int of at least 1, got {getattr(self, name)!r}"
-                )
-        for name in ("rows_per_batch", "bytes_per_batch"):
-            value = getattr(self, name)
-            if value is not None and not _is_count(value):
-                raise ValueError(f"{name} must be None or an int of at least 1, got {value!r}")
+        check_key_prefix(self.key_prefix)
 
 
 class ConstructionRejected(RuntimeError):
@@ -180,13 +141,15 @@ class RegionBinding:
 
     Registers, once each and on the builder thread, the regions the driver can access; revokes the
     registrations only when nothing can access them, on the backend's progress thread (or on the
-    builder thread when ``register`` rolls back a failed registration); releases the hold only after
-    every registration is confirmed revoked, on the manager's thread. The driver is never called
-    under the binding's lock, so reading the live registrations never waits on a revocation.
+    builder thread when ``register`` rolls back a failed registration); releases the hold only once
+    no registration may be live: through ``release_hold`` on the manager's thread, or inside
+    ``register`` on the builder thread when it raises ``ConstructionRejected``, after which the
+    caller must not call ``release_hold``. The driver is never called under the binding's lock, so
+    reading the live registrations never waits on a revocation.
 
-    A driver that implements ``RegistersRegionsTogether`` gets every region in one
-    ``register_regions`` call and gives them back in one ``unregister_regions``. The regions count
-    as live, and the hold stays, from before that call until the batch is confirmed revoked.
+    A driver implementing ``RegistersRegionsTogether`` takes every region in one
+    ``register_regions`` call and gives them back in one ``unregister_regions``; every region has
+    an owner here before the store is asked, so a failure of any shape leaves them accounted for.
 
     Args:
         regions: The lender's regions, in its order; region ``i`` is labelled ``region:<i>``.
@@ -199,70 +162,78 @@ class RegionBinding:
     ) -> None:
         self.regions = tuple(regions)
         self.driver = driver
-        self._together = driver if isinstance(driver, RegistersRegionsTogether) else None
         device_memory = driver.capabilities.device_memory
         # The regions register() registers, by index: those with slots in memory the driver can
         # access. A row in any other region is one the backend does not recognize.
-        self.served_regions = frozenset(
+        self.served_region_indices = frozenset(
             index
             for index, region in enumerate(self.regions)
             if region.slot_count > 0 and (region.memory_kind is MemoryKind.HOST or device_memory)
         )
         self._hold = hold
+        # The driver as a RegistersRegionsTogether, taking the regions as one batch; else None.
+        self._together = driver if isinstance(driver, RegistersRegionsTogether) else None
         self._name = f"region-binding-{next(_instance_ids)}"
         self._lock = threading.Lock()
         # Region index -> its handle, or None for a registration that may exist without one.
-        self._live: dict[int, RegionHandle | None] = {}
+        self._live_registrations: dict[int, RegionHandle | None] = {}
 
     def register(self) -> None:
-        """Registers the regions in ``served_regions``: one ``register`` per region, or one
-        ``register_regions`` for all of them when the driver registers regions together.
+        """Registers the regions in ``served_region_indices``.
 
         Raises:
             ConstructionRejected: Nothing is registered and the hold is released: there is no region
-                to register, or a registration failed with nothing escaping and whatever was
-                registered before it was revoked.
-            RuntimeError: A registration may be live; the hold is kept. ``live_labels`` names the
-                regions, ``unregister`` may be called again to revoke them, and ``release_hold``
-                gives the hold back once none is left.
+                to register, a region's layout is refused, or a registration failed with nothing
+                escaping and the earlier ones were revoked.
+            RuntimeError: A registration may be live; the hold is kept.
         """
-        if not self.served_regions:  # a backend that could serve no row
+        if not self.served_region_indices:  # a backend that could serve no row
             self._hold.release()
             raise ConstructionRejected("no region has slots in memory the store driver can access")
-        if self._together is not None:
-            self._register_together(self._together)
-            return
-        for index in sorted(self.served_regions):
+        layouts = {}
+        for index in sorted(self.served_region_indices):
             region = self.regions[index]
-            layout = RegionLayout(
-                region.slot_bytes, region.slot_count, region.layout_label, region.memory_kind
-            )
+            try:  # every layout is checked before any region is registered
+                layouts[index] = RegionLayout(
+                    region.slot_bytes, region.slot_count, region.layout_label, region.memory_kind
+                )
+            except ValueError as error:
+                self._hold.release()
+                raise ConstructionRejected(f"region:{index}: {error}") from error
+        if self._together is not None:
+            self._register_together(self._together, layouts)
+            return
+        for index, layout in layouts.items():
+            region = self.regions[index]
             try:
                 handle = self.driver.register(region.address, region.nbytes, layout)
             except Exception as error:
-                self._raise_for_failed_registration(index, error)
-            self._keep(index, handle)
+                self._roll_back_if_possible_and_raise(index, error)
+            else:
+                self._track_live_registration(index, handle)
 
-    def unregister(self) -> bool:
+    def try_unregister_all(self) -> bool:
         """Revokes every live registration it can. True when none is left; a revocation that failed
         stays live for the next call."""
         if self._together is not None:
             return self._unregister_together(self._together)
         with self._lock:
-            revocable = [(i, handle) for i, handle in self._live.items() if handle is not None]
+            revocable = [
+                (i, handle) for i, handle in self._live_registrations.items() if handle is not None
+            ]
         for index, handle in revocable:
             try:
                 self.driver.unregister(handle)
             except Exception as error:
-                _warn_once(
+                logger.warning_once(
                     f"blob backend: revoking region:{index} failed, will retry: {error!r}",
-                    (self._name, "unregister", index),
+                    key=(self._name, "unregister", index),
                 )
                 continue
             with self._lock:
-                del self._live[index]
+                del self._live_registrations[index]
         with self._lock:
-            return not self._live
+            return not self._live_registrations
 
     def release_hold(self) -> None:
         """Releases the lender's hold, on the manager's thread.
@@ -278,17 +249,21 @@ class RegionBinding:
     def live_labels(self) -> frozenset[str]:
         """``region:<i>`` for every region that may still be registered."""
         with self._lock:
-            return frozenset(f"region:{index}" for index in self._live)
+            return frozenset(f"region:{index}" for index in self._live_registrations)
 
-    def _raise_for_failed_registration(self, index: int, error: Exception) -> NoReturn:
+    def _roll_back_if_possible_and_raise(self, index: int, error: Exception) -> NoReturn:
+        """Raises for region ``index``'s failed registration. When nothing escaped, unregisters
+        every earlier region; once none is left, releases the lender's hold and raises
+        ``ConstructionRejected``. Otherwise (the failed registration may be live, or an earlier
+        region stays registered) keeps the hold and raises ``RuntimeError``."""
         handle = error.handle if isinstance(error, RegistrationError) else None
         nothing_escaped = isinstance(error, DriverRejected) or (
             isinstance(error, RegistrationError) and handle is None
         )
         if not nothing_escaped:
-            self._keep(index, handle)
+            self._track_live_registration(index, handle)
             raise RuntimeError(f"region:{index} may be registered after {error!r}") from error
-        if not self.unregister():
+        if not self.try_unregister_all():
             raise RuntimeError(
                 f"registering region:{index} failed and an earlier region stays registered: {error}"
             ) from error
@@ -297,22 +272,23 @@ class RegionBinding:
         self._hold.release()
         raise ConstructionRejected(f"registering region:{index} failed: {error}") from error
 
-    def _keep(self, index: int, handle: RegionHandle | None) -> None:
+    def _track_live_registration(self, index: int, handle: RegionHandle | None) -> None:
         with self._lock:
-            self._live[index] = handle
+            self._live_registrations[index] = handle
 
-    # The batch path, for a driver that registers regions together.
-
-    def _register_together(self, driver: RegistersRegionsTogether) -> None:
-        indices = sorted(self.served_regions)
+    def _register_together(
+        self, driver: RegistersRegionsTogether, layouts: dict[int, RegionLayout]
+    ) -> None:
         try:
-            specs = [self._spec(index) for index in indices]
+            specs = [
+                RegionSpec(self.regions[index].address, self.regions[index].nbytes, layout)
+                for index, layout in layouts.items()
+            ]
         except ValueError as error:  # a region the boundary cannot describe; the store not asked
             self._hold.release()
             raise ConstructionRejected(f"bad region geometry: {error}") from error
-        owned: dict[int, RegionHandle | None] = dict.fromkeys(indices)
         with self._lock:  # every region has an owner before the store is asked
-            self._live = owned
+            self._live_registrations = dict.fromkeys(layouts)
         try:
             handle = driver.register_regions(specs)
         except Exception as error:
@@ -322,22 +298,24 @@ class RegionBinding:
     def _unregister_together(self, driver: RegistersRegionsTogether) -> bool:
         with self._lock:
             handles: list[RegionHandle] = []
-            for handle in self._live.values():
+            for handle in self._live_registrations.values():
                 if handle is not None and not any(handle is seen for seen in handles):
                     handles.append(handle)
         for handle in handles:  # the one batch handle every region shares
             try:
                 driver.unregister_regions(handle)
             except Exception as error:
-                _warn_once(
+                logger.warning_once(
                     f"blob backend: revoking the regions together failed, will retry: {error!r}",
-                    (self._name, "unregister_regions"),
+                    key=(self._name, "unregister_regions"),
                 )
                 continue
             with self._lock:
-                self._live = {i: h for i, h in self._live.items() if h is not handle}
+                self._live_registrations = {
+                    i: h for i, h in self._live_registrations.items() if h is not handle
+                }
         with self._lock:
-            return not self._live
+            return not self._live_registrations
 
     def _raise_for_failed_batch(self, error: Exception) -> NoReturn:
         handle = error.handle if isinstance(error, RegistrationError) else None
@@ -346,7 +324,7 @@ class RegionBinding:
         )
         if nothing_escaped:
             with self._lock:
-                self._live.clear()
+                self._live_registrations.clear()
             self._hold.release()
             raise ConstructionRejected(
                 f"registering the regions together failed: {error}"
@@ -354,24 +332,24 @@ class RegionBinding:
         if handle is None:  # some may be registered, with nothing to revoke them by
             raise RuntimeError(f"the regions may be registered after {error!r}") from error
         self._keep_all(handle)
-        if not self.unregister():
+        if not self.try_unregister_all():
             raise RuntimeError(
                 f"registering the regions together failed and some may stay registered: {error}"
             ) from error
         self._hold.release()
         raise ConstructionRejected(f"registering the regions together failed: {error}") from error
 
-    def _spec(self, index: int) -> RegionSpec:
-        region = self.regions[index]
-        layout = RegionLayout(
-            region.slot_bytes, region.slot_count, region.layout_label, region.memory_kind
-        )
-        return RegionSpec(region.address, region.nbytes, layout)
-
     def _keep_all(self, handle: RegionHandle) -> None:
         with self._lock:
-            for index in self._live:
-                self._live[index] = handle
+            for index in self._live_registrations:
+                self._live_registrations[index] = handle
+
+
+class DriverCallLimit(NamedTuple):
+    """The most rows of a region, and their bytes, that one driver ``put`` or ``get`` carries."""
+
+    rows: int
+    nbytes: int
 
 
 class _GroupRows(NamedTuple):
@@ -379,31 +357,56 @@ class _GroupRows(NamedTuple):
 
     object_keys: np.ndarray  # uint8 [rows, width]
     addresses: np.ndarray  # int64 [rows]
-    region: SlotRegion
+    region_index: int
 
 
 @dataclass(eq=False)
-class _Batch:
-    """Rows ``[start, stop)`` of one group of an attempt; the unit of one driver call."""
+class _Call:
+    """Rows ``[start, stop)`` of one group of an attempt, handed to the driver as one operation: one
+    ``put`` or ``get``, one ``OpHandle``."""
 
     attempt: BlobAttempt
-    group: int  # position in the view's groups
+    group_position: int  # in ``View.groups``, not the group's ``layer_group_index``
     start: int
     stop: int
-    op: OpHandle | None = None
-    results_recorded: bool = False  # set once, under the backend's lock
-    access_recorded: bool = False  # set once, under the backend's lock
+    # The fields below change only under the backend's lock.
+    op: OpHandle | None = None  # the driver's handle, once the whole submission was handed over
+    results_recorded: bool = False
+    access_end_recorded: bool = False
     unprovable: bool = False  # the driver can never prove its access ended
-    cancel_forwarded: bool = False  # the driver's cancel was called for op; at most once
+    cancel_forwarded: bool = False  # the driver was asked to cancel it
 
     def __len__(self) -> int:
         return self.stop - self.start
 
-    @property
-    def settled(self) -> bool:
-        """Nothing more to learn from the driver: results recorded, and access ended or never
-        provable. An unprovable batch keeps its access open, so its attempt never quiesces."""
-        return self.results_recorded and (self.access_recorded or self.unprovable)
+
+class _CallResults(NamedTuple):
+    """A concluded call's results as an attempt records them: whether each row is READY, and the
+    first row that faulted (its index in the call) with its reason."""
+
+    ready: list[bool]
+    first_fault: tuple[int, str] | None
+
+    @classmethod
+    def none_delivered(cls, rows: int, fault: str | None = None) -> _CallResults:
+        """Every row undelivered: each faults with ``fault`` when given (the call failed as a
+        whole), otherwise none does (CANCELLED)."""
+        return cls([False] * rows, None if fault is None else (0, fault))
+
+    @classmethod
+    def of(cls, results: Sequence[RowResult]) -> _CallResults:
+        ready = [result.status is RowStatus.READY for result in results]
+        if all(ready):
+            return cls(ready, None)
+        faults = ((row, r.fault) for row, r in enumerate(results) if r.fault is not None)
+        return cls(ready, next(faults, None))
+
+
+class _Recorded(NamedTuple):
+    """What a record under the backend's lock leaves to do once the lock is released."""
+
+    wake_due: bool  # the attempt's outcome landed or it quiesced
+    newly_unprovable: bool  # the call turned unprovable with this record
 
 
 class BlobAttempt:
@@ -412,16 +415,15 @@ class BlobAttempt:
     Its state changes only under the backend's lock; ``poll`` and ``quiesced`` read one reference
     without it, so they never block.
 
-    Three counters track its batches:
+    Two counters, both set to the number of calls at submission; each call decrements each at most
+    once:
 
-    - ``_queued_batches``: still in a queue. A stop zeroes it at once and takes the batches out
-      of the queues (``BlobBackend._drop_queued``), so nothing of a stopped attempt is left for a
-      worker.
-    - ``_results_pending``: started, row results not recorded yet.
-    - ``_access_open``: started, access end not recorded yet. An unprovable batch never leaves it.
+    - ``_calls_awaiting_results``: calls whose row results are not recorded yet.
+    - ``_calls_awaiting_access_end``: calls whose access end is not recorded yet. An unprovable
+      call never leaves it.
 
-    The outcome lands once ``_queued_batches`` and ``_results_pending`` are 0; the attempt quiesces
-    once ``_queued_batches`` and ``_access_open`` are 0.
+    The outcome lands once ``_calls_awaiting_results`` is 0; the attempt quiesces once
+    ``_calls_awaiting_access_end`` is 0.
     """
 
     def __init__(
@@ -430,24 +432,22 @@ class BlobAttempt:
         label: str,
         is_fetch: bool,
         groups: list[_GroupRows],
+        call_ranges: list[tuple[int, int, int]],
         hint: Hint = None,
     ) -> None:
         self.label = label
         """The attempt's label among ``BlobBackend.shutdown``'s, ``attempt:<n>``."""
         self.is_fetch = is_fetch
         self._backend = backend
-        self._groups: list[_GroupRows] | None = groups
         self._hint = hint  # a fetch's source, for every driver get; immutable, so kept as given
         self._masks = [np.zeros(len(rows.addresses), dtype=bool) for rows in groups]
-        self._queued_batches = 0  # see the class docstring for the three counters
-        self._results_pending = 0
-        self._access_open = 0
-        # A batch can never prove its access ended, so this attempt never quiesces.
-        self._has_unprovable_batch = False
-        self._fault: str | None = None  # the first fault; _record_results says when it stops
-        # Set by a cancel, a stopping fault, a driver protocol violation or a shutdown.
+        self._calls = [_Call(self, *call_range) for call_range in call_ranges]
+        self._calls_awaiting_results = self._calls_awaiting_access_end = len(self._calls)
+        # The first row fault; _record_results decides whether it stops the attempt.
+        self._first_fault: str | None = None
+        # Set by a cancel, a stopping fault or a shutdown; when the driver declares cancel, the
+        # progress thread then asks it to cancel the calls not concluded.
         self._stopped = False
-        self._cancel_requested = False  # set by a cancel only; forwarded to started batches
         self._outcome: Outcome | None = None
         self._quiesced = False
 
@@ -458,56 +458,51 @@ class BlobAttempt:
         return self._quiesced
 
     def cancel(self) -> None:
-        """Stops dispatching the attempt's queued batches and, when the driver declares
-        ``cancel``, forwards the cancel once to every started batch without a result yet, a
-        batch whose handle arrives later included. Started batches otherwise run on.
-
-        Advisory either way: a cancel is no access-end evidence, and the attempt quiesces only
-        once every started batch proved its access ended.
-        """
+        """Stops the attempt unless its outcome landed. When the driver declares ``cancel``, the
+        progress thread asks it to cancel the calls whose rows have not all concluded; rows already
+        delivered stay delivered."""
         self._backend._cancel(self)
 
-    def _record_results(
-        self, batch: _Batch, results: Sequence[RowResult], whole_call_failed: bool
-    ) -> None:
-        self._masks[batch.group][batch.start : batch.stop] = [
-            result.status is RowStatus.READY for result in results
-        ]
-        for row, result in enumerate(results, batch.start):
-            if result.fault is not None:
-                self._fault = self._fault or f"group {batch.group} row {row}: {result.fault}"
-                # A fetch stops at its first fault: a prefix reuse has no use for the rows past
-                # it. A publish's rows stand alone, so only a call that failed as a whole stops it.
-                if self.is_fetch or whole_call_failed:
-                    self._stop()
-                return
+    @property
+    def _has_unprovable_call(self) -> bool:
+        """A call can never prove its access ended, so the attempt never quiesces."""
+        return any(call.unprovable for call in self._calls)
 
-    def _stop(self) -> None:
-        self._stopped = True
-        self._queued_batches = 0
+    def _record_results(self, call: _Call, results: _CallResults, whole_call_failed: bool) -> bool:
+        """Writes ``call``'s results into the masks and keeps the first fault. True when that fault
+        stops the attempt: when the driver declares ``cancel``, every call not concluded yet is
+        cancelled, earlier ones included, and rows already delivered stay delivered. Any fault stops
+        a fetch: the request it serves has a gap to fill some other way. A publish's rows stand
+        alone, so only a call that failed as a whole stops it."""
+        self._masks[call.group_position][call.start : call.stop] = results.ready
+        if results.first_fault is None:
+            return False
+        row, fault = results.first_fault
+        where = f"group {call.group_position} row {call.start + row}"  # indexes the outcome's masks
+        self._first_fault = self._first_fault or f"{where}: {fault}"
+        return self.is_fetch or whole_call_failed
 
     def _conclude_or_quiesce(self) -> bool:
         """Lands the outcome and turns quiesced once their conditions hold; True when either did."""
         changed = False
-        # After a fault the outcome still waits for the results of batches already started: with
-        # several workers a later batch can fail first, and freezing then would drop the earlier
-        # rows that a prefix reuse needs.
-        if self._outcome is None and self._queued_batches == 0 and self._results_pending == 0:
+        # The outcome waits for every call's results even after a fault: calls conclude in any
+        # order, so the first fault seen can come from a call issued after one that is still
+        # delivering rows a prefix reuse needs.
+        if self._outcome is None and self._calls_awaiting_results == 0:
             for mask in self._masks:  # final, so the outcome keeps them without a copy
                 mask.flags.writeable = False
-            self._outcome = Outcome(tuple(self._masks), self._fault)
+            self._outcome = Outcome(tuple(self._masks), self._first_fault)
             changed = True
-        if not self._quiesced and self._queued_batches == 0 and self._access_open == 0:
+        if not self._quiesced and self._calls_awaiting_access_end == 0:
             self._quiesced = True
-            self._groups = None  # nothing reads the view's arrays once the attempt quiesced
             changed = True
         return changed
 
     def _force_outcome(self, reason: str) -> None:
-        self._stop()
-        fault = reason if self._fault is None else f"{reason}; first fault: {self._fault}"
-        # Still writable, so ``Outcome`` copies them: batches already started go on writing
-        # their results into these masks.
+        first = self._first_fault
+        fault = reason if first is None else f"{reason}; first fault: {first}"
+        # Still writable, so ``Outcome`` copies them: calls still open go on writing their results
+        # into these masks.
         self._outcome = Outcome(tuple(self._masks), fault)
 
 
@@ -520,78 +515,62 @@ class BlobBackend:
             revokes the registrations once nothing can access them after shutdown.
         wake: Called outside every lock whenever an attempt's outcome lands or it quiesces, once
             the change shows through ``poll`` or ``quiesced``.
-        config: How submissions are cut into driver calls.
-
-    Raises:
-        RuntimeError: A backend thread could not start. Nothing of the backend runs afterwards:
-            the workers already started have left. The binding keeps its registrations and the
-            hold for whoever built it to revoke (``RegionBinding.unregister``) and release.
+        config: The store config's ``blob`` section.
     """
 
     def __init__(self, binding: RegionBinding, wake: WakeFn, config: BlobConfig) -> None:
+        # Fixed once __init__ returns.
         self._binding = binding
         self._driver = binding.driver
         self._regions = binding.regions
+        # Each region's whole extent, which a RowBatch names as holding all its rows.
+        self._region_extents = {
+            index: Span(region.address, region.nbytes)
+            for index, region in enumerate(binding.regions)
+            if index in binding.served_region_indices
+        }
         self._wake = wake
-        self._config = config
         self._key_stem = key_stem(config.key_prefix)
-        self._lock = threading.Lock()
-        self._work_ready = threading.Condition(self._lock)
-        self._progress_due = threading.Condition(self._lock)
-        # ``shutdown`` waits on this; notified whenever its answer may have changed: an attempt
-        # concluded or quiesced, or the progress thread finished the teardown.
-        self._shutdown_recheck = threading.Condition(self._lock)
-        self._progress_poked = False
-        self._fetch_queue: deque[_Batch] = deque()
-        self._publish_queue: deque[_Batch] = deque()
-        self._fetches_in_a_row = 0
-        self._watched: set[_Batch] = set()
-        self._attempts: set[BlobAttempt] = set()  # until concluded and quiesced
-        self._attempt_ids = itertools.count()
-        self._shutdown_requested = False
-        self._drained = False
-        self._teardown_done = False  # drained and every registration revoked
-        self._protocol_violation: str | None = None  # how the driver first broke its protocol
-        self._driver_call_started: dict[_Batch, float] = {}  # batch -> when its driver call started
-        self._reported_labels: frozenset[str] | None = None
         self._name = name = f"blob-backend-{next(_instance_ids)}"
         driver_capabilities = self._driver.capabilities
         self._max_rows_per_op = driver_capabilities.max_rows_per_op
         self._driver_reads_hints = driver_capabilities.hints
         self._driver_cancels = driver_capabilities.cancel
+        # Every call goes to the driver as it is submitted, so the backend can cancel only by
+        # asking the driver: it declares cancel exactly when the driver does.
         self._capabilities = Capabilities(
-            fetch=driver_capabilities.get, publish=driver_capabilities.put, cancel=True
+            fetch=driver_capabilities.get,
+            publish=driver_capabilities.put,
+            cancel=driver_capabilities.cancel,
         )
-        self._unprovable_batches = 0
-        self._workers_alive = config.workers
-        self._publish_limit = max(1, config.workers - 1)
-        self._publishes_running = 0
-        self._workers = [
-            threading.Thread(target=self._worker_loop, name=f"{name}-worker-{i}", daemon=True)
-            for i in range(config.workers)
-        ]
-        self._progress = threading.Thread(
+        self._attempt_ids = itertools.count()  # its next() is atomic: submissions take it unlocked
+        self._lock = threading.Lock()
+        # The progress thread waits on this between rounds; _poke_progress notifies it.
+        self._progress_due = threading.Condition(self._lock)
+        # ``shutdown`` waits on this; notified whenever its answer may have changed: an attempt
+        # concluded or quiesced, or the progress thread finished the teardown.
+        self._shutdown_recheck = threading.Condition(self._lock)
+
+        # Guarded by _lock.
+        # Set by _poke_progress, cleared as the next round starts: run a round now.
+        self._progress_poked = False
+        self._attempts: set[BlobAttempt] = set()  # until concluded and quiesced
+        # Set once and never cleared. The progress loop also reads it without the lock: a round
+        # that misses it runs again, since setting it pokes the progress thread.
+        self._shutdown_requested = False
+        self._teardown_done = False  # drained and every registration revoked
+        self._protocol_violation: str | None = None  # how the driver first broke its protocol
+
+        # Used by the progress thread only.
+        self._drained = False  # the driver's drain returned True; it is not drained again
+        # Used by ``shutdown`` only: the labels the last shutdown logged, which it logs again only
+        # once they changed.
+        self._last_logged_labels: frozenset[str] | None = None
+
+        self._progress_thread = threading.Thread(
             target=self._progress_loop, name=f"{name}-progress", daemon=True
         )
-        started: list[threading.Thread] = []
-        try:
-            for thread in (*self._workers, self._progress):
-                thread.start()
-                started.append(thread)
-        except RuntimeError:  # the system refused a thread: the backend never runs
-            self._abandon(started)
-            raise
-
-    def _abandon(self, started: list[threading.Thread]) -> None:
-        """Ends the workers started before a later thread failed to start. The progress thread
-        starts last, so it is never among them: no teardown runs, and the binding stays with its
-        owner, registrations and hold included."""
-        with self._lock:
-            self._shutdown_requested = True
-            self._workers_alive = len(started)
-            self._work_ready.notify_all()
-        for thread in started:
-            thread.join()
+        self._progress_thread.start()
 
     @property
     def capabilities(self) -> Capabilities:
@@ -608,16 +587,16 @@ class BlobBackend:
 
     def shutdown(self, timeout: float) -> frozenset[str]:
         """Forces outcomes, then waits up to ``timeout`` for the progress thread to finish cleanly,
-        or only until the answer can no longer change: every attempt still open holds a batch whose
-        access can never be proven to end.
+        or only until the answer can no longer change: every attempt not yet quiesced holds a call
+        whose access can never be proven to end.
 
-        Never calls the driver: the progress thread drains and revokes the registrations once every
-        worker has left and every attempt quiesced, since revocation can be slow (RDMA deregisters
-        on every NIC) and a call with no budget left must still return at once.
+        Never calls the driver: the progress thread forwards cancels, drains the driver and, once
+        every attempt quiesced, revokes the registrations, since revocation can be slow (RDMA
+        deregisters on every NIC) and a shutdown with no budget left must still return at once.
         """
         # Bounded so that the waits below accept it: an infinite budget must not raise.
         deadline = time.monotonic() + min(max(0.0, timeout), threading.TIMEOUT_MAX)
-        if self._close_and_force_outcomes():
+        if self._refuse_new_work_and_force_outcomes():
             self._call_wake()
         with self._lock:
             self._shutdown_recheck.wait_for(
@@ -625,45 +604,43 @@ class BlobBackend:
             )
             teardown_done = self._teardown_done
         if teardown_done:  # the progress thread is returning
-            self._progress.join(max(0.0, deadline - time.monotonic()))
-        labels = self._labels()
-        self._report(labels)
+            self._progress_thread.join(max(0.0, deadline - time.monotonic()))
+        labels = self._still_accessible_labels()
+        self._log_still_accessible(labels)
         return labels
 
-    def batch_size(self, region_index: int) -> tuple[int, int] | None:
-        """The most rows of region ``region_index`` one driver call carries, and their bytes; None
-        means no configured or driver-imposed size limit, while a repeated key may still split a
-        group into several calls.
+    def driver_call_limit(self, region_index: int) -> DriverCallLimit | None:
+        """The most rows of region ``region_index`` the driver takes in one ``put`` or ``get`` (its
+        ``max_rows_per_op``), and their bytes; None when the driver declares no limit on the rows
+        of one call. A group is still cut at a repeated object key, which no call carries twice.
 
-        An attempt quiesces only once every batch it started proved its access ended, so one call
-        that never proves it keeps the slots of its whole submission; a holder bounds that by
-        submitting at most this many rows of the region at a time.
+        An attempt quiesces only once every call proved its access ended, so one call that never
+        proves it keeps the slots of its whole submission; a holder bounds that by submitting at
+        most this many rows of the region at a time.
 
         Raises:
             ValueError: The backend did not register the region.
         """
-        if region_index not in self._binding.served_regions:
+        if region_index not in self._binding.served_region_indices:
             raise ValueError(f"region {region_index} is not registered")
-        region = self._regions[region_index]
-        rows = self._rows_per_batch(region)
-        return None if rows is None else (rows, rows * region.slot_bytes)
+        rows = self._max_rows_per_op
+        if rows is None:
+            return None
+        return DriverCallLimit(rows=rows, nbytes=rows * self._regions[region_index].slot_bytes)
 
     def stats(self) -> dict[str, int]:
         """A snapshot of the work in flight, for logs and tests."""
-        now = time.monotonic()
         with self._lock:
+            calls = [call for attempt in self._attempts for call in attempt._calls]
             return {
                 "attempts_active": len(self._attempts),
-                "batches_queued": sum(a._queued_batches for a in self._attempts),
-                "batches_in_queues": len(self._fetch_queue) + len(self._publish_queue),
-                "batches_access_open": sum(a._access_open for a in self._attempts),
-                "batches_unprovable": self._unprovable_batches,
-                "oldest_driver_call_ms": int(
-                    1e3 * (now - min(self._driver_call_started.values(), default=now))
-                ),
+                "calls_awaiting_results": sum(not call.results_recorded for call in calls),
+                "calls_awaiting_access_end": sum(not call.access_end_recorded for call in calls),
+                "calls_unprovable": sum(call.unprovable for call in calls),
             }
 
-    # Submission, in the call sequence.
+    # Submission, on the executor loop's thread: validates, then hands each call to the driver,
+    # which only records and queues it.
 
     def _submit(self, view: View, hint: Hint, is_fetch: bool) -> BlobAttempt:
         if hint is not None and not is_fetch:
@@ -672,12 +649,12 @@ class BlobBackend:
             raise InvalidSubmission(f"the store driver reads no hints, got {hint!r}")
         if not (self._capabilities.fetch if is_fetch else self._capabilities.publish):
             raise InvalidSubmission(f"the store driver cannot {'get' if is_fetch else 'put'}")
-        groups = [self._group_rows(group) for group in view.groups]
+        groups = [self._checked_group_rows(group) for group in view.groups]
         if is_fetch:
             _refuse_shared_destinations(groups)
         label = f"attempt:{next(self._attempt_ids)}"
-        attempt = BlobAttempt(self, label, is_fetch, groups, hint)
-        batches = self._cut(attempt, groups)
+        attempt = BlobAttempt(self, label, is_fetch, groups, self._call_ranges(groups), hint)
+        batches = [self._row_batch(groups, call) for call in attempt._calls]
         with self._lock:
             if self._shutdown_requested:
                 raise SubmissionRejected("the blob backend is shut down")
@@ -685,22 +662,14 @@ class BlobBackend:
                 raise SubmissionRejected(
                     f"the store driver broke its protocol: {self._protocol_violation}"
                 )
-            queued = sum(a._queued_batches for a in self._attempts)
-            if queued >= self._config.max_queued_batches:
-                raise SubmissionRejected(
-                    f"{queued} batches are waiting for a worker (max_queued_batches="
-                    f"{self._config.max_queued_batches})"
-                )
             self._attempts.add(attempt)
-            attempt._queued_batches = len(batches)
-            (self._fetch_queue if is_fetch else self._publish_queue).extend(batches)
-            self._work_ready.notify(len(batches))
-            wake_due = self._conclude_or_quiesce(attempt)
+            wake_due = self._conclude_or_quiesce_and_retire(attempt)  # an empty view ends here
         if wake_due:
             self._call_wake()
+        self._hand_over(attempt, batches)
         return attempt
 
-    def _group_rows(self, group: LayerGroupRows) -> _GroupRows:
+    def _checked_group_rows(self, group: LayerGroupRows) -> _GroupRows:
         where = f"layer group {group.layer_group_index}"
         if group.object_keys is None or group.addresses is None or group.region_index is None:
             raise InvalidSubmission(f"{where}: rows need object keys, addresses and a region")
@@ -712,439 +681,376 @@ class BlobBackend:
                 f"{where}: object keys must be uint8 [{rows}, width > 0], got {keys.dtype} "
                 f"{keys.shape}"
             )
+        keys = np.ascontiguousarray(keys)  # one key twice is allowed: _call_bounds cuts there
         if addresses.dtype != np.int64 or addresses.shape != (rows,):
             raise InvalidSubmission(
                 f"{where}: addresses must be int64 [{rows}], got {addresses.dtype} "
                 f"{addresses.shape}"
             )
-        if group.region_index not in self._binding.served_regions:  # refused, never skipped
+        # Refused, never skipped: the driver must not be handed memory it never registered.
+        if group.region_index not in self._binding.served_region_indices:
             raise InvalidSubmission(f"{where}: region {group.region_index} is not registered")
         region = self._regions[group.region_index]
+        # Known limit: numpy lets go of the GIL for arrays of more than about 500 elements, so a
+        # group that large may wait here behind a busy thread.
         slot, misalignment = np.divmod(addresses - region.address, region.slot_bytes)
         if np.any((slot < 0) | (slot >= region.slot_count) | (misalignment != 0)):
             raise InvalidSubmission(f"{where}: an address is not a slot of its region")
-        return _GroupRows(keys, addresses, region)
+        return _GroupRows(keys, addresses, group.region_index)
 
-    def _cut(self, attempt: BlobAttempt, groups: list[_GroupRows]) -> list[_Batch]:
-        batches = []
-        for group, group_rows in enumerate(groups):
-            count = len(group_rows.addresses)
-            step = self._rows_per_batch(group_rows.region) or max(count, 1)  # None: no size limit
-            batches += [
-                _Batch(attempt, group, start, stop)
-                for start, stop in _batch_bounds(group_rows.object_keys, step)
+    def _call_ranges(self, groups: list[_GroupRows]) -> list[tuple[int, int, int]]:
+        """``(group position, start, stop)`` of each call: one per group, split where the driver
+        limits the rows of one call and at a repeated object key."""
+        ranges = []
+        for position, group_rows in enumerate(groups):
+            rows_per_call = self._max_rows_per_op or max(len(group_rows.addresses), 1)
+            ranges += [
+                (position, start, stop)
+                for start, stop in _call_bounds(group_rows.object_keys, rows_per_call)
             ]
-        return batches
+        return ranges
 
-    def _rows_per_batch(self, region: SlotRegion) -> int | None:
-        """The most rows of ``region`` in one driver call, at least one; None when nothing limits
-        them."""
-        bytes_per_batch = self._config.bytes_per_batch
-        limits = [
-            limit
-            for limit in (
-                self._config.rows_per_batch,
-                None if bytes_per_batch is None else bytes_per_batch // region.slot_bytes,
-                self._max_rows_per_op,
-            )
-            if limit is not None
-        ]
-        return max(1, min(limits)) if limits else None
-
-    def _cancel(self, attempt: BlobAttempt) -> None:
-        with self._lock:
-            if attempt._outcome is not None:
-                return
-            attempt._cancel_requested = True
-            attempt._stop()
-            self._drop_queued(attempt)
-            # Started batches whose handle is back and whose result is not: the driver may still
-            # spare their rows. They sit in _driver_call_started until their worker finishes the
-            # call, then in _watched; a batch whose handle is not back yet gets its cancel when it
-            # lands.
-            started = [
-                batch.op
-                for batch in itertools.chain(self._watched, self._driver_call_started)
-                if batch.attempt is attempt and self._take_cancel(batch)
-            ]
-            wake_due = self._conclude_or_quiesce(attempt)
-        for op in started:
-            self._forward_cancel(op)
-        if wake_due:
-            self._call_wake()
-
-    def _take_cancel(self, batch: _Batch) -> bool:
-        """Under the lock: whether this call forwards the cancel for ``batch``, once per batch and
-        only to a driver that declares cancel, for a batch with a handle and no result yet."""
-        if not self._driver_cancels or batch.op is None:
-            return False
-        if batch.results_recorded or batch.cancel_forwarded:
-            return False
-        batch.cancel_forwarded = True
-        return True
-
-    def _forward_cancel(self, op: OpHandle) -> None:
-        try:
-            self._driver.cancel(op)
-        except Exception as error:  # noqa: BLE001 - advisory: a failed cancel changes nothing
-            _warn_once(
-                f"blob backend: cancelling a store operation raised {error!r}",
-                (self._name, "cancel", type(error)),
-            )
-
-    def _drop_queued(self, attempt: BlobAttempt) -> None:
-        """Under the lock: takes a stopped attempt's batches out of the queues, so submitting and
-        cancelling over and over cannot pile up entries the workers would only skip."""
-        for queue in (self._fetch_queue, self._publish_queue):
-            if any(batch.attempt is attempt for batch in queue):
-                kept = [batch for batch in queue if batch.attempt is not attempt]
-                queue.clear()
-                queue.extend(kept)
-
-    # Workers: up to ``config.workers`` driver calls at once, each on a thread of its own.
-
-    def _worker_loop(self) -> None:
-        try:
-            while (batch := self._take()) is not None:
-                self._run(batch)
-        finally:
-            with self._lock:
-                self._workers_alive -= 1
-                self._poke_progress()
-
-    def _take(self) -> _Batch | None:
-        with self._lock:
-            while True:
-                batch = self._pop_next()
-                if batch is None:
-                    if self._shutdown_requested:
-                        return None
-                    self._work_ready.wait()
-                    continue
-                attempt = batch.attempt
-                # A stopped attempt has no batch left here: the stop dropped them under this lock.
-                if not attempt.is_fetch:
-                    self._publishes_running += 1
-                # Counts only the fetches a waiting publish let go first.
-                publish_waits = bool(self._publish_queue)
-                fetch_ahead = attempt.is_fetch and publish_waits
-                self._fetches_in_a_row = self._fetches_in_a_row + 1 if fetch_ahead else 0
-                # Counted as started before the driver call: while the call runs, _access_open
-                # alone keeps the attempt from quiescing once a stop has zeroed _queued_batches.
-                attempt._queued_batches -= 1
-                attempt._results_pending += 1
-                attempt._access_open += 1
-                self._driver_call_started[batch] = time.monotonic()
-                return batch
-
-    def _pop_next(self) -> _Batch | None:
-        publish_due = (
-            self._publish_queue
-            and self._publishes_running < self._publish_limit
-            and (not self._fetch_queue or self._fetches_in_a_row >= FETCH_BATCHES_PER_PUBLISH_BATCH)
+    def _row_batch(self, groups: list[_GroupRows], call: _Call) -> RowBatch:
+        group_rows = groups[call.group_position]
+        rows = slice(call.start, call.stop)
+        region_index = group_rows.region_index
+        return RowBatch.of_slots(
+            self._key_stem,
+            group_rows.object_keys[rows],
+            group_rows.addresses[rows],
+            self._regions[region_index].slot_bytes,
+            self._region_extents[region_index],
         )
-        if publish_due:
-            return self._publish_queue.popleft()
-        return self._fetch_queue.popleft() if self._fetch_queue else None
 
-    def _run(self, batch: _Batch) -> None:
-        with self._lock:
+    def _hand_over(self, attempt: BlobAttempt, batches: list[RowBatch]) -> None:
+        """Hands ``attempt``'s calls to the driver in order, up to the first one the driver does
+        not take, or the first after a protocol violation was recorded (an earlier call's
+        ``on_change`` may record one meanwhile); that call fails as a whole, and the calls after it
+        never reach the driver and conclude CANCELLED."""
+        taken: list[tuple[_Call, OpHandle]] = []
+        for call, rows in zip(attempt._calls, batches):
+            # Read without the lock: a violation recorded a moment later lets one more call
+            # through, which is then held like any call already in the driver.
             violation = self._protocol_violation
-        if violation is not None:  # taken before the break was recorded: never dispatched
-            reason = f"the store driver broke its protocol: {violation}"
-            self._finish(batch, _refused(batch, reason))
-            return
-        try:
-            row_ios = self._row_ios(batch)
-        except Exception as error:  # the driver was never called: nothing escaped
-            self._finish(batch, _refused(batch, f"refused: {error}"))
-            return
-        try:
-            op = self._call_driver(batch.attempt, row_ios)
-        except DriverRejected as error:  # certifies that nothing escaped
-            self._finish(batch, _refused(batch, f"refused: {error}"))
-            return
-        except Exception as error:  # outside the driver protocol: the rows may be accessed for good
-            reason = f"the store driver raised {error!r}"
-            self._finish(
-                batch,
-                _Observation(
-                    _faults(batch, reason),
-                    ended=False,
-                    unprovable=True,
-                    whole_call_fault=reason,
-                    breaks_protocol=True,
-                ),
-            )
-            return
+            if violation is not None:
+                reason = f"not handed over: the store driver broke its protocol ({violation})"
+                self._fail_call(call, reason, this_call_broke_protocol=False)
+                break
+            op = self._hand_over_call(call, rows)
+            if op is None:
+                break
+            taken.append((call, op))
+        for call in attempt._calls[len(taken) + 1 :]:  # past the one the driver did not take
+            self._record(call, _CallResults.none_delivered(len(call)), access_ended=True)
         with self._lock:
-            # The handle lands under the lock, so a cancel from now on finds it in
-            # _driver_call_started; a cancel that came while the call was out is forwarded here.
-            batch.op = op
-            forward = batch.attempt._cancel_requested and self._take_cancel(batch)
-        if forward:
-            self._forward_cancel(op)
-        self._finish(batch, self._observe(batch))
-
-    def _call_driver(self, attempt: BlobAttempt, row_ios: list[RowIO]) -> OpHandle:
-        if not attempt.is_fetch:
-            return self._driver.put(row_ios)
-        if attempt._hint is None:
-            return self._driver.get(row_ios)
-        return self._driver.get(row_ios, attempt._hint)
-
-    def _row_ios(self, batch: _Batch) -> list[RowIO]:
-        groups = batch.attempt._groups
-        assert groups is not None  # cleared only once the attempt quiesced, after every batch
-        group_rows = groups[batch.group]
-        slot_bytes, stem = group_rows.region.slot_bytes, self._key_stem
-        names = group_rows.object_keys[batch.start : batch.stop]
-        hexed, width = names.tobytes().hex(), 2 * names.shape[1]  # one pass for the batch
-        addresses = group_rows.addresses[batch.start : batch.stop].tolist()
-        return [
-            RowIO(stem + hexed[i * width : (i + 1) * width], (Span(address, slot_bytes),))
-            for i, address in enumerate(addresses)
-        ]
-
-    def _observe(self, batch: _Batch) -> _Observation:
-        """The driver's results (when concluded), access end and unprovability for ``batch``."""
-        try:
-            results = self._driver.poll(batch.op)
-            ended = self._driver.access_ended(batch.op)
-            unprovable = not ended and self._driver.access_unprovable(batch.op)
-            count, done = len(results), concluded(results)
-        except Exception as error:  # no new evidence this time
-            _warn_once(
-                f"blob backend: observing a store operation raised {error!r}",
-                (self._name, "observe", type(error)),
-            )
-            return _NO_NEW_EVIDENCE
-        if count != len(batch):  # outside the driver protocol: no later answer proves an access end
-            reason = f"the store driver gave {count} results for {len(batch)} rows"
-            return _Observation(
-                _faults(batch, reason),
-                ended=False,
-                unprovable=not batch.access_recorded,
-                whole_call_fault=reason,
-                breaks_protocol=True,
-            )
-        return _Observation(results if done else None, ended=ended, unprovable=unprovable)
-
-    def _finish(self, batch: _Batch, observed: _Observation) -> None:
-        with self._lock:
-            del self._driver_call_started[batch]
-            # No notify when a publish ends: this worker calls _take next and uses the publish room
-            # it freed itself; an idle worker waits only while nothing it may take is queued.
-            if not batch.attempt.is_fetch:
-                self._publishes_running -= 1
-            wake_due = self._record(batch, observed)
-            if batch.op is not None and not batch.settled:
-                self._watched.add(batch)
+            for call, op in taken:
+                call.op = op
+            # The progress thread cancels only calls whose handle it knows, so a stop that came
+            # while the calls were being handed over is forwarded from here.
+            if attempt._stopped and self._driver_cancels:
                 self._poke_progress()
-        if wake_due:
+
+    def _hand_over_call(self, call: _Call, rows: RowBatch) -> OpHandle | None:
+        """The driver's handle for ``call``, or None when the driver did not take it; the failure
+        is then recorded."""
+        on_change: OnChange = functools.partial(self._query_and_record, call)
+        attempt = call.attempt
+        try:
+            if not attempt.is_fetch:
+                op = self._driver.put(rows, on_change=on_change)
+            elif attempt._hint is None:
+                op = self._driver.get(rows, on_change=on_change)
+            else:
+                op = self._driver.get(rows, attempt._hint, on_change=on_change)
+        except DriverRejected as error:  # certifies that nothing escaped
+            self._fail_call(call, f"refused: {error}", this_call_broke_protocol=False)
+            return None
+        except Exception as error:  # outside the driver protocol: the rows may be accessed for good
+            self._fail_call(
+                call, f"the store driver raised {error!r}", this_call_broke_protocol=True
+            )
+            return None
+        if op is None:  # outside the driver protocol too: nothing to query or cancel
+            self._fail_call(
+                call, "the store driver returned no handle", this_call_broke_protocol=True
+            )
+        return op
+
+    # Recording, on the thread that calls ``on_change``, or on the submitting one for a call the
+    # driver did not take.
+
+    def _query_and_record(self, call: _Call, op: OpHandle) -> None:
+        """``call``'s ``on_change``: queries its operation through the driver and records what the
+        queries show. A record can stop the attempt, land its outcome and quiescence, and latch a
+        protocol violation."""
+        try:
+            results = self._driver.poll(op)
+            access_ended = self._driver.access_ended(op)
+            unprovable = not access_ended and self._driver.access_unprovable(op)
+            count, all_concluded = len(results), concluded(results)
+        except Exception as error:  # the queries never raise for a handle the driver issued
+            self._fail_call(
+                call, f"a store driver query raised {error!r}", this_call_broke_protocol=True
+            )
+            return
+        if count != len(call):
+            reason = f"the store driver gave {count} results for {len(call)} rows"
+            self._fail_call(call, reason, this_call_broke_protocol=True)
+            return
+        # Read row by row here, outside the lock the submitting thread takes.
+        call_results = _CallResults.of(results) if all_concluded else None
+        self._record(call, call_results, access_ended, unprovable)
+
+    def _fail_call(self, call: _Call, reason: str, this_call_broke_protocol: bool) -> None:
+        """Records ``call`` as failed as a whole: every row faults with ``reason``.
+
+        A call the driver refused, or never saw, touched nothing, so its access ended. A call on
+        which the driver broke its protocol is held as unprovable (unless its access end was
+        recorded already): nothing the driver says about it later is taken as evidence. Calls
+        already in the driver keep being recorded from its answers, and every later submission is
+        rejected."""
+        with self._lock:
+            first_violation = this_call_broke_protocol and self._protocol_violation is None
+            if first_violation:
+                self._protocol_violation = reason
+            recorded = self._record_locked(
+                call,
+                _CallResults.none_delivered(len(call), reason),
+                access_ended=not this_call_broke_protocol,
+                unprovable=this_call_broke_protocol,
+                whole_call_failed=True,
+            )
+        if first_violation:
+            logger.warning(
+                f"blob backend: the store driver broke its protocol ({reason}); every later "
+                "submission is rejected"
+            )
+        self._after_record(call.attempt, recorded)
+
+    def _record(
+        self,
+        call: _Call,
+        results: _CallResults | None,
+        access_ended: bool,
+        unprovable: bool = False,
+    ) -> None:
+        with self._lock:
+            recorded = self._record_locked(call, results, access_ended, unprovable)
+        self._after_record(call.attempt, recorded)
+
+    def _after_record(self, attempt: BlobAttempt, recorded: _Recorded) -> None:
+        """What a record leaves to do once the lock is released: a log line for a call that turned
+        unprovable, and the holder's ``wake``. Neither runs under the lock, so a slow log sink or
+        ``wake`` never holds up the submitting thread."""
+        if recorded.newly_unprovable:
+            logger.warning_once(
+                f"blob backend: a store call of {attempt.label} can never prove its access "
+                "ended; its slots stay held",
+                key=(self._name, "unprovable"),
+            )
+        if recorded.wake_due:
             self._call_wake()
 
     # Bookkeeping, under the lock.
 
-    def _record(self, batch: _Batch, observed: _Observation) -> bool:
-        attempt = batch.attempt
-        if observed.results is not None and not batch.results_recorded:
-            batch.results_recorded = True
-            attempt._results_pending -= 1
-            whole_call_failed = observed.whole_call_fault is not None
-            stopped_before = attempt._stopped
-            attempt._record_results(batch, observed.results, whole_call_failed=whole_call_failed)
-            if attempt._stopped and not stopped_before:  # a stopping fault: its queue goes too
-                self._drop_queued(attempt)
-        # An unprovable batch is held for good, whatever the driver says of it later: its attempt
-        # never quiesces, which is what lets a shutdown answer before its budget runs out.
-        if observed.ended and not batch.access_recorded and not batch.unprovable:
-            batch.access_recorded = True
-            attempt._access_open -= 1
-        if observed.unprovable and not batch.unprovable:  # counted; polled again only for results
-            batch.unprovable = True
-            attempt._has_unprovable_batch = True
-            self._unprovable_batches += 1
-            _warn_once(
-                f"blob backend: a store call of {attempt.label} can never prove its access "
-                "ended; its slots stay held",
-                (self._name, "unprovable"),
-            )
-        if batch.settled:
-            self._watched.discard(batch)
-        others_changed = False
-        if observed.breaks_protocol and self._protocol_violation is None:
-            violation = observed.whole_call_fault or "an unnamed protocol violation"
-            others_changed = self._stop_after_protocol_violation(violation)
-        return self._conclude_or_quiesce(attempt) or others_changed
+    def _record_locked(
+        self,
+        call: _Call,
+        results: _CallResults | None,
+        access_ended: bool,
+        unprovable: bool,
+        whole_call_failed: bool = False,
+    ) -> _Recorded:
+        """Records ``call``'s results (None while not all concluded), its access end and whether
+        that end can never be proven. Only adds evidence, so a stale or repeated record changes
+        nothing; a recorded access end stands against a later claim that it can never be proven,
+        and an unprovable call stays held whatever the driver says of it later. The caller passes
+        what it returns to ``_after_record`` once it released the lock."""
+        attempt = call.attempt
+        if results is not None and not call.results_recorded:
+            call.results_recorded = True
+            attempt._calls_awaiting_results -= 1
+            fault_stops_attempt = attempt._record_results(call, results, whole_call_failed)
+            if fault_stops_attempt:
+                self._stop(attempt)
+        if access_ended and not call.access_end_recorded and not call.unprovable:
+            call.access_end_recorded = True
+            attempt._calls_awaiting_access_end -= 1
+        newly_unprovable = unprovable and not call.unprovable and not call.access_end_recorded
+        if newly_unprovable:
+            call.unprovable = True
+        return _Recorded(self._conclude_or_quiesce_and_retire(attempt), newly_unprovable)
 
-    def _stop_after_protocol_violation(self, violation: str) -> bool:
-        """The driver broke its protocol: refuses every later submission and stops every attempt
-        that still has batches queued, so none of them reaches the driver; that attempt's outcome
-        carries the violation as its fault unless it already had one. Batches already in the
-        driver run on and still record their rows. True when an attempt concluded or quiesced."""
-        self._protocol_violation = violation
-        logger.warning(  # type: ignore[no-untyped-call]
-            f"blob backend: the store driver broke its protocol ({violation}); every later "
-            "submission is refused and queued batches are dropped"
-        )
-        fault = f"the store driver broke its protocol: {violation}"
-        changed = False
-        for attempt in list(self._attempts):  # _conclude_or_quiesce may remove from the set
-            if attempt._queued_batches:
-                attempt._fault = attempt._fault or fault
-                attempt._stop()
-                self._drop_queued(attempt)
-                changed = self._conclude_or_quiesce(attempt) or changed
-        return changed
-
-    def _conclude_or_quiesce(self, attempt: BlobAttempt) -> bool:
+    def _conclude_or_quiesce_and_retire(self, attempt: BlobAttempt) -> bool:
+        """Under the lock: lands ``attempt``'s outcome and quiescence once due, and drops it from
+        ``_attempts`` once it has both. True when the caller is to call ``wake``."""
         wake_due = attempt._conclude_or_quiesce()
         if attempt._outcome is not None and attempt._quiesced:
             self._attempts.discard(attempt)
-        self._shutdown_recheck.notify_all()  # every change a shutdown waits for passes through here
+            if self._shutdown_requested:  # the teardown may be one round away
+                self._poke_progress()
+        # Every attempt change a shutdown waits for passes through here; the progress thread
+        # notifies the end of the teardown itself.
+        self._shutdown_recheck.notify_all()
         return wake_due
+
+    def _cancel(self, attempt: BlobAttempt) -> None:
+        """Stops ``attempt`` unless its outcome already landed. Stopping changes no counter, so it
+        lands neither the outcome nor quiescence itself."""
+        with self._lock:
+            if attempt._outcome is None:
+                self._stop(attempt)
+
+    def _stop(self, attempt: BlobAttempt) -> None:
+        """Under the lock: none of ``attempt``'s calls is worth finishing any more. When the driver
+        declares ``cancel``, the progress thread asks it to cancel those still running."""
+        if not attempt._stopped:
+            attempt._stopped = True
+            if self._driver_cancels:
+                self._poke_progress()
 
     def _poke_progress(self) -> None:
         self._progress_poked = True
         self._progress_due.notify()
 
-    # The progress thread: the only one that observes an operation after its worker let go.
+    # The progress thread: forwards cancels and, after a shutdown, tears down.
 
     def _progress_loop(self) -> None:
-        delay = PROGRESS_MIN_DELAY_S
+        retry_s = TEARDOWN_RETRY_MIN_S
         while True:
             try:
-                self._observe_watched()
-                self._report_stuck_calls()
+                self._forward_cancels()
                 if self._shutdown_requested and self._try_teardown():
                     with self._lock:
                         self._teardown_done = True
                         self._shutdown_recheck.notify_all()
                     return
             except Exception as error:  # the thread must live on, or the labels never clear
-                _warn_once(
+                logger.warning_once(
                     f"blob backend: a progress round raised {error!r}",
-                    (self._name, "progress", type(error)),
+                    key=(self._name, "progress", type(error)),
                 )
-            delay = self._wait_for_next_round(delay)
+            retry_s = self._wait_for_next_round(retry_s)
 
-    def _observe_watched(self) -> None:
-        with self._lock:
-            batches = list(self._watched)
-        if not batches:
+    def _forward_cancels(self) -> None:
+        """Asks the driver, once per call, to cancel the calls of stopped attempts whose rows have
+        not all concluded."""
+        if not self._driver_cancels:
             return
-        observations = [(batch, self._observe(batch)) for batch in batches]
         with self._lock:
-            wake_due = [self._record(batch, observed) for batch, observed in observations]
-        if any(wake_due):
-            self._call_wake()
-
-    def _report_stuck_calls(self) -> None:
-        now = time.monotonic()
-        with self._lock:
-            stuck = [
-                b
-                for b, started in self._driver_call_started.items()
-                if now - started > STUCK_CALL_WARNING_S
+            due = [
+                call
+                for attempt in self._attempts
+                if attempt._stopped
+                for call in attempt._calls
+                if call.op is not None and not call.results_recorded and not call.cancel_forwarded
             ]
-        for batch in stuck:
-            _warn_once(
-                f"blob backend: a store call of {batch.attempt.label} has run for over "
-                f"{STUCK_CALL_WARNING_S:g} s; its slots stay held until it returns",
-                (self._name, "stuck", batch.attempt.label, batch.group, batch.start),
-            )
+            for call in due:
+                call.cancel_forwarded = True
+        for call in due:
+            try:
+                self._driver.cancel(call.op)
+            except Exception as error:  # advisory: the call runs on
+                logger.warning_once(
+                    f"blob backend: cancelling a store call raised {error!r}",
+                    key=(self._name, "cancel", type(error)),
+                )
 
-    def _wait_for_next_round(self, delay: float) -> float:
-        """Waits ``delay`` before the next progress round, or less when poked; returns the next
-        delay. It doubles, up to PROGRESS_MAX_DELAY_S, while watched batches stay unsettled, and a
-        poke resets it."""
+    def _wait_for_next_round(self, retry_s: float) -> float:
+        """Waits until poked or, while a teardown may still finish, for at most ``retry_s``; returns
+        the retry interval for the wait after it."""
         with self._lock:
             if not self._progress_poked:
-                # Idle, the thread wakes only as often as stuck driver calls need reporting.
-                busy = self._watched or self._shutdown_requested
-                self._progress_due.wait(delay if busy else STUCK_CALL_WARNING_S)
+                tearing_down = self._shutdown_requested and not self._shutdown_answer_is_final()
+                self._progress_due.wait(retry_s if tearing_down else None)
             poked, self._progress_poked = self._progress_poked, False
-        return PROGRESS_MIN_DELAY_S if poked else min(2 * delay, PROGRESS_MAX_DELAY_S)
+        return TEARDOWN_RETRY_MIN_S if poked else min(2 * retry_s, TEARDOWN_RETRY_MAX_S)
 
     def _try_teardown(self) -> bool:
         """True once the driver is drained and the registrations revoked; a step that is not done
-        yet is retried next round. The driver is never closed here: whoever opened it closes it,
-        after this revocation, since a close may hold the GIL or send RPCs and is the opener's to
-        schedule."""
-        with self._lock:
-            if self._workers_alive or any(not attempt._quiesced for attempt in self._attempts):
-                return False
-        for worker in self._workers:
-            worker.join()  # each has left its loop already
+        yet is retried next round. The driver is drained from the first round on, as nothing is
+        submitted any more: queued work is cancelled and the driver's idle threads exit, even when
+        an attempt never quiesces. The registrations are revoked only once every attempt quiesced.
+        The driver is never closed here: closing a store client may block for long, and it is
+        the step of the owner that opened it, once shutdown returned no labels and the hold went
+        back."""
         if not self._drained:
             self._drained = self._driver.drain(0.0)
-        return self._drained and self._binding.unregister()
+        with self._lock:
+            if any(not attempt._quiesced for attempt in self._attempts):
+                return False
+        return self._drained and self._binding.try_unregister_all()
 
     # Shutdown, on the shutdown thread.
 
-    def _close_and_force_outcomes(self) -> bool:
+    def _refuse_new_work_and_force_outcomes(self) -> bool:
+        """Refuses every later submission, forces the shutdown outcome on each attempt not
+        concluded and stops it (its calls are cancelled when the driver declares cancel), and pokes
+        the progress thread to start the teardown. True when an outcome was forced, so the caller
+        calls ``wake``."""
         with self._lock:
             self._shutdown_requested = True
             forced = [attempt for attempt in self._attempts if attempt._outcome is None]
             for attempt in forced:
+                self._stop(attempt)
                 attempt._force_outcome(SHUTDOWN_FAULT)
-                self._conclude_or_quiesce(attempt)
-            self._fetch_queue.clear()  # every attempt is stopped: nothing queued will run
-            self._publish_queue.clear()
-            self._work_ready.notify_all()
-            self._poke_progress()
+                self._conclude_or_quiesce_and_retire(attempt)
+            self._poke_progress()  # the progress thread forwards the cancels and tears down
         return bool(forced)
 
     def _shutdown_answer_is_final(self) -> bool:
         """Under the lock, once closing: the progress thread finished, or the labels are final. An
-        attempt pinned by a batch whose access can never be proven to end never quiesces, and the
-        registrations are revoked only once every attempt quiesced, so when every open attempt is
-        pinned, neither its label nor a region's can go any more."""
+        attempt with a call whose access can never be proven to end never quiesces, and the
+        registrations are revoked only once every attempt quiesced, so when every attempt not yet
+        quiesced has such a call, neither its label nor a region's can go any more."""
         if self._teardown_done:
             return True
-        open_attempts = [attempt for attempt in self._attempts if not attempt._quiesced]
-        return bool(open_attempts) and all(
-            attempt._has_unprovable_batch for attempt in open_attempts
-        )
+        unquiesced = [attempt for attempt in self._attempts if not attempt._quiesced]
+        return bool(unquiesced) and all(attempt._has_unprovable_call for attempt in unquiesced)
 
-    def _labels(self) -> frozenset[str]:
+    def _still_accessible_labels(self) -> frozenset[str]:
         with self._lock:
             attempts = {attempt.label for attempt in self._attempts if not attempt._quiesced}
         return frozenset(attempts) | self._binding.live_labels()
 
-    def _report(self, labels: frozenset[str]) -> None:
-        if labels == self._reported_labels:
+    def _log_still_accessible(self, labels: frozenset[str]) -> None:
+        if labels == self._last_logged_labels:
             return
-        self._reported_labels = labels
+        self._last_logged_labels = labels
         if labels:
-            message = f"blob backend: shutting down, still accessible: {sorted(labels)}"
-            logger.warning(message)  # type: ignore[no-untyped-call]
+            logger.warning(f"blob backend: shutting down, still accessible: {sorted(labels)}")
         else:
-            message = "blob backend: shut down; nothing is accessible any more"
-            logger.info(message)  # type: ignore[no-untyped-call]
+            logger.info("blob backend: shut down; nothing is accessible any more")
 
     def _call_wake(self) -> None:
         try:
             self._wake()
         except Exception as error:  # a raising wake must not kill a backend thread
-            _warn_once(f"blob backend: wake raised {error!r}", (self._name, "wake", type(error)))
+            logger.warning_once(
+                f"blob backend: wake raised {error!r}", key=(self._name, "wake", type(error))
+            )
 
 
-def _batch_bounds(keys: np.ndarray, step: int) -> list[tuple[int, int]]:
-    """Consecutive ``[start, stop)`` runs of at most ``step`` rows, none naming a key twice: a
-    driver refuses a key that appears twice in one call, while a view may name one key at two
-    addresses. Distinct keys, the usual case, cut into whole steps without a pass over the rows."""
+def _call_bounds(keys: np.ndarray, step: int) -> list[tuple[int, int]]:
+    """Consecutive ``[start, stop)`` runs of at most ``step`` rows, none naming a key twice: a view
+    may name one key at two addresses, while a ``RowBatch`` promises the driver no key twice (a get
+    of one key into two slots would answer READY for both and write one). Keys are compared as
+    bytes in a Python set, not with ``np.unique``, whose sort lets go of the GIL and leaves this
+    thread waiting a switch interval behind any busy thread. Distinct keys, the usual case, cut
+    into whole steps."""
     count = len(keys)
     if count == 0:
         return []
-    if np.unique(keys, axis=0).shape[0] == count:
+    rows = cast(
+        list[bytes],
+        np.ascontiguousarray(keys).view(np.dtype((np.void, keys.shape[1]))).ravel().tolist(),
+    )
+    if len(set(rows)) == count:
         return [(start, min(start + step, count)) for start in range(0, count, step)]
     bounds: list[tuple[int, int]] = []
     seen: set[bytes] = set()
     start = 0
-    for index in range(count):
-        key = keys[index].tobytes()
+    for index, key in enumerate(rows):
         if index - start == step or key in seen:
             bounds.append((start, index))
             start, seen = index, set()
@@ -1155,25 +1061,10 @@ def _batch_bounds(keys: np.ndarray, step: int) -> list[tuple[int, int]]:
 
 def _refuse_shared_destinations(groups: list[_GroupRows]) -> None:
     """Two fetched rows in one slot would let one report READY over the other's bytes. A publish
-    only reads its slots, so only a fetch is checked."""
-    addresses = np.concatenate([rows.addresses for rows in groups]) if groups else np.empty(0)
-    if np.unique(addresses).size != addresses.size:
+    only reads its slots, so only a fetch is checked. A Python set, not np.unique, whose sort lets
+    go of the GIL."""
+    seen: set[int] = set()
+    for rows in groups:
+        seen.update(rows.addresses.tolist())
+    if len(seen) != sum(len(rows.addresses) for rows in groups):
         raise InvalidSubmission("two rows of a fetch write the same slot")
-
-
-def _is_count(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
-
-
-def _faults(batch: _Batch, reason: str) -> tuple[RowResult, ...]:
-    return (faulted(reason),) * len(batch)
-
-
-def _refused(batch: _Batch, reason: str) -> _Observation:
-    """A call that failed as a whole with nothing escaped: every row faults, access ended."""
-    return _Observation(
-        _faults(batch, reason), ended=True, unprovable=False, whole_call_fault=reason
-    )
-
-
-_NO_NEW_EVIDENCE = _Observation(results=None, ended=False, unprovable=False)

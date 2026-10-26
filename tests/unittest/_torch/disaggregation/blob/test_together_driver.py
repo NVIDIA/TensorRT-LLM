@@ -9,7 +9,7 @@ import pytest
 from test_memory_driver import TestTogetherDriverConformance as _BatchConformance
 from together_driver import KVCR_LIKE_CAPABILITIES, TogetherDriver
 
-from tensorrt_llm._torch.disaggregation.blob.store import DriverRejected, RowIO, Span
+from tensorrt_llm._torch.disaggregation.blob.store import DriverRejected, RowBatch, RowIO, Span
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import SLOT, specs_of
 from tensorrt_llm._torch.disaggregation.testing.host_memory import HostBuffer
 from tensorrt_llm._torch.disaggregation.testing.memory_store import MemoryStore
@@ -58,7 +58,7 @@ def test_hints_are_taken_and_recorded() -> None:
     memory = HostBuffer(SLOT)
     handle = driver.register_regions(specs_of([memory]))
     hint = ("peer-3", 7)
-    op = driver.get([RowIO("t/v1/00", (Span(memory.address, SLOT),))], hint)
+    op = driver.get(RowBatch.of([RowIO("t/v1/00", (Span(memory.address, SLOT),))]), hint)
     assert driver.hints_seen == [hint]
     assert driver.access_ended(op)
     driver.unregister_regions(handle)

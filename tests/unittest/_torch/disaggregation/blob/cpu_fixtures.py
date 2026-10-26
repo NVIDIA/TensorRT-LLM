@@ -4,24 +4,17 @@
 
 ``Endpoint`` is one side of a transfer: host slots in one registered region, a driver, a region
 binding, a backend and the waits a test lease holder needs. ``FakeLeaseHolder`` is that holder:
-one decision per attempt, the lease back on quiescence. ``KeyGatedStore`` holds store calls
-until the test opens its gate. ``DriverSpy`` forwards to a real driver, records every call with its
-thread, and can hold a method on an event or make it raise. ``in_a_child_process`` runs a test
-that keeps a backend thread for good in a process of its own. Every wait has an upper bound.
+one decision per attempt, the lease back on quiescence. ``KeyGatedStore`` stops store calls at
+its gate until the test opens it. ``DriverSpy`` forwards to a real driver, records every call
+with its thread, and can gate a method on an event or make it raise. Every wait has an upper bound.
 """
 
 from __future__ import annotations
 
-import contextlib
-import functools
 import hashlib
-import inspect
-import os
-import subprocess
-import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -37,12 +30,14 @@ from tensorrt_llm._torch.disaggregation.blob.keys import encode_key
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     Hint,
+    OnChange,
     OpHandle,
     RegionHandle,
     RegionLayout,
     RegionSpec,
     RegistersRegionsTogether,
     RegistrationError,
+    RowBatch,
     RowIO,
     RowResult,
     StoreDriver,
@@ -59,9 +54,9 @@ from tensorrt_llm._torch.disaggregation.testing.object_trailer import Checksum, 
 WAIT_S = 5.0
 """Upper bound of every wait in these tests; reached only when the code under test is wrong."""
 
-HELD_CALL_S = 10 * WAIT_S
-"""How long a held call waits for its gate: past any test wait, so a gate left shut fails the test's
-own wait first, yet a failed test never strands the thread."""
+GATED_CALL_S = 10 * WAIT_S
+"""How long a gated call waits for its gate: past any test wait, so a gate left shut fails the
+test's own wait first, yet a failed test never strands the thread."""
 
 PROMPT_S = 0.5
 """A call that must not wait on the driver returns well within this."""
@@ -101,43 +96,6 @@ def wait_until(predicate: Callable[[], bool], what: str, timeout: float = WAIT_S
         if time.monotonic() > deadline:
             raise AssertionError(f"timed out waiting for {what}")
         time.sleep(0.001)
-
-
-CHILD_ENV = "TRTLLM_BLOB_TEST_CHILD"
-CHILD_TIMEOUT_S = 120.0
-
-
-def in_a_child_process(test: Callable[..., None]) -> Callable[..., None]:
-    """For a test that leaves a backend thread alive for good, as an access the driver can never
-    prove ended does: under pytest the test runs itself again, by node id, in a child process
-    and passes when that run passed; the child, told apart by ``TRTLLM_BLOB_TEST_CHILD``, runs
-    the body and takes the thread with it when it exits. Fixtures resolve as usual and reach the
-    body in the child."""
-
-    @functools.wraps(test)
-    def wrapper(*args: object, **kwargs: object) -> None:
-        if os.environ.get(CHILD_ENV):
-            test(*args, **kwargs)
-            return
-        # The exact id, parameters included, comes from pytest; the file path from the function.
-        current = os.environ.get("PYTEST_CURRENT_TEST", "")
-        name = current.rsplit("::", 1)[-1].split(" ")[0] if current else test.__name__
-        node_id = f"{inspect.getfile(test)}::{name}"
-        command = [sys.executable, "-m", "pytest", node_id, "-q", "-p", "no:threadleak"]
-        completed = subprocess.run(
-            command,
-            cwd=os.getcwd(),
-            env={**os.environ, CHILD_ENV: "1"},
-            capture_output=True,
-            text=True,
-            timeout=CHILD_TIMEOUT_S,
-            check=False,
-        )
-        assert completed.returncode == 0, (
-            f"the child run of {test.__name__} failed:\n{completed.stdout}\n{completed.stderr}"
-        )
-
-    return wrapper
 
 
 class _Sealable:
@@ -258,22 +216,23 @@ class WakeCounter:
             self._woken.notify_all()
 
     def wait_for(self, predicate: Callable[[], bool], what: str) -> None:
-        """Waits for ``predicate``, re-checked on every wake: state that lands without a wake
-        times the test out."""
+        """Waits for ``predicate``, re-checked on every wake. State that lands without a wake times
+        the test out only when it lands after the wait began; a test that pins a wake counts
+        the wakes itself."""
         with self._woken:
             assert self._woken.wait_for(predicate, WAIT_S), f"no wake brought {what}"
 
 
 class KeyGatedStore(MemoryStore):
-    """Holds ``get``s and/or ``commit``s of the chosen keys (all by default) until the test sets
-    ``gate``; ``waiting`` counts the calls that reached it."""
+    """Stops ``get``s and/or ``commit``s of the chosen keys (all by default) at ``gate`` until the
+    test sets it; ``calls_at_gate`` counts the calls that reached it."""
 
     def __init__(
         self, *, gets: bool = False, commits: bool = False, keys: Iterable[str] | None = None
     ) -> None:
         super().__init__()
         self.gate = threading.Event()
-        self.waiting = 0
+        self.calls_at_gate = 0
         self._gets = gets
         self._commits = commits
         self._keys = None if keys is None else set(keys)
@@ -281,26 +240,26 @@ class KeyGatedStore(MemoryStore):
 
     def get(self, key: str) -> StoredObject | None:
         if self._gets:
-            self._hold(key)
+            self._wait_at_gate(key)
         return super().get(key)
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
         if self._commits:
-            self._hold(key)
+            self._wait_at_gate(key)
         return super().commit(key, payload, trailer)
 
-    def wait_for_waiting(self, count: int) -> None:
+    def wait_for_calls_at_gate(self, count: int) -> None:
         with self._arrived:
-            arrived = self._arrived.wait_for(lambda: self.waiting >= count, WAIT_S)
-            assert arrived, f"{self.waiting} of {count} store calls reached the gate"
+            arrived = self._arrived.wait_for(lambda: self.calls_at_gate >= count, WAIT_S)
+            assert arrived, f"{self.calls_at_gate} of {count} store calls reached the gate"
 
-    def _hold(self, key: str) -> None:
+    def _wait_at_gate(self, key: str) -> None:
         if self.gate.is_set() or (self._keys is not None and key not in self._keys):
             return
         with self._arrived:
-            self.waiting += 1
+            self.calls_at_gate += 1
             self._arrived.notify_all()
-        self.gate.wait(HELD_CALL_S)
+        self.gate.wait(GATED_CALL_S)
 
 
 class RollbackFailsDriver(MemoryDriver):
@@ -327,28 +286,28 @@ class Call:
 class DriverSpy:
     """A ``StoreDriver`` that forwards to ``inner`` and records every call with its thread name.
 
-    ``hold(method, after)`` makes calls of ``method`` past the first ``after`` wait until the
+    ``gate(method, after)`` makes calls of ``method`` past the first ``after`` wait until the
     returned event is set; ``fail(method, error, times)`` makes the next ``times`` calls raise
     ``error`` instead;
     ``answer(method, value, times)`` makes them return ``value`` without reaching the driver.
-    ``ops`` lists every operation ``put``/``get`` returned, with its rows; ``peak_in_flight`` is
-    the most ``put``/``get`` calls that were ever inside the driver at once.
+    ``ops`` lists every operation ``put``/``get`` returned, with its rows; ``call_on_change(op)``
+    calls the ``on_change`` that came with it again, as a driver may.
     """
 
     def __init__(self, inner: StoreDriver) -> None:
         self.inner = inner
         self.calls: list[Call] = []
         self.ops: list[tuple[tuple[RowIO, ...], OpHandle]] = []
-        self.in_flight = self.peak_in_flight = 0
+        self._on_changes: dict[OpHandle, OnChange | None] = {}
         self._changed = threading.Condition()
-        self._holds: dict[str, tuple[threading.Event, int]] = {}  # method -> (gate, after)
+        self._gates: dict[str, tuple[threading.Event, int]] = {}  # method -> (gate, after)
         self._failures: dict[str, list] = {}
         self._answers: dict[str, list] = {}
 
-    def hold(self, method: str, after: int = 0) -> threading.Event:
+    def gate(self, method: str, after: int = 0) -> threading.Event:
         """Makes every call of ``method`` past the first ``after`` wait on the returned event."""
         gate = threading.Event()
-        self._holds[method] = (gate, after)
+        self._gates[method] = (gate, after)
         return gate
 
     def fail(self, method: str, error: Exception, times: int = 1) -> None:
@@ -358,19 +317,22 @@ class DriverSpy:
         self._answers[method] = [value, times]
 
     def op_with(self, key: str) -> OpHandle:
-        """The latest operation carrying the row stored under ``key``, once one started."""
+        """The latest operation carrying the row stored under ``key``, once ``put`` or ``get``
+        returned it."""
         found: list[OpHandle] = []
 
-        def started() -> bool:
+        def returned() -> bool:
             found[:] = [op for rows, op in self.ops if any(row.key == key for row in rows)]
             return bool(found)
 
-        self.wait_for(started, f"an operation for {key}")
+        self.wait_for(returned, f"an operation for {key}")
         return found[-1]
 
-    def progress_polls(self, op: OpHandle) -> int:
-        """How often the backend's progress thread, not a worker, polled ``op``."""
-        return sum(call.thread.endswith("-progress") for call in self.calls_to("poll", op))
+    def call_on_change(self, op: OpHandle) -> None:
+        """Calls ``op``'s ``on_change`` on this thread, as a driver may."""
+        with self._changed:
+            on_change = self._on_changes[op]
+        on_change(op)
 
     def calls_to(self, method: str, op: object = None) -> list[Call]:
         with self._changed:
@@ -392,16 +354,19 @@ class DriverSpy:
         self._enter("unregister")
         self.inner.unregister(handle)
 
-    def put(self, rows: Sequence[RowIO]) -> OpHandle:
+    def put(self, rows: RowBatch, *, on_change: OnChange | None = None) -> OpHandle:
         self._enter("put", rows=rows)
-        with self._counted():
-            return self._started(rows, self.inner.put(rows))
+        return self._record_op(rows, self.inner.put(rows, on_change=on_change), on_change)
 
-    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> OpHandle:
+    def get(
+        self, rows: RowBatch, hint: Hint = None, *, on_change: OnChange | None = None
+    ) -> OpHandle:
         self._enter("get", rows=rows)
-        with self._counted():
-            op = self.inner.get(rows) if hint is None else self.inner.get(rows, hint)
-            return self._started(rows, op)
+        if hint is None:
+            op = self.inner.get(rows, on_change=on_change)
+        else:
+            op = self.inner.get(rows, hint, on_change=on_change)
+        return self._record_op(rows, op, on_change)
 
     def poll(self, op: OpHandle) -> tuple[RowResult, ...]:
         self._enter("poll", op=op)
@@ -429,17 +394,6 @@ class DriverSpy:
         self._enter("close")
         self.inner.close()
 
-    @contextlib.contextmanager
-    def _counted(self) -> Iterator[None]:
-        with self._changed:
-            self.in_flight += 1
-            self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
-        try:
-            yield
-        finally:
-            with self._changed:
-                self.in_flight -= 1
-
     def _scripted_answer(self, method: str) -> list | None:
         with self._changed:
             scripted = self._answers.get(method)
@@ -448,9 +402,12 @@ class DriverSpy:
             scripted[1] -= 1
             return scripted
 
-    def _started(self, rows: Sequence[RowIO], op: OpHandle) -> OpHandle:
+    def _record_op(
+        self, rows: Sequence[RowIO], op: OpHandle, on_change: OnChange | None
+    ) -> OpHandle:
         with self._changed:
             self.ops.append((tuple(rows), op))
+            self._on_changes[op] = on_change
             self._changed.notify_all()
         return op
 
@@ -463,17 +420,17 @@ class DriverSpy:
                 failure[1] -= 1
             else:
                 failure = None
-            hold = self._holds.get(method)
+            gate = self._gates.get(method)
             entered = sum(1 for call in self.calls if call.method == method)  # this one included
-        if hold is not None and entered > hold[1]:
-            hold[0].wait(HELD_CALL_S)
+        if gate is not None and entered > gate[1]:
+            gate[0].wait(GATED_CALL_S)
         if failure is not None:
             raise failure[0]
 
 
 class TogetherDriverSpy(DriverSpy):
     """A ``DriverSpy`` over a driver that registers regions together. The spy implements the
-    protocol too, so a binding over it takes the batch path; ``hold`` and ``fail`` work on
+    protocol too, so a binding over it takes the batch path; ``gate`` and ``fail`` work on
     ``register_regions`` and ``unregister_regions`` as on any other method."""
 
     def __init__(self, inner: StoreDriver) -> None:
@@ -508,10 +465,6 @@ class Endpoint:
         *,
         slot_bytes: int = SLOT_BYTES,
         fill: int = 0,
-        workers: int = 1,
-        rows_per_batch: int | None = 64,
-        bytes_per_batch: int | None = 128 << 20,
-        max_queued_batches: int = 256,
         on_wake: Callable[[], None] | None = None,
         others: Sequence[CpuRegion] = (),
     ) -> None:
@@ -523,15 +476,8 @@ class Endpoint:
         self.binding = RegionBinding((self.region, *others), self.driver, self.hold)
         self.binding.register()
         self.wake = WakeCounter(on_wake)
-        config = BlobConfig(
-            key_prefix=KEY_PREFIX,
-            workers=workers,
-            rows_per_batch=rows_per_batch,
-            bytes_per_batch=bytes_per_batch,
-            max_queued_batches=max_queued_batches,
-        )
         before = set(threading.enumerate())
-        self.backend = BlobBackend(self.binding, self.wake, config)
+        self.backend = BlobBackend(self.binding, self.wake, BlobConfig(key_prefix=KEY_PREFIX))
         self.threads = set(threading.enumerate()) - before
 
     def rows(self, names: Sequence[str], layer_group_index: int = 0) -> Rows:
@@ -553,7 +499,8 @@ class Endpoint:
         return attempt.poll()
 
     def op(self, name: str) -> OpHandle:
-        """The latest driver operation carrying the row ``name``, once one started."""
+        """The latest driver operation carrying the row ``name``, once ``put`` or ``get`` returned
+        it."""
         return self.driver.op_with(store_key(name))
 
     def wait_quiesced(self, attempt: BlobAttempt) -> None:
@@ -568,6 +515,16 @@ class Endpoint:
         for thread in self.threads:
             thread.join(WAIT_S)
         assert not any(thread.is_alive() for thread in self.threads)
+        # A background ``MemoryDriver``'s threads count as finished a moment before they exit.
+        wait_until(
+            lambda: not any(t.name == "memory-driver-op" for t in threading.enumerate()),
+            "the driver's operation threads to exit",
+        )
+        # The owner that opened the driver closes it, last: after the drain, the revocations and
+        # the hold's return. The backend never does.
+        self.driver.close()
+        ending = [call.method for call in self.driver.calls if call.method in ("drain", "close")]
+        assert ending.count("close") == 1 and ending[-1] == "close" and "drain" in ending, ending
 
 
 def _no_keys() -> np.ndarray:

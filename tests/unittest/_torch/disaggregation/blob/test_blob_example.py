@@ -8,6 +8,7 @@ working example of its part of the picture; ``README.md`` points here."""
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 
 import pytest
 from cpu_fixtures import (
@@ -23,7 +24,11 @@ from cpu_fixtures import (
 )
 
 from tensorrt_llm._torch.disaggregation.blob.store import StoreError
-from tensorrt_llm._torch.disaggregation.testing.memory_store import MemoryDriver, MemoryStore
+from tensorrt_llm._torch.disaggregation.testing.memory_store import (
+    DEFAULT_CAPABILITIES,
+    MemoryDriver,
+    MemoryStore,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -67,8 +72,9 @@ def test_a_fault_with_a_late_write_keeps_the_lease_until_the_attempt_quiesced(
     be writing: the lease waits for the evidence that it stopped."""
     for name, data in {"A": b"aaaaaaaa", "B": b"bbbbbbbb"}.items():
         commit_object(store, name, data)
-    driver = MemoryDriver(store, controlled=True)
-    reader = Endpoint(driver, ["A", "B"], rows_per_batch=1, fill=0x2D)
+    one_row_per_call = replace(DEFAULT_CAPABILITIES, max_rows_per_op=1)
+    driver = MemoryDriver(store, controlled=True, capabilities=one_row_per_call)
+    reader = Endpoint(driver, ["A", "B"], fill=0x2D)
     holder = FakeLeaseHolder(reader)
     attempt = holder.fetch("A", "B")
     op_a, op_b = reader.op("A"), reader.op("B")
@@ -119,7 +125,7 @@ def test_the_hold_goes_back_only_once_every_region_is_revoked(store: MemoryStore
     endpoint = Endpoint(MemoryDriver(store), ["A"], others=[CpuRegion(SLOT_BYTES, 2)])
     holder = FakeLeaseHolder(endpoint)
     endpoint.driver.fail("unregister", StoreError("device busy"), times=1)  # region 0, first try
-    retry = endpoint.driver.hold("unregister", after=2)  # region 1 goes through; the retry waits
+    retry = endpoint.driver.gate("unregister", after=2)  # region 1 goes through; the retry waits
     try:
         labels = holder.shut_down(0)
         assert labels and labels <= {"region:0", "region:1"} and not endpoint.hold.released
