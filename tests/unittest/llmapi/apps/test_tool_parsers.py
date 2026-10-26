@@ -4287,6 +4287,58 @@ class TestPoolsideV1ToolParser(BaseToolParserTestClass):
             },
         }
 
+    @pytest.mark.parametrize("raw, arg_type, expected", [
+        ("1e999", "integer", "1e999"),
+        ("-Infinity", "integer", "-Infinity"),
+        ("NaN", "integer", "NaN"),
+        ("1e999", "number", "1e999"),
+        ("NaN", "number", "NaN"),
+        ("1.e999", "number", "1.e999"),
+        ("9" * 400, "number", int("9" * 400)),
+        ("[1e999]", "array", "[1e999]"),
+        ("[" * 100000 + "]" * 100000, "array", "[" * 100000 + "]" * 100000),
+    ],
+                             ids=[
+                                 "integer-1e999", "integer--Infinity",
+                                 "integer-NaN", "number-1e999", "number-NaN",
+                                 "number-1.e999", "number-400_digits",
+                                 "array-1e999", "array-deeply_nested"
+                             ])
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_values_without_strict_json_keep_text(self, parser, raw, arg_type,
+                                                  expected, streaming):
+        """Values that overflow, nest too deeply or are NaN keep their text."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="f",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "v": {
+                                "type": arg_type
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        text = f"<tool_call>f\n<arg_key>v</arg_key>\n<arg_value>{raw}</arg_value>\n</tool_call>"
+
+        if streaming:
+            calls = parser.parse_streaming_increment(text, tools).calls
+        else:
+            calls = parser.detect_and_parse(text, tools).calls
+
+        def reject_constant(name):
+            raise ValueError(f"{name} is not strict JSON")
+
+        assert json.loads(calls[-1].parameters,
+                          parse_constant=reject_constant) == {
+                              "v": expected
+                          }
+
     def test_parse_streaming_increment_split_tags(self, sample_tools, parser):
         result = parser.parse_streaming_increment("<tool", sample_tools)
         assert result.normal_text == ""
