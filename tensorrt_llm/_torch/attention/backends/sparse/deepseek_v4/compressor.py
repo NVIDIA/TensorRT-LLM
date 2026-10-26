@@ -14,7 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
-from ..mixed_precision_overlay import retained_row_buffer, write_compressed_rows
+from ..mixed_precision_overlay import retained_compress_target
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -311,11 +311,6 @@ class Compressor(nn.Module):
 
         position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
         compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
-        # Mixed-precision KV: also store the post-processed rows in this layer's retained twin.
-        retained_rows = None
-        if not self.is_indexer and getattr(metadata, "mixed_high_block_table", None) is not None:
-            retained_rows = retained_row_buffer(metadata, kv_comp)
-
         if self.footer_scale_cache and not self.is_indexer:
             self._footer_scale_postprocess_scatter(
                 kv_comp,
@@ -334,7 +329,7 @@ class Compressor(nn.Module):
         # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache write
         torch.ops.trtllm.compressor_postprocess_scatter(
             kv_comp,
-            kv_out if kv_out is not None else retained_rows,
+            kv_out,
             self.norm.weight,
             self.norm.variance_epsilon,
             self.rotary_emb.rotary_cos_sin,
@@ -357,16 +352,50 @@ class Compressor(nn.Module):
             scale_output,
         )
 
-        if retained_rows is not None:
-            write_compressed_rows(
+        # Mixed-precision KV: the same scatter writes the retained rows into this layer's twin.
+        twin = (
+            retained_compress_target(
                 self,
                 metadata,
-                retained_rows,
                 num_comp_tokens,
                 cu_new_comp_kv,
                 start_pos,
                 compressed_mask,
                 bsz,
+                total_tokens,
+            )
+            if not self.is_indexer
+            else None
+        )
+        if twin is not None:
+            twin_cache, twin_table, twin_mask, twin_rows_per_block = twin
+            torch.ops.trtllm.compressor_postprocess_scatter(
+                kv_comp,
+                None,
+                self.norm.weight,
+                self.norm.variance_epsilon,
+                self.rotary_emb.rotary_cos_sin,
+                position_ids,
+                self.nope_head_dim,
+                self.rope_head_dim,
+                twin_cache,
+                None,
+                num_comp_tokens,
+                cu_new_comp_kv,
+                start_pos,
+                twin_table,
+                twin_mask,
+                twin_rows_per_block,
+                int(
+                    KVCacheDtype.FP8_PERTENSOR
+                    if twin_cache.dtype == torch.float8_e4m3fn
+                    else KVCacheDtype.NONE
+                ),
+                1.0,
+                0,
+                self.rotate_activation,
+                None,
+                None,
             )
         if quant_output is not None:
             if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
