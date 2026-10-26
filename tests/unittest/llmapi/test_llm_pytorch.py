@@ -34,6 +34,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        prompts, run_llm_abort_request,
                        sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
+                       tinyllama_batched_logits_processor_test_harness,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
@@ -71,6 +72,12 @@ from dataclasses import replace
 def test_tinyllama_logits_processor(enable_chunked_prefill):
     tinyllama_logits_processor_test_harness(
         backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
+
+
+@force_ampere
+@pytest.mark.part2
+def test_tinyllama_batched_logits_processor():
+    tinyllama_batched_logits_processor_test_harness(backend="pytorch")
 
 
 @skip_ray

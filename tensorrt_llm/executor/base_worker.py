@@ -529,6 +529,10 @@ class BaseWorker(GenerationExecutor):
                 lp = request.sampling_params.logits_processor
                 executor_request.py_logits_post_processors = lp if isinstance(
                     lp, list) else [lp]
+            if request.sampling_params.apply_batched_logits_processor:
+                # Only set when asked for, so the PP broadcast of Python-only
+                # request attributes has nothing to carry for other requests.
+                executor_request.py_apply_batched_logits_processor = True
 
             executor_request.py_scheduling_params = None
             if request.scheduling_params is not None:

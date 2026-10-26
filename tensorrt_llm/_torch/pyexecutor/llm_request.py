@@ -721,6 +721,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        # SamplingParams.apply_batched_logits_processor: the engine hands this
+        # request's logits to LLM(batched_logits_processor=...) each step.
+        self.py_apply_batched_logits_processor: bool = kwargs.pop(
+            "py_apply_batched_logits_processor", False)
         # Owned entirely on the Python side: the TorchSampler is the only
         # consumer, so the C++ request no longer carries a copy.
         self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
@@ -1705,6 +1709,8 @@ def executor_request_to_llm_request(
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
+        py_apply_batched_logits_processor=getattr(
+            executor_request, "py_apply_batched_logits_processor", False),
         encoder_input_tokens=executor_request.encoder_input_token_ids,
         encoder_input_features=encoder_input_features,
         encoder_output_len=encoder_output_len,

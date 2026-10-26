@@ -816,14 +816,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         The hook runs at the tail of the forward, before anything the executor
         does to the logits afterwards: the guided-decoding bitmask applied by
-        ``guided_decoder.execute()``, and the user's own logits processors run
-        by ``_execute_logit_post_processors``. Both happen once
+        ``guided_decoder.execute()``, and the user's own logits processors
+        (per request, or the LLM's batched one) run by
+        ``_execute_logit_post_processors``. Both happen once
         ``_forward_step`` has returned, so sampling in-graph would read unmasked
         logits and emit a token they were meant to forbid, while their output is
         discarded. Any future post-forward logits mutator belongs here too.
         """
-        return request.py_guided_decoding_params is not None or bool(
-            getattr(request, "py_logits_post_processors", None)
+        return (
+            request.py_guided_decoding_params is not None
+            or bool(getattr(request, "py_logits_post_processors", None))
+            or bool(getattr(request, "py_apply_batched_logits_processor", False))
         )
 
     def get_sample_type(self, requests: list[LlmRequest]) -> SampleType:
