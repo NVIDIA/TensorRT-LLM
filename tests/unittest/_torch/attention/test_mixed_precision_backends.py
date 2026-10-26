@@ -73,8 +73,8 @@ def test_optimized_two_pool_prefill_and_decode(
             max_tokens=65536,
             enable_block_reuse=True,
             dtype="mixed_nvfp4_fp8" if high_dtype == DataType.FP8 else "mixed_nvfp4_bfloat16",
-            first_n=block,
-            last_n=block,
+            mixed_precision_first_n=block,
+            mixed_precision_last_n=block,
             # Full-history (low) group, then the retained-token (high) group.
             pool_ratio=[0.75, 0.25],
         ),
@@ -442,8 +442,8 @@ def test_mla_cached_context_and_decode(backend):
             max_tokens=65536,
             enable_block_reuse=True,
             dtype="mixed_nvfp4_bfloat16",
-            first_n=block,
-            last_n=block,
+            mixed_precision_first_n=block,
+            mixed_precision_last_n=block,
             pool_ratio=[0.75, 0.25],
         ),
         CacheType.SELFKONLY,
@@ -635,7 +635,7 @@ def test_mixed_precision_public_options():
     assert KvCacheConfig().mixed_precision_kv is None
     config = KvCacheConfig(dtype="mixed_nvfp4_fp8")
     assert config.mixed_precision_kv == ("nvfp4", "fp8", 256, 256)
-    assert config.first_n == config.last_n == 256
+    assert config.mixed_precision_first_n == config.mixed_precision_last_n == 256
     assert config.pool_ratio is None
     for high in ("float16", "bfloat16"):
         assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").mixed_precision_kv.high == high
@@ -643,16 +643,18 @@ def test_mixed_precision_public_options():
         {"dtype": "mixed_int4_fp8"},
         {"dtype": "mixed_nvfp4_nvfp4"},
         {"dtype": "mixed_nvfp4_auto"},
-        {"dtype": "mixed_nvfp4_fp8", "first_n": -1},
-        {"dtype": "mixed_nvfp4_fp8", "last_n": -1},
-        {"dtype": "mixed_nvfp4_fp8", "first_n": 0, "last_n": 0},
-        {"mixed_precision_config": {"first_n": 1}},
+        {"dtype": "mixed_nvfp4_fp8", "mixed_precision_first_n": -1},
+        {"dtype": "mixed_nvfp4_fp8", "mixed_precision_last_n": -1},
+        {"dtype": "mixed_nvfp4_fp8", "mixed_precision_first_n": 0, "mixed_precision_last_n": 0},
+        {"mixed_precision_config": {"mixed_precision_first_n": 1}},
     ):
         with pytest.raises(ValidationError):
             KvCacheConfig(**invalid)
     for first_n, last_n in ((0, 1), (1, 0)):
-        KvCacheConfig(dtype="mixed_nvfp4_fp8", first_n=first_n, last_n=last_n)
-    KvCacheConfig(first_n=0, last_n=0)
+        KvCacheConfig(
+            dtype="mixed_nvfp4_fp8", mixed_precision_first_n=first_n, mixed_precision_last_n=last_n
+        )
+    KvCacheConfig(mixed_precision_first_n=0, mixed_precision_last_n=0)
 
 
 @pytest.mark.parametrize(
@@ -676,7 +678,18 @@ def test_mixed_precision_public_options():
             ValueError,
             "use_kv_cache_manager_v2=True",
         ),
-        ({"attn_backend": "VANILLA"}, NotImplementedError, "TRTLLM and FLASHINFER"),
+        ({"attn_backend": "vanilla"}, ValueError, "TRTLLM and FLASHINFER"),
+        (
+            {
+                "kv_connector_config": {
+                    "connector_module": "connector_module",
+                    "connector_scheduler_class": "Scheduler",
+                    "connector_worker_class": "Worker",
+                }
+            },
+            ValueError,
+            "KV connector",
+        ),
         (
             {
                 "speculative_config": {
@@ -697,7 +710,7 @@ def test_mixed_precision_public_options():
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
     ],
-    ids=("v1", "auto_v2", "backend", "dynamic_tree", "compression", "beam"),
+    ids=("v1", "auto_v2", "backend", "connector", "dynamic_tree", "compression", "beam"),
 )
 @pytest.mark.cpu_only
 def test_mixed_precision_llm_args_validation(overrides, error, match):
@@ -740,7 +753,7 @@ def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 
     target = KvCacheConfig(
-        dtype=f"mixed_nvfp4_{high}", first_n=16, last_n=64, pool_ratio=[0.9, 0.1]
+        dtype=f"mixed_nvfp4_{high}", mixed_precision_first_n=16, mixed_precision_last_n=64, pool_ratio=[0.9, 0.1]
     )
     draft = KvCacheCreator._get_one_model_draft_kv_cache_config(
         SimpleNamespace(), target, 1024, estimating_kv_cache=True
@@ -749,6 +762,30 @@ def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
     assert draft.mixed_precision_kv is None
     assert draft.max_attention_window is None
     assert target.mixed_precision_kv is not None
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_retained_dtype_must_match_model_dtype():
+    from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
+
+    model_config = SimpleNamespace(
+        quant_config=QuantConfig(), quant_config_dict=None, torch_dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="model dtype"):
+        validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_float16")
+    validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_bfloat16")
+    assert model_config.quant_config.kv_cache_quant_algo is None
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_llm_args_accept_lowercase_backend():
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    TorchLlmArgs(
+        model="/tmp/mixed-precision-nonexistent-model",
+        kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
+        attn_backend="flashinfer",
+    )
 
 
 @pytest.mark.parametrize(
@@ -779,8 +816,8 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
                 host_cache_size=0,
                 enable_block_reuse=True,
                 dtype="mixed_nvfp4_bfloat16",
-                first_n=block,
-                last_n=block,
+                mixed_precision_first_n=block,
+                mixed_precision_last_n=block,
                 pool_ratio=[0.75, 0.25],
             ),
             CacheType.SELF,
@@ -859,8 +896,8 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
             max_tokens=65536,
             enable_block_reuse=True,
             dtype="mixed_nvfp4_bfloat16",
-            first_n=block,
-            last_n=block,
+            mixed_precision_first_n=block,
+            mixed_precision_last_n=block,
             pool_ratio=[0.75, 0.25],
         ),
         CacheType.SELF,

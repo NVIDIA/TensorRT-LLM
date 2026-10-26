@@ -7,8 +7,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, Hashable, List, Optional, Tuple, Type,
-                    Union)
+from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
+                    Tuple, Type, Union)
 
 import torch
 import torch._dynamo.config
@@ -16,8 +16,9 @@ import torch._dynamo.config
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._utils import mpi_disabled, release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -35,25 +36,27 @@ from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..distributed.ops import MNNVLAllReduce
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from ..nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
-from ..speculative.utils import get_static_draft_len
 from ..tensor_lru_cache import TensorLRUCache
 from ..utils import set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import filter_cuda_graph_batch_sizes
-from .engine.lora import make_lora_model_config
+from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
-                                setup_mm_encoder_attn_metadata)
+                                setup_mm_encoder_attn_metadata,
+                                setup_mm_encoder_cuda_graphs, use_mrope)
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache)
@@ -98,6 +101,26 @@ class ModelEngine(ABC):
         perform warmup actions: instantiating CUDA graphs, torch.compile, etc.
         """
         return
+
+
+# Refit only needs the compile wrapper removed before weights are loaded: the
+# wrapper inserts "_orig_mod" into every parameter path, and load_weights()
+# matches checkpoint tensors by dotted path (modeling_utils.py:1141-1160). With
+# allow_partial_loading=True the whole compiled subtree then silently loads
+# nothing and keeps its pre-refit weights.
+#
+# Bisected on a TP8 Qwen3.5 397B refit against a real-weight reference; only the
+# unwrap changes the outcome, so the refit lifecycle is unwrap -> load ->
+# re-wrap and nothing else. The measurements, for anyone tempted to add the
+# other steps back:
+#   unwrap + compiler.reset() + recompile + recapture   clean 6.5 s
+#   unwrap + reset + recompile, no recapture            clean 5.7 s
+#   unwrap + recompile                                  clean 5.6 s
+#   unwrap + re-wrap only                    (shipped)  clean 5.1 s
+#   no unwrap                                           GARBAGE
+# Clearing and recapturing the piecewise graphs is the part that was dropped:
+# refit moves no tensor, so the captures stay valid and PWCG stays hot across a
+# refit (976 graphs measured still live) instead of going cold.
 
 
 def _filter_piecewise_capture_num_tokens(
@@ -203,9 +226,10 @@ class PyTorchModelEngine(ModelEngine):
         # The multimodal encoder token budget falls back to the LLM-side value
         # when unset. It may be raised after model load because atomic MM items
         # cannot be split.
-        self.encoder_max_num_tokens = (llm_args.encoder_max_num_tokens
-                                       if llm_args.encoder_max_num_tokens
-                                       is not None else self.max_num_tokens)
+        configured_encoder_max_num_tokens = (
+            llm_args.encoder_max_num_tokens if llm_args.encoder_max_num_tokens
+            is not None else self.max_num_tokens)
+        self.encoder_max_num_tokens = configured_encoder_max_num_tokens
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -222,11 +246,7 @@ class PyTorchModelEngine(ModelEngine):
             init_pp_comm(mapping)
         from ._util import (compute_max_num_sequences,
                             resolved_kv_cache_manager_is_v2,
-                            should_enable_adp_dummy_fixes,
-                            should_enable_non_overlap_adp_forward_intent,
-                            should_enable_overlap_headroom,
-                            should_enable_scheduler_aware_adp_dummy)
-        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
+                            should_enable_overlap_headroom)
         self.dist = dist
         self.llm_args = llm_args
         if dist is not None:
@@ -260,8 +280,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
-        self.sparse_attention_config = llm_args.sparse_attention_config
-        self.enable_spec_decode = self.is_spec_decode
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -286,7 +304,7 @@ class PyTorchModelEngine(ModelEngine):
                 llm_args=llm_args,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
-                sparse_attention_config=self.sparse_attention_config,
+                sparse_attention_config=llm_args.sparse_attention_config,
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
@@ -314,14 +332,7 @@ class PyTorchModelEngine(ModelEngine):
                 "parallel ranks and cannot be sampled in-graph.")
             self.enable_in_graph_sampling = False
         pretrained_config = self.model.model_config.pretrained_config
-        model_type = getattr(pretrained_config, "model_type", None)
-        self._enable_scheduler_aware_adp_dummy = (
-            should_enable_scheduler_aware_adp_dummy(
-                model_type, mapping, llm_args.disable_overlap_scheduler))
-        self._enable_non_overlap_adp_forward_intent = (
-            should_enable_non_overlap_adp_forward_intent(
-                mapping, llm_args.disable_overlap_scheduler))
-        self._enable_overlap_headroom = should_enable_overlap_headroom(
+        self.enable_overlap_headroom = should_enable_overlap_headroom(
             mapping,
             llm_args.disable_overlap_scheduler,
             kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
@@ -335,9 +346,8 @@ class PyTorchModelEngine(ModelEngine):
             mapping,
             self.batch_size,
             llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=self._enable_overlap_headroom,
+            enable_overlap_headroom=self.enable_overlap_headroom,
         )
-        self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
@@ -362,16 +372,15 @@ class PyTorchModelEngine(ModelEngine):
             input_processor=self.input_processor,
             encoder_max_num_tokens=self.encoder_max_num_tokens)
         self._mm_item_scheduler = mm_item_scheduler
-        # `getattr`-read by py_executor.py and _util.py.
+        # Read by py_executor.py and _util.py.
         self.mm_encoder_item_scheduling_enabled = mm_item_scheduler is not None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
+        self.bytes_per_mm_encoder_embedding: Optional[int] = None
         if mm_item_scheduler is not None:
             # The raised encoder token budget is read back off the engine by
             # `_util.py`, and sizes the encoder metadata set up below.
             self.encoder_max_num_tokens = mm_item_scheduler.encoder_max_num_tokens
             self.mm_encoder_output_budget_bytes = mm_item_scheduler.output_budget_bytes
-            # Absent, not None, when item scheduling is off: external readers
-            # rely on the `getattr` default.
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
         if isinstance(self.model,
                       MultimodalModelMixin) and mapping.is_first_pp_rank():
@@ -397,16 +406,13 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._disable_overlap_scheduler = self.llm_args.disable_overlap_scheduler
         self._torch_compile_backend = None
-        self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
 
         self.cuda_graph_config = self.llm_args.cuda_graph_config
-        self._is_encode_only = self.llm_args.encode_only
 
         if (isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
-                and self._is_encoder_decoder_model()):
+                and self.model.model_config.is_encoder_decoder):
             logger.warning(
                 "EncodeCudaGraphConfig is not supported for encoder-decoder "
                 "models through cuda_graph_config. Use DecodeCudaGraphConfig "
@@ -428,30 +434,27 @@ class PyTorchModelEngine(ModelEngine):
             decode_tokens_per_request,
             self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
 
-        self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
-                                           self._cuda_graph_batch_sizes else 0)
+        self.max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
+                                          self._cuda_graph_batch_sizes else 0)
 
-        self.torch_compile_config = self.llm_args.torch_compile_config
-        self.prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
-        torch_compile_enabled = bool(self.torch_compile_config is not None)
-        torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+        torch_compile_config = self.llm_args.torch_compile_config
+        prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
+        torch_compile_enabled = bool(torch_compile_config is not None)
+        torch_compile_fullgraph = torch_compile_config.enable_fullgraph if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
         compile_only_piecewise_graphs = (
-            self.torch_compile_config.compile_only_piecewise_graphs
-            if self.torch_compile_config is not None else TorchCompileConfig.
+            torch_compile_config.compile_only_piecewise_graphs
+            if torch_compile_config is not None else TorchCompileConfig.
             model_fields['compile_only_piecewise_graphs'].default)
-        torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+        torch_compile_inductor_enabled = torch_compile_config.enable_inductor if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_inductor'].default
-        torch_compile_piecewise_cuda_graph = (self.prefill_cuda_graph_backend ==
-                                              PrefillCudaGraphBackend.PIECEWISE)
-        torch_compile_enable_userbuffers = self.torch_compile_config.enable_userbuffers if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+        torch_compile_piecewise_cuda_graph = (
+            prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE)
+        torch_compile_enable_userbuffers = torch_compile_config.enable_userbuffers if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_userbuffers'].default
-        torch_compile_max_num_streams = self.torch_compile_config.max_num_streams if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+        torch_compile_max_num_streams = torch_compile_config.max_num_streams if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'max_num_streams'].default
 
-        self._torch_compile_enabled = torch_compile_enabled
-        self._compile_only_piecewise_graphs = compile_only_piecewise_graphs
-        self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
         self._torch_compile_prefill_only = False
 
         prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
@@ -474,31 +477,55 @@ class PyTorchModelEngine(ModelEngine):
                 f"Clamping them to the ceiling; raise max_seq_len for larger graphs."
             )
 
+        backend_num_streams = None
         try:
             use_ub_for_nccl = (
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
-            if self._torch_compile_enabled:
+            self._nccl_window_tensor_scope_hooks = []
+            if torch_compile_enabled:
                 set_torch_compiling(True)
+                if mpi_disabled() and self.mapping.world_size > 1:
+                    # Resolve the device-mesh dims the compiled forward reads
+                    # (mapping.tp_group & friends) while still eager: the
+                    # DeviceMesh resolver is compiler-disabled and must never
+                    # run under tracing; once memoized these reads trace as
+                    # constants.
+                    _ = self.mapping.tp_group
+                    _ = self.mapping.pp_group
+                    _ = self.mapping.cp_group
+                    if self.mapping.moe_ep_size > 1:
+                        _ = self.mapping.moe_tp_group
+                        _ = self.mapping.moe_ep_group
+                # torch.compile traces AllReduce.forward, whose lazy MNNVL
+                # workspace rescale cannot allocate inside the traced region -
+                # grow the workspaces to the engine maximum up front.
+                num_mnnvl_allreduces = 0
+                for module in self.model.modules():
+                    if isinstance(module, MNNVLAllReduce):
+                        module.prescale_workspace(self.max_num_tokens,
+                                                  self.model.config.hidden_size)
+                        num_mnnvl_allreduces += 1
+                if num_mnnvl_allreduces:
+                    logger.info(f"Pre-scaled the MNNVL allreduce workspace for "
+                                f"{num_mnnvl_allreduces} modules to cover "
+                                f"max_num_tokens={self.max_num_tokens} before "
+                                "torch.compile.")
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
-                self.backend_num_streams = Backend.Streams([
+                backend_num_streams = Backend.Streams([
                     torch.cuda.Stream()
                     for _ in range(torch_compile_max_num_streams - 1)
                 ])
                 self._torch_compile_backend = Backend(
                     torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
-                    enable_piecewise_cuda_graph=self.
-                    _torch_compile_piecewise_cuda_graph,
+                    enable_piecewise_cuda_graph=(
+                        torch_compile_piecewise_cuda_graph),
                     capture_num_tokens=self._prefill_cuda_graph_num_tokens,
                     max_num_streams=torch_compile_max_num_streams,
                     mapping=self.mapping)
-                apply_llm_torch_compile = getattr(self.model,
-                                                  "apply_llm_torch_compile",
-                                                  None)
-
                 if compile_only_piecewise_graphs and not isinstance(
                         self.model, DecoderModelForCausalLM):
                     raise ValueError(
@@ -506,49 +533,37 @@ class PyTorchModelEngine(ModelEngine):
                         "compile_only_piecewise_graphs=True is "
                         "only supported for DecoderModelForCausalLM models.")
 
-                if isinstance(self.model, DecoderModelForCausalLM):
-                    eager_model = self.model.model
-                    compiled_model = torch.compile(
-                        eager_model,
-                        backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
-                    self._torch_compile_prefill_only = (
-                        self._torch_compile_piecewise_cuda_graph
-                        and (compile_only_piecewise_graphs
-                             or not self.model.use_fx_for_pcg_fallback))
-                    if self._torch_compile_prefill_only:
-                        self.model.model = PrefillCompiledModel(
-                            eager_model, compiled_model)
-                    else:
-                        self.model.model = compiled_model
-                elif callable(apply_llm_torch_compile):
-                    # TODO: Move this contract to MultimodalModelMixin once
-                    # multimodal models consistently expose their LLM compile
-                    # scope through the mixin.
-                    apply_llm_torch_compile(backend=self._torch_compile_backend,
-                                            fullgraph=torch_compile_fullgraph)
-                else:
-                    self.model = torch.compile(
-                        self.model,
-                        backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
+                self._apply_torch_compile(self._torch_compile_backend,
+                                          torch_compile_fullgraph)
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
+                self._nccl_window_tensor_scope_hooks = (
+                    install_eager_nccl_window_tensor_scopes(self.model))
+
+            # Capture local encoders after their metadata is sized and before
+            # KV-cache estimation, so graph memory is included in the profile.
+            mm_config = self.llm_args.multimodal_config
+            setup_mm_encoder_cuda_graphs(
+                self.model,
+                mm_config.encoder_cuda_graph if mm_config is not None else None,
+                max_num_tokens=configured_encoder_max_num_tokens)
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
 
-        self.is_warmup = False
+        # Start outside warmup: load-balancer statistics on, serving MoE
+        # communication timeouts.
+        self._warmup_depth = 0
+        self._set_warmup_effects(False)
 
-        sparse_params = (self.sparse_attention_config.to_sparse_params(
+        sparse_attention_config = self.model.model_config.sparse_attention_config
+        sparse_params = (sparse_attention_config.to_sparse_params(
             pretrained_config=self.model.model_config.pretrained_config)
-                         if self.sparse_attention_config is not None else None)
+                         if sparse_attention_config is not None else None)
         self.attn_backend = get_attention_backend(self.llm_args.attn_backend,
                                                   sparse_params=sparse_params)
-
-        self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
         if self.is_spec_decode and issubclass(runner_cls, NoKVCacheRunner):
@@ -563,40 +578,33 @@ class PyTorchModelEngine(ModelEngine):
             )
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
             self.max_draft_len = spec_config.max_draft_len
-            # Mutable per-iteration draft length (updated each iteration when
-            # dynamic draft length is enabled; otherwise stays fixed).  Tree
-            # modes verify all tree nodes per step, which can be wider than the
-            # tree depth used by the drafter loop.
-            self.runtime_draft_len = get_static_draft_len(self.spec_config)
-
         else:
             self.without_logits = False
             self.max_draft_len = 0
-            self.runtime_draft_len = 0
             self.max_total_draft_tokens = 0
 
-        # Memos for engines without a decoder runner; see the properties.
-        self._attn_metadata = None
-        self._spec_metadata = None
         self.iter_states = {}
-
-        # We look up this key in resource_manager during forward to find the
-        # kv cache manager. Can be changed to support multiple model engines
-        # with different KV cache managers.
-        self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
+        self._lora_owner: Optional[DecoderLoraOwner] = None
+        self._lora_model: Optional[torch.nn.Module] = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
         self._model_caller = ModelCaller(
             self.model,
             compile_backend=self._torch_compile_backend,
-            aux_streams=(self.backend_num_streams
-                         if self._torch_compile_backend is not None else None),
+            aux_streams=backend_num_streams,
             prefill_compile_only=self._torch_compile_prefill_only,
         )
         self._runner = self._initialize_runner(runner_cls)
 
-        self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
+        layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
+        if layer_quant_mode.has_fp4_kv_cache():
+            self.kv_cache_dtype_byte_size = 1 / 2
+        elif (layer_quant_mode.has_fp8_kv_cache()
+              or layer_quant_mode.has_int8_kv_cache()):
+            self.kv_cache_dtype_byte_size = 1
+        else:
+            self.kv_cache_dtype_byte_size = 2
 
     def _initialize_runner(self, runner_cls: Type[ModelRunner]) -> ModelRunner:
         assert self._model_caller is not None
@@ -624,7 +632,6 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
             enable_autotuner=self.llm_args.enable_autotuner,
         )
         return runner_cls(
@@ -634,6 +641,7 @@ class PyTorchModelEngine(ModelEngine):
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
             model_caller=self._model_caller,
+            attention_runtime_features=self.attn_runtime_features,
         )
 
     def _initialize_encoder_decoder_runner(
@@ -649,7 +657,6 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
             enable_autotuner=self.llm_args.enable_autotuner,
             is_encoder_decoder=True,
         )
@@ -658,9 +665,11 @@ class PyTorchModelEngine(ModelEngine):
             enable_encoder_decoder_mixed_cuda_graph=(
                 self.llm_args.enable_encoder_decoder_mixed_cuda_graph),
         )
-        return self._initialize_decoder_runner(runner_cls,
-                                               runner_config,
-                                               encoder_config=encoder_config)
+        return self._initialize_decoder_runner(
+            runner_cls,
+            runner_config,
+            encoder_config=encoder_config,
+            input_processor=self.input_processor)
 
     def _initialize_no_kv_cache_runner(
             self, runner_cls: Type[NoKVCacheRunner]) -> NoKVCacheRunner:
@@ -671,11 +680,10 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             enable_attention_dp=self.enable_attention_dp,
-            prefill_cuda_graph_backend=self.prefill_cuda_graph_backend,
+            prefill_cuda_graph_backend=self.llm_args.prefill_cuda_graph_backend,
             prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
             attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
-            mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
+            mm_encoder_cache_enabled=mm_encoder_cache_enabled(self.model),
         )
         if issubclass(runner_cls, PoolingRunner):
             return runner_cls(
@@ -685,6 +693,7 @@ class PyTorchModelEngine(ModelEngine):
                 dist=self.dist,
                 moe_load_balancer=self.moe_load_balancer,
                 model_caller=self._model_caller,
+                attention_runtime_features=self.attn_runtime_features,
             )
         return runner_cls(
             self.model,
@@ -692,6 +701,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
+            attention_runtime_features=self.attn_runtime_features,
         )
 
     def _decoder_runner_config(
@@ -705,11 +715,10 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
-            dtype=self.dtype,
+            dtype=self.model.config.torch_dtype,
             enable_attention_dp=self.enable_attention_dp,
-            disable_overlap_scheduler=self._disable_overlap_scheduler,
-            is_encode_only=self._is_encode_only,
+            disable_overlap_scheduler=self.llm_args.disable_overlap_scheduler,
+            is_encode_only=self.llm_args.encode_only,
             is_spec_decode=self.is_spec_decode,
             max_draft_len=self.max_draft_len,
             max_total_draft_tokens=self.max_total_draft_tokens,
@@ -724,18 +733,22 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_config=self.cuda_graph_config,
             cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
             cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
-            max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
-            prefill_cuda_graph_backend=self.prefill_cuda_graph_backend,
+            max_cuda_graph_batch_size=self.max_cuda_graph_batch_size,
+            prefill_cuda_graph_backend=self.llm_args.prefill_cuda_graph_backend,
             prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
             enable_in_graph_sampling=self.enable_in_graph_sampling,
-            torch_compile_enabled=self._torch_compile_enabled,
+            torch_compile_enabled=self._torch_compile_backend is not None,
             torch_compile_piecewise_cuda_graph=(
-                self._torch_compile_piecewise_cuda_graph),
+                self.llm_args.prefill_cuda_graph_backend ==
+                PrefillCudaGraphBackend.PIECEWISE),
             torch_compile_prefill_only=self._torch_compile_prefill_only,
-            compile_only_piecewise_graphs=self._compile_only_piecewise_graphs,
-            use_mrope=self.use_mrope,
-            is_multimodal=self.is_multimodal,
-            mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
+            compile_only_piecewise_graphs=(
+                self.llm_args.torch_compile_config is not None and
+                self.llm_args.torch_compile_config.compile_only_piecewise_graphs
+            ),
+            use_mrope=use_mrope(self.model),
+            is_multimodal=is_multimodal(self.model, self.input_processor),
+            mm_encoder_cache_enabled=mm_encoder_cache_enabled(self.model),
             enable_autotuner=self.llm_args.enable_autotuner,
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
@@ -754,19 +767,19 @@ class PyTorchModelEngine(ModelEngine):
         return runner_cls(
             self.model,
             runner_config,
-            input_processor=self.input_processor,
             model_caller=self._model_caller,
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
-            sparse_attention_config=self.sparse_attention_config,
-            torch_compile_backend=self._torch_compile_backend,
-            get_runtime_tokens_per_gen_step=self.
-            get_runtime_tokens_per_gen_step,
+            sparse_attention_config=(
+                self.model.model_config.sparse_attention_config),
+            attention_runtime_features=self.attn_runtime_features,
+            get_runtime_tokens_per_gen_step=(
+                self.spec_config.get_runtime_tokens_per_gen_step if
+                self.spec_config is not None else lambda runtime_draft_len: 1),
             warmup_timer=self._warmup_timer,
             iter_states=self.iter_states,
             metrics=self._metrics,
-            kv_cache_manager_key=self.kv_cache_manager_key,
             mm_item_scheduler=self._mm_item_scheduler,
             **runner_kwargs,
         )
@@ -775,27 +788,13 @@ class PyTorchModelEngine(ModelEngine):
     def attn_metadata(self) -> Optional[AttentionMetadata]:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.attn_metadata
-        return self._attn_metadata
-
-    @attn_metadata.setter
-    def attn_metadata(self, value: Optional[AttentionMetadata]) -> None:
-        if isinstance(self._runner, DecoderRunner):
-            self._runner.attn_metadata = value
-        else:
-            self._attn_metadata = value
+        return None
 
     @property
     def spec_metadata(self) -> Optional[SpecMetadata]:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.spec_metadata
-        return self._spec_metadata
-
-    @spec_metadata.setter
-    def spec_metadata(self, value: Optional[SpecMetadata]) -> None:
-        if isinstance(self._runner, DecoderRunner):
-            self._runner.spec_metadata = value
-        else:
-            self._spec_metadata = value
+        return None
 
     @property
     def cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
@@ -825,34 +824,25 @@ class PyTorchModelEngine(ModelEngine):
         assert isinstance(self._runner, DecoderRunner)
         self._runner.register_sample_type_resolver(resolver, stage)
 
-    def get_kv_cache_dtype_byte_size(self) -> float:
-        """
-        Returns the size (in bytes) occupied by kv cache type.
-        """
-        layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
-        if layer_quant_mode.has_fp4_kv_cache():
-            return 1 / 2
-        elif layer_quant_mode.has_fp8_kv_cache(
-        ) or layer_quant_mode.has_int8_kv_cache():
-            return 1
-        else:
-            return 2
+    def initialize_lora_owner(self) -> DecoderLoraOwner:
+        """Bind the decoder owner once, across resource-capacity estimation passes."""
+        if self._lora_owner is None:
+            self._lora_owner, self._lora_model = resolve_lora_owner(
+                self.model, self.input_processor)
+        return self._lora_owner
 
-    def set_lora_model_config(self,
-                              lora_target_modules: list[str],
-                              trtllm_modules_to_hf_modules: dict[str, str],
-                              swap_gate_up_proj_lora_b_weight: bool = True):
-        # Called by `_util.py` after model loading, before graph-manager initialization.
-        self.lora_model_config = make_lora_model_config(
-            self.model, lora_target_modules, trtllm_modules_to_hf_modules,
-            swap_gate_up_proj_lora_b_weight)
+    def set_lora_model_config(self, lora_model_config: LoraModelConfig) -> None:
+        """Share the validated configuration with decoder execution."""
+        self.lora_model_config = lora_model_config
         if isinstance(self._runner, DecoderRunner):
             self._runner.lora_model_config = self.lora_model_config
 
-    def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
+    def init_cuda_graph_lora_manager(self, lora_config: LoraConfig) -> None:
         """Build LoRA preparation state for the current executor resources."""
         if isinstance(self._runner, DecoderRunner):
-            self._runner.init_cuda_graph_lora_manager(lora_config)
+            assert self._lora_model is not None
+            self._runner.init_cuda_graph_lora_manager(lora_config,
+                                                      self._lora_model)
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -863,69 +853,35 @@ class PyTorchModelEngine(ModelEngine):
             return success
         return False
 
-    @property
-    def use_mrope(self):
-        use_mrope = False
-        try:
-            use_mrope = self.model.model_config.pretrained_config.rope_scaling[
-                'type'] == 'mrope'
-        except Exception:
-            pass
-        logger.debug(f"Detected use_mrope: {use_mrope}")
-        return use_mrope
-
-    @functools.cached_property
-    def _mm_encoder_cache_enabled(self) -> bool:
-        """Whether the multimodal encoder cache is active for this model."""
-        return mm_encoder_cache_enabled(self.model)
-
-    @property
-    def is_warmup(self):
-        return getattr(self, "_is_warmup", False)
-
-    @is_warmup.setter
-    def is_warmup(self, value: bool):
-        self._is_warmup = value
-
-        # This setter is the one choke point every warmup transition passes
-        # through, including PyExecutor's, so switch the MoE communication
-        # timeouts here rather than in set_warmup_flag().
-        set_moe_comm_warmup(value)
-
-        self.moe_load_balancer_iter_info = (not value, not value)
-
-    @property
-    def moe_load_balancer_iter_info(self):
-        moe_load_balancer = self.moe_load_balancer
-        if moe_load_balancer is not None:
-            return moe_load_balancer.enable_statistic, moe_load_balancer.enable_update_weights
-        return False, False
-
-    @moe_load_balancer_iter_info.setter
-    def moe_load_balancer_iter_info(self, value: Tuple[bool, bool]):
-        moe_load_balancer = self.moe_load_balancer
-        if moe_load_balancer is not None:
-            moe_load_balancer.set_iter_info(enable_statistic=value[0],
-                                            enable_update_weights=value[1])
+    def _set_warmup_effects(self, in_warmup: bool) -> None:
+        set_moe_comm_warmup(in_warmup)
+        if self.moe_load_balancer is not None:
+            self.moe_load_balancer.set_iter_info(
+                enable_statistic=not in_warmup,
+                enable_update_weights=not in_warmup)
 
     @contextmanager
-    def set_warmup_flag(self):
-        prev_is_warmup = self.is_warmup
-        self.is_warmup = True
+    def warmup_scope(self) -> Iterator[None]:
+        """Run the enclosed passes as warmup.
+
+        Forwards inside the scope are dummy passes, the MoE communication
+        kernels use their warmup timeouts, and the load balancer neither records
+        statistics nor updates weights. Scopes nest; the outermost one switches
+        the effects.
+        """
+        self._warmup_depth += 1
+        if self._warmup_depth == 1:
+            self._set_warmup_effects(True)
         try:
             yield
         finally:
-            self.is_warmup = prev_is_warmup
+            self._warmup_depth -= 1
+            if self._warmup_depth == 0:
+                self._set_warmup_effects(False)
 
-    @staticmethod
-    def with_warmup_flag(method):
-
-        @functools.wraps(method)
-        def wrapper(self, *args, **kwargs):
-            with self.set_warmup_flag():
-                return method(self, *args, **kwargs)
-
-        return wrapper
+    def set_warmup_purpose(self, purpose: str) -> None:
+        """Label the following warmup passes in the warmup timing log."""
+        self._warmup_timer.purpose = purpose
 
     @staticmethod
     def warmup_with_kv_cache_cleanup(method):
@@ -952,8 +908,8 @@ class PyTorchModelEngine(ModelEngine):
                 result = method(self, resource_manager, *args, **kwargs)
                 with timing_metric("kv_cache_cleanup_seconds", self._metrics):
                     kv_cache_manager = (resource_manager.get_resource_manager(
-                        self.kv_cache_manager_key) if resource_manager
-                                        is not None else None)
+                        ResourceManagerType.KV_CACHE_MANAGER) if
+                                        resource_manager is not None else None)
                     if kv_cache_manager is not None:
                         has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
                             fill_with_zero=True)
@@ -965,20 +921,13 @@ class PyTorchModelEngine(ModelEngine):
 
         return wrapper
 
-    @with_warmup_flag
-    def _warmup_encoder_cuda_graphs_enc_dec(
-        self,
-        resource_manager: ResourceManager,
-    ) -> None:
-        if not self._is_encoder_decoder_model():
-            return
-        if not isinstance(self._runner, EncoderDecoderRunner):
-            raise RuntimeError(
-                "Encoder-decoder model did not initialize a model runner.")
-        self._runner.warmup_encoder(resource_manager)
+    def warmup_encoder(self, resource_manager: ResourceManager) -> None:
+        """Capture the encoder CUDA graphs of an encoder-decoder runner."""
+        if isinstance(self._runner, EncoderDecoderRunner):
+            with self.warmup_scope():
+                self._runner.warmup_encoder(resource_manager)
 
-    def _get_encoder_cuda_graph_batch_sizes(
-            self, max_batch_size: int) -> tuple[int, ...]:
+    def encoder_graph_batch_sizes(self, max_batch_size: int) -> tuple[int, ...]:
         """Use startup settings while encoder scheduling remains in PyExecutor."""
         if not isinstance(self._runner, EncoderDecoderRunner):
             return ()
@@ -1000,19 +949,19 @@ class PyTorchModelEngine(ModelEngine):
         outputs = self._runner.forward_encoder(
             ScheduledInputs(batch=scheduled_requests),
             resource_manager=resource_manager,
-            is_dummy=self.is_warmup,
+            is_dummy=self._warmup_depth > 0,
         )
         return (
             outputs["encoder_hidden_states"],
             outputs["encoder_seq_lens"],
         )
 
-    @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self,
                resource_manager: Optional[ResourceManager] = None) -> None:
         """Run model warmup and record its total wall-clock duration."""
-        self._warmup_impl(resource_manager)
+        with self.warmup_scope():
+            self._warmup_impl(resource_manager)
 
     def _warmup_impl(self,
                      resource_manager: Optional[ResourceManager] = None
@@ -1030,11 +979,6 @@ class PyTorchModelEngine(ModelEngine):
         self._runner.warmup(resource_manager)
 
     ### Helper methods promoted from the original warmup method ###
-
-    @property
-    def is_multimodal(self) -> bool:
-        """True iff this engine drives a multimodal model."""
-        return is_multimodal(self.model, self.input_processor)
 
     def _validate_breakable_cuda_graph_compatibility(self) -> None:
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
@@ -1097,7 +1041,8 @@ class PyTorchModelEngine(ModelEngine):
 
         1. The optional ``ModelLoader`` (which in turn releases any
            GMS client; see :meth:`ModelLoader.cleanup`).
-        2. Runner resources and engine-owned CUDA Graph captures.
+        2. Runner resources and executor-owned CUDA Graph captures (via
+           :meth:`_release_cuda_graphs`).
         3. The runner, model caller, MM item scheduler, and model references.
         4. Input processors.
 
@@ -1111,8 +1056,8 @@ class PyTorchModelEngine(ModelEngine):
             deliberately does *not* call this: it is also invoked mid-init by
             ``configure_kv_cache_capacity``, which reads ``model`` right
             afterwards, so clearing ``model`` here would break it. That path
-            calls :meth:`_release_cuda_graphs` and then drops its reference
-            instead.
+            uses an explicit temporary-executor shutdown and then drops its
+            reference instead.
         """
         if self._cleanup_done:
             return
@@ -1128,7 +1073,8 @@ class PyTorchModelEngine(ModelEngine):
 
         # Release runner-owned graphs before dropping the runner. Keep the
         # handle available if graph release fails and cleanup is retried.
-        self._release_cuda_graphs()
+        # Destruction timing is not rank-symmetric; only explicit shutdown releases owners.
+        self._release_cuda_graphs(release_nccl_window_owners=False)
 
         # The runner, caller and scheduler retain the model, so
         # clearing the engine's attribute alone would leave the weights
@@ -1136,6 +1082,8 @@ class PyTorchModelEngine(ModelEngine):
         self._runner = None
         self._model_caller = None
         self._mm_item_scheduler = None
+        self._lora_model = None
+        self._lora_owner = None
         self.model = None
 
         self.input_processor = None
@@ -1252,11 +1200,173 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_seq_len()
         self._init_max_num_tokens()
 
-    def _release_cuda_graphs(self) -> None:
+    def _release_model_owned_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ) -> None:
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
+                clear_blocks_graph = getattr(module, "clear_blocks_cuda_graph",
+                                             None)
+                if clear_blocks_graph is not None:
+                    clear_blocks_graph(
+                        release_nccl_window_owners=release_nccl_window_owners)
+
+    def _release_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ) -> None:
         if self._runner is not None:
-            self._runner.release_graphs()
+            self._runner.release_graphs(
+                release_nccl_window_owners=release_nccl_window_owners)
         if self._torch_compile_backend is not None:
-            self._torch_compile_backend.clear_piecewise_cuda_graphs()
+            self._torch_compile_backend.clear_piecewise_cuda_graphs(
+                release_nccl_window_owners=release_nccl_window_owners)
+
+    def release_executor_resources(self, *,
+                                   release_model_owned_graphs: bool) -> None:
+        """Release CUDA graphs and attention metadata bound to the executor's
+        resource managers, before those managers shut down.
+
+        ``release_model_owned_graphs`` also clears graphs captured inside the
+        model's own modules; the KV cache estimation shutdown keeps them.
+        """
+        if release_model_owned_graphs:
+            self._release_model_owned_cuda_graphs()
+        self._release_cuda_graphs()
+        if isinstance(self._runner, DecoderRunner):
+            self._runner.attn_metadata = None
+
+    def _eager_decoder_scope(self) -> torch.nn.Module:
+        """Return the eager decoder scope under any compile or prefill wrapper."""
+        scope = self.model.model
+        if isinstance(scope, PrefillCompiledModel):
+            scope = scope.eager_model
+        return getattr(scope, "_orig_mod", scope)
+
+    def _apply_torch_compile(self, backend: Backend, fullgraph: bool) -> None:
+        """Compile the eager model scope."""
+        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
+                                          None)
+        if isinstance(self.model, DecoderModelForCausalLM):
+            eager_model = self._eager_decoder_scope()
+            compiled_model = torch.compile(eager_model,
+                                           backend=backend,
+                                           fullgraph=fullgraph)
+            self._torch_compile_prefill_only = (
+                self.llm_args.prefill_cuda_graph_backend
+                == PrefillCudaGraphBackend.PIECEWISE
+                and (self.llm_args.torch_compile_config.
+                     compile_only_piecewise_graphs
+                     or not self.model.use_fx_for_pcg_fallback))
+            self.model.model = (PrefillCompiledModel(
+                eager_model, compiled_model) if self._torch_compile_prefill_only
+                                else compiled_model)
+        elif callable(apply_llm_torch_compile):
+            # Avoid nesting a new wrapper around the previous compile.
+            llm = getattr(self.model, "llm", None)
+            compiled_model = getattr(llm, "model", None)
+            if hasattr(compiled_model, "_orig_mod"):
+                llm.model = compiled_model._orig_mod
+            # TODO: Move this contract to MultimodalModelMixin once
+            # multimodal models consistently expose their LLM compile scope.
+            apply_llm_torch_compile(backend=backend, fullgraph=fullgraph)
+        else:
+            eager_model = getattr(self.model, "_orig_mod", self.model)
+            self.model = torch.compile(eager_model,
+                                       backend=backend,
+                                       fullgraph=fullgraph)
+
+    def _remove_torch_compile(self) -> None:
+        """Restore the eager model scope."""
+        if isinstance(self.model, DecoderModelForCausalLM):
+            self.model.model = self._eager_decoder_scope()
+            return
+        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
+                                          None)
+        if callable(apply_llm_torch_compile):
+            llm = getattr(self.model, "llm", None)
+            compiled_model = getattr(llm, "model", None)
+            if hasattr(compiled_model, "_orig_mod"):
+                llm.model = compiled_model._orig_mod
+            return
+        self.model = getattr(self.model, "_orig_mod", self.model)
+
+    def unwrap_compiled_model_for_refit(self) -> None:
+        """Release compiled state before refit.
+
+        Gated on torch.compile, NOT on piecewise CUDA graphs. PWCG is only one
+        thing a compiled engine carries across a refit; the compiled wrapper
+        itself has to be unwrapped either way. Gating this on
+        ``_torch_compile_piecewise_cuda_graph`` left ``TorchCompileConfig()``
+        (compile on, PWCG off -- the default shape of that config) with no refit
+        lifecycle at all, and a TP8 Qwen3.5 397B refit in that configuration
+        emits degenerate repetition while the same engine with PWCG enabled is
+        clean. Nothing goes stale: the wrapper inserts ``_orig_mod`` into every
+        parameter path, ``load_weights`` matches checkpoint tensors by dotted
+        path, and ``allow_partial_loading=True`` then skips the whole compiled
+        subtree in silence, so it simply keeps its pre-refit weights.
+
+        The piecewise captures are deliberately NOT cleared. Refit moves no
+        tensor (0 of 1405 parameters, buffers and tensor attributes change
+        address), so the captures stay valid; clearing them only forces PWCG
+        cold and replay-less until something recaptures.
+        """
+        if self._torch_compile_backend is None:
+            return
+        # Barrier before refit overwrites weights, so prior GPU work cannot still
+        # be reading them. In the original code this sat *after* the PWCG-gated
+        # early return, so a compile-without-PWCG engine skipped it entirely.
+        torch.cuda.synchronize()
+        self._remove_torch_compile()
+
+    def restore_compiled_model_after_refit(
+            self, resource_manager: ResourceManager) -> None:
+        """Re-install the torch.compile wrapper after refit.
+
+        Gated on torch.compile, not on PWCG -- see
+        :meth:`unwrap_compiled_model_for_refit` for why.
+
+        This ONLY re-wraps: the cached compiled artifact is reused, so there is
+        no ``torch.compiler.reset()`` and no piecewise recapture. Both were
+        measured unnecessary on a TP8 Qwen3.5 397B refit -- 976 piecewise graphs
+        were still live afterwards, so the captures survive intact and PWCG
+        stays hot.
+
+        No ``gc.collect()`` either. The previous wrapper is released by
+        reference count when it is replaced, and a full collection in a
+        process holding the executor, the request bookkeeping and the
+        trainer-side Ray state costs seconds; this hook sits inside the
+        refit bubble, so that was pure generation-idle time.
+
+        Deliberately NOT decorated with ``warmup_with_kv_cache_cleanup``: that
+        decorator ends with ``check_invalid_values_in_kv_cache(fill_with_zero=
+        True)``, which zero-fills every attention KV pool whether or not it
+        found a NaN. It belongs after a capture warm-up that ran forwards on
+        placeholder inputs; this hook never runs a forward, and under an
+        in-flight weight update (``drain=False``) the zero-fill would wipe the
+        KV of every request kept across the refit. The wrapper also ran when
+        torch.compile is disabled, because the early return below happens
+        inside the wrapped method.
+
+        ``resource_manager`` is unused here; it stays in the signature because
+        callers (including NeMo-RL) already pass it.
+        """
+        if self._torch_compile_backend is None:
+            return
+        with self.warmup_scope():
+            self._apply_torch_compile(
+                self._torch_compile_backend,
+                self.llm_args.torch_compile_config.enable_fullgraph)
+
+    # Back-compat aliases. Callers probe these names with getattr() and fall
+    # back to doing nothing, so removing them would silently skip the unwrap
+    # and let refit load into a wrapped model again.
+    release_piecewise_cuda_graphs_for_refit = unwrap_compiled_model_for_refit
+    recapture_piecewise_cuda_graphs_after_refit = restore_compiled_model_after_refit
 
     def get_max_num_sequences(self) -> int:
         """
@@ -1265,39 +1375,32 @@ class PyTorchModelEngine(ModelEngine):
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
-    def _is_encoder_decoder_model(self) -> bool:
-        return bool(
-            getattr(getattr(self.model, "model_config", None),
-                    "is_encoder_decoder", False))
-
     def forward(self,
                 batch: Union[ScheduledRequests, PackedInputs],
                 resource_manager: Optional[ResourceManager] = None,
                 new_tensors_device: Optional[SampleStateTensors] = None,
-                cache_indirection_buffer: Optional[torch.Tensor] = None):
+                cache_indirection_buffer: Optional[torch.Tensor] = None,
+                *,
+                enable_spec_decode: bool = False,
+                runtime_draft_len: int = 0):
         if isinstance(batch, PackedInputs):
             assert isinstance(self._runner, PackedModelRunner), (
                 "a packed batch requires a packed-batch runner")
             return self._runner.forward(batch)
         assert resource_manager is not None, (
             "scheduled execution requires a resource manager")
-        inputs = make_scheduled_inputs(
-            batch,
-            new_tensors_device,
-            cache_indirection_buffer,
-            enable_spec_decode=self.enable_spec_decode,
-            runtime_draft_len=self.runtime_draft_len)
-        # Executor memory profiling establishes this flag. Padding requests in
-        # a serving batch do not make the pass dummy.
-        outputs = self._forward_scheduled(
+        inputs = make_scheduled_inputs(batch,
+                                       new_tensors_device,
+                                       cache_indirection_buffer,
+                                       enable_spec_decode=enable_spec_decode,
+                                       runtime_draft_len=runtime_draft_len)
+        # Only a warmup scope makes the pass dummy; padding requests in a
+        # serving batch do not.
+        return self._forward_scheduled(
             inputs,
             resource_manager=resource_manager,
-            is_dummy=self.is_warmup,
+            is_dummy=self._warmup_depth > 0,
         )
-        if isinstance(outputs, dict):
-            self.runtime_draft_len = outputs.pop("runtime_draft_len",
-                                                 inputs.runtime_draft_len)
-        return outputs
 
     def _forward_scheduled(
         self,
@@ -1318,6 +1421,18 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
             return False
 
+        # The userbuffers bootstrap exchanges CUDA memory handles over raw
+        # MPI_COMM_WORLD collectives (userbuffers-host.cpp). Under non-MPI
+        # orchestrators (Ray sets TLLM_DISABLE_MPI) every worker holds a
+        # 1-rank MPI world, so importer ranks would receive uninitialized
+        # bytes instead of peer handles and crash in
+        # cuMemImportFromShareableHandle with 'operation not supported'.
+        if mpi_disabled():
+            logger.info(
+                "Disabling userbuffers: its bootstrap requires MPI, which is "
+                "disabled under this orchestrator.")
+            return False
+
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
@@ -1334,17 +1449,6 @@ class PyTorchModelEngine(ModelEngine):
                                           hidden_size * self.max_num_tokens * 2)
 
         return True
-
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        """
-        When doing spec decode, sometimes draft models need to share certain weights
-        with their target models. Here, we set up such weights by invoking
-        self.model.load_weights_from_target_model if such a method exists.
-        """
-        loader = getattr(self.model, "load_weights_from_target_model", None)
-        if callable(loader):
-            loader(target_model)
 
     def wait_for_input_copy(self):
         """
