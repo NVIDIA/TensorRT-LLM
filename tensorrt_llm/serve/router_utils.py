@@ -19,6 +19,7 @@ implementation of block hashing without importing the whole router module.
 
 import os
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Union
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
@@ -32,17 +33,18 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.serve.chat_tokenization import (
     resolve_model_type_from_config,
-    tokenize_chat_request_for_serving,
     uses_harmony_tokenization,
 )
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
 from tensorrt_llm.serve.render import (
+    HarmonyConversionError,
     PreparedContext,
     RenderResources,
+    UnrenderableMessagesError,
     UnsupportedRenderError,
     fingerprint_mismatch,
-    legacy_render_enabled,
     render_chat,
+    render_chat_for_length,
     worker_resolves_thinking,
 )
 
@@ -179,6 +181,15 @@ def block_key_hasher(
     return hash_v1_block_key(token_ids, parent_hash=parent, cache_salt_id=cache_salt_id)
 
 
+@dataclass(frozen=True)
+class WriteBackDecision:
+    """Whether rendered ids may be forwarded to the workers, and what blocks them if not."""
+
+    allowed: bool
+    mismatched: dict[str, str] = field(default_factory=dict)  # server -> reason
+    needs_prompt_text: list[str] = field(default_factory=list)  # reasoning parser reads the prompt
+
+
 class BlockHashMixin:
     """Shared tokenization and block-hash computation.
 
@@ -285,22 +296,21 @@ class BlockHashMixin:
 
         return encode_rendered
 
-    def _tokenize_chat_legacy(
-        self, request: ChatCompletionRequest, set_prompt_token_ids: bool = True
-    ) -> list[int]:
-        """The pre-merge router renderer (``TRTLLM_RENDER_LEGACY=1``)."""
+    def _length_chat_ids(self, request: ChatCompletionRequest) -> list[int]:
+        """Routing ids from :func:`render_chat_for_length`; never forwarded to a worker.
 
-        def tokenizer_factory() -> object:
-            return self._get_tokenizer(request.model)
-
-        return tokenize_chat_request_for_serving(
-            request,
-            tokenizer_factory=tokenizer_factory,
-            encode_rendered=self._make_encode_rendered(request),
-            use_harmony=self._use_harmony,
-            model_type_resolver=self._get_model_type,
-            set_prompt_token_ids=set_prompt_token_ids,
-        )
+        A request the request model rejects, or Harmony cannot convert, gets no ids. One the chat
+        template rejects raises.
+        """
+        try:
+            return render_chat_for_length(
+                request,
+                self._render_resources(request.model),
+                encode_rendered=self._make_encode_rendered(request),
+            ).token_ids
+        except (UnsupportedRenderError, HarmonyConversionError) as error:
+            logger.debug(f"Router has no length for the request ({error}); routing on no ids.")
+            return []
 
     def _render_resources(self, model: str) -> RenderResources:
         """Rendering resources of this router for ``model``, built once."""
@@ -335,9 +345,9 @@ class BlockHashMixin:
             cache[model] = resources
         return resources
 
-    def _may_write_back_token_ids(
+    def _write_back_decision(
         self, model: str, resolved_thinking: Optional[dict[str, bool]] = None
-    ) -> bool:
+    ) -> "WriteBackDecision":
         """Whether prompt ids rendered here may replace the worker's own rendering.
 
         Only when every active worker reports the same rendering fingerprint as
@@ -349,9 +359,9 @@ class BlockHashMixin:
         off the prompt. A forwarded request has no prompt text for the worker to read it from,
         so ids go only to workers whose own parser does not need it.
 
-        The workers whose rendering differs are left in ``_write_back_blockers``, by server with
-        the reason; the workers that need the prompt text for the reasoning mode, in
-        ``_thinking_blockers``.
+        This runs on several threads at once (``_tokenize`` is called through
+        ``asyncio.to_thread``), so the decision and the reasons for it are built from local
+        values and returned, never kept on the instance.
         """
         published = self.__dict__.get("_published_render_fingerprints")
         servers = list(getattr(self, "_servers", None) or [])
@@ -365,26 +375,30 @@ class BlockHashMixin:
             # fetch leaves a worker active with no entry, and it must not be skipped.
             info = getattr(self, "_server_info", None) or {}
             remote = [(info.get(server) or {}).get("render_fingerprint") for server in servers]
-        self._write_back_blockers = {}
-        self._thinking_blockers = []
         if not remote:
-            return False
+            return WriteBackDecision(allowed=False)
         cache = self.__dict__.setdefault("_render_fingerprint_cache", {})
         local = cache.get(model)
         if local is None:
             local = cache[model] = self._render_resources(model).fingerprint()
+        mismatched: dict[str, str] = {}
         for server, fingerprint in zip(servers, remote):
             reason = fingerprint_mismatch(local, fingerprint)
             if reason is not None:
-                self._write_back_blockers[server] = reason
-        if self._write_back_blockers:
-            return False
-        self._thinking_blockers = [
+                mismatched[server] = reason
+        if mismatched:
+            return WriteBackDecision(allowed=False, mismatched=mismatched)
+        needs_prompt_text = [
             server
             for server, fingerprint in zip(servers, remote)
             if worker_resolves_thinking(fingerprint, resolved_thinking or {})
         ]
-        return not self._thinking_blockers
+        return WriteBackDecision(allowed=not needs_prompt_text, needs_prompt_text=needs_prompt_text)
+
+    def _may_write_back_token_ids(
+        self, model: str, resolved_thinking: Optional[dict[str, bool]] = None
+    ) -> bool:
+        return self._write_back_decision(model, resolved_thinking).allowed
 
     def set_published_render_fingerprints(self, fingerprints: dict[str, Optional[dict]]) -> None:
         """Worker fingerprints (summaries) a disagg coordinator published, by server."""
@@ -401,12 +415,18 @@ class BlockHashMixin:
                 tokenize=True,
                 encode_rendered=self._make_encode_rendered(request),
             )
+        except UnrenderableMessagesError as error:
+            # The exact render spent the request's message iterators; the worker has the raw body.
+            logger.debug(f"Router could not render the messages ({error}); routing on no ids.")
+            return []
         except (UnsupportedRenderError, ValueError) as error:
-            # Media, a model the renderer does not support, or a request a serving extension
-            # rejects (kimi_k3 parameter policy, dynamic tools): route on an estimate and let
-            # the worker render the request itself, and answer it.
-            logger.debug(f"Router could not render the request ({error}); routing on an estimate.")
-            return self._tokenize_chat_legacy(request, set_prompt_token_ids=False)
+            # Media, an unsupported model, or an extension rejection: route on its text.
+            logger.debug(f"Router could not render the request exactly ({error}).")
+            return self._length_chat_ids(request)
+        except HarmonyConversionError as error:
+            # The router has no tokenizer for Harmony to fall back to; the worker answers it.
+            logger.debug(f"Router could not convert the messages ({error}); routing on no ids.")
+            return []
         # A forwarded request is an ordinary chat request carrying prompt_token_ids, so the
         # worker cannot see the rendered text and decides nothing from it: usage adjustments
         # (kimi_k3) and reasoning modes read off the prompt are lost. Ids whose serving
@@ -419,14 +439,17 @@ class BlockHashMixin:
             request_reason = "a named tool_choice is rendered by the worker"
         elif context.prompt_tokens_excluded_from_usage:
             request_reason = "the worker adjusts the reported prompt usage from the prompt text"
-        if request_reason is None and self._may_write_back_token_ids(
-            request.model, context.resolved_thinking
-        ):
+        decision = (
+            None
+            if request_reason is not None
+            else self._write_back_decision(request.model, context.resolved_thinking)
+        )
+        if decision is not None and decision.allowed:
             request.prompt_token_ids = rendered.token_ids
             self._last_fallback_reason = None
             return rendered.token_ids
-        blockers = getattr(self, "_write_back_blockers", None) or {}
-        thinking_blockers = getattr(self, "_thinking_blockers", None) or []
+        blockers = decision.mismatched if decision is not None else {}
+        thinking_blockers = decision.needs_prompt_text if decision is not None else []
         if request_reason is not None:
             logger.debug(f"Router rendered prompt ids are not forwarded: {request_reason}.")
         elif not blockers and thinking_blockers:
@@ -453,8 +476,6 @@ class BlockHashMixin:
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
-            if legacy_render_enabled():
-                return [self._tokenize_chat_legacy(request)]
             return [self._tokenize_chat(request)]
 
         # Handle CompletionRequest (has prompt)

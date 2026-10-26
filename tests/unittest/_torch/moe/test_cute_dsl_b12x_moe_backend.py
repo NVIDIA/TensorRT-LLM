@@ -232,6 +232,42 @@ def test_nvfp4_decode_applies_the_awq_pre_quant_scale():
     assert out_sf is None
 
 
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_w4a16_applies_the_awq_pre_quant_scale(has_pre_quant_scale):
+    """This leaf never quantizes the activation, but an AWQ checkpoint still
+    needs its pre-quant scale: it stores ``W / s``, so the weights the b12x
+    W4A16 kernel dequantizes expect ``x * s``. ``load_quant_scales`` fills
+    ``fc31_act_scale`` from the ``*.pre_quant_scale`` keys without consulting
+    ``quant_algo``, so a plain NVFP4 checkpoint leaves it None and the input is
+    handed over untouched.
+
+    ``__new__`` without ``__init__``: the real constructor wants a GPU, while
+    ``quantize_input`` reads one parameter. Registered the way
+    ``create_weights`` does -- the slot as ``None``, then a ``(1, hidden)``
+    parameter of the module dtype -- so the ``nn.Module`` parameter lookup and
+    the broadcast shape are the production ones.
+    """
+    hidden_size = 8
+    moe = CuteDslB12xW4a16Nvfp4FusedMoE.__new__(CuteDslB12xW4a16Nvfp4FusedMoE)
+    torch.nn.Module.__init__(moe)
+    moe.register_parameter("fc31_act_scale", None)
+    pre_quant_scale = None
+    if has_pre_quant_scale:
+        pre_quant_scale = torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0)
+        moe.register_parameter(
+            "fc31_act_scale", torch.nn.Parameter(pre_quant_scale, requires_grad=False)
+        )
+    x = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    out, out_sf = moe.quantize_input(x)
+
+    assert out_sf is None
+    if has_pre_quant_scale:
+        torch.testing.assert_close(out, x * pre_quant_scale, rtol=0, atol=0)
+    else:
+        assert out is x
+
+
 def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     class _RoutingMethod:
         experts_per_token = 4

@@ -32,6 +32,7 @@ __all__ = [
     "BertForSequenceClassification",
     "CLIPVisionModel",
     "Cohere2ForCausalLM",
+    "Cosmos3EdgeModel",
     "Cosmos3Model",
     "DeepseekV3ForCausalLM",
     "DeepseekV41ForCausalLM",

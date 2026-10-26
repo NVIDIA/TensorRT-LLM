@@ -1347,6 +1347,7 @@ _CUTLASS_QUANTIZE_INPUT = {
     TrtllmCutlassMxfp8Impl: quantize_input_mxfp8,
     TrtllmCutlassW4a8Mxfp4Mxfp8Impl: quantize_input_mxfp8,
     TrtllmCutlassNvfp4Impl: vars(TrtllmCutlassNvfp4Impl).get("quantize_input"),
+    TrtllmCutlassW4a16Nvfp4Impl: vars(TrtllmCutlassW4a16Nvfp4Impl).get("quantize_input"),
 }
 _CUTLASS_PAD_TO = {TrtllmCutlassW4a16Mxfp4Impl: 128}
 
