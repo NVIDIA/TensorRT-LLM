@@ -122,6 +122,52 @@ and pipelined KV transfer remain unsupported with V2 beam search.
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 
+### Mixed-Precision KV Cache (Prototype)
+
+The V2 manager can store the full KV history of every full-attention layer in
+NVFP4 while keeping the first `mixed_precision_first_n` and the most recent
+`mixed_precision_last_n` tokens of each sequence in the regular KV dtype.
+Select it through `dtype`:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  dtype: mixed_nvfp4_bfloat16   # or mixed_nvfp4_fp8, mixed_nvfp4_float16
+  mixed_precision_first_n: 256
+  mixed_precision_last_n: 256
+  pool_ratio: [0.75, 0.25]      # optional, see below
+```
+
+The first part of the dtype names the history storage (NVFP4 values with one
+FP8 scale per 16 elements); the second part is the dtype attention computes
+in and the retained tokens are stored in. Like `dtype: fp8`, it overrides the
+checkpoint's KV quantization: `fp8` selects FP8 KV, `float16` and `bfloat16`
+select the unquantized model dtype. Retention follows the
+cache page granularity, and at least one of `mixed_precision_first_n` and
+`mixed_precision_last_n` must be positive.
+
+Each mixed-precision layer owns two pools: its original pool holds the NVFP4
+history, and a second layer group, appended after the model's own layer
+groups, holds the retained tokens. When `pool_ratio` is set it must therefore
+carry one more entry than the model has layer groups, with the retained-token
+group last; leave it unset to size all groups automatically. Sliding-window
+layers and layers whose KV is shared with another layer stay native.
+
+Before a mixed-precision layer runs, the attention metadata gathers the two
+pools into a staging copy in the attention dtype and writes the new tokens
+back afterwards, so attention kernels are unchanged. The staging copy is
+allocated once per rank from the attention buffer pool and sized as
+`max_num_sequences x ceil(max_seq_len / page) x largest local layer page`,
+with KV heads already sharded across tensor-parallel ranks; its size is
+logged at startup and the KV budget profiling run accounts for it. Each
+forward converts up to the longest sequence in the batch for every
+mixed-precision layer (the full span inside CUDA graphs), which is the
+feature's per-step cost.
+
+The prototype requires the TRTLLM or FlashInfer attention backend with
+`use_kv_cache_manager_v2: true`, and does not support speculative decoding,
+beam search, sparse attention, cold-page compression or context parallelism.
+
 ### SWA Endpoint Retention
 
 To prefer cached sliding-window attention (SWA) blocks near a prompt's endpoint
@@ -152,6 +198,30 @@ This preference does not guarantee residency or change attention windows or
 prefix matching. It excludes dummy and draft requests. The default, `0`, disables
 the entire endpoint-priority callback, including its preference for the final window.
 This option requires V2, block reuse, and the `all_reusable` policy.
+
+### Branch Snapshots
+
+Sliding-window attention (SWA) layers can reuse a cached prefix only up to a
+point where V2 kept the SWA window. The `per_request` and `per_conversation`
+policies keep this window only at the prompt end. SWA scratch reuse keeps it
+only at each context chunk end. So when a request shares a prefix with an
+earlier request and then diverges, it cannot reuse up to the fork. The prototype
+`kv_cache_config.block_reuse_config.enable_branch_snapshot` option makes V2 also
+keep the SWA window at the fork:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  block_reuse_config:
+    policy: per_conversation
+    enable_branch_snapshot: true
+```
+
+The fork is aligned down to a block boundary and becomes a context chunk
+boundary, so the executor uses the `FORCE_CHUNK` chunking policy. The option
+requires V2 and block reuse. It has no effect on models without SWA layers or on
+SWA layers with joint target/draft KV cache reuse.
 
 ### Mamba Snapshot Boundaries
 
@@ -201,6 +271,10 @@ Mamba models select V2 by default (see
 compatibility manager. In disaggregated serving, V2 Mamba requires the Python
 NIXL transceiver (`transceiver_runtime: PYTHON`); V1 routes support periodic
 snapshots only.
+
+For hybrid Mamba models, `block_reuse_config.enable_branch_snapshot` also
+snapshots the recurrent state at the fork. The deprecated
+`mamba_state_config.enable_branch_snapshot` alias turns on the same option.
 
 ### KV Cache Salting for Secure Reuse
 

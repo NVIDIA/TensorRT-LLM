@@ -57,6 +57,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..peft.lora.config import LoraConfig
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
@@ -282,18 +283,9 @@ class DynamicResolutionParams:
 def _get_vision_encoder_cuda_graph_config(
     mm_config: Optional["MultimodalConfig"],
 ) -> Optional["MultimodalEncoderCudaGraphConfig"]:
+    """Select the vision tower's graph config from the model-wide modality mapping."""
     if mm_config is None or mm_config.encoder_cuda_graph is None:
         return None
-
-    # TODO: Add support for audio encoder CUDA graphs.
-    supported_modalities = {"vision"}
-    unknown_modalities = set(mm_config.encoder_cuda_graph) - supported_modalities
-    if unknown_modalities:
-        raise ValueError(
-            f"Unsupported multimodal encoder CUDA graph modalities: {sorted(unknown_modalities)}. "
-            f"Supported modalities: {sorted(supported_modalities)}."
-        )
-
     return mm_config.encoder_cuda_graph.get("vision")
 
 
@@ -2865,6 +2857,7 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
     _supports_flash_attn = True
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
@@ -2947,7 +2940,6 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # Load vision encoder weights.
         if self.vision_encoder is not None:
             self.vision_encoder.load_weights(weights)
-            self.vision_encoder.enable_radio_cuda_graph()
 
         # Free vision encoder weights from the dict so the backing mmap pages can be released.
         if hasattr(weights, "mark_consumed"):

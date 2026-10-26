@@ -80,9 +80,68 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 0}}}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {
+                "multimodal_config": {
+                    "encoder_cuda_graph": {"audio": {"max_batch_size": 4, "max_num_tokens": 2048}}
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"buckets": [[256, 1]]}}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "multimodal_config": {
+                    "encoder_cuda_graph": {"vision": {"max_batch_size": 8, "max_num_tokens": 0}}
+                }
+            },
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "dtype": "mixed_nvfp4_fp8",
+                    "mixed_precision_first_n": 1,
+                    "mixed_precision_last_n": 65,
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "dtype": "mixed_nvfp4_bfloat16",
+                    "mixed_precision_first_n": 255,
+                    "mixed_precision_last_n": 0,
+                }
+            },
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_first_n": -1}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_last_n": -1}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_config": {}}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),

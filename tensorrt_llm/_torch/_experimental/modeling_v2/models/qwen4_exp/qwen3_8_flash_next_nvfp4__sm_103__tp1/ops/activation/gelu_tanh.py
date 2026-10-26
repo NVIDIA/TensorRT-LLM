@@ -40,93 +40,43 @@ class GeluTanh(OpWrapper):
 
     # spec: shape, dtype; `dist` "uniform" over [lo, hi] (default) or "fc1" (a
     # unit-normal hidden state through an fc1 at the checkpoint's measured
-    # weight std 0.0197 / bias std 1.676); `layout` "contiguous" (default),
-    # "column_slice" (the first half of a twice-as-wide buffer) or "transposed".
+    # weight std 0.0197 / bias std 1.676).
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"block MLP activand, {rows} patch rows x 4304 bf16",
-                spec=dict(shape=(rows, INTERMEDIATE_SIZE), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
-            )
-            for rows in (1, 2, 7, 64, 1024, 4096)
-        )
-        + (
-            Cell(
-                why="activand built through fc1 at the checkpoint's measured scale",
-                spec=dict(shape=(512, INTERMEDIATE_SIZE), dtype=torch.bfloat16, dist="fc1"),
-            ),
-            Cell(
-                why="fp16 over [-16, 16]",
-                spec=dict(shape=(256, INTERMEDIATE_SIZE), dtype=torch.float16, lo=-16.0, hi=16.0),
-            ),
-            Cell(
-                why="fp32 over [-16, 16]",
-                spec=dict(shape=(256, INTERMEDIATE_SIZE), dtype=torch.float32, lo=-16.0, hi=16.0),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"{str(dtype)[6:]} over [-3, 3], the tanh/erf divergence peak",
-                spec=dict(shape=(256, INTERMEDIATE_SIZE), dtype=dtype, lo=-3.0, hi=3.0),
-            )
-            for dtype in (torch.bfloat16, torch.float16, torch.float32)
-        )
-        + (
-            Cell(
-                why="column slice of a wider buffer: row stride free",
-                spec=dict(
-                    shape=(64, INTERMEDIATE_SIZE),
-                    dtype=torch.bfloat16,
-                    lo=-16.0,
-                    hi=16.0,
-                    layout="column_slice",
-                ),
-            ),
-            Cell(
-                why="transposed buffer: output keeps the input's strides",
-                spec=dict(
-                    shape=(64, INTERMEDIATE_SIZE),
-                    dtype=torch.bfloat16,
-                    lo=-16.0,
-                    hi=16.0,
-                    layout="transposed",
-                ),
-            ),
-            Cell(
-                why="1-D input",
-                spec=dict(shape=(INTERMEDIATE_SIZE,), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
-            ),
-            Cell(
-                why="3-D input",
-                spec=dict(
-                    shape=(2, 37, INTERMEDIATE_SIZE), dtype=torch.bfloat16, lo=-16.0, hi=16.0
-                ),
-            ),
-            Cell(
-                why="zero-row batch",
-                spec=dict(shape=(0, INTERMEDIATE_SIZE), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
-            ),
-        )
+        Cell(
+            why="activand built through fc1 at the checkpoint's measured scale",
+            spec=dict(shape=(512, INTERMEDIATE_SIZE), dtype=torch.bfloat16, dist="fc1"),
+        ),
+        Cell(
+            why="block MLP activand at the tower call ceiling, 32768 patch rows x 4304 bf16",
+            spec=dict(shape=(32768, INTERMEDIATE_SIZE), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
+        ),
+        Cell(
+            why="block MLP activand, 1 patch row x 4304 bf16",
+            spec=dict(shape=(1, INTERMEDIATE_SIZE), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
+        ),
     )
 
     note = """
     Metadata consumed: none. Out-of-place; `x` is not mutated.
 
-    The output inherits `x`'s memory format: a transposed `x` returns a
-    non-contiguous result (bitwise equal to the call on a contiguous copy).
+    Certified on contiguous bf16 `[rows, 4304]` activands (what the block MLP's
+    fc1 returns) at 1, 512 and 32768 rows (32768, the tower call ceiling).
 
-    Identity is pinned by the fp32 cells only. Max |tanh GELU - erf GELU| is
-    4.73e-4 (|x| ~ 2.7); in fp32 the erf form lands ~1600x the correct path's
-    deviation away, 31x outside the default gate. In bf16 one ulp at the output
-    scale exceeds that gap (erf variant 8.19e-3 vs correct 7.75e-3 max abs), so a
-    bf16 match does not say which GELU was computed.
+    Identity is pinned by fp32 only (the identity test).
+    Max |tanh GELU - erf GELU| is 4.73e-4 (|x| ~ 2.7); in fp32 the erf form
+    lands ~1600x the correct path's deviation away, 31x outside the default
+    gate. In bf16 one ulp at the output scale exceeds that gap (erf variant
+    8.19e-3 vs correct 7.75e-3 max abs), so a bf16 match does not say which GELU
+    was computed.
 
-    Values: `-inf -> nan` (the closed form does the same: -inf times a factor
-    saturated to 0); `+inf -> +inf`; large negatives give `-0.0`; `finfo.max`
-    comes back unchanged in bf16/fp16/fp32 (the cube is not taken in the input
-    dtype). CUDA-graph capturable; the output is a fresh allocation.
+    Measured, not certified: `-inf -> nan` (the closed form does the same: -inf
+    times a factor saturated to 0); `+inf -> +inf`; large negatives give
+    `-0.0`; `finfo.max` comes back unchanged in bf16/fp16/fp32 (the cube is not
+    taken in the input dtype); CUDA-graph capturable; the output is a fresh
+    allocation.
 
-    Not certified: float8 operands. No index-typed argument; numel past 2^31
+    Not certified: fp32 beyond the identity test, non-contiguous inputs, fp16,
+    other widths, float8 operands. No index-typed argument; numel past 2^31
     not probed.
     """
 
