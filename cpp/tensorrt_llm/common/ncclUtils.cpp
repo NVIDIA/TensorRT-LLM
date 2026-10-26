@@ -126,11 +126,16 @@ namespace
 bool mpiAllTrue(MPI_Comm comm, std::vector<int> const& ranks, bool localOk)
 {
     mpi::MpiComm const hostMpi(comm, false);
+    int value = localOk;
+    if (ranks.size() == static_cast<size_t>(hostMpi.getSize()))
+    {
+        int allOk = 0;
+        hostMpi.allreduce(&value, &allOk, 1, mpi::MpiType::kINT32, mpi::MpiOp::MIN);
+        return allOk != 0;
+    }
     auto const root = ranks.front();
     auto const tag = mpi::MpiTag::kNcclWindowAllocation;
-    int value = localOk;
-    // Communicator creation can initialize GPU collectives and invalidate capture.
-    // Gather and return the vote using only host messages on the existing communicator.
+    // Only subgroup members participate; no communicator is created during capture.
     if (hostMpi.getRank() != root)
     {
         hostMpi.sendValue(value, root, tag);
