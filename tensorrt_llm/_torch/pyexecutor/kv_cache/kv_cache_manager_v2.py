@@ -1462,9 +1462,7 @@ class KVCacheManagerV2(BaseResourceManager):
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
     retained_dtype: Optional[DataType] = None
-    # Declared by each manager class that can host the retained-token layer
-    # group next to its own pools; it is read from the class itself, so a
-    # subclass does not inherit it.
+    # Set by each manager class that hosts retained-token twins; not inherited.
     _supports_mixed_precision_kv = True
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
@@ -1570,8 +1568,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if len(set(self.pp_layers)) != len(self.pp_layers):
                 raise ValueError(f"layer-spec global layer ids must be unique: {self.pp_layers}")
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
-        # Draft layers appended to this manager (ids from num_layers up) keep a
-        # plain cache: the attention staging never covers them.
+        # Draft layers appended to this manager keep a plain cache.
         self._first_spec_layer_id: Optional[int] = None
         if layer_mask is None and spec_config is not None:
             from tensorrt_llm._torch.speculative import get_num_spec_layers
@@ -2076,9 +2073,7 @@ class KVCacheManagerV2(BaseResourceManager):
         assert candidate is not None
         self.kv_cache_manager_py_config = config
         self.impl = candidate
-        # Retained-token pools are read page-wise (and overlaid) before every row
-        # of a page has been written; start them zeroed so never-written rows do
-        # not read as FP8 NaN.
+        # Zero the retained pools: never-written rows must not read as FP8 NaN.
         for local in self.high_layers:
             self._get_mixed_precision_buffers(local, "NHD", "high").zero_()
         self.can_evict = len(config.cache_tiers) > 1
@@ -3561,8 +3556,7 @@ class KVCacheManagerV2(BaseResourceManager):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
         self.retained_dtype = str_dtype_to_binding(mixed.high)
-        # A manager whose own pools already hold NVFP4 (sparse MLA) keeps them
-        # as the low-precision pool; only the retained twins use mixed.high.
+        # Native NVFP4 pools (sparse MLA) stay the low-precision pool; twins use mixed.high.
         if dtype != self.retained_dtype and dtype != DataType.NVFP4:
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
@@ -3729,11 +3723,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def fill_retained_page_table(
         self, request_ids: List[int], layer_idx: int, out: np.ndarray
     ) -> None:
-        """Write the ``(batch, pages)`` page table of ``layer_idx``'s retained-token twin.
-
-        Backends that read their history through their own gather (sparse MLA)
-        need only this lane; ``fill_mixed_precision_page_tables`` adds the low lane.
-        """
+        """Write the ``(batch, pages)`` page table of ``layer_idx``'s retained-token twin."""
         self._fill_page_table(self.high_layers[self.layer_offsets[layer_idx]], request_ids, out)
 
     def get_mixed_precision_page_tables(
@@ -6865,8 +6855,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 return layer.bytes_per_token()
             return layer.bytes_per_token(data_role)
 
-        # A native NVFP4 pool keeps its own row format; the inline codec rows
-        # only replace a FP16/BF16/FP8 pool.
+        # A native NVFP4 pool keeps its row format; the inline codec only replaces FP16/BF16/FP8.
         if self._is_mixed_precision_layer(local_layer_idx) and self.dtype != DataType.NVFP4:
             return self._mixed_precision_layer_bytes_per_token(local_layer_idx, data_role)
         if self.dtype not in (

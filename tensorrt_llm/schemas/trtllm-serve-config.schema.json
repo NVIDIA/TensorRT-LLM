@@ -2894,14 +2894,6 @@
           "title": "Event Buffer Max Size",
           "type": "integer"
         },
-        "first_n": {
-          "default": 256,
-          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
-          "minimum": 0,
-          "status": "prototype",
-          "title": "First N",
-          "type": "integer"
-        },
         "fp8_context_mla_kv_len_cap": {
           "anyOf": [
             {
@@ -2981,14 +2973,6 @@
           "$ref": "#/$defs/KvPoolRebalanceConfig",
           "description": "Tuning for the KVCacheManagerV2 pool rebalance auto-tuner. Only used when ``enable_kv_pool_rebalance`` is True.",
           "status": "prototype"
-        },
-        "last_n": {
-          "default": 256,
-          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
-          "minimum": 0,
-          "status": "prototype",
-          "title": "Last N",
-          "type": "integer"
         },
         "mamba_ssm_cache_dtype": {
           "default": "auto",

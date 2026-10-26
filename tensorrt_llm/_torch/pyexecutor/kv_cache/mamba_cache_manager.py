@@ -3147,8 +3147,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Set per instance on a disaggregated context server of a KDA model.
     kda_context_only = False
 
-    # Mixed-precision KV: the retained-token layer group is appended after the
-    # recurrent-state and attention layers like any other attention group.
+    # Mixed-precision KV: the retained-token group is appended like any attention group.
     _supports_mixed_precision_kv = True
 
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
@@ -4035,8 +4034,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
-        # Layer ids past the model's local layers are appended attention
-        # groups (mixed-precision retained tokens), never recurrent state.
+        # Layer ids past the local layers are appended attention groups, not recurrent state.
         return (local_layer_idx < len(self.pp_layers)
                 and self._mamba_layer_mask[self.pp_layers[local_layer_idx]])
 

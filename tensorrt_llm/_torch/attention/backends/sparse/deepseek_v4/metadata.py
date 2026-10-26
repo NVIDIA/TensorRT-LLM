@@ -307,8 +307,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
-        # Mixed-precision KV: page table of the retained-token twins (compressed
-        # rows at the attention dtype), -1 where a page is not retained.
+        # Mixed-precision KV: page table of the retained twins, -1 where a page is not retained.
         self.mixed_high_block_table = None
         if getattr(self.kv_cache_manager, "high_layers", None):
             # Twins of the two compression ratios have different page sizes and pools.
@@ -792,11 +791,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             state.is_prefill = True
 
     def _has_mixed_precision_kv(self) -> bool:
-        # No dense-path staging copy here. After the indexer's top-k, this
-        # backend's gather already dequantizes the selected compressed rows
-        # into a per-call FP8 scratch (k rows per token, not the whole
-        # history), so that scratch is the staging: the retained tokens' rows
-        # are overlaid onto it after the gather (mixed_precision_overlay.overlay_rows).
+        # No staging: the gather's FP8 scratch already is one; retained rows are overlaid onto it.
         return False
 
     def prepare(self) -> None:

@@ -696,9 +696,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         view = self.mixed_precision_staging
         if (view is not None and view.lengths is not None
                 and view.manager is self.kv_cache_manager):
-            # The engine corrects kv_lens_cuda on the device once the previous
-            # step's accepted draft tokens are known; the staging gather and
-            # writeback follow the same lengths.
+            # Spec decoding + overlap: staging lengths follow kv_lens_cuda.
             lengths = view.lengths
             n = lengths.shape[1]
             lengths[1].copy_(self.kv_lens_cuda[:n])

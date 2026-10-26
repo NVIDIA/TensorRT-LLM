@@ -311,8 +311,7 @@ class Compressor(nn.Module):
 
         position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
         compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
-        # Mixed-precision KV: the main compressor also stores its post-processed
-        # rows in the retained-token twin of this layer.
+        # Mixed-precision KV: also store the post-processed rows in this layer's retained twin.
         retained_rows = None
         if not self.is_indexer and getattr(metadata, "mixed_high_block_table", None) is not None:
             retained_rows = retained_row_buffer(metadata, kv_comp)
