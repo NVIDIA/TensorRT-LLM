@@ -60,6 +60,7 @@ struct MoeRebalanceHaloRParams
     int* plan;                      //!< [halo_r::kPlanWords] plan published to the relay copy.
     int* routePrefix;               //!< [384 * (ep + 1)] per-broadcast destination prefix of this rank's routes.
     std::uint64_t* readyFlags;      //!< [ep] this layer's READY row on this rank; drained before each exchange.
+    unsigned* relayResidentCtas;    //!< [1] the relay copy's residency counter, zeroed at entry; may be null.
     int ep;
     int experts;
     int helpers;

@@ -363,6 +363,9 @@ __global__ void haloRRelayKernel(MoeRebalanceRelayParams const p)
     RelayWork& work = *reinterpret_cast<RelayWork*>(relayShared);
     if (threadIdx.x == 0)
     {
+        // Report residency first: MAIN launches MegaMoE, whose full grid blocks on READY, only once every relay CTA
+        // holds its SM.
+        asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.residentCtas) : "memory");
         prepareRelayWork(p, &work);
     }
     __syncthreads();
@@ -445,7 +448,7 @@ void invokeMoeRebalanceRelay(MoeRebalanceRelayParams const& params, cudaStream_t
 {
     TLLM_CHECK_WITH_INFO(params.plan != nullptr && params.sourceTable != nullptr && params.destinationTable != nullptr
             && params.planeBytes != nullptr && params.status != nullptr && params.completedCtas != nullptr
-            && params.launchCount != nullptr && params.readyFlagMc != nullptr,
+            && params.launchCount != nullptr && params.residentCtas != nullptr && params.readyFlagMc != nullptr,
         "HALO-R relay buffers must not be null");
     TLLM_CHECK_WITH_INFO(params.ep >= 2 && params.ep <= halo_r::kMaxRanks && params.experts > 0
             && params.experts <= halo_r::kPlanFieldStride && params.experts % params.ep == 0 && params.localRank >= 0

@@ -324,6 +324,11 @@ __device__ void planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch, un
 __global__ __launch_bounds__(kSchedulerThreads, 1) void haloRSchedulerKernel(
     MoeRebalanceHaloRParams const p, unsigned long long const spinCycles)
 {
+    // The relay copy launched after this kernel counts its resident CTAs from zero (see moeRebalanceRelay.h).
+    if (p.relayResidentCtas != nullptr && blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        *p.relayResidentCtas = 0;
+    }
     // Only the caller's valid prefix is readable; clear the rest of the output capacity in the same kernel.
     for (int index = p.validRouteCount + blockIdx.x * blockDim.x + threadIdx.x; index < p.routeCapacity;
          index += gridDim.x * blockDim.x)

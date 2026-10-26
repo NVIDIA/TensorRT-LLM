@@ -13,9 +13,13 @@ After each call it checks:
 - the READY row holds the current epoch on every cell, without the error bit,
   and every status word is clear.
 A negative case records a scheduler failure on one rank and expects the error
-bit in that rank's READY cell on every rank.
+bit in that rank's READY cell on every rank. The residency cases put a
+full-device kernel that spins on the READY row, like MegaMoE's gate, on MAIN
+right after the route wait, while the relay is starved of SMs, and expect it
+to pass its gate in eager mode and under graph replay.
 """
 
+import ctypes
 import faulthandler
 import pickle
 import random
@@ -49,6 +53,10 @@ _AUXILIARY_SMS = 8
 _HIDDEN = 256
 _INTERMEDIATE = 128
 _WORKER_TIMEOUT_S = 300
+# The READY-gate stand-in gives up after this long; the relay finishes in milliseconds.
+_GATE_TIMEOUT_NS = 5_000_000_000
+# The SM hog outlives the scheduler, so the relay is pending when its SMs free up.
+_HOG_NS = 300_000_000
 
 
 @pytest.fixture
@@ -132,6 +140,153 @@ def _skip_reason() -> str | None:
     if not MnnvlMemory.supports_mnnvl():
         return "HALO-R requires an NVLink fabric with multicast"
     return None
+
+
+_GATE_SOURCE = r"""
+__device__ unsigned long long globalTimer()
+{
+    unsigned long long now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    return now;
+}
+
+// Holds its SM for `ns` nanoseconds.
+extern "C" __global__ void smHog(unsigned long long ns)
+{
+    extern __shared__ unsigned char smem[];
+    if (threadIdx.x == 0)
+    {
+        smem[0] = 0;
+        unsigned long long const start = globalTimer();
+        while (globalTimer() - start < ns)
+        {
+            __nanosleep(1000);
+        }
+    }
+}
+
+// MegaMoE's helper-weight READY gate: hold the SM until every cell of this rank's READY row carries a
+// generation or the error bit. Gives up after `timeoutNs` and counts the CTA in `timedOut`.
+extern "C" __global__ void readyGate(
+    unsigned long long const* ready, int cells, unsigned long long timeoutNs, int* timedOut)
+{
+    extern __shared__ unsigned char smem[];
+    if (threadIdx.x != 0)
+    {
+        return;
+    }
+    smem[0] = 0;
+    unsigned long long const start = globalTimer();
+    for (;;)
+    {
+        bool open = true;
+        for (int c = 0; c < cells; ++c)
+        {
+            unsigned long long value;
+            asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(ready + c) : "memory");
+            open = open && value != 0;
+        }
+        if (open)
+        {
+            return;
+        }
+        if (globalTimer() - start > timeoutNs)
+        {
+            atomicAdd(timedOut, 1);
+            return;
+        }
+        __nanosleep(256);
+    }
+}
+"""
+
+
+class _GateKernels:
+    """A READY-gate stand-in on every SM and an SM hog, both one CTA per SM.
+
+    Each CTA takes over half of an SM's shared memory, so neither shares an SM
+    with the other or with a relay CTA, which takes nearly all of it.
+    """
+
+    def __init__(self, device: int) -> None:
+        try:
+            from cuda.bindings import driver, nvrtc
+        except ImportError:
+            from cuda import cuda as driver
+            from cuda import nvrtc
+        self.driver = driver
+
+        def check(result):
+            error, *values = result if isinstance(result, tuple) else (result,)
+            if error not in (driver.CUresult.CUDA_SUCCESS, nvrtc.nvrtcResult.NVRTC_SUCCESS):
+                raise RuntimeError(f"CUDA error {error}")
+            return values[0] if len(values) == 1 else values
+
+        self.check = check
+        major, minor = torch.cuda.get_device_capability(device)
+        program = check(
+            nvrtc.nvrtcCreateProgram(_GATE_SOURCE.encode(), b"ready_gate.cu", 0, [], [])
+        )
+        options = [f"--gpu-architecture=sm_{major}{minor}".encode()]
+        if (
+            nvrtc.nvrtcCompileProgram(program, len(options), options)[0]
+            != nvrtc.nvrtcResult.NVRTC_SUCCESS
+        ):
+            log = b" " * check(nvrtc.nvrtcGetProgramLogSize(program))
+            check(nvrtc.nvrtcGetProgramLog(program, log))
+            raise RuntimeError(f"NVRTC compile failed: {log.decode(errors='replace')}")
+        cubin = b" " * check(nvrtc.nvrtcGetCUBINSize(program))
+        check(nvrtc.nvrtcGetCUBIN(program, cubin))
+        self.module = check(driver.cuModuleLoadData(cubin))
+        self.gate = check(driver.cuModuleGetFunction(self.module, b"readyGate"))
+        self.hog = check(driver.cuModuleGetFunction(self.module, b"smHog"))
+        cu_device = check(driver.cuDeviceGet(device))
+        per_sm = check(
+            driver.cuDeviceGetAttribute(
+                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+                cu_device,
+            )
+        )
+        self.shared_bytes = per_sm // 2 + 1024
+        for function in (self.gate, self.hog):
+            check(
+                driver.cuFuncSetAttribute(
+                    function,
+                    driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    self.shared_bytes,
+                )
+            )
+        self.sms = torch.cuda.get_device_properties(device).multi_processor_count
+        self.timed_out = torch.zeros(1, dtype=torch.int32, device=f"cuda:{device}")
+
+    def _launch(self, function, blocks: int, args, stream: torch.cuda.Stream) -> None:
+        self.check(
+            self.driver.cuLaunchKernel(
+                function,
+                blocks,
+                1,
+                1,
+                128,
+                1,
+                1,
+                self.shared_bytes,
+                self.driver.CUstream(stream.cuda_stream),
+                args,
+                0,
+            )
+        )
+
+    def launch_hog(self, stream: torch.cuda.Stream) -> None:
+        # Leave only the scheduler's SMs free: fewer than the relay's CTAs.
+        args = ((_HOG_NS,), (ctypes.c_ulonglong,))
+        self._launch(self.hog, self.sms - _AUXILIARY_SMS, args, stream)
+
+    def launch_gate(self, ready: torch.Tensor, stream: torch.cuda.Stream) -> None:
+        args = (
+            (ready.data_ptr(), ready.numel(), _GATE_TIMEOUT_NS, self.timed_out.data_ptr()),
+            (ctypes.c_void_p, ctypes.c_int, ctypes.c_ulonglong, ctypes.c_void_p),
+        )
+        self._launch(self.gate, self.sms, args, stream)
 
 
 def _check_call(group, arena, routes: torch.Tensor, epoch: int, rank: int, layer: int = 0) -> list:
@@ -358,6 +513,76 @@ def _case_error_bit(layers: _Layers) -> list:
     return failures
 
 
+def _starve_relay(layers: _Layers) -> None:
+    """Give COPY the lowest stream priority, below the MAIN of the residency cases.
+
+    Production gives COPY the highest priority, which only orders CTAs that
+    are still pending; inverting it makes MegaMoE win every SM that frees up
+    once the relay is pending. Must run before the groups are built.
+    """
+    least, _ = torch.cuda.Stream.priority_range()
+    copy_stream = torch.cuda.Stream(device=layers.rank, priority=least)
+    layers.manager.get_copy_stream = lambda device: copy_stream
+
+
+def _case_relay_residency(layers: _Layers, use_graph: bool) -> list:
+    """MegaMoE's full grid, queued right after the route wait, must not starve the relay.
+
+    A hog holds every SM but the scheduler's, so the relay is still short of
+    SMs when the hog retires; with COPY below MAIN, a gate kernel that MAIN
+    has already released takes those SMs first. The calls use the native ops
+    directly: the group's Python check rejects a MAIN above COPY.
+    """
+    rank, experts = layers.rank, layers.experts
+    group, arena = layers.groups[0], layers.arenas[0]
+    ops = getattr(getattr(torch, "ops"), "trtllm")
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
+        HALO_R_SPIN_BUDGET_NS,
+    )
+
+    kernels = _GateKernels(rank)
+    ready = arena.terminal_flags_tensor().view(torch.int64)
+    _, greatest = torch.cuda.Stream.priority_range()
+    main = torch.cuda.Stream(device=rank, priority=greatest)
+    side = torch.cuda.Stream(device=rank)
+    routes = _routes(0, rank, _MAX_TOKENS, experts, rank)
+
+    def layer_call() -> None:
+        ops.moe_rebalance_halo_r_submit(group._handle, routes, HALO_R_SPIN_BUDGET_NS)
+        ops.moe_rebalance_halo_r_wait_routes(group._handle)
+        kernels.launch_gate(ready, torch.cuda.current_stream())
+        ops.moe_rebalance_halo_r_release(group._handle, 0)
+
+    graph = None
+    if use_graph:
+        main.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=main):
+            layer_call()
+    failures = []
+    for step in range(1, 4):
+        routes.copy_(_routes(step, rank, _MAX_TOKENS, experts, rank))
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        kernels.launch_hog(side)
+        with torch.cuda.stream(main):
+            if graph is not None:
+                graph.replay()
+            else:
+                layer_call()
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        layers.epochs[0] += 1
+        timed_out = int(kernels.timed_out.item())
+        if timed_out:
+            failures.append(f"rank {rank}: step {step}: {timed_out} gate CTAs timed out on READY")
+            kernels.timed_out.zero_()
+        failures += _check_call(group, arena, routes, layers.epochs[0], rank)
+    if graph is not None:
+        graph.reset()
+    return failures
+
+
 def _run_worker(case: str):
     faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S, exit=True)
     rank = tllm.mpi_rank()
@@ -370,6 +595,8 @@ def _run_worker(case: str):
             return "; ".join(sorted({r for r in reasons if r})), []
         _init_process_group(rank)
         layers = _Layers(rank, 3 if case == "banks" else 1)
+        if case.startswith("residency"):
+            _starve_relay(layers)
         try:
             layers.build_groups()
         except RuntimeError as error:
@@ -381,6 +608,8 @@ def _run_worker(case: str):
             return None, _case_alternating_banks(layers)
         if case == "error_bit":
             return None, _case_error_bit(layers)
+        if case.startswith("residency"):
+            return None, _case_relay_residency(layers, use_graph=case == "residency_cuda_graph")
         return None, _case_single_layer(layers, use_graph=case == "cuda_graph")
     except Exception:
         traceback.print_exc()
@@ -395,7 +624,10 @@ def _run_worker(case: str):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < _EP_SIZE, reason="Requires 4 GPUs")
-@pytest.mark.parametrize("case", ["eager", "cuda_graph", "banks", "error_bit"])
+@pytest.mark.parametrize(
+    "case",
+    ["eager", "cuda_graph", "banks", "error_bit", "residency_eager", "residency_cuda_graph"],
+)
 def test_halo_r_relay_matches_reference(halo_r_mpi_pool, case):
     results = list(halo_r_mpi_pool.map(_run_worker, [case] * _EP_SIZE))
     skips = {skip for skip, _ in results if skip}

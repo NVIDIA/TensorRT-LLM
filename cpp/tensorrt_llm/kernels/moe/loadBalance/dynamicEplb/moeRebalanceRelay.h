@@ -44,6 +44,8 @@ struct MoeRebalanceRelayParams
     int const* status;                     //!< The scheduler's status words.
     unsigned* completedCtas;               //!< [1] zero before the first launch; every launch leaves it zero.
     unsigned* launchCount;                 //!< [1] relay launches of this layer; zero before the first launch.
+    unsigned* residentCtas;                //!< [1] CTAs of this launch that are resident. The scheduler zeroes it,
+                                           //!< and each CTA adds 1 as its first action; MAIN waits for `ctas`.
     std::uint64_t* readyFlagMc;            //!< This rank's READY cell through the multicast view of the READY rows.
     int ep;
     int experts;
