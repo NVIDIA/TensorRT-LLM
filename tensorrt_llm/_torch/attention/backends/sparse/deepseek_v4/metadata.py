@@ -787,7 +787,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             state.is_prefill = True
 
     def _has_mixed_precision_kv(self) -> bool:
-        # No staging: the gather's FP8 scratch already is one; retained rows are overlaid onto it.
+        # No staging copy: the gather's FP8 scratch already is one; see has_mixed_precision_retained_rows.
         return False
 
     def prepare(self) -> None:

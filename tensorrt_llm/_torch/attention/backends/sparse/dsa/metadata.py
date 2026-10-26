@@ -382,8 +382,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
     def _has_mixed_precision_kv(self) -> bool:
-        # No staging: the gather's FP8 scratch already is one; retained rows are overlaid onto it.
+        # No staging copy: the gather's FP8 scratch already is one; see has_mixed_precision_retained_rows.
         return False
+
+    @property
+    def has_mixed_precision_retained_rows(self) -> bool:
+        """Mixed-precision KV is on: twin layers hold the retained tokens' rows for this backend."""
+        return self.retained_block_table is not None
 
     def prepare(self):
         self._validate_ragged_verification()
