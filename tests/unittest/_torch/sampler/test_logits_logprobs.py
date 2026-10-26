@@ -576,9 +576,12 @@ def test_logprobs_against_logits(
                 f"Sampled token {sampled_token_id} is not a valid key in the first entry "
                 f"of the generation logprob dict: {list(first_generation_logprob.keys())}"
             )
+            # Context and selected generation logprobs use different FP32 reductions.
             torch.testing.assert_close(
                 last_context_logprob[sampled_token_id].logprob,
                 first_generation_logprob[sampled_token_id].logprob,
+                atol=2e-6,
+                rtol=1e-6,
                 msg=(
                     f"logprob {last_context_logprob[sampled_token_id].logprob} in the last "
                     f"entry of the context logprob dict does not match the corresponding "
@@ -595,6 +598,8 @@ def test_logprobs_against_logits(
                 torch.testing.assert_close(
                     expected_logprob,
                     compare_logprob,
+                    atol=2e-6,
+                    rtol=1e-6,
                     msg=(
                         f"logprob {expected_logprob} does not match the corresponding "
                         f"logprob {compare_logprob} in the other dict for token {token_id}"
@@ -1482,8 +1487,8 @@ class TestLogsprobsInBatchedSampling:
 
         sample_batched = sampler._sample_batched_by_strategy
 
-        def _check_logprobs_capacity(logits_cuda, requests, model_outputs, **kwargs):
-            result = sample_batched(logits_cuda, requests, model_outputs, **kwargs)
+        def _check_logprobs_capacity(logits_cuda, requests, **kwargs):
+            result = sample_batched(logits_cuda, requests, **kwargs)
             if any(req.py_return_log_probs for req in requests):
                 expected_rows = sum(
                     get_draft_token_length(req) + 1
