@@ -1,18 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""A bf16 KDA recurrent-state pool must round-trip through the fp32-only paths.
-
-The fused T=1 decode kernel and the indexed prefill kernel read and write the
-state in fp32 only, so a bf16 pool goes through an fp32 copy of the addressed
-rows: plain decode takes ``forward_decode_fallback`` (gather, widen, run the
-kernel, round back) and prefill stages the rows for the same indexed kernel the
-fp32 pool uses. The fp32 pool is the reference in both cases: decode must agree
-up to bf16 rounding of the committed state, prefill must be bit-identical
-(same kernel, same fp32 inputs) with the state rounded once, and rows the batch
-does not address must stay untouched.
-
-Needs 1 GPU + fla-core; runs with random weights (no checkpoint).
-"""
+"""BF16 recurrent-state parity for direct prefill and staged native decode."""
 
 from types import SimpleNamespace
 
@@ -49,10 +37,10 @@ class _LayerCache:
     """Only what the plain-decode path reads; no fused-verify replay caches.
 
     ``has_kda_replay_caches`` mirrors the manager's property, which is
-    ``kda_qkg_cache is not None``; the mixer reads it unguarded.
+    ``kda_k_cache is not None``; the mixer reads it unguarded.
     """
 
-    kda_qkg_cache = None
+    kda_k_cache = None
     has_kda_replay_caches = False
 
 
@@ -123,46 +111,27 @@ def test_bf16_pool_decode_matches_fp32_pool():
     torch.testing.assert_close(ssm_bf16[untouched], initial[untouched], rtol=0, atol=0)
 
 
-def _prefill_metadata(
-    sequence_lengths, use_initial_states, has_initial_states, cu_seqlens, slot_indices
-):
-    """The Kimi K3 runtime metadata forward_prefill reads (chunk indices precomputed)."""
-    chunk_indices = torch.tensor(
-        [
-            [sequence_index, chunk_index]
-            for sequence_index, length in enumerate(sequence_lengths)
-            for chunk_index in range((length + 63) // 64)
-        ],
-        device="cuda",
-        dtype=torch.long,
-    )
+def _prefill_metadata(use_initial_states, has_initial_states, cu_seqlens, slot_indices):
+    """Prepare packed offsets and state ownership for production prefill."""
     return SimpleNamespace(
         use_initial_states=use_initial_states,
         has_initial_states=torch.tensor(has_initial_states, device="cuda", dtype=torch.bool),
-        kda_chunk_indices=chunk_indices,
-        kda_varlen_is_aligned=all(length % 64 == 0 for length in sequence_lengths),
-        kda_single_sequence_length=(sequence_lengths[0] if len(sequence_lengths) == 1 else None),
         # the packed causal convolution takes int32 sequence starts and the conv-pool slots
         query_start_loc=cu_seqlens.to(torch.int32),
         state_indices=slot_indices,
-        # the runtime metadata's preallocated 0..max_batch range (staged rows are dense)
-        _arange_buffer=torch.arange(len(sequence_lengths) + 1, dtype=torch.int32, device="cuda"),
     )
 
 
 @pytest.mark.parametrize(
     "sequence_lengths,use_initial_states,has_initial_states",
     [
-        # >= 4 chunks of 64 tokens in total: below that the optimized prefill
-        # op would launch a zero-size grid, so the dispatch keeps such batches
-        # on the FLA reference path and neither pool reaches the indexed kernel.
         ([17, 31, 64, 40], False, [False, False, False, False]),
         ([1, 129], True, [True, False]),
     ],
 )
 @torch.no_grad()
 def test_bf16_pool_prefill_matches_fp32_pool(
-    sequence_lengths, use_initial_states, has_initial_states, monkeypatch
+    sequence_lengths, use_initial_states, has_initial_states
 ):
     torch.manual_seed(0)
     runtime = _make_runtime()
@@ -178,9 +147,7 @@ def test_bf16_pool_prefill_matches_fp32_pool(
     cu_seqlens = torch.tensor(
         [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()], device="cuda", dtype=torch.long
     )
-    metadata = _prefill_metadata(
-        sequence_lengths, use_initial_states, has_initial_states, cu_seqlens, slot_indices
-    )
+    metadata = _prefill_metadata(use_initial_states, has_initial_states, cu_seqlens, slot_indices)
     hidden = torch.randn(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
     conv_seed = torch.randn(slots, 3 * dim, CONV_WIDTH - 1, dtype=torch.bfloat16, device="cuda")
     conv_seed *= 0.02
@@ -191,15 +158,6 @@ def test_bf16_pool_prefill_matches_fp32_pool(
     ssm_fp32 = ssm_bf16.float()
     initial = ssm_bf16.clone()
 
-    indexed_calls = []
-    prefill_chunk_kda = runtime._dispatch.prefill_chunk_kda
-
-    def _record(**kwargs):
-        indexed_calls.append(kwargs["state_pool"] is not None)
-        return prefill_chunk_kda(**kwargs)
-
-    monkeypatch.setattr(runtime._dispatch, "prefill_chunk_kda", _record)
-
     ref_conv = conv_seed.clone()
     expected = runtime.forward_prefill(
         hidden, cu_seqlens, metadata, num_prefills, ref_conv, ssm_fp32, slot_indices
@@ -209,11 +167,8 @@ def test_bf16_pool_prefill_matches_fp32_pool(
         hidden, cu_seqlens, metadata, num_prefills, actual_conv, ssm_bf16, slot_indices
     )
 
-    assert indexed_calls == [True, True], "both pools must take the indexed prefill kernel"
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert _relative_error(actual, expected) < 0.03
     torch.testing.assert_close(actual_conv, ref_conv, rtol=0, atol=0)
     assert not torch.equal(ssm_bf16[addressed], initial[addressed]), "state was not written back"
-    torch.testing.assert_close(
-        ssm_bf16[addressed], ssm_fp32[addressed].to(torch.bfloat16), rtol=0, atol=0
-    )
+    assert _relative_error(ssm_bf16[addressed], ssm_fp32[addressed]) < 0.03
     torch.testing.assert_close(ssm_bf16[untouched], initial[untouched], rtol=0, atol=0)

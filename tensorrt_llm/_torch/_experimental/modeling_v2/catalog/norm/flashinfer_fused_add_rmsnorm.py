@@ -29,7 +29,7 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
     form, no quantization.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # The two hidden sizes the shipped targets normalize over, at a decode
     # shape and a prefill shape. Both targets call this op only on the

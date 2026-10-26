@@ -227,6 +227,8 @@ class _M3CompositionExperts(nn.Module):
     def __init__(self, scheduler_kind: MoESchedulerKind) -> None:
         super().__init__()
         self.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+        # M3 opts in, so a fused-comm layer hands back the global output.
+        self.returns_global_routed_output = scheduler_kind == MoESchedulerKind.FUSED_COMM
 
     def forward(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, **kwargs: object
@@ -321,6 +323,7 @@ def test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler(
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)
             self.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+            self.returns_global_routed_output = scheduler_kind == MoESchedulerKind.FUSED_COMM
             self.routed_output_is_global = _moe_routed_output_is_global(self)
 
     monkeypatch.setattr(
@@ -985,7 +988,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         msa_write_idx_k=Mock(),
         msa_prefill_proxy_plan=None,
         msa_prefill_n_valid_blocks=None,
-        msa_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
+        msa_prefill_proxy_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
         msa_qo_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_kv_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_qo_offset_cpu=torch.tensor([0], dtype=torch.int32),
@@ -2458,6 +2461,150 @@ def test_minimax_m3_fused_routing_cuda_graph_replay_tracks_inputs() -> None:
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 router gate needs CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 64, 2048])
+def test_minimax_m3_gate_stays_fp32_when_tf32_is_allowed(num_tokens: int) -> None:
+    """The router GEMM is FP32 (as in SGLang) even when torch runs fp32 matmuls as TF32."""
+    hidden_size, num_experts = 6144, 128
+    torch.manual_seed(0)
+    gate = modeling_minimaxm3.MiniMaxM3Gate(
+        hidden_size, num_experts, top_k=4, routed_scaling_factor=2.0
+    ).cuda()
+    gate.weight.data.normal_(std=0.02)
+    hidden = torch.randn(num_tokens, hidden_size, device="cuda").bfloat16()
+    replay_hidden = torch.randn(num_tokens, hidden_size, device="cuda").bfloat16()
+    reference = hidden.double() @ gate.weight.double().t()
+    scale = reference.abs().max()
+
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        logits = gate(hidden)
+        tf32_logits = torch.nn.functional.linear(hidden.float(), gate.weight)
+        static_hidden = hidden.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            gate(static_hidden)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_logits = gate(static_hidden)
+        static_hidden.copy_(replay_hidden)
+        graph.replay()
+        replay_reference = gate(replay_hidden)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+    assert logits.dtype == torch.float32 and logits.shape == (num_tokens, num_experts)
+    assert float((logits.double() - reference).abs().max() / scale) < 1e-5
+    if num_tokens == 2048:
+        # The bound above only means something if F.linear really runs as TF32 here.
+        assert float((tf32_logits.double() - reference).abs().max() / scale) > 1e-4
+    torch.testing.assert_close(graph_logits, replay_reference, rtol=0, atol=0)
+
+
+def _router_topk_mismatches(
+    logits: torch.Tensor, reference: torch.Tensor, bias: torch.Tensor, top_k: int, tie: float
+) -> int:
+    """Rows whose sigmoid + bias top-k expert set differs from the FP64 reference.
+
+    Rows whose reference k-th and (k+1)-th scores are within ``tie`` are not counted.
+    """
+    scores = torch.sigmoid(logits.double()) + bias.double()
+    ref_scores = torch.sigmoid(reference.double()) + bias.double()
+    got = torch.sort(torch.topk(scores, top_k, dim=-1).indices, dim=-1).values
+    ref_values, ref_indices = torch.topk(ref_scores, top_k + 1, dim=-1)
+    want = torch.sort(ref_indices[:, :top_k], dim=-1).values
+    clear = (ref_values[:, top_k - 1] - ref_values[:, top_k]) > tie
+    return int(((got != want).any(dim=-1) & clear).sum())
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_split_router_weight_reconstructs_fp32() -> None:
+    """The three BF16 terms of the router weight sum back to the FP32 weight exactly."""
+    torch.manual_seed(0)
+    weight = torch.randn(128, 6144) * 0.02
+    split = modeling_minimaxm3.split_router_weight_bf16(weight)
+    assert split.dtype == torch.bfloat16 and split.shape == (128, 3 * 6144)
+    total = sum(term.double() for term in split.split(6144, dim=1))
+    torch.testing.assert_close(total, weight.double(), rtol=0, atol=0)
+    with pytest.raises(ValueError):
+        modeling_minimaxm3.split_router_weight_bf16(weight.bfloat16())
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 router gate needs CUDA")
+@pytest.mark.parametrize("rows", [33, 96, 256])
+def test_minimax_m3_gate_bf16_split_matches_fp32_router(rows: int) -> None:
+    """The BF16-split GEMM matches the FP32 router in logits and top-k.
+
+    Inputs are BF16 norm outputs, as on the serving path. Logits are compared with an
+    FP64 reference and with the FP32 cuBLAS router; the top-4 sets of sigmoid + bias must
+    match the FP64 reference on every row that is not a near-tie.
+    """
+    hidden_size, num_experts, top_k = 6144, 128, 4
+    torch.manual_seed(rows)
+    gate = modeling_minimaxm3.MiniMaxM3Gate(
+        hidden_size, num_experts, top_k=top_k, routed_scaling_factor=1.0
+    ).cuda()
+    weight = torch.randn(num_experts, hidden_size, device="cuda") * 0.02
+    bias = torch.randn(num_experts, device="cuda") * 0.05
+    gate.load_weights([{"weight": weight, "e_score_correction_bias": bias}])
+    assert gate.split_weight is not None
+
+    mismatches, fp32_mismatches, total = 0, 0, 0
+    for _ in range(8):
+        y = torch.randn(rows, hidden_size, device="cuda").bfloat16()
+        logits = gate(y)
+        assert logits.dtype == torch.float32 and logits.shape == (rows, num_experts)
+        reference = y.double() @ weight.double().t()
+        fp32_logits = torch.ops.trtllm.cublas_mm(
+            y.float(), weight.t(), bias=None, out_dtype=torch.float32
+        )
+        scale = float(reference.abs().max())
+        assert float((logits.double() - reference).abs().max()) / scale < 1e-5
+        assert float((fp32_logits.double() - reference).abs().max()) / scale < 1e-5
+        mismatches += _router_topk_mismatches(
+            logits, reference, gate.e_score_correction_bias, top_k, 1e-5
+        )
+        fp32_mismatches += _router_topk_mismatches(
+            fp32_logits, reference, gate.e_score_correction_bias, top_k, 1e-5
+        )
+        total += rows
+    assert mismatches == 0, (
+        f"{mismatches}/{total} top-{top_k} flips (FP32 router: {fp32_mismatches})"
+    )
+
+    # CUDA graph capture and replay of the split path at this row count.
+    static_y = torch.randn(rows, hidden_size, device="cuda").bfloat16()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        gate(static_y.clone())
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_logits = gate(static_y)
+    new_y = torch.randn(rows, hidden_size, device="cuda").bfloat16()
+    static_y.copy_(new_y)
+    graph.replay()
+    torch.testing.assert_close(graph_logits, gate(new_y), rtol=0, atol=0)
+
+    # Reloading the router weight refreshes the split buffer in place, so the
+    # captured graph computes with the new weight.
+    before_refit = graph_logits.clone()
+    new_weight = torch.randn(num_experts, hidden_size, device="cuda") * 0.02
+    gate.load_weights([{"weight": new_weight, "e_score_correction_bias": bias}])
+    graph.replay()
+    assert not torch.equal(graph_logits, before_refit)
+    torch.testing.assert_close(graph_logits, gate(new_y), rtol=0, atol=0)
+    reference = new_y.double() @ new_weight.double().t()
+    assert (
+        float((graph_logits.double() - reference).abs().max()) / float(reference.abs().max()) < 1e-5
+    )
+
+
+@pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 needs CUDA")
 def test_text_norm_weights_real_loader_smoke(monkeypatch: pytest.MonkeyPatch):
     """real ``_load_weights_impl_v2`` populates norm parameters.
@@ -2716,15 +2863,19 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "libraries,available,use_native",
+    "libraries,available,extra_pages_only,use_native",
     [
-        ("flashinfer_trtllm_gen,fallback", True, True),
-        ("fallback,flashinfer_trtllm_gen", True, False),
-        ("fallback", True, False),
-        ("flashinfer_trtllm_gen,fallback", False, False),
+        ("flashinfer_trtllm_gen,fallback", True, False, True),
+        ("fallback,flashinfer_trtllm_gen", True, False, False),
+        ("fallback", True, False, False),
+        ("flashinfer_trtllm_gen,fallback", False, False, False),
+        # SM107: the library serves only extra page sizes; dense layers keep SDPA.
+        ("flashinfer_trtllm_gen,fallback", True, True, False),
     ],
 )
-def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, available, use_native):
+def test_minimax_m3_dense_backend_library_order(
+    monkeypatch, libraries, available, extra_pages_only, use_native
+):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -2745,6 +2896,7 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
         "is_available",
         classmethod(lambda cls, attn: available),
     )
+    monkeypatch.setattr(model_module, "get_sm_version", lambda: 107 if extra_pages_only else 100)
     layer = SimpleNamespace(
         attn=legacy,
         layer_idx=0,
@@ -2762,7 +2914,7 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
     )
     assert layer.attn is (native if use_native else legacy)
     assert layer.support_fused_qkv is use_native
-    if libraries == "flashinfer_trtllm_gen,fallback" and available:
+    if libraries == "flashinfer_trtllm_gen,fallback" and available and not extra_pages_only:
         construct.assert_called_once()
         assert construct.call_args.kwargs["pos_embd_params"] is None
     else:

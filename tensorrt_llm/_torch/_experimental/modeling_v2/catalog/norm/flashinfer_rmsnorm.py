@@ -25,7 +25,7 @@ class FlashinferRmsnorm(OpWrapper):
     (`flashinfer_gemma_rmsnorm`), no quantization. `x` is not mutated.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # The widths the shipped targets normalize over. gpt-oss reaches this op
     # only on its residual stream; deepseek reaches it there and on the two

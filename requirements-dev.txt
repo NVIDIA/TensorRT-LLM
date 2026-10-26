@@ -20,6 +20,11 @@ distro==1.9.0
 pyyaml>=6.0.1,<6.0.3
 requests>=2.32.4,<3
 boto3
+# Prefix-scheduling integration tests require this exact benchmark revision.
+# Owner: Simeng Liu (@SimengLiu-nv); route installation and test failures caused
+# by LMBenchmark to him. Keep this revision pinned; update only when it causes
+# failures, rather than tracking upstream releases on a schedule.
+benchmark @ git+https://github.com/LMCache/LMBenchmark.git@c1e05a708a5a1fd04a9ec09d215edbdcccdf92cb
 einops
 # Reference implementation for KDA kernel parity tests.
 flash-linear-attention==0.5.2
@@ -65,7 +70,7 @@ opentelemetry-semantic-conventions-ai>=0.4.1
 rapidfuzz==3.14.5
 aiperf==0.8.0
 nanobind>=2.9.0
-nixl-cu13==1.4.0
+nixl-cu13==1.5.0
 cupti-python>=13.0,<13.5
 nvidia-cuda-cupti>=13.0,<13.5
 cxxfilt

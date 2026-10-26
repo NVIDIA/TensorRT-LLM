@@ -38,6 +38,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
+    from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
 
     return {
         "fp4_mla": Fp4MlaFmha,
@@ -51,13 +52,21 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
         "prims_ts": PrimsTSFmha,
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
+        # DeepSeek-V4 generation on the vendored PrimTS native sparse MLA
+        # kernel. Enabled by default: it only reports itself available for
+        # DeepSeek-V4 on SM100, so every other model and architecture never
+        # sees it; everything else keeps the TRTLLM-Gen libraries below.
+        "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }
 
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(name for name in FMHA_LIBS if name != "prims_ts")
+_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts"})
+DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
+    name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
+)
 
 
 def _parse_fmha_libs_env() -> tuple[str, ...]:

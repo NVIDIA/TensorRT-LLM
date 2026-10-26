@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 
 class FusedQkNormRope(OpWrapper):
@@ -27,12 +28,13 @@ class FusedQkNormRope(OpWrapper):
     call and the KV-cache append and attention after it.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # gpt-oss-120b asks for the RoPE half only: `is_qk_norm=False`, neox
-    # pairing, and YaRN-blended frequencies. 64 query heads, 8 key and 8 value,
-    # head_dim 64, all of which the cells carry because the op reads them as
-    # scalars rather than deriving them.
+    # gpt-oss-120b's default target asks for the RoPE half only:
+    # `is_qk_norm=False`, neox pairing, and YaRN-blended frequencies. 64 query
+    # heads, 8 key and 8 value, head_dim 64, all of which the cells carry
+    # because the op reads them as scalars rather than deriving them. Under
+    # attention TP each rank sees its own share of the heads.
     _GPT_OSS = dict(
         num_heads_q=64,
         num_heads_k=8,
@@ -82,6 +84,12 @@ class FusedQkNormRope(OpWrapper):
             spec=dict(tokens=37, **_GPT_OSS),
         ),
         Cell(
+            why="default target at attention TP8: 8q/1k/1v heads per rank",
+            spec=dict(
+                tokens=64, **{**_GPT_OSS, "num_heads_q": 8, "num_heads_k": 1, "num_heads_v": 1}
+            ),
+        ),
+        Cell(
             why="qwen4_exp main rope, decode: one token, Gemma norm and interleaved mRoPE "
             "with three distinct position rows",
             spec=dict(tokens=1, **_QWEN_MAIN),
@@ -94,6 +102,21 @@ class FusedQkNormRope(OpWrapper):
             why="qwen4_exp main rope, 8192-token prefill: the Gemma one-ulp tail, under "
             "GEMMA_PREFILL_ATOL",
             spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_MAIN),
+        ),
+        # The main rope run in place on qwen4_exp's fused input projection, whose
+        # row is [q | k | v | gate | index | pad] = 55 heads of 256: everything
+        # after k is passed as v heads, which only sets the row stride.
+        Cell(
+            why="qwen4_exp fused-row main rope, 1 token: 29 v heads only set the row stride",
+            spec=dict(tokens=1, **{**_QWEN_MAIN, "num_heads_v": 29}),
+        ),
+        Cell(
+            why="qwen4_exp fused-row main rope, 128 tokens: decode at max concurrency",
+            spec=dict(tokens=128, **{**_QWEN_MAIN, "num_heads_v": 29}),
+        ),
+        Cell(
+            why="qwen4_exp fused-row main rope, 8192 tokens: prefill, under GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **{**_QWEN_MAIN, "num_heads_v": 29}),
         ),
         Cell(
             why="qwen4_exp index rope (mRoPE), 1 token: one k and one v head, the "
