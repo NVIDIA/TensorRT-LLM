@@ -709,8 +709,9 @@ def test_mixed_precision_public_options():
             "single-beam",
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
+        ({"sparse_attention_config": {"algorithm": "rocket"}}, ValueError, "sparse attention"),
     ],
-    ids=("v1", "auto_v2", "backend", "connector", "dynamic_tree", "compression", "beam"),
+    ids=("v1", "auto_v2", "backend", "connector", "dynamic_tree", "compression", "beam", "sparse"),
 )
 @pytest.mark.cpu_only
 def test_mixed_precision_llm_args_validation(overrides, error, match):
@@ -805,14 +806,15 @@ def test_retained_compressed_row_mask_drops_pages_the_twin_released():
     )
 
     rows_per_page = 4
-    # Two requests: 6 and 3 new compressed rows, starting at compressed positions 2 and 9.
+    # Two requests: 6 and 3 new compressed rows, starting at compressed positions 2 and 14.
     cu = torch.tensor([0, 6, 9], dtype=torch.int32)
     num_comp = torch.tensor([5, 3], dtype=torch.int32)  # request 0 has one padding row
-    start_pos = torch.tensor([2, 9], dtype=torch.int32)
+    start_pos = torch.tensor([2, 14], dtype=torch.int32)
     compressed_mask = torch.ones(9, dtype=torch.bool)
     compressed_mask[7] = False
-    # Twin page table: request 0 holds pages 0 and 1, request 1 holds page 2 only.
-    table = torch.tensor([[10, 11, -1, -1], [-1, -1, 12, -1]], dtype=torch.int32)
+    # Twin page table: request 0 released page 1, request 1 holds page 3 only and its
+    # last row falls in page 4, beyond the table.
+    table = torch.tensor([[10, -1, 11, -1], [-1, -1, -1, 12]], dtype=torch.int32)
     mask = _retained_compressed_row_mask(
         table, rows_per_page, num_comp, cu, start_pos, compressed_mask, 2, 9
     )
@@ -826,9 +828,9 @@ def test_retained_compressed_row_mask_drops_pages_the_twin_released():
         )
         expected.append(bool(compressed_mask[row]) and local < int(num_comp[req]) and page >= 0)
     assert mask.tolist() == expected
-    # request 0: positions 2..6 -> pages 0,0,1,1,1 all held; row 5 is padding.
-    # request 1: positions 9, 10 (masked), 11 -> page 2 held.
-    assert expected == [True, True, True, True, True, False, True, False, True]
+    # request 0: positions 2, 3 -> page 0 held; 4, 5, 6 -> page 1 released; row 5 is padding.
+    # request 1: position 14 -> page 3 held; 15 masked; 16 -> page 4 beyond the table.
+    assert expected == [True, True, False, False, False, False, True, False, False]
 
 
 @pytest.mark.cpu_only
@@ -845,6 +847,34 @@ def test_mixed_precision_retained_dtype_must_match_model_dtype():
         validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_float16")
     validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_bfloat16")
     assert model_config.quant_config.kv_cache_quant_algo is None
+    # Sparse MLA models map the pool to NVFP4, but the retained dtype still has to match.
+    sparse = SimpleNamespace(
+        quant_config=QuantConfig(),
+        quant_config_dict=None,
+        torch_dtype=torch.bfloat16,
+        sparse_attention_config=SimpleNamespace(algorithm="dsa"),
+        pretrained_config=SimpleNamespace(),
+        attn_backend="TRTLLM",
+    )
+    with pytest.raises(ValueError, match="model dtype"):
+        validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_float16")
+    validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_bfloat16")
+    assert sparse.quant_config.kv_cache_quant_algo == "NVFP4"
+
+
+@pytest.mark.cpu_only
+def test_native_nvfp4_pool_accepts_any_retained_dtype():
+    """DeepSeek-V4 hands the base manager FP8 while its compressed pool is NVFP4."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+
+    assert KVCacheManagerV2._has_native_nvfp4_pool(None, DataType.NVFP4)
+    assert not KVCacheManagerV2._has_native_nvfp4_pool(None, DataType.FP8)
+    dsv4 = SimpleNamespace(_use_nvfp4_compress=True)
+    assert DeepseekV4CacheManager._has_native_nvfp4_pool(dsv4, DataType.FP8)
+    dsv4._use_nvfp4_compress = False
+    assert not DeepseekV4CacheManager._has_native_nvfp4_pool(dsv4, DataType.FP8)
 
 
 @pytest.mark.cpu_only

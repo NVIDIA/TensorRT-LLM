@@ -1568,13 +1568,16 @@ class KVCacheManagerV2(BaseResourceManager):
             if len(set(self.pp_layers)) != len(self.pp_layers):
                 raise ValueError(f"layer-spec global layer ids must be unique: {self.pp_layers}")
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
-        # Draft layers appended to this manager keep a plain cache.
+        # Draft layers appended to this manager keep a plain cache. They follow
+        # the model's own layers, with or without an explicit layer mask.
         self._first_spec_layer_id: Optional[int] = None
-        if layer_mask is None and spec_config is not None:
+        if spec_config is not None:
             from tensorrt_llm._torch.speculative import get_num_spec_layers
 
             if get_num_spec_layers(spec_config) > 0:
-                self._first_spec_layer_id = num_layers
+                self._first_spec_layer_id = getattr(
+                    kwargs.get("pretrained_config"), "num_hidden_layers", num_layers
+                )
         self.is_draft = is_draft
         self._legacy_draft_layer_ids = {
             global_layer_id
@@ -3557,7 +3560,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
         self.high_precision_dtype = str_dtype_to_binding(mixed.high)
         # Native NVFP4 pools (sparse MLA) stay the low-precision pool; twins use mixed.high.
-        if dtype != self.high_precision_dtype and dtype != DataType.NVFP4:
+        if dtype != self.high_precision_dtype and not self._has_native_nvfp4_pool(dtype):
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
@@ -3573,6 +3576,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     self._shared_kv_layers.add(
                         first_shared - 1 - source_types[::-1].index(layer_type)
                     )
+
+    def _has_native_nvfp4_pool(self, dtype: DataType) -> bool:
+        """Whether this manager's own pool already is the NVFP4 low-precision pool."""
+        return dtype == DataType.NVFP4
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
         """Whether this local layer stores its history in the low-precision pool."""
