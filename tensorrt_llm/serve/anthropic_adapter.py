@@ -1092,15 +1092,22 @@ async def _with_ticks(
     source is never resumed from another task; that task is cancelled when the
     consumer stops.
     """
-    items: asyncio.Queue = asyncio.Queue()
+    # One item at a time: the reader waits for the consumer, so a slow client
+    # holds back the source as reading it directly would.
+    items: asyncio.Queue = asyncio.Queue(maxsize=1)
     end = object()
 
     async def read_all() -> None:
         try:
             async for item in source:
-                items.put_nowait(item)
-        finally:
-            items.put_nowait(end)
+                await items.put(item)
+        except asyncio.CancelledError:
+            # The consumer has stopped; nobody is left to take the end marker.
+            raise
+        except Exception:
+            await items.put(end)
+            raise
+        await items.put(end)
 
     reader = asyncio.create_task(read_all())
     try:

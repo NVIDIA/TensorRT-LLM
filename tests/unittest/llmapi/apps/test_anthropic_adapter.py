@@ -1811,6 +1811,60 @@ def test_stream_sends_no_ping_while_events_flow(monkeypatch):
     assert "ping" not in [name for name, _ in events]
 
 
+def test_stream_sends_no_ping_after_done(monkeypatch):
+    """After [DONE] the message is complete: a slow end of the upstream brings no ping."""
+    events = _reframe_paced(
+        monkeypatch,
+        [
+            (0, _line(chunk({"content": "hello"}))),
+            (0, _line(chunk({}, finish_reason="stop"))),
+            (0, "data: [DONE]\n\n"),
+            (0.3, "\n"),
+        ],
+        interval=0.05,
+    )
+
+    assert_event_invariants(events)
+    assert "ping" not in [name for name, _ in events]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_slow_client_holds_back_the_upstream(monkeypatch, fails):
+    """The upstream is read only as fast as the client takes frames; its end or error still arrives."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 10)
+    words = [f"w{i} " for i in range(20)]
+    produced = []
+
+    async def source():
+        for word in words:
+            produced.append(word)
+            yield _line(chunk({"content": word}))
+        if fails:
+            raise RuntimeError("engine failed")
+        yield _line(chunk({}, finish_reason="stop"))
+        yield "data: [DONE]\n\n"
+
+    async def read_slowly():
+        frames, lead = [], 0
+        async for frame in reframe_openai_stream(source(), MODEL):
+            frames.append(frame)
+            taken = sum(
+                1
+                for name, payload in parse_frames(frames)
+                if name == "content_block_delta" and payload["delta"].get("text") in words
+            )
+            lead = max(lead, len(produced) - taken)
+            await asyncio.sleep(0.005)
+        return parse_frames(frames), lead
+
+    events, lead = asyncio.run(read_slowly())
+
+    assert lead <= 3, f"the upstream ran {lead} chunks ahead of the client"
+    texts = [p["delta"]["text"] for n, p in events if n == "content_block_delta"]
+    assert texts == words
+    assert events[-1][0] == ("error" if fails else "message_stop")
+
+
 def test_stopping_the_stream_cancels_its_pending_read(monkeypatch):
     """A client that goes away mid-silence stops the upstream read at once."""
     monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.05)
