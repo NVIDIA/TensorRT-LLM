@@ -36,6 +36,28 @@ file(
   CONFIGURE_DEPENDS "${modeling_v2_models_dir}/*/csrc/CMakeLists.txt")
 list(SORT family_lists)
 
+# A family removed or renamed since an earlier configure leaves its build
+# directory, and a library in it, behind: empty its cuda_architectures.txt so
+# that build_wheel.py neither installs that library nor keeps it installed.
+set(families "")
+foreach(family_list IN LISTS family_lists)
+  get_filename_component(csrc_dir "${family_list}" DIRECTORY)
+  get_filename_component(family_dir "${csrc_dir}" DIRECTORY)
+  get_filename_component(family "${family_dir}" NAME)
+  list(APPEND families "${family}")
+endforeach()
+file(
+  GLOB previous_arch_files
+  LIST_DIRECTORIES false
+  "${CMAKE_CURRENT_BINARY_DIR}/*/cuda_architectures.txt")
+foreach(arch_file IN LISTS previous_arch_files)
+  get_filename_component(binary_dir "${arch_file}" DIRECTORY)
+  get_filename_component(name "${binary_dir}" NAME)
+  if(NOT name IN_LIST families)
+    file(WRITE "${arch_file}" "")
+  endif()
+endforeach()
+
 if(WIN32 OR NOT BUILD_MODELING_V2)
   # As deep_ep does on a build without a matching architecture: an empty
   # cuda_architectures.txt per family, so build_wheel.py installs nothing,
