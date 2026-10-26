@@ -18,6 +18,7 @@ pytest.importorskip("fla")
 from kda_module_test_utils import compare  # noqa: E402
 
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import is_kda_decode_supported  # noqa: E402
 
 HIDDEN_SIZE = 512
 NUM_HEADS = 4
@@ -40,8 +41,8 @@ class _Cfg:
 def _make_runtime() -> KimiKDALinearAttention:
     if not torch.cuda.is_available():
         pytest.skip("the fused KDA decode kernel requires a CUDA device")
-    if torch.cuda.get_device_capability(0) not in {(10, 0), (10, 3), (10, 7)}:
-        pytest.skip("Kimi K3 requires SM100/SM103/SM107")
+    if not is_kda_decode_supported():
+        pytest.skip("the fused KDA decode kernel requires SM90/SM100/SM103/SM107")
     runtime = KimiKDALinearAttention(_Cfg(), layer_idx=0).to("cuda")
     # Checkpoints initialize dt_bias; seed it before finalizing kernel constants.
     torch.nn.init.normal_(runtime.dt_bias, std=0.1)
