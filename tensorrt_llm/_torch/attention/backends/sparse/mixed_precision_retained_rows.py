@@ -235,27 +235,22 @@ def store_retained_generation_rows(
     )
 
 
-def retained_compressed_scatter_args(
-    compressor,
-    metadata,
+def _retained_compressed_row_mask(
+    block_table: torch.Tensor,
+    tokens_per_block: int,
     num_comp_tokens: torch.Tensor,
     cu_new_comp_kv: torch.Tensor,
     start_pos: torch.Tensor,
     compressed_mask: torch.Tensor,
     batch_size: int,
     total_rows: int,
-):
-    """``(kv_cache, block_table, mask, tokens_per_block)`` for a second native compressor scatter.
+) -> torch.Tensor:
+    """``compressed_mask`` narrowed to the rows whose page the retained twin holds.
 
-    The native scatter addresses pages straight from the table it is given, so the mask also
-    drops the rows whose page the twin does not hold (-1 in the table). Returns None without a twin.
+    The native scatter addresses pages straight from the table it is given and does not
+    understand -1, so the rows of pages the twin released must be masked out.
     """
-    kv_cache = _retained_kv_cache(metadata, compressor)
-    if kv_cache is None or total_rows == 0 or batch_size == 0:
-        return None
-    block_table = _retained_block_table(metadata, compressor)
-    tokens_per_block = kv_cache.shape[1]
-    row = torch.arange(total_rows, device=kv_cache.device, dtype=torch.int32)
+    row = torch.arange(total_rows, device=block_table.device, dtype=torch.int32)
     request = torch.searchsorted(cu_new_comp_kv[1 : batch_size + 1], row, right=True)
     request = request.clamp_(max=batch_size - 1)
     local = row - cu_new_comp_kv[request]
@@ -264,8 +259,66 @@ def retained_compressed_scatter_args(
         min=0, max=block_table.shape[1] - 1
     )
     page = block_table[request.clamp(max=block_table.shape[0] - 1), block]
-    mask = compressed_mask & (local < num_comp_tokens[request]) & (position >= 0) & (page >= 0)
-    return kv_cache, block_table, mask, tokens_per_block
+    return compressed_mask & (local < num_comp_tokens[request]) & (position >= 0) & (page >= 0)
+
+
+def store_retained_compressed_rows(
+    compressor,
+    metadata,
+    kv_comp: torch.Tensor,
+    position_ids: torch.Tensor,
+    num_comp_tokens: torch.Tensor,
+    cu_new_comp_kv: torch.Tensor,
+    start_pos: torch.Tensor,
+    compressed_mask: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """DeepSeek-V4: run the native compressor scatter a second time, into the retained twin."""
+    from .deepseek_v4.compressor import KVCacheDtype
+
+    kv_cache = _retained_kv_cache(metadata, compressor)
+    total_rows = kv_comp.shape[0]
+    if kv_cache is None or total_rows == 0 or batch_size == 0:
+        return
+    block_table = _retained_block_table(metadata, compressor)
+    tokens_per_block = kv_cache.shape[1]
+    mask = _retained_compressed_row_mask(
+        block_table,
+        tokens_per_block,
+        num_comp_tokens,
+        cu_new_comp_kv,
+        start_pos,
+        compressed_mask,
+        batch_size,
+        total_rows,
+    )
+    cache_dtype = (
+        KVCacheDtype.FP8_PERTENSOR if kv_cache.dtype == torch.float8_e4m3fn else KVCacheDtype.NONE
+    )
+    torch.ops.trtllm.compressor_postprocess_scatter(
+        kv_comp,
+        None,
+        compressor.norm.weight,
+        compressor.norm.variance_epsilon,
+        compressor.rotary_emb.rotary_cos_sin,
+        position_ids,
+        compressor.nope_head_dim,
+        compressor.rope_head_dim,
+        kv_cache,
+        None,
+        num_comp_tokens,
+        cu_new_comp_kv,
+        start_pos,
+        block_table,
+        mask,
+        tokens_per_block,
+        int(cache_dtype),
+        1.0,
+        0,
+        compressor.rotate_activation,
+        None,
+        None,
+    )
 
 
 def overlay_retained_rows(

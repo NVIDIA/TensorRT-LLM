@@ -14,7 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
-from ..mixed_precision_retained_rows import retained_compressed_scatter_args
+from ..mixed_precision_retained_rows import store_retained_compressed_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -353,50 +353,17 @@ class Compressor(nn.Module):
         )
 
         # Mixed-precision KV: the same scatter also writes this layer's retained twin.
-        retained = None
         if not self.is_indexer and metadata.retained_block_table is not None:
-            retained = retained_compressed_scatter_args(
+            store_retained_compressed_rows(
                 self,
                 metadata,
+                kv_comp,
+                position_ids,
                 num_comp_tokens,
                 cu_new_comp_kv,
                 start_pos,
                 compressed_mask,
                 bsz,
-                total_tokens,
-            )
-        if retained is not None:
-            retained_kv_cache, retained_block_table, retained_mask, retained_tokens_per_block = (
-                retained
-            )
-            retained_dtype = (
-                KVCacheDtype.FP8_PERTENSOR
-                if retained_kv_cache.dtype == torch.float8_e4m3fn
-                else KVCacheDtype.NONE
-            )
-            torch.ops.trtllm.compressor_postprocess_scatter(
-                kv_comp,
-                None,
-                self.norm.weight,
-                self.norm.variance_epsilon,
-                self.rotary_emb.rotary_cos_sin,
-                position_ids,
-                self.nope_head_dim,
-                self.rope_head_dim,
-                retained_kv_cache,
-                None,
-                num_comp_tokens,
-                cu_new_comp_kv,
-                start_pos,
-                retained_block_table,
-                retained_mask,
-                retained_tokens_per_block,
-                int(retained_dtype),
-                1.0,
-                0,
-                self.rotate_activation,
-                None,
-                None,
             )
         if quant_output is not None:
             if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
