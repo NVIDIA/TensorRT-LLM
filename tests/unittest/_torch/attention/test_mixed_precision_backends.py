@@ -724,7 +724,10 @@ def test_mixed_precision_retained_dtype_must_match_model_dtype():
     from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 
     model_config = SimpleNamespace(
-        quant_config=QuantConfig(), quant_config_dict=None, torch_dtype=torch.bfloat16
+        quant_config=QuantConfig(),
+        quant_config_dict=None,
+        torch_dtype=torch.bfloat16,
+        sparse_attention_config=None,
     )
     with pytest.raises(ValueError, match="model dtype"):
         validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_float16")
