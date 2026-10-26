@@ -868,8 +868,11 @@ set wrong has a test that catches it:
   and its events into a native context once, and each layer call makes three
   native calls on its handle: submit, wait for routes and release. Like
   HALO-Q's route epoch, the route wait is a stream wait on a device counter:
-  every relay CTA bumps it on entry, so MegaMoE's full grid is released only
-  once the relay that opens its READY gate holds its SMs. Its device waits use a fixed wall-clock bound
+  every relay CTA bumps it before its copy work, so MegaMoE's full grid is released only
+  once the relay that opens its READY gate holds its SMs. The relay is a
+  programmatic dependent launch of the scheduler (`TRTLLM_HALO_R_RELAY_PDL=0`
+  turns it off): it starts once the plan is published and acquires it through
+  the plan epoch, and it publishes READY after the scheduler completes. Its device waits use a fixed wall-clock bound
   (`HALO_R_SPIN_BUDGET_NS`) instead of `SchedulerSpinBound`.
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and

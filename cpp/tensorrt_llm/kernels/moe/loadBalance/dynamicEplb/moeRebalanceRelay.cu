@@ -69,6 +69,10 @@ constexpr std::uint64_t kBulkAlignment = 16;
 constexpr std::uint64_t kWordAlignment = 4;
 //! Back-off between polls of a slot's load barrier.
 constexpr unsigned kAwaitBackoffNs = 32;
+//! How long a relay CTA polls the plan epoch before it waits for the scheduler grid to complete instead. The
+//! scheduler triggers the relay right after releasing the epoch, so the epoch is normally visible at once; the bound
+//! only decides when a scheduler that exited without a plan, or a stale epoch after a failure, stops the polling.
+constexpr std::uint64_t kRelayPlanPollNs = 50'000;
 
 //! This rank's received broadcasts in plan order with item prefix sums. Built by thread 0 of every CTA at the start
 //! of the dynamic shared memory.
@@ -164,6 +168,46 @@ __device__ __forceinline__ void multicastStoreReady(std::uint64_t* flag, std::ui
     asm volatile("fence.acq_rel.sys;" ::: "memory");
     asm volatile("multimem.st.release.sys.global.u64 [%0], %1;" ::"l"(flag), "l"(value) : "memory");
     asm volatile("fence.proxy.alias;" ::: "memory");
+}
+
+__device__ __forceinline__ std::uint64_t globalTimerNs()
+{
+    std::uint64_t now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    return now;
+}
+
+//! Waits until the scheduler grid this relay depends on has completed and its memory operations are visible
+//! (cudaGridDependencySynchronize). Returns at once when the relay is a plain launch.
+__device__ __forceinline__ void waitForScheduler()
+{
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+
+//! Thread 0: acquire this launch's plan. The scheduler of this launch publishes epoch `launches + 1`, and an earlier
+//! plan's epoch is at most `launches` (one scheduler launch per relay launch). Polls the epoch with acquire semantics;
+//! if it does not appear within kRelayPlanPollNs, waits for the scheduler grid instead and uses whatever plan it left,
+//! as a plain launch would, so relayReadyValue applies today's epoch and status checks. Returns whether it fell back.
+__device__ bool acquirePlan(MoeRebalanceRelayParams const& p)
+{
+    unsigned const expected = *reinterpret_cast<unsigned const volatile*>(p.launchCount) + 1U;
+    std::uint64_t const start = globalTimerNs();
+    for (;;)
+    {
+        unsigned epoch;
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(epoch) : "l"(p.plan) : "memory");
+        if (epoch == expected)
+        {
+            return false;
+        }
+        if (globalTimerNs() - start > kRelayPlanPollNs)
+        {
+            break;
+        }
+        __nanosleep(kAwaitBackoffNs);
+    }
+    waitForScheduler();
+    return true;
 }
 
 __device__ __forceinline__ bool validPlaneCount(int planes)
@@ -356,15 +400,43 @@ __device__ std::uint64_t relayReadyValue(MoeRebalanceRelayParams const& p, bool 
     return error ? (value | kReadyErrorBit) : value;
 }
 
+//! This launch's timing record, or null when the probe is off or full. Read before the last CTA bumps launchCount.
+__device__ __forceinline__ unsigned long long* relayProbeRecord(MoeRebalanceRelayParams const& p)
+{
+    if (p.probe == nullptr)
+    {
+        return nullptr;
+    }
+    unsigned const launch = *reinterpret_cast<unsigned const volatile*>(p.launchCount);
+    return launch < static_cast<unsigned>(p.probeRecords)
+        ? reinterpret_cast<unsigned long long*>(p.probe) + static_cast<std::size_t>(launch) * kHaloRProbeWords
+        : nullptr;
+}
+
+//! With a programmatic launch, this kernel may start while the scheduler's workers still write routes. It reads only
+//! the plan before its last CTA has waited for the scheduler grid: the plan through the acquired epoch, and the
+//! status words, whose worker writes are final only at scheduler exit, after that wait.
 __global__ void haloRRelayKernel(MoeRebalanceRelayParams const p)
 {
     // The work table and every slot live in dynamic shared memory, so the footprint is the requested size.
     extern __shared__ __align__(128) unsigned char relayShared[];
     RelayWork& work = *reinterpret_cast<RelayWork*>(relayShared);
+    unsigned long long* probe = nullptr;
     if (threadIdx.x == 0)
     {
-        // Report residency first: MAIN launches MegaMoE, whose full grid blocks on READY, only once every relay CTA
-        // holds its SM.
+        probe = relayProbeRecord(p);
+        if (probe != nullptr)
+        {
+            atomicMin(probe + kHaloRProbeRelayStart, static_cast<unsigned long long>(globalTimerNs()));
+        }
+        bool const fellBack = acquirePlan(p);
+        if (probe != nullptr && fellBack)
+        {
+            atomicAdd(probe + kHaloRProbeRelayFallbacks, 1ULL);
+        }
+        // Report residency before any copy work: MAIN launches MegaMoE, whose full grid blocks on READY, only once
+        // every relay CTA holds its SM. The scheduler zeroed the counter before releasing the plan epoch acquired
+        // above (or before completing, after a fallback), so this add follows that zero.
         asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.residentCtas) : "memory");
         prepareRelayWork(p, &work);
     }
@@ -397,7 +469,14 @@ __global__ void haloRRelayKernel(MoeRebalanceRelayParams const p)
         // Every CTA has arrived; the next launch is stream-ordered after this one, so the counter can be rearmed.
         asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" ::"l"(p.completedCtas) : "memory");
         bool const copyFailed = !validPlaneCount(p.planes) || issuers == 0;
+        // The workers record route failures until the scheduler exits, so READY waits for the scheduler grid, as it
+        // did when the relay started after it. The copy is done; by now the scheduler normally is too.
+        waitForScheduler();
         multicastStoreReady(p.readyFlagMc, relayReadyValue(p, copyFailed));
+        if (probe != nullptr)
+        {
+            atomicMax(probe + kHaloRProbeRelayEnd, static_cast<unsigned long long>(globalTimerNs()));
+        }
     }
 }
 
@@ -428,6 +507,22 @@ int relayDynamicSharedMemoryBytes(int device)
     TLLM_CUDA_CHECK(cudaFuncSetAttribute(haloRRelayKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     bytesByDevice[device] = bytes;
     return bytes;
+}
+
+//! Programmatic dependent launch needs compute capability 9.0; elsewhere the relay falls back to a plain launch.
+bool programmaticLaunchSupported(int device)
+{
+    static std::mutex mutex;
+    static std::map<int, bool> supported;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto const found = supported.find(device);
+    if (found != supported.end())
+    {
+        return found->second;
+    }
+    int major = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    return supported[device] = major >= 9;
 }
 
 } // namespace
@@ -466,9 +561,22 @@ void invokeMoeRebalanceRelay(MoeRebalanceRelayParams const& params, cudaStream_t
     TLLM_CHECK_WITH_INFO(params.ctas >= 1 && params.ctas <= smCount,
         "HALO-R relay CTAs must be between 1 and the device SM count (%d), got %d", smCount, params.ctas);
     int const sharedBytes = relayDynamicSharedMemoryBytes(device);
+    TLLM_CHECK_WITH_INFO(params.probe == nullptr || params.probeRecords > 0, "HALO-R timing probe needs a record");
 
-    haloRRelayKernel<<<params.ctas, kRelayThreads, sharedBytes, stream>>>(params);
-    TLLM_CUDA_CHECK(cudaGetLastError());
+    // A programmatic launch overlaps the scheduler's route tail. The kernel is correct either way: on a plain launch
+    // the plan epoch is visible at once and the scheduler waits return immediately.
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute.val.programmaticStreamSerializationAllowed
+        = params.programmaticLaunch && programmaticLaunchSupported(device);
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(params.ctas);
+    config.blockDim = dim3(kRelayThreads);
+    config.dynamicSmemBytes = static_cast<std::size_t>(sharedBytes);
+    config.stream = stream;
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, haloRRelayKernel, params));
 }
 
 } // namespace kernels

@@ -28,7 +28,10 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -74,6 +77,14 @@ T* checkedPointer(std::int64_t value, char const* name)
     return reinterpret_cast<T*>(static_cast<std::uintptr_t>(value));
 }
 
+//! TRTLLM_HALO_R_RELAY_PDL=0 launches the relay copy plainly after the scheduler instead of as its programmatic
+//! dependent. Read when a layer's context is bound.
+bool relayProgrammaticLaunchEnabled()
+{
+    char const* value = std::getenv("TRTLLM_HALO_R_RELAY_PDL");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
 } // namespace
 
 //! One layer's HALO-R scheduler and relay copy on one EP rank. It binds every argument the per-layer launches share,
@@ -84,6 +95,12 @@ T* checkedPointer(std::int64_t value, char const* name)
 //!     wait_routes: MAIN wait plan_ready; MAIN wait relay_resident >= relay CTAs
 //!     release:     COPY wait the consumer (consumer_done on MAIN, or the caller's event) -> record copy_idle;
 //!                  MAIN wait copy_idle
+//!
+//! The relay copy is a programmatic dependent launch of the scheduler unless TRTLLM_HALO_R_RELAY_PDL=0: it starts
+//! once the scheduler has published the plan, while the scheduler's workers finish the routes. plan_ready still
+//! fires at scheduler completion, so MAIN's route reads are unaffected. Under stream capture the record adds no node
+//! and the relay gets a programmatic edge from the scheduler node; whether an eager event record between the two
+//! launches still lets them overlap is up to the driver, and the relay is correct either way.
 class MoeRebalanceHaloRState : public torch::CustomClassHolder
 {
 public:
@@ -160,6 +177,9 @@ public:
             0,
             ctas,
             0,
+            nullptr,
+            reinterpret_cast<unsigned const*>(relayLaunchCount.data_ptr<int>()),
+            0,
         };
         mRelay = kernels::MoeRebalanceRelayParams{
             plan.data_ptr<int>(),
@@ -176,6 +196,9 @@ public:
             checkedInt(localRankValue, "local_rank"),
             planes,
             checkedInt(relayCtasValue, "relay_ctas"),
+            relayProgrammaticLaunchEnabled(),
+            nullptr,
+            0,
         };
         mDevice = device.index();
         mTopk = topk;
@@ -292,12 +315,40 @@ public:
         checkCudaResult(cudaStreamWaitEvent(execution, mEvents[kCopyIdle], 0), "cudaStreamWaitEvent(HALO-R copy idle)");
     }
 
+    //! Binds (or, with an undefined tensor, clears) a timing probe for tests and benchmarks: a CUDA uint64
+    //! [records, kHaloRProbeWords] tensor of %globaltimer stamps, one record per launch indexed by the relay launch
+    //! count (MoeRebalanceHaloRProbeWord). The caller presets it and has drained the launches that use the old one.
+    void setProbe(std::optional<torch::Tensor> const& probe)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        requireBound();
+        mProbe.reset();
+        std::uint64_t* records = nullptr;
+        int count = 0;
+        if (probe.has_value() && probe->defined())
+        {
+            TORCH_CHECK_VALUE(probe->is_cuda() && probe->get_device() == mDevice
+                    && probe->scalar_type() == at::ScalarType::Long && probe->is_contiguous() && probe->dim() == 2
+                    && probe->size(0) > 0 && probe->size(0) <= INT_MAX && probe->size(1) == kernels::kHaloRProbeWords,
+                "probe must be a contiguous CUDA int64 [records, ", static_cast<int>(kernels::kHaloRProbeWords),
+                "] tensor on device ", mDevice);
+            mProbe = *probe;
+            records = reinterpret_cast<std::uint64_t*>(probe->data_ptr<std::int64_t>());
+            count = static_cast<int>(probe->size(0));
+        }
+        mScheduler.probe = records;
+        mScheduler.probeRecords = count;
+        mRelay.probe = records;
+        mRelay.probeRecords = count;
+    }
+
     //! Releases the events and the bound tensors; the caller has drained the device work that uses them.
     void destroy()
     {
         std::lock_guard<std::mutex> lock(mMutex);
         releaseEvents();
         mTensors.clear();
+        mProbe.reset();
         mCopyStream = nullptr;
         mBound = false;
     }
@@ -342,6 +393,7 @@ private:
     kernels::MoeRebalanceHaloRParams mScheduler{};
     kernels::MoeRebalanceRelayParams mRelay{};
     std::vector<torch::Tensor> mTensors;
+    std::optional<torch::Tensor> mProbe;
     int mDevice{-1};
     int mTopk{0};
     cudaStream_t mCopyStream{nullptr};
@@ -402,6 +454,11 @@ void moeRebalanceHaloRRelease(std::int64_t handle, std::int64_t completionEvent)
     stateFromHandle(handle).release(completionEvent);
 }
 
+void moeRebalanceHaloRSetProbe(std::int64_t handle, std::optional<torch::Tensor> const& probe)
+{
+    stateFromHandle(handle).setProbe(probe);
+}
+
 void moeRebalanceHaloRDestroy(MoeRebalanceHaloRStatePtr const& state)
 {
     TORCH_CHECK(state, "HALO-R state is null");
@@ -429,6 +486,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("moe_rebalance_halo_r_submit(int handle, Tensor routes, int spin_ns) -> ()");
     m.def("moe_rebalance_halo_r_wait_routes(int handle) -> ()");
     m.def("moe_rebalance_halo_r_release(int handle, int completion_event) -> ()");
+    m.def("moe_rebalance_halo_r_set_probe(int handle, Tensor? probe) -> ()");
     m.def(
         "moe_rebalance_halo_r_destroy("
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState state) -> ()");
@@ -441,5 +499,6 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
     m.impl("moe_rebalance_halo_r_submit", &tensorrt_llm::torch_ext::moeRebalanceHaloRSubmit);
     m.impl("moe_rebalance_halo_r_wait_routes", &tensorrt_llm::torch_ext::moeRebalanceHaloRWaitRoutes);
     m.impl("moe_rebalance_halo_r_release", &tensorrt_llm::torch_ext::moeRebalanceHaloRRelease);
+    m.impl("moe_rebalance_halo_r_set_probe", &tensorrt_llm::torch_ext::moeRebalanceHaloRSetProbe);
     m.impl("moe_rebalance_halo_r_destroy", &tensorrt_llm::torch_ext::moeRebalanceHaloRDestroy);
 }

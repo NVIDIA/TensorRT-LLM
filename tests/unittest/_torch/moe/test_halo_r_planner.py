@@ -400,13 +400,61 @@ def test_route_wait_follows_relay_residency():
     scheduler = _function_body(
         (_DYNAMIC_EPLB_SOURCE / "moeRebalanceHaloR.cu").read_text(), "void haloRSchedulerKernel("
     )
-    assert scheduler.index("*p.relayResidentCtas = 0;") < scheduler.index("p.outSlots[index]")
-    # Every relay CTA reports residency before it does any work.
+    assert scheduler.index("*p.relayResidentCtas = 0;") < scheduler.index("schedulerBody(")
+    # Every relay CTA reports residency before it does any copy work.
     relay = _function_body(
         (_DYNAMIC_EPLB_SOURCE / "moeRebalanceRelay.cu").read_text(), "void haloRRelayKernel("
     )
     increment = relay.index('"red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.residentCtas)')
     assert increment < relay.index("prepareRelayWork(") < relay.index("relayIssue(")
+
+
+def test_relay_is_a_programmatic_dependent_of_the_scheduler():
+    # The relay may start while the scheduler's workers still write routes, so
+    # it must take nothing from the scheduler through the launch order alone.
+    halo_r = (_DYNAMIC_EPLB_SOURCE / "moeRebalanceHaloR.cu").read_text()
+    scheduler = _function_body(halo_r, "void haloRSchedulerKernel(")
+    # The residency zero precedes every trigger, so no relay add can precede it.
+    assert scheduler.index("*p.relayResidentCtas = 0;") < scheduler.index(
+        "triggerDependentLaunch();"
+    )
+    # CTA 0 triggers only after it releases the plan epoch that the relay acquires.
+    publish = _function_body(halo_r, "void planAndPublish(")
+    assert publish.count("triggerDependentLaunch();") == 1
+    assert publish.index("store_release_device(p.plan, epoch);") < publish.index(
+        "triggerDependentLaunch();"
+    )
+
+    relay_source = (_DYNAMIC_EPLB_SOURCE / "moeRebalanceRelay.cu").read_text()
+    relay = _function_body(relay_source, "void haloRRelayKernel(")
+    increment = relay.index('"red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.residentCtas)')
+    # The plan is acquired before the residency add (ordered after the zero)
+    # and before the work table reads it.
+    assert relay.index("acquirePlan(p)") < increment < relay.index("prepareRelayWork(")
+    acquire = _function_body(relay_source, "bool acquirePlan(")
+    assert '"ld.acquire.gpu.global.u32 %0, [%1];"' in acquire
+    assert acquire.index("kRelayPlanPollNs") < acquire.index("waitForScheduler();")
+    # The status words are final only at scheduler exit: READY waits for it,
+    # and nothing else in the kernel does, so the copy overlaps the route tail.
+    assert relay.count("waitForScheduler();") == 1
+    assert (
+        relay.index("relayIssue(")
+        < relay.index("waitForScheduler();")
+        < relay.index("relayReadyValue(")
+    )
+
+    invoke = _function_body(relay_source, "void invokeMoeRebalanceRelay(")
+    assert "cudaLaunchAttributeProgrammaticStreamSerialization" in invoke
+    assert "params.programmaticLaunch && programmaticLaunchSupported(device)" in invoke
+    op = _HALO_R_OP_SOURCE.read_text()
+    assert 'std::getenv("TRTLLM_HALO_R_RELAY_PDL")' in op
+    assert "relayProgrammaticLaunchEnabled()," in op
+
+
+def test_timing_probe_is_a_separate_test_op():
+    op = _HALO_R_OP_SOURCE.read_text()
+    schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op.split("m.def(")[1:]]
+    assert "moe_rebalance_halo_r_set_probe(int handle, Tensor? probe) -> ()" in schemas
 
 
 def test_context_binds_the_relay_residency_counter():
