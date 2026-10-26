@@ -14,6 +14,7 @@
 # limitations under the License.
 """Tests for how `create_input_processor` resolves a model's input processor."""
 
+from collections.abc import Callable
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -32,6 +33,10 @@ pytestmark = pytest.mark.cpu_only
 
 class _FakeVisionLanguageModel:
     """Stand-in model class that the fake architecture lookup resolves to."""
+
+
+class _FakeTextOnlyModel:
+    """Stand-in registered model class with no registered input processor."""
 
 
 class _RecordingInputProcessor:
@@ -71,6 +76,37 @@ def config_loads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return loads
 
 
+def _fail_config_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the Hugging Face config load raise after `config_loads` records it."""
+    record_load = model_config_mod.ModelConfig.from_pretrained
+
+    def _from_pretrained(_cls, model_path, trust_remote_code=False, **kwargs):
+        record_load(model_path, trust_remote_code=trust_remote_code, **kwargs)
+        raise ValueError("unreadable config")
+
+    monkeypatch.setattr(
+        model_config_mod.ModelConfig, "from_pretrained", classmethod(_from_pretrained)
+    )
+
+
+def _unregister_architecture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the architecture lookup report an unregistered model."""
+
+    def _get_model_architecture(_config):
+        raise RuntimeError("unregistered model")
+
+    monkeypatch.setattr(models_mod, "get_model_architecture", _get_model_architecture)
+
+
+def _resolve_to_model_without_processor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve to a model class without a registered processor, as a text-only root does."""
+    monkeypatch.setattr(
+        models_mod,
+        "get_model_architecture",
+        lambda config: (_FakeTextOnlyModel, config.architectures[0]),
+    )
+
+
 @pytest.mark.parametrize("checkpoint_format", ["HF", "MX"])
 def test_create_input_processor_uses_registered_processor_for_hf_format_checkpoints(
     config_loads: list[str],
@@ -89,6 +125,38 @@ def test_create_input_processor_uses_registered_processor_for_hf_format_checkpoi
     assert processor.model_path == "/ckpt"
     assert processor.tokenizer is tokenizer
     assert processor.config.architectures == ["FakeForConditionalGeneration"]
+    assert config_loads == ["/ckpt"]
+
+
+@pytest.mark.parametrize("checkpoint_format", ["HF", "MX"])
+@pytest.mark.parametrize(
+    "cause_fallback",
+    [
+        pytest.param(_fail_config_load, id="config-load-fails"),
+        pytest.param(_unregister_architecture, id="unregistered-architecture"),
+        pytest.param(_resolve_to_model_without_processor, id="no-registered-processor"),
+    ],
+)
+def test_create_input_processor_falls_back_to_default_for_hf_format_checkpoints(
+    config_loads: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_format: str,
+    cause_fallback: Callable[[pytest.MonkeyPatch], None],
+) -> None:
+    """HF and MX checkpoints fall back to `DefaultInputProcessor` when no processor resolves.
+
+    That happens when the Hugging Face config fails to load, when the
+    architecture is not registered, and when the registered model, such as a
+    text-only root, has no registered input processor. The fallback keeps the
+    caller's tokenizer.
+    """
+    cause_fallback(monkeypatch)
+    tokenizer = object()
+
+    processor = create_input_processor("/ckpt", tokenizer, checkpoint_format)
+
+    assert type(processor) is DefaultInputProcessor
+    assert processor.tokenizer is tokenizer
     assert config_loads == ["/ckpt"]
 
 
