@@ -1092,7 +1092,9 @@ def test_selfsampling_route_k2048_regclus() -> None:
 
 
 @pytest.mark.parametrize("pattern", ["randn", "ties", "equal"])
-@pytest.mark.parametrize("b,n", [(1, 16399), (4, 65551), (16, 32771)], ids=lambda v: str(v))
+@pytest.mark.parametrize(
+    "b,n", [(1, 16399), (4, 65551), (16, 32771), (1, 131072)], ids=lambda v: str(v)
+)
 def test_selfsampling_varlen_regclus_k2048_exact(b: int, n: int, pattern: str) -> None:
     """K=2048 reg_clus is exact on random, heavily tied and all-equal rows."""
     k, npad = 2048, (n + 63) // 64 * 64
@@ -1126,7 +1128,9 @@ def test_selfsampling_varlen_regclus_k2048_short_rows():
     torch.cuda.synchronize()
     ref = _reference_varlen_indices(lg, kv, nn, 1, k)
     for r in range(4 * nn):
-        if (ref[r] >= 0).any():
+        if 0 < int((ref[r] >= 0).sum()) < k:
+            assert torch.equal(out[r], ref[r]), f"row {r} short-row identity mismatch"
+        elif (ref[r] >= 0).any():
             row = lg[r]
             got = row[out[r].long().clamp_min(0)].sort().values
             want = row[ref[r].long().clamp_min(0)].sort().values
