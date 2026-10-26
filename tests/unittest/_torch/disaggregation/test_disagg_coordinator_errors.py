@@ -370,6 +370,7 @@ def _executor_with_real_error_path(monkeypatch) -> tuple:
     monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
     monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     executor = object.__new__(PyExecutor)
+    executor.sampler = Mock(spec=["release_request"])
     executor.active_requests = []
     executor.canceled_req_ids = []
     executor._pending_transfer_responses = []

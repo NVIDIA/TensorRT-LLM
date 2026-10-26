@@ -1412,6 +1412,43 @@ def test_swa_endpoint_rewind_manager_selection(preference: str | None,
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("disabled",
+                         ["enable_block_reuse", "use_kv_cache_manager_v2"])
+def test_KvCacheConfig_branch_snapshot_requires_reuse_and_v2(
+        disabled: str) -> None:
+    with pytest.raises(ValidationError, match=disabled):
+        KvCacheConfig.model_validate({
+            disabled: False,
+            "block_reuse_config": {
+                "enable_branch_snapshot": True
+            },
+        })
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("preference", [None, "V1", "V2"])
+def test_branch_snapshot_auto_manager_selection(preference: str | None) -> None:
+
+    class Model:
+
+        @staticmethod
+        def get_preferred_kv_cache_manager_version(
+                config: object) -> str | None:
+            return preference
+
+    args = TorchLlmArgs(
+        model="dummy",
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2="auto",
+            block_reuse_config=BlockReuseConfig(enable_branch_snapshot=True)))
+    if preference == "V2":
+        assert _resolve_kv_cache_manager_v2_auto(args, Model) is True
+    else:
+        with pytest.raises(ValueError, match="enable_branch_snapshot"):
+            _resolve_kv_cache_manager_v2_auto(args, Model)
+
+
+@pytest.mark.cpu_only
 def test_BlockReuseConfig_reports_renamed_policy_field():
     with pytest.raises(ValidationError, match="block_reuse_config\\.policy"):
         KvCacheConfig.model_validate(
@@ -1506,15 +1543,13 @@ def test_KvCacheConfig_requires_v2_for_branch_snapshots():
 def test_KvCacheConfig_keeps_branch_snapshots_under_per_conversation():
     """per_conversation zeroes the periodic interval but not this flag."""
     config = KvCacheConfig(
-        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
-        mamba_state_config=MambaStateConfig(
-            periodic_snapshot_interval=64,
-            enable_branch_snapshot=True,
-        ),
+        block_reuse_config=BlockReuseConfig(policy="per_conversation",
+                                            enable_branch_snapshot=True),
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
     )
 
     assert config.mamba_state_config.periodic_snapshot_interval == 0
-    assert config.mamba_state_config.enable_branch_snapshot is True
+    assert config.block_reuse_config.enable_branch_snapshot is True
 
 
 @pytest.mark.parametrize("interval", [0, 64])
@@ -1543,6 +1578,35 @@ def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
     assert any("mamba_state_cache_interval' is deprecated" in message
                for message in warnings_seen)
     assert "mamba_state_cache_interval" not in config.model_dump()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_block_reuse", [True, False])
+def test_KvCacheConfig_migrates_deprecated_mamba_branch_snapshot(
+        monkeypatch, enable_block_reuse: bool) -> None:
+    warnings_seen = []
+    monkeypatch.setattr(llm_args_mod.logger, "warning",
+                        lambda message: warnings_seen.append(message))
+
+    config = KvCacheConfig(
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_config=MambaStateConfig(enable_branch_snapshot=True))
+
+    # The old flag had no effect without block reuse, so it is not copied then.
+    assert config.block_reuse_config.enable_branch_snapshot is enable_block_reuse
+    assert any(
+        "mamba_state_config.enable_branch_snapshot' is deprecated" in message
+        for message in warnings_seen)
+    assert "enable_branch_snapshot" not in config.model_dump(
+    )["mamba_state_config"]
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_rejects_conflicting_branch_snapshot_flags() -> None:
+    with pytest.raises(ValidationError, match="Cannot set both"):
+        KvCacheConfig(
+            block_reuse_config=BlockReuseConfig(enable_branch_snapshot=False),
+            mamba_state_config=MambaStateConfig(enable_branch_snapshot=True))
 
 
 @pytest.mark.cpu_only
@@ -1652,6 +1716,58 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
 
 @pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
+
+    def test_automatic_buckets_need_only_max_batch_size(self):
+        config = MultimodalEncoderCudaGraphConfig(max_batch_size=8)
+        assert config.max_batch_size == 8
+        assert config.max_num_tokens is None
+        assert config.buckets is None
+
+    def test_automatic_buckets_accept_token_cap(self):
+        config = MultimodalEncoderCudaGraphConfig(max_batch_size=8,
+                                                  max_num_tokens=1024)
+        assert config.max_num_tokens == 1024
+
+    @pytest.mark.parametrize("kwargs", [
+        {
+            "max_batch_size": 0
+        },
+        {
+            "max_batch_size": -1
+        },
+        {
+            "max_batch_size": 8,
+            "max_num_tokens": 0
+        },
+        {
+            "max_num_tokens": 1024
+        },
+        {
+            "buckets": [(256, 1)],
+            "max_batch_size": 8
+        },
+        {
+            "buckets": [(256, 1)],
+            "max_num_tokens": 1024
+        },
+    ])
+    def test_rejects_invalid_automatic_config(self, kwargs):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(**kwargs)
+
+    def test_both_modalities_accept_automatic_config(self):
+        config = MultimodalConfig(
+            encoder_cuda_graph={
+                "vision": {
+                    "max_batch_size": 8
+                },
+                "audio": {
+                    "max_batch_size": 4,
+                    "max_num_tokens": 2048
+                },
+            })
+        assert config.encoder_cuda_graph["vision"].max_batch_size == 8
+        assert config.encoder_cuda_graph["audio"].max_num_tokens == 2048
 
     def test_minimal_required_fields(self):
         config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])

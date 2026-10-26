@@ -68,13 +68,12 @@ else:  # pragma: no cover - CPU / no-flashinfer environments
     flashinfer_apply_rope_with_cos_sin_cache_inplace = None
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_glm5_next import Glm5NextForCausalLM, glm5_next_attention_mapping
-from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
 from .modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
-from .modeling_qwen2vl import _prepare_qwen_vl_vision_attn_metadata
 from .modeling_utils import (
     ModelConfig,
     QuantConfig,
@@ -94,21 +93,6 @@ if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 
 _VISION_WEIGHT_PREFIX = "model.visual"
-
-
-def _image_encoder_cuda_graph_config(
-    model_config: ModelConfig[PretrainedConfig],
-) -> Optional["MultimodalEncoderCudaGraphConfig"]:
-    mm_config = model_config.multimodal_config
-    if mm_config is None or mm_config.encoder_cuda_graph is None:
-        return None
-    unknown = set(mm_config.encoder_cuda_graph) - {"image"}
-    if unknown:
-        raise ValueError(
-            "glm5_next: unsupported multimodal encoder CUDA graph modalities "
-            f"{sorted(unknown)}; only 'image' is supported"
-        )
-    return mm_config.encoder_cuda_graph.get("image")
 
 
 def _text_dtype(model_config: ModelConfig[PretrainedConfig]) -> torch.dtype:
@@ -383,6 +367,8 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
     """The GLM vision tower: patch embed → 24 blocks → post-norm →
     downsample → projector. Context-only, ``kv_cache_manager=None``."""
 
+    encoder_cuda_graph_modality = "image"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         super().__init__()
         _require_trtllm_vision_backend(model_config, type(self).__name__)
@@ -443,7 +429,7 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         # Optional CUDA-graph replay of the block stack (see
         # `enable_blocks_cuda_graph`); opted in through
         # `multimodal_config.encoder_cuda_graph["image"]`.
-        self._encoder_cuda_graph_config = _image_encoder_cuda_graph_config(model_config)
+        self.configure_encoder_cuda_graph(model_config.multimodal_config)
         self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
     @property
@@ -451,24 +437,11 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         return self.patch_embed.proj.weight.device
 
     # -- block-stack CUDA graphs ---------------------------------------------
-    def enable_blocks_cuda_graph(
-        self,
-        config: Optional["MultimodalEncoderCudaGraphConfig"] = None,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        """Capture the 24-block loop for every configured bucket.
-
-        Weights must already live on the CUDA device. The eager prelude
-        (patch embed, rotary tables) and tail (post norm, downsample, merger)
-        stay outside the graph; a request whose (num_images, total_patches)
-        matches no bucket falls back to the eager block loop.
-        """
-        config = config if config is not None else self._encoder_cuda_graph_config
-        if config is None or self._blocks_graph_runner is not None:
-            return
+    def _build_blocks_graph_runner(
+        self, config: "MultimodalEncoderCudaGraphConfig"
+    ) -> MultimodalEncoderGraphRunner:
         dtype = self.patch_embed.proj.weight.dtype
-        runner = MultimodalEncoderGraphRunner(
+        return MultimodalEncoderGraphRunner(
             encoder_fn=self._encoder_graph_fn,
             metadata_provider=_Glm5NextVisionGraphMetadataProvider(self),
             input_specs={
@@ -479,14 +452,6 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
             output_specs={"x": 0},
             config=config,
         )
-        runner.capture_all(device if device is not None else self.device)
-        self._blocks_graph_runner = runner
-
-    def clear_blocks_cuda_graph(self, *, release_nccl_window_owners: bool = True) -> None:
-        """Release the block graphs at the engine coordinated teardown boundary."""
-        if self._blocks_graph_runner is not None:
-            self._blocks_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
-            self._blocks_graph_runner = None
 
     def _encoder_graph_fn(
         self, inputs: Mapping[str, torch.Tensor], attn_metadata: AttentionMetadata
@@ -525,7 +490,7 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
                 )
                 if out is not None:
                     return out["x"]
-            self.attn_metadata = _prepare_qwen_vl_vision_attn_metadata(
+            self.attn_metadata = prepare_encoder_attn_metadata(
                 seq_lens, self.attn_metadata, max_seq_len=self._fixed_max_seq_len
             )
             return self._run_blocks_eager(hidden_states, position_embeddings, self.attn_metadata)
@@ -628,14 +593,14 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         return self.merger(hidden_states)
 
 
-class _Glm5NextVisionGraphMetadataProvider(EncoderMetadataProvider):
+class _Glm5NextVisionGraphMetadataProvider(EncoderMetadataProvider[AttentionMetadata]):
     """Graph-owned TRTLLM metadata for the block-stack runner.
 
     Per bucket one metadata instance with ``is_cuda_graph=True`` so the
     ``seq_lens`` setter copies into the captured ``_seq_lens_cuda`` buffer
     instead of reallocating; the packed cumulative lengths the FMHA reads
-    live in a fixed ``cu_q_seqlens`` buffer refreshed in place. Host-side
-    views are rebound per refresh — the C++ op reads them only at capture.
+    live in a fixed ``cu_q_seqlens`` buffer refreshed in place. Host lengths
+    and runtime views are bound once per bucket and updated before replay.
     """
 
     graph_critical_attrs: Sequence[str] = ("_seq_lens_cuda", "cu_q_seqlens")
@@ -655,22 +620,18 @@ class _Glm5NextVisionGraphMetadataProvider(EncoderMetadataProvider):
             key.num_contexts + 1, dtype=torch.int32, device=vit.device
         )
         metadata.cu_kv_seqlens = metadata.cu_q_seqlens
+        metadata.seq_lens = torch.zeros(
+            key.num_contexts, dtype=torch.int32, pin_memory=prefer_pinned()
+        )
+        metadata.bind_encoder_cuda_graph_seq_lens(metadata.seq_lens, key.num_contexts)
         return metadata
 
     def refresh_in_place(
         self, metadata: AttentionMetadata, padded_seq_lengths: Sequence[int]
     ) -> None:
-        n = len(padded_seq_lengths)
-        seq_lens = torch.tensor(padded_seq_lengths, dtype=torch.int32, pin_memory=prefer_pinned())
-        metadata.num_contexts = n
-        metadata.request_ids = list(range(1, n + 1))
-        metadata.seq_lens = seq_lens
-        metadata.bind_encoder_cuda_graph_seq_lens(metadata.seq_lens, n)
-        cu_seqlens = torch.zeros(n + 1, dtype=torch.int32, pin_memory=prefer_pinned())
-        torch.cumsum(seq_lens, dim=0, out=cu_seqlens[1:])
-        metadata.cu_q_seqlens.copy_(cu_seqlens, non_blocking=True)
-        metadata.max_seq_len = self._vit._fixed_max_seq_len
-        metadata.prepare_encoder_only()
+        prepare_encoder_attn_metadata(
+            list(padded_seq_lengths), metadata, max_seq_len=self._vit._fixed_max_seq_len
+        )
 
 
 class Glm5NextVisionModelBase(nn.Module):
@@ -1211,6 +1172,4 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
                     "tower (serve text-only with disable_mm_encoder instead)"
                 )
             self.mm_encoder.load_weights(weights)
-            # Weights are on device now; capture the (opt-in) encoder graphs.
-            self.mm_encoder.enable_blocks_cuda_graph()
         self.llm.load_weights(weights)

@@ -81,6 +81,7 @@ def _make_wrapper(cls=visual_trtllm.TrtllmAttention, *, quant_attention_config=N
     attention.quant_attention_config = quant_attention_config
     attention.layer_idx = 0
     attention.sparse_params = None
+    attention.is_dense_layer = False
     attention.metadata = visual_trtllm.TrtllmAttentionMetadata(
         device=torch.device("cpu"), attention_metadata_state={}
     )
