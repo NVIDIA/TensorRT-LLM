@@ -152,14 +152,13 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
-        checkpoint_loader, configured_encoder_max_num_tokens = self._init_from_args(
+        configured_encoder_max_num_tokens = self._init_from_args(
             model_path=model_path,
             llm_args=llm_args,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
-            checkpoint_loader=checkpoint_loader,
         )
         self._load_model(
             model_path=model_path,
@@ -183,12 +182,10 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures],
         dist: Optional[Distributed],
         spec_config: Optional[DecodingBaseConfig],
-        checkpoint_loader: Optional[BaseCheckpointLoader],
-    ) -> Tuple[BaseCheckpointLoader, Optional[int]]:
+    ) -> Optional[int]:
         """Resolve the requested sizes, the original speculation widths and the
         services derived from the arguments; capacity may still be unset.
-        Returns the checkpoint loader and the encoder token budget before any
-        multimodal increase."""
+        Returns the encoder token budget before any multimodal increase."""
         _configure_deep_gemm_pdl()
 
         self._metrics: dict[str, float] = defaultdict(float)
@@ -219,16 +216,6 @@ class PyTorchModelEngine(ModelEngine):
             llm_args.encoder_max_num_tokens if llm_args.encoder_max_num_tokens
             is not None else self.max_num_tokens)
         self.encoder_max_num_tokens = configured_encoder_max_num_tokens
-
-        if checkpoint_loader is None:
-            checkpoint_loader = _construct_checkpoint_loader(
-                llm_args.checkpoint_loader,
-                llm_args.checkpoint_format,
-                mx_config=llm_args.mx_config,
-                checkpoint_io_policy=llm_args.checkpoint_io_policy,
-                load_format=llm_args.load_format,
-                partial_model_loading=llm_args.is_partial_model_loading,
-            )
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -280,18 +267,28 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_format=llm_args.checkpoint_format,
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
-        return checkpoint_loader, configured_encoder_max_num_tokens
+        return configured_encoder_max_num_tokens
 
     def _load_model(
         self,
         *,
         model_path: str,
         model: Optional[torch.nn.Module],
-        checkpoint_loader: BaseCheckpointLoader,
+        checkpoint_loader: Optional[BaseCheckpointLoader],
         model_weights_memory_tag: Optional[str],
         model_weights_restore_mode,
     ) -> None:
-        """Load the model, or take the given one, at the requested capacity."""
+        """Resolve the checkpoint loader, then load the model, or take the given
+        one, at the requested capacity."""
+        if checkpoint_loader is None:
+            checkpoint_loader = _construct_checkpoint_loader(
+                self.llm_args.checkpoint_loader,
+                self.llm_args.checkpoint_format,
+                mx_config=self.llm_args.mx_config,
+                checkpoint_io_policy=self.llm_args.checkpoint_io_policy,
+                load_format=self.llm_args.load_format,
+                partial_model_loading=self.llm_args.is_partial_model_loading,
+            )
         self.moe_load_balancer: Optional[MoeLoadBalancer] = None
         self.model_loader: Optional[ModelLoader] = None
         if model is None:
