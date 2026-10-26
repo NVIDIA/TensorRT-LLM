@@ -47,6 +47,14 @@ FOLDER_SECURITY_SCANNING = "security_scanning"
 
 url_mapping = {}
 
+# Constraints added to a project before its requirements.txt entries, keyed by
+# the project's directory relative to the repo root. They steer the resolver
+# away from versions that make it backtrack through hundreds of releases.
+project_constraints = {
+    # botocore (via nemo-toolkit) requires python-dateutil<3.0.0.
+    "examples/quantization": ["python-dateutil<3.0.0"],
+}
+
 target_env = {
     "python_version": 310,
     "platform_system": "",
@@ -150,6 +158,11 @@ if __name__ == "__main__":
                                 shell=True,
                                 capture_output=True,
                                 text=True).stdout
+        for constraint in project_constraints.get(
+                str(Path(file_path).relative_to(curr_path)), []):
+            subprocess.run(f"poetry add '{constraint}'",
+                           shell=True,
+                           cwd=save_path)
         packages = output.split('\n')
 
         if packages[-1] == '':  # last entry is newline
