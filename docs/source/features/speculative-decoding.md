@@ -30,6 +30,11 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config, disabl
 The EAGLE 3 algorithm is described in the paper [EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test](https://arxiv.org/pdf/2503.01840).
 By default, each request uses a single sequence (linear chain) of draft tokens with length `max_draft_len`. Optionally, dynamic tree draft generation can be enabled to improve acceptance rates — see [Dynamic Tree Mode](#dynamic-tree-mode) below.
 
+Set `max_draft_len` to control the maximum number of draft tokens. The draft
+model hidden-layer count is read from its checkpoint configuration. Remove the
+retired `num_eagle_layers` key from EAGLE Python and YAML configurations; it is
+rejected as an unknown field, including when set to `null`.
+
 The following draft model checkpoints can be used for EAGLE 3:
 * Llama 3 variants: [use the checkpoints from the authors of the original EAGLE 3 paper](https://huggingface.co/yuhuili).
 * Llama 4 Maverick: [use the checkpoint from the NVIDIA HuggingFace repository](https://huggingface.co/nvidia/Llama-4-Maverick-17B-128E-Eagle3).

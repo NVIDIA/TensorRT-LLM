@@ -2829,11 +2829,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         "The topK value for each layer when dynamic tree is enabled. Required "
         "when use_dynamic_tree is True; ignored (with a warning) when "
         "use_dynamic_tree is False.")
-    num_eagle_layers: Optional[int] = Field(
-        default=None,
-        description=
-        "Deprecated TensorRT-only field with different semantics from draft model "
-        "layer count. Do not use on the PyTorch backend.")
     _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
@@ -2855,7 +2850,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
