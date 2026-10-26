@@ -26,8 +26,7 @@ Rows are the forward's token rows: at TP2 with DSpark K drafts a decode step has
 the 48-row parts (mc_boundary, router_tc) cover batch <= 12 and select covers batch <= 18.
 
 Switches (read once at import; "0", "false", "off", "no" = off): M3AX_L5 (master, off by default), then
-M3AX_L5_SELECT, M3AX_L5_NVFP4_HOIST, M3AX_L5_MC_BOUNDARY, each on once the master is on, and M3AX_L5_ROUTER_TC (off
-by default: its TF32 router logits are less precise than this model's FP32-grade gate); the row
+M3AX_L5_SELECT, M3AX_L5_NVFP4_HOIST, M3AX_L5_ROUTER_TC, M3AX_L5_MC_BOUNDARY, each on once the master is on; the row
 ranges M3AX_L5_SELECT_ROWS (default 1-72), M3AX_L5_ROUTER_TC_ROWS (2-48), M3AX_L5_MC_ROWS (1-48), "lo-hi[,lo-hi...]",
 and M3AX_L5_HOIST_MAX_ROWS (1024).
 """
@@ -69,7 +68,7 @@ def _rows_spec(name: str, default: str, cap: Optional[int] = None) -> Tuple[Tupl
 MASTER = _switch("M3AX_L5", "0")
 SELECT = MASTER and _switch("M3AX_L5_SELECT")
 NVFP4_HOIST = MASTER and _switch("M3AX_L5_NVFP4_HOIST")
-ROUTER_TC = MASTER and _switch("M3AX_L5_ROUTER_TC", "0")
+ROUTER_TC = MASTER and _switch("M3AX_L5_ROUTER_TC")
 MC_BOUNDARY = MASTER and _switch("M3AX_L5_MC_BOUNDARY")
 SELECT_ROWS = _rows_spec("M3AX_L5_SELECT_ROWS", "1-72")
 ROUTER_TC_ROWS = _rows_spec("M3AX_L5_ROUTER_TC_ROWS", "2-48", cap=MC_MAX_ROWS)
@@ -138,8 +137,7 @@ class McBoundary:
         built = None
         try:
             built = mc.get_workspace(mapping, hidden)
-        except (RuntimeError, ValueError, OSError) as e:
-            # Every rank must reach tp_agree_built below, so a local failure only records "not built".
+        except RuntimeError as e:
             logger.warning(f"MiniMax-M3 multicast boundary workspace creation failed: {e}")
         built = mc.tp_agree_built(mapping, built, "MiniMax-M3 multicast boundary workspace")
         if built is None or any(w.flags.get(_MC_CLUSTER) is None for w in built.workspaces):
