@@ -4055,11 +4055,13 @@ def _ring_gate_manager(
     conv_dtype=torch.bfloat16,
     ssm_dtype=torch.bfloat16,
     conv_state_layout="q_k_v",
+    mamba_pp_layers=(0,),
 ):
     return SimpleNamespace(
         spec_config=MTPDecodingConfig(max_draft_len=draft_len),
         _state_layout=SimpleNamespace(
-            ssm_state_shape=(4, head_dim, d_state),
+            mamba_pp_layers=mamba_pp_layers,
+            ssm_state_shape=(4, head_dim, d_state) if mamba_pp_layers else (),
             conv_state_dtype=conv_dtype,
             ssm_state_dtype=ssm_dtype,
             conv_state_layout=conv_state_layout,
@@ -4080,6 +4082,7 @@ def _ring_gate_manager(
         ("1", True, True, {"head_dim": 64}, False, True),
         ("1", True, True, {"draft_len": 2}, False, True),
         ("1", True, True, {"conv_state_layout": "x_b_c"}, False, True),
+        ("force", True, True, {"mamba_pp_layers": ()}, False, False),
     ],
     ids=[
         "eligible_T4",
@@ -4092,6 +4095,7 @@ def _ring_gate_manager(
         "head_dim_64",
         "T3",
         "x_b_c_layout",
+        "no_local_gdn_layers",
     ],
 )
 def test_gdn_flashinfer_ring_replay_gate(

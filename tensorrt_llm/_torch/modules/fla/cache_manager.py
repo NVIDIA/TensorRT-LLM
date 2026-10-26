@@ -643,11 +643,12 @@ def _use_flashinfer_ring_replay(manager: MambaHybridCacheManagerV2, replay_enabl
     Decided once at load: the ring and double-buffer history layouts differ,
     so the kernel cannot be switched per call.
     """
-    if not is_gdn_flashinfer_replay_enabled():
+    layout = manager._state_layout
+    # Managers without local GDN layers (e.g. the one-model MTP draft) hold no history.
+    if not is_gdn_flashinfer_replay_enabled() or not layout.mamba_pp_layers:
         return False
     from .flashinfer_cached_replay import is_flashinfer_cached_replay_available
 
-    layout = manager._state_layout
     _, head_dim, d_state = layout.ssm_state_shape
     reason = None
     if not replay_enabled:
