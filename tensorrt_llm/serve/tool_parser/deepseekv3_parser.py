@@ -17,6 +17,9 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 
 from .utils import is_complete_json
 
+# Closes the json code block that holds a tool call's arguments.
+_FENCE = "\n```"
+
 
 class DeepSeekV3Parser(BaseToolParser):
     (
@@ -60,6 +63,9 @@ class DeepSeekV3Parser(BaseToolParser):
         )
         self._last_arguments = ""
         self.current_tool_id = -1
+        # Buffer index from which a closing fence could still appear. Text
+        # before it was already searched without completing a tool call.
+        self._fence_search_start = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -111,6 +117,7 @@ class DeepSeekV3Parser(BaseToolParser):
                 return StreamingParseResult()
             normal_text = current_text
             self._buffer = ""
+            self._fence_search_start = 0
             for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
                 normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text)
@@ -122,12 +129,23 @@ class DeepSeekV3Parser(BaseToolParser):
         if normal_text:
             current_text = current_text[prefix_len:]
             self._buffer = current_text
+            self._fence_search_start = max(0, self._fence_search_start - prefix_len)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
         try:
+            # A tool call matches only once its closing fence arrives, so the
+            # buffer is searched again only when new text holds a fence. This
+            # keeps a long tool call from being rescanned on every increment.
+            if (
+                not self.current_tool_name_sent
+                and current_text.find(_FENCE, self._fence_search_start) == -1
+            ):
+                self._fence_search_start = max(0, len(current_text) - len(_FENCE) + 1)
+                return StreamingParseResult(normal_text=normal_text)
+
             # Lazy groups keep the match within the first call of the buffer; a
             # later call is matched once this one is reported and removed.
             partial_match = re.search(
@@ -199,12 +217,15 @@ class DeepSeekV3Parser(BaseToolParser):
                             self._buffer = current_text[match.end() :]
                         else:
                             self._buffer = ""
+                        self._fence_search_start = 0
 
                         result = StreamingParseResult(normal_text=normal_text, calls=calls)
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
                         return result
+            else:
+                self._fence_search_start = max(0, len(current_text) - len(_FENCE) + 1)
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 
