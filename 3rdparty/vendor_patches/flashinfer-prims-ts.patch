@@ -419,7 +419,7 @@ index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/mla_decode.py b/mla_decode.py
-index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..074e4a0a3262aed9b39e58c66bb3a37482aa5bed 100644
+index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab92e630db 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -598,7 +598,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..074e4a0a3262aed9b39e58c66bb3a374
          _validate_query(
              query,
              packed_query=state["packed"],
-@@ -2863,10 +2926,124 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2863,10 +2926,125 @@ class BatchSparseMLADecodePagedTSWrapper:
                  if static_scales
                  else state["compiled"],
              )
@@ -716,6 +716,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..074e4a0a3262aed9b39e58c66bb3a374
 +            (indices, ci, lengths, cl, s0, s1, sinks),
 +            bmm1,
 +            bmm2,
++            None,
 +            None,
 +        )
 +        return out
