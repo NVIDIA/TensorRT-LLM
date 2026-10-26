@@ -329,7 +329,7 @@ def _run_create_py_executor(
         py_executor_creator, "get_spec_resource_manager", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(py_executor_creator, "get_spec_drafter", lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda: None)
+    monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: is_mla_model)
     monkeypatch.setattr(

@@ -39,6 +39,7 @@ from strenum import StrEnum
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
+from tensorrt_llm._torch.pyexecutor.kv_cache.memory_utils import get_integrated_gpu_free_memory
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -494,6 +495,21 @@ def _estimate_full_attn_size_per_token(
         for layer_size, window_size in zip(layer_sizes, attention_windows)
         if window_size is None or window_size <= 0
     )
+
+
+def _get_available_memory_for_auto_host_tier(shares_device_memory: bool) -> float:
+    """Read available memory before allocating either cache tier.
+
+    Args:
+        shares_device_memory: Whether host and device allocations share RAM.
+    """
+    if shares_device_memory:
+        cuda_free, cuda_total = torch.cuda.mem_get_info()
+        return get_integrated_gpu_free_memory(cuda_free, cuda_total)
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (ValueError, OSError):
+        return float("inf")
 
 
 def _compute_auto_host_tier_quota(
@@ -1959,10 +1975,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # ~170GiB device quota each on a 975GiB node).
             local_ranks = max(1, Distributed.get(mapping).local_world_size)
 
-            try:
-                mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
-            except (ValueError, OSError):
-                mem_available = float("inf")
+            shares_device_memory = is_device_integrated()
+            mem_available = _get_available_memory_for_auto_host_tier(shares_device_memory)
             try:
                 _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
                 memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float("inf")
@@ -1973,7 +1987,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 local_ranks,
                 mem_available,
                 memlock_limit,
-                shares_device_memory=is_device_integrated(),
+                shares_device_memory=shares_device_memory,
             )
             logger.info(
                 f"KV cache manager v2 auto host tier sizing: "

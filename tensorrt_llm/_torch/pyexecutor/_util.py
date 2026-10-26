@@ -73,6 +73,7 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
+from .kv_cache.memory_utils import get_integrated_gpu_free_memory
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import ModelEngine
 from .py_executor import PyExecutor
@@ -88,70 +89,6 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
-
-
-def _read_meminfo_available_bytes(
-        meminfo_path: str = "/proc/meminfo") -> Optional[int]:
-    """Return the kernel's ``MemAvailable`` estimate in bytes, or None."""
-    try:
-        with open(meminfo_path) as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    fields = line.split()
-                    # The value is reported in kB.
-                    return int(fields[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
-
-
-def _read_cgroup_memory_headroom_bytes(
-        cgroup_dir: str = "/sys/fs/cgroup") -> Optional[int]:
-    """Return the cgroup v2 memory headroom in bytes, or None if unlimited.
-
-    Page cache charged to the cgroup is reclaimable within it, so it does not
-    count against the headroom: ``memory.max - (memory.current - file)``.
-    """
-    try:
-        with open(os.path.join(cgroup_dir, "memory.max")) as f:
-            limit = f.read().strip()
-        if limit == "max":
-            return None
-        with open(os.path.join(cgroup_dir, "memory.current")) as f:
-            current = int(f.read().strip())
-        file_bytes = 0
-        with open(os.path.join(cgroup_dir, "memory.stat")) as f:
-            for line in f:
-                key, _, value = line.partition(" ")
-                if key == "file":
-                    file_bytes = int(value)
-                    break
-        return max(0, int(limit) - max(0, current - file_bytes))
-    except (OSError, ValueError):
-        return None
-
-
-def get_integrated_gpu_free_memory(cuda_free: int, cuda_total: int) -> int:
-    """Free device memory on an integrated GPU, counting reclaimable page cache.
-
-    On integrated GPUs (for example GB10 / DGX Spark) device allocations come
-    from the same physical pool as host memory, and ``cudaMemGetInfo`` reports
-    only memory that is free right now. Page cache left by container image
-    pulls and by reading the checkpoint is reclaimed by the kernel when a CUDA
-    allocation needs it, so it is available to the KV cache even though it is
-    not reported as free. Use the kernel's ``MemAvailable`` estimate instead,
-    bounded by the device total and by any cgroup limit, and never below the
-    CUDA value. Fall back to the CUDA value when the estimate is unavailable.
-    """
-    available = _read_meminfo_available_bytes()
-    if available is None:
-        return cuda_free
-    available = min(available, cuda_total)
-    cgroup_headroom = _read_cgroup_memory_headroom_bytes()
-    if cgroup_headroom is not None:
-        available = min(available, cgroup_headroom)
-    return max(cuda_free, available)
-
 
 # Page size of a standalone drafter's separate KV pool (DFlash, standalone
 # DSpark). Deliberately not kv_cache_config.tokens_per_block: that describes
@@ -4756,7 +4693,12 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
-def _adjust_torch_mem_fraction():
+def _adjust_torch_mem_fraction(*, use_reclaimable_memory: bool = False) -> None:
+    """Cap PyTorch allocations, counting shared page cache for V2 integrated GPUs.
+
+    Args:
+        use_reclaimable_memory: Whether the executor uses V2 memory accounting.
+    """
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.
@@ -4794,8 +4736,11 @@ def _adjust_torch_mem_fraction():
         return
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
+    if use_reclaimable_memory and is_device_integrated():
+        mem_free = get_integrated_gpu_free_memory(mem_free, mem_total)
     safety_margin = 32 * 1024**2
-    mem_torch_max = mem_free + mem_reserved - safety_margin
+    mem_torch_max = min(mem_total,
+                        max(0, mem_free + mem_reserved - safety_margin))
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(
         f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
