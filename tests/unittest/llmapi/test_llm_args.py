@@ -1810,6 +1810,26 @@ class TestMultimodalEncoderCudaGraphConfig:
 
 
 @pytest.mark.cpu_only
+class TestInputProcessorWorkers:
+
+    @pytest.mark.parametrize("workers", [0, 1, 2, 4, 8, 16])
+    def test_num_input_processor_workers(self, workers):
+        assert TorchLlmArgs(
+            model=llama_model_path).num_input_processor_workers == 8
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            num_input_processor_workers=workers)
+        assert args.num_input_processor_workers == workers
+        assert "num_input_processor_workers" not in MultimodalConfig.model_fields
+
+    @pytest.mark.parametrize("workers", [-1, 1.5, "invalid"])
+    def test_invalid_num_input_processor_workers(self, workers):
+        with pytest.raises(ValidationError, match="num_input_processor_workers"):
+            TorchLlmArgs(model=llama_model_path,
+                         num_input_processor_workers=workers)
+
+
+@pytest.mark.cpu_only
 class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
@@ -5467,3 +5487,53 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        ([], 3),
+        (["--num_input_processor_workers", "0"], 0),
+        (["--num_input_processor_workers", "1"], 1),
+        (["--num_input_processor_workers", "2"], 2),
+        (["--num_input_processor_workers", "8"], 8),
+        ([
+            "--num_input_processor_workers", "2", "--set",
+            "num_input_processor_workers=4"
+        ], 4),
+        ([
+            "--set", "num_input_processor_workers=4",
+            "--num_input_processor_workers", "2"
+        ], 4),
+    ],
+)
+def test_serve_preprocess_workers_precedence(tmp_path, extra_args, expected):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "num_input_processor_workers: 3\nmultimodal_config:\n"
+        "  encoder_cache_max_bytes: 1024\n",
+        encoding="utf-8")
+    with (
+            patch("tensorrt_llm.commands.serve.device_count", return_value=1),
+            patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                  return_value=False),
+            patch("tensorrt_llm.commands.serve.launch_server") as launch,
+    ):
+        serve_main(args=["dummy/model", "--config",
+                         str(config), *extra_args],
+                   standalone_mode=False)
+    args = launch.call_args.args[2]
+    mm_config = args["multimodal_config"]
+    if isinstance(mm_config, BaseModel):
+        mm_config = mm_config.model_dump()
+    assert args["num_input_processor_workers"] == expected
+    assert mm_config["encoder_cache_max_bytes"] == 1024
+    assert "num_input_processor_workers" not in mm_config
+
+
+@pytest.mark.cpu_only
+def test_serve_preprocess_workers_rejects_negative_cli():
+    with pytest.raises(click.BadParameter, match="x>=0"):
+        serve_main(args=["dummy/model", "--num_input_processor_workers", "-1"],
+                   standalone_mode=False)

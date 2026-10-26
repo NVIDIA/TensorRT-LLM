@@ -3,6 +3,8 @@
 
 import copy
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
@@ -1379,3 +1381,53 @@ def test_qwen3vl_vision_block_forward_end_to_end():
         attn_metadata=attn_metadata,
     )
     assert out.shape == hidden.shape
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("workers", [0, 1, 4])
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_preprocessing_thread_local_processor_and_tokenizer(workers, modality):
+    class FakeProcessor(SimpleNamespace):
+        def __call__(self, *, videos, **kwargs):
+            self.video_processor["values"].append(videos[0][0])
+            return {"video_grid_thw": torch.tensor([[1, 4, 4]])}
+
+    processor = object.__new__(Qwen3VLInputProcessorBase)
+    processor._processor = FakeProcessor(
+        tokenizer={"values": []}, image_processor={"values": []}, video_processor={"values": []}
+    )
+    processor._tokenizer = {"values": []}
+    processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
+    processor.configure_preprocessing(workers)
+    if workers <= 1:
+        assert processor.processor is processor._processor
+        assert processor.tokenizer is processor._tokenizer
+        if modality == "video":
+            assert processor.get_num_tokens_per_video(video=[0]) == 4
+        return
+    gate = threading.Barrier(workers)
+
+    def use_processor(value):
+        hf_processor, tokenizer = processor.processor, processor.tokenizer
+        hf_processor.tokenizer["values"].append(value)
+        if modality == "video":
+            assert processor.get_num_tokens_per_video(video=[value]) == 4
+        else:
+            hf_processor.image_processor["values"].append(value)
+        tokenizer["values"].append(value)
+        gate.wait(timeout=5)
+        assert processor.processor is hf_processor
+        assert processor.tokenizer is tokenizer
+        assert hf_processor.tokenizer["values"] == [value]
+        media_processor = getattr(hf_processor, f"{modality}_processor")
+        assert media_processor["values"] == [value]
+        assert tokenizer["values"] == [value]
+        return hf_processor, tokenizer
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        copies = list(pool.map(use_processor, range(workers)))
+    assert len({id(p) for p, _ in copies}) == workers
+    assert len({id(t) for _, t in copies}) == workers
+    assert processor._processor.tokenizer["values"] == []
+    assert processor._processor.video_processor["values"] == []
+    assert processor._tokenizer["values"] == []

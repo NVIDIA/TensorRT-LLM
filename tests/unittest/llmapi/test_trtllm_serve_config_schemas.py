@@ -80,6 +80,13 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
+        (generator.SERVE_SCHEMA, {"num_input_processor_workers": 0}, True),
+        (generator.SERVE_SCHEMA, {"num_input_processor_workers": 1}, True),
+        (generator.SERVE_SCHEMA, {"num_input_processor_workers": 8}, True),
+        (generator.SERVE_SCHEMA, {"num_input_processor_workers": -1}, False),
+        (generator.SERVE_SCHEMA, {"num_input_processor_workers": 1.5}, False),
+        (generator.SERVE_SCHEMA, {"num_input_processor_workers": "eight"}, False),
+        (generator.SERVE_SCHEMA, {"multimodal_config": {"num_input_processor_workers": 8}}, False),
         (
             generator.SERVE_SCHEMA,
             {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},

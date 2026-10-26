@@ -129,3 +129,9 @@ def test_get_dummy_mm_data_default_raises_not_implemented():
     builder = _StubBuilder()
     with pytest.raises(NotImplementedError):
         builder.get_dummy_mm_data(max_num_encoder_tokens=1024, mm_counts={"image": 4})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("workers", [0, 1, 8])
+def test_preprocessing_worker_modes(workers):
+    _make_subclass().configure_preprocessing(workers)

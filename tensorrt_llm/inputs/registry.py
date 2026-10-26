@@ -244,6 +244,9 @@ class BaseMultimodalInputProcessor(ABC):
         self._trust_remote_code = trust_remote_code
         self._multimodal_hashing_supported: Optional[bool] = None
 
+    def configure_preprocessing(self, num_workers: int) -> None:
+        """Prepare processor state for the serving frontend's worker count."""
+
     def _init_tokenization_cache(self, enable_tokenization_cache: bool,
                                  tokenizer: PreTrainedTokenizerBase) -> None:
         """Build the cache on `tokenizer` if `enable_tokenization_cache`.
