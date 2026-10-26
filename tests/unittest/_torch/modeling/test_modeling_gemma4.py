@@ -2822,6 +2822,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
     def test_model_defaults_follow_architecture(self):
         """Preserve TRTLLM on SM100f and FlashInfer FA2 elsewhere."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
         for is_sm100f, expected in ((True, "TRTLLM"), (False, "FLASHINFER")):
             with (
@@ -2832,31 +2835,38 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(
-                    Gemma4ForCausalLM.get_model_defaults(None)["attn_backend"], expected
+                    Gemma4ForCausalLM.get_model_defaults(llm_args)["attn_backend"], expected
                 )
                 self.assertEqual(
-                    Gemma4ForConditionalGeneration.get_model_defaults(None)["attn_backend"],
+                    Gemma4ForConditionalGeneration.get_model_defaults(llm_args)["attn_backend"],
                     expected,
                 )
 
     def test_causal_lm_does_not_disable_cuda_graphs(self):
         """Gemma4ForCausalLM must not disable CUDA graphs."""
-        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        defaults = Gemma4ForCausalLM.get_model_defaults(TorchLlmArgs(model="/tmp/dummy_model"))
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_conditional_gen_does_not_disable_cuda_graphs(self):
         """Gemma4ForConditionalGeneration must not disable CUDA graphs."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-        defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
+        defaults = Gemma4ForConditionalGeneration.get_model_defaults(
+            TorchLlmArgs(model="/tmp/dummy_model")
+        )
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_external_shared_kv_mtp_defaults_to_flashinfer(self):
         """External shared-KV MTP requires FlashInfer attention metadata."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, TorchLlmArgs
 
-        spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
-        llm_args = SimpleNamespace(speculative_config=SimpleNamespace(spec_dec_mode=spec_dec_mode))
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model", speculative_config=MTPDecodingConfig(max_draft_len=1)
+        )
 
         for is_sm100f in (True, False):
             with (
@@ -2878,6 +2888,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
     def test_attn_backend_dispatches_by_architecture(self):
         """Verify architecture defaults dispatch to their intended classes."""
         from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
         expected_classes = ((True, "TrtllmAttention"), (False, "FlashInferAttention"))
         for is_sm100f, expected_class in expected_classes:
@@ -2892,7 +2905,7 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                     return_value=is_sm100f,
                 ),
             ):
-                defaults = Gemma4ForCausalLM.get_model_defaults(None)
+                defaults = Gemma4ForCausalLM.get_model_defaults(llm_args)
                 backend_cls = get_attention_backend(defaults["attn_backend"])
                 self.assertEqual(backend_cls.__name__, expected_class)
 
