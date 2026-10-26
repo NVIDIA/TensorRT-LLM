@@ -38,9 +38,6 @@ from .dflash_attention import (
 )
 from .interface import SpecMetadata, SpecWorkerBase
 
-# Read the drafter's per-row block counts back from the device instead of
-# deriving them on the host (debug A/B switch; read at import).
-_SYNC_CTX_ALLOC = os.environ.get("TRTLLM_DFLASH_SYNC_CTX_ALLOC", "0") == "1"
 
 
 def host_counted_block_width(attn_metadata) -> Optional[int]:
@@ -1762,7 +1759,7 @@ class DFlashWorker(SpecWorkerBase):
         tell what the refresh counted, the list is built on the host; otherwise it
         is read back from the device, which waits for the GPU to finish the step.
         """
-        width = None if _SYNC_CTX_ALLOC else host_counted_block_width(attn_metadata)
+        width = host_counted_block_width(attn_metadata)
         if width is not None:
             return [width * self._ctx_page_size] * num_contexts
         return (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()

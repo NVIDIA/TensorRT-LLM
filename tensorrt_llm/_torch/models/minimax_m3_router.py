@@ -14,12 +14,8 @@ accumulator. When cuBLAS also runs that GEMM as one accumulation chain over K (n
 round identically and the logits are bitwise equal; that holds on the row counts in
 ``ROUTER_TRITON_ROWS``, which were checked on SM103 against ``torch.ops.trtllm.cublas_mm``. Outside
 that range cuBLAS may choose a split-K kernel, so the stock path runs there.
-
-Switch: ``M3_ROUTER_TRITON_ROWS`` = ``"lo-hi[,lo-hi...]"`` row ranges (default below), or one of
-"0", "off", "false", "no" to disable.
 """
 
-import os
 from typing import Tuple
 
 import torch
@@ -28,33 +24,12 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
 
-_OFF = ("0", "off", "false", "no", "")
-
-DEFAULT_ROUTER_TRITON_ROWS = "8625-16384"
-"""str: Rows where the Triton router matched the cuBLAS router GEMM bit for bit on SM103 (hidden 6144, 128 experts,
+ROUTER_TRITON_ROWS: Tuple[Tuple[int, int], ...] = ((8625, 16384),)
+"""Rows where the Triton router matched the cuBLAS router GEMM bit for bit on SM103 (hidden 6144, 128 experts,
 every row count checked). Below 8625 cuBLAS alternates between kernels whose K order differs."""
 
 _SUPPORTED_SM = (103,)
 
-
-def _parse_rows(text: str) -> Tuple[Tuple[int, int], ...]:
-    text = text.strip().lower()
-    if text in _OFF:
-        return ()
-    ranges = []
-    for part in text.split(","):
-        lo, _, hi = part.strip().partition("-")
-        lo_i = int(lo)
-        hi_i = int(hi) if hi else lo_i
-        if lo_i < 1 or hi_i < lo_i:
-            raise ValueError(f"M3_ROUTER_TRITON_ROWS: bad range {part!r}")
-        ranges.append((lo_i, hi_i))
-    return tuple(ranges)
-
-
-ROUTER_TRITON_ROWS = _parse_rows(
-    os.environ.get("M3_ROUTER_TRITON_ROWS", DEFAULT_ROUTER_TRITON_ROWS)
-)
 
 _BM, _BK, _NUM_WARPS, _NUM_STAGES = 128, 128, 8, 3
 

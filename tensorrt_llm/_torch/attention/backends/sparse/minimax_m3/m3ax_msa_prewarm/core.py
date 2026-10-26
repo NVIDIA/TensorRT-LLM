@@ -59,9 +59,7 @@ def log(msg, warn=False):
 
 def stack_parts():
     """Every GB300 stack part's switch state in this process, for the log (prewarm is on, or this would not run)."""
-    off = ("0", "false", "off", "no")
-    parts = [("master", int(os.environ.get("M3AX_STACK_A", "1").strip().lower() not in off))]
-    parts.append(("prewarm", 1))
+    parts = [("prewarm", 1)]
     try:
         from . import sdwarm
 

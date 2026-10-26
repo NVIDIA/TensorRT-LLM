@@ -14,7 +14,6 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 from __future__ import annotations
 
 import functools
-import os
 from types import ModuleType
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
@@ -351,26 +350,17 @@ def _combined_topk_table(
     return out
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    return os.environ.get(name, "1" if default else "0").strip().lower() not in (
-        "0",
-        "false",
-        "off",
-        "no",
-    )
-
-
 # Context-row top-16 select through minimax_m31_select_prefill_tile on sm_103: one CTA per (KV head,
 # 8 queries) reads each 32-byte score sector once. Same table as minimax_m3_select_blocks, bit for bit.
-PREFILL_SELECT_TILE = _env_flag("TRTLLM_M3_PREFILL_SELECT_TILE", True)
+PREFILL_SELECT_TILE = True
 # Below this many context tokens the stock select is as fast.
-PREFILL_SELECT_TILE_MIN_ROWS = int(os.environ.get("TRTLLM_M3_PREFILL_SELECT_TILE_MIN_ROWS", "256"))
+PREFILL_SELECT_TILE_MIN_ROWS = 256
 # At or below 128 blocks the stock select runs register-resident bitonic sorts and is faster.
 PREFILL_SELECT_TILE_MIN_BLOCKS = 129
 # The op's shared-memory bound (kMinimaxM3SelectPrefillTileMaxBlocks).
 PREFILL_SELECT_TILE_MAX_BLOCKS = 5856
 # Context proxy scores go into an unfilled buffer, since the proxy writes every entry the select reads.
-PREFILL_HOST_TRIMS = _env_flag("TRTLLM_M3_MSA_PREFILL_HOST_TRIMS", True)
+PREFILL_HOST_TRIMS = True
 
 
 @functools.lru_cache(maxsize=None)

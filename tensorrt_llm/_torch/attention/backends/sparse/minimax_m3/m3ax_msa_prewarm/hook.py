@@ -15,22 +15,12 @@ DecoderRunner (pyexecutor/engine/runners/decoder/runner.py) calls:
       can select (core.prewarm_for_runner); the indexer prewarm itself then loads and runs its KV-split proxy
       variants and ends with its CUDA sync and TP barrier.
 
-Both are no-ops unless M3AX_STACK_A and M3AX_MSA_PREWARM_VARIANTS are on (each defaults to on; 0/false/off/no
-turns it off); the switches are read once, at import. sdwarm has its own switch, M3AX_SPARSE_DECODE_PREWARM.
 Neither entry point raises on a prewarm failure: the lazy JIT applies.
 """
 
 import contextlib
-import os
 
-OFF = ("0", "false", "off", "no")
-
-
-def _switch_on(name):
-    return os.environ.get(name, "1").strip().lower() not in OFF
-
-
-ENABLED = _switch_on("M3AX_STACK_A") and _switch_on("M3AX_MSA_PREWARM_VARIANTS")
+ENABLED = True
 
 
 def _sdwarm():

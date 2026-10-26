@@ -12,9 +12,7 @@ Modules (none imports torch, triton or the MSA library at import time):
   selftest  coverage check on one GPU: real fmha_sm100 proxy plans for every q, variant lookups recorded, nothing
             may be missing
 
-Switches (each defaults to on; 0/false/off/no turns it off): M3AX_STACK_A (master) and M3AX_MSA_PREWARM_VARIANTS
-gate everything; M3AX_SPARSE_DECODE_PREWARM gates sdwarm only. Every part engages only on a MiniMax-M3 MSA runner
-and never raises: on any failure the stock lazy JIT applies.
+Every part engages only on a MiniMax-M3 MSA runner and never raises: on any failure the stock lazy JIT applies.
 """
 
 VERSION = "msa-prewarm-1+stack-a"

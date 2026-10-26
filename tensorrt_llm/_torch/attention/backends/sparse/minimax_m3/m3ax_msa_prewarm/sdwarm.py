@@ -38,18 +38,15 @@ DecoderRunner.warmup returns:
 Serving afterwards: the same functions and routing; the in-process Triton caches and the on-disk cache already hold
 the keys. Numerics are unchanged (the same kernels, compiled earlier).
 
-Switch: M3AX_SPARSE_DECODE_PREWARM=0 (or false/off/no; default on) records nothing, warms nothing and sets no hook.
 Best effort: any failure is logged and the stock lazy Triton JIT applies unchanged.
 No torch / tensorrt_llm / triton import at module import time.
 """
 
 import functools
 import importlib
-import os
 import time
 
 TAG = "[M3AX msa-prewarm]"
-ENV = "M3AX_SPARSE_DECODE_PREWARM"
 TSD = "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode"
 FUNC = "minimax_m3_sparse_attn_decode"
 KERNELS = (
@@ -67,7 +64,6 @@ TOKEN_RESIDUES = (
 )
 MAX_BATCH_CAP = 1024
 RECORD_CAP = 100000  # recorder stops looking at calls after this many (it is meant for warmup only)
-OFF = ("0", "false", "off", "no")
 
 _S = {}  # one warmup's recorder state (reset by begin)
 _H = {
@@ -96,7 +92,7 @@ _reset()
 
 
 def enabled():
-    return os.environ.get(ENV, "1").strip().lower() not in OFF
+    return True
 
 
 def log(msg, warn=False):
