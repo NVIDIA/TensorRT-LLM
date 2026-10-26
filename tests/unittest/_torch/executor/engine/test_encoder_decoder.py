@@ -8,6 +8,7 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
@@ -72,7 +73,7 @@ def test_encoder_decoder_rejects_mixed_token_and_feature_batch() -> None:
     )
 
     with pytest.raises(ValueError, match="cannot share one batch"):
-        runner.prepare_inputs(
+        runner._prepare_inputs(
             scheduled_requests,
             resource_manager=None,
         )
@@ -167,7 +168,7 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
     prepared = EncoderPreparedInputs({}, sequence_lengths=[2, 3])
     hidden_states = torch.arange(10).reshape(5, 2)
     runner = object.__new__(EncoderStage)
-    runner.prepare_inputs = Mock(return_value=prepared)
+    runner._prepare_inputs = Mock(return_value=prepared)
     runner._execute_prepared = Mock(return_value=hidden_states)
     scheduled_requests = ScheduledRequests()
     resource_manager = object()
@@ -181,7 +182,7 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
         "encoder_hidden_states": hidden_states,
         "encoder_seq_lens": [2, 3],
     }
-    runner.prepare_inputs.assert_called_once_with(
+    runner._prepare_inputs.assert_called_once_with(
         scheduled_requests,
         resource_manager=resource_manager,
     )
@@ -195,6 +196,7 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
     mapping = object()
     dist = object()
     input_processor = object()
+    features = object()
     shapes = frozenset({(1, 16)})
 
     order = Mock()
@@ -216,11 +218,20 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
             dist=dist,
             moe_load_balancer=None,
             input_processor=input_processor,
+            attention_runtime_features=features,
         )
 
     assert runner._encoder_stage is stage_type.return_value
+    assert runner._input_processor is input_processor
     assert order.mock_calls == [
-        call.stage(model, encoder_config, mapping=mapping, dist=dist, moe_load_balancer=None),
+        call.stage(
+            model,
+            encoder_config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=None,
+            attention_runtime_features=features,
+        ),
         call.decoder(
             shapes,
             model,
@@ -228,15 +239,16 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
             mapping=mapping,
             dist=dist,
             moe_load_balancer=None,
-            input_processor=input_processor,
+            attention_runtime_features=features,
         ),
     ]
 
 
 def test_encoder_decoder_runner_builds_encoder_decoder_components() -> None:
     runner = object.__new__(EncoderDecoderRunner)
-    runner.sparse_attention_config = object()
-    runner.input_processor = object()
+    runner._sparse_attention_config = object()
+    runner._input_processor = object()
+    runner._attention_runtime_features = object()
     runner._encoder_graph_shapes = frozenset({(1, 16)})
     runner._inputs = object()
     mm_item_scheduler = object()
@@ -256,11 +268,13 @@ def test_encoder_decoder_runner_builds_encoder_decoder_components() -> None:
     kw.assert_called_once_with(mm_item_scheduler)
     dummy_type.assert_called_once_with(dummy=1)
     preparer_type.assert_called_once_with(
-        inputs=2, sparse_attention_config=runner.sparse_attention_config
+        inputs=2,
+        sparse_attention_config=runner._sparse_attention_config,
+        attention_runtime_features=runner._attention_runtime_features,
     )
     graphs_type.assert_called_once_with(
         graphs=3,
-        input_processor=runner.input_processor,
+        input_processor=runner._input_processor,
         encoder_graph_shapes=runner._encoder_graph_shapes,
         inputs=runner._inputs,
     )
@@ -275,11 +289,11 @@ def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
     runner._encoder_stage = calls.stage
 
     with patch.object(DecoderRunner, "release_graphs", calls.decoder):
-        runner.release_graphs()
+        runner.release_graphs(release_nccl_window_owners=False)
 
     assert calls.mock_calls == [
-        call.stage.release_graphs(),
-        call.decoder(),
+        call.stage.release_graphs(release_nccl_window_owners=False),
+        call.decoder(release_nccl_window_owners=False),
     ]
 
 
@@ -360,7 +374,6 @@ def _dummy_requests(
             use_mrope=False,
             max_beam_width=1,
         ),
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
         model=SimpleNamespace(
             model_config=SimpleNamespace(pretrained_config=pretrained_config or SimpleNamespace())
         ),
@@ -573,3 +586,72 @@ def test_input_fast_path_clears_staged_request_ids_when_not_taken(
         assert result is None
         assert preparer._staged_request_ids is None
         preparer._prepare_fast.assert_not_called()
+
+
+@pytest.mark.parametrize("feature_mode", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_encoder_lifetime_scope_covers_embedding_and_preserves_output(
+    monkeypatch: pytest.MonkeyPatch, feature_mode: bool, fail: bool
+) -> None:
+    events = []
+    active = False
+
+    def begin(inputs: list[torch.Tensor]) -> int:
+        nonlocal active
+        assert not active
+        active = True
+        events.append("begin")
+        return 0
+
+    def end(
+        inputs: list[torch.Tensor],
+        outputs: list[torch.Tensor],
+        failed: bool,
+        entry_depth: int,
+    ) -> None:
+        nonlocal active
+        assert active
+        assert failed is fail
+        assert entry_depth == 0
+        assert len(outputs) == (0 if fail else 1)
+        if not fail:
+            assert outputs[0] is output
+        active = False
+        events.append("end")
+
+    def embedding(input_ids: torch.Tensor) -> torch.Tensor:
+        assert active
+        events.append("embedding")
+        return input_ids.to(torch.float32).unsqueeze(1)
+
+    def encoder(**kwargs: object) -> torch.Tensor:
+        assert active
+        events.append("encoder")
+        if fail:
+            raise RuntimeError("encoder failed")
+        return output
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    runner = object.__new__(EncoderStage)
+    runner._model = SimpleNamespace(
+        encoder=encoder,
+        model=SimpleNamespace(shared_embedding=embedding, embed_scale=2.0),
+    )
+    with FakeTensorMode():
+        output = torch.empty(3, 2, device="cuda")
+        inputs = {"encoder_attn_metadata": object()}
+        if feature_mode:
+            inputs["input_features"] = torch.empty(3, 4, device="cuda")
+        else:
+            inputs["encoder_input_ids"] = torch.tensor([1, 2, 3], device="cuda")
+        if fail:
+            with pytest.raises(RuntimeError, match="encoder failed"):
+                runner._forward_encoder_stack(inputs)
+        else:
+            assert runner._forward_encoder_stack(inputs) is output
+
+    assert not active
+    assert events == (
+        ["begin", "encoder", "end"] if feature_mode else ["begin", "embedding", "encoder", "end"]
+    )

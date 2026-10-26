@@ -1893,7 +1893,7 @@ def _create_mock_metadata(
     class MockMetadata(DSAtrtllmAttentionMetadata):
         """Mock DSA attention metadata for unit testing indexer operations."""
 
-        def __init__(self, cache_manager):
+        def __init__(self, cache_manager: DSACacheManager | DSACacheManagerV2) -> None:
             """Initialize mock metadata with buffers, block tables, and indexer state.
 
             `cache_manager` is a parameter rather than a capture of the enclosing
@@ -1932,7 +1932,7 @@ def _create_mock_metadata(
             self._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
-                [batch_size, cache_manager.max_blocks_per_seq],
+                [batch_size, self.kv_cache_manager.max_blocks_per_seq],
                 device="cuda",
                 dtype=torch.int32,
             )
@@ -1941,7 +1941,7 @@ def _create_mock_metadata(
                 device="cpu",
                 pin_memory=True,
             )
-            block_ids = cache_manager.get_batch_cache_indices(request_ids)
+            block_ids = self.kv_cache_manager.get_batch_cache_indices(request_ids)
             for i in range(len(block_ids)):
                 self.host_indexer_k_cache_block_offsets[i, : len(block_ids[i])] = torch.tensor(
                     block_ids[i], dtype=torch.int32

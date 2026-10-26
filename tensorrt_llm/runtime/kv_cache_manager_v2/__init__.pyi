@@ -263,6 +263,7 @@ class BufferConfig:
     size: int
     tokens_per_block_override: int | None = None
     is_sparse: bool = False
+    coalescing_group: int = 0
 
 class AttentionReusePolicy(enum.IntEnum):
     REQUIRED = 0

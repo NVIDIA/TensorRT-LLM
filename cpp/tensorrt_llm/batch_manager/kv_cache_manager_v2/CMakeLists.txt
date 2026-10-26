@@ -14,13 +14,13 @@
 # the License.
 
 # Sources for the C++ KVCacheManagerV2 implementation. These are added to the
-# tensorrt_llm_batch_manager_static target by the parent CMakeLists.txt.
+# KV-cache component targets by the parent CMakeLists.txt.
 
 # Bitcoin Core SHA-256 (vendored, MIT; see common/sha256/README.md) — needed by
 # blockRadixTree.cpp. Slimmed to the single-block CSHA256 path: portable scalar
 # core + runtime dispatch (sha256.cpp) plus a per-architecture hardware
 # transform. Plain C++17; the include root common/sha256 is added on the
-# batch_manager target so "sha256.h" resolves.
+# KV-cache target so "sha256.h" resolves.
 set(SHA256_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../common/sha256)
 set(SHA256_SRCS ${SHA256_DIR}/sha256.cpp)
 # x86/x86-64: Intel SHA-NI transform.
@@ -38,23 +38,27 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
   list(APPEND SHA256_SRCS ${SHA256_ARM_SHANI})
 endif()
 
+set(KV_CACHE_HOST_MEMORY_SRCS
+    kv_cache_manager_v2/utils/hostMem.cpp
+    kv_cache_manager_v2/utils/hostMemBacking.cpp
+    kv_cache_manager_v2/utils/staticHostMem.cpp
+    kv_cache_manager_v2/utils/poison.cpp)
+
 set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/batch.cpp
     kv_cache_manager_v2/common.cpp
     kv_cache_manager_v2/config.cpp
+    kv_cache_manager_v2/cudaVirtMem.cpp
     kv_cache_manager_v2/lifeCycleRegistry.cpp
     kv_cache_manager_v2/utils/cudaEvent.cpp
     kv_cache_manager_v2/utils/optionalGilRelease.cpp
-    kv_cache_manager_v2/utils/hostMem.cpp
-    kv_cache_manager_v2/utils/hostMemBacking.cpp
-    kv_cache_manager_v2/utils/staticHostMem.cpp
-    kv_cache_manager_v2/utils/poison.cpp
-    kv_cache_manager_v2/cudaVirtMem.cpp
     kv_cache_manager_v2/storage/config.cpp
     kv_cache_manager_v2/storage/core.cpp
     kv_cache_manager_v2/evictionController.cpp
     kv_cache_manager_v2/stagingBuffer.cpp
     kv_cache_manager_v2/copyEngine.cpp
+    kv_cache_manager_v2/utils/copyUtils.cpp
+    kv_cache_manager_v2/utils/copyUtils.cu
     kv_cache_manager_v2/tokenIdExt.cpp
     kv_cache_manager_v2/blockRadixTree.cpp
     kv_cache_manager_v2/batchedPageCopy.cu

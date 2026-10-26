@@ -154,13 +154,13 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     LifeCycleRegistry registry{config};
     int tokensPerBlock = config.tokensPerBlock;
 
-    // Map: lifeCycleId → (bufferSize → list of BufferId).
-    // Outer map key is LifeCycleId; inner map key is expanded buffer size.
+    // Map: lifeCycleId → ((coalescingGroup, expanded buffer size) → list of BufferId).
     // NOTE: Python uses insertion-ordered dict/defaultdict here. The std::map
     // grouping below intentionally remains sorted, which can make observable
     // pool-group indices/layout order differ from Python. Later lookups use
     // StorageConfig mappings, so this is not expected to affect correctness.
-    std::map<LifeCycleId, std::map<size_t, std::vector<BufferId>>> bufferGroups;
+    using CoalescingKey = std::pair<int, size_t>;
+    std::map<LifeCycleId, std::map<CoalescingKey, std::vector<BufferId>>> bufferGroups;
     std::unordered_map<BufferId, int, BufferIdHash> expansionMap;
 
     for (auto const& layer : config.layers)
@@ -179,7 +179,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
                     BufferId bid{cfg.layerId, buf.role};
                     expansionMap[bid] = exp;
-                    bufferGroups[lcId][expandedSize].push_back(bid);
+                    bufferGroups[lcId][{buf.coalescingGroup, expandedSize}].push_back(bid);
                 }
             },
             layer);
@@ -189,14 +189,14 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     // Each variant: coalesced buffers sorted by size descending.
     std::vector<SlotDescVariant> slotGroups;
     slotGroups.reserve(bufferGroups.size());
-    for (auto const& [lcId, sizeMap] : bufferGroups)
+    for (auto const& [lcId, coalescingMap] : bufferGroups)
     {
         SlotDescVariant var;
         var.lifeCycleId = lcId;
-        for (auto const& [sz, bufIds] : sizeMap)
+        for (auto const& [key, bufIds] : coalescingMap)
         {
             CoalescedBuffer cb;
-            cb.singleBufferSize = sz;
+            cb.singleBufferSize = key.second;
             cb.bufferIds = bufIds;
             var.coalescedBuffers.push_back(std::move(cb));
         }

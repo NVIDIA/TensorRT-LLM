@@ -258,7 +258,7 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
     block_scale = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
     global_scale = torch.ones(1)
 
-    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103"):
+    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103/SM107"):
         minimax_m3_sparse_attn_decode(
             q,
             kv,
@@ -273,6 +273,34 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
             v_block_scale=block_scale,
             k_global_scale=global_scale,
             v_global_scale=global_scale,
+        )
+    get_capability.assert_called_once_with(q.device)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+def test_nvfp4_sparse_decode_admits_the_sm100_family(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    """SM100-family devices, Rubin included, pass the device check and reach
+    input validation, which here rejects the missing scales."""
+    get_capability = Mock(spec_set=torch.cuda.get_device_capability, return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    q = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 128, 64), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="needs all four"):
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv,
+            kv,
+            torch.zeros((1, 1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            sm_scale=128**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=1,
+            k_block_scale=torch.empty((1, 1, 128, 8), dtype=torch.uint8),
         )
     get_capability.assert_called_once_with(q.device)
 

@@ -105,11 +105,12 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
 
 
 def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
-    """As :func:`get_backend_class`, but ``None`` when TRTLLM has no such leaf.
+    """As :func:`get_backend_class`, but ``None`` when no leaf serves the format.
 
     For a caller enumerating combinations to decide which are worth running,
     "no leaf publishes this format" is an answer and not a failure. Only the
-    TRTLLM branch can give it, so the rest is delegated rather than restated.
+    TRTLLM and CUTLASS branches can give it, so the rest is delegated rather
+    than restated.
 
     Names one class. A caller deciding whether a configuration is *runnable*
     wants :func:`find_backend_classes` instead, because for ``TRTLLM`` that
@@ -119,6 +120,10 @@ def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import find_trtllm_gen_leaf
 
         return find_trtllm_gen_leaf(quant_algo)
+    if backend_type == MoeBackendType.CUTLASS:
+        from tensorrt_llm._torch.moe.fused_moe.cutlass import find_cutlass_leaf
+
+        return find_cutlass_leaf(quant_algo)
     return get_backend_class(backend_type, quant_algo)
 
 
@@ -129,6 +134,8 @@ def find_backend_classes(backend_type: MoeBackendType, quant_algo=None) -> tuple
     resolution falls through to the native leaf when the FlashInfer one
     rejects -- a missing wheel, an unmet shape -- not only when it is absent.
     Asking a single pre-picked class prunes candidates a run would have served.
+
+    For CUTLASS ``fp8_block_scales`` these are the SM90 and SM120 leaves.
     """
     if backend_type == MoeBackendType.TRTLLM:
         from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
@@ -136,6 +143,10 @@ def find_backend_classes(backend_type: MoeBackendType, quant_algo=None) -> tuple
         )
 
         return trtllm_gen_leaves_in_resolution_order(quant_algo)
+    if backend_type == MoeBackendType.CUTLASS:
+        from tensorrt_llm._torch.moe.fused_moe.cutlass import cutlass_leaves_in_resolution_order
+
+        return cutlass_leaves_in_resolution_order(quant_algo)
     cls = find_backend_class(backend_type, quant_algo)
     return () if cls is None else (cls,)
 
@@ -143,15 +154,15 @@ def find_backend_classes(backend_type: MoeBackendType, quant_algo=None) -> tuple
 def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
     """Import and return the concrete backend class for ``backend_type`` lazily.
 
-    ``quant_algo`` is only consulted for ``TRTLLM``, whose leaves are keyed by
-    quantization format; every other backend is one class. Raises when
-    no leaf publishes the format -- see :func:`find_backend_class` for the
-    lookup that reports absence instead.
+    ``quant_algo`` is only consulted for ``TRTLLM`` and ``CUTLASS``, whose
+    leaves are keyed by quantization format; every other backend is one class.
+    Raises when no leaf publishes the format -- see :func:`find_backend_class`
+    for the lookup that reports absence instead.
     """
     if backend_type == MoeBackendType.CUTLASS:
-        from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+        from tensorrt_llm._torch.moe.fused_moe.cutlass import cutlass_leaf
 
-        return CutlassFusedMoE
+        return cutlass_leaf(quant_algo)
     if backend_type == MoeBackendType.TRTLLM:
         # Leaves are keyed by (provider, quant), so the format has to be
         # named. ``trtllm_gen_leaf`` returns the native leaf where one exists

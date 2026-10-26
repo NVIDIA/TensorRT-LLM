@@ -8,6 +8,7 @@ import subprocess  # nosec B404
 import sys
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
@@ -16,6 +17,7 @@ import pytest
 import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
@@ -24,7 +26,11 @@ from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              split_mpi_env)
 
 
-def task0():
+def task0() -> int:
+    from mpi4py import MPI
+
+    # Keep each worker occupied until every worker has received its task.
+    MPI.COMM_WORLD.barrier()
     if MPINodeState.state is None:
         MPINodeState.state = 0
     MPINodeState.state += 1
@@ -38,16 +44,19 @@ def _enable_mpi(monkeypatch):
 
 @pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
-def test_mpi_session_basic():
+def test_mpi_session_basic() -> None:
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
     n_workers = 4
-    executor = MpiPoolSession(n_workers)
-    results = executor.submit_sync(task0)
-    assert results == [1, 1, 1, 1], results
+    executor = MpiPoolSession(n_workers, wait_shutdown=True)
+    try:
+        results = executor.submit_sync(task0)
+        assert results == [1, 1, 1, 1], results
 
-    results = executor.submit_sync(task0)
-    assert results == [2, 2, 2, 2], results
+        results = executor.submit_sync(task0)
+        assert results == [2, 2, 2, 2], results
+    finally:
+        executor.shutdown()
 
 
 def rendezvous_environment_probe():
@@ -185,6 +194,76 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 
     except Exception as e:
         return f"Error in client: {str(e)}"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "response",
+    [[1, 1], RuntimeError("remote task failed"),
+     SystemExit(7)],
+    ids=["results", "error", "system-exit"])
+def test_remote_mpi_submit_sync_response_after_empty_poll(
+        monkeypatch: pytest.MonkeyPatch,
+        response: list[int] | BaseException) -> None:
+    """A response following an empty poll must wake the waiting client."""
+    first_empty_poll = threading.Event()
+    release_server = threading.Event()
+    address: Future[tuple[str, bytes]] = Future()
+    empty_poll_at: list[float] = []
+    monkeypatch.setattr(RemoteMpiCommSessionClient, "_global_instance", None)
+
+    def send_response() -> None:
+        # Each socket is created, used, and closed on its owning thread.
+        server = ZeroMqQueue(is_server=True)
+        server.socket.setsockopt(zmq.SNDTIMEO, 2000)
+        server.socket.setsockopt(zmq.LINGER, 0)
+        try:
+            address.set_result(server.address)
+            request = server.get(timeout=10)
+            assert request.sync
+            assert request.args == (-1, )
+            assert first_empty_poll.wait(10)
+            server.put(response)
+            assert release_server.wait(10)
+        finally:
+            server.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        peer = executor.submit(send_response)
+        client = None
+        try:
+            endpoint, key = address.result(timeout=10)
+            client = RemoteMpiCommSessionClient(endpoint, hmac_key=key)
+            client.queue.socket.setsockopt(zmq.SNDTIMEO, 2000)
+            client.queue.socket.setsockopt(zmq.LINGER, 0)
+            poll = client.poll
+
+            def observe_poll() -> object:
+                if empty_poll_at and time.monotonic() - empty_poll_at[0] > 10:
+                    raise TimeoutError("Client did not receive the response")
+                result = poll()
+                if not result and not first_empty_poll.is_set():
+                    empty_poll_at.append(time.monotonic())
+                    first_empty_poll.set()
+                return result
+
+            # Observe the real socket poll; do not alter its timeout or result.
+            monkeypatch.setattr(client, "poll", observe_poll)
+            actual = client.submit_sync(abs, -1)
+            elapsed = time.monotonic() - empty_poll_at[0]
+        finally:
+            release_server.set()
+            if client is not None:
+                client.queue.close()
+            peer.result(timeout=10)
+
+    assert first_empty_poll.is_set()
+    assert elapsed < 2, f"Client waited {elapsed:.3f}s after an empty poll"
+    if isinstance(response, BaseException):
+        assert type(actual) is type(response)
+        assert actual.args == response.args
+    else:
+        assert actual == response
 
 
 @pytest.mark.cpu_only
@@ -369,18 +448,27 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
 
     ``python3`` and ``openssl`` are stubbed so the launcher can hand out an IPC
     address and an HMAC key without importing tensorrt_llm. Stdlib-only
-    ``python3 -S`` calls use the test interpreter.
+    ``python3 -S`` calls, including the process guard, use the test interpreter
+    so launcher registration and cleanup retain their normal behavior.
     """
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir(exist_ok=True)
     python_stub = stub_bin / "python3"
-    python_stub.write_text("#!/bin/sh\n"
-                           "if [ \"$1\" = \"-S\" ]; then\n"
-                           f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
-                           "fi\n"
-                           "if [ \"$1\" = \"-c\" ]; then\n"
-                           "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
-                           "fi\n")
+    stop_fifo = tmp_path / "launcher-stop"
+    os.mkfifo(stop_fifo)
+    python_stub.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-S\" ]; then\n"
+        f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
+        "elif [ \"$1\" = \"-c\" ]; then\n"
+        "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
+        "elif [ \"$1\" = \"-m\" ]; then\n"
+        "    if [ \"$4\" = \"stop\" ]; then\n"
+        "        echo stop > \"$LAUNCHER_TEST_STOP_FIFO\"\n"
+        "    else\n"
+        "        read message < \"$LAUNCHER_TEST_STOP_FIFO\"\n"
+        "    fi\n"
+        "fi\n")
     python_stub.chmod(0o755)
     openssl_stub = stub_bin / "openssl"
     openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
@@ -390,6 +478,7 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     for name in _LAUNCHER_ENV_SCRUB:
         env.pop(name, None)
     env["PMI_RANK"] = "0"
+    env["LAUNCHER_TEST_STOP_FIFO"] = str(stop_fifo)
     env["HOME"] = home
     env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
     return env
@@ -467,51 +556,12 @@ def test_llmapi_launch_temporary_fallback_leaves_cubin_dir_unset(
 
 @pytest.mark.cpu_only
 def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
-    stub_bin = tmp_path / "bin"
-    stub_bin.mkdir()
-    python_stub = stub_bin / "python3"
-    python_stub.write_text("#!/bin/sh\n"
-                           "if [ \"$1\" = \"-S\" ]; then\n"
-                           f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
-                           "fi\n"
-                           "if [ \"$1\" = \"-c\" ]; then\n"
-                           "    echo ipc:///tmp/trtllm-unified-cache-test\n"
-                           "fi\n")
-    python_stub.chmod(0o755)
-    openssl_stub = stub_bin / "openssl"
-    openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
-    openssl_stub.chmod(0o755)
-
-    env = os.environ.copy()
-    for name in (
-            "SLURM_NTASKS",
-            "SLURM_PROCID",
-            "OMPI_COMM_WORLD_SIZE",
-            "OMPI_COMM_WORLD_RANK",
-            "PMI_ID",
-            "FLASHINFER_WORKSPACE_BASE",
-            "FLASHINFER_CUBIN_DIR",
-            "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
-            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
-    ):
-        env.pop(name, None)
     cache_root = tmp_path / "home" / "unified"
-    env["PMI_RANK"] = "0"
-    env["HOME"] = str(tmp_path / "home")
+    env = _launcher_env(tmp_path, str(tmp_path / "home"))
     env["TRTLLM_CACHE_DIR"] = "~/unified"
     env["FLASHINFER_WORKSPACE_BASE"] = str(cache_root / "flashinfer")
-    env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
 
-    launcher = Path(__file__).parents[
-        3] / "tensorrt_llm" / "llmapi" / "trtllm-llmapi-launch"
-    result = subprocess.run(  # nosec B603
-        ["bash", str(launcher), "/usr/bin/env"],
-        check=True,
-        capture_output=True,
-        env=env,
-        text=True,
-        timeout=10,
-    )
+    result = _run_launcher_env(env)
 
     workspace = cache_root / "flashinfer" / "rank-0"
     assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
@@ -906,8 +956,11 @@ def test_stop_request_reaches_server_still_waiting_for_workers(
         def submit(self, *args, **kwargs):
             return [worker_future]
 
-        def shutdown_abort(self):
+        def shutdown(self) -> None:
             stopped.set()
+
+        def abort(self) -> None:
+            pytest.fail("worker drain unexpectedly required MPI abort")
 
     server.session = _Session()
     monkeypatch.setattr(mpi_session, "mpi_world_size", lambda: 1, raising=False)
@@ -990,26 +1043,3 @@ def test_stop_cli_exit_code_reports_the_ack(monkeypatch, acknowledged,
                         lambda: acknowledged)
     result = CliRunner().invoke(mgmn_leader_node.main, ["--action", "stop"])
     assert result.exit_code == exit_code
-
-
-@pytest.mark.cpu_only
-def test_server_wait_for_futures_logs_failures_and_returns_no_messages(
-        tmp_path: Path, monkeypatch) -> None:
-    from concurrent.futures import Future
-
-    from tensorrt_llm.llmapi import mpi_session
-
-    errors = []
-    monkeypatch.setattr(mpi_session.logger, "error",
-                        lambda *msg: errors.append(" ".join(map(str, msg))))
-    server = _bare_server_on(f"ipc://{tmp_path / 'server.sock'}",
-                             os.urandom(32))
-    try:
-        ok, failed = Future(), Future()
-        ok.set_result(1)
-        failed.set_exception(RuntimeError("rank 1 failed"))
-        assert server._wait_for_pending_futures([ok, failed]) == []
-        assert len(errors) == 1
-        assert "1/2" in errors[0] and "rank 1 failed" in errors[0]
-    finally:
-        server.queue.close()

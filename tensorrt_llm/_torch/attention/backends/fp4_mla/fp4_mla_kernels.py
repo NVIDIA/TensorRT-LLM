@@ -1438,6 +1438,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     Q_SF_COLS: tl.constexpr,
     WRITE_Q: tl.constexpr,
     Q1_KV_BLOCKS_PER_PROGRAM: tl.constexpr,
+    Q_ROWS_PER_SEQ: tl.constexpr = 0,
 ):
     q1_shared_main: tl.constexpr = FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1
     q1_grouped_kv: tl.constexpr = q1_shared_main and Q1_KV_BLOCKS_PER_PROGRAM > 1
@@ -1508,7 +1509,15 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 q_token = seq_idx * gen_len + q_token_idx
                 head_lanes = tl.arange(0, BLOCK_Q_HEADS)
                 head_offsets = q_head_block * BLOCK_Q_HEADS + head_lanes
-                q_rows = q_token * NUM_Q_HEADS + head_offsets
+                # The BF16 Q input is token-major; the FP4 output follows the
+                # decode layout: token-major, or packed per request where each
+                # request owns Q_ROWS_PER_SEQ rows (a multiple of 128) holding
+                # its [query token, head] pairs.
+                q_in_rows = q_token * NUM_Q_HEADS + head_offsets
+                if Q_ROWS_PER_SEQ > 0:
+                    q_rows = seq_idx * Q_ROWS_PER_SEQ + q_token_idx * NUM_Q_HEADS + head_offsets
+                else:
+                    q_rows = q_in_rows
                 q_input_row_stride: tl.constexpr = Q_PREFIX_D + ROPE_DIM
                 q_packed_row_stride: tl.constexpr = (Q_PREFIX_D + 2 * ROPE_DIM) // 2
                 # Every lane is valid only when the launch covers the head
@@ -1528,7 +1537,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                         tl.static_assert(Q_PREFIX_BLOCK_D % FP4_BLOCK == 0)
                         q_global_scale = tl.load(q_global_scale_ptr).to(tl.float32)
                         prefix_dims = tl.arange(0, Q_PREFIX_BLOCK_D)
-                        prefix_base = q_rows[:, None].to(tl.int64) * q_input_row_stride
+                        prefix_base = q_in_rows[:, None].to(tl.int64) * q_input_row_stride
                         prefix_groups: tl.constexpr = Q_PREFIX_BLOCK_D // FP4_BLOCK
                         q_prefix_iterations: tl.constexpr = Q_PREFIX_BLOCKS_PER_PROGRAM
                         for q_prefix_iteration in tl.range(

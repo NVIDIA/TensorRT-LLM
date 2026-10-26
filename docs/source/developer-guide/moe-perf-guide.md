@@ -432,7 +432,7 @@ The **baseline** is the MoE configuration on the **Pareto Curve** of the [Infere
 
 These configurations are published in [InferenceX](https://github.com/SemiAnalysisAI/InferenceX):
 - [Dashboard](https://inferencex.com): each point's tooltip shows the recipe (model, framework, precision, parallelism, ISL/OSL, concurrency) and a link to the GitHub Actions run.
-- [`nvidia-master.yaml`](https://github.com/SemiAnalysisAI/InferenceX/blob/main/.github/configs/nvidia-master.yaml): lists the disagg topology (`num-worker`, `tp`, `ep`, `dp-attn`, ISL/OSL, concurrency) and the `CONFIG_FILE` path.
+- [`nvidia-master.yaml`](https://github.com/SemiAnalysisAI/InferenceX/blob/main/inferencex-e2e/configs/nvidia-master.yaml): lists the disagg topology (`num-worker`, `tp`, `ep`, `dp-attn`, ISL/OSL, concurrency) and the `CONFIG_FILE` path.
 - [`NVIDIA/srt-slurm`](https://github.com/NVIDIA/srt-slurm): the `CONFIG_FILE` YAML holds the serving configuration (`moe_config.backend`, EP/TP, CUDA Graph, batch, MTP), for example [`ctx1_gen4_tep8_batch1_eplb0_mtp3.yaml`](https://github.com/NVIDIA/srt-slurm/blob/sa-submission-q2-2026/recipes/trtllm/gb300-fp4/1k1k/mtp/ctx1_gen4_tep8_batch1_eplb0_mtp3.yaml).
 
 #### How a Pareto point is compared to `bench_moe` microbenchmark?

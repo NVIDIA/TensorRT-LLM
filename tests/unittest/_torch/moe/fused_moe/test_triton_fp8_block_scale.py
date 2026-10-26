@@ -38,6 +38,7 @@ def _run_moe_bf16_reference(
     w2_scales: torch.Tensor,
     activation_type: int,
     output_dtype: torch.dtype | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Dequantize FP8 weights and run the MoE in BF16."""
     num_tokens, hidden = x.shape
@@ -81,6 +82,11 @@ def _run_moe_bf16_reference(
             gate_up = x[t].float() @ w31_bf16[e].float().T
             u, g = gate_up[:intermediate], gate_up[intermediate:]
             act_int = int(activation_type)
+            if swiglu_limit is not None:
+                # The CUTLASS ``SwigluBiasAdaptor`` order: cap the SiLU input
+                # from above, the linear half symmetrically.
+                g = g.clamp(max=swiglu_limit)
+                u = u.clamp(-swiglu_limit, swiglu_limit)
             if act_int in (int(ActivationType.Swiglu), int(ActivationType.Silu)):
                 ic2 = F.silu(g) * u
             else:
@@ -141,7 +147,8 @@ def _make_inputs(
     device: str = "cuda",
     seed: int = 0,
     activation_type: int = int(ActivationType.Swiglu),
-) -> dict[str, torch.Tensor | int]:
+    swiglu_limit: float | None = None,
+) -> dict[str, torch.Tensor | int | float | None]:
     g = torch.Generator(device=device).manual_seed(seed)
     num_tokens = shape.num_tokens
     hidden = shape.hidden
@@ -178,6 +185,7 @@ def _make_inputs(
         w2=w2_fp8,
         w2_scales=w2_sf,
         activation_type=activation_type,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -201,3 +209,35 @@ def test_fp8_matches_bf16_reference(shape: MoeShape, activation_type: int) -> No
 
     diff = calc_diff(out_fp8, out_ref).item()
     assert diff < 1e-2, f"shape={shape.name} cosine-diff={diff:.4e} exceeds 1e-2"
+
+
+@skip_unsupported
+@pytest.mark.parametrize("shape", CORRECTNESS_SHAPES, ids=lambda s: s.name)
+def test_swiglu_clamp_matches_bf16_reference(shape: MoeShape) -> None:
+    """A SwiGLU clamp reaches the gated-activation kernel and bites.
+
+    The limit is chosen below the FC1 output range of ``_make_inputs``, so the
+    unclamped output differs -- a dropped clamp would not just be inaccurate,
+    it would be invisible without that check.
+    """
+    inputs = _make_inputs(shape, swiglu_limit=0.1)
+
+    out_fp8 = run_triton_fp8_block_scale_moe(**inputs)
+    out_ref = _run_moe_bf16_reference(**inputs)
+    out_unclamped = run_triton_fp8_block_scale_moe(**{**inputs, "swiglu_limit": None})
+
+    diff = calc_diff(out_fp8, out_ref).item()
+    assert diff < 1e-2, f"shape={shape.name} cosine-diff={diff:.4e} exceeds 1e-2"
+    assert not torch.allclose(out_fp8, out_unclamped), "the clamp changed nothing"
+
+
+@skip_unsupported
+def test_clamp_is_rejected_for_a_non_swiglu_activation() -> None:
+    """Geglu carries no clamp, so the kernel refuses one instead of applying
+    the SwiGLU order to a GELU gate."""
+    inputs = _make_inputs(
+        CORRECTNESS_SHAPES[0], activation_type=int(ActivationType.Geglu), swiglu_limit=0.1
+    )
+
+    with pytest.raises(ValueError, match="clamps SwiGLU only"):
+        run_triton_fp8_block_scale_moe(**inputs)

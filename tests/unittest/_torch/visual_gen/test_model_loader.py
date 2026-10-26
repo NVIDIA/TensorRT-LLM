@@ -13,6 +13,8 @@ import torch.nn as nn
 from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 # Skip heavy components (text_encoder ~44GB, vae ~300MB) to speed up tests
 # These components are loaded via diffusers and don't need quantization testing
@@ -52,15 +54,8 @@ def test_meta_init_mode_creates_meta_tensors(checkpoint_path) -> None:
     assert param.device.type == "meta", f"Expected meta device, got {param.device}"
 
 
-def test_dual_transformer_checkpoint_creates_distinct_model_configs(tmp_path):
-    """Diffusers checkpoints with two transformers get one model config per component."""
-    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
-
-    # Construct a minimal Wan-style two-transformer checkpoint. The expected
-    # behavior is that both component config.json files are loaded into
-    # separate DiffusionModelConfig objects, instead of transformer_2 reusing
-    # the primary transformer's config data or mutable per-model config objects.
+def _write_dual_transformer_checkpoint(tmp_path, quant_algos):
+    """Write two Wan component configs with distinguishable architecture and quantization."""
     (tmp_path / "model_index.json").write_text(
         json.dumps(
             {
@@ -71,25 +66,74 @@ def test_dual_transformer_checkpoint_creates_distinct_model_configs(tmp_path):
             }
         )
     )
-    for component_name, num_layers, num_attention_heads in (
-        ("transformer", 40, 40),
-        ("transformer_2", 48, 32),
+    for index, (component_name, num_layers, num_attention_heads) in enumerate(
+        (("transformer", 40, 40), ("transformer_2", 48, 32))
     ):
         component_dir = tmp_path / component_name
         component_dir.mkdir()
-        (component_dir / "config.json").write_text(
-            json.dumps(
-                {
-                    "_class_name": "WanTransformer3DModel",
-                    "num_layers": num_layers,
-                    "num_attention_heads": num_attention_heads,
-                }
-            )
-        )
+        component_config = {
+            "_class_name": "WanTransformer3DModel",
+            "num_layers": num_layers,
+            "num_attention_heads": num_attention_heads,
+        }
+        if quant_algos[index] is not None:
+            component_config["quantization_config"] = {
+                "quant_algo": quant_algos[index],
+                "ignore": [f"blocks.{index}.*"],
+                "config_groups": {
+                    "default": {
+                        "weights": {"dynamic": index == 0},
+                        "input_activations": {"dynamic": index == 1},
+                    }
+                },
+            }
+        (component_dir / "config.json").write_text(json.dumps(component_config))
 
+
+_NO_QUANT = (None, None, False, False)
+_PRIMARY_FP8 = (QuantAlgo.FP8, ["blocks.0.*"], True, False)
+_SECONDARY_FP8 = (QuantAlgo.FP8, ["blocks.1.*"], False, True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "quant_algos, user_quant, expected_quant",
+    [
+        pytest.param((None, None), None, (_NO_QUANT, _NO_QUANT), id="bf16_bf16"),
+        pytest.param(("FP8", None), {}, (_PRIMARY_FP8, _NO_QUANT), id="fp8_bf16"),
+        pytest.param((None, "FP8"), None, (_NO_QUANT, _SECONDARY_FP8), id="bf16_fp8"),
+        pytest.param(
+            ("FP8", "FP8"),
+            {"quant_algo": None},
+            (_PRIMARY_FP8, _SECONDARY_FP8),
+            id="fp8_fp8",
+        ),
+        pytest.param(
+            (None, "FP8"),
+            {"quant_algo": "FP8", "dynamic": True, "ignore": ["runtime.*"]},
+            ((QuantAlgo.FP8, ["runtime.*"], True, False),) * 2,
+            id="dict_override",
+        ),
+        pytest.param(
+            ("FP8", None),
+            QuantConfig(quant_algo=QuantAlgo.FP8, exclude_modules=["runtime.*"]),
+            ((QuantAlgo.FP8, ["runtime.*"], False, False),) * 2,
+            id="quant_config_override",
+        ),
+    ],
+)
+def test_dual_transformer_checkpoint_creates_distinct_model_configs(
+    tmp_path, quant_algos, user_quant, expected_quant
+):
+    """Resolve each component's metadata independently unless an explicit user algorithm overrides it."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    _write_dual_transformer_checkpoint(tmp_path, quant_algos)
     config = DiffusionPipelineConfig.from_pretrained(
         str(tmp_path),
-        args=VisualGenArgs(model=str(tmp_path)),
+        args=VisualGenArgs(model=str(tmp_path), quant_config=user_quant),
+        device="cpu",
     )
 
     assert set(config.model_configs) == {"transformer", "transformer_2"}
@@ -103,6 +147,43 @@ def test_dual_transformer_checkpoint_creates_distinct_model_configs(tmp_path):
     assert transformer_config.pretrained_config.num_attention_heads == 40
     assert transformer_2_config.pretrained_config.num_layers == 48
     assert transformer_2_config.pretrained_config.num_attention_heads == 32
+    assert transformer_config.quant_config is not transformer_2_config.quant_config
+    assert transformer_config.quant_config is not config.quant_config
+    for component_config, expected in zip(
+        (transformer_config, transformer_2_config), expected_quant
+    ):
+        algo, excluded, dynamic_weights, dynamic_activations = expected
+        assert component_config.quant_config.quant_algo == algo
+        assert component_config.quant_config.exclude_modules == excluded
+        assert component_config.quant_config_dict is None
+        assert component_config.dynamic_weight_quant is dynamic_weights
+        assert component_config.force_dynamic_quantization is dynamic_activations
+    assert config.quant_config == transformer_config.quant_config
+    assert config.dynamic_weight_quant is transformer_config.dynamic_weight_quant
+    assert config.force_dynamic_quantization is transformer_config.force_dynamic_quantization
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target_component", ["transformer", "transformer_2"])
+def test_runtime_lora_checks_target_component_quantization(tmp_path, target_component):
+    """Reject a quantized LoRA target without rejecting an untargeted quantized component."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig, VisualGenArgs
+
+    _write_dual_transformer_checkpoint(tmp_path, (None, "FP8"))
+    args = VisualGenArgs(
+        model=str(tmp_path),
+        runtime_lora_config=RuntimeLoRAConfig(
+            path=str(tmp_path / "adapter.safetensors"),
+            target_components=[target_component],
+        ),
+    )
+    if target_component == "transformer_2":
+        with pytest.raises(ValueError, match=r"quantization \(transformer_2: FP8\)"):
+            DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
+    else:
+        config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
+        assert config.runtime_lora.target_components == [target_component]
 
 
 def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch):

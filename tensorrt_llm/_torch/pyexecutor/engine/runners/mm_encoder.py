@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range
@@ -67,7 +68,7 @@ class MultimodalEncoderRunner(NoKVCacheRunner):
                 continue
             mm_request_indices_with_payload.append(request_idx)
             mm_params_with_payload.append(multimodal_param)
-            mm_embedding_lengths.append(multimodal_embedding_lengths)
+            mm_embedding_lengths.append(list(multimodal_embedding_lengths))
         if not mm_params_with_payload:
             return {
                 "mm_embeddings": [],
@@ -76,13 +77,18 @@ class MultimodalEncoderRunner(NoKVCacheRunner):
             }
         # For mm_encoder_only mode, we only run the vision encoder part.
         # The model should be a vision encoder (e.g., Qwen2VisionModelBase).
-        mm_embeddings = self._model.forward(mm_params_with_payload)
-        assert len(mm_embeddings) == 1, (
-            "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
-        )
+        # This call bypasses ModelCaller, so scope the TP all-reduce windows here.
+        # The embeddings outlive this step, so keep a clone rather than a window.
+        with discard_nccl_window_tensor_outputs(inputs):
+            mm_embeddings = self._model.forward(mm_params_with_payload)
+            assert len(mm_embeddings) == 1, (
+                "mm_embeddings should be a 1-element list, mix modality (video+image) is not "
+                "supported"
+            )
+            mm_embedding_batch = mm_embeddings[0].clone()
 
         split_lengths = [sum(lengths) for lengths in mm_embedding_lengths]
-        mm_embeddings = list(torch.split(mm_embeddings[0], split_lengths, dim=0))
+        mm_embeddings = list(torch.split(mm_embedding_batch, split_lengths, dim=0))
         if len(mm_embeddings) != len(mm_embedding_lengths):
             raise ValueError(
                 "mm_encoder_only produced an embedding batch that does not match "

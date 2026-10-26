@@ -127,7 +127,6 @@ The `py_executor` property contains the timed scopes in `create_py_executor()`, 
 |-----------------|-------|
 | `config_and_checkpoint_loader_initialization_seconds` | Initialize the model config and checkpoint loader. |
 | `model_engine_creation_seconds` | Construct the main model engine, which includes loading model weights. |
-| `draft_model_engine_creation_seconds` | Construct the separate draft model engine in the deprecated two-model MTP setting. |
 | `guided_decoder_creation_seconds` | Construct guided-decoding resources. |
 | `sampler_creation_seconds` | Construct the sampler. |
 | `initial_kv_cache_creation_seconds` | Construct the temporary KV cache used to estimate final capacity. |
@@ -145,8 +144,6 @@ The two model-engine properties contain times for various `PyTorchModelEngine` w
 `py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation` timing.
 Likewise, `final_model_engine` measures the timings for the final model engine creation as part of
 the `py_executor.final_py_executor_creation_seconds` timing.
-The deprecated two-model speculative decoding setting may produce the additional properties
-`initial_draft_model_engine` and `final_draft_model_engine`.
 
 Each model-engine property contains the warmup scopes below. Which scopes appear depends on the model
 and configuration; for example, encoder-decoder and context-parallel configurations can skip some
@@ -174,7 +171,7 @@ The `model_loader` property contains timings for loading the main LLM weights, i
 `checkpoint_finalization_seconds` for checkpoint-session synchronization and cleanup after weight population.
 If a draft model is used, additional fields `draft_checkpoint_preparation_seconds`,
 `draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds` will appear.
-A `draft_model_loader` property can also appear in the deprecated two-model MTP setting.
+A `draft_model_loader` property appears when a user-provided drafter exposes a `draft_model_engine`.
 The `py_executor.model_engine_creation_seconds` timing includes the total `model_loader` timing.
 
 | Metric | Description |
@@ -258,6 +255,84 @@ Ray workers treat `DG_JIT_CACHE_DIR` equal to
 and GPU, even when that value was set explicitly. Other explicit values are
 preserved. Set `TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0` to preserve and share the
 unified path.
+
+### Launcher process ownership
+
+The rank-0 `trtllm-llmapi-launch` shell starts a small Python guard for the MPI
+communication server, task, and shutdown helper. Each guard owns a separate
+process group and monitors the shell, so killing only the shell with `SIGKILL`
+under plain `mpirun` still triggers cleanup of those groups. Startup registration
+finishes before a command can run. Guards also clean remaining group members
+when the command exits, then return its original exit status.
+
+Cleanup sends `SIGTERM`, followed by `SIGKILL` after
+`TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS` (default 5 seconds). This covers descendants
+that remain in their inherited process group. A command that deliberately
+creates a separate session or process group must manage those processes itself;
+killing a guard independently also requires the job's scheduler/container to
+reclaim its workload.
+
+### Remote MPI shutdown timeouts
+
+Configure these settings together when using `trtllm-llmapi-launch`:
+
+| Setting | Default | Scope |
+| --- | --- | --- |
+| `TLLM_MGMN_SHUTDOWN_GRACE_SECONDS` | 60 seconds | Server budget for draining a failed batch or stopping the MPI world. Final session and shared-executor teardown use the remaining budget. |
+| `TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT` | 120 seconds | Launcher wait for the stop helper and server after the task exits. Also used separately for guard registration and for the task to exit naturally after a server failure. |
+| `TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS` | 5 seconds | Additional cleanup grace between TERM and KILL for owned process groups. |
+
+The server shutdown grace starts when it receives the stop request; an earlier
+worker-failure deadline can shorten the remaining grace. The launcher also waits
+for the stop helper's Python startup and `tensorrt_llm` imports before that request
+can be sent. Set the launcher stop timeout above the server grace by enough to
+cover measured cold startup/import time, connection/send and queue cleanup, and
+scheduling margin. The defaults leave 60 seconds of allowance; raising only the
+server grace does not raise the launcher timeout.
+
+For example, a 120-second server grace with a 180-second launcher timeout leaves
+60 seconds for this overhead. This is an illustrative allowance: increase it if
+cold or loaded nodes need more time.
+
+If task-first shutdown exhausts the launcher budget, the launcher terminates
+owned groups and returns 124 when the task succeeded; an existing nonzero task
+status takes precedence. After a server-first failure, the launcher instead
+preserves a naturally completed task's nonzero status, otherwise the server's
+failure status. TERM-to-KILL cleanup is a separate phase. Launcher waits count
+100 ms sleeps, so polling and scheduling overhead add time; these settings are
+not a strict end-to-end wall-clock limit.
+
+The launcher returns exit code 2 for invalid
+`TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT` or
+`TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS` values; both require a positive integer
+of at most six digits. A process-guard registration timeout also returns 124.
+If registration of the stop helper fails after the task has exited, an existing
+nonzero task status still takes precedence.
+
+### Remote MPI batch ordering
+
+The remote MPI server dispatches the next batch only after every future in the
+previous batch has completed. The task wrapper retains its entry barrier to
+place one task on each rank, but has no trailing barrier: an individual rank can
+finish or report an error while its peers are still running. Cross-batch ordering
+is enforced by the server; directly invoking the wrapper does not provide a
+collective completion barrier.
+
+### Disaggregated MPI leader failures
+
+The disaggregated MPI leader uses the same remote MPI server. An asynchronous
+worker failure is fatal to that server: it reports the worker error, stops
+accepting new work, and keeps the error channel available until a stop request
+or the original failure deadline. Final teardown can abort the MPI communicator
+if its remaining grace expires. This does not restart the failed service.
+
+The leader launches its proxy through an autonomous process guard. Normal leader
+cleanup signals the guard; if the leader exits through `MPI_Abort` or is killed,
+the guard detects parent death and cleans the proxy's inherited process group.
+It allows 5 seconds between `SIGTERM` and `SIGKILL`. Descendants that create their
+own session or process group still require separate ownership, as described
+above. The Bash launcher's `TLLM_LLMAPI_LAUNCH_*` settings do not configure this
+Python launcher.
 
 ### FlashInfer JIT workspaces for MPI workers
 

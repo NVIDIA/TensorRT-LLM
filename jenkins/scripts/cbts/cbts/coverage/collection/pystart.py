@@ -15,21 +15,33 @@
 
 from __future__ import annotations
 
+import configparser
 import os
 import secrets
 import socket
 import sys
 import threading
+from fnmatch import fnmatchcase
+from pathlib import Path
 from types import CodeType
 from typing import Iterable, Mapping, Optional
 
-from cbts.coverage.collection.compact_db import write_leaf_database
+from cbts.coverage.collection.compact_db import canonicalize_path, write_leaf_database
 
 _MON = getattr(sys, "monitoring", None)
 _DEFAULT_TOOL_ID = int(os.environ.get("CBTS_PYSTART_TOOL_ID", "4"))
+REPOSITORY_ROOT = str(Path(__file__).resolve().parents[6])
 
 # (process_uid, context, kind, reason) nobody can vouch for.
 Taint = tuple[str, str, str, str]
+
+
+def read_source_config(path: str | os.PathLike[str] | None = None) -> configparser.ConfigParser:
+    """Read collection settings with the checkout path resolved in this process."""
+    config = configparser.ConfigParser(defaults={"repository_root": REPOSITORY_ROOT})
+    with open(path or Path(__file__).with_name("coveragerc.template"), encoding="utf-8") as stream:
+        config.read_file(stream)
+    return config
 
 
 class PyStartTracker:
@@ -41,8 +53,13 @@ class PyStartTracker:
         data_dir: str,
         stage: str = "stage",
         tool_id: int = _DEFAULT_TOOL_ID,
+        *,
+        repository_root: Optional[str] = None,
+        include: Iterable[str] = (),
     ) -> None:
-        self.source_roots = tuple(os.path.abspath(p).rstrip("/") + "/" for p in source_roots if p)
+        self.source_roots = tuple(os.path.realpath(p).rstrip("/") + "/" for p in source_roots if p)
+        self.repository_root = os.path.realpath(repository_root) if repository_root else None
+        self.include = tuple(include)
         self.data_dir = data_dir
         self.stage = stage
         self.tool_id = tool_id
@@ -52,7 +69,8 @@ class PyStartTracker:
         self._expected: dict[str, int] = {}  # context -> pool workers the coordinator spawned
         self._taints: set[Taint] = set()
         self._diagnostics: dict[str, dict[str, str]] = {}  # process_uid -> {key: value}
-        self._file_ok: dict[str, bool] = {}  # co_filename -> bool (cached source-membership)
+        # co_filename -> absolute source path, or "" if excluded.
+        self._source_files: dict[str, str] = {}
         self._active = False
         self._save_lock = threading.Lock()  # serialize periodic-thread and atexit saves
         self._suffix = ""
@@ -73,20 +91,26 @@ class PyStartTracker:
         self._suffix = f"{socket.gethostname()}.X{secrets.token_urlsafe(6)}"
 
     def _in_source(self, filename: str) -> bool:
-        if not filename or filename[0] == "<":
+        if not filename or filename[0] == "<" or not filename.endswith(".py"):
             return False
-        return os.path.abspath(filename).startswith(self.source_roots)
+        absolute = os.path.realpath(filename)
+        if not absolute.startswith(self.source_roots):
+            return False
+        relative = canonicalize_path(absolute, self.repository_root)
+        return not self.include or any(fnmatchcase(relative, pattern) for pattern in self.include)
 
     # Skip synthetic comprehension / genexpr / lambda frames; keep real functions, methods, module bodies.
     _SKIP_QUALNAMES = frozenset(("<genexpr>", "<listcomp>", "<setcomp>", "<dictcomp>", "<lambda>"))
 
     def _on_py_start(self, code: CodeType, offset: int):
         try:
-            fn = code.co_filename
-            ok = self._file_ok.get(fn)
-            if ok is None:
-                ok = self._file_ok[fn] = self._in_source(fn)
-            if ok:
+            filename = code.co_filename
+            fn = self._source_files.get(filename)
+            if fn is None:
+                fn = self._source_files[filename] = (
+                    os.path.realpath(filename) if self._in_source(filename) else ""
+                )
+            if fn:
                 qual = code.co_qualname
                 if "<locals>" not in qual and qual not in self._SKIP_QUALNAMES:
                     self._data.setdefault(self._ctx, set()).add((fn, qual))
@@ -184,6 +208,7 @@ class PyStartTracker:
                 expected_workers=expected,
                 taints=taints,
                 diagnostics=diagnostics,
+                repository_root=self.repository_root,
             )
             os.replace(tmp, path)
         return path

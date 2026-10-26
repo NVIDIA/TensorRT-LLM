@@ -146,6 +146,7 @@ def test_indexer_runtime_cache_cost_matches_registered_buffers(fp8, snapshot_int
     from tensorrt_llm.mapping import Mapping
 
     manager = object.__new__(Glm5NextCacheManager)
+    manager.layer_specs = None
     manager.mapping = Mapping(world_size=1, tp_size=1)
     manager.pp_layers = [0, 1]
     manager.layer_offsets = {0: 0, 1: 1}

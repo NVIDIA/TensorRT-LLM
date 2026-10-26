@@ -127,7 +127,7 @@ def _inspect_block_sparse_bsr(
         inspect_bsr = compile_block_sparse_inspection(
             device_index=device_index,
             batch_size=static.batch_size,
-            num_kv_heads=_num_sparse_pattern_heads(
+            num_pattern_heads=_num_sparse_pattern_heads(
                 static.num_kv_heads, static.share_pattern_across_kv_heads
             ),
             seq_len_q=static.seq_len_q,
@@ -172,7 +172,7 @@ def _inspect_paged_block_sparse_metadata(
         inspect_metadata = compile_paged_block_sparse_metadata_inspection(
             device_index=device_index,
             batch_size=static.batch_size,
-            num_kv_heads=_num_sparse_pattern_heads(
+            num_pattern_heads=_num_sparse_pattern_heads(
                 static.num_kv_heads, static.share_pattern_across_kv_heads
             ),
             seq_len_q=static.seq_len_q,

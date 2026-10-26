@@ -47,6 +47,7 @@ from .modeling_utils import (
     EagerFusionConfig,
     duplicate_kv_weight,
     filter_weights,
+    layerwise_moe_quant_config,
     register_auto_model,
 )
 
@@ -375,9 +376,12 @@ class Glm4MoE(nn.Module):
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
         if getattr(model_config, "quant_config_dict", None) is None:
             return model_config.quant_config
-        return model_config.quant_config_dict.get(
-            f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config
+        experts_quant_config = layerwise_moe_quant_config(
+            model_config.quant_config_dict, f"model.layers.{layer_idx}.mlp.experts"
         )
+        if experts_quant_config is None:
+            return model_config.quant_config
+        return experts_quant_config
 
     def compute_routed_output(
         self,

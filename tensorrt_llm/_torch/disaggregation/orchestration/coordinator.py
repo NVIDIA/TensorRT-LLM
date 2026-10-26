@@ -610,7 +610,7 @@ class DisaggTransferCoordinator:
                 return
             # Create the response while the state is still TRANS_IN_PROGRESS
             # (required by C++ createResult).
-            response = request.create_response(False, self._dist.rank)
+            response = request.create_response()
             if response:
                 response.result.cached_tokens = request.cached_tokens
                 attach_ctx_usage(request, response)

@@ -47,7 +47,7 @@ class TransferRequest(SimpleNamespace):
         super().__init__(**defaults)
         self.state_at_response_creation = None
 
-    def create_response(self, _use_fast_logits, _rank):
+    def create_response(self):
         self.state_at_response_creation = self.state
         return self.response
 

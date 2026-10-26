@@ -669,7 +669,7 @@ def test_resolve_max_num_sequences_prefers_the_published_pool(explicit, engine_s
     """
     engine = SimpleNamespace(
         max_num_seq_slots=engine_seats,
-        _enable_overlap_headroom=True,
+        enable_overlap_headroom=True,
     )
     mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
     llm_args = SimpleNamespace(disable_overlap_scheduler=False)

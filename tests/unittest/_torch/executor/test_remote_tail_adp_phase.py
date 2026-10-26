@@ -614,6 +614,10 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
     engine = SimpleNamespace(
         enable_attention_dp=True,
         spec_config=None,
+        is_spec_decode=False,
+        enable_in_graph_sampling=False,
+        enable_overlap_headroom=False,
+        mm_encoder_item_scheduling_enabled=False,
         cuda_graph_runner=runner,
         model=SimpleNamespace(
             model=SimpleNamespace(
@@ -636,6 +640,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         ),
         get_max_num_sequences=lambda: 8,
         warmup=warmup,
+        warmup_scope=nullcontext,
     )
     should_enable = has_transceiver and not context_only
 

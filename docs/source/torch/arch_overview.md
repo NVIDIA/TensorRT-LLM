@@ -30,6 +30,11 @@ The single-step flow of PyExecutor involves:
 - Running the decoder using the model forward outputs for the scheduled requests.
 - Adding output tokens for each request and handling finished requests.
 
+## Multimodal Request Data
+
+See the [multimodal developer guide](../developer-guide/multimodal.md) for
+shared data contracts, process boundaries, and request ownership.
+
 ## Model Engine
 
 The core component of `PyExecutor` is the `ModelEngine`, responsible for executing the model's forward pass efficiently on the GPU.

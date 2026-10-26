@@ -32,7 +32,19 @@ machinery / pytest actually load by bare name live outside the `cbts` package, i
 | `import_watch.py` | The generic meta-path import-completion watcher (run a callback once a named module finishes executing), used by the bootstrap to detect the framework's import finishing. |
 | `process_roles.py` | Generic launch-target detection: opts pip/cmake/ninja/Ray-infra subtrees out of instrumentation, and identifies an `mpi4py.futures` pool worker so only that process type defers `PY_START` activation. |
 | `../../command/coverage/collection/pystart_report.py` | The CLI (`cbts.command coverage collection pystart-report`): unions compact databases and emits `--out-sqlite` (the selector artifact), `--out-dir` (a split HTML report) and `--out-json` (the full `test -> [file::qualname]` map). |
-| `coveragerc.template`, `make_coveragerc.sh` | The runtime rcfile: `[run] source` and `data_file`, with `@...@` placeholders substituted into `$JOB_WORKSPACE/.coveragerc`. |
+| `coveragerc.template`, `make_coveragerc.sh` | The runtime rcfile: `[run] source`, `include` and `data_file`, with `@...@` placeholders substituted into `$JOB_WORKSPACE/.coveragerc`. |
+
+The default scope covers library Python from both the installed wheel and checkout, all Python
+under `examples/`, `scripts/` and `tests/test_common/`, and the root and `tests/` conftest files.
+The Python bootstrap resolves `%(repository_root)s` from its own location in the checkout, so K8s
+and SLURM use the checkout visible to their test process. Include patterns match repository-relative
+paths with `fnmatch` semantics (`*` also matches `/`). Extending collection does not extend the
+coverage selector's core-Python eligibility rules.
+
+Source roots and filenames resolve symlinks before membership checks. Installed
+`site-packages/tensorrt_llm/` and `dist-packages/tensorrt_llm/` paths retain the same library
+identity even when the virtual environment is inside the checkout. The report skips unrelated
+top-level directories when the configured include patterns name literal top-level paths.
 
 ## When it runs
 
@@ -245,6 +257,10 @@ Coverage stage merges every stage's files through `pystart_report.py` and upload
 `cbts_pystart_report.tar.gz`, holding `cbts_touchmap.sqlite` (the indexed selector artifact, with a
 `meta` table carrying the coverage rate) and `cbts_report/` (the split HTML report; open
 `cbts_report/index.html` after extracting).
+
+For a coverage-rate report, pass the checkout as `--source-root`. The report reads include patterns
+from the same template as the collector, so its denominator covers the same library, examples,
+scripts, test_common and conftest scope.
 
 Every database uses schema version 4. `case_stage` stores a bare test ID beside its stage ID, and
 logical views reconstruct the selector's `<stage>/<test>` key. Integer IDs are local to a database,

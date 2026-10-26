@@ -23,6 +23,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -44,6 +45,70 @@ protected:
 
     void TearDown() override {}
 };
+
+TEST_F(LlmRequestTest, encoderInputLengthValidation)
+{
+    auto const inputTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3});
+    auto const makeRequest = [&inputTokens](std::optional<SizeType32> encoderInputLength)
+    {
+        return tb::LlmRequest(/*requestId=*/77, /*maxNewTokens=*/10, inputTokens, texec::SamplingConfig{},
+            /*isStreaming=*/false, /*promptEmbeddingTable=*/std::nullopt, /*promptVocabSize=*/std::nullopt,
+            /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt, /*multimodalLengths=*/std::nullopt,
+            /*multimodalUuids=*/std::nullopt, /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
+            /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+            /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt, texec::Request::kDefaultPriority,
+            encoderInputLength);
+    };
+
+    for (SizeType32 const length : {-1, std::numeric_limits<SizeType32>::min()})
+    {
+        EXPECT_THROW(makeRequest(length), tc::TllmException);
+    }
+
+    for (auto const length : {std::optional<SizeType32>{}, std::optional<SizeType32>{0}, std::optional<SizeType32>{12},
+             std::optional<SizeType32>{std::numeric_limits<SizeType32>::max()}})
+    {
+        auto const request = makeRequest(length);
+        EXPECT_EQ(request.tryGetEncoderInputLen(), length);
+        EXPECT_EQ(request.getState(),
+            length.has_value() ? tb::LlmRequestState::kENCODER_INIT : tb::LlmRequestState::kCONTEXT_INIT);
+    }
+}
+
+TEST_F(LlmRequestTest, encoderFeatureMetadata)
+{
+    for (bool const imageInput : {false, true})
+    {
+        texec::Request execReq(VecTokens{1, 2, 3}, 10);
+        texec::SamplingConfig samplingConfig;
+        samplingConfig.setNumReturnSequences(2);
+        execReq.setSamplingConfig(samplingConfig);
+        execReq.setEncoderInputFeatures(imageInput ? texec::Tensor::cpu(texec::DataType::kFP32, {12, 3, 2, 2})
+                                                   : texec::Tensor::cpu(texec::DataType::kFP32, {12, 8}));
+        execReq.setEncoderOutputLength(6);
+        tb::LlmRequest llmReq(77, execReq);
+        EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kENCODER_INIT);
+        EXPECT_EQ(llmReq.tryGetEncoderInputLen(), 12);
+        EXPECT_EQ(llmReq.tryGetEncoderOutputLen(), 6);
+        EXPECT_NO_THROW(llmReq.validate(10, 30, 0));
+        llmReq.setState(tb::LlmRequestState::kGENERATION_IN_PROGRESS);
+        llmReq.pause(20);
+        EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kENCODER_INIT);
+        EXPECT_EQ(llmReq.tryGetEncoderInputLen(), 12);
+        auto child = llmReq.createChildRequest(78);
+        EXPECT_EQ(child->tryGetEncoderInputLen(), 12);
+        EXPECT_EQ(child->tryGetEncoderOutputLen(), 6);
+    }
+
+    texec::Request tokenReq(VecTokens{1, 2, 3}, 10);
+    tokenReq.setEncoderInputTokenIds(VecTokens{4, 5});
+    tb::LlmRequest encoderReq(79, tokenReq);
+    EXPECT_EQ(encoderReq.tryGetEncoderInputLen(), 2);
+    EXPECT_EQ(encoderReq.tryGetEncoderOutputLen(), 2);
+    tb::LlmRequest decoderReq(80, texec::Request(VecTokens{1, 2, 3}, 10));
+    EXPECT_FALSE(decoderReq.tryGetEncoderInputLen().has_value());
+    EXPECT_FALSE(decoderReq.tryGetEncoderOutputLen().has_value());
+}
 
 TEST_F(LlmRequestTest, fromExecutorRequest)
 {
@@ -163,7 +228,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             execReq.setPromptTuningConfig(config);
             tb::LlmRequest llmReq(requestId, execReq);
 
-            llmReq.validate(500, 1000, 1, std::nullopt, true);
+            llmReq.validate(500, 1000, 1, true);
         };
         lambdaErrMsgs.emplace_back(lambda, "Input token extra ids must be provided");
     }
@@ -211,7 +276,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         tb::LlmRequest llmReq(requestId, execReq);
 
         EXPECT_EQ(static_cast<size_t>(llmReq.getOrigPromptLen()), inputTokens.size());
-        llmReq.validate(500, 1000, 1, std::nullopt, true);
+        llmReq.validate(500, 1000, 1, true);
     }
     {
         using AdditionalModelOutput = texec::AdditionalModelOutput;
@@ -223,13 +288,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         outputConfig.additionalModelOutputs = additionalModelOutputs;
         execReq.setOutputConfig(outputConfig);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, std::nullopt, false);
-        auto const& additionalContextOutputs = llmReq.getAdditionalContextOutputs();
-        EXPECT_EQ(additionalContextOutputs.count("context_gen_output"), 1);
-        EXPECT_EQ(additionalContextOutputs.count("gen_output"), 0);
-        auto const& additionalGenerationOutputs = llmReq.getAdditionalGenerationOutputs();
-        EXPECT_EQ(additionalGenerationOutputs.count("context_gen_output"), 1);
-        EXPECT_EQ(additionalGenerationOutputs.count("gen_output"), 1);
+        llmReq.validate(10, 60, 2, false);
     }
 }
 
@@ -269,53 +328,6 @@ TEST_F(LlmRequestTest, pause)
     EXPECT_EQ(llmReq.mMaxNewTokens, 59);
     EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kCONTEXT_INIT);
     EXPECT_EQ(llmReq.getMaxNumGeneratedTokens(), 0);
-}
-
-TEST_F(LlmRequestTest, testAllocateLogitsBuffer)
-{
-    auto inputTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5});
-    SizeType32 maxNewTokens(60);
-    tb::LlmRequest::RequestIdType requestId{77};
-
-    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tensorrt_llm::executor::SamplingConfig(1), false);
-
-    EXPECT_EQ(llmReq.mPromptLen, 5);
-
-    SizeType32 vocabSizePadded = 32000;
-    tensorrt_llm::DataType logitsDataType = tensorrt_llm::DataType::kFLOAT;
-
-    // Test the allocation of context logits
-    EXPECT_EQ(llmReq.getContextLogitsHost(), nullptr);
-    llmReq.allocContextLogitsHost(vocabSizePadded, logitsDataType);
-    auto contextLogitsHostShape = llmReq.getContextLogitsHost()->getShape();
-    EXPECT_EQ(contextLogitsHostShape.nbDims, 2);
-    EXPECT_EQ(contextLogitsHostShape.d[0], 5);
-    EXPECT_EQ(contextLogitsHostShape.d[1], vocabSizePadded);
-
-    // Test the allocation of generation logits
-    EXPECT_EQ(llmReq.getGenerationLogitsHost(), nullptr);
-    llmReq.allocGenerationLogitsHost(vocabSizePadded, logitsDataType);
-    auto generationLogitsHostShape = llmReq.getGenerationLogitsHost()->getShape();
-    EXPECT_EQ(generationLogitsHostShape.nbDims, 3);
-    EXPECT_EQ(generationLogitsHostShape.d[0], 1);
-    EXPECT_EQ(generationLogitsHostShape.d[1], maxNewTokens);
-    EXPECT_EQ(generationLogitsHostShape.d[2], vocabSizePadded);
-
-    // Test the allocation of target model's accepted token logits
-    // Set draft token
-    EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
-    auto draftTokens = std::make_shared<VecTokens>(VecTokens{7, 8, 9});
-    llmReq.setDraftTokens(draftTokens);
-    EXPECT_EQ(llmReq.getNumDraftTokens(), 3);
-    // Clean the generation logits
-    llmReq.setGenerationLogitsHost(nullptr);
-    EXPECT_EQ(llmReq.getGenerationLogitsHost(), nullptr);
-    llmReq.allocTargetModelAcceptedTokenLogitsHost(vocabSizePadded, logitsDataType);
-    auto targetModelAcceptedTokenLogitShape = llmReq.getGenerationLogitsHost()->getShape();
-    EXPECT_EQ(targetModelAcceptedTokenLogitShape.nbDims, 3);
-    EXPECT_EQ(targetModelAcceptedTokenLogitShape.d[0], 1);
-    EXPECT_EQ(targetModelAcceptedTokenLogitShape.d[1], 4);
-    EXPECT_EQ(targetModelAcceptedTokenLogitShape.d[2], vocabSizePadded);
 }
 
 TEST_F(LlmRequestTest, testLastTokensSetIndependence)
@@ -685,7 +697,7 @@ TEST_F(LlmRequestTest, createResultDisaggContextComplete)
     // This is the regression case — without the fix, createResult() returns nullopt
     // because DISAGG_CONTEXT_COMPLETE was not handled by createResult's early guard
     // or its context-phase branch.
-    auto resultOpt = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
+    auto resultOpt = llmReq.createResult();
     ASSERT_TRUE(resultOpt.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
     EXPECT_TRUE(resultOpt->contextPhaseParams.has_value())
         << "contextPhaseParams must be populated for context-only DISAGG_CONTEXT_COMPLETE requests";

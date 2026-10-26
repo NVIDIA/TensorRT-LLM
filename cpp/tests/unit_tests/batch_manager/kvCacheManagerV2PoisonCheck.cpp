@@ -22,8 +22,8 @@
 // listener is what makes such a failure visible, and it clears the latch afterwards so a single
 // bad test does not condemn every test that follows it.
 //
-// Linked into each KVCM2 test target by CMakeLists.txt rather than included, so registration
-// cannot be lost to an unused-include cleanup and does not depend on inline-variable semantics.
+// The test-support library is whole-archived into each KVCM2 test target so its static
+// registration runs even though the test executable does not reference a symbol from this file.
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.h"
 
@@ -66,8 +66,7 @@ public:
     }
 };
 
-// Runs before gtest_main enters the suite. This translation unit is linked straight into the test
-// executable, so its initializer always runs.
+// Runs before gtest_main enters the suite. Whole-archive linkage retains this initializer.
 struct PoisonCheckRegistrar
 {
     PoisonCheckRegistrar()

@@ -10,7 +10,7 @@ Covers the SiTU cubin integration behavior:
   ``siTuGlu``, and from the expected cubin family -- ``MxE4m3_MxE2m1`` for
   the MXFP4 drop, ``E2m1_E2m1E2m1`` for the NVFP4 one (tactic availability
   for both families is pinned at the op level in
-  tests/unittest/_torch/thop/serial/test_moe.py);
+  tests/unittest/_torch/moe/kernels/serial/test_moe.py);
 * fused output matches the Python ``SituAndMul`` reference within
   MXFP8/MXFP4 quantization tolerance, for the default AND asymmetric
   non-default ``activation_situ_beta`` / ``activation_situ_linear_beta``;
@@ -677,8 +677,8 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     """K3 must propagate strict backend selection through create_moe."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE
     from tensorrt_llm._torch.moe.fused_moe.activation import SiTuActivation
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEEligibility, MoERejectReason
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
         BACKEND_FAMILY,
@@ -699,7 +699,9 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
             ),
         )
     monkeypatch.setattr(
-        CutlassFusedMoE, "can_implement", classmethod(lambda cls, p, d: MoEEligibility.ok())
+        TrtllmCutlassNvfp4Impl,
+        "can_implement",
+        classmethod(lambda cls, p, d: MoEEligibility.ok()),
     )
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     pretrained_config = PretrainedConfig()
@@ -724,7 +726,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
         allow_degradation=True,
     )
     assert report.degraded
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
 
     # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
     with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:
@@ -1851,7 +1853,7 @@ def _dequantize_expert_bank(bank):
     meaningful.
 
     This mirrors ``e2m1_and_ufp8_scale_batches`` in
-    ``tests/unittest/_torch/thop/serial/test_moe.py``; the layout arguments
+    ``tests/unittest/_torch/moe/kernels/serial/test_moe.py``; the layout arguments
     follow ``_quantize_expert_to_nvfp4``, which stores UE4M3 block scales
     (``sfUseUE8M0=False`` -> ``sfType=1``) already de-swizzled by
     ``block_scale_interleave_reverse`` (-> ``isSfSwizzledLayout=False``).

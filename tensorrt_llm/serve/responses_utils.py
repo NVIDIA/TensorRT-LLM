@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
@@ -73,8 +74,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
                                                 UCompletionResponse)
-from tensorrt_llm.serve.render import (RenderResources, legacy_render_enabled,
-                                       render_conversation)
+from tensorrt_llm.serve.render import RenderResources, render_conversation
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
@@ -1209,8 +1209,6 @@ async def _create_input_tokens(
         hf_config=model_config,
         processor=processor,
         default_chat_template=chat_template)
-    if legacy_render_enabled():
-        render_resources = render_resources.legacy_view()
     tools_dict = [
         render_resources.extension.serialize_tool(tool)
         for tool in _get_chat_completion_function_tools(request.tools)
@@ -1445,6 +1443,8 @@ def _apply_tool_parser(
     text: str,
     streaming: bool,
     tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
+    finished: bool = False,
+    partial: bool = False,
 ) -> Tuple[str, list[ToolCallItem]]:
     tool_parser: Optional[BaseToolParser] = None
     if tool_parser_id is not None and tools is not None:
@@ -1460,10 +1460,15 @@ def _apply_tool_parser(
 
     if tool_parser is not None and tools is not None:
         if not streaming:
-            result = tool_parser.detect_and_parse(text, tools)
+            result = (tool_parser.parse_partial(text, tools)
+                      if partial else tool_parser.detect_and_parse(text, tools))
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
         normal_text, calls = result.normal_text, result.calls
+        if streaming and finished:
+            tail = tool_parser.finish(tools)
+            normal_text += tail.normal_text
+            calls += tail.calls
         if not streaming:
             warn_if_tool_call_unparsed(tool_parser_id, tool_parser, text, calls)
     else:
@@ -2159,6 +2164,7 @@ def _should_send_done_events(
             text=full_text,
             streaming=False,
             tool_parser_dict=tool_parser_dict,
+            partial=not finished_generation,
         )
 
     # Detect reasoning -> text transition
@@ -2278,8 +2284,7 @@ def _generate_streaming_event(
         chat_template_kwargs=reasoning_chat_template_kwargs(request),
     )
 
-    if delta_text:
-        # TODO(JunyiXu-nv): handle tool calls in streaming mode
+    if delta_text or finished_generation:
         delta_text, calls = _apply_tool_parser(
             tool_parser_id=tool_parser_id,
             tools=available_tools,
@@ -2287,6 +2292,7 @@ def _generate_streaming_event(
             text=delta_text,
             streaming=True,
             tool_parser_dict=tool_parser_dict,
+            finished=finished_generation,
         )
 
     _responses_debug_log(

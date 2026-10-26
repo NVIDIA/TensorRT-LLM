@@ -38,6 +38,7 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
     convert_to_torch_tensor,
+    get_sm_version,
     prefer_pinned,
 )
 from tensorrt_llm.bindings import DataType
@@ -227,6 +228,28 @@ def extend_attention_op_pools_for_shared_draft_layers(
     )
 
 
+def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:
+    """Fail at setup, not at the first prefill, when the P128 opt-in has no FMHA (SM107).
+
+    On SM107 only FlashInfer TRTLLM-Gen has paged-context kernels for the extra
+    page sizes (its cubins ship with it), so the route exists iff it is enabled.
+    """
+    if get_sm_version() != 107:
+        return
+    # Imported here: the FMHA backends import the attention classes this module serves.
+    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+        FlashInferTrtllmGenFmha,
+    )
+    from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
+
+    if FlashInferTrtllmGenFmha not in get_enabled_fmha_lib_classes():
+        raise RuntimeError(
+            f"SM107 with {tokens_per_block}-token KV pages needs the flashinfer_trtllm_gen FMHA "
+            "library, the only one with paged-context kernels for this page size here, but "
+            "TLLM_FMHA_LIBS excludes it. Keep flashinfer_trtllm_gen in TLLM_FMHA_LIBS (or unset it)."
+        )
+
+
 class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
@@ -399,6 +422,18 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
                     layer_idx, kv_layout
                 )
+        # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
+        # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
+        # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
+        # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
+        # byte a kernel writes is unchanged.
+        for view in (
+            *self._kv_buffers.values(),
+            *self._block_scale_buffers.values(),
+            *self._index_k_buffers.values(),
+        ):
+            if view is not None:
+                view.zero_()
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
         # Dynamic-tree relocation moves packed K/V bytes without their NVFP4
@@ -540,7 +575,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             for layer_idx in (*self._dense_native_layer_ids, *self._shared_draft_layer_ids)
             if layer_idx in self.layer_offsets
         ]
-        if self.is_draft or not native_layers:
+        if self.is_draft:
+            # A separate draft manager holds only draft layers, which all run
+            # native attention and use their own pool tables; it needs the P128
+            # opt-in but no virtual pools. (MiniMax-M3 Eagle3 shares the target
+            # manager today; this keeps a separate one on the trtllm-gen route.)
+            if self.tokens_per_block == 128 and self.dtype != DataType.NVFP4:
+                _require_trtllm_gen_extra_page_route(128)
+                self.trtllm_gen_extra_tokens_per_block = frozenset({128})
+            return
+        if not native_layers:
             return
         if self.enable_swa_scratch_reuse:
             raise NotImplementedError(
@@ -552,8 +596,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return
         # Native layers run at the target's 128-token pages. trtllm-gen has P128
         # kernels for their dense-GQA shapes but not for every shape, so opt in
-        # here rather than in the global allowlist.
+        # here rather than in the global allowlist. On SM107 this opt-in is the
+        # only route for these layers: FallbackFmha has no P128 paged-context kernels.
         if self.tokens_per_block == 128:
+            # On SM107 the dense layers keep SDPA (see the model's native dense attention
+            # setup), so only the shared draft layers need the route there.
+            if any(i in self.layer_offsets for i in self._shared_draft_layer_ids):
+                _require_trtllm_gen_extra_page_route(128)
             self.trtllm_gen_extra_tokens_per_block = frozenset({128})
         if self._use_per_layer_page_tables:
             # Per-layer page tables already give every layer its own pool.
@@ -938,6 +987,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         is_kv_aggregate: bool = True,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
         index_scale: Optional[int] = None,
+        kv_factor: Optional[int] = None,
     ):
         """Return page indices; padded entries remain ``BAD_PAGE_INDEX`` (-1).
 
@@ -966,6 +1016,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             index_scale: Kept for compatibility with the base virtual method;
                 M3 bypasses the V1 block-id conversion entirely, so any
                 caller-supplied scale is ignored alongside ``index_scales``.
+            kv_factor: Kept for compatibility with the base virtual method;
+                M3 returns raw slot IDs without KV aggregation.
         """
         res = []
         for req_idx, req_id in enumerate(request_ids):
@@ -1031,6 +1083,8 @@ class MiniMaxM3DraftKVCacheView:
                 "MiniMax-M3 draft KV cache views support exactly one local shared draft layer; "
                 f"got {len(draft_layer_ids)}. Multiple layers require separate pool roots."
             )
+        if manager.tokens_per_block in self.trtllm_gen_extra_tokens_per_block:
+            _require_trtllm_gen_extra_page_route(manager.tokens_per_block)
         self._manager = manager
         layer_id = draft_layer_ids[0]
         local = int(manager.layer_offsets[layer_id])

@@ -34,8 +34,8 @@ def mixed_config(dtype=DataType.BF16, **overrides):
         enable_block_reuse=True,
         block_reuse_config={"policy": "per_request"},
         dtype=_MIXED_DTYPE[dtype],
-        first_n=1,
-        last_n=65,
+        mixed_precision_first_n=1,
+        mixed_precision_last_n=65,
         pool_ratio=[5 / 6, 1 / 6],
     )
     options.update(overrides)

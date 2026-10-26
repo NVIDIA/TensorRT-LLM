@@ -510,19 +510,11 @@ public:
                     // kv cache reuse / chunked context cases, latent_cache is not used
                     mla_params.latent_cache = nullptr;
                 }
-                TORCH_CHECK(q_pe.has_value());
-                TORCH_CHECK(q_pe->dim() == 3);
-                TORCH_CHECK(q_pe->strides()[2] == 1);
-
-                mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
-                mla_params.q_pe_ld = q_pe->strides()[1];
-                mla_params.q_pe_stride = q_pe->strides()[0];
-
                 // Fused FP8-Q path: forward caller's quant_q_buffer / scale so
                 // applyMLARopeAndAssignQKVKernelOptContext<kOutputFp8Q=true>
                 // appends rope FP8 in place and the standalone quantize is
-                // skipped. Without this wiring the sparse-MLA context branch
-                // runs the legacy quantize over the bf16 placeholder q.
+                // skipped. A missing q_pe on this path means the upstream q_b
+                // fusion has already written the complete rotated FP8 Q.
                 mla_params.bmm1_scale = mla_bmm1_scale.has_value()
                     ? reinterpret_cast<float*>(mla_bmm1_scale.value().data_ptr())
                     : nullptr;
@@ -535,6 +527,23 @@ public:
                     ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
                     : nullptr;
                 mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
+                mla_params.q_rope_applied = mla_params.fuse_q_fp8_in_rope && !q_pe.has_value();
+                if (q_pe.has_value())
+                {
+                    TORCH_CHECK(q_pe->dim() == 3);
+                    TORCH_CHECK(q_pe->strides()[2] == 1);
+                    mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
+                    mla_params.q_pe_ld = q_pe->strides()[1];
+                    mla_params.q_pe_stride = q_pe->strides()[0];
+                }
+                else
+                {
+                    TORCH_CHECK(mla_params.q_rope_applied,
+                        "Sparse MLA context requires q_pe unless quant_q_buffer already contains rotated Q.");
+                    mla_params.q_pe = nullptr;
+                    mla_params.q_pe_ld = 0;
+                    mla_params.q_pe_stride = 0;
+                }
 
                 // Fused kv_a_layernorm: the norm weight implies `latent_cache` is the
                 // RAW kv_a_proj output, with the caller's RMSNorm and concat dropped.
@@ -589,8 +598,10 @@ public:
                 TORCH_CHECK(v.has_value());
                 TORCH_CHECK(k->dim() == 2);
                 TORCH_CHECK(v->dim() == 2);
-                TORCH_CHECK(k->strides()[1] == 1);
-                TORCH_CHECK(v->strides()[1] == 1);
+                TORCH_CHECK(
+                    k->strides()[1] == 1, "Separate-K context FMHA requires contiguous K features within each token");
+                TORCH_CHECK(
+                    v->strides()[1] == 1, "Separate-V context FMHA requires contiguous V features within each token");
 
                 k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
                 v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
@@ -956,6 +967,16 @@ public:
                 TORCH_CHECK(
                     cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
                 enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
+            }
+            if (op.mIsMLAEnabled && v_ptr != nullptr && v.has_value())
+            {
+                TORCH_CHECK(v->stride(0) > 0, "Separate-V context FMHA requires a positive V token stride");
+                enqueue_params.v_stride_in_bytes = v->stride(0) * v->element_size();
+                constexpr int64_t kTmaAlignmentBytes = 16;
+                TORCH_CHECK(enqueue_params.v_stride_in_bytes % kTmaAlignmentBytes == 0,
+                    "Separate-V context FMHA requires a 16-byte aligned V token stride");
+                TORCH_CHECK(reinterpret_cast<std::uintptr_t>(v_ptr) % kTmaAlignmentBytes == 0,
+                    "Separate-V context FMHA requires a 16-byte aligned V pointer");
             }
             if (is_cross && cross_kv.has_value())
             {
@@ -1355,7 +1376,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mRotaryEmbeddingLongMscale = rope_long_m_scale;
     op->mRotaryEmbeddingMaxPositions = rope_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rope_original_max_positions;
+    // Only the FP8 context FMHA kernels read an NVFP4 KV cache, whatever the output type; they do so on SM100-family
+    // GPUs only, so elsewhere an NVFP4 KV cache still fails the FP4 KV check in AttentionOp. MLA keeps its own NVFP4 KV
+    // handling (mUseNvfp4MlaKvCache, mFP8ContextMLA below) and must not pick this up.
     op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
+        || (!is_mla_enable && op->mKVCacheQuantMode.hasFp4KvCache() && tensorrt_llm::common::isSM100Family())
         || use_sage_attn;
     // SageAttention block sizes and quantization mode.
     op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q);
@@ -1692,14 +1717,17 @@ KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPo
     }
     else
     {
-        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2 || hostKvCachePoolPointers.dim() == 3);
+        // Non-FP4 layers use only the data pointers in a mixed-format pool table.
+        auto const dataPointers
+            = hostKvCachePoolPointers.dim() == 3 ? hostKvCachePoolPointers.select(2, 0) : hostKvCachePoolPointers;
         pointers.primaryPoolPtr = reinterpret_cast<void*>(
             reinterpret_cast<char*>(
-                readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))
+                readHostTensor2D<int64_t>(dataPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))
             + intraPoolOffset);
         pointers.secondaryPoolPtr = reinterpret_cast<void*>(
             reinterpret_cast<char*>(
-                readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, "host_kv_cache_pool_pointers"))
+                readHostTensor2D<int64_t>(dataPointers, poolIndex, 1, "host_kv_cache_pool_pointers"))
             + intraPoolOffset);
     }
     return pointers;

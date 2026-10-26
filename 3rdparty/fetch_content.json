@@ -46,7 +46,10 @@
       "git_tag": "b64107f2b9599ca76445b7f62eedf66bae1d095b",
       "git_submodules_recurse": true,
       "source_subdir": "dont-add-this-project-with-add-subdirectory",
-      "patch_file": "patches/deepgemm_configurable_barrier_timeout.patch"
+      "patch_file": [
+        "patches/deepgemm_configurable_barrier_timeout.patch",
+        "patches/deepgemm_sm10x_family_target.patch"
+      ]
     },
     {
       "name": "eigen",

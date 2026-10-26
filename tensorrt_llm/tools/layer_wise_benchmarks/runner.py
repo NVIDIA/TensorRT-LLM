@@ -23,6 +23,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor._util import _mamba_conv_layout_kwargs, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
@@ -418,6 +419,16 @@ class Runner:
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
             load_format=load_format,
+            # Must agree with `mapping`, which the loader takes separately:
+            # to_mapping() derives world_size from tp*pp*cp, so the 1-GPU defaults
+            # reject every rank above 0.
+            tensor_parallel_size=mapping.tp_size,
+            pipeline_parallel_size=mapping.pp_size,
+            context_parallel_size=mapping.cp_size,
+            moe_expert_parallel_size=mapping.moe_ep_size,
+            moe_cluster_parallel_size=mapping.moe_cluster_size,
+            enable_attention_dp=mapping.enable_attention_dp,
+            gpus_per_node=mapping.gpus_per_node,
             # `ModelLoader(spec_config=...)` below is what reaches
             # `model_config.spec_config`; this keeps `llm_args` consistent with it.
             **({"speculative_config": spec_config} if spec_config is not None else {}),
@@ -433,20 +444,26 @@ class Runner:
                 dtype=kv_cache_dtype, mamba_ssm_cache_dtype=mamba_ssm_cache_dtype
             ),
         )
-        model_loader = ModelLoader(
-            llm_args=llm_args,
-            mapping=mapping,
-            spec_config=spec_config,
-            sparse_attention_config=None,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-        )
-
         with (
             self.scaled_from_ctx(scaled_from, mapping),
             self.vision_config_ctx(vision_config),
             self.skip_unused_layers_ctx(layer_indices),
         ):
+            # Serving applies these in py_executor_creator; the harness builds
+            # llm_args by hand, so without this every model default is off here
+            # only. Resolved inside the config contexts so the defaults come from
+            # the same config (text-only, scaled) that the model loads with.
+            llm_args = ModelLoader.load_config_and_apply_defaults(
+                pretrained_model_name_or_path, llm_args, checkpoint_loader
+            )
+            model_loader = ModelLoader(
+                llm_args=llm_args,
+                mapping=mapping,
+                spec_config=spec_config,
+                sparse_attention_config=None,
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+            )
             model, _ = model_loader.load(
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
@@ -776,19 +793,25 @@ class Runner:
             kwargs["mamba_metadata"] = mamba_metadata
 
         def run_pack(*, check=False):
-            with model_extra_attrs(self.model_config.extra_attrs):
+            # The layers run outside `ModelCaller`, so this harness owns the NCCL-window lease
+            # scope. Window-backed outputs are released at scope exit; validate them inside it.
+            # Returned tensors are benchmark scratch and must not be read after the call.
+            with (
+                model_extra_attrs(self.model_config.extra_attrs),
+                discard_nccl_window_tensor_outputs((position_ids, hidden_states, residual)),
+            ):
                 get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
                 with torch.inference_mode():
                     hidden_states_out, residual_out = self.model(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
                     )
-            if check and isinstance(hidden_states_out, torch.Tensor):
-                if hidden_states_out.isnan().any():
-                    raise ValueError("Has nan, please fix weights initialization")
-                if hidden_states_out.isinf().any():
-                    raise ValueError("Has inf, please fix weights initialization")
-                if (hidden_states_out == 0).sum() > 0.5 * hidden_states_out.numel():
-                    raise ValueError("Too many zeros, please fix weights initialization")
+                if check and isinstance(hidden_states_out, torch.Tensor):
+                    if hidden_states_out.isnan().any():
+                        raise ValueError("Has nan, please fix weights initialization")
+                    if hidden_states_out.isinf().any():
+                        raise ValueError("Has inf, please fix weights initialization")
+                    if (hidden_states_out == 0).sum() > 0.5 * hidden_states_out.numel():
+                        raise ValueError("Too many zeros, please fix weights initialization")
             return hidden_states_out, residual_out
 
         return run_pack

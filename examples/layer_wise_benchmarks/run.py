@@ -14,6 +14,10 @@ import yaml
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.nccl_window_graph import (
+    nccl_window_graph_capture,
+    release_nccl_window_graph_owner,
+)
 from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
@@ -457,7 +461,11 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         if args.use_cuda_graph:
             with with_multi_stream(True):
                 g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
+                # Bind NCCL-window buffers requested during capture to this graph's pool.
+                graph_pool = torch.cuda.graph_pool_handle()
+                with nccl_window_graph_capture(
+                    g, graph_pool, stream=capture_stream, capture_error_mode="global"
+                ):
                     run_pack()
 
         balance_ratio_str = "" if balance_ratio is None else f" balance={balance_ratio:.2g}"
@@ -476,6 +484,10 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         events[-1].record()
         calibrator.stop()
     torch.cuda.synchronize()
+    if args.use_cuda_graph:
+        # Hand the pool's NCCL-window buffers back only after the graph is gone.
+        g.reset()
+        release_nccl_window_graph_owner(graph_pool)
 
     # Print statistics
     #   Print before `cudaProfilerStop` to ensure messages are included in the profile

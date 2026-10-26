@@ -23,6 +23,7 @@ import torch
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.attention.backends import prims_ts
+from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.attention.backends.fmha import prims_ts_block_sparse as block_sparse_fmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseRuntimeParams,
 )
+from tensorrt_llm._torch.attention.kernels.sage_quant import SageQuantized
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -148,7 +150,10 @@ def _contiguous_case():
         num_sparse_topk=0,
         helix_position_offsets=None,
         kv_cache_manager=None,
+        num_contexts=2,
         seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        seq_lens_cuda=torch.tensor([64, 64], dtype=torch.int32),
+        seq_lens_kv_cuda=torch.tensor([256, 256], dtype=torch.int32),
         fmha_plan_caches={},
     )
     args = AttentionForwardArgs(
@@ -406,6 +411,119 @@ def test_block_sparse_plan_cache_lives_on_the_metadata(monkeypatch) -> None:
     other_metadata = SimpleNamespace(**{**vars(metadata), "fmha_plan_caches": {}})
     second._forward_contiguous(q, k, v, other_metadata, args)
     assert factory.call_count == 2
+
+
+def _set_sage_recipe(args: AttentionForwardArgs) -> None:
+    args.sage_attn_num_elts_per_blk_q = 1
+    args.sage_attn_num_elts_per_blk_k = 16
+    args.sage_attn_num_elts_per_blk_v = 1
+
+
+def test_attention_core_quantizes_sage_inputs_ahead_of_the_fmha(monkeypatch) -> None:
+    attention, _fmha, q, k, v, metadata, args = _contiguous_case()
+    # The core quantizes whichever libraries the layer has; each library decides whether it
+    # takes the quantized inputs.
+    attention._fmha_manager = SimpleNamespace(fmha_libs=[])
+    quantized = SageQuantized._make(Mock(name=name) for name in SageQuantized._fields)
+    sage_quantize = Mock(return_value=quantized)
+    monkeypatch.setattr(trtllm_backend, "sage_quantize", sage_quantize)
+
+    def quantize():
+        return trtllm_backend.TrtllmAttention._quantize_sage_inputs(
+            attention, q, k, v, metadata, args
+        )
+
+    assert quantize() is None
+    _set_sage_recipe(args)
+    args.sage_attn_smooth_k = True
+    assert quantize() is quantized
+    (query, key, value, cu_seqlens_q, cu_seqlens_kv), kwargs = sage_quantize.call_args
+    assert query.shape == (128, 2, 128)
+    assert key.shape == value.shape == (512, 1, 128)
+    assert cu_seqlens_q.tolist() == [0, 64, 128]
+    assert cu_seqlens_kv.tolist() == [0, 256, 512]
+    assert kwargs == {
+        "q_block_size": 1,
+        "k_block_size": 16,
+        "qk_quant_dtype": torch.float8_e4m3fn,
+        "smooth_k": True,
+        "smooth_v": False,
+    }
+    assert sage_quantize.call_count == 1
+
+    # Proxy summaries are keys of their own, with the V scales and means of the call's own K/V.
+    proxy = _bitmask_inputs(proxy=True)
+    _set_block_sparse_inputs(args, proxy)
+    summary = SageQuantized._make(Mock(name=name) for name in SageQuantized._fields)
+    sage_quantize.reset_mock()
+    sage_quantize.side_effect = [quantized, summary]
+    actual = quantize()
+    (query, key, value, cu_seqlens_q, cu_seqlens_blocks), kwargs = sage_quantize.call_args
+    assert query is None and cu_seqlens_q is None
+    assert key.shape == value.shape == (8, 1, 128)
+    assert cu_seqlens_blocks.tolist() == [0, 4, 8]
+    assert kwargs == {"k_block_size": 1, "qk_quant_dtype": torch.float8_e4m3fn, "stats": quantized}
+    assert actual.k_summary is summary.k.view.return_value
+    assert actual.v_summary is summary.v.view.return_value
+    assert actual.k_summary_scale is summary.k_scale
+    sage_quantize.side_effect = None
+
+    # Dense calls keep the attention op's quantization unless they need V smoothing, which
+    # the attention op cannot apply.
+    sage_quantize.reset_mock()
+    _set_block_sparse_inputs(args, None)
+    assert quantize() is None
+    args.sage_attn_smooth_v = True
+    assert quantize() is quantized
+    assert sage_quantize.call_args.kwargs["smooth_v"]
+
+    # Calls with a KV cache quantize nothing.
+    sage_quantize.reset_mock()
+    _set_block_sparse_inputs(args, proxy)
+    metadata.kv_cache_manager = Mock()
+    assert quantize() is None
+    sage_quantize.assert_not_called()
+
+
+def test_contiguous_sage_requires_inputs_quantized_by_the_attention_core() -> None:
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
+    _set_sage_recipe(args)
+
+    reason = fmha._contiguous_unsupported_reason(q, k, v, metadata, args)
+
+    assert reason == "SageAttention requires inputs quantized by the attention core"
+
+
+def test_dense_sage_with_v_smoothing_runs_on_a_dense_plan() -> None:
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
+    _set_block_sparse_inputs(args, None)
+    _set_sage_recipe(args)
+    supported, reason = fmha._is_supported_with_reason(
+        q, k, v, metadata, args, phase=FmhaPhase.CONTEXT
+    )
+    assert not supported
+    assert reason == "block-sparse forward inputs are required"
+
+    args.sage_attn_smooth_v = True
+    args.sage_quantized = Mock()
+    supported, reason = fmha._is_supported_with_reason(
+        q, k, v, metadata, args, phase=FmhaPhase.CONTEXT
+    )
+    assert supported, reason
+    key = fmha._make_plan_key(
+        q.view(2, 64, 2, 128),
+        None,
+        batch_size=2,
+        seq_len_q=64,
+        kv_capacity=256,
+        page_size=None,
+        mask_type="dense",
+        sage=block_sparse_fmha._sage_recipe(args),
+    )
+    assert not key.use_block_sparse
+    assert (key.q_block_size, key.kv_block_size, key.max_blocks_per_row) == (128, 128, None)
+    assert key.sage.v_mean
+    assert key.unsupported_reason() is None
 
 
 def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch) -> None:

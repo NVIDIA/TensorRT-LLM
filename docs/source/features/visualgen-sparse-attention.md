@@ -94,7 +94,7 @@ User configuration is supplied through Python or YAML and controls how the check
 
 `threshold_scale_factor` and `target_sparsity` are alternatives: if both are present, `threshold_scale_factor` takes precedence and the calibration formula is not used. User-provided `target_sparsity` and `disabled_until_timestep` override checkpoint defaults. Checkpoint `ignore` patterns always disable Skip Softmax Attention for matching layers.
 
-Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and SOL cannot be combined with quantized attention on any backend.
+Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4). VSA and SOL can be combined with quantized attention only on TRTLLM, through its SageAttention recipes.
 
 #### Mapping `disabled_until_timestep` to Actual Denoising Steps
 
@@ -234,9 +234,11 @@ softmax. VisualGen serves it on two backends behind one `SolAttentionConfig`:
   attention metadata and the `timestep` in the forward arguments; dense layers
   and dense timestep phases return no routes. The VisualGen wrapper compacts
   fused projection split views once and shares those tensors between
-  prediction and the block-sparse FMHA. Cross-attention, context parallelism,
-  attention quantization and unsupported tensor envelopes raise an error
-  instead of silently falling back to dense attention.
+  prediction and the block-sparse FMHA. With a SageAttention recipe, the
+  attention core quantizes Q/K/V and the proxy means for the FMHA after
+  prediction; the dense timestep phases use the dense SageAttention kernel.
+  Cross-attention, context parallelism and unsupported tensor envelopes raise
+  an error instead of silently falling back to dense attention.
 - **CUTEDSL** runs the fused kernel vendored from the reference implementation
   (`SOLCuTeDSLAttention`), which folds routing, sparse computation and the
   approximation correction into one online-softmax pass. It runs on datacenter
@@ -318,7 +320,7 @@ Requirements:
 - A VSA-fine-tuned checkpoint such as [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not carry the learned VSA gates.
 - The `CUTEDSL` or `TRTLLM` attention backend. `CUTEDSL` uses the CuTe DSL fine-stage kernel; `TRTLLM` lowers the selected cubes through the generic PrimTS block-sparse FMHA contract.
 - A supported CUDA device and tensor shape for the selected block-sparse kernel. When that kernel is unavailable or the input is outside its envelope, the fine branch runs the compact Q/K/V through that backend's dense path (SDPA for `CUTEDSL`, TRTLLM attention for `TRTLLM`) and the VSA post-processing still applies.
-- VSA cannot be combined with `quant_attention_config`.
+- On `TRTLLM`, VSA can be combined with a SageAttention `quant_attention_config`; the block-sparse fine stage then runs with quantized Q/K/V. `CUTEDSL` rejects `quant_attention_config` with VSA.
 - VSA is not compatible with Ring attention or Attention2D (it does not produce per-split LSE). Ulysses is supported.
 
 Configure VSA with `VideoSparseAttentionConfig` and either backend:

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,7 @@
 
 """Unit tests for Responses API streaming tool call emission (TRTLLM-9605)."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -202,3 +203,158 @@ class TestGenerateStreamingEventToolCalls:
         assert len(function_call_dones) >= 1
         assert function_call_dones[0].item.name == "get_weather"
         assert function_call_dones[0].item.arguments == '{"location":"NYC"}'
+
+
+@pytest.mark.parametrize("suffix", ["<", "<t", "<tool_cal"])
+@pytest.mark.parametrize("empty_terminal_delta", [False, True])
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_qwen_coder_flushes_text_before_done(suffix, empty_terminal_delta, with_tools):
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+
+    request = ResponsesRequest(
+        model="test",
+        input="Hello",
+        tools=[
+            {"type": "function", "name": "ping", "parameters": {"type": "object", "properties": {}}}
+        ]
+        if with_tools
+        else [],
+    )
+    helper = ResponsesStreamingEventsHelper()
+    parsers = {}
+    text = "x " + suffix
+    events = list(
+        _generate_streaming_event(
+            _make_mock_output(text=text, text_diff=text),
+            request,
+            not empty_terminal_delta,
+            helper,
+            tool_parser_id="qwen3_coder",
+            tool_parser_dict=parsers,
+        )
+    )
+    if empty_terminal_delta:
+        events += list(
+            _generate_streaming_event(
+                _make_mock_output(text=text, text_diff=""),
+                request,
+                True,
+                helper,
+                tool_parser_id="qwen3_coder",
+                tool_parser_dict=parsers,
+            )
+        )
+    deltas = [event for event in events if event.type == "response.output_text.delta"]
+    done = [event for event in events if event.type == "response.output_text.done"]
+    assert "".join(event.delta for event in deltas) == text
+    assert len(done) == 1 and done[0].text == text
+    assert max(events.index(event) for event in deltas) < events.index(done[0])
+    assert parsers[0]._buf == ""
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+@pytest.mark.parametrize("second_call", ["", "<tool_call><function=g></function></tool_call>"])
+def test_qwen_coder_recovers_unclosed_parameters_before_done(chunk_size, second_call):
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+
+    text = "<tool_call><function=f><parameter=x>abc</function></tool_call>" + second_call
+    request = ResponsesRequest(
+        model="test",
+        input="Hello",
+        tools=[
+            {
+                "type": "function",
+                "name": "f",
+                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+            },
+            {"type": "function", "name": "g", "parameters": {"type": "object"}},
+        ],
+    )
+    helper = ResponsesStreamingEventsHelper()
+    parsers = {}
+    events = []
+    for start in range(0, len(text), chunk_size):
+        end = min(start + chunk_size, len(text))
+        events.extend(
+            _generate_streaming_event(
+                _make_mock_output(text=text[:end], text_diff=text[start:end]),
+                request,
+                False,
+                helper,
+                tool_parser_id="qwen3_coder",
+                tool_parser_dict=parsers,
+            )
+        )
+    events.extend(
+        _generate_streaming_event(
+            _make_mock_output(text=text),
+            request,
+            True,
+            helper,
+            tool_parser_id="qwen3_coder",
+            tool_parser_dict=parsers,
+        )
+    )
+    done_calls = [
+        event.item
+        for event in events
+        if event.type == "response.output_item.done" and event.item.type == "function_call"
+    ]
+    expected = [("f", {"x": "abc"})] + ([("g", {})] if second_call else [])
+    assert [(call.name, json.loads(call.arguments)) for call in done_calls] == expected
+    added_calls = [
+        event.item
+        for event in events
+        if event.type == "response.output_item.added" and event.item.type == "function_call"
+    ]
+    assert [(call.name, json.loads(call.arguments)) for call in added_calls] == expected
+    assert [call.id for call in added_calls] == [call.id for call in done_calls]
+    assert not any(event.type == "response.output_text.delta" for event in events)
+
+
+def test_qwen_coder_partial_preview_preserves_literal_outer_closers():
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+
+    request = ResponsesRequest(
+        model="test",
+        input="Hello",
+        tools=[
+            {
+                "type": "function",
+                "name": "f",
+                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+            }
+        ],
+    )
+    prefix = "before<tool_call><function=f><parameter=x>a</function></tool_call>"
+    text = prefix + "b</parameter></function></tool_call>"
+    helper = ResponsesStreamingEventsHelper()
+    parsers = {}
+    events = list(
+        _generate_streaming_event(
+            _make_mock_output(text=prefix, text_diff=prefix),
+            request,
+            False,
+            helper,
+            tool_parser_id="qwen3_coder",
+            tool_parser_dict=parsers,
+        )
+    )
+    assert not any(event.type == "response.output_text.done" for event in events)
+    events.extend(
+        _generate_streaming_event(
+            _make_mock_output(text=text, text_diff=text[len(prefix) :]),
+            request,
+            True,
+            helper,
+            tool_parser_id="qwen3_coder",
+            tool_parser_dict=parsers,
+        )
+    )
+    done_calls = [
+        event.item
+        for event in events
+        if event.type == "response.output_item.done" and event.item.type == "function_call"
+    ]
+    assert len(done_calls) == 1
+    assert json.loads(done_calls[0].arguments) == {"x": "a</function></tool_call>b"}

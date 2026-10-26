@@ -247,3 +247,41 @@ def test_block_rows_take_consecutive_slots() -> None:
     assert offsets.tolist() == [
         base + (4 + row) * _RNG_SLOT_SPAN for base in (1000, BASE) for row in range(3)
     ]
+
+
+# --- all-greedy batches ------------------------------------------------------
+
+ROWS = MAX_DRAFT_LEN + 1
+
+
+def _populated(meta: SpecMetadata, requests: list[types.SimpleNamespace]) -> list[int]:
+    """Run _populate_request_rng_state on CPU buffers and return request_offsets."""
+    for request in requests:
+        request.sampling_config = types.SimpleNamespace(seed=request.seed)
+    normalized = [(0.0, 0, 1.0, 0.0, ROWS) for _ in requests]
+    meta._populate_request_rng_state(requests, normalized)
+    return meta.request_offsets[: len(requests)].tolist()
+
+
+def test_all_greedy_batch_skips_the_copies_but_advances_the_windows() -> None:
+    # The argmax graph reads none of the Philox buffers, so an all-greedy batch
+    # leaves them as they are; its windows are still taken, so the next sampled
+    # batch gets the same offsets it would have had.
+    meta = _meta()
+    sentinel = -5
+    meta.temperatures = torch.ones(8 * ROWS)
+    meta.request_seeds = torch.full((8,), sentinel, dtype=torch.int64)
+    meta.request_offsets = torch.full((8,), sentinel, dtype=torch.int64)
+    meta.seeds = torch.full((8 * ROWS,), sentinel, dtype=torch.int64)
+    meta.offsets = torch.full((8 * ROWS,), sentinel, dtype=torch.int64)
+
+    meta.is_all_greedy_sample = True
+    assert _populated(meta, [_request(0, seed=7), _request(1)]) == [sentinel, sentinel]
+    assert meta.seeds.eq(sentinel).all() and meta.offsets.eq(sentinel).all()
+
+    meta.is_all_greedy_sample = False
+    assert _populated(meta, [_request(0, seed=7), _request(1)]) == [WINDOW, BASE + WINDOW]
+    assert meta.request_seeds[:2].tolist() == [7, DEFAULT_SAMPLING_SEED]
+    assert meta.offsets[: 2 * ROWS].tolist() == [
+        base + row * _RNG_SLOT_SPAN for base in (WINDOW, BASE + WINDOW) for row in range(ROWS)
+    ]

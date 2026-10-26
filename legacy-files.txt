@@ -604,8 +604,8 @@ tests/unittest/_torch/kernels/parallel/test_w4a8_linear.py
 tests/unittest/_torch/kernels/parallel/test_w4a8_mxfp4_mxfp8_gemm.py
 tests/unittest/_torch/kernels/parallel/test_weight_only_quant_gemm.py
 tests/unittest/_torch/kernels/parallel/test_weight_only_quant_linear.py
-tests/unittest/_torch/thop/serial/test_moe.py
-tests/unittest/_torch/thop/serial/test_moe_alltoall.py
+tests/unittest/_torch/moe/kernels/serial/test_moe.py
+tests/unittest/_torch/moe/kernels/serial/test_moe_alltoall.py
 tests/unittest/api_stability/api_stability_core.py
 tests/unittest/api_stability/test_llm_api.py
 tests/unittest/bindings/test_bindings_moe.py

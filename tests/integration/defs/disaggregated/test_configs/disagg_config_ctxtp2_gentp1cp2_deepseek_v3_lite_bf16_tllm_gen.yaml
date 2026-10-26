@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 hostname: localhost
 model: DeepSeek-V3-Lite/bf16
 free_gpu_memory_fraction: 0.25
@@ -10,7 +13,7 @@ context_servers:
     enable_block_reuse: false
     enable_partial_reuse: false
     tokens_per_block: 32
-    use_kv_cache_manager_v2: false
+    use_kv_cache_manager_v2: true
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   cache_transceiver_config:
@@ -29,7 +32,7 @@ generation_servers:
     enable_block_reuse: false
     enable_partial_reuse: false
     tokens_per_block: 32
-    use_kv_cache_manager_v2: false
+    use_kv_cache_manager_v2: true
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON

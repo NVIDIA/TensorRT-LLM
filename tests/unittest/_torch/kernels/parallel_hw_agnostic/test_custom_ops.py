@@ -18,6 +18,9 @@ import torch
 import torch._library.utils as library_utils
 
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__tp16.ops import (
+    _cpp_fakes,  # noqa: F401
+)
 
 pytestmark = pytest.mark.cpu_only
 

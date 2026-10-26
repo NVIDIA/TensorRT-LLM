@@ -94,6 +94,7 @@ def _pool_scope(events):
 def _make_loader(monkeypatch, *, events, spec_config=None):
     llm_args = SimpleNamespace(
         load_format=LoadFormat.GMS,
+        lm_head_output_dtype="auto",
         gms_config=SimpleNamespace(socket_path="/tmp/gms.sock", mode="auto", tag="weights"),
     )
     loader = ModelLoader(

@@ -27,6 +27,7 @@ import subprocess
 import sys
 
 import yaml
+from report import build_cases
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLACEHOLDER_PREFIX = "<"
@@ -138,6 +139,12 @@ def validate(cfg):
 
     if not cfg.get("ucx_env_sweep"):
         errors.append("ucx_env_sweep must contain at least one entry")
+
+    if not errors and (tm.get("combinations") or tm.get("combos")):
+        try:
+            build_cases(cfg)
+        except ValueError as exc:
+            errors.append(str(exc))
 
     run = cfg.get("run", {})
     per_cell = run.get("timeout_per_cell_s", 60)
