@@ -93,6 +93,7 @@ def test_resume_restores_page_buffers_and_sparse_metadata_row(sparse: bool) -> N
 @pytest.mark.parametrize("is_draft", [False, True])
 def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
     manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock()
     order = Mock()
     manager._disagg_receive_ready = {}
     manager.is_draft = is_draft
@@ -118,10 +119,11 @@ def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
     manager.kv_connector_manager = Mock()
     manager._connector_reservations_enabled = Mock(return_value=True)
     manager._accept_connector_prefix_reservations = order.accept
+    manager._on_allocation_stream = set()
     order.attach_mock(manager.kv_connector_manager.build_scheduler_output, "report")
     order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
     order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
-    scheduled = Mock()
+    scheduled = Mock(context_requests=[])
     manager.report_batch_to_connector(scheduled)
     assert order.mock_calls == [
         call.accept(scheduled),
@@ -2840,6 +2842,26 @@ class TestEncoder:
         )
         cross_mgr.kv_cache_map[ctx_req.py_request_id].resize.assert_called_once_with(80)
 
+    def test_cross_pool_reuse_is_scoped_by_cache_salt(self):
+        """Cross-KV blocks share the self pool's per-request salt namespace."""
+        self_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager(enable_block_reuse=True)
+        sched = make_encoder_scheduler(
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
+        )
+        ctx_req = make_ctx_request(0, context_remaining_length=50, encoder_output_len=80)
+        ctx_req.cache_salt = "tenant-a"
+
+        out = sched.schedule_request([ctx_req], set())
+
+        assert ids(out.context_requests) == [0]
+        cross_mgr._create_kv_cache.assert_called_once_with(
+            ctx_req.py_request_id,
+            ctx_req.lora_task_id,
+            ctx_req.get_encoder_unique_tokens.return_value,
+            cache_salt="tenant-a",
+        )
+
     def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
         """Later decoder chunks read existing cross-KV without reallocation."""
         self_mgr = make_kv_cache_manager()
@@ -2945,7 +2967,9 @@ class TestCrossKVAllocationFailures:
         ]
         retry_cache = cross_mgr.kv_cache_map[0]
         assert retry_cache is not failed_cache
-        cross_mgr._create_kv_cache.assert_any_call(0, blocked.lora_task_id, None)
+        cross_mgr._create_kv_cache.assert_any_call(
+            0, blocked.lora_task_id, None, cache_salt=blocked.cache_salt
+        )
         cross_mgr._resume_and_restore.assert_called_with(0, retry_cache)
         retry_cache.resize.assert_called_once_with(82)
         for manager in (self_mgr, cross_mgr):
@@ -3399,6 +3423,49 @@ class TestChunkedContext:
 
         assert ids(out.context_requests) == [0]
         assert req.context_chunk_size == 128
+
+    @staticmethod
+    def _started_ctx_ending_at_snapshot(request_id: int, position: int, point: int):
+        req = make_ctx_request(
+            request_id,
+            1000,
+            prompt_len=position + 1000,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = position
+        req.expect_snapshot_points = [point]
+        return req
+
+    def test_force_chunk_first_chunk_waits_on_leftover_budget(self):
+        # The started chunk stops at its snapshot point after 130 tokens and
+        # leaves 20 of 150. A first chunk would only prepare and release.
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr, max_num_tokens=150, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 32)
+        )
+        started = self._started_ctx_ending_at_snapshot(0, 1000, 1130)
+        waiting = [make_ctx_request(1, 4000), make_ctx_request(2, 4000)]
+
+        out = sched.schedule_request([started, *waiting], set())
+
+        assert ids(out.context_requests) == [0]
+        assert started.context_chunk_size == 130
+        assert mgr.prepare_context.call_args_list == [call(started)]
+        mgr.free_resources.assert_not_called()
+
+    def test_force_chunk_first_chunk_that_fits_leftover_still_runs(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr, max_num_tokens=150, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 32)
+        )
+        started = self._started_ctx_ending_at_snapshot(0, 1000, 1130)
+        short = make_ctx_request(1, 16)
+
+        out = sched.schedule_request([started, short], set())
+
+        assert ids(out.context_requests) == [0, 1]
+        assert short.context_chunk_size == 16
 
     def test_multiple_ctx_share_budget(self):
         """Two ctx requests share the budget."""
@@ -5016,3 +5083,113 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+class TestPregrownContextCapacity:
+    """Capacity grown by a skipped forward is replayed exactly, first, under SWA scratch reuse."""
+
+    def _make(self, scratch=True):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.enable_swa_scratch_reuse = scratch
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        return sched, mgr
+
+    @staticmethod
+    def _req(mgr, request_id, remaining, kv_start=0, grown=0):
+        """grown: capacity held past kv_start by an earlier, skipped pass."""
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, is_first_context_chunk=kv_start == 0
+        )
+        req.context_current_position = kv_start
+        mgr.kv_cache_map[request_id].capacity = kv_start + grown + mgr.num_extra_kv_tokens
+        return req
+
+    def test_pregrown_tokens_are_computed_and_clamped(self):
+        sched, mgr = self._make()
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, kv_start=1_000)) == 0
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 768
+        mgr.num_extra_kv_tokens = 3
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 768
+        mgr.num_extra_kv_tokens = 0
+        # Never more than what is left to prefill.
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 500, 1_000, grown=768)) == 500
+        req = self._req(mgr, 0, 5_000, kv_start=1_000)
+        mgr.kv_cache_map[0].capacity = 900
+        assert sched._pregrown_context_tokens(req) == 0
+
+    def test_zero_without_scratch_reuse_or_cache(self):
+        sched, mgr = self._make(scratch=False)
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 0
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 5_000, 1_000, grown=768)
+        mgr.kv_cache_map.pop(0)
+        assert sched._pregrown_context_tokens(req) == 0
+        # A manager that does not define the flag reads as off.
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 0
+
+    def test_replays_exactly_the_pregrown_chunk(self):
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 512  # not the full 1024 budget
+        mgr.resize_context.assert_called_once_with(req, 512)
+
+    def test_mm_alignment_does_not_resize_the_pregrown_chunk(self):
+        import torch
+
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        # The pre-grown end was MM-aligned when first sized: a block ends there.
+        mask = torch.zeros(1_024 + 10_000, dtype=torch.int64)
+        mask[1_024 + 448 : 1_024 + 512] = 1
+        req.py_multimodal_data = {
+            "multimodal_embed_mask_cumsum": mask.cumsum(0, dtype=torch.int64),
+            "mm_bidirectional_blocks": True,
+        }
+        with patch.object(
+            sched, "_align_chunk_to_mm_block", wraps=sched._align_chunk_to_mm_block
+        ) as align:
+            out = sched.schedule_request([req], set())
+        align.assert_not_called()
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 512
+        mgr.resize_context.assert_called_once_with(req, 512)
+
+    def test_skipped_when_the_budget_cannot_cover_it(self):
+        sched, mgr = self._make()
+        first = self._req(mgr, 0, 10_000, kv_start=1_024, grown=768)
+        second = self._req(mgr, 1, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0]
+        assert first.context_chunk_size == 768
+        assert all(call.args[0] is not second for call in mgr.resize_context.call_args_list)
+
+    def test_pregrown_request_runs_first_when_reordered(self):
+        sched, mgr = self._make()
+        newcomer = self._req(mgr, 1, 256)
+        pregrown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([newcomer, pregrown], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert pregrown.context_chunk_size == 512
+        assert newcomer.context_chunk_size == 256
+
+    def test_suspended_pregrown_request_runs_first(self):
+        sched, mgr = self._make()
+        newcomer = self._req(mgr, 1, 1_024)
+        pregrown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        mgr.kv_cache_map[0].is_active = False  # suspended: capacity is kept
+        out = sched.schedule_request([newcomer, pregrown], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert pregrown.context_chunk_size == 512
+        assert newcomer.context_chunk_size == 512
+
+    def test_order_unchanged_without_scratch_reuse(self):
+        sched, mgr = self._make(scratch=False)
+        short = self._req(mgr, 1, 256)
+        grown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([short, grown], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert grown.context_chunk_size == 768  # leftover budget, no clamp

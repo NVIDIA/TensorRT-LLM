@@ -18,8 +18,6 @@ Keep non-obvious constants here with their rationale so config, resource, and
 reduction code can use named values without duplicating comments.
 """
 
-import math
-
 # B200 has 148 SMs. Use this only when the runtime SM query is unavailable,
 # so auto split-KV selection remains deterministic in offline/test flows.
 FALLBACK_SM_COUNT_B200 = 148
@@ -60,7 +58,9 @@ KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
 # FlashInfer/TRT-LLM policy, this assumes normal model logits rather than
 # adversarial values outside the qualified probability bound. Streamed KV256
 # and block-sparse Keeps profiles apply it; see
-# ``FmhaDecodeConfig.defers_softmax_anchor_updates``.
+# ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
+# ``FmhaDecodeConfig.softmax_rescale_threshold_log2``, is its 16-bit default,
+# and is the block-sparse plans' default for every P dtype.
 SOFTMAX_RESCALE_THRESHOLD_LOG2 = 8.0
 
 # A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
@@ -156,10 +156,11 @@ FP16_VALUES_PER_REG = 2
 # one-byte or 16 two-byte K elements.
 MMA_K_STEP_BYTES = 32
 
-# FP8 probabilities are quantized as 448 * p (the E4M3 maximum); row sums and
-# sink terms share the scale, and the output normalization divides it out.
-FP8_P_QUANT_SCALE = 448.0
-FP8_P_QUANT_LOG2_SCALE = math.log2(FP8_P_QUANT_SCALE)
+# FP8 probabilities are quantized as ``p * FmhaDecodeConfig.fp8_p_quant_scale``:
+# the E4M3 maximum, less the binades a deferred exponent anchor may lag the
+# row maximum (``FmhaDecodeConfig.softmax_anchor_headroom_log2``). Row sums
+# and sink terms share the scale, and the output normalization divides it out.
+E4M3_MAX = 448.0
 
 # tcgen05 SMEM descriptor geometry: address offsets count 16-byte units and a
 # 128-byte swizzle atom spans one 128-byte row per K or MN index.
@@ -185,14 +186,21 @@ REDUCTION_BYTES_PER_SLICE = REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THRE
 
 # Clustered standalone reducer shape. One 128-thread CTA covers a contiguous
 # 2 KiB partial-O slice with one 16-byte vector per thread. Each cluster rank
-# owns a compile-time 2, 4, or 8 split slots. Loads are batched in groups of at
-# most four; padded split slots remain neutral and never form GMEM pointers.
+# owns a compile-time 2, 4, or 8 split slots. Padded and unpublished slots
+# remain neutral and never form GMEM pointers.
 PARALLEL_REDUCTION_THREADS_PER_CTA = 128
 PARALLEL_REDUCTION_BYTES_PER_SLICE = (
     PARALLEL_REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THREAD
 )
-PARALLEL_REDUCTION_LOAD_BATCH = 4
+# Batch independent published-slot loads before the serial fold.
+PARALLEL_REDUCTION_LOAD_BATCH = 16
 PARALLEL_REDUCTION_FINAL_REDUCERS = 4
+# Single-CTA reducer profiles spread one output fragment's split slots
+# over this many adjacent lanes and merge them with warp shuffles. The fold is
+# a serial chain of dependent FP32 instructions at very low occupancy, so more
+# lanes with fewer slots shorten that per-lane dependency chain. Must divide
+# the slots owned by each CTA.
+PARALLEL_REDUCTION_SLOT_LANES = 4
 
 # Each reduction thread produces an 8-element O vector backed by four packed
 # 16-bit registers.

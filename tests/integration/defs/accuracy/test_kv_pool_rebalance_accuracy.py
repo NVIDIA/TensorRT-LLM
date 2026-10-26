@@ -23,6 +23,8 @@ Run as:
       tests/integration/defs/accuracy/test_kv_pool_rebalance_accuracy.py
 """
 
+import warnings
+
 import pytest
 
 from tensorrt_llm import LLM
@@ -34,9 +36,17 @@ from ..conftest import llm_models_root, skip_pre_hopper
 # Ratio injection
 # --------------------------------------------------------------------------- #
 
+# Tokens every in-flight request must have generated before the forced
+# rebalance fires.  Late enough that adjust() migrates live KV for requests
+# that are mid-decode, early enough that most of each output is decoded
+# after it.  Also well ahead of prompt 1's known near-tie at token 10 (see
+# _NEAR_TIE_LOGPROB_MARGIN), so a flip there always lands after the rebalance
+# step, even when the overlap scheduler delays the rebalance by a token or two.
+_REBALANCE_AFTER_TOKENS = 4
 
-def _inject_pool_ratio_mismatch(llm: LLM, *, skew: float = 2.0) -> None:
-    """Force the V2 auto-tuner to do real pool-resize work on the next rebalance call.
+
+def _arm_mid_generation_rebalance(llm: LLM, *, skew: float = 2.0) -> list[dict[int, int]]:
+    """Force one real pool resize mid-generation and record where it landed.
 
     Delegates to the backend-agnostic KVCacheManagerV2 introspection hook, which
     bypasses the sample-count / cooldown gates and perturbs the target GPU ratio
@@ -44,19 +54,59 @@ def _inject_pool_ratio_mismatch(llm: LLM, *, skew: float = 2.0) -> None:
     >=2 pool groups (e.g. Gemma-3-1B with VSWA) and raises otherwise, so a future
     model change can't silently turn this test into a no-op.
 
+    Forcing that precondition before ``generate()`` is not enough: the executor
+    acts on it on its first iteration, before any request is scheduled, so
+    ``adjust()`` would resize empty pools and never move live KV.  Instead the
+    precondition is forced from inside the executor's rebalance hook, on the
+    first iteration where every in-flight request has generated at least
+    ``_REBALANCE_AFTER_TOKENS`` tokens.
+
     Also drops the executor's rebalance-check throttle to every iteration, so
     the test does not depend on how ``KV_POOL_REBALANCE_CHECK_INTERVAL`` compares
-    to the number of iterations this short prompt set happens to run.  Raise that
-    interval above the iteration count and the hook would never fire, leaving the
-    token comparison below to pass vacuously; the ratio assertion in
-    ``_generate_tokens`` is the backstop that would catch it.
+    to the number of iterations this short prompt set happens to run.
+
+    Returns a list that gets one entry per rebalance that actually runs.  Each
+    entry maps the client id of every in-flight request (the ``request_id``
+    that ``generate()`` reports) to the number of tokens it had generated at
+    that point; tokens from that index on were decoded against the migrated KV
+    cache.
     """
     from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
 
     executor = llm._executor.engine
     executor._rebalance_check_interval = 1
-    kv_cache_manager = executor.kv_cache_manager
-    _introspection.force_rebalance_precondition(kv_cache_manager.impl, skew=skew)
+    impl = executor.kv_cache_manager.impl
+    maybe_rebalance = executor._maybe_rebalance_kv_pools
+    rebalance_now = executor._rebalance_kv_pools_now
+    armed = False
+    rebalances: list[dict[int, int]] = []
+
+    def num_generated(req) -> int:
+        return req.get_num_tokens(0) - req.py_prompt_len
+
+    def maybe_rebalance_mid_generation() -> None:
+        nonlocal armed
+        active = executor.active_requests
+        if (
+            not armed
+            and active
+            and all(num_generated(r) >= _REBALANCE_AFTER_TOKENS for r in active)
+        ):
+            _introspection.force_rebalance_precondition(impl, skew=skew)
+            armed = True
+        maybe_rebalance()
+
+    def record_and_rebalance() -> None:
+        # Runs after the overlap loop's in-flight batch has been consumed, so
+        # the token counts include every token sampled before the resize.
+        rebalances.append({r.py_client_id: num_generated(r) for r in executor.active_requests})
+        rebalance_now()
+
+    # Both are looked up on self at their call sites in the executor loops,
+    # so instance attributes take effect.
+    executor._maybe_rebalance_kv_pools = maybe_rebalance_mid_generation
+    executor._rebalance_kv_pools_now = record_and_rebalance
+    return rebalances
 
 
 # --------------------------------------------------------------------------- #
@@ -110,10 +160,14 @@ def _vswa_kv_cache_config(*, enable_rebalance: bool) -> KvCacheConfig:
 
 
 def _generate_tokens(*, model_path: str, disable_overlap: bool, enable_rebalance: bool):
-    """Run one LLM, return a (token_ids, logprobs) pair per prompt.
+    """Run one LLM, return ``(results, rebalance_steps)``.
 
+    ``results`` holds a (token_ids, logprobs) pair per prompt, where
     ``logprobs`` holds one ``{token_id: Logprob}`` dict per generated token,
     covering that position's top-2 candidates.
+
+    ``rebalance_steps`` is None without rebalance.  With it, entry ``i`` is the
+    index of prompt ``i``'s first token decoded after the forced ``adjust()``.
 
     Note: the ratio-injection helper requires direct access to the
     in-process PyExecutor, so the test runs in single-process worker
@@ -130,7 +184,7 @@ def _generate_tokens(*, model_path: str, disable_overlap: bool, enable_rebalance
     ) as llm:
         impl = llm._executor.engine.kv_cache_manager.impl
         if enable_rebalance:
-            _inject_pool_ratio_mismatch(llm)
+            rebalances = _arm_mid_generation_rebalance(llm)
         ratio_before = list(_introspection.current_gpu_ratio(impl))
         outputs = llm.generate(_PROMPTS, _SAMPLING)
         ratio_after = list(_introspection.current_gpu_ratio(impl))
@@ -164,10 +218,28 @@ def _generate_tokens(*, model_path: str, disable_overlap: bool, enable_rebalance
                 f"{len(logprobs)} for {len(token_ids)} tokens"
             )
             results.append((token_ids, logprobs))
-        return results
+
+        if not enable_rebalance:
+            return results, None
+
+        # The ratio moving shows adjust() ran, but not that it ran while the
+        # requests were mid-decode, which is what this test is for.
+        assert len(rebalances) == 1, f"expected exactly one forced rebalance, got {len(rebalances)}"
+        in_flight = rebalances[0]
+        rebalance_steps = []
+        for i, o in enumerate(outputs):
+            step = in_flight.get(o.request_id)
+            num_tokens = len(o.outputs[0].token_ids)
+            assert step is not None and step < num_tokens, (
+                f"prompt {i}: the rebalance did not land mid-generation "
+                f"(in flight at the time: {in_flight}, request {o.request_id} "
+                f"generated {num_tokens} tokens), so its KV cache was never migrated"
+            )
+            rebalance_steps.append(step)
+        return results, rebalance_steps
 
 
-def _assert_tokens_match_or_near_tie(prompt_idx: int, baseline, treated) -> None:
+def _assert_tokens_match_or_near_tie(prompt_idx: int, baseline, treated, rebalance_step) -> bool:
     """Assert both arms decode identically, apart from at most one near-tie flip.
 
     Up to their first divergence the outputs must match token for token.  The
@@ -176,6 +248,13 @@ def _assert_tokens_match_or_near_tie(prompt_idx: int, baseline, treated) -> None
     each other.  That means the arms chose opposite sides of a near-tie while
     still agreeing on the two leading candidates.  Tokens after the divergence
     are not compared, because from there each arm continues a different prefix.
+
+    The divergence must also come at or after ``rebalance_step``.  Before the
+    rebalance both arms run the same configuration, so an earlier divergence
+    cannot be the rebalance's doing, and it would leave none of this prompt's
+    post-rebalance tokens checked.
+
+    Returns True if the outputs match exactly.
     """
     b_tokens, b_logprobs = baseline
     t_tokens, t_logprobs = treated
@@ -194,9 +273,14 @@ def _assert_tokens_match_or_near_tie(prompt_idx: int, baseline, treated) -> None
             f"{context}\n  outputs agree for {min(len(b_tokens), len(t_tokens))} "
             f"tokens, then one arm stops ({len(b_tokens)} vs {len(t_tokens)} tokens)"
         )
-        return
+        return True
 
     b_tok, t_tok = b_tokens[k], t_tokens[k]
+    assert k >= rebalance_step, (
+        f"{context}\n  diverged at token {k} ({b_tok} vs {t_tok}), before the "
+        f"rebalance at token {rebalance_step}: the arms are configured "
+        "identically until then, so the rebalance cannot have caused it"
+    )
     for arm, logprobs in (("baseline", b_logprobs), ("treated", t_logprobs)):
         top = logprobs[k]
         assert b_tok in top and t_tok in top, (
@@ -209,10 +293,15 @@ def _assert_tokens_match_or_near_tie(prompt_idx: int, baseline, treated) -> None
             f"{arm} top-2 logprob gap of {margin:.4f} > "
             f"{_NEAR_TIE_LOGPROB_MARGIN}: not a near-tie flip"
         )
-    print(
+    # A warning rather than a print, so accepted flips show up in the CI
+    # summary instead of only in captured output.
+    warnings.warn(
         f"prompt {prompt_idx}: accepted near-tie flip at token {k} "
-        f"({b_tok} vs {t_tok}); {k} tokens matched before it"
+        f"({b_tok} vs {t_tok}); {k - rebalance_step} tokens after the "
+        f"rebalance at token {rebalance_step} matched before it",
+        stacklevel=2,
     )
+    return False
 
 
 @skip_pre_hopper
@@ -221,7 +310,9 @@ class TestKvPoolRebalanceAccuracy:
 
     Compares rebalance=off and rebalance=on with a forced mid-generation
     adjust().  Outputs must match token for token, except that one divergence
-    at a near-tie is tolerated (see _assert_tokens_match_or_near_tie).
+    per prompt at a near-tie after the rebalance is tolerated (see
+    _assert_tokens_match_or_near_tie).  At least one prompt must match exactly,
+    so at least one output is checked end to end across the rebalance.
     """
 
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
@@ -232,14 +323,22 @@ class TestKvPoolRebalanceAccuracy:
         # can reach .engine on the client side.
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
-        baseline = _generate_tokens(
+        baseline, _ = _generate_tokens(
             model_path=self.MODEL_PATH, disable_overlap=disable_overlap, enable_rebalance=False
         )
 
-        treated = _generate_tokens(
+        treated, rebalance_steps = _generate_tokens(
             model_path=self.MODEL_PATH, disable_overlap=disable_overlap, enable_rebalance=True
         )
 
         assert len(baseline) == len(treated) == len(_PROMPTS)
-        for i, (b, t) in enumerate(zip(baseline, treated)):
-            _assert_tokens_match_or_near_tie(i, b, t)
+        exact = [
+            _assert_tokens_match_or_near_tie(i, b, t, step)
+            for i, (b, t, step) in enumerate(zip(baseline, treated, rebalance_steps))
+        ]
+        # Each tolerated flip leaves the rest of that prompt unchecked.  If every
+        # prompt flipped, most of the post-rebalance decode would go unverified.
+        assert any(exact), (
+            "every prompt took a near-tie flip after the rebalance; at least one "
+            "must match exactly so one output is checked end to end"
+        )

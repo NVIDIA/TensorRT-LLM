@@ -264,6 +264,31 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
+        # `is True`: a manager without the flag reads as off.
+        self._swa_scratch_reuse = (
+            getattr(kv_cache_manager, "enable_swa_scratch_reuse", False) is True
+        )
+
+    def _pregrown_context_tokens(self, req: LlmRequest) -> int:
+        """KV capacity a context request holds past its position, left by a skipped forward.
+
+        Under SWA scratch reuse, blocks of the grown chunk outside its end's
+        window get no page; a shorter chunk would leave pages missing inside the
+        next chunk's window (an invalid page index), so it must replay exactly.
+        A suspended cache keeps its capacity, so it counts too.
+        """
+        if not self._swa_scratch_reuse:
+            return 0
+        kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return 0
+        grown = (
+            kv_cache.capacity
+            - self.kv_cache_manager.num_extra_kv_tokens
+            - req.context_current_position
+        )
+        return max(0, min(grown, req.context_remaining_length))
+
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
 
@@ -566,6 +591,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
+        # After any reordering: pre-grown requests go first so no other request
+        # takes the budget their replay needs (stable sort).
+        if self._swa_scratch_reuse:
+            pending_ctx = sorted(
+                pending_ctx,
+                key=lambda r: not (
+                    r.state_value == self._context_init_state_value
+                    and self._pregrown_context_tokens(r) > 0
+                ),
+            )
+
         for req in pending_ctx:
             if budget.requests_full:
                 break
@@ -576,6 +612,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and req.state_value == self._context_init_state_value
                 and not self._has_context_chunk_budget(budget)
             ):
+                continue
+            if scheduled_ctx and self._first_chunk_waits_for_budget(req, budget):
                 continue
             if req.py_request_id in preempted_ids:
                 continue
@@ -959,6 +997,26 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
         )
 
+    def _first_chunk_waits_for_budget(self, req: LlmRequest, budget: BudgetTracker) -> bool:
+        """Whether a first chunk should wait for the next iteration's budget.
+
+        FORCE_CHUNK admits a leftover below chunk_unit_size, because a started
+        context can end at a snapshot point or at its end inside it. A first
+        chunk learns its reuse only in prepare_context, which matches its prefix
+        and resumes its pages, and a failed first chunk releases both again.
+        Once another context chunk runs this iteration, the first chunk waits
+        for a fresh budget unless its whole remaining prompt fits.
+        """
+        remaining = budget.remaining_tokens
+        return (
+            self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+            and req.state_value == self._context_init_state_value
+            and req.is_first_context_chunk
+            and remaining is not None
+            and remaining < self.chunk_unit_size
+            and req.context_remaining_length > remaining
+        )
+
     def _try_schedule_context_chunked(
         self,
         req: LlmRequest,
@@ -1040,15 +1098,26 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
+        # Run exactly the pre-grown chunk, or wait for a pass with enough budget;
+        # a longer chunk would grow the capacity again before the history catches up.
+        pregrown = self._pregrown_context_tokens(req)
+        if pregrown > 0:
+            if chunk_size < pregrown:
+                return ScheduleAction.SKIP, 0, False
+            chunk_size = pregrown
+
         if chunk_size <= 0:
             # Out of token budget rather than out of pages, so releasing pages
             # would not help; the next iteration gets a fresh budget. Not
             # suspended either, to avoid pathological suspend/resume cycles.
             return ScheduleAction.SKIP, 0, False
 
-        chunk_size = self._align_chunk_to_mm_block(
-            req, chunk_size, remaining_budget, context_remaining
-        )
+        # A pre-grown chunk was MM-aligned from this same position when it was
+        # first sized, and either snap direction would break the exact replay.
+        if pregrown == 0:
+            chunk_size = self._align_chunk_to_mm_block(
+                req, chunk_size, remaining_budget, context_remaining
+            )
         # Alignment returns 0 when neither snap-up nor snap-down can preserve
         # bidirectional MM attention this iteration — defer the request rather
         # than schedule a chunk that would corrupt attention. Next iteration
@@ -1434,7 +1503,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 else None
             )
             kv_cache = cross_kv_cache_manager._create_kv_cache(
-                req.py_request_id, req.lora_task_id, input_tokens
+                req.py_request_id, req.lora_task_id, input_tokens, cache_salt=req.cache_salt
             )
             kv_cache.cuda_stream = cross_kv_cache_manager._stream.cuda_stream
 
@@ -1534,9 +1603,9 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _try_allocate_generation(self, req: LlmRequest) -> bool:
         """Atomically admit one generation step in target and draft pools.
 
-        The draft pool mirrors the target pool (same requests, same block
-        boundaries, same ``tokens_per_block``), so a draft-side failure just
-        means this request does not fit. Roll the target growth back and report
+        The draft pool mirrors the target pool's requests and token counts (a
+        standalone drafter's pool may use its own ``tokens_per_block``), so a
+        draft-side failure just means this request does not fit. Roll the target growth back and report
         a plain allocation failure, letting the caller run the same evict /
         recompute-pause / self-suspend ladder it uses for target-pool pressure.
 

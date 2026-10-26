@@ -69,14 +69,12 @@ class TestSetupSamplerStepRequestSelection:
         *,
         is_attention_dp_dummy: bool = False,
         is_finished: bool = False,
-        py_is_draft: bool = False,
     ) -> LlmRequest:
         return cast(
             LlmRequest,
             SimpleNamespace(
                 is_attention_dp_dummy=is_attention_dp_dummy,
                 is_finished=is_finished,
-                py_is_draft=py_is_draft,
             ),
         )
 
@@ -85,34 +83,27 @@ class TestSetupSamplerStepRequestSelection:
 
         context_request = self._make_request()
         finished_context_request = self._make_request(is_finished=True)
-        draft_context_request = self._make_request(py_is_draft=True)
         adp_dummy_generation_request = self._make_request(is_attention_dp_dummy=True)
         regular_generation_request = self._make_request()
         finished_adp_dummy_generation_request = self._make_request(
             is_attention_dp_dummy=True, is_finished=True
         )
-        draft_adp_dummy_generation_request = self._make_request(
-            is_attention_dp_dummy=True, py_is_draft=True
-        )
 
         scheduled_requests.context_requests_last_chunk = [
             context_request,
             finished_context_request,
-            draft_context_request,
         ]
         scheduled_requests.generation_requests = [
             adp_dummy_generation_request,
             regular_generation_request,
             finished_adp_dummy_generation_request,
-            draft_adp_dummy_generation_request,
         ]
 
         collected = TorchSampler._collect_new_requests_for_setup(scheduled_requests)
-        assert len(collected) == 4
+        assert len(collected) == 3
         assert collected[0] is context_request
         assert collected[1] is adp_dummy_generation_request
         assert collected[2] is finished_adp_dummy_generation_request
-        assert collected[3] is draft_adp_dummy_generation_request
 
 
 @force_ampere
@@ -806,9 +797,8 @@ def test_stable_greedy_cache_key_includes_sequence_slots(monkeypatch: pytest.Mon
             sampling_config=SamplingConfig(),
             seq_slot=seq_slot,
             is_streaming=False,
-            is_draft=is_draft,
         )
-        for seq_slot, is_draft in ((0, False), (1, True))
+        for seq_slot in (0, 1)
     ]
 
     for seq_slot, request in enumerate(requests):
@@ -928,6 +918,74 @@ def test_greedy_occurrence_penalties_bypass_stable_path(penalty_name: str, penal
 
     assert not single_step_greedy
     assert new_tokens_host.reshape(-1)[0].item() == 2
+
+
+@pytest.mark.parametrize(
+    ("target_tokens", "finish_step", "force_num_accepted", "expected_tokens", "expected_accepted"),
+    [
+        pytest.param([5, 6, 7, 8], None, 0, [5, 6, 7, 8], 3, id="all_accepted"),
+        pytest.param([9, 6, 7, 8], None, 0, [9], 0, id="first_rejected"),
+        pytest.param([5, 6, 9, 8], None, 0, [5, 6, 9], 2, id="mid_chain_rejected"),
+        pytest.param([5, 6, 7, 8], 1, 0, [5, 6], 1, id="finished_mid_chain"),
+        pytest.param([9, 9, 9, 9], None, 2, [9, 9, 9], 2, id="force_num_accepted"),
+    ],
+)
+def test_draft_tokens_accepted_until_first_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    target_tokens: list[int],
+    finish_step: Optional[int],
+    force_num_accepted: int,
+    expected_tokens: list[int],
+    expected_accepted: int,
+):
+    draft_tokens = [5, 6, 7]
+    max_num_sequences = 4
+    monkeypatch.setenv("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS", str(force_num_accepted))
+    sampler = TorchSampler(
+        args=TorchSampler.Args(
+            max_seq_len=32,
+            max_draft_len=len(draft_tokens),
+            max_total_draft_tokens=len(draft_tokens),
+            max_num_sequences=max_num_sequences,
+            max_beam_width=1,
+            disable_overlap_scheduler=True,
+        )
+    )
+    prompt = [1, 2]
+    request = LlmRequest(
+        request_id=0,
+        seq_slot=2,
+        input_tokens=prompt,
+        max_new_tokens=16,
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+        draft_tokens=draft_tokens,
+    )
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests_last_chunk = [request]
+    sampler.setup_sampler_step(scheduled_requests)
+
+    new_tokens = torch.zeros((len(draft_tokens) + 1, max_num_sequences, 1), dtype=torch.int32)
+    new_tokens[:, request.py_seq_slot, 0] = torch.tensor(target_tokens, dtype=torch.int32)
+    finish_reasons = torch.full_like(new_tokens, FinishReason.NOT_FINISHED.value)
+    if finish_step is not None:
+        finish_reasons[finish_step, request.py_seq_slot, 0] = FinishReason.END_ID.value
+    state = SampleStateTorch(
+        requests=[request],
+        device=None,
+        host=SampleStateTensorsHostTorch(
+            new_tokens=new_tokens,
+            finish_reasons=finish_reasons,
+            first_finish_reasons=None,
+        ),
+    )
+
+    sampler.update_requests(state)
+
+    assert request.get_tokens(0) == prompt + expected_tokens
+    assert request.py_num_accepted_draft_tokens == expected_accepted
+    assert request.py_rewind_len == len(draft_tokens) - expected_accepted
+    assert request.is_finished == (finish_step is not None)
 
 
 class TestFinishReasons:
@@ -1125,7 +1183,6 @@ class TestFinishReasons:
                 ).T
                 sampler.store.new_tokens[:, seq_slots_cuda, cls.BEAM] = new_tokens_cuda
 
-                is_draft_batch = False
                 # Capture return value of write_finish_reasons for use after _uut() runs.
                 write_finish_reasons_result: list[torch.Tensor] = []
 
@@ -1133,7 +1190,6 @@ class TestFinishReasons:
                     with extra_context() if extra_context is not None else nullcontext():
                         result = sampler._finish_reasons_handler.write_finish_reasons(
                             seq_slots_host=seq_slots_host,
-                            is_draft_batch=is_draft_batch,
                             seq_slots_cuda=seq_slots_cuda,
                             seq_lens_cuda=seq_lens_cuda,
                             new_tokens_cuda=sampler.store.new_tokens,
@@ -1338,152 +1394,6 @@ class TestFinishReasons:
             extra_context=lambda: raising_single_token_stop_words_ctx(False),
         )
         run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
-
-    @classmethod
-    def check_resize_and_update_stop_words_buffer(
-        cls,
-        old_stop_words: torch.Tensor,
-        old_past_tokens: torch.Tensor,
-        new_stop_words: torch.Tensor,
-        new_past_tokens: torch.Tensor,
-        seq_slots_to_compare: torch.Tensor,
-        num_draft_tokens: int,
-    ):
-        old_num_stop_words = old_stop_words.shape[0]
-        old_stop_word_length = old_stop_words.shape[1]
-
-        old_past_token_length = old_past_tokens.shape[0]
-
-        # These sizes should not change after the resize
-        assert old_stop_words.shape[2] == new_stop_words.shape[2]
-        assert old_past_tokens.shape[1] == new_past_tokens.shape[1]
-        assert old_past_tokens.shape[2] == new_past_tokens.shape[2]
-
-        assert (
-            new_stop_words[-old_num_stop_words:, -old_stop_word_length:, seq_slots_to_compare]
-            == old_stop_words[..., seq_slots_to_compare]
-        ).all()
-        # initial fill has an offset of 1, as there will be a shift happening during sample_async
-        assert (
-            new_past_tokens[-old_past_token_length:-num_draft_tokens, seq_slots_to_compare, :]
-            == old_past_tokens[:-num_draft_tokens, seq_slots_to_compare, :]
-        ).all()
-
-    @classmethod
-    def test_stop_words_buffer_resize(cls, monkeypatch: pytest.MonkeyPatch):
-        @contextmanager
-        def check_resize_ctx() -> Generator[None, None, None]:
-            with monkeypatch.context() as patch_ctx:
-                setup_sampler_step_orig = TorchSampler.setup_sampler_step
-
-                def setup_sampler_step_with_size_check(self, scheduled_requests: ScheduledRequests):
-                    # RequestCase.build calls setup_sampler_step to fill the buffers for all context requests
-                    # Move the context requests to the generation requests
-                    scheduled_requests.generation_requests = scheduled_requests.context_requests
-                    # Add a request that enforces a resize
-                    scheduled_requests.context_requests_last_chunk = [
-                        cls.RequestCase(
-                            prompt=[1],
-                            stop_words_list=[
-                                [x for x in range(2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH)]
-                            ],
-                            new_tokens=[4],
-                            finish_reasons=[cls.NOT_FINISHED],
-                        ).request
-                    ]
-                    # Store the old stop words and past tokens for comparison
-                    old_stop_words = self.store.stop_words.clone()
-                    old_past_tokens = self.store.past_tokens.clone()
-                    # Call setup sampler step to trigger the resize
-                    setup_sampler_step_orig(self, scheduled_requests)
-
-                    # Check if sizes are correct
-                    assert self.store.stop_words.shape[0] == TorchSampler.DEFAULT_MAX_STOP_WORDS
-                    assert (
-                        self.store.stop_words.shape[1]
-                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH
-                    )
-                    assert self.max_tokens == 1
-                    assert (
-                        self.store.past_tokens.shape[0]
-                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH - 1 + self.max_tokens
-                    )
-                    # Check if values are added correctly
-                    seq_slots_to_compare_cuda = torch.Tensor(
-                        [
-                            scheduled_requests.generation_requests[x].py_seq_slot
-                            for x in range(len(scheduled_requests.generation_requests))
-                        ]
-                    ).to(device="cuda", dtype=torch.int32, non_blocking=True)
-                    cls.check_resize_and_update_stop_words_buffer(
-                        old_stop_words,
-                        old_past_tokens,
-                        self.store.stop_words,
-                        self.store.past_tokens,
-                        seq_slots_to_compare_cuda,
-                        self.max_draft_len,
-                    )
-
-                patch_ctx.setattr(
-                    TorchSampler, "setup_sampler_step", setup_sampler_step_with_size_check
-                )
-                yield
-
-        # The test adds one more request
-        num_requests = 8
-        uut_provider_with_resize_on_demand = cls.RequestCase.build(
-            [
-                cls.RequestCase(
-                    prompt=[1 + x],
-                    stop_words_list=[[x + 100]],
-                    new_tokens=[x + 4, x + 3, x + 2],
-                    finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.NOT_FINISHED],
-                )
-                for x in range(num_requests)
-            ],
-            extra_context=lambda: check_resize_ctx(),
-        )
-        run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=0.5)
-
-    @classmethod
-    def test_stop_words_buffer_resizes_on_demand(cls, monkeypatch: pytest.MonkeyPatch):
-        @contextmanager
-        def check_resize_ctx() -> Generator[None, None, None]:
-            with monkeypatch.context() as patch_ctx:
-                setup_sampler_step_orig = TorchSampler.setup_sampler_step
-
-                def setup_sampler_step_with_size_check(self, scheduled_requests: ScheduledRequests):
-                    setup_sampler_step_orig(self, scheduled_requests)
-                    assert self.store.stop_words.shape[0] == TorchSampler.DEFAULT_MAX_STOP_WORDS
-                    assert (
-                        self.store.stop_words.shape[1]
-                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH
-                    )
-                    assert self.max_tokens == 1
-                    assert (
-                        self.store.past_tokens.shape[0]
-                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH - 1 + self.max_tokens
-                    )
-
-                patch_ctx.setattr(
-                    TorchSampler, "setup_sampler_step", setup_sampler_step_with_size_check
-                )
-                yield
-
-        uut_provider_with_resize_on_demand = cls.RequestCase.build(
-            [
-                cls.RequestCase(
-                    prompt=[1],
-                    stop_words_list=[
-                        [x for x in range(2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH)]
-                    ],
-                    new_tokens=[4],
-                    finish_reasons=[cls.NOT_FINISHED],
-                )
-            ],
-            extra_context=lambda: check_resize_ctx(),
-        )
-        run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
 
     @staticmethod
     def _all_beams_finished_reference(row: torch.Tensor, beam_width: int) -> bool:
@@ -1911,8 +1821,6 @@ class TestBatchedSampling:
         logits_orig = logits.clone()
         try:
             yield {
-                # No 'd2t': Non-greedy sampling with 'd2t' is currently not
-                #           supported and greedy case is tested elsewhere
                 "logits": logits,
             }
         finally:
@@ -3118,7 +3026,6 @@ class TestRequestSeed:
                 SimpleNamespace(
                     py_seq_slot=0,
                     py_request_id=request_id,
-                    py_is_draft=False,
                     sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
                 ),
             )
@@ -3130,75 +3037,6 @@ class TestRequestSeed:
 
         assert first.seed.tolist() == second.seed.tolist() == [42]
         assert first.offset.item() != second.offset.item()
-
-    def test_draft_batch_does_not_disturb_target_seed_state(self):
-        """Draft slots come from a different SeqSlotManager over the same range.
-
-        Observing a draft batch must not look like a change of occupant for the
-        target request holding that slot number, which would reset its offset
-        and make it replay part of its stream.
-        """
-        manager = _SeedManager(max_num_sequences=4, global_seed=42)
-        device = torch.device("cpu")
-
-        target = cast(
-            LlmRequest,
-            SimpleNamespace(
-                py_seq_slot=0,
-                py_request_id=100,
-                py_is_draft=False,
-                sampling_config=SamplingConfig(SamplingParams(seed=1234)._get_sampling_config()),
-            ),
-        )
-        manager.observe([target])
-        assert manager.take_row_seeds([0], device=device).seed.tolist() == [1234]
-        offset_before = manager._offsets[0].item()
-
-        # A draft request lands on slot 0, owned by `target` above.
-        draft = cast(
-            LlmRequest,
-            SimpleNamespace(
-                py_seq_slot=0,
-                py_request_id=200,
-                py_is_draft=True,
-                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
-            ),
-        )
-        manager.observe([draft])
-        # Draft rows draw from the global seed, not the target's stream.
-        assert manager.take_row_seeds([0], device=device).seed.tolist() == [42]
-        assert manager._offsets[0].item() == offset_before
-        assert manager._slot_owner[0] == 100  # still the target request
-
-        # The target is unchanged when it comes back around.
-        manager.observe([target])
-        assert manager._offsets[0].item() == offset_before
-
-    def test_draft_batch_advances_unseeded_offsets(self):
-        manager = _SeedManager(max_num_sequences=4, global_seed=42)
-        device = torch.device("cpu")
-
-        def request(request_id: int, is_draft: bool) -> LlmRequest:
-            return cast(
-                LlmRequest,
-                SimpleNamespace(
-                    py_seq_slot=0,
-                    py_request_id=request_id,
-                    py_is_draft=is_draft,
-                    sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
-                ),
-            )
-
-        target = request(100, is_draft=False)
-        manager.observe([target])
-        before = manager.take_row_seeds([0], device=device)
-        manager.observe([request(200, is_draft=True)])
-        during = manager.take_row_seeds([0], device=device)
-        manager.observe([target])
-        after = manager.take_row_seeds([0], device=device)
-
-        assert before.seed.tolist() == during.seed.tolist() == after.seed.tolist() == [42]
-        assert before.offset.item() < during.offset.item() < after.offset.item()
 
     def test_multi_row_offsets_do_not_overlap(self):
         """Speculative decoding draws several rows per request per step.
@@ -3403,7 +3241,7 @@ class TestTopPDecay:
             py_request_id=0,
             py_seq_slot=slot,
             is_dummy=False,
-            return_log_probs=False,
+            py_return_log_probs=False,
             # Read by the row_stride query in sampler_common; these tests are
             # single-beam, so the static admission width is 1.
             py_beam_width=1,

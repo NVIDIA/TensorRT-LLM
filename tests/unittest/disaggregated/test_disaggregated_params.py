@@ -22,7 +22,7 @@ import torch
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor.result import GenerationResultBase, Logprob
-from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs
+from tensorrt_llm.inputs.multimodal import MultimodalInputLayout
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -248,7 +248,7 @@ def test_context_only_response_carries_the_first_token_logprobs_and_logits():
     )
     result._disaggregated_params = DisaggregatedParams(
         multimodal_embedding_handles=[{"tensor_size": [1, 16]}],
-        multimodal_input_layout=DisaggPrefillMultimodalInputs(
+        multimodal_input_layout=MultimodalInputLayout(
             prompt_token_ids=[1, 2, 3],
             multimodal_positions=[1],
             multimodal_lengths=[1],
@@ -277,6 +277,10 @@ def test_context_only_response_carries_the_first_token_logprobs_and_logits():
         cum_log_probs=[-0.5],
         log_probs=[[first_token_logprob]],
         generation_logits=first_logits,
+        per_pos_drafted=None,
+        per_pos_accepted=None,
+        spec_dec_totals=None,
+        time_breakdown_metrics=None,
         context_logits=None,
         request_perf_metrics=None,
         additional_context_outputs=None,
