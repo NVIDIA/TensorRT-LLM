@@ -93,7 +93,16 @@ def _cutedsl_score(
     # The kernel wants MQA index-K as [num_pages, page_size, head_dim]; the
     # squeeze is zero-copy and keeps the pool's real per-page stride, which the
     # TMA descriptor reads at runtime.
-    torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+    # Outside torch.compile the runner is called directly: the registered op
+    # launches the same compiled kernel, behind a Python custom-op dispatch and
+    # an input-description string it formats on every call, once per sparse
+    # layer of every eager step.
+    score_op = (
+        torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score
+        if torch.compiler.is_compiling()
+        else runner.forward
+    )
+    score_op(
         idx_q,
         idx_k_paged.squeeze(1),
         block_table,
