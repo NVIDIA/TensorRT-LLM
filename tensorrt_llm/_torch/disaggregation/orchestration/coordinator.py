@@ -28,6 +28,11 @@ from .interfaces import ActiveRequestRegistry, ExecutorEffects
 if TYPE_CHECKING:
     import torch
 
+    from tensorrt_llm._torch.disaggregation.transfer_manager import (
+        DomainFailure,
+        OperationObservation,
+        TransferManager,
+    )
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 
@@ -131,6 +136,61 @@ class DisaggTransferCoordinator:
         self._unpublished_gen_receives: Dict[
             int, Tuple[LlmRequest, Optional["torch.cuda.Event"]]
         ] = {}
+        self._shared_transfer_manager: Optional["TransferManager"] = None
+        self._shared_updates: List["OperationObservation"] = []
+
+    def attach_shared_transfer_manager(self, manager: "TransferManager") -> None:
+        """Attach the shared holder on its owner thread before submitting work.
+
+        Args:
+            manager: Executor-local holder assembled for a supported profile.
+
+        Raises:
+            RuntimeError: A different holder is already attached.
+        """
+        if (
+            self._shared_transfer_manager is not None
+            and self._shared_transfer_manager is not manager
+        ):
+            raise RuntimeError("a shared transfer manager is already attached")
+        self._shared_transfer_manager = manager
+
+    def has_pending_shared_transfers(self) -> bool:
+        """Return whether shared work still needs owner-loop progress."""
+        manager = self._shared_transfer_manager
+        return manager is not None and manager.pending()
+
+    def take_shared_updates(self) -> Tuple["OperationObservation", ...]:
+        """Drain local observations for orchestration to reconcile across ranks.
+
+        Returns:
+            Operation facts; request associations and readiness belong to orchestration.
+        """
+        updates = tuple(self._shared_updates)
+        self._shared_updates.clear()
+        return updates
+
+    def take_shared_domain_failures(self) -> Tuple["DomainFailure", ...]:
+        """Drain lender-wide stops for orchestration to apply at its recovery boundary."""
+        manager = self._shared_transfer_manager
+        return () if manager is None else manager.take_domain_failures()
+
+    def begin_shared_shutdown(self) -> None:
+        """Close shared admission while keeping the owner loop alive for cleanup."""
+        manager = self._shared_transfer_manager
+        if manager is not None:
+            manager.begin_shutdown(time.monotonic() + manager.shutdown_timeout_s)
+
+    def shared_shutdown_complete(self) -> bool:
+        """Return whether shared resources permit manager teardown."""
+        manager = self._shared_transfer_manager
+        return manager is None or manager.shutdown_status().complete
+
+    def _advance_shared_transfers(self) -> None:
+        """Observe shared work locally without entering native collectives."""
+        manager = self._shared_transfer_manager
+        if manager is not None:
+            self._shared_updates.extend(manager.advance(time.monotonic()))
 
     # -- loop head -----------------------------------------------------------
 
@@ -145,6 +205,7 @@ class DisaggTransferCoordinator:
         otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
         deadlocks or leaves peer replicas running.
         """
+        self._advance_shared_transfers()
         pending_ids = self.take_pending_context_failures()
         pending_requests = (
             [req for req in self._registry.active_requests() if get_unique_rid(req) in pending_ids]
@@ -851,13 +912,15 @@ class DisaggTransferCoordinator:
         )
         if waiting_on_transfer:
             time.sleep(0.001)
+        elif self.has_pending_shared_transfers():
+            self._shared_transfer_manager.wait_for_progress()
 
 
 class NoopDisaggCoordinator(DisaggTransferCoordinator):
     """Coordinator used when the executor has no KV cache transceiver.
 
-    A null object: no state, no dependencies, no side effects. The loops call
-    every entry point unconditionally, so each one is a no-op here. Transceiver
+    Native entry points are no-ops. An explicitly attached shared holder still
+    progresses without a native transceiver. Transceiver
     enablement is rank-uniform within a collective group, so every rank skips
     the same collectives symmetrically.
     """
@@ -875,7 +938,7 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         )
 
     def handle_errors_synced(self) -> None:
-        return None
+        self._advance_shared_transfers()
 
     def admit(self, fitting_gen_init: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
         return fitting_gen_init, False
@@ -941,4 +1004,5 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         return None
 
     def pace_idle(self) -> None:
-        return None
+        if self.has_pending_shared_transfers():
+            self._shared_transfer_manager.wait_for_progress()

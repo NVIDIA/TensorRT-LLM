@@ -229,6 +229,8 @@ def _reserve(req, *, local_end, offered_end, tail, tokens_per_block=4):
     mgr.tokens_per_block = tokens_per_block
     mgr._spec_recompute_tail = tail
     mgr.is_draft = False
+    # No lender attached: the history a window would reach is left as it is.
+    mgr._lent_history.side_effect = lambda kv_cache, history: history
     KVCacheManagerV2._prepare_connector_prefix_reservation(mgr, req)
     return connector
 

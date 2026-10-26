@@ -1116,3 +1116,78 @@ def test_final_admission_rejects_an_invalid_local_allocation() -> None:
     assert req.py_served_prefix_end == 0
     manager.release_unused_connector_reservations(set())
     assert connector.releases == [(1, 0, 64)]
+
+
+@pytest.mark.cpu_only
+class TestBesideALender:
+    """The connector loads past a fetch's prefix, no further than a window keeps locked blocks."""
+
+    class _EveryCache(dict):
+        def __contains__(self, key):
+            return True
+
+    @staticmethod
+    def locking(cap):
+        """A lender whose locks hold blocks of every cache and let a window reach ``cap`` tokens."""
+        every = TestBesideALender._EveryCache
+        return SimpleNamespace(
+            _history_cap=lambda kv_cache: cap,
+            _page_lock_state=lambda: SimpleNamespace(
+                holding=1, locked_caches=every(), caps_history=True, unreusable={}
+            ),
+        )
+
+    def test_the_connector_is_asked_past_the_prefix_a_fetch_served(self):
+        connector = FakeConnectorManager(num_matched=32)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=64, capacity=PROMPT_LEN)
+        kv_cache.history_length = 128  # the fetch's resume raised it
+        manager.kv_cache_map[req.py_request_id] = kv_cache
+        req.py_served_prefix_end = 128
+        req.set_prepopulated_prompt_len(128, TOKENS_PER_BLOCK)
+        assert manager._apply_connector_matched_prefix(req)
+        assert connector.queries == [(0, 128)]
+        assert req.context_current_position == 160
+        assert connector.commits == [(0, 32, False)]
+
+    def test_a_reservation_starts_past_the_prefix_a_fetch_served(self):
+        connector = FakeConnectorManager(num_matched=64)
+        connector.prefix_reservations_enabled = True
+        manager = make_manager(connector)
+        req = FakeRequest()
+        cache = FakeKvCache(committed=64, capacity=PROMPT_LEN)
+        cache.history_length = 128
+        manager.kv_cache_map[req.request_id] = cache
+        req.py_served_prefix_end = 128
+        assert manager.prepare_context(req)
+        assert connector.queries == [(0, 128)]
+        reservation = connector.get_prefix_reservation(req)
+        assert (reservation.start, reservation.end) == (128, 192)
+        assert req.context_current_position == 192
+
+    @pytest.mark.parametrize("cap,served", [(None, PROMPT_LEN - 1), (100, 100), (40, 64)])
+    def test_a_served_prefix_ends_where_a_window_keeps_the_locked_blocks(self, cap, served):
+        """Under a lock the served end, and so the history, stops where the window keeps them."""
+        connector = FakeConnectorManager(num_matched=192)
+        manager = make_manager(connector)
+        manager._sharing = self.locking(cap)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=64, capacity=PROMPT_LEN)
+        assert serve(manager, req, kv_cache) is (served > 64)
+        assert req.context_current_position == served
+        assert kv_cache.history_length == served
+        assert connector.commits == [(0, served - 64, False)]
+
+    def test_a_reservation_ends_at_the_whole_blocks_a_window_keeps_under_a_lock(self):
+        connector = FakeConnectorManager(num_matched=128)
+        connector.prefix_reservations_enabled = True
+        manager = make_manager(connector)
+        manager._sharing = self.locking(100)
+        req = FakeRequest()
+        manager.kv_cache_map[req.request_id] = FakeKvCache(committed=0, capacity=0)
+        assert manager.prepare_context(req)
+        reservation = connector.get_prefix_reservation(req)
+        assert (reservation.start, reservation.end) == (0, 96)
+        assert connector.releases == [(1, 96, 128)]
+        assert req.context_current_position == 96

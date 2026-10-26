@@ -12,30 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lending a KV cache manager v2's blocks to transfer backends.
-
-This module is the whole API: callers import only its names, the package's other modules are
-private, and ``attach_lender`` selects the implementation. The docstrings of these names state every
-caller obligation.
-
-Roles: the integrator attaches one lender to a manager; the holder lends, polls, marks arrivals and
-releases; the backend moves the bytes; the waiter asks ``Lender.resume_bounds``. Lender,
-lease and hold methods run only on the manager's thread, one call at a time: the builder, then the
-executor loop, then the shutdown thread. Positions are tokens. Ready views describe stable,
-accessible lent memory; leases and region holds delimit backend access. Cache ownership remains
-with the manager.
-"""
+"""Public KV-cache lending API; other modules are private. Positions are tokens.
+The integrator attaches; orchestration lends; holders poll and return leases; backends move ready
+bytes. Calls run serially on the manager thread through shutdown; leases/holds bound access;
+managers own caches."""
 
 import typing as _typing
 
 from ._types import (
-    LayerGroupBlocks,
+    ALL_ARRIVED,
+    HeldPages,
+    HoldReason,
     Lease,
     LeaseView,
     Lender,
+    LentLayerGroupRows,
+    MemoryKind,
     MemoryRegion,
     RegionHold,
     ResumeBounds,
+    RowSelection,
     StagingOptions,
 )
 
@@ -43,149 +39,176 @@ if _typing.TYPE_CHECKING:
     from ..kv_cache_manager_v2 import KVCacheManagerV2
 
 __all__ = [
-    "LayerGroupBlocks",
+    "ALL_ARRIVED",
+    "HeldPages",
+    "HoldReason",
+    "LentLayerGroupRows",
     "Lease",
     "LeaseView",
     "Lender",
+    "MemoryKind",
     "MemoryRegion",
     "RegionHold",
     "ResumeBounds",
+    "RowSelection",
     "StagingOptions",
     "attach_lender",
 ]
 
 
 def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: StagingOptions) -> Lender:
-    """Attach the manager's one lender, which relays whole blocks through host staging.
+    """Attach a lifetime lender; encoder-decoder models, including CROSS caches, are unsupported.
 
-    The lender copies blocks between a request's device pages and host slots on the manager's
-    execution stream, for backends that can only read and write host memory, and says where the
-    request may resume after a fetch. ``Lender`` states what its holder and backends keep. A
-    name covers ``scope``, the committed tokens up to its block's end, their multimodal digests and
-    the manager's reuse scope, nothing else a request carries, so the decoder self-attention pool of
-    an encoder-decoder model is not lent by name.
+    HOST supports NAMED; DEVICE supports NAMED and ALL. HOST/ALL or HOST without staging raises
+    ``ValueError``. Host regions precede device regions; ``Lender.page_layout`` locates each pool.
+    Import layout types from ``tensorrt_llm._torch.pyexecutor.kv_cache.page_layout``.
 
-    Caller obligations:
-        - This implementation reserves the request's device pages before waiting for host regions.
-          Keep room for running requests in each pool group while fetches are parked: their locked
-          pages, other unreclaimable pages, the largest generation request's full resume window and
-          its next step must fit within ``max_util_for_resume``. V2 cannot evict or preempt a parked
-          fetch. Reserving space for parked fetches alone does not prevent scheduler deadlock.
-        - Copies use the manager's execution stream, ordered with its forward work. Any writer of
-          recycled pages on another stream must wait for that stream first. The diagnostic fresh-
-          page fill (``TRTLLM_KV_FRESH_PAGE_FILL``) already does so and then synchronizes its own
-          stream; a fetch that grows pages with this diagnostic enabled can wait on the CPU.
-          Pageable memory under confidential computing can also make a call wait for its stream.
-        - A failed copy whose completion cannot be established quarantines its slots permanently.
-          Capacity can erode until a pending lease cannot fit and blocks those behind it. Release
-          leases that wait too long or free their requests. Quarantined slots, unreleased leases
-          or region holds, and cleanup errors can keep host memory until process exit.
-        - From ``lend_write`` until the request resumes or its cache is dropped, keep it among the
-          executor's active requests and unscheduled until the resume state is applied. To resume at
-          ``p``, set ``py_served_prefix_end=p``, raise the cache history to ``p`` if necessary and,
-          back in context state with a chunk spanning the remaining prompt, call
-          ``set_prepopulated_prompt_len(p, tokens_per_block)``. It moves the prepopulated length
-          and context position together; moving either alone is not sufficient. A resume at 0
-          from a later context position requires dropping the cache and recomputing.
-        - With routed-expert capture, fetch only before the first context step, not after a
-          recompute pause; otherwise skipped positions can have no recorded routes. A later
-          fetch also does not change the response's original ``cached_tokens`` count.
-        - Under attention data parallelism without a transceiver, do not park every active
-          request on a rank unless the resulting all-rank forward stall is acceptable.
-        - SWA scratch reuse must be off for fetches. A window must not abandon an uncomputed block
-          still held for prefix reuse; with extra speculative KV tokens, keep later consecutive
-          segments shorter than ``window + tokens_per_block - 1`` or compute the remainder.
-          Requests requiring context logits, prompt logprobs or additional per-token model
-          outputs cannot be fetched, because those outputs are not restored by this implementation.
-        - These device-page reservations, execution-stream ordering, diagnostics, slot quarantine
-          and executor-specific constraints belong to the current implementation and may change
-          when its backing mechanism changes; the ``Lender`` contract does not expose them.
-        - Attach on the thread that builds the executor, to the manager the executor serves. A
-          manager built only to estimate the KV cache size shuts down first, after which a lender
-          attached there lends nothing; that shutdown frees the staging memory, or keeps it until
-          the process exits where a lease or staging hold is still open then, a slot was lost to a
-          failed copy, an error in a free stopped the lender (``Lease``), or an error arose in the
-          lender's own work within that shutdown.
-        - Shut the manager down last, with the device's CUDA context used for the attach current
-          on the calling thread, after the shutdown steps ``Lender`` lists. A manager
-          that never shuts down keeps the staging memory and its own page-index host buffer until
-          the process exits, and a shutdown that raises keeps that buffer until a retried shutdown
-          returns, or else until the process exits: the runtime's shutdown raises while any cache is
-          open, also one whose close raised in a free, unless the runtime is poisoned. Its leases,
-          released ones too, and the lender's records also keep the requests' caches, and with them
-          the manager's device pools, until the leases and the lender are dropped; drop the last
-          reference on a thread that has used the device's CUDA context.
-        - For a request whose one-model draft has a joint-reuse pool of its own, attach a lender to
-          both managers, the draft pool's under a ``scope`` of its own (laid out alike, both pools
-          would name blocks alike), fetch through both, since a fetch fills only this manager's
-          blocks, and resume as ``ResumeBounds`` states, keeping what ``Lender`` states for
-          such a pair.
-        - A caller serving requests the input processor may treat differently keeps them apart with
-          per-item ``multi_modal_uuids``, which names and the multimodal encoder cache both cover,
-          since a name trusts the multimodal digests the input pipeline computes, as the manager's
-          own prefix reuse does. A digest covers an item's bytes, not how the input processor treats
-          them, so blocks with different KV bytes can share a name: a NumPy array and a
-          ``torch.Tensor`` with the same dtype, shape and bytes share a digest though some input
-          processors rescale only one, and a request's ``mm_processor_kwargs`` reach the processor
-          but not the digest. A ``cache_salt`` covers names but not that cache, which some models
-          keep by default and which keys an item's embedding by its digest and
-          ``mm_processor_kwargs``: salted requests can still share an embedding, so a ``cache_salt``
-          alone keeps them apart only with that cache off
-          (``multimodal_config.encoder_cache_max_bytes=0``).
-        - Under ``SaveHiddenStatesDecodingConfig`` a fetch restores only this manager's KV blocks,
-          so the hidden states saved for a resumed request pair its whole prompt with the rows of
-          the tokens it computed, then stale rows, misaligned as after the manager's own prefix
-          reuse: the caller fetches into no such request, or accepts that.
-        - An attach that raises for a reason its docstring does not list may keep the staging memory
-          it allocated until the process exits.
+    Names cover ``scope``, committed prefix tokens, multimodal digests and reuse scope, excluding
+    other request inputs. Naming requires committed blocks, a lossless cold-page codec, no model
+    recurrent state or context parallelism, and no one-model draft reading past a block's end.
+    Otherwise only DEVICE/ALL is available. A HOST region establishes named-lending support;
+    DEVICE naming follows these conditions. After reuse reset, NAMED returns failed leases while
+    ALL remains available. A loading KV connector disables staging, but does not itself forbid
+    DEVICE/NAMED. Eagle and MTP-Eagle look ahead one token, vanilla MTP its draft length; PARD,
+    DFlash and DSpark read none. Checks include shared draft layers, joint-reuse pools and targets
+    whose draft layers live elsewhere. Unknown upstream lookahead counts as zero, including
+    DraftTarget: its target names blocks, its unpaired noncommitting draft does not.
+
+    Contract obligations:
+        These caller duties are part of the public lending contract; a lending method a later
+        optional protocol adds states the duties of the leases it lends.
+
+        - Follow ``Lender``'s thread, progress, registration and shutdown duties. A lease binds to
+          the cache its request holds at the lend: do not run the request on a cache with an open
+          in-place write or recurrent-state lease that ``lend_read`` or ``lend_write`` lent.
+          Freeing such a cache retires it: its leases keep its pages protected until they are
+          returned and their rows count nothing, while the request may run on a new cache, the
+          pages then held twice (``Lender.held_page_counts``). Reads may overlap later steps;
+          access only returned rows, whose memory remains protected until the lease is returned.
+        - Attach on every cache-holding rank or none. Each pipeline stage lends only its own
+          layers; ``lend_read`` and ``lend_write`` lend them after the stage processed the step.
+          Aggregate attach outcomes across all ranks: any failure fails startup, since an attached
+          lender cannot be detached. Model-wide exclusions are checked consistently across stages;
+          ``max_bytes`` sufficiency is stage-local and can differ. For each distributed transfer,
+          require delivery on every stage, return every stage's leases in the same iteration
+          using the transfer path's allgather, and intersect bounds. Before ``return_writes``,
+          settle the transfer's outcome on every participating rank and finish all backend access
+          to its views. An arrival notification alone is insufficient; a HOST return may enqueue
+          a copy from staging immediately.
+        - Coordinate scheduling across cache-holding ranks. Protect every rank's locked requests
+          from eviction and preemption, and run a batch only after every rank has allocated it.
+          If any rank cannot allocate, roll back or retry consistently across ranks before forward.
+          A pipeline root's scheduling result does not establish admission on the other stages;
+          an integrator attaching lenders to a pipeline executor must supply this coordination.
+        - Apply settled bounds before scheduling a request fetched through ``lend_write``. An
+          empty intersection requires dropping its fetched caches and computing from zero. Fetch
+          both participating joint-reuse target/draft pools before advancing their shared cursor;
+          P/D receives that lend no draft pool do not intersect its bounds. Separate draft pools
+          need a lender and distinct scope.
+        - ALL arrivals need every transferred buffer's bytes this request will read. See
+          ``Lender.return_writes`` for permitted omissions; return a partially filled receive
+          with ``reusable=False``, and the lender keeps its cache out of reuse, as it does one
+          missing window margins. NAMED always transfers the whole object.
+        - Treat failed leases and empty bounds as request-level outcomes, including permanent local
+          states such as reuse reset. ``ValueError``/``TypeError`` from lends and returns and
+          misuse-related ``RuntimeError`` from lease methods and returns are caller errors.
+          ``RuntimeError`` from ``lend_*`` may also report a manager or CUDA operation failure.
+          After it or an unlisted exception, stop lending, polling and querying bounds; return
+          leases and release holds after access ends, treat parked fetch intervals as empty, drop
+          their caches and compute from zero.
+        - Subtract ``held_page_counts().deduct`` from admission capacity, separately per rank and
+          stage. Fetches can hold device pages while waiting for host slots; keep
+          ``held_page_counts().unreclaimable`` pages, the largest generation resume window and its
+          next step within each pool group's ``max_util_for_resume``. A parked-fetch quota alone
+          is insufficient.
+        - Use per-item ``multi_modal_uuids`` to distinguish processor-dependent inputs. Digests trust
+          input-pipeline bytes, like prefix reuse, and omit differences such as NumPy/Tensor rescaling
+          or ``mm_processor_kwargs``. ``cache_salt`` separates names but not encoder embeddings:
+          salt alone suffices only with ``multimodal_config.encoder_cache_max_bytes=0``.
+
+    Implementation constraints:
+        The V2 recovery recipe and the following reservations, streams, diagnostics, quarantine
+        and executor constraints depend on this implementation and are not frozen API obligations.
+
+        - Attach on the construction thread. Remote-cache configuration alone does not attach a
+          lender. A lender cannot lend after its manager shuts down.
+        - Host staging copies whole named rows on the manager stream; connector writes are unordered
+          with these copies. Each device pool is one region, fixed for the lender's life: do not
+          rebalance the pools of a manager with a lender attached.
+        - Before this worker finishes context, ALL reads end at finished whole blocks and in-place
+          reads omit groups whose window is shorter than that context, with SWA scratch reuse on or
+          off; read again after context finishes to obtain them. Recurrent groups lend one state row
+          at prompt end, between context and generation; their fetch resumes there or nowhere. Under
+          Helix, each rank lends pages of ``PageLayout.tokens_per_page`` tokens; starts align to
+          ``cp_size * tokens_per_page`` and ``total_input_len_cp`` is the whole prompt length.
+        - Locks prevent eviction, preemption, scheduler suspension and deadlock reports; history
+          cannot abandon locked pages. Allocation-failure rollback in ``revert_allocate_context``
+          and first-block ``resize_context`` skips suspension, leaving locked caches active;
+          explicit suspension and admission paths raise ``RuntimeError`` on locks. Overlapping
+          commits retry after unlock; freed caches close at their last unlock, and a reset with such
+          caches open raises ``RuntimeError``. Manager query hooks propagate original exception
+          types. These V2 errors report calling order, not a failed lease or poisoned domain.
+        - With a connector, fetch at or beyond the served prefix; connector loads start beyond a
+          fetched prefix. Reads reject prefix reservations and wait for pending loads, during which
+          windowed NAMED fetches reject history advancement. Lend outside batch preparation: an
+          accepted load can be abandoned before forward.
+        - Keep fetched requests active but unscheduled. To resume at ``p``, set
+          ``py_served_prefix_end=p``, raise cache history to ``p`` if needed, restore context state
+          with a chunk covering the remaining prompt, then call
+          ``set_prepopulated_prompt_len(p, tokens_per_block)`` to move both cursor fields. This
+          needs ``p`` below prompt length (``total_input_len_cp`` under Helix). A full ALL fetch
+          into generation-init resumes at prompt end as after a receive. Rewinding to zero requires
+          dropping and recomputing.
+        - Routed-expert capture allows fetching only before the first context step, never after
+          recompute pause; skipped routes are not restored. Later fetches leave ``cached_tokens``
+          unchanged. With attention data parallelism and no transceiver, parking every active
+          request on one rank can stall all ranks' forward.
+        - Disable SWA scratch reuse for fetches. Retain uncomputed prefix-reuse blocks; with extra
+          speculative KV tokens, keep later consecutive segments shorter than
+          ``window + tokens_per_block - 1`` or compute the remainder. Fetches do not restore context
+          logits, prompt logprobs or additional per-token outputs. With
+          ``SaveHiddenStatesDecodingConfig``, exclude fetches or accept saved states pairing the
+          full prompt with computed then stale rows.
+        - Writers recycling pages off the manager stream must wait for it. Diagnostic
+          ``TRTLLM_KV_FRESH_PAGE_FILL`` waits and synchronizes its own stream, so growth can block
+          the CPU, as confidential-computing pageable copies can. Shutdown waits for recorded
+          copies; the first runtime cache close can synchronize the device. Unknown copy completion
+          quarantines slots permanently: return leases waiting too long or free their requests.
+        - Shut down with the attach device's CUDA context current. Without shutdown, staging and
+          the manager's page-index host buffer survive until exit; failed shutdown retains that
+          buffer until retry succeeds or exit. Unless poisoned, runtime shutdown raises with any
+          cache open, including failed closes. Open locks/device holds retain runtime and pools;
+          open leases/holds, lost slots and cleanup errors can retain host memory until exit.
+          Even returned leases and lender records retain caches/pools: drop their last references
+          on a thread that has used the device's CUDA context. Unlisted attach errors may retain
+          allocated staging until exit.
 
     Args:
-        manager: A ``KVCacheManagerV2`` with a ``mapping`` that commits blocks to its prefix-reuse
-            tree: block reuse on, and joint reuse for a draft manager; not built for a one-model
-            draft that reads prompt tokens ahead, and without a KV cache connector. Subclasses are
-            accepted; one whose ``try_commit_blocks`` keys blocks from other tokens or another reuse
-            scope than the base manager's changes names silently, at worst putting wrong bytes under
-            a correct name.
-        scope: Equal exactly where KV bytes mean the same; at most 65535 bytes. The lender only puts
-            it, unread, into every name's namespace, so different scopes never share a name. It must
-            cover every configuration that changes a block's bytes beyond what the manager declares:
-            the model, its weights and LoRA adapters (the adapter an id maps to), the one-model
-            draft whose pool it is (its weights, mode and the target layers it reads), element types
-            and quantization, the attention (windows such as ``max_attention_window``, sinks, sparse
-            attention), the attention backend's K/V arrangement (head-major or token-major; the base
-            manager declares head-major whichever backend writes its pages), and a release that
-            changes what KV bytes mean. An adapter enters a name only through the request's
-            ``lora_task_id``: instances sharing a ``scope`` map each id to the same adapter, or else
-            lend no LoRA request by name or take different scopes. The framework's assembly builds
-            it from its configuration, so no backend guesses which settings it needs.
-        staging: The staging size, in whole fetches.
+        manager: A ``KVCacheManagerV2`` with a mapping. Naming requires block reuse, joint reuse
+            for a draft, and the restrictions above. Subclasses must preserve the committed tokens
+            and reuse scope used by ``try_commit_blocks`` or names can identify wrong bytes.
+        scope: At most 65535 bytes, equal exactly where KV bytes mean the same; different scopes
+            never share names. Cover model/weights, LoRA id-to-adapter mapping, one-model draft
+            weights/mode/target layers, dtypes/quantization, attention/windows/sinks/sparsity,
+            backend K/V arrangement and incompatible releases. The base manager declares head-major
+            regardless of writing backend. Equal scopes must map each ``lora_task_id`` to the same
+            adapter, or exclude LoRA from names. Framework assembly derives scope; backends do not.
+        staging: Host capacity in fetch units (``StagingOptions``).
 
     Returns:
-        The lender, installed on ``manager`` for the manager's life.
+        The lender installed for the manager's life.
 
     Raises:
-        TypeError: ``manager`` is not a ``KVCacheManagerV2`` or has no mapping, ``scope`` is not
-            ``bytes``, or ``staging`` is not ``StagingOptions``.
-        ValueError: A lender is attached already; the manager is context-parallel (Helix included,
-            ``mapping.cp_size > 1``) or pipeline-parallel (``mapping.pp_size > 1``), holds recurrent
-            state, commits no blocks (block reuse off, or a draft manager without joint reuse),
-            since a publish lends only committed blocks, has a KV cache connector or a lossy
-            cold-page codec (``quantization_for_cold_page``), or is built for a
-            one-model draft that reads prompt tokens ahead; it has a layer group of sparse buffers
-            (``is_sparse``), whose read-only pages a cache can lock in host memory, though sparse
-            attention whose buffers are not marked sparse is not refused by this; its layer groups,
-            layer configs and declarations do not agree; it has no pages to stage; ``scope`` is
-            longer than 65535 bytes; ``staging.max_bytes`` is below one fetch. One-model Eagle and
-            MTP-Eagle read 1 prompt token ahead, vanilla MTP its draft length, and the check reads
-            the manager, not ``is_draft``, so it refuses draft layers sharing the target's manager,
-            a joint-reuse draft pool, and the target's manager of such a draft whose layers live
-            elsewhere. Drafts reading no token ahead (PARD, DFlash, DSpark) and managers without
-            speculative decoding are accepted. A draft whose read-ahead upstream has not established
-            counts as reading none: for one-model DraftTarget, staging accepts the target's manager
-            and refuses its unpaired draft pool, which commits no blocks, so a fetch fills only the
-            target's blocks, as the manager's own prefix reuse does.
-        MemoryError: Page-locking the staging memory failed.
-    """
-    from ._lender import _attach_staging as _attach
+        TypeError: Manager is not V2 or lacks a mapping; scope is not bytes or staging is not
+            ``StagingOptions``.
+        ValueError: Already attached; CROSS cache; non-Helix context parallelism; model windows or
+            recurrent state under Helix; model sparse buffers (``is_sparse``), whose pages can live
+            in host memory; a non-REQUIRED attention group without a window; inconsistent groups,
+            configs or declarations, or a missing ``Role.ALL`` mapper declaration; no pages to
+            stage; ``max_bytes`` below one local fetch; a malformed region, or two of one memory
+            kind that overlap; or scope over 65535 bytes. Unmarked sparse-attention buffers are not
+            rejected as sparse.
+        MemoryError: Staging page-lock allocation failed."""
+    from ._lender import _attach_lender as _attach
 
     return _attach(manager, scope=scope, staging=staging)

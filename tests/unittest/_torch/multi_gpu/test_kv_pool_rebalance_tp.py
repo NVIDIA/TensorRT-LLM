@@ -105,6 +105,7 @@ def _make_executor(
     exe.is_shutdown = False
     exe.drafter = None
     exe.kv_cache_manager = MagicMock()
+    exe.kv_cache_manager._sharing = None
     exe.kv_cache_manager.max_beam_width = 1
     exe.kv_cache_manager.impl = MagicMock()
     exe.kv_cache_manager.impl.need_adjustment = need_adjustment
