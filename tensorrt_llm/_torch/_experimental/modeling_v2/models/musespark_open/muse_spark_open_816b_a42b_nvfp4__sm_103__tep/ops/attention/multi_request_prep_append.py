@@ -51,13 +51,24 @@ up running the built-in preprocess after all reads the same operand.
 ``prefetch`` (optional): a tensor whose bytes the kernel asks the L2 to fetch --
 the layer's attention output projection weight, read after the FMHA. Every
 program issues one ``cp.async.bulk.prefetch.L2`` of an equal slice right after
-its wait, so the requests leave every SM's TMA unit within the prep, before the
-FMHA's own TMA loads of K/V start. It reads nothing back and writes nothing: the
-values computed are the same with and without it.
+its wait, and a prefetching call runs one program per (row, head) item -- the
+built-in grid's program count, so the requests and their slice sizes are the
+built-in grid's -- and they leave every SM's TMA unit within the prep, before the
+FMHA's own TMA loads of K/V start. It reads nothing back and writes nothing: the values computed are the same
+with and without it.
+
+Launch geometry, per SM version (``LAUNCH_KIND_BY_SM``). On sm103 one program
+takes several consecutive (row, head) items of the row-major ``rows x (H + G)``
+grid (``PACKED_GEOMETRY``), each item running the per-head code of a
+one-program-per-(row, head) grid element for element (the same loads, the same
+additions in the same order, the same rounding points and stores), so the bytes
+written do not depend on the geometry. On sm107 the grid is one program per
+(row, head), one warp each (``_multi_request_prep_append_grid_kernel``).
 """
 
 from __future__ import annotations
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -74,7 +85,9 @@ from .preattn_prep import (
     _load8,
     _normalize,
     _rotate,
+    _rsqrt_approx_ftz,
     is_rope_table,
+    libdevice,
     preattn_prep,
 )
 
@@ -83,16 +96,340 @@ LOG2E = 1.4426950408889634
 #: Query rows per sequence the entry takes: one accepted token and up to 7 drafts.
 MAX_ROWS_PER_SEQ = 8
 #: Sequences one call takes: 128 verify blocks of 8 rows (``preattn_prep``'s 1024-row cap), the
-#: largest decode step of a generation worker of ``max_batch_size`` 128. The grid is one program
-#: per (row, head), so a call's rows do not depend on how many sequences it carries.
+#: largest decode step of a generation worker of ``max_batch_size`` 128. The grid covers the
+#: (row, head) items, so a call's rows do not depend on how many sequences it carries.
 MAX_SEQS = 128
 #: Rows one call takes.
 MAX_ROWS = MAX_SEQS * MAX_ROWS_PER_SEQ
+#: The launch geometry by row count: ``(last row count, (row, head) items per program, warps per
+#: program, vector lanes)``, the first entry whose row count reaches the call's. An item is one
+#: head of one row; a program's items are consecutive in row-major (row, head) order. With vector
+#: lanes a lane loads and stores its 8 consecutive values as one vector (the same bytes). The
+#: entries above 32 rows are the fastest geometries of a GB300 sweep at 16..1024 rows; up to 32
+#: rows one item per program (the built-in grid) is faster in a served decode step on GB300.
+PACKED_GEOMETRY = (
+    (32, 1, 1, False),
+    (128, 2, 1, False),
+    (256, 4, 1, True),
+    (768, 8, 2, True),
+    (MAX_ROWS, 4, 1, True),
+)
+
+
+def packed_geometry(rows: int, heads: int, programs_at_least: int = 0) -> Tuple[int, int, bool]:
+    """``(items per program, warps, vector lanes)`` of a call of ``rows`` rows of ``heads`` heads.
+
+    ``programs_at_least`` lowers the items per program (never below one) until the grid has at
+    least that many programs -- the prefetching call's one bulk request per program then leaves
+    from at least that many programs.
+    """
+    items, warps, vec = next((i, w, v) for last, i, w, v in PACKED_GEOMETRY if rows <= last)
+    while items > 1 and -(-rows * heads // items) < programs_at_least:
+        items //= 2
+    warps = max(1, min(warps, items * 8 // 32))
+    return items, warps, vec
 
 
 @triton.jit
-def _fp8_store8(ptr, y0, y1, y2, y3, y4, y5, y6, y7, scale_bf16):
-    """Eight BF16 values one norm thread owns, as E4M3 at ``ptr + 0..7``."""
+def _fp8_store8(ptr, y0, y1, y2, y3, y4, y5, y6, y7, scale_bf16, mask):
+    """Eight BF16 values one norm thread owns, as E4M3 at ``ptr + 0..7`` where ``mask``."""
+    tl.store(ptr + 0, _to_cache_fp8(y0, scale_bf16), mask=mask)
+    tl.store(ptr + 1, _to_cache_fp8(y1, scale_bf16), mask=mask)
+    tl.store(ptr + 2, _to_cache_fp8(y2, scale_bf16), mask=mask)
+    tl.store(ptr + 3, _to_cache_fp8(y3, scale_bf16), mask=mask)
+    tl.store(ptr + 4, _to_cache_fp8(y4, scale_bf16), mask=mask)
+    tl.store(ptr + 5, _to_cache_fp8(y5, scale_bf16), mask=mask)
+    tl.store(ptr + 6, _to_cache_fp8(y6, scale_bf16), mask=mask)
+    tl.store(ptr + 7, _to_cache_fp8(y7, scale_bf16), mask=mask)
+
+
+@triton.jit
+def _split8(v):
+    """The 8 elements of ``v``'s last axis (shape ``[ITEMS, 2, 2, 2, 8]``), in order, each
+    ``[ITEMS, 2, 2, 2]``."""
+    v = tl.reshape(v, (v.shape[0], 2, 2, 2, 2, 2, 2))
+    # Element k = 4 a + 2 b + c of the last three axes (a, b, c): split c, then b, then a.
+    c0, c1 = tl.split(v)
+    c0b0, c0b1 = tl.split(c0)
+    c1b0, c1b1 = tl.split(c1)
+    x0, x4 = tl.split(c0b0)
+    x2, x6 = tl.split(c0b1)
+    x1, x5 = tl.split(c1b0)
+    x3, x7 = tl.split(c1b1)
+    return x0, x1, x2, x3, x4, x5, x6, x7
+
+
+@triton.jit
+def _join8(x0, x1, x2, x3, x4, x5, x6, x7):
+    """``_split8``'s inverse: ``[ITEMS, 2, 2, 2, 8]`` with element k = ``xk``."""
+    c0 = tl.join(tl.join(x0, x4), tl.join(x2, x6))
+    c1 = tl.join(tl.join(x1, x5), tl.join(x3, x7))
+    v = tl.join(c0, c1)
+    return tl.reshape(v, (v.shape[0], 2, 2, 2, 8))
+
+
+@triton.jit
+def _inverse_rms_per_item(x0, x1, x2, x3, x4, x5, x6, x7, eps):
+    """``_inverse_rms`` of each item of ``[ITEMS, 2, 2, 2]`` lane-shaped values, as ``[ITEMS]``.
+
+    The same additions in the same order: in order within a lane (``add.rn``), then lane
+    bit 0, 1, 2, each a single commutative add of a size-2 axis.
+    """
+    s = libdevice.add_rn(x0 * x0, x1 * x1)
+    s = libdevice.add_rn(s, x2 * x2)
+    s = libdevice.add_rn(s, x3 * x3)
+    s = libdevice.add_rn(s, x4 * x4)
+    s = libdevice.add_rn(s, x5 * x5)
+    s = libdevice.add_rn(s, x6 * x6)
+    s = libdevice.add_rn(s, x7 * x7)
+    total = tl.sum(tl.sum(tl.sum(s, axis=3), axis=2), axis=1)
+    return _rsqrt_approx_ftz(total / 64.0 + eps)
+
+
+@triton.jit
+def _multi_request_prep_append_kernel(
+    qkv_ptr,
+    qkv_out_ptr,
+    gate_out_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    q8_ptr,
+    pool_ptr,
+    bt_ptr,
+    bt_stride_seq,
+    bt_stride_kv,
+    seq_len_ptr,
+    orig_quant_ptr,
+    quant_orig_ptr,
+    bmm1_ptr,
+    bmm2_ptr,
+    cu_seqlens_ptr,
+    bmm1_host,
+    o_scale,
+    qkv_stride,
+    qkv_out_stride,
+    gate_out_stride,
+    eps,
+    q_scale,
+    num_seqs,
+    num_items,
+    pf_base,
+    pf_bytes,
+    pf_chunk,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    QKV_PERMUTED: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    ROWS_PER_SEQ: tl.constexpr,
+    P: tl.constexpr,
+    LOG2_P: tl.constexpr,
+    SEQS_BLOCK: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    ITEMS: tl.constexpr = 1,
+    LANES: tl.constexpr = 32,
+    VEC: tl.constexpr = False,
+    PREFETCH: tl.constexpr = False,
+):
+    """Program ``p`` takes the ``ITEMS`` items ``p * ITEMS ..`` of the ``rows * (H + G)``
+    (row, head) items in row-major order; every item runs the one-head code of the
+    one-program-per-(row, head) grid it replaces, element for element."""
+    D: tl.constexpr = 64
+    HALF: tl.constexpr = 32
+    HEADS: tl.constexpr = NUM_Q_HEADS + NUM_KV_HEADS
+    PAGE: tl.constexpr = NUM_KV_HEADS * P * D
+    if LAUNCH_WITH_PDL:
+        # Before any global read: the projection is the previous kernel's output.
+        # No early trigger: a dependent (the FMHA) launches when this grid ends.
+        tl.extra.cuda.gdc_wait()
+    program = tl.program_id(0)
+    if PREFETCH:
+        # One bulk L2 prefetch of this program's slice of ``pf_bytes`` (element 0 issues it;
+        # ``LANES`` is the program's thread count, so no element is held twice). The asm
+        # yields 0, so the store never happens; it keeps the request live.
+        lane = tl.arange(0, LANES)
+        start = program.to(tl.int64) * pf_chunk
+        size = tl.minimum(pf_bytes - start, pf_chunk)
+        size = tl.where((lane == 0) & (size > 0), size, 0).to(tl.int32)
+        issued = _bulk_prefetch_l2(tl.full([LANES], 0, tl.int64) + pf_base + start, size)
+        tl.store(cu_seqlens_ptr + lane, issued, mask=issued != 0)
+
+    # The program's items; a tail item past the last one computes item 0's addresses
+    # (every load stays in bounds) and stores nothing.
+    item = program * ITEMS + tl.arange(0, ITEMS)
+    valid = item < num_items
+    item = tl.where(valid, item, 0)
+    row = item // HEADS
+    head = item % HEADS
+    is_q = head < NUM_Q_HEADS
+    is_kv = head >= NUM_Q_HEADS
+    kv_head = head - NUM_Q_HEADS
+    row64 = row.to(tl.int64)
+    scale_bf16 = tl.load(orig_quant_ptr).to(tl.bfloat16)
+
+    # The row's cache position: the sequence's last ROWS_PER_SEQ positions
+    # (seq_lens counts the step's rows), addressed as KVBlockArray does.
+    seq = row // ROWS_PER_SEQ
+    position = tl.load(seq_len_ptr + seq) - ROWS_PER_SEQ + row % ROWS_PER_SEQ
+    table = bt_ptr + seq.to(tl.int64) * bt_stride_seq + (position >> LOG2_P)
+    slot = (kv_head * P + (position & (P - 1))) * D
+
+    # The pass-through half first, so its load is in flight during the norm:
+    # a query item copies its gate head, a key item its value head (and stores it
+    # into the cache's V page).
+    d = tl.arange(0, D)[None, :]
+    if QKV_PERMUTED:
+        gate_in = (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * D + head * D
+        v_in = NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+    else:
+        gate_in = head * 2 * D + D
+        v_in = 2 * NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+    pass_in = tl.where(is_q, gate_in, v_in)
+    passed = tl.load(qkv_ptr + (row64 * qkv_stride + pass_in)[:, None] + d)
+    q_store = (valid & is_q)[:, None]
+    kv_store = (valid & is_kv)[:, None]
+    tl.store(gate_out_ptr + (row64 * gate_out_stride + head * D)[:, None] + d, passed, mask=q_store)
+    tl.store(
+        qkv_out_ptr
+        + (row64 * qkv_out_stride + (NUM_Q_HEADS + NUM_KV_HEADS) * D + kv_head * D)[:, None]
+        + d,
+        passed,
+        mask=kv_store,
+    )
+    page_v = tl.load(table + bt_stride_kv, mask=valid & is_kv, other=0).to(tl.int64)
+    tl.store(
+        pool_ptr + (page_v * PAGE + slot)[:, None] + d,
+        _to_cache_fp8(passed, scale_bf16),
+        mask=kv_store,
+    )
+
+    if QKV_PERMUTED:
+        in_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    else:
+        in_off = tl.where(is_q, head * 2 * D, 2 * NUM_Q_HEADS * D + kv_head * D)
+    out_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    scale = tl.where(is_q, q_scale, 1.0)[:, None, None, None]
+
+    lane8 = 8 * (
+        4 * tl.arange(0, 2)[None, :, None, None]
+        + 2 * tl.arange(0, 2)[None, None, :, None]
+        + tl.arange(0, 2)[None, None, None, :]
+    )
+    in_lane = qkv_ptr + (row64 * qkv_stride + in_off)[:, None, None, None] + lane8
+    if VEC:
+        # One 16-byte load per lane: the same 8 values.
+        x0, x1, x2, x3, x4, x5, x6, x7 = _split8(
+            tl.load(in_lane[:, :, :, :, None] + tl.arange(0, 8)[None, None, None, None, :]).to(
+                tl.float32
+            )
+        )
+    else:
+        x0, x1, x2, x3, x4, x5, x6, x7 = _load8(in_lane)
+    inverse_rms = _inverse_rms_per_item(x0, x1, x2, x3, x4, x5, x6, x7, eps)[:, None, None, None]
+    y0 = _normalize(x0, inverse_rms, scale)
+    y1 = _normalize(x1, inverse_rms, scale)
+    y2 = _normalize(x2, inverse_rms, scale)
+    y3 = _normalize(x3, inverse_rms, scale)
+    y4 = _normalize(x4, inverse_rms, scale)
+    y5 = _normalize(x5, inverse_rms, scale)
+    y6 = _normalize(x6, inverse_rms, scale)
+    y7 = _normalize(x7, inverse_rms, scale)
+
+    if APPLY_ROPE:
+        # Pair p = 4 * lane + i rotates elements 2p, 2p + 1 by table row
+        # [cos(32) | sin(32)] of this token's RoPE position.
+        rope_position = tl.load(positions_ptr + row).to(tl.int64)
+        rope = cos_sin_ptr + (rope_position * D)[:, None, None, None] + lane8 // 2
+        y0, y1 = _rotate(y0, y1, tl.load(rope + 0), tl.load(rope + HALF + 0))
+        y2, y3 = _rotate(y2, y3, tl.load(rope + 1), tl.load(rope + HALF + 1))
+        y4, y5 = _rotate(y4, y5, tl.load(rope + 2), tl.load(rope + HALF + 2))
+        y6, y7 = _rotate(y6, y7, tl.load(rope + 3), tl.load(rope + HALF + 3))
+
+    # The BF16 operand values: what the prep stores and what the append converts.
+    b0 = y0.to(tl.bfloat16)
+    b1 = y1.to(tl.bfloat16)
+    b2 = y2.to(tl.bfloat16)
+    b3 = y3.to(tl.bfloat16)
+    b4 = y4.to(tl.bfloat16)
+    b5 = y5.to(tl.bfloat16)
+    b6 = y6.to(tl.bfloat16)
+    b7 = y7.to(tl.bfloat16)
+    store = valid[:, None, None, None]
+    out = qkv_out_ptr + (row64 * qkv_out_stride + out_off)[:, None, None, None] + lane8
+    q8 = q8_ptr + ((row64 * NUM_Q_HEADS + head) * D)[:, None, None, None] + lane8
+    page_k = tl.load(table, mask=valid & is_kv, other=0).to(tl.int64)
+    k8 = pool_ptr + (page_k * PAGE + slot)[:, None, None, None] + lane8
+    if VEC:
+        # One vector store per lane each: the same bytes.
+        e = tl.arange(0, 8)[None, None, None, None, :]
+        b = _join8(b0, b1, b2, b3, b4, b5, b6, b7)
+        tl.store(out[:, :, :, :, None] + e, b, mask=store[:, :, :, :, None])
+        b8 = _to_cache_fp8(b, scale_bf16)
+        tl.store(q8[:, :, :, :, None] + e, b8, mask=(valid & is_q)[:, None, None, None, None])
+        tl.store(k8[:, :, :, :, None] + e, b8, mask=(valid & is_kv)[:, None, None, None, None])
+    else:
+        tl.store(out + 0, b0, mask=store)
+        tl.store(out + 1, b1, mask=store)
+        tl.store(out + 2, b2, mask=store)
+        tl.store(out + 3, b3, mask=store)
+        tl.store(out + 4, b4, mask=store)
+        tl.store(out + 5, b5, mask=store)
+        tl.store(out + 6, b6, mask=store)
+        tl.store(out + 7, b7, mask=store)
+        # Their E4M3 copies: Q into the FMHA's query buffer, K into the cache's K page.
+        _fp8_store8(
+            q8, b0, b1, b2, b3, b4, b5, b6, b7, scale_bf16, (valid & is_q)[:, None, None, None]
+        )
+        _fp8_store8(
+            k8, b0, b1, b2, b3, b4, b5, b6, b7, scale_bf16, (valid & is_kv)[:, None, None, None]
+        )
+
+    if program == 0:
+        # The FMHA's scale words, in the built-in kernel's operation order:
+        # (s_q * s_k) * bmm1_host, then that * log2(e); o_scale * s_v.
+        s = tl.load(quant_orig_ptr)
+        bmm1 = s * s * bmm1_host
+        tl.store(bmm1_ptr, bmm1)
+        tl.store(bmm1_ptr + 1, bmm1 * 1.4426950408889634)
+        tl.store(bmm2_ptr, o_scale * s)
+        if ROWS_PER_SEQ > 1:
+            # The decoder-info kernel's cumulative query lengths for fixed query lengths
+            # (it runs only for more than one query row per sequence).
+            i = tl.arange(0, SEQS_BLOCK)
+            tl.store(cu_seqlens_ptr + i, i * ROWS_PER_SEQ, mask=i <= num_seqs)
+
+
+#: The kernel ``multi_request_prep_append`` launches per SM version (``launch_kind``): on sm103
+#: the packed kernel above on ``PACKED_GEOMETRY``; on sm107 the grid of one program per
+#: (row, head), one warp each (``_multi_request_prep_append_grid_kernel``). Both compute every
+#: item with the same per-head code, so the bytes written are the same.
+LAUNCH_KIND_BY_SM = {103: "packed", 107: "grid"}
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_of(index: int) -> int:
+    major, minor = torch.cuda.get_device_capability(index)
+    return 10 * major + minor
+
+
+def launch_kind(device: torch.device) -> str:
+    """``LAUNCH_KIND_BY_SM`` for ``device``.
+
+    Raises:
+        ValueError: on a device ``LAUNCH_KIND_BY_SM`` does not list.
+    """
+    sm = _sm_of(device.index if device.index is not None else torch.cuda.current_device())
+    kind = LAUNCH_KIND_BY_SM.get(sm)
+    if kind is None:
+        raise ValueError(
+            f"multi_request_prep_append: no launch for sm{sm} "
+            f"(supported: {sorted(LAUNCH_KIND_BY_SM)})"
+        )
+    return kind
+
+
+@triton.jit
+def _fp8_store8_all(ptr, y0, y1, y2, y3, y4, y5, y6, y7, scale_bf16):
+    """Eight BF16 values one norm thread owns, as E4M3 at ``ptr + 0..7`` (no mask)."""
     tl.store(ptr + 0, _to_cache_fp8(y0, scale_bf16))
     tl.store(ptr + 1, _to_cache_fp8(y1, scale_bf16))
     tl.store(ptr + 2, _to_cache_fp8(y2, scale_bf16))
@@ -104,7 +441,7 @@ def _fp8_store8(ptr, y0, y1, y2, y3, y4, y5, y6, y7, scale_bf16):
 
 
 @triton.jit
-def _multi_request_prep_append_kernel(
+def _multi_request_prep_append_grid_kernel(
     qkv_ptr,
     qkv_out_ptr,
     gate_out_ptr,
@@ -252,11 +589,11 @@ def _multi_request_prep_append_kernel(
     # Their E4M3 copies: Q into the FMHA's query buffer, K into the cache's K page.
     if is_q:
         q8 = q8_ptr + (row64 * NUM_Q_HEADS + head) * D + lane * 8
-        _fp8_store8(q8, b0, b1, b2, b3, b4, b5, b6, b7, scale_bf16)
+        _fp8_store8_all(q8, b0, b1, b2, b3, b4, b5, b6, b7, scale_bf16)
     else:
         page_k = tl.load(table).to(tl.int64)
         k8 = pool_ptr + page_k * PAGE + slot + lane * 8
-        _fp8_store8(k8, b0, b1, b2, b3, b4, b5, b6, b7, scale_bf16)
+        _fp8_store8_all(k8, b0, b1, b2, b3, b4, b5, b6, b7, scale_bf16)
 
     if (row == 0) & (head == 0):
         # The FMHA's scale words, in the built-in kernel's operation order:
@@ -321,7 +658,10 @@ class MultiRequestPrepAppend(OpWrapper):
     every target layer (46 RoPE + 16 NoPE) on decode steps of 2..128 sequences
     of the same number of rows (fast path multi_request_prep_append), whose
     trtllm-gen generation preprocess launch (decoder-info + append kernels)
-    the target then skips. Grid (rows, H + G), one warp per program.
+    the target then skips. Grid on sm103: the rows * (H + G) (row, head) items in
+    row-major order, PACKED_GEOMETRY's items, warps and lanes per program by row count
+    (with a prefetch, one program per item); on sm107: (rows, H + G), one warp per
+    program.
 
     Bit-identical, gated by its own tests: qkv_out and gate_out against
     preattn_prep; the cache bytes, the E4M3 query bytes, both scale words and
@@ -428,7 +768,11 @@ class MultiRequestPrepAppend(OpWrapper):
                 )
         elif position_ids is not None:
             raise ValueError("multi_request_prep_append: position_ids without a cos/sin table")
+        heads = num_q_heads + num_kv_heads
+        num_items = rows * heads
+        kind = launch_kind(qkv.device)
         pf_base, pf_bytes, pf_chunk = 0, 0, 16
+        programs_at_least = 0
         if prefetch is not None:
             pf_bytes = prefetch.numel() * prefetch.element_size()
             if not (
@@ -442,14 +786,66 @@ class MultiRequestPrepAppend(OpWrapper):
                     f"of a multiple of 16 bytes, got {tuple(prefetch.shape)} {prefetch.dtype} at "
                     f"{prefetch.data_ptr():#x}"
                 )
-            programs = rows * (num_q_heads + num_kv_heads)
+            # One bulk request per program, one program per (row, head) item: the o_proj
+            # weight is requested in the one-program-per-(row, head) grid's slices, from
+            # every SM, whatever the table's packing at these rows.
+            programs_at_least = num_items
+        if kind == "grid":
+            items, warps, vec = 1, 1, False
+        else:
+            items, warps, vec = packed_geometry(rows, heads, programs_at_least)
+        programs = -(-num_items // items)
+        if prefetch is not None:
             pf_base = prefetch.data_ptr()
             pf_chunk = ((pf_bytes + programs - 1) // programs + 15) // 16 * 16
         qkv_out = torch.empty(
             (rows, (num_q_heads + 2 * num_kv_heads) * HEAD_DIM), dtype=qkv.dtype, device=qkv.device
         )
         gate_out = torch.empty((rows, num_q_heads * HEAD_DIM), dtype=qkv.dtype, device=qkv.device)
-        _multi_request_prep_append_kernel[(rows, num_q_heads + num_kv_heads)](
+        if kind == "grid":
+            _multi_request_prep_append_grid_kernel[(rows, heads)](
+                qkv,
+                qkv_out,
+                gate_out,
+                cos_sin,
+                positions,
+                q_fp8.view(torch.uint8).view(torch.float8_e4m3fn),
+                kv_pool,
+                block_tables,
+                block_tables.stride(0),
+                block_tables.stride(1),
+                seq_lens,
+                kv_scale_orig_quant,
+                kv_scale_quant_orig,
+                bmm1_scale,
+                bmm2_scale,
+                cu_seqlens,
+                bmm1_host_scale,
+                o_scale,
+                qkv.stride(0),
+                qkv_out.stride(0),
+                gate_out.stride(0),
+                eps,
+                q_scale,
+                num_seqs,
+                pf_base,
+                pf_bytes,
+                pf_chunk,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_KV_HEADS=num_kv_heads,
+                QKV_PERMUTED=qkv_permuted,
+                APPLY_ROPE=cos_sin is not None,
+                ROWS_PER_SEQ=rows_per_seq,
+                P=page,
+                LOG2_P=page.bit_length() - 1,
+                SEQS_BLOCK=triton.next_power_of_2(num_seqs + 1),
+                LAUNCH_WITH_PDL=enable_pdl,
+                PREFETCH=prefetch is not None,
+                num_warps=1,
+                launch_pdl=enable_pdl,
+            )
+            return qkv_out, gate_out
+        _multi_request_prep_append_kernel[(programs,)](
             qkv,
             qkv_out,
             gate_out,
@@ -474,6 +870,7 @@ class MultiRequestPrepAppend(OpWrapper):
             eps,
             q_scale,
             num_seqs,
+            num_items,
             pf_base,
             pf_bytes,
             pf_chunk,
@@ -486,8 +883,11 @@ class MultiRequestPrepAppend(OpWrapper):
             LOG2_P=page.bit_length() - 1,
             SEQS_BLOCK=triton.next_power_of_2(num_seqs + 1),
             LAUNCH_WITH_PDL=enable_pdl,
+            ITEMS=items,
+            LANES=32 * warps,
+            VEC=vec,
             PREFETCH=prefetch is not None,
-            num_warps=1,
+            num_warps=warps,
             launch_pdl=enable_pdl,
         )
         return qkv_out, gate_out

@@ -93,6 +93,30 @@ MIN_PAGES = 4
 #: The build the target launches: O rescale in 16-column chunks (spill-free), two Q terms.
 RESCALE_COLS = 16
 NQ = 2
+#: Pages (8 KB of K and V each) a CTA's ring holds in flight, by the number of E4M3 terms Q enters
+#: as, per SM version (``ring_stages``). At deep contexts the split kernel streams the cache and
+#: the ring depth sets its rate. sm103: each build takes the deepest ring one CTA's shared memory
+#: holds next to its Q buffers, 20 pages with a one-term Q (the served E4M3 Q) and 16 with a
+#: two-term Q (24 and 20 do not launch). sm107: 16 pages for either Q.
+RING_STAGES_BY_SM = {103: {1: 20, 2: 16}, 107: {1: 16, 2: 16}}
+#: sm103's ring depths.
+RING_STAGES = RING_STAGES_BY_SM[103]
+
+
+def ring_stages(device_index: int, q_terms: int) -> int:
+    """The ring depth of a build whose Q enters as ``q_terms`` E4M3 terms on the device.
+
+    Raises:
+        ValueError: on a device ``RING_STAGES_BY_SM`` does not list.
+    """
+    major, minor = torch.cuda.get_device_capability(device_index)
+    table = RING_STAGES_BY_SM.get(10 * major + minor)
+    if table is None:
+        raise ValueError(
+            f"multi_request_split_kv: no ring depth for sm{10 * major + minor} "
+            f"(supported: {sorted(RING_STAGES_BY_SM)})"
+        )
+    return table[q_terms]
 
 
 def default_num_work(kv_heads: int, sm_count: int) -> int:
@@ -163,10 +187,11 @@ def _compiled_kernel(
     rescale_cols: int = RESCALE_COLS,
     q_fp8: bool = False,
     device_scale: bool = False,
-    stages: int = 16,
+    stages: Optional[int] = None,
     max_requests: int = REQUEST_BUILDS[0],
 ):
-    """The compiled split kernel of one build."""
+    """The compiled split kernel of one build (its ring depth from ``ring_stages`` unless
+    ``stages`` is given)."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -175,6 +200,8 @@ def _compiled_kernel(
     from . import multi_request_split_kv_kernel as mk
 
     assert (mk.MAX_ROWS, mk.REQUEST_BUILDS) == (MAX_ROWS, REQUEST_BUILDS)
+    if stages is None:
+        stages = ring_stages(device_index, 1 if q_fp8 else nq)
     kernel = mk.MultiRequestSplitKvKernel(
         enable_pdl=enable_pdl,
         kv_heads=kv_heads,
