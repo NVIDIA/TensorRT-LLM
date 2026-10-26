@@ -243,6 +243,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
+  - unittest/llmapi/apps/test_media_io.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
   - unittest/llmapi/apps/test_openai_protocol_chat_store.py

@@ -178,10 +178,14 @@ _MAX_REDIRECTS = 5
 
 # Maximum number of decoded audio samples (frames x channels) per audio input.
 # Compressed formats such as FLAC can expand a few hundred kilobytes into
-# gigabytes of samples, so the encoded size limit alone does not bound memory.
-# The limit admits every 16-bit PCM file within _MAX_RESPONSE_BYTES, which is
-# about 100 Mi samples, or 800 MiB as float64.
+# gigabytes of samples, so decoded audio needs its own limit. The value is the
+# sample count of _MAX_RESPONSE_BYTES of 16-bit PCM, about 100 Mi samples, or
+# 800 MiB as float64.
 _MAX_AUDIO_SAMPLES = _MAX_RESPONSE_BYTES // 2
+
+# Frame count that libsndfile reports when a file does not state its length,
+# such as a FLAC stream whose STREAMINFO total is 0.
+_SF_UNKNOWN_FRAMES = 2**63 - 1
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
@@ -1102,18 +1106,24 @@ def _decode_base64_with_limit(data: str) -> bytes:
 def _read_audio_with_limit(source: Any) -> Tuple[np.ndarray, int]:
     """Decode audio like ``soundfile.read`` with a cap on decoded samples.
 
-    Reads at most one frame beyond the limit, so a payload that decodes to more
-    than ``_MAX_AUDIO_SAMPLES`` samples is rejected before it is fully decoded.
+    A file whose header reports more than ``_MAX_AUDIO_SAMPLES`` samples is
+    rejected before any samples are read. For a file of unknown length, the
+    read stops at one frame beyond the limit, so an oversized payload is
+    rejected before it is fully decoded.
     """
+    too_many_samples = (
+        f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+        f"(frames x channels), the maximum allowed."
+    )
     with soundfile.SoundFile(source) as audio_file:
-        max_frames = _MAX_AUDIO_SAMPLES // max(audio_file.channels, 1)
+        # libsndfile refuses to open a file with fewer than one channel.
+        max_frames = _MAX_AUDIO_SAMPLES // audio_file.channels
+        if audio_file.frames != _SF_UNKNOWN_FRAMES and audio_file.frames > max_frames:
+            raise ValueError(too_many_samples)
         data = audio_file.read(frames=max_frames + 1)
         samplerate = audio_file.samplerate
     if len(data) > max_frames:
-        raise ValueError(
-            f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
-            f"(frames x channels), the maximum allowed."
-        )
+        raise ValueError(too_many_samples)
     return data, samplerate
 
 
@@ -1364,7 +1374,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
         return self._read(BytesIO(data))
 
     def load_base64(self, media_type: str, data: str) -> Tuple[np.ndarray, int]:
-        return self.load_bytes(base64.b64decode(data))
+        return self.load_bytes(_decode_base64_with_limit(data))
 
     def load_file(self, url: str) -> Tuple[np.ndarray, int]:
         # Strip `file://` and unquote the path for `file:` URIs; pass
