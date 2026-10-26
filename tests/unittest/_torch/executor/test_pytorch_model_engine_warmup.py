@@ -53,6 +53,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
     DraftTargetDecodingConfig,
+    MultimodalConfig,
     PARDDecodingConfig,
     PrefillCudaGraphBackend,
     TorchLlmArgs,
@@ -113,7 +114,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         encoder_max_num_tokens=None,
         enable_in_graph_sampling=False,
         enable_return_routed_experts=False,
-        multimodal_config=SimpleNamespace(video_pruning_rate=None),
+        multimodal_config=MultimodalConfig(),
         checkpoint_format="HF",
         trust_remote_code=False,
         disable_overlap_scheduler=True,
