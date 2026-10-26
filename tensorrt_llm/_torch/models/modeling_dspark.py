@@ -140,6 +140,86 @@ if IS_CUTLASS_DSL_AVAILABLE:
         is_fused_dspark_rmsnorm_rope_supported,
     )
 
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+
+
+# TLLM_DFLASH_FUSED_PROLOGUE=1, read per call: the MLA block decode builds its
+# layer-invariant fixup in one Triton kernel, writes each layer's block latents
+# into the pool with one Triton scatter instead of an index_put, and the
+# decode-step context-KV precompute runs the same compiled RMSNorm/RoPE kernel
+# straight into one per-layer buffer (one transpose copy instead of a contiguous
+# copy and an output copy per layer). Bit-exact with the replaced code.
+def _fused_prologue_on() -> bool:
+    return os.environ.get("TLLM_DFLASH_FUSED_PROLOGUE", "0") == "1"
+
+
+@triton.jit
+def _mla_block_fixup_kernel(
+    ctx_ptr,
+    rows_ptr,
+    tab_ptr,
+    t_row,
+    NCOL,
+    PS,
+    pages_ptr,
+    offs_ptr,
+    pt_ptr,
+    sl_ptr,
+    kvb_ptr,
+    BS: tl.constexpr,
+    BSP2: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """_build_mla_block_fixup over table[rows].
+
+    Pages / offsets of ctx_len + j, int32 page-table rows, seq_lens, kv_bounds.
+    """
+    b = tl.program_id(0)
+    row = tl.load(rows_ptr + b)
+    for c0 in range(0, NCOL, BLOCK):
+        c = c0 + tl.arange(0, BLOCK)
+        m = c < NCOL
+        tl.store(
+            pt_ptr + b.to(tl.int64) * NCOL + c, tl.load(tab_ptr + row * t_row + c, mask=m), mask=m
+        )
+    cl = tl.load(ctx_ptr + b).to(tl.int64)
+    j = tl.arange(0, BSP2)
+    jm = j < BS
+    pos = cl + j
+    page = tl.load(tab_ptr + row * t_row + pos // PS, mask=jm, other=0).to(tl.int64)
+    tl.store(pages_ptr + b * BS + j, page, mask=jm)
+    tl.store(offs_ptr + b * BS + j, pos % PS, mask=jm)
+    sl = (cl + BS).to(tl.int32)
+    tl.store(sl_ptr + b, sl)
+    tl.store(kvb_ptr + b * BS + j, tl.zeros((BSP2,), dtype=tl.int32) + sl, mask=jm)
+
+
+@triton.jit
+def _mla_block_write_kernel(
+    src_ptr,
+    s_row,
+    pages_ptr,
+    offs_ptr,
+    pool_ptr,
+    p_page,
+    p_off,
+    HD: tl.constexpr,
+    HDP2: tl.constexpr,
+):
+    """pool[pages[t], offsets[t]] = src[t]  (the block latents of one layer)."""
+    t = tl.program_id(0)
+    d = tl.arange(0, HDP2)
+    dm = d < HD
+    page = tl.load(pages_ptr + t)
+    off = tl.load(offs_ptr + t)
+    tl.store(
+        pool_ptr + page * p_page + off * p_off + d,
+        tl.load(src_ptr + t.to(tl.int64) * s_row + d, mask=dm),
+        mask=dm,
+    )
+
+
 # ----------------------------------------------------------------------------
 # Captured-context attention primitives.
 # ----------------------------------------------------------------------------
@@ -2982,6 +3062,47 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             return "cute_dsl"
         return "trtllm_gen" if self._mla_decode_op() is not None else "eager"
 
+    def _build_mla_block_fixup_fused(
+        self, ctx_len, rows, table, block_size, page_size
+    ) -> _MLABlockFixup:
+        """_build_mla_block_fixup(ctx_len, table[rows].long(), ...) in one Triton launch."""
+        batch, ncol = rows.shape[0], table.shape[1]
+        device = ctx_len.device
+        pages = torch.empty((batch, block_size), dtype=torch.long, device=device)
+        offsets = torch.empty((batch, block_size), dtype=torch.long, device=device)
+        page_tables_i32 = torch.empty((batch, ncol), dtype=torch.int32, device=device)
+        seq_lens_i32 = torch.empty(batch, dtype=torch.int32, device=device)
+        kv_bounds_i32 = torch.empty(batch * block_size, dtype=torch.int32, device=device)
+        if batch > 0:
+            _mla_block_fixup_kernel[(batch,)](
+                ctx_len,
+                rows,
+                table,
+                table.stride(0),
+                ncol,
+                page_size,
+                pages,
+                offsets,
+                page_tables_i32,
+                seq_lens_i32,
+                kv_bounds_i32,
+                BS=block_size,
+                BSP2=triton.next_power_of_2(block_size),
+                BLOCK=1024,
+            )
+        key = (block_size, device)
+        cached = getattr(self, "_mla_block_valid_cache", None)
+        if cached is not None and cached[0] == key:
+            valid = cached[1]
+        else:
+            idx = torch.arange(block_size, device=device)
+            valid = (idx.view(1, block_size) > idx.view(block_size, 1)).view(
+                1, block_size, 1, block_size
+            )
+            if not torch.cuda.is_current_stream_capturing():
+                self._mla_block_valid_cache = (key, valid)
+        return _MLABlockFixup(pages, offsets, valid, page_tables_i32, seq_lens_i32, kv_bounds_i32)
+
     def _mla_decode_workspace(self, device, min_bytes: int = 0):
         want = max(_MLA_DECODE_WORKSPACE_BYTES, int(min_bytes))
         if self._mla_workspace is None or self._mla_workspace.numel() < want:
@@ -3103,6 +3224,33 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
         return out
 
+    def _write_block_latents(self, blk_kv, layer_cache, fixup):
+        """The block's own latents into the pool at fixup.pages / fixup.offsets."""
+        pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
+        src = blk_kv.reshape(-1, blk_kv.shape[-1])
+        if (
+            _fused_prologue_on()
+            and pool.stride(2) == 1
+            and src.stride(1) == 1
+            and src.dtype == pool.dtype
+            and fixup.pages.is_contiguous()
+            and fixup.offsets.is_contiguous()
+            and src.shape[0] > 0
+        ):
+            _mla_block_write_kernel[(src.shape[0],)](
+                src,
+                src.stride(0),
+                fixup.pages,
+                fixup.offsets,
+                pool,
+                pool.stride(0),
+                pool.stride(1),
+                HD=src.shape[1],
+                HDP2=triton.next_power_of_2(src.shape[1]),
+            )
+        else:
+            pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = src
+
     def _mla_paged_attention(self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len):
         """Absorbed-MLA block attention: paged kernel + a block-local fixup.
 
@@ -3126,10 +3274,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # --- the block's own latents into the pool, then one causal pass ---
         # Must precede BOTH decode paths: each reads the block back out of the
         # pool, so writing it afterwards would attend uninitialised slots.
-        pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
-        pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = blk_kv.reshape(
-            -1, blk_kv.shape[-1]
-        )
+        self._write_block_latents(blk_kv, layer_cache, fixup)
 
         if self._mla_block_decode_variant(paged=True) == "cute_dsl":
             return self._cute_dsl_block_decode(query, layer_cache, fixup, block_size)
@@ -3287,6 +3432,55 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             ).squeeze(0)
         return out.unsqueeze(2).contiguous(), None
 
+    def precompute_context_kv_layers(self, projected_hidden, positions):
+        """precompute_context_kv into one ``[L, N, head_dim]`` buffer, or None when the fused kernel is unavailable.
+
+        Same GEMM, same compiled RMSNorm/RoPE kernel per layer as precompute_context_kv, on compact per-layer rows
+        that one transpose copy produces -- the caller reads the result through a strided ``[N, L, 1, hd]`` view."""
+        if self._fused_kv_weight is None:
+            self._build_fused_kv_buffers()
+        if not (IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()):
+            return None
+        n = projected_hidden.shape[0]
+        num_layers = self._num_attn_layers
+        weight_dtype = self._fused_kv_weight.dtype
+        if projected_hidden.dtype != weight_dtype:
+            projected_hidden = projected_hidden.to(weight_dtype)
+        latent = F.linear(projected_hidden, self._fused_kv_weight).view(
+            n, num_layers, self._head_dim
+        )
+        freqs = self._mla_freqs_cis(latent.device)[positions.view(-1).long()]
+        freqs_real = torch.view_as_real(freqs.unsqueeze(0)).reshape(-1, freqs.shape[-1], 2)
+        lat_t = latent.transpose(0, 1).contiguous()
+        for layer_idx in range(num_layers):
+            if not is_fused_dspark_rmsnorm_rope_supported(
+                lat_t[layer_idx].unsqueeze(0),
+                self._kv_a_norm_stacked[layer_idx],
+                freqs_real,
+                1,
+                self.qk_rope_head_dim,
+                self.kv_lora_rank,
+            ):
+                return None
+        from ..custom_ops.dspark_rmsnorm_rope_custom_op import _compile_fused_dspark_rmsnorm_rope
+
+        compiled = _compile_fused_dspark_rmsnorm_rope(
+            self._head_dim,
+            self.qk_rope_head_dim,
+            1,
+            self._kv_a_norm_eps,
+            True,
+            True,
+            False,
+            self.kv_lora_rank,
+        )
+        out = torch.empty_like(lat_t)
+        for layer_idx in range(num_layers):
+            compiled(
+                lat_t[layer_idx], self._kv_a_norm_stacked[layer_idx], freqs_real, out[layer_idx]
+            )
+        return out
+
     # -- block decode ------------------------------------------------------
 
     def dflash_forward(
@@ -3319,30 +3513,51 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         blk_freqs = self._mla_freqs_cis(device)[query_positions.long()]
 
         slots = ctx_cache_batch_idx.long()
-        # Context pages for this batch, resolved once: rows are batch positions
-        # when bound to the manager's per-request block table and slots on the
-        # private arena, which is exactly what ctx_cache_batch_idx already is.
-        page_tables = (
-            None if ctx_page_table is None else ctx_page_table.index_select(0, slots).long()
+        fused_fixup = (
+            _fused_prologue_on()
+            and ctx_page_table is not None
+            and ctx_page_table.dtype == torch.int32
+            and ctx_page_table.stride(1) == 1
+            and ctx_kv_cache is not None
+            and self._mla_block_decode_variant(True) != "eager"
         )
+        if fused_fixup:
+            # Kernel path only (never gathers page_tables): one Triton launch builds the whole fixup.
+            page_tables = None
+            page_size = ctx_kv_cache[0].shape[-2]
+            capacity = ctx_page_table.shape[1] * page_size
+            variant = self._mla_block_decode_variant(True)
+            use_kernel = True
+            fixup = self._build_mla_block_fixup_fused(
+                num_ctx_per_req[:batch], slots.contiguous(), ctx_page_table, block_size, page_size
+            )
+        else:
+            # Context pages for this batch, resolved once: rows are batch positions
+            # when bound to the manager's per-request block table and slots on the
+            # private arena, which is exactly what ctx_cache_batch_idx already is.
+            page_tables = (
+                None if ctx_page_table is None else ctx_page_table.index_select(0, slots).long()
+            )
 
-        # Valid-key mask, shared by every layer: context slots below this
-        # request's length, then the whole block (DSpark is non-causal). Pages
-        # past a request's allocation hold another request's data, so the mask
-        # is what keeps them out -- not the block table.
-        page_size = None if page_tables is None else ctx_kv_cache[0].shape[-2]
-        capacity = ctx_k_cache.shape[2] if page_tables is None else page_tables.shape[1] * page_size
-        # attention_backend picks the implementation; both kernel backends need
-        # page tables, so the eager gather also covers the private arena.
-        variant = self._mla_block_decode_variant(page_tables is not None)
-        use_kernel = variant != "eager"
-        # Kernel path: index and mask operands are layer-invariant, so build
-        # them once here rather than five times inside the decode loop.
-        fixup = (
-            _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block_size, page_size)
-            if use_kernel
-            else None
-        )
+            # Valid-key mask, shared by every layer: context slots below this
+            # request's length, then the whole block (DSpark is non-causal). Pages
+            # past a request's allocation hold another request's data, so the mask
+            # is what keeps them out -- not the block table.
+            page_size = None if page_tables is None else ctx_kv_cache[0].shape[-2]
+            capacity = (
+                ctx_k_cache.shape[2] if page_tables is None else page_tables.shape[1] * page_size
+            )
+            # attention_backend picks the implementation; both kernel backends need
+            # page tables, so the eager gather also covers the private arena.
+            variant = self._mla_block_decode_variant(page_tables is not None)
+            use_kernel = variant != "eager"
+            # Kernel path: index and mask operands are layer-invariant, so build
+            # them once here rather than five times inside the decode loop.
+            fixup = (
+                _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block_size, page_size)
+                if use_kernel
+                else None
+            )
         logger.info_once(
             "MLA DSpark block decode: "
             + {
