@@ -14,8 +14,8 @@
 # limitations under the License.
 """The machine catalogue: each machine's measured facts, and the ladder it runs by default.
 
-    pytest --collect-only -p qa_selection.plugin --machine=L40S --selection-out-dir=out/
-    -> out/L40S.json "ladder": the profile's `ladder`, or [max_gpu_per_node] without one
+    pytest --collect-only -p qa_selection.plugin --machine=GB200 --selection-out-dir=out/
+    -> out/GB200.json "ladder": the profile's `ladder`, or [max_gpu_per_node] without one
 
 A profile's `ladder` is the allocation policy its fleet schedules by: the bucket
 clusters get 1,4,8, and a machine always held whole has none. `--ladder` still
@@ -31,44 +31,6 @@ from qa_selection.core.machine import MachineCatalog, ProfileConfigError
 
 PROFILES = Path(__file__).parents[1] / "core" / "profiles.json"
 
-#: Measured on Colossus `LLM_FUNCTION_TEST` runs: `nvidia-smi --query-gpu` name
-#: without the `NVIDIA ` prefix, compute capability, `memory.total` and GPU
-#: count, and `uname -m`.
-MEASURED = {
-    # 10.57.205.57, run #2489
-    "RTX_PRO_6000": {
-        "sm": 120,
-        "device_name": "RTX PRO 6000 Blackwell Server Edition",
-        "device_memory_mib": 97887,
-        "max_gpu_per_node": 8,
-        "cpu_arch": "x86_64",
-    },
-    # 10.176.198.125, run #2421
-    "H20": {
-        "sm": 90,
-        "device_name": "H20",
-        "device_memory_mib": 97871,
-        "max_gpu_per_node": 8,
-        "cpu_arch": "x86_64",
-    },
-    # 10.63.135.23 and 10.117.0.83, runs #2437 and #2487
-    "A100": {
-        "sm": 80,
-        "device_name": "A100 80GB PCIe",
-        "device_memory_mib": 81920,
-        "max_gpu_per_node": 8,
-        "cpu_arch": "x86_64",
-    },
-    # 10.86.9.85 and 10.63.137.172, runs #2488 and #2454
-    "L40S": {
-        "sm": 89,
-        "device_name": "L40S",
-        "device_memory_mib": 46068,
-        "max_gpu_per_node": 8,
-        "cpu_arch": "x86_64",
-    },
-}
-
 #: The ladder each machine runs when `--ladder` is absent.
 DEFAULT_LADDERS = {
     "H100": [1, 4, 8],
@@ -77,17 +39,7 @@ DEFAULT_LADDERS = {
     "GB200": [4],
     "GB300": [4],
     "VR200": [4],
-    "RTX_PRO_6000": [8],
-    "H20": [8],
-    "A100": [8],
-    "L40S": [8],
 }
-
-
-@pytest.mark.parametrize("machine", sorted(MEASURED))
-def test_measured_profile(machine):
-    """A Colossus machine's profile holds its measured facts, and no ladder: it is held whole."""
-    assert json.loads(PROFILES.read_text())[machine] == MEASURED[machine]
 
 
 def test_every_machine_has_a_default_ladder():
@@ -130,9 +82,9 @@ def test_profile_ladder_ends_at_the_node(tmp_path, ladder, message):
 
     Read through the loader: no option points the plugin at another catalogue.
     """
-    profile = dict(MEASURED["L40S"], ladder=ladder)
+    profile = dict(json.loads(PROFILES.read_text())["B200"], ladder=ladder)
     source = tmp_path / "profiles.json"
-    source.write_text(json.dumps({"L40S": profile}))
+    source.write_text(json.dumps({"B200": profile}))
 
     with pytest.raises(ProfileConfigError, match=message):
         MachineCatalog.load(source)

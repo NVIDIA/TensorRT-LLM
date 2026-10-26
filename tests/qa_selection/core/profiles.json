@@ -43,33 +43,5 @@
     "device_memory_mib": 168896,
     "max_gpu_per_node": 4,
     "cpu_arch": "aarch64"
-  },
-  "RTX_PRO_6000": {
-    "sm": 120,
-    "device_name": "RTX PRO 6000 Blackwell Server Edition",
-    "device_memory_mib": 97887,
-    "max_gpu_per_node": 8,
-    "cpu_arch": "x86_64"
-  },
-  "H20": {
-    "sm": 90,
-    "device_name": "H20",
-    "device_memory_mib": 97871,
-    "max_gpu_per_node": 8,
-    "cpu_arch": "x86_64"
-  },
-  "A100": {
-    "sm": 80,
-    "device_name": "A100 80GB PCIe",
-    "device_memory_mib": 81920,
-    "max_gpu_per_node": 8,
-    "cpu_arch": "x86_64"
-  },
-  "L40S": {
-    "sm": 89,
-    "device_name": "L40S",
-    "device_memory_mib": 46068,
-    "max_gpu_per_node": 8,
-    "cpu_arch": "x86_64"
   }
 }

@@ -22,26 +22,22 @@ Each criterion collects `DeviceCases.MODULE` into an output directory, for B200
     how does an allocation policy divide it?   --machine=B200 --ladder=1,4,8  one list per rung
 
 Without `--ladder`, the profile's ladder asks: 1,4,8 for B200, and the first
-question for a machine whose profile has none, such as A100.
+question for a machine whose profile has none, such as GB200.
 
 Every kept test is in exactly one published list, and nothing else is kept.
 """
 
+import pytest
 from mocks import DeviceCases
 
 
 def test_whole_node_by_default(selection):
     """Without `--ladder` or a profile ladder, the ladder is one rung of the machine's node."""
-    run = selection.run(DeviceCases.MODULE, "--machine=A100", "--selection-out-dir={out}")
+    run = selection.run(DeviceCases.MODULE, "--machine=GB200", "--selection-out-dir={out}")
 
-    assert run.selected == [
-        DeviceCases.UNMARKED,
-        DeviceCases.TWO_GPUS,
-        DeviceCases.EIGHT_GPUS,
-        DeviceCases.EIGHT_RANKS,
-    ]
-    assert run.written == ["A100-8gpu.ids", "A100.json"]
-    assert run.record["ladder"] == [8]
+    assert run.selected == [DeviceCases.UNMARKED, DeviceCases.TWO_GPUS]
+    assert run.written == ["GB200-4gpu.ids", "GB200.json"]
+    assert run.record["ladder"] == [4]
 
 
 def test_smaller_allocation(selection):
@@ -82,3 +78,18 @@ def test_no_rung_option(selection):
     run = selection.refuse(DeviceCases.MODULE, "--machine=B200", "--rung=4")
 
     run.result.stderr.fnmatch_lines(["*unrecognized arguments: --rung=4*"])
+
+
+# The catalogue covers the machines the QA cluster pipeline allocates /
+# Machines selected on their own host are not catalogued
+@pytest.mark.parametrize("machine", ["L40S", "RTX_PRO_6000", "H20", "A100"])
+def test_own_host_machines_are_not_catalogued(selection, machine):
+    """A machine only selected on its own host is no `--machine` choice; the error lists the six."""
+    run = selection.refuse(DeviceCases.MODULE, f"--machine={machine}")
+
+    run.result.stderr.fnmatch_lines(
+        [
+            f"*argument --machine: invalid choice: '{machine}' "
+            "(choose from B200, B300, GB200, GB300, H100, VR200)*"
+        ]
+    )
