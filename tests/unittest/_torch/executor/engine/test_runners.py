@@ -36,6 +36,10 @@ from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+)
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     EncodeCudaGraphConfig,
@@ -476,7 +480,9 @@ def test_mm_encoder_runner_forward_step_skips_metadata_only_and_missing_length_r
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
             },
             multimodal_lengths=[2],
         ),
@@ -524,14 +530,18 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [1],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
             },
             multimodal_lengths=[1],
         ),
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
             },
             multimodal_lengths=[2],
         ),
@@ -744,12 +754,22 @@ def test_model_caller_requires_streams_with_compile_backend():
 def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> None:
     requests = [
         SimpleNamespace(
-            py_multimodal_data={"image": object(), "multimodal_embedding_lengths": [1]},
+            py_multimodal_data={
+                "image": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
+            },
             multimodal_lengths=[1],
         ),
         SimpleNamespace(py_multimodal_data=None),
         SimpleNamespace(
-            py_multimodal_data={"video": object(), "multimodal_embedding_lengths": [3, 2]},
+            py_multimodal_data={
+                "video": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("video", 0), ("video", 1)], output_embedding_lengths=[3, 2]
+                ),
+            },
             multimodal_lengths=[7, 6],
         ),
     ]

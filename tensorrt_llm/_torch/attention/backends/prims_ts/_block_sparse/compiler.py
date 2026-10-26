@@ -17,6 +17,8 @@
 from collections.abc import Callable
 import functools
 
+from .._compile_cache import build_and_load_attention_kernel
+
 import torch
 
 from flashinfer.utils import ceil_div
@@ -535,7 +537,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             Float32(1.0),
         )
 
-    with torch.cuda.device(key.device_index):
+    def compile_kernel():
         return cute.compile(
             tensor_adapter,
             *dynamic_args,
@@ -547,6 +549,11 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             key.num_kv_heads,
             key.head_dim,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(key.device_index):
+        return build_and_load_attention_kernel(
+            "block_sparse", "main", key, _COMPILE_OPTIONS, compile_kernel, extra=()
         )
 
 
