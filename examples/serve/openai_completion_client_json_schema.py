@@ -50,5 +50,5 @@ try:
     response_json = json.loads(content)
     assert "name" in response_json and "population" in response_json
     print(content)
-except json.JSONDecodeError:
-    print("Failed to decode JSON response")
+except json.JSONDecodeError as e:
+    raise RuntimeError(f"Failed to decode JSON response: {content!r}") from e
