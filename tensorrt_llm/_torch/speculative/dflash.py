@@ -627,7 +627,8 @@ class DFlashSpecMetadata(SpecMetadata):
                         assigned[slot] = min(
                             int(self.host_position_ids[token_offset]), worker._max_ctx
                         )
-            worker._write_ctx_len(assigned)
+            if assigned:
+                worker._write_ctx_len(assigned)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
