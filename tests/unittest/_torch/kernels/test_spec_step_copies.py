@@ -23,7 +23,7 @@ engine's for max batch 8 and max draft length 7 (sampler stores [8, slots, 1], [
   > 0; shuffled distinct slot tables; accepted lengths from 0 to past the output width. A mixed context / generation
   batch laid out as the one-model worker writes it (a context row's tokens past column 0 never written) stores zeros
   there.
-* ``StepInputGather.gather`` vs PyTorchModelEngine._prepare_tp_inputs's torch overlap gathers (the stores by slot into
+* ``StepInputGather.gather`` vs ModelEngine._prepare_tp_inputs's torch overlap gathers (the stores by slot into
   the input ids and draft tokens, the lengths by the per-token index list into the position offsets,
   ``new_tokens_lens - T`` by slot into the KV-length offsets): the engine's offsets (the requests without a previous
   batch first), zero and arbitrary offsets, a draft width below T - 1, the engine's and arbitrary index lists.
@@ -137,7 +137,7 @@ def torch_gather(
     previous_kv_lens_offsets_cuda,
     kv_begin,
 ):
-    """PyTorchModelEngine._prepare_tp_inputs's torch overlap gathers (StepInputGather.gather's arguments)."""
+    """ModelEngine._prepare_tp_inputs's torch overlap gathers (StepInputGather.gather's arguments)."""
     tokens = runtime_tokens_per_gen_step
     width = runtime_draft_token_buffer_width
     previous_slots = previous_batch_indices_cuda[:previous_batch_len]

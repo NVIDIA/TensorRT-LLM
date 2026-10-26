@@ -210,7 +210,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 ):
                     module.post_load_weights()
 
-        # PyTorchModelEngine builds the vision encoders' AttentionMetadata after
+        # ModelEngine builds the vision encoders' AttentionMetadata after
         # load via `setup_mm_encoder_attn_metadata`. These standalone
         # model tests don't go through the engine, so mirror that walk here --
         # otherwise the encoder forward raises on an uninitialized attn_metadata.

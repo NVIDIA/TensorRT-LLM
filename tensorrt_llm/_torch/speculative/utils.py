@@ -12,7 +12,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
@@ -1045,7 +1045,7 @@ def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
     return draft_len
 
 
-def update_draft_len(model_engine: "PyTorchModelEngine",
+def update_draft_len(model_engine: "ModelEngine",
                      scheduled_batch: "ScheduledRequests",
                      *,
                      draft_len: Optional[int] = None,

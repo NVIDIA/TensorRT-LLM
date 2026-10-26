@@ -121,7 +121,7 @@ def _make_model_config(
 
 
 def _make_mock_model_engine(model_config):
-    """Mock PyTorchModelEngine shell; a real engine needs GPU + loaded weights."""
+    """Mock ModelEngine shell; a real engine needs GPU + loaded weights."""
     engine = Mock()
     engine.model.model_config = model_config
     engine.model.config.torch_dtype = torch.bfloat16

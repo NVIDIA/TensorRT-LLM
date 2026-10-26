@@ -109,7 +109,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           get_mm_pending_items,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
-from .model_engine import PyTorchModelEngine
+from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
@@ -433,7 +433,7 @@ class PyExecutor:
         self,
         resource_manager,
         scheduler: RequestScheduler,
-        model_engine: PyTorchModelEngine,
+        model_engine: ModelEngine,
         sampler: Sampler,
         dist: Distributed,
         max_num_sequences: int,

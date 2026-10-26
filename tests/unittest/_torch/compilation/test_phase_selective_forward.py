@@ -16,7 +16,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
 
@@ -44,12 +44,10 @@ def _create_compile_restricted_runner(
 def test_engine_passes_compile_policy_to_decoder_runner(enabled: bool) -> None:
     engine = Mock()
     engine.llm_args.torch_compile_config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
-    config = PyTorchModelEngine._decoder_runner_config(engine)
+    config = ModelEngine._decoder_runner_config(engine)
     runner_type = Mock()
 
-    result = PyTorchModelEngine._initialize_decoder_runner(
-        engine, runner_type, runner_config=config
-    )
+    result = ModelEngine._initialize_decoder_runner(engine, runner_type, runner_config=config)
 
     assert config.compile_only_piecewise_graphs is enabled
     assert result is runner_type.return_value

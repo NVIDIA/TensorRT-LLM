@@ -111,7 +111,7 @@ def _configure_deep_gemm_pdl() -> None:
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 
-class PyTorchModelEngine:
+class ModelEngine:
 
     def __init__(
         self,
@@ -1079,8 +1079,8 @@ class PyTorchModelEngine:
         try:
             self.cleanup()
         except (RuntimeError, AttributeError) as e:
-            logger.warning(
-                "PyTorchModelEngine cleanup failed during destruction: %s", e)
+            logger.warning("ModelEngine cleanup failed during destruction: %s",
+                           e)
 
     def _init_max_seq_len(self):
         # Allow user to override the inferred max_seq_len with a warning.

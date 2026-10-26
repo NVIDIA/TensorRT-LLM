@@ -1313,7 +1313,7 @@ class VilaModel(PreTrainedModel):
 
     @property
     def llm_checkpoint_dir(self):
-        """Return the directory of the LLM checkpoint. Workaround for multimodal models that config is in root directory but llm checkpoint is in subdirectory. Without this, PyTorchModelEngine will try to load LLM checkpoint from root."""
+        """Return the directory of the LLM checkpoint. Workaround for multimodal models that config is in root directory but llm checkpoint is in subdirectory. Without this, ModelEngine will try to load LLM checkpoint from root."""
         return self.llm_path
 
     def load_weights(self, weights):
