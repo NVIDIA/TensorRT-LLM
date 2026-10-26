@@ -16,6 +16,7 @@ from tensorrt_llm._torch.distributed import AllReduceStrategy
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -32,6 +33,15 @@ from .params import (
     CSA2Params,
     RowTransform,
 )
+
+# Token count up to which the BF16 hidden-state projections (wq_a, wkv) use trtllm::tinygemm2 on
+# SM107. These are N-small, K = hidden_size GEMMs for which cuBLAS reaches a fraction of the
+# memory bandwidth at decode sizes.
+_TINYGEMM_MAX_TOKENS = 8
+
+
+def _tinygemm_projections_supported() -> bool:
+    return torch.cuda.is_available() and get_sm_version() == 107
 
 
 class DeepseekV41Attention(nn.Module):
@@ -177,6 +187,13 @@ class DeepseekV41Attention(nn.Module):
         self.wkv = Linear(
             hidden_size, head_dim, bias=False, dtype=torch.bfloat16, quant_config=quant_config
         )
+        self._tinygemm_projections = (
+            projection_quantization == "bf16" and _tinygemm_projections_supported()
+        )
+        # Set by post_load_weights: the row-concatenated [wq_a; wkv] weight (both Linear weights
+        # are views into it) and the zero bias tinygemm2 requires.
+        self._q_a_kv_weight: torch.Tensor | None = None
+        self._tinygemm_zero_bias: torch.Tensor | None = None
         self.q_norm = RMSNorm(hidden_size=q_lora_rank, eps=eps, dtype=torch.bfloat16)
         self.kv_norm = RMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
         self.attn_sink = nn.Parameter(torch.zeros(self.num_heads_tp, dtype=torch.float32))
@@ -452,6 +469,77 @@ class DeepseekV41Attention(nn.Module):
         query = self.index_wq_b(qr).reshape(-1, self.index_heads, self.index_head_dim)
         return self._rope(query, positions, self.index_heads), None
 
+    def post_load_weights(self) -> None:
+        """Back the ``wq_a`` and ``wkv`` weights with one concatenated tensor for tinygemm2."""
+        self._q_a_kv_weight = None
+        self._tinygemm_zero_bias = None
+        if not self._tinygemm_projections:
+            return
+        wq_a, wkv = self.wq_a.weight, self.wkv.weight
+        if (
+            wq_a.dtype != torch.bfloat16
+            or wkv.dtype != torch.bfloat16
+            or wq_a.device.type != "cuda"
+            or wkv.device != wq_a.device
+            or wkv.shape[1] != wq_a.shape[1]
+        ):
+            return
+        fused = torch.cat([wq_a.detach(), wkv.detach()])
+        self.wq_a.weight.data = fused[: wq_a.shape[0]]
+        self.wkv.weight.data = fused[wq_a.shape[0] :]
+        self._q_a_kv_weight = fused
+        self._tinygemm_zero_bias = fused.new_zeros(fused.shape[0])
+
+    def _project_hidden(self, linear: Linear, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._tinygemm_zero_bias is None:
+            return linear(hidden_states)
+        weight = linear.weight
+        if (
+            hidden_states.dim() == 2
+            and 0 < hidden_states.shape[0] <= _TINYGEMM_MAX_TOKENS
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and linear.bias is None
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and hidden_states.data_ptr() % 16 == 0
+            and weight.data_ptr() % 16 == 0
+        ):
+            return torch.ops.trtllm.tinygemm2(
+                hidden_states, weight, self._tinygemm_zero_bias[: weight.shape[0]]
+            )
+        return linear(hidden_states)
+
+    def _project_q_a_and_kv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``wq_a(hidden_states)`` and ``wkv(hidden_states)``.
+
+        One token runs both projections as a single tinygemm2 over the concatenated weight while
+        both Linear weights still alias it; otherwise each projection runs on its own.
+        """
+        fused = self._q_a_kv_weight
+        if (
+            fused is not None
+            and hidden_states.dim() == 2
+            and hidden_states.shape[0] == 1
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and hidden_states.data_ptr() % 16 == 0
+            and self.wq_a.weight.data_ptr() == fused.data_ptr()
+            and self.wkv.weight.data_ptr() == fused[self.wq_a.weight.shape[0] :].data_ptr()
+        ):
+            projected = torch.ops.trtllm.tinygemm2(hidden_states, fused, self._tinygemm_zero_bias)
+            q_rows = self.wq_a.weight.shape[0]
+            kv_rows = fused.shape[0] - q_rows
+            # Give both halves the strides of a dense [1, N] tensor.
+            return (
+                projected[:, :q_rows].as_strided((1, q_rows), (q_rows, 1)),
+                projected[:, q_rows:].as_strided((1, kv_rows), (kv_rows, 1)),
+            )
+        return (
+            self._project_hidden(self.wq_a, hidden_states),
+            self._project_hidden(self.wkv, hidden_states),
+        )
+
     def _project_output(self, output, positions, *, inverse_rope_applied: bool = False):
         if self._o_a_fp8_block128 and inverse_rope_applied:
             raise ValueError("Grouped 128-block FP8 owns its fused inverse-RoPE/quantization")
@@ -550,14 +638,14 @@ class DeepseekV41Attention(nn.Module):
                     skip_global=precomputed,
                 )
                 self._prepare_done.record()
-        qr = self.q_norm(self.wq_a(hidden_states))
+        q_a, swa = self._project_q_a_and_kv(hidden_states)
+        qr = self.q_norm(q_a)
         # CSA2 never applies V4's projected-Q per-head normalization.
         q = self._rope(
             self.wq_b(qr).reshape(-1, self.num_heads_tp, self.qk_head_dim),
             positions,
             self.num_heads_tp,
         )
-        swa = self.wkv(hidden_states)
         swa_transform = None
         if self.rotary_emb.is_neox:
             swa = self._rope(self.kv_norm(swa).unsqueeze(1), positions, 1).squeeze(1)

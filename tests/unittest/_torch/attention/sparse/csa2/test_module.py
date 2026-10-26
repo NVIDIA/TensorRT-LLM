@@ -179,6 +179,7 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
     model.aux_stream = None
     model.num_heads_tp, model.qk_head_dim, model.eps = 1, 512, 1e-6
     model.wq_a = model.wq_b = model.wkv = nn.Identity()
+    model._q_a_kv_weight = model._tinygemm_zero_bias = None
     model.compressor = nn.Identity()
     model.q_norm = model.kv_norm = nn.Identity()
     # Neox RoPE keeps the explicit norm / RoPE calls this test patches out of the cache writes.
@@ -522,7 +523,10 @@ def _native_model(
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout, CSA2Params
     from tensorrt_llm.functional import PositionEmbeddingType
 
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    if projection_quantization == "mxfp8" and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
         pytest.skip("Native MXFP8 projections require SM100/SM103")
     layout = layout or CSA2Layout((1,), (0,), (0,), index_topk=32)
     options = {"fuse_index_q": fused}
@@ -622,6 +626,72 @@ def test_attention_dp_loads_full_projection_weights(rank, quantization):
     torch.testing.assert_close(
         model.o_b_proj(projected), reference.o_b_proj(projected), atol=0, rtol=0
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="tinygemm2 hidden-state projections are enabled on SM107 only",
+)
+@torch.inference_mode()
+def test_tinygemm_hidden_state_projections(monkeypatch):
+    model, weights = _native_model(projection_quantization="bf16")
+    model.post_load_weights()
+    q_rows, kv_rows = model.wq_a.weight.shape[0], model.wkv.weight.shape[0]
+    fused = model._q_a_kv_weight
+    assert fused is not None and fused.shape == (q_rows + kv_rows, model.wq_a.weight.shape[1])
+    assert model.wq_a.weight.data_ptr() == fused.data_ptr()
+    assert model.wkv.weight.data_ptr() == fused[q_rows:].data_ptr()
+
+    calls = []
+    tinygemm2 = torch.ops.trtllm.tinygemm2
+
+    def counted(x, weight, bias):
+        calls.append(weight.shape[0])
+        return tinygemm2(x, weight, bias)
+
+    monkeypatch.setattr(torch.ops.trtllm, "tinygemm2", counted)
+
+    def check(tokens, expected_calls):
+        hidden = torch.randn(tokens, model.wq_a.in_features, device="cuda", dtype=torch.bfloat16)
+        calls.clear()
+        q_a, kv = model._project_q_a_and_kv(hidden)
+        assert calls == expected_calls
+        assert q_a.shape == (tokens, q_rows) and q_a.stride() == (q_rows, 1)
+        assert kv.shape == (tokens, kv_rows) and kv.stride() == (kv_rows, 1)
+        for actual, linear in ((q_a, model.wq_a), (kv, model.wkv)):
+            expected = F.linear(hidden.float(), linear.weight.float())
+            torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+
+    check(1, [q_rows + kv_rows])
+    for tokens in (2, 8):
+        check(tokens, [q_rows, kv_rows])
+    for tokens in (9, 32):
+        check(tokens, [])
+
+    # The fused call is captured and replayed like the per-projection ones.
+    static = torch.randn(1, model.wq_a.in_features, device="cuda", dtype=torch.bfloat16)
+    model._project_q_a_and_kv(static)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_q_a, graph_kv = model._project_q_a_and_kv(static)
+    for _ in range(3):
+        static.copy_(torch.randn_like(static))
+        graph.replay()
+        eager_q_a, eager_kv = model._project_q_a_and_kv(static)
+        torch.testing.assert_close(graph_q_a, eager_q_a, atol=0, rtol=0)
+        torch.testing.assert_close(graph_kv, eager_kv, atol=0, rtol=0)
+
+    # Reloading writes through the views; a replaced weight disables the fused call.
+    reloaded = dict(weights)
+    for name in ("wq_a.weight", "wkv.weight"):
+        reloaded[name] = torch.randn(weights[name].shape, device="cuda").to(torch.float8_e4m3fn)
+    previous = fused.clone()
+    model.load_hf_weights(reloaded)
+    assert model.wq_a.weight.data_ptr() == fused.data_ptr()
+    assert not torch.equal(fused, previous)
+    check(1, [q_rows + kv_rows])
+    model.wkv.weight = nn.Parameter(model.wkv.weight.detach().clone(), requires_grad=False)
+    check(1, [q_rows, kv_rows])
 
 
 @skip_pre_blackwell
