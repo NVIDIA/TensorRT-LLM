@@ -83,7 +83,6 @@ full:B200/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 full:B200/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6435097)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6728119)
-full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-deepseek_r1_v2_fp4_stress] SKIP (https://nvbugs/6765807)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-gpt_oss_120b_eagle_trtllm_stress] SKIP (https://nvbugs/6649384)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_32b_fp8_stress] SKIP (https://nvbugs/6621362)
 full:B200/test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-eagle3] SKIP (https://nvbugs/6695515)
