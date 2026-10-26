@@ -195,7 +195,6 @@ class DecoderCudaGraphs:
         model: torch.nn.Module,
         sparse_attention_config: BaseSparseAttentionConfig | None,
         metrics: dict[str, float],
-        kv_cache_manager_key: ResourceManagerType,
         dummy_requests: DummyRequestFactory,
         agreement: WarmupAgreement,
         metadata: DecoderMetadata,
@@ -214,7 +213,6 @@ class DecoderCudaGraphs:
         self.model = model
         self.sparse_attention_config = sparse_attention_config
         self._metrics = metrics
-        self.kv_cache_manager_key = kv_cache_manager_key
         self._dummy_requests = dummy_requests
         self._agreement = agreement
         self._metadata = metadata
@@ -660,7 +658,9 @@ class DecoderCudaGraphs:
                 ):
                     return
 
-                kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+                kv_cache_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.KV_CACHE_MANAGER
+                )
                 context_only = (
                     getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
                 )

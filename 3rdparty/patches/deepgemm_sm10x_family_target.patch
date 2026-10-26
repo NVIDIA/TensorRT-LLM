@@ -1,0 +1,13 @@
+--- a/csrc/runtime/jit.hpp
++++ b/csrc/runtime/jit.hpp
+@@ -37,6 +37,10 @@
+         // Preserve the existing 12.x family target when DeepJIT derives a different minor target.
+         if (runtime->device.get_arch_major() == 12 and runtime->device.get_arch_minor() != 0)
+             runtime->default_compiler_options.arch = "120f";
++        // A 10.x device past 10.3 (e.g. 10.7) builds for the 10.0 family target, which it runs:
++        // the bundled CUTLASS enables TMA and tcgen05 only for the targets it knows.
++        if (runtime->device.get_arch_major() == 10 and runtime->device.get_arch_minor() > 3)
++            runtime->default_compiler_options.arch = "100f";
+         return runtime;
+     });
+ }

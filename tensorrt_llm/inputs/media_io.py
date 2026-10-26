@@ -25,7 +25,6 @@ from typing import (
     Dict,
     Generic,
     List,
-    Literal,
     Mapping,
     Optional,
     Tuple,
@@ -44,7 +43,7 @@ from blake3 import blake3
 from packaging.version import Version
 from PIL import Image
 
-from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
+from tensorrt_llm.inputs.multimodal_data import AudioData, MediaModality, VideoData
 from tensorrt_llm.logger import logger
 
 
@@ -77,9 +76,6 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
     else:
         return image.convert(to_mode)
 
-
-# Canonical set of supported media modalities for Pydantic field validation.
-MediaModality = Literal["image", "video", "audio"]
 
 # Output representations supported by `ImageMediaIO`:
 # `"pt"` -> `torch.Tensor`, `"np"` -> uint8 HWC `numpy.ndarray`,
