@@ -798,8 +798,11 @@ def install_modeling_v2_libs(mv2_build_dir: Path, lib_dir: Path,
 
     Each family's build directory holds cuda_architectures.txt, written at
     configure time: the architectures its library was built for, empty when
-    there is none (cpp/cmake/modules/modeling_v2.cmake).
+    there is none (cpp/cmake/modules/modeling_v2.cmake). As deep_ep's package
+    is, a family library installed by an earlier build that this build did not
+    produce is removed, so it is neither loaded nor shipped.
     """
+    installed = set()
     for arch_file in sorted(mv2_build_dir.glob("*/cuda_architectures.txt")):
         if not arch_file.read_text().strip().strip(";"):
             continue
@@ -808,6 +811,10 @@ def install_modeling_v2_libs(mv2_build_dir: Path, lib_dir: Path,
             "Exactly one modeling_v2 library should be present in "
             f"{arch_file.parent}: {libraries}")
         install_file(libraries[0], lib_dir / libraries[0].name)
+        installed.add(libraries[0].name)
+    for stale in lib_dir.glob("libth_modeling_v2_*.so"):
+        if stale.name not in installed:
+            stale.unlink()
 
 
 def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
