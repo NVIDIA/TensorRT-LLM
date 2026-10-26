@@ -19,10 +19,10 @@
 
 #include "tensorrt_llm/common/config.h"
 
-// trtllm_mv2_target() and trtllm_mv2_shared() define TRTLLM_MV2_SCOPE as
-// `<family>::<target>` or `<family>::shared` (cpp/cmake/modules/modelingV2.cmake).
+// add_modeling_v2_target() and add_modeling_v2_shared() define TRTLLM_MV2_SCOPE
+// as `<family>::<target>` or `<family>::shared` (cpp/cmake/modules/modeling_v2.cmake).
 #ifndef TRTLLM_MV2_SCOPE
-#error "modeling_v2 native code is compiled through trtllm_mv2_target() or trtllm_mv2_shared()"
+#error "modeling_v2 native code is compiled through add_modeling_v2_target() or add_modeling_v2_shared()"
 #endif
 
 //! Opens tensorrt_llm::modeling_v2::<family>::<target> (or ::shared) for the unit

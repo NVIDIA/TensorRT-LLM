@@ -16,13 +16,13 @@
 #
 
 # The infrastructure fixture: one target with one op, so that CI drives the
-# whole native path -- build, packaging, load, contract fingerprint, fake op,
+# whole native path -- build, packaging, load, built_targets(), fake op,
 # GPU op -- on every GPU it has. It is also the smallest complete family to copy
 # (see ../README.md). Its architectures cover every GPU CI runs on; a real
 # target declares the architectures it was written and gated for.
-trtllm_mv2_family(fixture)
+add_modeling_v2_family(fixture)
 
-trtllm_mv2_target(
+add_modeling_v2_target(
   fixture scale_add__sm_80__default
   ARCHS 80 90 100f 120f
   SOURCES kernels/scaleAdd.cu ops/scaleAddOp.cpp)

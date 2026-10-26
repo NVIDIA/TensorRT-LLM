@@ -26,10 +26,10 @@
           "ARCHS": "+"
         }
       },
-      "trtllm_mv2_family": {
+      "add_modeling_v2_family": {
         "pargs": 1
       },
-      "trtllm_mv2_shared": {
+      "add_modeling_v2_shared": {
         "pargs": 1,
         "kwargs": {
           "ARCHS": "+",
@@ -38,7 +38,7 @@
           "REQUIRES": "+"
         }
       },
-      "trtllm_mv2_target": {
+      "add_modeling_v2_target": {
         "pargs": 2,
         "kwargs": {
           "ARCHS": "+",

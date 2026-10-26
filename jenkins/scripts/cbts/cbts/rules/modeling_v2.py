@@ -17,8 +17,8 @@ modeling_v2 is a second modeling path: one self-contained forward per
 (checkpoint, GPU arch, parallel topology), assembled from a catalog of op
 wrappers. Its Python lives under `tensorrt_llm/_torch/_experimental/modeling_v2/`
 and its native code under `cpp/tensorrt_llm/modeling_v2/`, which builds one
-library per model family, loaded only when routing picks one of the family's
-targets.
+torch-op library per model family, loaded only when routing picks one of the
+family's targets.
 
 Scope — per family, else all of modeling_v2:
 A change confined to one family's directories (`models/<family>/` in Python,
@@ -26,7 +26,7 @@ A change confined to one family's directories (`models/<family>/` in Python,
 entries -- `accuracy/modeling_v2/test_<family>.py` and
 `unittest/_torch/modeling_v2/models/<family>/` -- plus the modeling_v2 CPU
 checks. Any other modeling_v2 change (catalog, resolver, loader, the native
-build module and contract surface) selects every modeling_v2 entry. Several
+build module and its common headers) selects every modeling_v2 entry. Several
 families in one PR union their entries.
 
 Why no outward fallback is needed: nothing beyond the resolver is imported, and
@@ -38,8 +38,8 @@ libth_common.so. The claims tests under `tests/unittest/_torch/modeling_v2/`
 keep that true (stock never references a target, targets never reach a
 sibling, `modeling_v2` defaults to `off`); they run in every scope this rule
 selects. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`,
-`_torch/models/modeling_auto.py`, the `trtllm::mv2_contract_fingerprint` op in
-`cpp/tensorrt_llm/thop/`) stay unclaimed: a change to them runs the baseline.
+`_torch/models/modeling_auto.py`) stay unclaimed: a change to them runs the
+baseline.
 
 `.md` exclusion matters here: every catalog entry carries a contract document,
 so a fifth of the Python subtree is Markdown; claiming it would let a
@@ -71,12 +71,7 @@ _CPP_ROOT = "cpp/tensorrt_llm/modeling_v2/"
 # Directories of the native tree that are not families.
 _CPP_NON_FAMILY_DIRS = frozenset({"common", "catalog"})
 # The native build module: shared by every family library.
-_CPP_BUILD_FILES = frozenset(
-    {
-        "cpp/cmake/modules/modelingV2.cmake",
-        "cpp/cmake/modules/modelingV2Fingerprint.cmake",
-    }
-)
+_CPP_BUILD_FILES = frozenset({"cpp/cmake/modules/modeling_v2.cmake"})
 
 # Source-path prefixes the rule may claim. Tests under tests/** are left to
 # TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
@@ -104,7 +99,7 @@ _MV2_CHECK_ENTRY = re.compile(r"^unittest/_torch/modeling_v2/test_modeling_v2_[\
 def _camel(name: str) -> str:
     """The C++ directory of a family: `minimax_m3` -> `minimaxM3`.
 
-    Mirrors `_trtllm_mv2_camel` in cpp/cmake/modules/modelingV2.cmake.
+    Mirrors `_modeling_v2_camel` in cpp/cmake/modules/modeling_v2.cmake.
     """
     parts = [p for p in name.split("_") if p]
     return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])

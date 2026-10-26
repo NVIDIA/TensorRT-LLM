@@ -171,13 +171,6 @@ add_th_common_family(
 # model.
 add_subdirectory(glmMoeDsa)
 
-# trtllm::mv2_contract_fingerprint: the stock side of the check the modeling_v2
-# loader makes before it uses a family library (cpp/tensorrt_llm/modeling_v2).
-add_th_common_family(th_common_modeling_v2 modelingV2ContractOp.cpp)
-add_dependencies(th_common_modeling_v2 trtllm_mv2_contract_fingerprint)
-target_include_directories(th_common_modeling_v2
-                           PRIVATE ${TRTLLM_MV2_GENERATED_DIR})
-
 add_library(
   th_common SHARED
   $<TARGET_OBJECTS:th_common_attention>
@@ -186,8 +179,7 @@ add_library(
   $<TARGET_OBJECTS:th_common_distributed>
   $<TARGET_OBJECTS:th_common_sequence>
   $<TARGET_OBJECTS:th_common_visual_gen>
-  $<TARGET_OBJECTS:th_common_decoding>
-  $<TARGET_OBJECTS:th_common_modeling_v2>)
+  $<TARGET_OBJECTS:th_common_decoding>)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)

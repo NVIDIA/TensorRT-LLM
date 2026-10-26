@@ -794,34 +794,20 @@ def has_sm90_or_newer(cuda_architectures: str) -> bool:
 
 def install_modeling_v2_libs(mv2_build_dir: Path, lib_dir: Path,
                              install_file) -> None:
-    """Install the modeling_v2 family libraries and their manifest.
+    """Install the modeling_v2 family libraries the way deep_ep and flash_mla are.
 
-    The manifest is what the loader reads
-    (tensorrt_llm/_torch/_experimental/modeling_v2/_native.py). This is also
-    the packaging completeness check: the manifest lists, per family, the
-    library its built targets need, and a listed library that is missing fails
-    the build here rather than turning into a modeling_v2 fallback at run time.
+    Each family's build directory holds cuda_architectures.txt, written at
+    configure time: the architectures its library was built for, empty when
+    there is none (cpp/cmake/modules/modeling_v2.cmake).
     """
-    manifest_path = mv2_build_dir / "modeling_v2_manifest.json"
-    if not manifest_path.is_file():
-        raise RuntimeError(
-            f"{manifest_path} is missing; the cmake configure step writes it "
-            "(cpp/tensorrt_llm/modeling_v2/CMakeLists.txt)")
-    manifest = json.loads(manifest_path.read_text())
-    install_file(manifest_path, lib_dir / manifest_path.name)
-    missing = []
-    for family, entry in sorted(manifest.get("families", {}).items()):
-        library = entry.get("library")
-        if library is None:
+    for arch_file in sorted(mv2_build_dir.glob("*/cuda_architectures.txt")):
+        if not arch_file.read_text().strip().strip(";"):
             continue
-        if not (mv2_build_dir / library).is_file():
-            missing.append(f"{family}: {library}")
-            continue
-        install_file(mv2_build_dir / library, lib_dir / library)
-    if missing:
-        raise RuntimeError(
-            "modeling_v2 packaging check: the manifest lists libraries the build "
-            f"did not produce: {', '.join(missing)}")
+        libraries = list(arch_file.parent.glob("libth_modeling_v2_*.so"))
+        assert len(libraries) == 1, (
+            "Exactly one modeling_v2 library should be present in "
+            f"{arch_file.parent}: {libraries}")
+        install_file(libraries[0], lib_dir / libraries[0].name)
 
 
 def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:

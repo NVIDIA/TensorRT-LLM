@@ -91,9 +91,9 @@ def test_claims_python_and_native_sources_but_not_docs_or_stock():
     assert _is_mv2_claim(f"{_PY}/models/fixture/scale_add__sm_80__default/__init__.py")
     assert _is_mv2_claim(f"{_CPP}/fixture/scaleAddSm80Default/kernels/scaleAdd.cu")
     assert _is_mv2_claim(f"{_CPP}/contractSurface.txt")
-    assert _is_mv2_claim("cpp/cmake/modules/modelingV2.cmake")
+    assert _is_mv2_claim("cpp/cmake/modules/modeling_v2.cmake")
     assert not _is_mv2_claim(f"{_CPP}/README.md")
-    assert not _is_mv2_claim("cpp/tensorrt_llm/thop/modelingV2ContractOp.cpp")
+    assert not _is_mv2_claim("cpp/tensorrt_llm/thop/attentionOp.cpp")
     assert not _is_mv2_claim("tensorrt_llm/_torch/pyexecutor/model_loader.py")
 
 
@@ -143,7 +143,7 @@ def test_two_families_union(rule):
         f"{_PY}/_native.py",
         f"{_CPP}/common/torchLibrary.h",
         f"{_CPP}/contractSurface.txt",
-        "cpp/cmake/modules/modelingV2.cmake",
+        "cpp/cmake/modules/modeling_v2.cmake",
     ],
 )
 def test_shared_modeling_v2_code_selects_everything_of_modeling_v2(rule, changed):

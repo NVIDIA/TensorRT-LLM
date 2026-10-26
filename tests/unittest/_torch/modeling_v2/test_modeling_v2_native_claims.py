@@ -25,18 +25,13 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import (
-    arch_covers,
-    camel,
-    identifier,
-    torch_namespace,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._native import camel, identifier, torch_namespace
 
 _REPO = Path(__file__).resolve().parents[4]
 _NATIVE = _REPO / "cpp/tensorrt_llm/modeling_v2"
 _PY = _REPO / "tensorrt_llm/_torch/_experimental/modeling_v2"
 _MODELS = _PY / "models"
-_CMAKE_MODULE = _REPO / "cpp/cmake/modules/modelingV2.cmake"
+_CMAKE_MODULE = _REPO / "cpp/cmake/modules/modeling_v2.cmake"
 _TEST_DB = _REPO / "tests/integration/test_lists/test-db"
 
 pytestmark = [
@@ -49,6 +44,19 @@ _NATIVE_SUFFIXES = (".cu", ".cuh", ".h", ".hpp", ".inl", ".cpp")
 _NON_FAMILY_DIRS = {"common", "catalog"}
 # A target name's sm segment that names a family of architectures.
 _SM_GROUPS = {"10x": ((10, 0), (10, 3))}
+
+
+def arch_covers(arch: str, capability: tuple[int, int]) -> bool:
+    """Whether code built for ``arch`` (``NN``, ``NNa`` or ``NNf``) runs on ``capability``.
+
+    ``NNa`` runs on exactly NN; ``NN`` on NN and later minor versions of the same
+    major version; ``NNf`` on every member of family NN, the same way.
+    """
+    suffix = arch[-1] if arch[-1] in "af" else ""
+    major, minor = divmod(int(arch[:-1] if suffix else arch), 10)
+    if suffix == "a":
+        return capability == (major, minor)
+    return capability[0] == major and capability[1] >= minor
 
 
 # --- Reading the CMake declarations ------------------------------------------
@@ -75,19 +83,19 @@ def _families() -> dict[str, Path]:
     """family -> native family directory, from every family CMakeLists.txt."""
     families = {}
     for cmake in sorted(_NATIVE.glob("*/CMakeLists.txt")):
-        calls = _calls(cmake.read_text(), "trtllm_mv2_family")
+        calls = _calls(cmake.read_text(), "add_modeling_v2_family")
         assert len(calls) == 1 and len(calls[0]) == 1, (
-            f"{cmake.relative_to(_REPO)} must call trtllm_mv2_family(<family>) exactly once"
+            f"{cmake.relative_to(_REPO)} must call add_modeling_v2_family(<family>) exactly once"
         )
         families[calls[0][0]] = cmake.parent
     return families
 
 
 def _targets() -> list[tuple[str, str, list[str]]]:
-    """(family, target, tokens) of every trtllm_mv2_target call."""
+    """(family, target, tokens) of every add_modeling_v2_target call."""
     out = []
     for family_dir in _families().values():
-        for tokens in _calls((family_dir / "CMakeLists.txt").read_text(), "trtllm_mv2_target"):
+        for tokens in _calls((family_dir / "CMakeLists.txt").read_text(), "add_modeling_v2_target"):
             out.append((tokens[0], tokens[1], tokens[2:]))
     return out
 
@@ -129,7 +137,7 @@ def test_every_native_target_is_a_python_target_that_loads_it():
             if sub.name == "shared":
                 continue
             assert any(camel(t) == sub.name for f, t in declared if f == family), (
-                f"{sub.relative_to(_REPO)} is not the directory of any trtllm_mv2_target "
+                f"{sub.relative_to(_REPO)} is not the directory of any add_modeling_v2_target "
                 f"of family {family!r}"
             )
 
@@ -142,7 +150,7 @@ def test_python_targets_that_load_native_code_have_it():
         family, target = package.parent.parent.name, package.parent.name
         assert (family, target) in declared, (
             f"{package.relative_to(_REPO)} loads native code, but no "
-            f"trtllm_mv2_target({family} {target} ...) declares it"
+            f"add_modeling_v2_target({family} {target} ...) declares it"
         )
 
 
@@ -386,18 +394,18 @@ def test_accuracy_entries_name_a_family():
 @pytest.mark.skipif(shutil.which("cmake") is None, reason="needs cmake")
 def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
     """The loader and CBTS compute directory, namespace and architecture
-    coverage in Python; the build computes them in modelingV2.cmake."""
+    coverage in Python; the build computes them in modeling_v2.cmake."""
     names = ["fixture", "minimax_m3", "scale_add__sm_80__default", "r1_0528_nvfp4__sm_10x__default"]
     script = tmp_path / "probe.cmake"
     lines = [f'include("{_CMAKE_MODULE}")']
     for name in names:
         lines += [
-            f'_trtllm_mv2_camel(c "{name}")',
-            f'_trtllm_mv2_ident(i "{name}")',
+            f'_modeling_v2_camel(c "{name}")',
+            f'_modeling_v2_ident(i "{name}")',
             f'message(STATUS "name {name} ${{c}} ${{i}}")',
         ]
     lines += [
-        "_trtllm_mv2_resolve_archs(r DECLARED 80 90a 100f 103a 120f REQUESTED 86 90 103 107)",
+        "_modeling_v2_resolve_archs(r DECLARED 80 90a 100f 103a 120f REQUESTED 86 90 103 107)",
         'message(STATUS "archs ${r}")',
     ]
     script.write_text("\n".join(lines) + "\n")

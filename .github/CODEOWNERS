@@ -390,8 +390,7 @@
 # modeling_v2 native code: the modeling_v2 owners for the targets, the kernels
 # owners because it is CUDA and links against the stock libraries.
 /cpp/tensorrt_llm/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
-/cpp/cmake/modules/modelingV2.cmake @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
-/cpp/cmake/modules/modelingV2Fingerprint.cmake @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
+/cpp/cmake/modules/modeling_v2.cmake @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
 /tests/integration/defs/accuracy/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
 # The two catalog categories whose contracts state kernel behaviour the

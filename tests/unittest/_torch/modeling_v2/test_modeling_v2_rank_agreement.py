@@ -98,7 +98,7 @@ def test_disagreeing_ranks_all_fail(monkeypatch, dist):
 
 
 def test_another_ranks_error_fails_this_rank(monkeypatch, dist):
-    dist.others = [(None, None, "NativeLoadError: libtrtllm_mv2_x.so cannot be loaded")]
+    dist.others = [(None, None, "NativeLoadError: libth_modeling_v2_x.so cannot be loaded")]
     _route_to(monkeypatch, target=Target)
     with pytest.raises(RuntimeError, match="rank 1: NativeLoadError"):
         modeling_v2_resolve_on_all_ranks(_config(), _args("auto"))

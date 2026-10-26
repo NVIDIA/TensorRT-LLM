@@ -15,27 +15,37 @@
 # the License.
 #
 
-# Native code of modeling_v2 targets: one library per model family, loaded only
-# when routing picks one of its targets. Every subdirectory with a
+# Native code of modeling_v2 targets: one torch-op library per model family,
+# loaded only when routing picks one of its targets. Every subdirectory with a
 # CMakeLists.txt is a family; see README.md and
-# cpp/cmake/modules/modelingV2.cmake.
+# cpp/cmake/modules/modeling_v2.cmake.
+
+include(modeling_v2)
 
 add_custom_target(modeling_v2_libs)
 
-if(WIN32)
-  trtllm_mv2_write_disabled_manifest(
-    "modeling_v2 libraries are not built on Windows")
-elseif(NOT BUILD_MODELING_V2)
-  trtllm_mv2_write_disabled_manifest("built with BUILD_MODELING_V2=OFF")
-else()
-  file(
-    GLOB family_lists
-    LIST_DIRECTORIES false
-    CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*/CMakeLists.txt")
-  list(SORT family_lists)
+file(
+  GLOB family_lists
+  LIST_DIRECTORIES false
+  CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*/CMakeLists.txt")
+list(SORT family_lists)
+
+if(WIN32 OR NOT BUILD_MODELING_V2)
+  # As deep_ep does on a build without a matching architecture: an empty
+  # cuda_architectures.txt per family, so build_wheel.py installs nothing,
+  # including a library left from an earlier configuration.
   foreach(family_list IN LISTS family_lists)
     get_filename_component(family_dir "${family_list}" DIRECTORY)
-    add_subdirectory("${family_dir}")
+    get_filename_component(family_dir_name "${family_dir}" NAME)
+    file(WRITE
+         "${CMAKE_CURRENT_BINARY_DIR}/${family_dir_name}/cuda_architectures.txt"
+         "")
   endforeach()
-  trtllm_mv2_finalize()
+  return()
 endif()
+
+foreach(family_list IN LISTS family_lists)
+  get_filename_component(family_dir "${family_list}" DIRECTORY)
+  add_subdirectory("${family_dir}")
+endforeach()
+add_modeling_v2_family_libraries()

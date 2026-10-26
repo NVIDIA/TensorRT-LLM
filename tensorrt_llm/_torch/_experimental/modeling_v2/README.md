@@ -125,12 +125,14 @@ catalog/<category>/ entries more than one target calls
 
 A target's C++/CUDA lives beside the stock tree, not in it:
 `cpp/tensorrt_llm/modeling_v2/<familyCamel>/<targetCamel>/`, built into one
-library per family, `libtrtllm_mv2_<family>.so`. Nothing of it is linked into
-`libtensorrt_llm.so` or `libth_common.so`, and nothing loads it until routing
-imports one of the family's targets, whose `__init__.py` starts with
-`native_ops = load_target_ops(__name__)`. A target this build or this device
-cannot run is a `NoTarget`, so `auto` keeps the built-in model; a broken
-installation is a `NativeLoadError`, never a fallback.
+torch-op library per family, `libth_modeling_v2_<family>.so`, installed next to
+`libth_common.so`. Nothing of it is linked into `libtensorrt_llm.so` or
+`libth_common.so`, and nothing loads it until routing imports one of the
+family's targets, whose `__init__.py` starts with
+`native_ops = load_target_ops(__name__)`. As with the stock code's optional
+native modules, a library this installation does not carry is a `NoTarget`, so
+`auto` keeps the built-in model; one that is installed but broken is a
+`NativeLoadError`, never a fallback.
 `cpp/tensorrt_llm/modeling_v2/README.md` is the guide, and
 `models/fixture/` is the smallest complete example.
 

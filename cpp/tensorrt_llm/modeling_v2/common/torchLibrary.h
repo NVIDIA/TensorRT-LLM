@@ -19,12 +19,12 @@
 
 #include <torch/library.h>
 
-// trtllm_mv2_target() defines TRTLLM_MV2_TORCH_NS as mv2_<family>_<target> and
-// trtllm_mv2_shared() as mv2_<family> (cpp/cmake/modules/modelingV2.cmake). The
+// add_modeling_v2_target() defines TRTLLM_MV2_TORCH_NS as mv2_<family>_<target>
+// and add_modeling_v2_shared() as mv2_<family> (cpp/cmake/modules/modeling_v2.cmake). The
 // family library claims each namespace once with TORCH_LIBRARY, so op files only
 // ever add fragments to it.
 #ifndef TRTLLM_MV2_TORCH_NS
-#error "modeling_v2 torch bindings are compiled through trtllm_mv2_target() or trtllm_mv2_shared()"
+#error "modeling_v2 torch bindings are compiled through add_modeling_v2_target() or add_modeling_v2_shared()"
 #endif
 
 // One level of indirection so that TORCH_LIBRARY_*'s own # and ## operators see

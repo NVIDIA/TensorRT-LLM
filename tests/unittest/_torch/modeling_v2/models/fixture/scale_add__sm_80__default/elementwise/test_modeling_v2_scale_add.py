@@ -4,8 +4,8 @@
 
 Importing the entry imports its target package, which loads the fixture family
 library through ``_native.load_target_ops``: a pass here means the library was
-built for this GPU, packaged, opened, matched the stock contract fingerprint and
-registered its fake op -- before the first cell runs.
+built for this GPU, packaged, opened, listed the target in its built_targets()
+and registered its fake op -- before the first cell runs.
 """
 
 import zlib

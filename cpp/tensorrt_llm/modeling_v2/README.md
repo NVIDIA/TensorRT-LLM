@@ -6,7 +6,8 @@
 C++/CUDA used only by modeling_v2 targets
 (`tensorrt_llm/_torch/_experimental/modeling_v2/`) lives here, not in
 `cpp/tensorrt_llm/kernels/` or `thop/`. Each model family builds into one
-library, `libtrtllm_mv2_<family>.so`.
+torch-op library, `libth_modeling_v2_<family>.so`, installed next to
+`libth_common.so`.
 
 - **Not linked into stock.** Nothing in the family library is linked into
   `libtensorrt_llm.so` or `libth_common.so`.
@@ -24,8 +25,8 @@ cpp/tensorrt_llm/modeling_v2/
   CMakeLists.txt              adds every family directory (the only stock hook)
   contractSurface.txt         the stock headers native code may include
   common/                     namespace and torch-registration macros
-  <familyCamel>/              one model family -> libtrtllm_mv2_<family>.so
-    CMakeLists.txt            trtllm_mv2_family / trtllm_mv2_shared / trtllm_mv2_target
+  <familyCamel>/              one model family -> libth_modeling_v2_<family>.so
+    CMakeLists.txt            add_modeling_v2_family / _shared / _target
     shared/                   code more than one target of the family calls
     <targetCamel>/            one target
       kernels/                *.cu *.cuh *.h -- compiled for the target's ARCHS, no torch
@@ -51,9 +52,9 @@ The example below adds an op to target `foo_nvfp4__sm_103__tp4` of family
 1. **Declare it.** The declaration goes in `cpp/tensorrt_llm/modeling_v2/foo/CMakeLists.txt`:
 
    ```cmake
-   trtllm_mv2_family(foo)
+   add_modeling_v2_family(foo)
 
-   trtllm_mv2_target(
+   add_modeling_v2_target(
      foo foo_nvfp4__sm_103__tp4
      ARCHS 103a
      SOURCES kernels/*.cu ops/*.cpp
@@ -123,25 +124,26 @@ No stock file changes along the way.
 
 ## CMake API
 
-The functions are defined in `cpp/cmake/modules/modelingV2.cmake`.
+The functions are defined in `cpp/cmake/modules/modeling_v2.cmake`, in the style
+of `add_th_common_family`.
 
 | Function | What it declares |
 |---|---|
-| `trtllm_mv2_family(<family>)` | The family; call it first in the family's `CMakeLists.txt`. |
-| `trtllm_mv2_target(<family> <target> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])` | One target's code, in `<targetCamel>/`. |
-| `trtllm_mv2_shared(<family> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])` | Code several targets of the family call, in `shared/`. Its ops are in `torch.ops.mv2_<family>`. |
+| `add_modeling_v2_family(<family>)` | The family; call it first in the family's `CMakeLists.txt`. |
+| `add_modeling_v2_target(<family> <target> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])` | One target's code, in `<targetCamel>/`. |
+| `add_modeling_v2_shared(<family> ARCHS ... SOURCES ... [DEPS ...] [REQUIRES ...])` | Code several targets of the family call, in `shared/`. Its ops are in `torch.ops.mv2_<family>`. |
 
 | Keyword | Meaning |
 |---|---|
-| `ARCHS` | `NN`, `NNa` or `NNf`, intersected with the build's requested architectures: `NN`/`NNa` build when `NN` is requested; `NNf` builds when any member of family `NN` is. A target whose intersection is empty is **not built**: no placeholder kernels, and the manifest records why. The declared architectures must cover the SM in the target's name; when moving existing code, keep the architectures it was gated with. |
+| `ARCHS` | `NN`, `NNa` or `NNf`, intersected with the build's requested architectures: `NN`/`NNa` build when `NN` is requested; `NNf` builds when any member of family `NN` is. This is how flash_mla and deep_ep choose their architectures. A target whose intersection is empty is **not built**: no placeholder kernels, and the configure step prints why. The declared architectures must cover the SM in the target's name; when moving existing code, keep the architectures it was gated with. |
 | `SOURCES` | Paths or globs relative to the unit's directory. `.cu` files are compiled for `ARCHS` without torch; `.cpp` files are the torch bindings. |
 | `DEPS` | `cublas`, `cublaslt`, `cuda_driver`, `internal_cutlass`, `nccl`, `trtllm_gen_fmha_interface`. Ask for anything else by extending the module. |
 | `REQUIRES` | `MULTI_DEVICE`, `NVSHMEM`. A target whose requirement the build lacks (e.g. a single-device build) is skipped and recorded. |
 
 ### Build options
 
-- **`-DBUILD_MODELING_V2=OFF`** builds no family library. The manifest then
-  says so, and every target with native code is a `NoTarget`.
+- **`-DBUILD_MODELING_V2=OFF`** builds no family library, so every target with
+  native code is a `NoTarget`.
 - **`-DTRTLLM_MODELING_V2_TARGETS=<family>/<target>;...`** builds only the
   matching targets. Globs are allowed, e.g. `fixture/*`; the default is
   `all`. Pass it through
@@ -150,7 +152,7 @@ The functions are defined in `cpp/cmake/modules/modelingV2.cmake`.
   edit relinks only that library:
 
   ```bash
-  cmake --build cpp/build --target trtllm_mv2_<family>
+  cmake --build cpp/build --target th_modeling_v2_<family>
   ```
 
 ## Namespaces
@@ -158,7 +160,7 @@ The functions are defined in `cpp/cmake/modules/modelingV2.cmake`.
 | Kind | Name |
 |---|---|
 | Target torch ops | `torch.ops.mv2_<family>_<target>`, with `__` collapsed to `_` |
-| Family shared torch ops | `torch.ops.mv2_<family>`; also holds `contract_fingerprint()` |
+| Family shared torch ops | `torch.ops.mv2_<family>`; also holds `built_targets()` |
 | Target C++ | `tensorrt_llm::modeling_v2::<family>::<target>` (`TRTLLM_MV2_NAMESPACE_BEGIN`) |
 | Shared C++ | `tensorrt_llm::modeling_v2::<family>::shared` |
 
@@ -198,17 +200,11 @@ reserved and not built yet.
 It links against `libtensorrt_llm.so` (logger, `TllmException`, mcast
 registry and other singletons stay there), `th_utils` and torch.
 
-**The contract fingerprint.** `contractSurface.txt` is also the stock side of
-the contract. The build hashes those headers, the global compile definitions,
-and the torch and CUDA versions into a *contract fingerprint*:
-
-- `libth_common.so` reports it as `torch.ops.trtllm.mv2_contract_fingerprint()`.
-- Each family library reports it as `torch.ops.mv2_<family>.contract_fingerprint()`.
-- The loader refuses a family library whose fingerprint differs from the
-  loaded `libth_common.so`'s.
-
-Adding a header to the list widens what stock changes can affect targets; the
-header's stock owners review it.
+All family libraries come from the same build as the stock libraries, as
+`flash_mla`, `deep_gemm` and `deep_ep` do; a precompiled wheel used with a
+checkout is checked by `setup.py`'s native-input skew detection, which covers
+all of `cpp/`. Adding a header to `contractSurface.txt` widens what stock
+changes can affect targets; the header's stock owners review it.
 
 **When a target needs stock to change**, for example a new option on a stock
 kernel, that change is a separate stock PR. It must leave stock behavior
@@ -216,24 +212,28 @@ unchanged by default, and it is reviewed by the stock owners.
 
 ## How it loads
 
-`_native.load_target_ops(__name__)` runs these steps:
+`_native.load_target_ops(__name__)` treats a family library the way the stock
+code treats its optional native modules (`flash_mla`, `deep_ep`):
 
-1. Read `tensorrt_llm/libs/modeling_v2_manifest.json`.
-2. Check that the target was built, and built for this GPU.
-3. Open the family library.
-4. Compare contract fingerprints.
-5. Import the target's `fake_ops.py`.
+1. Open `tensorrt_llm/libs/libth_modeling_v2_<family>.so`, once per process.
+2. Ask it which targets it carries: `torch.ops.mv2_<family>.built_targets()`,
+   a query op like `th_common`'s `mhc_fused_hc_mma_enabled()`.
+3. Import the target's `fake_ops.py`.
 
 | Outcome | Raised as | Meaning |
 |---|---|---|
-| The target was skipped or excluded by this build, or does not run on this GPU | `NoTarget` | `auto` keeps the built-in model; `require` reports why |
-| The manifest or library is missing, `dlopen` fails, the fingerprint differs, or an op is missing | `NativeLoadError` | A broken installation; never a fallback |
+| The library is not installed, or does not carry the target | `NoTarget` | This build did not compile it; `auto` keeps the built-in model, `require` reports why |
+| The library is installed but fails to open, or an op `fake_ops.py` declares is missing | `NativeLoadError` | A broken installation; never a fallback |
 
 `route` imports a target only on the branch that returns it, so this runs as
-part of routing. Every rank then agrees on the result
+part of routing, and routing has already checked the device's compute
+capability. Every rank then agrees on the result
 (`modeling_v2_resolve_on_all_ranks`), or every rank fails.
 
-`_native.available_targets()` lists what the installed wheel supports.
+**Packaging.** Like deep_ep and flash_mla, each family writes
+`cuda_architectures.txt` into its build directory -- the architectures its
+library was built for, empty when it has none -- and `scripts/build_wheel.py`
+installs the library only when that list is not empty, asserting it exists.
 
 ## CI
 
@@ -243,7 +243,7 @@ trees. What it selects depends on what the PR changes:
 | PR changes only… | CI runs… |
 |---|---|
 | One family (`models/<family>/` and/or `cpp/tensorrt_llm/modeling_v2/<familyCamel>/`) | That family's test-db entries plus the modeling_v2 CPU checks |
-| Shared modeling_v2 code (catalog, loader, resolver, `common/`, the CMake module, `contractSurface.txt`) | Every modeling_v2 entry |
+| Shared modeling_v2 code (catalog, loader, resolver, `common/`, the CMake module) | Every modeling_v2 entry |
 | Stock code | The full suite |
 
 **Why the narrowing is safe.** It relies on these CPU checks, which run in
