@@ -399,3 +399,29 @@ def test_cutedsl_score_helper_falls_back_on_unsupported_geometry():
         seq_lens_cuda=seq_lens,
         decode_query_len=dql,
     )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("decode_query_len", [1, 7])
+def test_cutedsl_score_helper_matches_registered_op(decode_query_len):
+    """_cutedsl_score calls the runner directly in eager mode; the bytes must match the op's."""
+    _runner()
+    seq_lens = [max(s, decode_query_len) for s in (300, 4097, 129)]
+    idx_q, k_cache, block_table, seq_lens_dev, backing, score, _ = _make_inputs(
+        seq_lens, dtype=torch.float8_e4m3fn, num_heads=4, decode_query_len=decode_query_len, seed=5
+    )
+    want_backing = backing.clone()
+    torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+        idx_q, k_cache, block_table, seq_lens_dev, want_backing.transpose(1, 2), decode_query_len
+    )
+    # _cutedsl_score takes the paged pool [pages, 1, page, dim] and the selector's
+    # [heads, blocks, tokens] buffer.
+    assert _cutedsl_score(
+        idx_q,
+        k_cache.unsqueeze(1),
+        backing,
+        block_table=block_table,
+        seq_lens_cuda=seq_lens_dev,
+        decode_query_len=decode_query_len,
+    )
+    assert torch.equal(backing, want_backing)
