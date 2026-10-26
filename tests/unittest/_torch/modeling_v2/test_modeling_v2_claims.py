@@ -251,7 +251,7 @@ def test_every_unit_test_is_in_a_test_list():
     path with no test at it fails its CI stage: pytest finds nothing to run.
     """
     listed = set()
-    for path in (_TESTS_ROOT / "integration/test_lists/test-db").glob("l0_*.yml"):
+    for path in (_TESTS_ROOT / "integration/test_lists/test-db").glob("*.yml"):
         for blocks in (yaml.safe_load(path.read_text()) or {}).values():
             for block in blocks if isinstance(blocks, list) else ():
                 for entry in block.get("tests") or ():
