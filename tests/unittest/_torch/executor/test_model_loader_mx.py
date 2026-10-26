@@ -540,6 +540,14 @@ def _qwen3_moe_hf_config(**overrides: object) -> Qwen3MoeConfig:
     return Qwen3MoeConfig(**values)
 
 
+# `_tiny_qwen3_moe_model` builds its routed experts on CUDA through the CUTLASS
+# leaf for unquantized weights, which supports SM80 and newer.
+_requires_cutlass_bf16_moe = pytest.mark.skipif(
+    not torch.cuda.is_available() or getSMVersion() < 80,
+    reason="the Qwen3 MoE fixture needs CUDA and the SM80+ CUTLASS MoE leaf",
+)
+
+
 def _tiny_qwen3_moe_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1858,6 +1866,7 @@ def _qualify_qwen3_moe_model(model: nn.Module):
     )
 
 
+@_requires_cutlass_bf16_moe
 def test_qwen3_moe_profile_qualifies_full_staged_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1919,6 +1928,7 @@ def test_qwen3_moe_profile_qualifies_full_staged_lifecycle(
     }
 
 
+@_requires_cutlass_bf16_moe
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize(
     "moe_ep_size, moe_tp_size, w3_w1_shape, w2_shape, local_expert_ids",
@@ -1992,6 +2002,7 @@ def test_qwen3_moe_profile_qualifies_tp2_rank_lifecycle(
     assert layout["initial_local_expert_ids"] == local_expert_ids[rank]
 
 
+@_requires_cutlass_bf16_moe
 def test_staged_qwen3_moe_finalization_preserves_mx_tensor_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
