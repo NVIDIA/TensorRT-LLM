@@ -5865,6 +5865,17 @@
       "additionalProperties": false,
       "description": "Multimodal model configuration.",
       "properties": {
+        "audio_input_form": {
+          "default": "waveform",
+          "description": "What the audio item of a Whisper request carries. 'waveform': the audio itself (a file path or URL, an (array, sample_rate) tuple, or an {'array', 'sampling_rate'} mapping), whose log-mel spectrogram the encoder computes. 'spectrogram': the log-mel spectrogram the checkpoint's feature extractor returns, as {'input_features': ...}. An LLM instance takes one form for all its requests; its encoder CUDA graphs are captured for that form. Python API only: trtllm-serve decodes its audio inputs to waveforms and rejects 'spectrogram'.",
+          "enum": [
+            "waveform",
+            "spectrogram"
+          ],
+          "status": "prototype",
+          "title": "Audio Input Form",
+          "type": "string"
+        },
         "encoder_cache_max_bytes": {
           "default": 134217728,
           "description": "Target capacity in bytes for reusable multimodal encoder embeddings; 0 disables cross-request reuse. The capacity applies per rank; ranks do not share a cache. With item scheduling, encoder outputs still use the model-owned cache and its capacity is at least one legal encoder iteration; this value can make that cache larger. String values such as '512MB' and '1GiB' use binary units. Both inline encoding and item scheduling cache individual items; inline caching supports only single-modality parameters. Compatible with side-stream prefetch.",

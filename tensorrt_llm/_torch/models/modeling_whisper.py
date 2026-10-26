@@ -39,6 +39,7 @@ Key differences from BART:
       key bias is materialized as zeros at weight-load time.
 """
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -390,6 +391,10 @@ class WhisperLogMelFrontend(nn.Module):
         # shape, so deriving it a second way would risk disagreeing with the
         # tensors the processor actually produces.
         self.n_samples = int(extractor.n_samples)
+        # Frames of one window, the extractor's own number: what
+        # `WhisperInputProcessor` validates a precomputed spectrogram against,
+        # and what `encoder_graph_spec` reports for one.
+        self.nb_max_frames = int(extractor.nb_max_frames)
         # Pre-STFT Gaussian noise, applied where HF applies it; 0.0 (all
         # official checkpoints) disables it.
         self.dither = float(getattr(extractor, "dither", 0.0))
@@ -483,9 +488,10 @@ class WhisperEncoder(nn.Module):
         input_features: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        # input_features: [batch, n_samples] raw 30 s-padded waveform (the
-        # request contract), or a precomputed [batch, num_mel_bins, 3000] mel
-        # (kept for direct-callers/validation harnesses).
+        # input_features: [batch, n_samples] raw 30 s-padded waveform, or a
+        # precomputed [batch, num_mel_bins, 3000] log-mel spectrogram (a
+        # request whose audio item carries "input_features", or a direct
+        # caller).
         if input_features.dim() == 2:
             input_features = self.log_mel(input_features)
         input_features = input_features.to(self.conv1.weight.dtype)
@@ -580,8 +586,11 @@ class WhisperInputProcessor(InputProcessor):
 
     Validates and zero-pads `multi_modal_data["audio"]` to the fixed 30 s
     window (the log-mel spectrogram itself is computed on GPU inside the
-    engine, see `WhisperLogMelFrontend`), and returns the forced
-    decoder prompt as the request's token ids. An empty text prompt selects
+    engine, see `WhisperLogMelFrontend`), or, when the instance was created
+    with `multimodal_config.audio_input_form="spectrogram"`, validates a
+    log-mel spectrogram the client already computed (`{"input_features":
+    ...}`, the key and shape the checkpoint's feature extractor returns),
+    and returns the forced decoder prompt as the request's token ids. An empty text prompt selects
     the checkpoint default
     (`<|startoftranscript|>[<|en|>][<|transcribe|>]<|notimestamps|>`); a
     non-empty text prompt is tokenized verbatim as the decoder prompt, which
@@ -606,10 +615,26 @@ class WhisperInputProcessor(InputProcessor):
     def supported_modalities(self) -> frozenset[str]:
         return frozenset({"audio"})
 
-    def __init__(self, model_path, config, tokenizer, trust_remote_code: bool = True, **kwargs):
+    def __init__(
+        self,
+        model_path,
+        config,
+        tokenizer,
+        trust_remote_code: bool = True,
+        audio_input_form: str = "waveform",
+        **kwargs,
+    ):
         self.model_path = model_path
         self.config = config
         self.tokenizer = tokenizer
+        if audio_input_form not in ("waveform", "spectrogram"):
+            raise ValueError(
+                f"audio_input_form must be 'waveform' or 'spectrogram', got {audio_input_form!r}."
+            )
+        # Fixed per instance (multimodal_config.audio_input_form): the encoder
+        # packs concurrent requests into one tensor and captures its CUDA
+        # graphs for one input shape, so the two forms cannot mix.
+        self.audio_input_form = audio_input_form
         # No decoder-side placeholder tokens exist to hash against; skip the
         # multimodal-hashing probe (the registry then always uses this
         # processor directly).
@@ -624,10 +649,20 @@ class WhisperInputProcessor(InputProcessor):
         # (WhisperLogMelFrontend reads the same config engine-side). Longer
         # audio is rejected instead of silently truncated (long-form chunking
         # is a separate feature).
-        extractor = self.processor.feature_extractor
+        self._configure_audio_contract(self.processor.feature_extractor)
+        self._decoder_prompt = self._build_decoder_prompt()
+
+    def _configure_audio_contract(self, extractor) -> None:
+        """Derive what a request's audio may be from the extractor and the config."""
         self.sampling_rate = int(extractor.sampling_rate)
         self.n_samples = int(extractor.n_samples)
         self.max_audio_seconds = self.n_samples / float(self.sampling_rate)
+        # Shape of a precomputed log-mel spectrogram: the bins the conv stem
+        # consumes (the model config, which wins over a disagreeing
+        # preprocessor config, see WhisperLogMelFrontend) and the frames of
+        # one window.
+        self.num_mel_bins = int(self.config.num_mel_bins)
+        self.n_frames = int(extractor.nb_max_frames)
         # The mel frames halved by the conv stem must fill the encoder
         # position table exactly, or every downstream cross-KV size is wrong.
         hop_length = int(extractor.hop_length)
@@ -640,7 +675,6 @@ class WhisperInputProcessor(InputProcessor):
                 f"positions, but config.max_source_positions is "
                 f"{self.config.max_source_positions}."
             )
-        self._decoder_prompt = self._build_decoder_prompt()
 
     # The decoder prompt contains no multimodal placeholder tokens (the audio
     # feeds the encoder), so the embed-mask/cumsum machinery has nothing to
@@ -716,7 +750,7 @@ class WhisperInputProcessor(InputProcessor):
             from ...inputs.utils import load_audio
 
             waveform, sample_rate = load_audio(item)
-        elif isinstance(item, dict) and "array" in item:
+        elif isinstance(item, Mapping) and "array" in item:
             # HF datasets audio format: {"array": ..., "sampling_rate": ...}
             waveform = item["array"]
             sample_rate = item.get("sampling_rate", self.sampling_rate)
@@ -726,7 +760,10 @@ class WhisperInputProcessor(InputProcessor):
             raise TypeError(
                 "Unsupported audio item for Whisper: expected a file "
                 "path/URL, an (array, sample_rate) tuple, or a dict with "
-                f"'array'/'sampling_rate'; got {type(item).__name__}."
+                f"'array'/'sampling_rate'; got {type(item).__name__}. A "
+                "precomputed spectrogram ({'input_features': ...}) needs an "
+                "instance created with "
+                "multimodal_config.audio_input_form='spectrogram'."
             )
 
         if int(sample_rate) != self.sampling_rate:
@@ -747,6 +784,53 @@ class WhisperInputProcessor(InputProcessor):
                 "input on the client side."
             )
         return waveform
+
+    def _load_mel(self, item: Any) -> torch.Tensor:
+        """A log-mel spectrogram computed by the client, as fp32 [1, num_mel_bins, frames].
+
+        The item is a mapping with `input_features`: what the checkpoint's
+        `WhisperFeatureExtractor` returns for one window (its `BatchFeature`
+        is accepted as is), with or without the batch axis of 1.
+        """
+        if not (isinstance(item, Mapping) and "input_features" in item):
+            raise TypeError(
+                "Unsupported audio item for a Whisper instance that takes "
+                "precomputed spectrograms (multimodal_config.audio_input_form="
+                "'spectrogram'): expected {'input_features': ...}, as the "
+                f"checkpoint's feature extractor returns it; got {type(item).__name__}."
+            )
+        features = item["input_features"]
+        if isinstance(features, torch.Tensor):
+            if not features.is_floating_point():
+                raise ValueError(
+                    "Whisper input_features must be a floating-point log-mel "
+                    f"spectrogram; got dtype {features.dtype}."
+                )
+            # Same path as a waveform: a fresh fp32 CPU copy without autograd
+            # history, whatever device the client computed it on, that the
+            # client's buffer cannot change afterwards.
+            features = features.detach().to(
+                "cpu", torch.float32, copy=True, memory_format=torch.contiguous_format
+            )
+        else:
+            array = np.asarray(features)
+            if not np.issubdtype(array.dtype, np.floating):
+                raise ValueError(
+                    "Whisper input_features must be a floating-point log-mel "
+                    f"spectrogram; got dtype {array.dtype}."
+                )
+            features = torch.from_numpy(np.array(array, dtype=np.float32))
+        if features.dim() == 3 and features.shape[0] == 1:
+            features = features[0]
+        expected = (self.num_mel_bins, self.n_frames)
+        if features.dim() != 2 or tuple(features.shape) != expected:
+            raise ValueError(
+                "Whisper input_features must be a log-mel spectrogram of shape "
+                f"{expected} (config.num_mel_bins, frames of one "
+                f"{self.max_audio_seconds:.0f}s window), optionally with a "
+                f"leading batch axis of 1; got {tuple(features.shape)}."
+            )
+        return features.unsqueeze(0).contiguous()
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -782,14 +866,22 @@ class WhisperInputProcessor(InputProcessor):
                 )
             sampling_params.max_tokens = decoder_budget
 
-        waveform = self._load_waveform(audio_items[0])
-        # Zero-pad to the fixed window, as the HF extractor does. Shipped as
-        # fp32 [1, n_samples]: the STFT needs fp32, and the leading dim of 1
-        # keeps the C++ request's encoder-input-length bookkeeping unchanged.
-        n_samples = self.n_samples
-        padded = np.zeros((1, n_samples), dtype=np.float32)
-        padded[0, : waveform.shape[0]] = waveform
-        input_features = torch.from_numpy(padded)
+        audio_item = audio_items[0]
+        if self.audio_input_form == "spectrogram":
+            # A spectrogram the client already computed, shipped as fp32
+            # [1, num_mel_bins, frames]; the encoder skips its log-mel
+            # front-end for a 3-D input. The leading dim of 1 keeps the C++
+            # request's encoder-input-length bookkeeping the same as below.
+            input_features = self._load_mel(audio_item)
+        else:
+            waveform = self._load_waveform(audio_item)
+            # Zero-pad to the fixed window, as the HF extractor does. Shipped as
+            # fp32 [1, n_samples]: the STFT needs fp32, and the leading dim of 1
+            # keeps the C++ request's encoder-input-length bookkeeping unchanged.
+            n_samples = self.n_samples
+            padded = np.zeros((1, n_samples), dtype=np.float32)
+            padded[0, : waveform.shape[0]] = waveform
+            input_features = torch.from_numpy(padded)
 
         extra = {
             "multimodal_data": {
@@ -913,7 +1005,9 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         """Fixed-shape encoder contract for enc-dec encoder CUDA graphs.
 
         Every Whisper encoder request is an fp32 waveform zero-padded by
-        `WhisperInputProcessor` to the extractor's window, which yields exactly
+        `WhisperInputProcessor` to the extractor's window, or, for an instance
+        created with ``multimodal_config.audio_input_form="spectrogram"``, the
+        fp32 log-mel spectrogram of that window; either yields exactly
         ``max_source_positions`` encoder positions — so the encoder graph key
         degenerates to the batch size.
 
@@ -929,8 +1023,15 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         Returns ``(per_request_feature_shape, dtype, fixed_seq_len)``.
         """
         fixed_seq_len = int(self.config.max_source_positions)
-        n_samples = int(self.model.encoder.log_mel.n_samples)
-        return ((n_samples,), torch.float32, fixed_seq_len)
+        log_mel = self.model.encoder.log_mel
+        multimodal_config = getattr(self.model_config, "multimodal_config", None)
+        if getattr(multimodal_config, "audio_input_form", "waveform") == "spectrogram":
+            return (
+                (int(self.config.num_mel_bins), int(log_mel.nb_max_frames)),
+                torch.float32,
+                fixed_seq_len,
+            )
+        return ((int(log_mel.n_samples),), torch.float32, fixed_seq_len)
 
     def forward(
         self,

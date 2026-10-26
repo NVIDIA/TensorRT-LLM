@@ -866,6 +866,20 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
+    audio_input_form: Literal["waveform", "spectrogram"] = Field(
+        default="waveform",
+        description=(
+            "What the audio item of a Whisper request carries. 'waveform': the "
+            "audio itself (a file path or URL, an (array, sample_rate) tuple, "
+            "or an {'array', 'sampling_rate'} mapping), whose log-mel "
+            "spectrogram the encoder computes. 'spectrogram': the log-mel "
+            "spectrogram the checkpoint's feature extractor returns, as "
+            "{'input_features': ...}. An LLM instance takes one form for all "
+            "its requests; its encoder CUDA graphs are captured for that form. "
+            "Python API only: trtllm-serve decodes its audio inputs to "
+            "waveforms and rejects 'spectrogram'."),
+        status="prototype")
+
     video_pruning_rate: Optional[float] = Field(
         default=None,
         ge=0.0,

@@ -264,6 +264,42 @@ longer clips and other sampling rates are rejected rather than silently
 truncated or resampled. Long-form chunked transcription is not part of this
 path.
 
+A client that already has the log-mel spectrogram can send it instead of the
+audio. Create the instance with
+`multimodal_config=MultimodalConfig(audio_input_form="spectrogram")` and pass
+each clip as `{"input_features": ...}`: the array the checkpoint's
+`WhisperFeatureExtractor` returns for one 30-second window, shaped
+`(num_mel_bins, 3000)` with or without its leading batch axis of 1. Other shapes
+are rejected. The encoder then skips its own log-mel front-end; the decoder
+prompt, `max_tokens` cap, encoder CUDA graphs and every other setting work as
+for audio. The spectrogram must come from the same extractor configuration as
+the checkpoint, since nothing can check that on the server side, and it must
+have `config.num_mel_bins` bins. The length check moves to the client as well:
+the extractor truncates longer audio to one window by default, so pass
+`truncation=False` (a longer clip then yields more frames and is rejected) or
+check the duration yourself. An instance takes one form for all its requests,
+because the encoder packs concurrent requests into one tensor and captures its
+CUDA graphs for one input shape; an audio item of the other form is rejected at
+submission. The option is for the Python API: `trtllm-serve` decodes its audio
+inputs to waveforms and refuses to start with it.
+
+```python
+from transformers import WhisperFeatureExtractor
+
+from tensorrt_llm.llmapi import MultimodalConfig
+
+# ... the LLM settings from above, plus:
+#     multimodal_config=MultimodalConfig(audio_input_form="spectrogram"),
+extractor = WhisperFeatureExtractor.from_pretrained(model)
+mel = extractor(
+    wave, sampling_rate=sample_rate, truncation=False, return_tensors="np"
+)["input_features"]
+result = llm.generate(
+    {"prompt": "", "multi_modal_data": {"audio": {"input_features": mel}}},
+    sampling_params=SamplingParams(max_tokens=96, temperature=0.0),
+)
+```
+
 ### Select the language and task
 
 An empty text prompt selects the checkpoint default, which is English
@@ -455,7 +491,9 @@ per-request input is the waveform itself, not a spectrogram), produces the same
 number of encoder positions for every request, so both lists follow from the
 model and are derived rather than configured. For those models
 `batch_sizes` alone enables capture, and any `num_tokens` or `seq_lens` you set
-is ignored.
+is ignored. For a Whisper instance created with
+`multimodal_config.audio_input_form="spectrogram"` the captured shape is the
+spectrogram's.
 
 Batch sizes that do not fit `encoder_max_num_tokens` divided by the model's
 encoder output length are dropped, and the encoder stays eager when none fit.

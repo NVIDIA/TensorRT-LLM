@@ -2106,6 +2106,9 @@ class _TorchLLM(BaseLLM):
         video_pruning_rate = self.args.multimodal_config.video_pruning_rate
         if video_pruning_rate is not None:
             input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
+        if self.args.multimodal_config.audio_input_form != "waveform":
+            input_processor_kwargs[
+                'audio_input_form'] = self.args.multimodal_config.audio_input_form
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
@@ -2114,6 +2117,14 @@ class _TorchLLM(BaseLLM):
             enable_tokenization_cache=self.args.enable_tokenization_cache,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
+        audio_input_form = self.args.multimodal_config.audio_input_form
+        if audio_input_form != "waveform" and getattr(self.input_processor,
+                                                      "audio_input_form",
+                                                      None) != audio_input_form:
+            raise ValueError(
+                f"multimodal_config.audio_input_form={audio_input_form!r} is a "
+                "Whisper option; the input processor of this model "
+                f"({type(self.input_processor).__name__}) does not take it.")
 
         # Resolve encode_only mode (opt-in only)
         self._encode_only = (self.args.encode_only is True)
