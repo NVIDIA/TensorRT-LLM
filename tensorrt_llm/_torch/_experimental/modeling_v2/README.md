@@ -72,9 +72,8 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                         +-- modeling_v2_resolve(config, llm_args)
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
-                    models/<x>/routing.py     +-- route(config, mapping, compute_capability,
-                                              |         spec_config, kv_cache_quant_algo,
-                                              |         model_config, llm_args)
+                    models/<x>/routing.py     +-- route(model_config, llm_args,
+                                              |         compute_capability)
                                               |         -> target class, or NoTarget
                                         |
                                      config.modeling_v2_target = class
@@ -369,6 +368,11 @@ entry:
   its 2- and 4-rank matrices, in the post-merge 4-GPU job;
 * `mnnvl_allreduce` needs 8 ranks over two trays. Its matrix runs only by
   hand under srun (see its docstring), and no CI job re-runs it.
+
+Matrix subprocesses use the launcher's interpreter and inherited Python search
+path to import the installed TensorRT-LLM package. Install a matching wheel or
+complete editable build before running them; an unbuilt checkout must not be
+prepended to `PYTHONPATH` in place of the installed package.
 
 Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,

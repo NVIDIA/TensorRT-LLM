@@ -161,9 +161,9 @@ Then, start the server with the configuration file:
 Multimodal Chat API
 ~~~~~~~~~~~~~~~~~~~
 
-You can query Completions API with any http clients, a typical example is OpenAI Python client:
+You can query the Chat Completions API with any HTTP client. A typical example uses the OpenAI Python client:
 
-.. literalinclude:: ../../../../examples/serve/openai_completion_client_for_multimodal.py
+.. literalinclude:: ../../../../examples/serve/openai_chat_client_for_multimodal.py
     :language: python
     :linenos:
 

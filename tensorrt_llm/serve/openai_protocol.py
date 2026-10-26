@@ -328,6 +328,8 @@ class DisaggregatedParams(OpenAIBaseModel):
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
     resolved_thinking: Optional[bool] = None
+    # Orchestrator -> generation worker: seconds since arrival at the orchestrator.
+    orig_elapsed_s: Optional[float] = None
 
     @model_validator(mode="after")
     def validate_multimodal_spans(self) -> "DisaggregatedParams":
@@ -2019,6 +2021,7 @@ def to_llm_disaggregated_params(
         remote_tail_start=disaggregated_params.remote_tail_start,
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
+        orig_elapsed_s=disaggregated_params.orig_elapsed_s,
     )
 
 

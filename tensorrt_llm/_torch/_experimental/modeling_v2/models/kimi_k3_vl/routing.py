@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget
+from ..._router_index import NoTarget, routes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -93,20 +93,17 @@ def _parallel(m) -> Optional[str]:
     return None
 
 
+@routes("KimiK3ForConditionalGeneration")
 def route(
-    pretrained_config: Any,
-    mapping: Any,
-    compute_capability: Tuple[int, int],
-    spec_config: Optional[Any],
-    kv_cache_quant_algo: Optional[Any],
-    model_config: Optional[ModelConfig] = None,
-    llm_args: Optional[TorchLlmArgs] = None,
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
     Each target is imported where it is returned, so declining costs no import
     of modeling code.
     """
+    pretrained_config = model_config.pretrained_config
+    mapping = model_config.mapping
     text_config = getattr(pretrained_config, "text_config", None)
     shape = (
         None

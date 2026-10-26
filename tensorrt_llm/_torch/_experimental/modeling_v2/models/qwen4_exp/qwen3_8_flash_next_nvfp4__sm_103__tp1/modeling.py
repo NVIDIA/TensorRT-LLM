@@ -137,6 +137,7 @@ from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITIO
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -6476,7 +6477,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         Refused: a frame past `_VISION_CALL_MAX_PATCHES` patches (the one bound the
         tower keeps), a malformed grid or pixel payload, media whose rows disagree with
         the prompt's placeholder count, missing or mis-sized `mrope_position_ids`, and a
-        request with both images and videos whose `mm_item_order` is missing or does not
+        request with both images and videos whose item metadata is missing or does not
         list its items."""
         data = request.py_multimodal_data
         if not data:
@@ -6504,7 +6505,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             )
 
         if len(grids) > 1:
-            self._check_item_order(grids, getattr(request, "py_mm_item_order", None))
+            metadata = get_multimodal_item_metadata(data)
+            self._check_item_order(grids, metadata.item_refs if metadata is not None else None)
 
         cumsum = data.get("multimodal_embed_mask_cumsum")
         if cumsum is not None:
@@ -6558,22 +6560,23 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
         """A request with several modalities lists its items in prompt order."""
         if not order:
             raise ValueError(
-                f"a request carrying {sorted(grids)} needs mm_item_order to splice them in "
+                f"a request carrying {sorted(grids)} needs item metadata to splice them in "
                 "prompt order; the payload holds each modality's rows apart"
             )
         listed = {modality: [] for modality in grids}
         for entry in order:
             try:
-                listed[entry["modality"]].append(int(entry["index"]))
+                modality, index = entry
+                listed[modality].append(int(index))
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(
-                    f"mm_item_order entry {entry!r} is not an item of this request, which "
-                    f"carries {sorted(grids)}; entries are {{'modality', 'index'}}"
+                    f"item_refs entry {entry!r} is not an item of this request, which "
+                    f"carries {sorted(grids)}; entries are (modality, index) pairs"
                 ) from error
         for modality, grid in grids.items():
             if sorted(listed[modality]) != list(range(len(grid))):
                 raise ValueError(
-                    f"mm_item_order lists {modality} items {listed[modality]}; the payload "
+                    f"item_refs lists {modality} items {listed[modality]}; the payload "
                     f"carries {len(grid)}"
                 )
 
@@ -6672,15 +6675,16 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
 
         `towers` maps each modality the request carries to `(rows, grid_thw)`; each
         grid row is one item of `t*h*w / merge**2` rows. One modality is already in
-        prompt order. Two are reassembled item by item from `mm_item_order`
-        (`{"modality", "index"}` per item in prompt order, `index` counting that
+        prompt order. Two are reassembled item by item from `item_metadata.item_refs`
+        (`(modality, index)` per item in prompt order, `index` counting that
         modality's items); without it there is no host-side way to tell which
         placeholder run is an image and which a video."""
         if len(towers) == 1:
             return next(iter(towers.values()))[0]
-        order = getattr(params, "mm_item_order", None)
+        metadata = params.item_metadata
+        order = metadata.item_refs if metadata is not None else None
         assert order, (
-            f"a request carrying {sorted(towers)} needs mm_item_order to splice them "
+            f"a request carrying {sorted(towers)} needs item metadata to splice them "
             "in prompt order; the payload holds each modality's rows apart"
         )
         merge_unit = self.model.v_merge * self.model.v_merge
@@ -6693,18 +6697,17 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             )
             items[modality] = torch.split(embeds, counts, 0)
         listed = {modality: [] for modality in items}
-        for entry in order:
-            assert entry["modality"] in items, (
-                f"mm_item_order lists a {entry['modality']!r} item; this request "
-                f"carries {sorted(items)}"
+        for modality, index in order:
+            assert modality in items, (
+                f"item_refs lists a {modality!r} item; this request carries {sorted(items)}"
             )
-            listed[entry["modality"]].append(int(entry["index"]))
+            listed[modality].append(int(index))
         for modality, parts in items.items():
             assert sorted(listed[modality]) == list(range(len(parts))), (
-                f"mm_item_order lists {modality} items {listed[modality]}; the "
+                f"item_refs lists {modality} items {listed[modality]}; the "
                 f"payload carries {len(parts)}"
             )
-        return torch.cat([items[entry["modality"]][int(entry["index"])] for entry in order], 0)
+        return torch.cat([items[modality][int(index)] for modality, index in order], 0)
 
     def forward(
         self,
