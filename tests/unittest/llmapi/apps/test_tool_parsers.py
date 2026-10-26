@@ -6872,13 +6872,18 @@ def _dsml_block(calls_tag: str, invoke_tag: str, parameter_tag: str) -> str:
             f"</{dsml}{calls_tag}>")
 
 
-def _stream(parser, text: str, chunk_size: int,
-            tools: list[ChatCompletionToolsParam]):
+def _stream(parser,
+            text: str,
+            chunk_size: int,
+            tools: list[ChatCompletionToolsParam],
+            *,
+            finish: bool = True):
     results = [
         parser.parse_streaming_increment(text[i:i + chunk_size], tools)
         for i in range(0, len(text), chunk_size)
     ]
-    results.append(parser.finish(tools))
+    if finish:
+        results.append(parser.finish(tools))
     content = "".join(result.normal_text for result in results)
     calls = [call for result in results for call in result.calls]
     return content, calls
@@ -6927,9 +6932,15 @@ def test_dsml_text_after_the_block_is_still_content(
     """
     text = _dsml_block(calls_tag, invoke_tag, parameter_tag) + " Done."
 
-    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+    parser = parser_cls()
+    content, calls = _stream(parser,
+                             text,
+                             chunk_size,
+                             sample_tools,
+                             finish=False)
 
     assert content == " Done."
+    assert parser.finish(sample_tools).normal_text == ""
     assert [call.name for call in calls
             if call.name] == ["get_weather", "search_web"]
 
