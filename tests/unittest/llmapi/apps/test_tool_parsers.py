@@ -6042,6 +6042,30 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
             "count": "not-a-number"
         }
 
+    @pytest.mark.parametrize("value", ["[" * 100000 + "]" * 100000, "9" * 5000],
+                             ids=["deeply_nested", "too_many_digits"])
+    def test_undecodable_json_falls_back_to_raw(self, sample_tools, parser,
+                                                value):
+        """JSON that nests too deeply or has too many digits keeps its text."""
+        argument_text = self._section(
+            self._call("get_weather", 1, self._argument("count", "object",
+                                                        value)))
+        json_text = self._section(
+            self._call(
+                "get_weather", 1, f'<|open|>json type="object"<|sep|>{value}'
+                '<|close|>json<|sep|>'))
+
+        for text, expected in ((argument_text, json.dumps({"count": value})),
+                               (json_text, value)):
+            result = parser.detect_and_parse(text, sample_tools)
+            assert result.calls[0].parameters == expected
+
+            streaming = KimiK3ToolParser()
+            calls = streaming.parse_streaming_increment(text,
+                                                        sample_tools).calls
+            calls += streaming.finish(sample_tools).calls
+            assert calls[-1].parameters == expected
+
     def test_attribute_unescaping(self, sample_tools, parser):
         """Unescape encoded XTML attribute values.
 
@@ -7563,3 +7587,43 @@ def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
     assert content == "Checking."
     assert parser_cls().detect_and_parse(text,
                                          sample_tools).normal_text == content
+
+
+# ============================================================================
+# MiniMaxM3ToolParser
+# ============================================================================
+
+
+@pytest.mark.parametrize("value", ["[" * 100000 + "]" * 100000, "9" * 5000],
+                         ids=["deeply_nested", "too_many_digits"])
+def test_minimax_m3_undecodable_json_keeps_text(value):
+    """JSON that nests too deeply or has too many digits keeps its text."""
+    from tensorrt_llm.serve.tool_parser.minimax_m3_parser import \
+        MiniMaxM3ToolParser
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="configure",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "options": {
+                            "type": "object"
+                        }
+                    },
+                },
+            ),
+        )
+    ]
+    ns = "]<]minimax[>["
+    text = (f'{ns}<tool_call>\n{ns}<invoke name="configure">\n'
+            f"{ns}<options>{value}{ns}</options>\n{ns}</invoke>\n"
+            f"{ns}</tool_call>")
+
+    result = MiniMaxM3ToolParser().detect_and_parse(text, tools)
+
+    assert [(call.name, json.loads(call.parameters))
+            for call in result.calls] == [("configure", {
+                "options": value
+            })]
