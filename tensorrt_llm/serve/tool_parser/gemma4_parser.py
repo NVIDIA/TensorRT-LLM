@@ -332,7 +332,7 @@ class Gemma4ToolParser(BaseToolParser):
         for func_name, args_str in raw_calls:
             try:
                 parsed_args = _parse_gemma4_args(args_str)
-            except (ValueError, IndexError, TypeError, KeyError) as e:
+            except (ValueError, IndexError, TypeError, KeyError, RecursionError) as e:
                 logger.warning(f"Failed to parse Gemma4 tool call args: {args_str}, error: {e}")
                 continue
 
@@ -475,7 +475,7 @@ class Gemma4ToolParser(BaseToolParser):
                     try:
                         parsed_args = _parse_gemma4_args(args_str)
                         args_json = json.dumps(parsed_args, ensure_ascii=False)
-                    except (ValueError, IndexError, TypeError, KeyError):
+                    except (ValueError, IndexError, TypeError, KeyError, RecursionError):
                         args_json = "{}"
 
                     calls = []
