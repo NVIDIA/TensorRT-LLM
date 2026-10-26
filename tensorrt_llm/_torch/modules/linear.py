@@ -3365,17 +3365,24 @@ def _mxfp8_flashinfer_only() -> bool:
     return (not _mxfp8_cutlass_op_available()
             and hasattr(torch.ops.trtllm, "mxfp8_quantize")
             and torch.cuda.is_available()
-            and torch.cuda.get_device_capability()[0] >= 10)
+            and torch.cuda.get_device_capability()[0] >= 10
+            and not is_sm_100f())
 
 
 def mxfp8_gemm_backend_override() -> Optional[str]:
     """Return the fixed MXFP8 GEMM backend, or None to let the engine choose.
 
-    ``TRTLLM_MXFP8_GEMM_BACKEND`` takes precedence. Outside the SM100 family
-    the native GEMM is not compiled, so FlashInfer is the only backend.
+    ``TRTLLM_MXFP8_GEMM_BACKEND`` takes precedence on SM100-family GPUs.
+    Elsewhere the native GEMM is not compiled, so FlashInfer is the only
+    backend and other explicit choices are rejected.
     """
     backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND")
-    if backend is None and _mxfp8_flashinfer_only():
+    if _mxfp8_flashinfer_only():
+        if backend not in (None, "flashinfer"):
+            raise ValueError(
+                f"TRTLLM_MXFP8_GEMM_BACKEND={backend!r} is not supported on "
+                "this GPU: the native MXFP8 GEMM runs on SM100-family GPUs "
+                "only, so use 'flashinfer' or leave it unset")
         backend = "flashinfer"
     return backend
 

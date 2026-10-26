@@ -119,7 +119,10 @@ class DeepseekV41Attention(nn.Module):
                 (10, 3),
                 (12, 0),
             ):
-                raise ValueError("CSA2 native MXFP8 projections require SM100/SM103/SM120")
+                raise ValueError(
+                    "CSA2 native MXFP8 projections require SM100/SM103/SM120; "
+                    "SM121 has no FP8 block-scale BMM for the output projection"
+                )
             if not hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm"):
                 raise RuntimeError("CSA2 native MXFP8 GEMM is not compiled")
             quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8)
