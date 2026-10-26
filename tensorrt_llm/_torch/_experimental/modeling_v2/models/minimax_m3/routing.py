@@ -173,6 +173,30 @@ def _m31_speculation_mismatch(spec_config: Optional[Any]) -> Optional[str]:
     return None
 
 
+def arm_sm107_shared_opt_ins() -> None:
+    """Arm, process-wide and before the model is built, the shared paths the MiniMax-M3.1 sm_107 targets take: the
+    shipped ahead-of-time CuTe DSL objects, the drafter KV reserve and guard page, the host-tier KV prefetch, the
+    context-only int32 prompt tokens, the BF16X / E4M3X sparse-prefill fork, the indexer proxy max-score buffer reuse,
+    the context one-hot index_fill and the DFlash host-side context allocation. Each keeps its kill switch. Armed here
+    rather than in a target's RuntimeHooks so that the target directories (the AOT objects' source digests) are not
+    edited."""
+    from tensorrt_llm._torch import cute_aot
+    from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_indexer
+    from tensorrt_llm._torch.pyexecutor import llm_request, py_executor
+    from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+    from tensorrt_llm._torch.speculative import dflash, interface
+
+    cute_aot.arm()
+    kv_cache_manager_v2.arm_draft_kv_reserve_guard()
+    py_executor.arm_kv_gpu_prefetch()
+    llm_request.arm_context_token_array()
+    msa_prefill.arm_prefill_fork()
+    msa_indexer.arm_proxy_ms_reuse()
+    interface.arm_onehot_index_fill()
+    dflash.arm_host_ctx_alloc()
+
+
 def route(
     pretrained_config: Any,
     mapping: Any,
@@ -239,14 +263,10 @@ def route(
         and m31_spec_miss is None
         and kv_cache
     ):
-        from tensorrt_llm._torch import cute_aot
-
         from .fake_ops import register
 
         register()
-        # The sm_107 targets ship ahead-of-time CuTe DSL objects (cute_aot_data); serve them before the model builds
-        # its kernels.
-        cute_aot.arm()
+        arm_sm107_shared_opt_ins()
         if parallel == "tp2":
             from .minimax_m31_nvfp4__sm_107__tp2.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp2
 
