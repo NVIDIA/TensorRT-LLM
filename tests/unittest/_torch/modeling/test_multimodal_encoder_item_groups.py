@@ -16,8 +16,10 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderGroup,
+    EncoderInputField,
     MultimodalEncoderContractError,
     MultimodalModelMixin,
+    batch_encoder_inputs,
     encode_multimodal_by_groups,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
@@ -907,3 +909,73 @@ def test_request_cache_input_is_built_once_and_shared_with_forward_views():
     model._apply_metadata_slice(residual, request.py_multimodal_params, [1])
     assert residual.multimodal_input.multimodal_hashes == [[2] * 8]
     assert first.multimodal_hashes == [[1] * 8, [2] * 8]
+
+
+@pytest.mark.parametrize("axis", [1, 2])
+def test_encoder_input_batch_pads_only_declared_axes(axis):
+    shape = [2, 3, 4]
+    shorter_shape = shape.copy()
+    shorter_shape[axis] -= 2
+    first = torch.arange(24, dtype=torch.float32).reshape(shape)
+    second = torch.full(shorter_shape, 7.0)
+    result = batch_encoder_inputs(
+        [{"features": first}, {"features": second}],
+        {"values": EncoderInputField(("features",), pad_dims=(axis,), pad_value=-1.0)},
+    )["values"]
+    assert result.shape == (4, 3, 4)
+    assert torch.equal(result[:2], first)
+    expected = torch.full(shape, -1.0)
+    expected.narrow(axis, 0, shorter_shape[axis]).copy_(second)
+    assert torch.equal(result[2:], expected)
+    assert torch.equal(second, torch.full(shorter_shape, 7.0))
+
+
+def test_encoder_input_batch_pads_features_and_boolean_validity_together():
+    features = [torch.ones(2, 3, 4), torch.full((1, 5, 4), 2.0)]
+    masks = [torch.tensor([[True, True, False], [True, False, False]]), torch.ones(1, 5).bool()]
+    result = batch_encoder_inputs(
+        [{"x": x, "valid": mask} for x, mask in zip(features, masks, strict=True)],
+        {
+            "features": EncoderInputField(("x",), pad_dims=(1,)),
+            "mask": EncoderInputField(("valid",), pad_dims=(1,)),
+        },
+    )
+    assert result["mask"].dtype == torch.bool
+    assert torch.equal(result["mask"].sum(1), torch.tensor([2, 1, 5]))
+    assert torch.count_nonzero(result["features"][:2, 3:]) == 0
+    assert not result["mask"][:2, 3:].any()
+    assert torch.equal(result["features"][2], features[1][0])
+
+
+@pytest.mark.parametrize("aliases", [("primary", "alternate"), ("primary", "unused", "alternate")])
+def test_encoder_input_batch_aliases_keep_input_order_and_owned_storage(aliases):
+    first = torch.arange(6).reshape(2, 3).T
+    second = torch.full_like(first, 9)
+    field = EncoderInputField(aliases, dim=1)
+    result = batch_encoder_inputs(
+        [{"primary": None, "alternate": first}, {"primary": second}], {"values": field}
+    )["values"]
+    assert torch.equal(result, torch.cat([first, second], dim=1))
+    single = batch_encoder_inputs([{"primary": first}], {"values": field})["values"]
+    assert single.data_ptr() != first.data_ptr()
+    assert single.dtype == first.dtype and single.device == first.device
+
+
+def test_encoder_input_batch_rejects_missing_field_instead_of_discarding_mask():
+    with pytest.raises(ValueError, match="Missing encoder input 'mask'"):
+        batch_encoder_inputs(
+            [{"valid": torch.ones(1, 2)}, {}],
+            {"mask": EncoderInputField(("valid",), pad_dims=(1,))},
+        )
+
+
+def test_encoder_input_batch_does_not_infer_padding():
+    with pytest.raises(RuntimeError):
+        batch_encoder_inputs(
+            [{"x": torch.ones(1, 2)}, {"x": torch.ones(1, 3)}],
+            {"values": EncoderInputField(("x",))},
+        )
+    with pytest.raises(ValueError, match="empty encoder inputs"):
+        batch_encoder_inputs([], {"values": EncoderInputField(("x",))})
+    with pytest.raises(ValueError, match="exclude the concat axis"):
+        EncoderInputField(("x",), pad_dims=(0,))

@@ -55,8 +55,8 @@ from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProces
 from transformers.models.gemma4.modeling_gemma4 import (  # noqa: E402
     Gemma4MultimodalEmbedder as HFGemma4MultimodalEmbedder,
 )
-from transformers.models.gemma4.modeling_gemma4 import (  # noqa: E402
-    Gemma4VisionModel as HFGemma4VisionModel,
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4VisionModel as HFGemma4VisionModel,  # noqa: E402
 )
 from transformers.models.gemma4.video_processing_gemma4 import Gemma4VideoProcessor  # noqa: E402
 
@@ -2297,3 +2297,90 @@ class TestGemma4VisionHeadDimPadding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("positions", ["all", "partial", "none"])
+def test_common_vision_batch_preserves_optional_fields(modality, positions):
+    model = _Gemma4EncoderCacheHarness()
+    inputs = []
+    for index in range(2):
+        data = {
+            "pixel_values": torch.full((index + 1, 3, 2), float(index + 1)),
+            "image_seq_lens": [3] * (index + 1),
+        }
+        if positions == "all" or (positions == "partial" and index == 0):
+            data["image_position_ids"] = torch.full((index + 1, 3, 2), index)
+        inputs.append(data)
+    params = [MultimodalParams(multimodal_data={modality: data}) for data in inputs]
+    with mock.patch.object(
+        _Gemma4EncoderCacheHarness,
+        "_get_image_features",
+        side_effect=lambda pixel_values, **_: pixel_values[:, 0],
+    ) as encoder:
+        output = model.encode_multimodal_inputs(params)
+    kwargs = encoder.call_args.kwargs
+    assert torch.equal(kwargs["pixel_values"], torch.cat([data["pixel_values"] for data in inputs]))
+    assert kwargs["image_seq_lens"] == [3, 3, 3]
+    if positions == "all":
+        assert torch.equal(
+            kwargs["image_position_ids"], torch.cat([data["image_position_ids"] for data in inputs])
+        )
+    else:
+        assert kwargs["image_position_ids"] is None
+    assert torch.equal(output, torch.tensor([[1.0, 1.0], [2.0, 2.0], [2.0, 2.0]]))
+
+
+@pytest.mark.cpu_only
+def test_common_vision_batch_matches_serial_with_reordered_items_and_audio_masks():
+    model = _Gemma4EncoderCacheHarness()
+    params = []
+    for modality, value in (("image", 1.0), ("image", 2.0), ("video", 3.0), ("audio", 4.0)):
+        if modality == "audio":
+            data = {"audio_features": torch.full((1, 3, 1), value), "audio_features_mask": None}
+        else:
+            data = {"pixel_values": torch.tensor([[[value]], [[value + 10]]])}
+        params.append(MultimodalParams(multimodal_data={modality: data}))
+    params[0].multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        [("image", 0), ("image", 1)], output_embedding_lengths=[1, 1]
+    )
+    params[0] = model.build_multimodal_encoder_input(params[0], [1, 0], "image")
+    with (
+        mock.patch.object(
+            _Gemma4EncoderCacheHarness,
+            "_get_image_features",
+            side_effect=lambda pixel_values, **_: pixel_values[:, 0],
+        ),
+        mock.patch.object(
+            _Gemma4EncoderCacheHarness,
+            "_get_audio_features",
+            side_effect=lambda features, mask: features[:, 0],
+        ) as audio,
+    ):
+        batched = model.encode_multimodal_inputs(params)
+        serial = torch.cat([model.encode_multimodal_inputs([param]) for param in params])
+    assert torch.equal(batched, serial)
+    assert torch.equal(batched[:2, 0], torch.tensor([11.0, 1.0]))
+    assert all(call.args[1] is None for call in audio.call_args_list)
+
+
+@pytest.mark.cpu_only
+def test_common_vision_runs_copy_outputs_before_static_buffer_reuse():
+    model = _Gemma4EncoderCacheHarness()
+    params = [
+        MultimodalParams(multimodal_data={modality: {"pixel_values": torch.full((1, 1, 1), value)}})
+        for modality, value in (("image", 1.0), ("video", 2.0), ("image", 3.0))
+    ]
+    static_output = torch.empty(1, 1)
+
+    def encode(pixel_values, **kwargs):
+        assert kwargs["image_seq_lens"] is None
+        return static_output.copy_(pixel_values[:, 0])
+
+    with mock.patch.object(
+        _Gemma4EncoderCacheHarness, "_get_image_features", side_effect=encode
+    ) as encoder:
+        output = model.encode_multimodal_inputs(params)
+    assert encoder.call_count == 3
+    assert torch.equal(output[:, 0], torch.tensor([1.0, 2.0, 3.0]))

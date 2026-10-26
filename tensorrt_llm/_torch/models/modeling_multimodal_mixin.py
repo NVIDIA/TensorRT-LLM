@@ -17,6 +17,7 @@
 import contextlib
 import copy
 import itertools
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -60,6 +61,99 @@ from .modeling_multimodal_utils import (
 
 class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
+
+
+@dataclass(frozen=True)
+class EncoderInputField:
+    """How one encoder argument combines already ordered input payloads.
+
+    ``source_names`` lists aliases in lookup order; the first non-None value
+    is used. Only ``pad_dims`` may vary besides the concatenation dimension.
+    Padding extends the right side with ``pad_value``. Callers supply compatible
+    tensor ranks, dtypes, devices and remaining dimensions, and retain ownership
+    of modality order, optional-field policy and attention-mask semantics.
+    """
+
+    source_names: tuple[str, ...]
+    dim: int = 0
+    pad_dims: tuple[int, ...] = ()
+    pad_value: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not self.source_names:
+            raise ValueError("Encoder input fields require at least one source name")
+        if self.dim < 0 or any(axis < 0 or axis == self.dim for axis in self.pad_dims):
+            raise ValueError("Encoder padding axes must be nonnegative and exclude the concat axis")
+
+
+def batch_encoder_inputs(
+    inputs: Sequence[Mapping[str, Any]],
+    fields: Mapping[str, EncoderInputField],
+) -> dict[str, torch.Tensor]:
+    """Gather, explicitly pad and concatenate encoder kwargs without reordering.
+
+    Inputs are read-only and the result always owns concatenated storage, even
+    for one input. Models may use this inside ``EncoderGroup.build_batched_input``
+    while existing grouped output restoration continues to use item metadata.
+    Lengths, grids and masks are never inferred from tensor shapes.
+    """
+    if not inputs:
+        raise ValueError("Cannot batch empty encoder inputs")
+    result: dict[str, torch.Tensor] = {}
+    only = inputs[0] if len(inputs) == 1 else None
+    for name, field in fields.items():
+        source_name = field.source_names[0]
+        if len(field.source_names) == 1:
+            try:
+                values = (
+                    [only[source_name]]
+                    if only is not None
+                    else [payload[source_name] for payload in inputs]
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"Missing encoder input {name!r}: expected {field.source_names}"
+                ) from exc
+        elif len(field.source_names) == 2:
+            alternate = field.source_names[1]
+            try:
+                values = [
+                    value if (value := payload.get(source_name)) is not None else payload[alternate]
+                    for payload in inputs
+                ]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Missing encoder input {name!r}: expected {field.source_names}"
+                ) from exc
+        else:
+            values = []
+            for payload in inputs:
+                value = payload.get(source_name)
+                if value is None:
+                    for alias in field.source_names[1:]:
+                        value = payload.get(alias)
+                        if value is not None:
+                            break
+                    if value is None:
+                        raise ValueError(
+                            f"Missing encoder input {name!r}: expected {field.source_names}"
+                        )
+                values.append(value)
+        if field.pad_dims and only is None:
+            maxima = {axis: max(value.shape[axis] for value in values) for axis in field.pad_dims}
+            padded = []
+            for value in values:
+                padding = [0] * (2 * value.ndim)
+                for axis, maximum in maxima.items():
+                    padding[2 * (value.ndim - axis) - 1] = maximum - value.shape[axis]
+                padded.append(
+                    torch.nn.functional.pad(value, padding, value=field.pad_value)
+                    if any(padding)
+                    else value
+                )
+            values = padded
+        result[name] = torch.cat(values, dim=field.dim)
+    return result
 
 
 def _assemble_multimodal_encoder_embeddings(

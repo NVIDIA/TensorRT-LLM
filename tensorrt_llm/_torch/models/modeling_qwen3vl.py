@@ -54,8 +54,10 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
 from .modeling_multimodal_mixin import (
     EncoderGroup,
+    EncoderInputField,
     MultimodalModelMixin,
     PreparedLlmInputs,
+    batch_encoder_inputs,
     encode_multimodal_by_groups,
 )
 from .modeling_qwen2vl import (
@@ -1297,26 +1299,37 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetad
         self._vision.prepare_attn_metadata(list(padded_seq_lengths), metadata)
 
 
+_QWEN3VL_ENCODER_INPUT_FIELDS = {
+    "pixel_values": EncoderInputField(("pixel_values", "pixel_values_videos")),
+    "grid_thw": EncoderInputField(("image_grid_thw", "video_grid_thw")),
+}
+_QWEN3VL_SINGLE_MODALITY_FIELDS = tuple(
+    {
+        name: EncoderInputField((field.source_names[index],))
+        for name, field in _QWEN3VL_ENCODER_INPUT_FIELDS.items()
+    }
+    for index in (0, 1)
+)
+
+
 def _qwen3vl_build_batched_input(
     multimodal_params: list[MultimodalParams],
 ) -> dict[str, Any]:
     """Cat image items then video items across requests (matching the
     ``EncoderGroup.modalities`` order) into one ViT input."""
-    pixels: list[torch.Tensor] = []
-    grids: list[torch.Tensor] = []
-    for m, pv_key, thw_key in (
-        ("image", "pixel_values", "image_grid_thw"),
-        ("video", "pixel_values_videos", "video_grid_thw"),
-    ):
-        for mp in multimodal_params:
-            bucket = mp.multimodal_data.get(m)
-            if bucket is not None:
-                pixels.append(bucket[pv_key])
-                grids.append(bucket[thw_key])
-    return {
-        "pixel_values": torch.cat(pixels, dim=0),
-        "grid_thw": torch.cat(grids, dim=0),
-    }
+    inputs_by_modality = [
+        [
+            bucket
+            for param in multimodal_params
+            if (bucket := param.multimodal_data.get(modality)) is not None
+        ]
+        for modality in ("image", "video")
+    ]
+    images, videos = inputs_by_modality
+    if images and videos:
+        return batch_encoder_inputs(images + videos, _QWEN3VL_ENCODER_INPUT_FIELDS)
+    index = 0 if images else 1
+    return batch_encoder_inputs(inputs_by_modality[index], _QWEN3VL_SINGLE_MODALITY_FIELDS[index])
 
 
 class Qwen3VisionModelBase(nn.Module):
