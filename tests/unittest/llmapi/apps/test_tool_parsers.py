@@ -6940,7 +6940,9 @@ def test_dsml_text_after_the_block_is_still_content(
                              finish=False)
 
     assert content == " Done."
-    assert parser.finish(sample_tools).normal_text == ""
+    finish_result = parser.finish(sample_tools)
+    assert finish_result.normal_text == ""
+    assert finish_result.calls == []
     assert [call.name for call in calls
             if call.name] == ["get_weather", "search_web"]
 
