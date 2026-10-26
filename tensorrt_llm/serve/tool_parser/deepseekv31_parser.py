@@ -69,6 +69,39 @@ class DeepSeekV31Parser(BaseToolParser):
         """Check if the text contains a deepseek format tool call."""
         return self.bot_token in text
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Send the arguments of a tool call whose end came in the last delta.
+
+        An increment sends at most one tool name or the arguments of one call,
+        and the arguments go out one increment after the name. So when the last
+        delta holds the end of a call, its name has been sent and its arguments
+        have not. They are sent here when the buffer holds only that call, with
+        its end token, the same non-empty name and a JSON object that continues
+        what was already sent. In any other case nothing is sent.
+        """
+        func_detail = None
+        if self.current_tool_name_sent and self._buffer.count("<｜tool▁call▁begin｜>") == 1:
+            match = re.search(self.func_call_regex, self._buffer, re.DOTALL)
+            func_detail = match and re.search(self.func_detail_regex, match.group(), re.DOTALL)
+        if not func_detail:
+            return StreamingParseResult()
+        func_name = func_detail.group(1)
+        func_args = func_detail.group(2).strip()
+        if (
+            not func_name
+            or func_name != self.prev_tool_call_arr[self.current_tool_id]["name"]
+            or not (func_args.startswith("{") and is_complete_json(func_args))
+            or not func_args.startswith(self._last_arguments)
+            or func_args == self._last_arguments
+        ):
+            return StreamingParseResult()
+        argument_diff = func_args[len(self._last_arguments) :]
+        self._last_arguments = func_args
+        self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+        return StreamingParseResult(
+            calls=[ToolCallItem(tool_index=self.current_tool_id, parameters=argument_diff)]
+        )
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-time parsing: Detects and parses tool calls in the provided text.
 
