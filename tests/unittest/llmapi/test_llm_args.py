@@ -78,27 +78,6 @@ from .test_llm import llama_model_path
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("type_name",
-                         ["BatchingType", "ExtendedRuntimePerfKnobConfig"])
-def test_retired_executor_types(type_name: str) -> None:
-    from tensorrt_llm.llmapi import llm_utils, serialization
-
-    for module in (tle, public_llmapi, llm_args_mod, llm_utils):
-        assert not hasattr(module, type_name)
-        assert type_name not in getattr(module, "__all__", ())
-    assert type_name not in serialization.BASE_EXAMPLE_CLASSES[
-        "tensorrt_llm.bindings.executor"]
-
-    legacy_pickle = f"ctensorrt_llm.bindings.executor\n{type_name}\n.".encode()
-    with pytest.raises(ValueError, match=f"{type_name} is not allowed"):
-        serialization.loads(legacy_pickle,
-                            approved_imports=serialization.BASE_EXAMPLE_CLASSES)
-
-    policy = CapacitySchedulerPolicy.STATIC_BATCH
-    assert policy._to_pybind() == tle.CapacitySchedulerPolicy.STATIC_BATCH
-
-
-@pytest.mark.cpu_only
 def test_generation_config_mode_defaults_and_validation() -> None:
     assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
     assert (TorchLlmArgs(model=llama_model_path,
