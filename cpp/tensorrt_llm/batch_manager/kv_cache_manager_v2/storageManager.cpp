@@ -1756,6 +1756,11 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
     }
 }
 
+std::optional<LocalityDomainId> StorageManager::localityDomainOf(CacheLevel level, LifeCycleId lc, SlotId slot) const
+{
+    return mLevels.at(level).storage->poolGroup(getPoolGroupIndex(level, lc)).localityDomainOf(slot);
+}
+
 // ---------------------------------------------------------------------------
 // isEvictable
 // ---------------------------------------------------------------------------

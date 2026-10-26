@@ -78,7 +78,7 @@ TEST(KvCacheManagerV2LocalityTest, SlotIdMapRoundTripsAndRejectsForeignChunks)
     EXPECT_FALSE(map.localIndex(SlotId{0}).has_value());
 }
 
-TEST(KvCacheManagerV2LocalityTest, MappedAllocatorsIssueDisjointGlobalIdsAndStampTheDomain)
+TEST(KvCacheManagerV2LocalityTest, MappedAllocatorsIssueDisjointGlobalIds)
 {
     SlotIdMap map0{SlotCount{4}};
     SlotIdMap map1{SlotCount{4}};
@@ -97,25 +97,22 @@ TEST(KvCacheManagerV2LocalityTest, MappedAllocatorsIssueDisjointGlobalIdsAndStam
     std::set<SlotId> ids;
     for (auto const& slot : slots0)
     {
-        EXPECT_EQ(slot.localityDomainId(), std::optional<LocalityDomainId>{0});
         EXPECT_LT(slot.slotId(), SlotId{4});
         ids.insert(slot.slotId());
     }
     for (auto const& slot : slots1)
     {
-        EXPECT_EQ(slot.localityDomainId(), std::optional<LocalityDomainId>{1});
         EXPECT_GE(slot.slotId(), SlotId{4});
         ids.insert(slot.slotId());
     }
     EXPECT_EQ(ids.size(), 8U);
     EXPECT_EQ(alloc0.numFreeSlots(), 0);
 
-    // A handle carrying the other domain's id is foreign to this allocator; the real slot stays
+    // A slot id from the other domain's chunk is foreign to this allocator; the real slot stays
     // with alloc1 and is released below.
     {
         Slot foreign;
         foreign.setSlotId(slots1[0].slotId());
-        foreign.setLocalityDomainId(LocalityDomainId{1});
         EXPECT_THROW(alloc0.release(std::move(foreign)), LogicError);
     }
     for (auto& slot : slots0)
@@ -370,6 +367,32 @@ TEST_F(KvCacheManagerV2MockLocalityTest, ResizeKeepsDomainsIndependent)
 
     storage.expandPoolGroup(kHotLevel, pg, before0, LocalityDomainId{1});
     EXPECT_GT(freeSlotsPerDomain(storage)[1], 0);
+}
+
+// A slot's locality domain comes from the chunk its id falls in, so it stays right after one domain
+// returns chunks and the other domain takes them over.
+TEST_F(KvCacheManagerV2MockLocalityTest, SlotIdDeterminesTheLocalityDomain)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeLocalizedConfig());
+    auto& storage = manager->storage();
+    PoolGroupIndex const pg{0};
+    LifeCycleId const lc{0};
+    SlotCount const before = storage.numSlots(pg);
+    storage.shrinkPoolGroup(kHotLevel, pg, SlotCount{1}, {}, LocalityDomainId{0});
+    storage.expandPoolGroup(kHotLevel, pg, 2 * before, LocalityDomainId{1});
+    storage.expandPoolGroup(kHotLevel, pg, before, LocalityDomainId{0});
+
+    auto const freeBefore = freeSlotsPerDomain(storage);
+    for (LocalityDomainId domain{0}; domain < storage.numLocalityDomains(); ++domain)
+    {
+        auto slots = storage.newSlotsForPoolGroup(kHotLevel, pg, freeBefore[domain.value()], {}, {}, domain);
+        for (auto& slot : slots)
+        {
+            ASSERT_EQ(storage.localityDomainOf(kHotLevel, lc, slot.slotId()), std::optional<LocalityDomainId>{domain});
+            storage.releaseSlot(lc, kHotLevel, std::move(slot));
+        }
+    }
+    EXPECT_EQ(freeSlotsPerDomain(storage), freeBefore);
 }
 
 // A slot size with only a 16-byte power-of-two factor needs 2 MiB / 16 slots per chunk, about 16 GiB, so the

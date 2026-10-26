@@ -67,12 +67,16 @@ Page::~Page()
                 manager->onPageDestroyed(*this);
                 Slot s;
                 s.setSlotId(slotId());
-                s.setLocalityDomainId(localityDomainId());
                 s.readyEvent = std::move(readyEvent);
                 resetSlot();
                 manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
             }
         });
+}
+
+std::optional<LocalityDomainId> Page::localityDomainId() const
+{
+    return hasValidSlot() ? manager->localityDomainOf(cacheLevel, lifeCycle, slotId()) : std::nullopt;
 }
 
 PageStatus Page::status() const noexcept
@@ -260,7 +264,6 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     }
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
-    committed->setLocalityDomainId(localityDomainId());
     committed->readyEvent = std::move(readyEvent);
     resetSlot();
     readyEvent = CachedCudaEvent::makeNull();
