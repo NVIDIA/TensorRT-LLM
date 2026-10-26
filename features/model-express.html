@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -732,6 +733,14 @@ profiles:</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">trtllm-mistral-dense-target-layout-v1</span></code></p></td>
 <td><p>Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, no sliding window, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">phi3-for-causal-lm-bf16-target-v1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">phi3</span></code></p></td>
+<td><p>Target model</p></td>
+<td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-phi3-dense-target-layout-v1</span></code></p></td>
+<td><p>Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -755,6 +764,30 @@ The native <code class="docutils literal notranslate"><span class="pre">mistral<
 model type to <code class="docutils literal notranslate"><span class="pre">mistral_common</span></code>; it cannot be combined with the MX loading path.
 The unregistered Llama-based <code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code> class in <code class="docutils literal notranslate"><span class="pre">modeling_llama.py</span></code>
 shares components with the qualified root but is not qualified.</p>
+<p>The Phi3 identity covers dense Hugging Face-format checkpoints that resolve to
+the exact <code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">phi3</span></code> pair; Phi-4 is the qualified canary.
+Phi-4-reasoning-plus, Phi-3-mini-4k-instruct, and Phi-3-medium-4k-instruct
+declare the same identity with BF16 weights, default RoPE, and untied
+embeddings, so they match the profile under the same runtime constraints. The
+Phi-3 4k configurations set <code class="docutils literal notranslate"><span class="pre">sliding_window</span></code>, but the Phi3 root does not apply
+it: every Phi3 checkpoint runs full attention in TensorRT LLM, so this profile
+does not constrain the sliding window. The 128k-context Phi-3 checkpoints and
+Phi-3.5-mini-instruct use LongRoPE scaling, and Phi-4-mini-instruct also ties
+its embeddings, so these checkpoints do not match the profile. Phi-3-small
+(<code class="docutils literal notranslate"><span class="pre">Phi3SmallForCausalLM</span></code>), the Phi-3 and Phi-3.5 vision models
+(<code class="docutils literal notranslate"><span class="pre">Phi3VForCausalLM</span></code>), Phi-3.5-MoE (<code class="docutils literal notranslate"><span class="pre">PhiMoEForCausalLM</span></code>), and
+Phi-4-multimodal (<code class="docutils literal notranslate"><span class="pre">Phi4MMForCausalLM</span></code>, including its quantized variants) use
+other roots. Phi4MM builds a Phi3 language model internally, but qualification
+matches the outer root, so these checkpoints fall back as well.</p>
+<p>Phi3 has one known limitation. <code class="docutils literal notranslate"><span class="pre">Phi3Attention.__init__</span></code> in
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/models/modeling_phi3.py</span></code> writes the runtime <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>
+into the shared pretrained configuration for LongRoPE, and <code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code>
+hashes that configuration. A donor and a receiver with different <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>
+values therefore get different model fingerprints: the receiver logs a
+<code class="docutils literal notranslate"><span class="pre">SourceIdentity</span> <span class="pre">mismatch</span></code> warning and falls back to non-shared weight loading,
+even though no transferred weight of a default-RoPE checkpoint depends on the
+value. Until the model code stops recording it, run both sides with the same
+<code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>.</p>
 <p>TensorRT LLM applies two independent compatibility gates:</p>
 <ul class="simple">
 <li><p>The qualification profile records that a model/config/lifecycle combination
@@ -771,14 +804,14 @@ missing ABI, or a different ABI is rejected rather than treated as compatible.</
 standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
 submodel.</p>
-<p>The Llama, Qwen2, Qwen3, and Mistral profiles are text-only and do not enable
-reward-model, embedding, MoE, or vision-language roots. FP16, quantized weights
-or KV cache, alternate attention backends, YaRN, tied embeddings, TP greater
-than 2, PP greater than 1, CP greater than 1, LoRA, sparse attention, attention
-DP, multi-node transfer, and speculative decoding require separate
-qualification rows. Each profile also pins its qualified RoPE realization:
-Llama, Qwen2, and Mistral require the default fused RoPE path, so unfused RoPE
-requires separate qualification for them, while Qwen3 fuses RoPE into the
+<p>The Llama, Qwen2, Qwen3, Mistral, and Phi3 profiles are text-only and do not
+enable reward-model, embedding, MoE, or vision-language roots. FP16, quantized
+weights or KV cache, alternate attention backends, YaRN or LongRoPE scaling,
+tied embeddings, TP greater than 2, PP greater than 1, CP greater than 1, LoRA,
+sparse attention, attention DP, multi-node transfer, and speculative decoding
+require separate qualification rows. Each profile also pins its qualified RoPE realization:
+Llama, Qwen2, Mistral, and Phi3 require the default fused RoPE path, so unfused
+RoPE requires separate qualification for them, while Qwen3 fuses RoPE into the
 QK-norm kernel and therefore requires <code class="docutils literal notranslate"><span class="pre">rope_fusion=False</span></code> in the realized
 configuration. The Mistral profile additionally pins the realized attention
 window: every attention layer must run without a sliding window, so
@@ -864,10 +897,12 @@ results archive even when the test fails. The test also prints one
 durations.</p>
 <p>Run the TP=2 rank-mapping qualification on four GPUs by selecting
 <code class="docutils literal notranslate"><span class="pre">llama-bf16-tp2</span></code>. <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_LLAMA_MODEL</span></code> can override the default TinyLlama
-checkpoint path. The Qwen2, Qwen3, and Mistral profile rows use
-<code class="docutils literal notranslate"><span class="pre">qwen2-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen2-bf16-tp2</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3-bf16-tp2</span></code>, and
-<code class="docutils literal notranslate"><span class="pre">mistral-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">mistral-bf16-tp2</span></code>, with optional model path overrides in
-<code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN2_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_MODEL</span></code>, and <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_MISTRAL_MODEL</span></code>.
+checkpoint path. The Qwen2, Qwen3, Mistral, and Phi3 profile rows use
+<code class="docutils literal notranslate"><span class="pre">qwen2-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen2-bf16-tp2</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3-bf16-tp2</span></code>,
+<code class="docutils literal notranslate"><span class="pre">mistral-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">mistral-bf16-tp2</span></code>, and <code class="docutils literal notranslate"><span class="pre">phi3-bf16-tp1</span></code> /
+<code class="docutils literal notranslate"><span class="pre">phi3-bf16-tp2</span></code>, with optional model path overrides in
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN2_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_MISTRAL_MODEL</span></code>,
+and <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_PHI3_MODEL</span></code>.
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_REQUIRED=1</span></code> converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
@@ -1109,13 +1144,17 @@ path.</p>
 <h2>Notes and Limitations<a class="headerlink" href="#notes-and-limitations" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p>Post-transform MX reception is currently limited to the exact Llama,
-Qwen2/Qwen2.5 dense, Qwen3 dense, and Mistral dense profiles above. Other
-roots and variants that do not match the documented identity and runtime
-envelope safely fall back to Hugging Face loading until explicitly qualified.</p></li>
+Qwen2/Qwen2.5 dense, Qwen3 dense, Mistral dense, and Phi3 dense profiles
+above. Other roots and variants that do not match the documented identity and
+runtime envelope safely fall back to Hugging Face loading until explicitly
+qualified.</p></li>
 <li><p>Mistral checkpoints served through the native <code class="docutils literal notranslate"><span class="pre">mistral</span></code> checkpoint format
 (<code class="docutils literal notranslate"><span class="pre">mistral_common</span></code> model type), sliding-window or Ministral <code class="docutils literal notranslate"><span class="pre">layer_types</span></code>
 variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
 are not qualified and use the Hugging Face fallback.</p></li>
+<li><p>Phi LongRoPE variants (128k-context Phi-3, Phi-3.5-mini, and Phi-4-mini),
+tied-embedding variants, and the Phi-3-small, vision, MoE, and Phi4MM
+multimodal roots are not qualified and use the Hugging Face fallback.</p></li>
 <li><p>The MX server and Redis lifecycle is external to TensorRT LLM. Every
 TensorRT LLM instance must be able to reach the configured MX server URL.</p></li>
 <li><p>The MX server coordinates source discovery but does not store model weights.
@@ -1281,9 +1320,9 @@ is already registered.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

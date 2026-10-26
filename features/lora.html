@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -686,6 +687,7 @@
 <li><p><a class="reference internal" href="#nemo-lora-format">NeMo LoRA Format</a></p></li>
 <li><p><a class="reference internal" href="#routed-expert-moe-lora">Routed-Expert MoE LoRA</a></p></li>
 <li><p><a class="reference internal" href="#cache-management">Cache Management</a></p></li>
+<li><p><a class="reference internal" href="#options-for-performance-tuning">Options for Performance Tuning</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#trtllm-serve-with-lora">TRTLLM serve with LoRA</a></p>
@@ -973,6 +975,21 @@ for routed-expert MoE LoRA modules; see <a class="reference internal" href="#rou
 </pre></div>
 </div>
 </section>
+<section id="options-for-performance-tuning">
+<h3>Options for Performance Tuning<a class="headerlink" href="#options-for-performance-tuning" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">LoraConfig</span></code> exposes several options for performance tuning depending on the user’s workload. The first is <code class="docutils literal notranslate"><span class="pre">overlap_lora_and_base</span></code>:
+setting this to <code class="docutils literal notranslate"><span class="pre">True</span></code> enables concurrent execution of LoRA adapter and base model computations, which are scheduled on
+separate CUDA streams. This allows to significantly reduce the latency overhead introduced by LoRA, especially in low-concurrency
+(i.e., memory-bound) regimes. This option covers the LoRA path for the <code class="docutils literal notranslate"><span class="pre">mlp</span></code>, <code class="docutils literal notranslate"><span class="pre">gated_mlp</span></code>, <code class="docutils literal notranslate"><span class="pre">attention</span></code> and <code class="docutils literal notranslate"><span class="pre">linear</span></code> modules, but does
+not apply to MoE LoRA.</p>
+<p>The second option is <code class="docutils literal notranslate"><span class="pre">cuda_graph_specialize_lora</span></code>: enabling this triggers the capture of two sets of CUDA graphs, having the LoRA path
+enabled or disabled for all requests in the batch; by default, a single set of CUDA graphs is captured with the LoRA path active, using
+dummy requests without <code class="docutils literal notranslate"><span class="pre">lora_task_id</span></code>, with empty adapter slots that have rank <code class="docutils literal notranslate"><span class="pre">0</span></code> and zeroed weight pointers. This option is particularly
+effective when the majority of requests in the workload does not use LoRA, since it allows most batches to follow the non-LoRA path and
+therefore eliminate all of the associated overhead.</p>
+<p>However, it should be noted that enabling <code class="docutils literal notranslate"><span class="pre">cuda_graph_specialize_lora</span></code> will result in a slight memory overhead due to the additional
+number of CUDA graphs that need to be captured and stored (about 50MB for 21 generation graphs with Qwen3 32B).</p>
+</section>
 </section>
 <section id="trtllm-serve-with-lora">
 <h2>TRTLLM serve with LoRA<a class="headerlink" href="#trtllm-serve-with-lora" title="Link to this heading">#</a></h2>
@@ -1127,6 +1144,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cache-management">Cache Management</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#options-for-performance-tuning">Options for Performance Tuning</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-with-lora">TRTLLM serve with LoRA</a><ul class="nav section-nav flex-column">
@@ -1231,9 +1249,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

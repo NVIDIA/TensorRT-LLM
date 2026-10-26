@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -1414,7 +1415,17 @@ not used to mark a feature as supported here.</p>
 <td><p>Untested</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id26" id="id39" role="doc-noteref"><span class="fn-bracket">[</span>13<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Untested</p></td>
+<td><p>Yes</p></td>
+<td><p>Untested</p></td>
+<td><p>Untested</p></td>
+<td><p>Untested</p></td>
+<td><p>L + I + V</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
@@ -1424,7 +1435,7 @@ not used to mark a feature as supported here.</p>
 <td><p>Yes</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
@@ -1434,7 +1445,7 @@ not used to mark a feature as supported here.</p>
 <td><p>Yes</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForConditionalGeneration</span></code></p></td>
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
@@ -1458,6 +1469,48 @@ not used to mark a feature as supported here.</p>
 <h2>Multimodal Encoder Optimizations<a class="headerlink" href="#multimodal-encoder-optimizations" title="Link to this heading">#</a></h2>
 <p>The following optimizations are available to models that implement
 <code class="docutils literal notranslate"><span class="pre">MultimodalModelMixin</span></code>.</p>
+<section id="encoder-cuda-graphs">
+<h3>Encoder CUDA graphs<a class="headerlink" href="#encoder-cuda-graphs" title="Link to this heading">#</a></h3>
+<p>For encoders with CUDA graph support, set a maximum batch size in the model’s
+modality configuration. For example, pass this YAML through <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">--config</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">multimodal_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">encoder_cuda_graph</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">vision</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+</pre></div>
+</div>
+<p>The encoder adapter automatically generates capture shapes for batch sizes 1 through 8,
+within <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code> (or <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> when unset). Use the optional
+per-modality <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> to limit capture memory and startup work. Batch size counts
+independent encoder contexts: images, video frame groups, or audio chunks as defined by
+the encoder. It does not count concurrent API requests or the scheduler’s atomic items.
+Larger or unsupported shapes fall back to eager execution. Graphs remain disabled by default.</p>
+<p>Each supported tower reads its own modality entry. An audio adapter uses the same settings,
+with its own shape, mask, and output rules:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">multimodal_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">encoder_cuda_graph</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">vision</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="w">    </span><span class="nt">audio</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="w">      </span><span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
+</pre></div>
+</div>
+<p>The second example requires a model with graph-enabled vision and audio towers. The current
+production integrations are Qwen3-VL and related Qwen vision encoders, RADIO (<code class="docutils literal notranslate"><span class="pre">vision</span></code>), and
+GLM5-Next (<code class="docutils literal notranslate"><span class="pre">image</span></code> instead of <code class="docutils literal notranslate"><span class="pre">vision</span></code>). The shared audio adapter interface is available,
+but production audio towers still need an implementation and model validation. Requesting an
+unsupported modality fails before any graphs are captured.</p>
+<p>Advanced users can supply <code class="docutils literal notranslate"><span class="pre">buckets:</span> <span class="pre">[[256,</span> <span class="pre">1],</span> <span class="pre">[512,</span> <span class="pre">2]]</span></code> instead of <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>
+and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>. Each pair specifies total real encoder tokens and an exact context count.
+Automatic shapes use per-context capacities starting at 256 tokens (or the available budget
+when smaller), doubling up to each batch size’s token budget. Adapters can override these
+shapes for additional alignment constraints. Padded replay is enabled by default; disabling it
+requires an exact token-count match. Encoder graphs and encoder side-stream prefetch are
+mutually exclusive.</p>
+</section>
+<section id="side-streams-and-embeddings-cache">
+<h3>Side streams and embeddings cache<a class="headerlink" href="#side-streams-and-embeddings-cache" title="Link to this heading">#</a></h3>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Model Architecture</p></th>
@@ -1518,9 +1571,11 @@ capacity plus any in-flight prefetched encoder inputs and outputs.</p></li>
 <code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_scheduling_policy</span></code> is <code class="docutils literal notranslate"><span class="pre">DISABLED</span></code>. Cached items are reused before
 encoder work is selected, so they use none of the per-iteration encoder item or token budget.
 Only missing items are encoded, mixed-modality requests are cached per item, and newly encoded
-items populate the cache for later requests. The item path also keeps encoder outputs in this
-cache until the request’s prefill completes, so the cache is never smaller than the output of
-one encoder iteration, even when <code class="docutils literal notranslate"><span class="pre">encoder_cache_max_bytes</span></code> is <code class="docutils literal notranslate"><span class="pre">0</span></code>. Item scheduling does not
+items populate the cache for later requests. With KV cache manager V2, items covered by confirmed
+KV reuse are not encoded. With chunked prefill, each chunk waits only for its required items
+and releases encoder outputs after use. KV cache manager V1 keeps whole-request encoder
+scheduling. The cache is never smaller than the output of one encoder iteration, even when
+<code class="docutils literal notranslate"><span class="pre">encoder_cache_max_bytes</span></code> is <code class="docutils literal notranslate"><span class="pre">0</span></code>. Item scheduling does not
 support side-stream prefetch or pipeline parallelism yet. With <code class="docutils literal notranslate"><span class="pre">pipeline_parallel_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>,
 the <code class="docutils literal notranslate"><span class="pre">DEFAULT</span></code> policy, explicit or unset, logs a warning and falls back to the inline path, and
 the <code class="docutils literal notranslate"><span class="pre">EAGER</span></code> policy raises an error.</p></li>
@@ -1529,12 +1584,13 @@ the <code class="docutils literal notranslate"><span class="pre">EAGER</span></c
 </ul>
 </section>
 </section>
+</section>
 <section class="tex2jax_ignore mathjax_ignore" id="visual-generation-models">
 <h1>Visual Generation Models<a class="headerlink" href="#visual-generation-models" title="Link to this heading">#</a></h1>
 <p>TensorRT-LLM provides beta support for diffusion-based image and video generation.
 For full documentation, see the <a class="reference internal" href="visual-generation.html"><span class="std std-doc">Visual Generation</span></a> page.</p>
-<section id="id39">
-<h2>Supported Models<a class="headerlink" href="#id39" title="Link to this heading">#</a></h2>
+<section id="id40">
+<h2>Supported Models<a class="headerlink" href="#id40" title="Link to this heading">#</a></h2>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>HuggingFace Model ID</p></th>
@@ -1723,8 +1779,8 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>Qwen-Image-Layered</strong></p></td>
-<td><p>Yes</p></td>
+<tr class="row-odd"><td><p><strong>Qwen-Image-Layered</strong> <a href="#id43"><span class="problematic" id="id41">[^vg2]</span></a></p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -1742,7 +1798,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1800,7 +1856,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <aside class="footnote brackets" id="id24" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>11<span class="fn-bracket">]</span></span>
 <span class="backrefs">(<a role="doc-backlink" href="#id1">1</a>,<a role="doc-backlink" href="#id11">2</a>)</span>
-<p>DeepSeek-V4 is only supported on Blackwell GPUs (<code class="docutils literal notranslate"><span class="pre">SM100+</span></code>). See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example README</a> for setup and parallelism.</p>
+<p>DeepSeek-V4 is only supported on Blackwell GPUs (<code class="docutils literal notranslate"><span class="pre">SM100+</span></code>). See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example README</a> for setup and parallelism.</p>
 </aside>
 <aside class="footnote brackets" id="id25" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></span>
@@ -1808,8 +1864,9 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <p>Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForCausalLM</span></code> architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.</p>
 </aside>
 <aside class="footnote brackets" id="id26" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id38">13</a><span class="fn-bracket">]</span></span>
-<p>The Cosmos 3 family also supports visual generation through the VisualGen API. See <a class="reference internal" href="#visual-generation-models">Visual Generation Models</a>.</p>
+<span class="label"><span class="fn-bracket">[</span>13<span class="fn-bracket">]</span></span>
+<span class="backrefs">(<a role="doc-backlink" href="#id38">1</a>,<a role="doc-backlink" href="#id39">2</a>)</span>
+<p>Cosmos3-Nano and Cosmos3-Super Reasoner checkpoints use <code class="docutils literal notranslate"><span class="pre">Cosmos3ForConditionalGeneration</span></code>. Cosmos3-Edge Reasoner uses <code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeForConditionalGeneration</span></code> (SigLIP2 vision encoder, 4608-11520-2048 projector, dense ReLU-squared decoder, interleaved mRoPE) and is BF16. The same Cosmos 3 checkpoints also support visual generation through the VisualGen API. See <a class="reference internal" href="#visual-generation-models">Visual Generation Models</a>.</p>
 </aside>
 <aside class="footnote brackets" id="id27" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></span>
@@ -1827,7 +1884,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 </aside>
 <aside class="footnote brackets" id="id30" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id16">17</a><span class="fn-bracket">]</span></span>
-<p>Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain <code class="docutils literal notranslate"><span class="pre">DFlash</span></code>.</p>
+<p>Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain <code class="docutils literal notranslate"><span class="pre">DFlash</span></code>. Speculators-format DSpark checkpoints require <code class="docutils literal notranslate"><span class="pre">aux_hidden_state_layer_ids</span></code> to be a nonempty list of positive integers; booleans, floats and strings are rejected rather than coerced.</p>
 </aside>
 <aside class="footnote brackets" id="id31" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id8">18</a><span class="fn-bracket">]</span></span>
@@ -1898,11 +1955,15 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 </li>
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#encoder-decoder-feature-support-matrix-pytorch-backend">Encoder-Decoder Feature Support Matrix (PyTorch Backend)</a></li>
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-feature-support-matrix-pytorch-backend">Multimodal Feature Support Matrix (PyTorch Backend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-encoder-optimizations">Multimodal Encoder Optimizations</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-encoder-optimizations">Multimodal Encoder Optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#encoder-cuda-graphs">Encoder CUDA graphs</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#side-streams-and-embeddings-cache">Side streams and embeddings cache</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-generation-models">Visual Generation Models</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id39">Supported Models</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id40">Supported Models</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-matrix">Feature Matrix</a></li>
 </ul>
 </li>
@@ -2000,9 +2061,9 @@ For full documentation, see the <a class="reference internal" href="visual-gener
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

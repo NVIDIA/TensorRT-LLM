@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -430,6 +430,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -865,7 +866,6 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">return_perf_metrics</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">return_routed_experts</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">additional_model_outputs</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">_return_log_probs</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">guided_decoding</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">thinking_token_budget</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">ignore_eos</span></span></em>,</dd>
@@ -925,7 +925,17 @@
 
 <dl class="py class">
 <dt class="sig sig-object py">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">BlockReuseConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">policy</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_turns</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">swa_endpoint_rewind_tokens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#BlockReuseConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">BlockReuseConfig</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">policy</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_num_turns</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">swa_endpoint_rewind_tokens</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_branch_snapshot</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#BlockReuseConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
 <dd><p><a class="reference internal" href="reference/BlockReuseConfig.html"><span class="doc">View the full BlockReuseConfig reference</span></a></p>
 </dd></dl>
 
@@ -944,6 +954,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">disk_cache_size</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disk_cache_path</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cross_kv_cache_fraction</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cold_tier_offload_min_priority</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">secondary_offload_min_priority</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">event_buffer_max_size</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_dp_events_gather_period_ms</span></span></em>,</dd>
@@ -954,6 +965,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_gpu_total_bytes</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">iteration_stats_interval</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mixed_precision_first_n</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mixed_precision_last_n</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mamba_ssm_cache_dtype</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mamba_ssm_stochastic_rounding</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mamba_ssm_philox_rounds</span></span></em>,</dd>
@@ -1656,6 +1669,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_dp_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disable_overlap_scheduler</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_return_routed_experts</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">lm_head_output_dtype</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">nvfp4_gemm_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">dwdp_config</span></span></em>,</dd>
@@ -2201,9 +2215,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

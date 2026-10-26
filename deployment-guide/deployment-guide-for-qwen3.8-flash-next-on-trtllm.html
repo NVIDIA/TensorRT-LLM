@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -783,7 +784,7 @@
 -p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
 -v<span class="w"> </span>~/.cache:/root/.cache:rw<span class="w"> </span><span class="se">\</span>
 --name<span class="w"> </span>tensorrt_llm<span class="w"> </span><span class="se">\</span>
-nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc1<span class="w"> </span><span class="se">\</span>
+nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc2<span class="w"> </span><span class="se">\</span>
 /bin/bash
 </pre></div>
 </div>
@@ -861,7 +862,7 @@ nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc1<span class="w"> </span><span class=
 <span class="w">    </span><span class="nt">periodic_snapshot_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
 </pre></div>
 </div>
-<p>Block reuse stays on only if <code class="docutils literal notranslate"><span class="pre">mamba_state_config</span></code> sets at least one snapshot placement: <code class="docutils literal notranslate"><span class="pre">periodic_snapshot_interval</span></code>, <code class="docutils literal notranslate"><span class="pre">additional_snapshot_offsets_from_start</span></code>, or <code class="docutils literal notranslate"><span class="pre">additional_snapshot_offsets_from_end</span></code>. <code class="docutils literal notranslate"><span class="pre">enable_branch_snapshot</span></code> refines where snapshots land but does not by itself keep reuse enabled. The same settings apply in disaggregated serving; configure them on both workers. A snapshot restores the PLE short-convolution state and n-gram context along with the GDN state, because they share one recurrent page. Check the effective LLM arguments and the per-request <code class="docutils literal notranslate"><span class="pre">num_reused_blocks</span></code> metric rather than assuming the submitted setting took effect.</p>
+<p>Block reuse stays on only if <code class="docutils literal notranslate"><span class="pre">mamba_state_config</span></code> sets at least one snapshot placement: <code class="docutils literal notranslate"><span class="pre">periodic_snapshot_interval</span></code>, <code class="docutils literal notranslate"><span class="pre">additional_snapshot_offsets_from_start</span></code>, or <code class="docutils literal notranslate"><span class="pre">additional_snapshot_offsets_from_end</span></code>. <code class="docutils literal notranslate"><span class="pre">block_reuse_config.enable_branch_snapshot</span></code> refines where snapshots land but does not by itself keep reuse enabled. The same settings apply in disaggregated serving; configure them on both workers. A snapshot restores the PLE short-convolution state and n-gram context along with the GDN state, because they share one recurrent page. Check the effective LLM arguments and the per-request <code class="docutils literal notranslate"><span class="pre">num_reused_blocks</span></code> metric rather than assuming the submitted setting took effect.</p>
 </section>
 </section>
 <section id="launch-the-tensorrt-llm-server">
@@ -1319,9 +1320,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

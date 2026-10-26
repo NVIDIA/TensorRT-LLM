@@ -8,4 +8,4 @@ CacheTransceiverConfig
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_json_schema,parse_raw,model_fields,Config,model_post_init,from_orm,parse_obj,schema,copy,validate,model_config,json,model_fields_set,model_validate_json,model_copy,model_extra,update_forward_refs,parse_file,model_parametrized_name,construct,schema_json,dict,model_dump_json,model_rebuild,model_construct,model_dump,model_computed_fields,model_validate,model_validate_strings
+    :exclude-members: schema_json,parse_raw,model_fields,dict,model_validate,model_copy,from_orm,model_config,model_json_schema,model_validate_strings,model_extra,update_forward_refs,Config,schema,parse_file,model_computed_fields,model_dump,json,model_fields_set,construct,model_construct,model_rebuild,model_post_init,validate,parse_obj,model_parametrized_name,model_validate_json,model_dump_json,copy

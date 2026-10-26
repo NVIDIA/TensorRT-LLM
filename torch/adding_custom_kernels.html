@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -432,6 +432,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -702,12 +703,12 @@
 <tr class="row-odd"><td class="text-left"><p><a class="reference external" href="https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html">CuTe DSL</a> (Python)</p></td>
 <td class="text-left"><p>Python using <code class="docutils literal notranslate"><span class="pre">cutlass.cute</span></code> / <code class="docutils literal notranslate"><span class="pre">&#64;cute.kernel</span></code></p></td>
 <td class="text-left"><p>JIT, on first call (cached in-process)</p></td>
-<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cute_dsl_kernels/</span></code></a></p></td>
+<td class="text-left"><p>Beside the owning module layer — <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/attention/kernels"><code class="docutils literal notranslate"><span class="pre">attention/kernels/</span></code></a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/moe/kernels"><code class="docutils literal notranslate"><span class="pre">moe/kernels/</span></code></a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen/kernels"><code class="docutils literal notranslate"><span class="pre">visual_gen/kernels/</span></code></a> — or, when no single layer owns them, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/kernels/</span></code></a></p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p><a class="reference external" href="https://docs.nvidia.com/cuda/cutile-python/">cuTile</a> (Python)</p></td>
 <td class="text-left"><p>Python using <code class="docutils literal notranslate"><span class="pre">cuda.tile</span></code> / <code class="docutils literal notranslate"><span class="pre">&#64;ct.kernel</span></code></p></td>
 <td class="text-left"><p>JIT, on first call (cached in-process)</p></td>
-<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cuda_tile_kernels/</span></code></a></p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/kernels/</span></code></a> (<code class="docutils literal notranslate"><span class="pre">rms_norm.py</span></code>, <code class="docutils literal notranslate"><span class="pre">rms_norm_fuse_residual.py</span></code>)</p></td>
 </tr>
 </tbody>
 </table>
@@ -847,11 +848,11 @@
 </thead>
 <tbody>
 <tr class="row-even"><td class="text-left"><p>CuTe DSL</p></td>
-<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cute_dsl_kernels/</span></code></a> (Blackwell variants under <code class="docutils literal notranslate"><span class="pre">blackwell/</span></code>)</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/kernels/</span></code></a> plus the domain-owned <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/attention/kernels"><code class="docutils literal notranslate"><span class="pre">attention/kernels/</span></code></a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/moe/kernels"><code class="docutils literal notranslate"><span class="pre">moe/kernels/</span></code></a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen/kernels"><code class="docutils literal notranslate"><span class="pre">visual_gen/kernels/</span></code></a> (architecture variants under <code class="docutils literal notranslate"><span class="pre">blackwell/</span></code> and <code class="docutils literal notranslate"><span class="pre">rubin/</span></code>)</p></td>
 <td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">IS_CUTLASS_DSL_AVAILABLE</span></code> in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_utils.py"><code class="docutils literal notranslate"><span class="pre">cute_dsl_utils.py</span></code></a></p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>cuTile</p></td>
-<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cuda_tile_kernels/</span></code></a></p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/kernels/</span></code></a></p></td>
 <td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">IS_CUDA_TILE_AVAILABLE</span></code> in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_utils.py"><code class="docutils literal notranslate"><span class="pre">cuda_tile_utils.py</span></code></a></p></td>
 </tr>
 </tbody>
@@ -860,8 +861,8 @@
 </section>
 <section id="kernel-skeleton">
 <h3>4.2 Kernel skeleton<a class="headerlink" href="#kernel-skeleton" title="Link to this heading">#</a></h3>
-<p><strong>CuTe DSL.</strong> The kernel is a class (or a free function) decorated with <code class="docutils literal notranslate"><span class="pre">&#64;cute.jit</span></code> for host code and <code class="docutils literal notranslate"><span class="pre">&#64;cute.kernel</span></code> for the device entry point. Compilation is cached by the call site and reused across launches. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/argmax.py"><code class="docutils literal notranslate"><span class="pre">cute_dsl_kernels/argmax.py</span></code></a> for a self-contained reduction example, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_gemm_persistent.py"><code class="docutils literal notranslate"><span class="pre">cute_dsl_kernels/blackwell/dense_gemm_persistent.py</span></code></a> for a GEMM with TMA + persistent scheduling.</p>
-<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="c1"># tensorrt_llm/_torch/cute_dsl_kernels/my_kernel.py</span>
+<p><strong>CuTe DSL.</strong> The kernel is a class (or a free function) decorated with <code class="docutils literal notranslate"><span class="pre">&#64;cute.jit</span></code> for host code and <code class="docutils literal notranslate"><span class="pre">&#64;cute.kernel</span></code> for the device entry point. Compilation is cached by the call site and reused across launches. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/argmax.py"><code class="docutils literal notranslate"><span class="pre">kernels/argmax.py</span></code></a> for a self-contained reduction example, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/blackwell/dense_gemm_persistent.py"><code class="docutils literal notranslate"><span class="pre">kernels/blackwell/dense_gemm_persistent.py</span></code></a> for a GEMM with TMA + persistent scheduling.</p>
+<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="c1"># tensorrt_llm/_torch/kernels/my_kernel.py</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..cute_dsl_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IS_CUTLASS_DSL_AVAILABLE</span>
 
 <span class="k">if</span> <span class="n">IS_CUTLASS_DSL_AVAILABLE</span><span class="p">:</span>
@@ -897,8 +898,8 @@
         <span class="k">return</span> <span class="n">out</span>
 </pre></div>
 </div>
-<p><strong>cuTile.</strong> The kernel is a Python function decorated with <code class="docutils literal notranslate"><span class="pre">&#64;ct.kernel</span></code> that takes tensors plus <code class="docutils literal notranslate"><span class="pre">ct.Constant[...]</span></code> compile-time parameters, and is launched via <code class="docutils literal notranslate"><span class="pre">ct.launch(stream,</span> <span class="pre">grid,</span> <span class="pre">kernel,</span> <span class="pre">args)</span></code>. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_kernels/rms_norm.py"><code class="docutils literal notranslate"><span class="pre">cuda_tile_kernels/rms_norm.py</span></code></a> and the corresponding Torch op wrapper in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py"><code class="docutils literal notranslate"><span class="pre">custom_ops/cuda_tile_custom_ops.py</span></code></a>.</p>
-<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="c1"># tensorrt_llm/_torch/cuda_tile_kernels/my_kernel.py</span>
+<p><strong>cuTile.</strong> The kernel is a Python function decorated with <code class="docutils literal notranslate"><span class="pre">&#64;ct.kernel</span></code> that takes tensors plus <code class="docutils literal notranslate"><span class="pre">ct.Constant[...]</span></code> compile-time parameters, and is launched via <code class="docutils literal notranslate"><span class="pre">ct.launch(stream,</span> <span class="pre">grid,</span> <span class="pre">kernel,</span> <span class="pre">args)</span></code>. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/rms_norm.py"><code class="docutils literal notranslate"><span class="pre">kernels/rms_norm.py</span></code></a> and the corresponding Torch op wrapper in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py"><code class="docutils literal notranslate"><span class="pre">custom_ops/cuda_tile_custom_ops.py</span></code></a>.</p>
+<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="c1"># tensorrt_llm/_torch/kernels/my_kernel.py</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..cuda_tile_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IS_CUDA_TILE_AVAILABLE</span>
 
 <span class="k">if</span> <span class="n">IS_CUDA_TILE_AVAILABLE</span><span class="p">:</span>
@@ -920,7 +921,7 @@
 
 <span class="k">if</span> <span class="n">IS_CUDA_TILE_AVAILABLE</span><span class="p">:</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">cuda.tile</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ct</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">..cuda_tile_kernels</span><span class="w"> </span><span class="kn">import</span> <span class="n">rms_norm_kernel</span>  <span class="c1"># the JIT kernel above</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">..kernels.rms_norm</span><span class="w"> </span><span class="kn">import</span> <span class="n">rms_norm_kernel</span>  <span class="c1"># the JIT kernel above</span>
 
     <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">"trtllm::cuda_tile_rms_norm"</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">cuda_tile_rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
@@ -939,7 +940,7 @@
 <section id="runtime-caveats">
 <h3>4.4 Runtime caveats<a class="headerlink" href="#runtime-caveats" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p><strong>Compute capability checks.</strong> Kernels under <code class="docutils literal notranslate"><span class="pre">cute_dsl_kernels/blackwell/</span></code> and the entire <code class="docutils literal notranslate"><span class="pre">cuda_tile_kernels/</span></code> tree assume sm_100+. Always probe with <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._utils.get_sm_version()</span></code> (see <code class="docutils literal notranslate"><span class="pre">_should_use_torch_fallback</span></code> in <code class="docutils literal notranslate"><span class="pre">argmax.py</span></code>) and route to a fallback otherwise.</p></li>
+<li><p><strong>Compute capability checks.</strong> CuTe DSL kernels under a <code class="docutils literal notranslate"><span class="pre">kernels/blackwell/</span></code> package assume sm_100+, and those under a <code class="docutils literal notranslate"><span class="pre">kernels/rubin/</span></code> package assume sm_107+. The cuTile kernels under <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/kernels/</span></code> assume sm_100+ too. Always probe with <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._utils.get_sm_version()</span></code> (see <code class="docutils literal notranslate"><span class="pre">_should_use_torch_fallback</span></code> in <code class="docutils literal notranslate"><span class="pre">argmax.py</span></code>) and route to a fallback otherwise.</p></li>
 <li><p><strong>DLPack/CUDA Graphs.</strong> When exporting tensors via DLPack, use the stream override that mimics the <code class="docutils literal notranslate"><span class="pre">CUDAGraphCompatibleWrapper</span></code> in <code class="docutils literal notranslate"><span class="pre">argmax.py</span></code> so the capture replays cleanly.</p></li>
 <li><p><strong>JIT compile cache.</strong> Always cache compiled kernels by the keys that affect codegen (dtype, last-dim size, hardware variant). <code class="docutils literal notranslate"><span class="pre">argmax.py</span></code> and the <code class="docutils literal notranslate"><span class="pre">cute_dsl_custom_ops.py</span></code> runners are good references.</p></li>
 </ul>
@@ -1193,9 +1194,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

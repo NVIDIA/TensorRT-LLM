@@ -419,7 +419,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -434,7 +434,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -785,6 +785,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -1034,8 +1035,9 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">traceback</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">deque</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span><span class="p">,</span> <span class="n">ThreadPoolExecutor</span><span class="p">,</span> <span class="n">as_completed</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">CancelledError</span><span class="p">,</span> <span class="n">Future</span><span class="p">,</span> <span class="n">ThreadPoolExecutor</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">wait</span> <span class="k">as</span> <span class="n">futures_wait</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">TypeVar</span>
 
@@ -1397,6 +1399,25 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="n">_DEFAULT_IDENTITY_TIMEOUT</span> <span class="o">=</span> <span class="mf">300.0</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_mgmn_shutdown_grace_seconds</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Bound draining a failed batch and shutting down the server-owned world.</span>
+
+<span class="sd">    When using trtllm-llmapi-launch, allow this grace plus cold stop-helper</span>
+<span class="sd">    startup/import, communication and cleanup overhead in</span>
+<span class="sd">    TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT.</span>
+<span class="sd">    """</span>
+    <span class="n">raw</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"TLLM_MGMN_SHUTDOWN_GRACE_SECONDS"</span><span class="p">,</span> <span class="s2">"60"</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">value</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">value</span><span class="p">)</span> <span class="ow">and</span> <span class="n">value</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">value</span>
+    <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+        <span class="k">pass</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">"Ignoring invalid TLLM_MGMN_SHUTDOWN_GRACE_SECONDS=</span><span class="si">{</span><span class="n">raw</span><span class="si">!r}</span><span class="s2">; using 60s"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="mf">60.0</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_identity_barrier_timeout</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
@@ -1876,15 +1897,13 @@ window.runMermaid = runMermaid;</script>
             <span class="n">RemoteTask</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">,</span> <span class="n">sync</span><span class="o">=</span><span class="n">sync</span><span class="p">,</span> <span class="n">sys_path</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="p">)))</span>
         <span class="k">return</span> <span class="p">[]</span>
 
-    <span class="n">SYNC_IDLE_INTERVAL</span> <span class="o">=</span> <span class="mi">8</span>
-
     <span class="k">def</span><span class="w"> </span><span class="nf">submit_sync</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">T</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""Submit a task to the remote MPI pool and wait for task completion."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="n">sync</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
+        <span class="c1"># poll() blocks on the response socket and wakes when a result arrives.</span>
         <span class="k">while</span> <span class="ow">not</span> <span class="p">((</span><span class="n">res</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">poll</span><span class="p">())</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span><span class="p">):</span>
             <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Waiting for task completion... </span><span class="si">{</span><span class="n">res</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span> <span class="s2">"grey"</span><span class="p">)</span>
-            <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">SYNC_IDLE_INTERVAL</span><span class="p">)</span>
 
         <span class="n">logger_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">"rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> RemoteMpiCommSessionClient.send_sync received results: </span><span class="si">{</span><span class="n">res</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
@@ -1964,7 +1983,6 @@ window.runMermaid = runMermaid;</script>
                                  <span class="n">socket_type</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">PAIR</span><span class="p">,</span>
                                  <span class="n">use_hmac_encryption</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">comm</span> <span class="o">=</span> <span class="n">comm</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>  <span class="c1"># the results may arrive in any order</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">comm</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">session</span> <span class="o">=</span> <span class="n">MpiCommSession</span><span class="p">(</span><span class="n">n_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">comm</span><span class="o">.</span><span class="n">Get_size</span><span class="p">(),</span>
@@ -1993,7 +2011,7 @@ window.runMermaid = runMermaid;</script>
             <span class="sa">f</span><span class="s2">"MpiCommSession rank</span><span class="si">{</span><span class="n">mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> start task [</span><span class="si">{</span><span class="n">task</span><span class="si">}</span><span class="s2">] with args: </span><span class="si">{</span><span class="n">args</span><span class="si">}</span><span class="s2"> and kwargs: </span><span class="si">{</span><span class="n">kwargs</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
             <span class="s2">"green"</span><span class="p">)</span>
 
-        <span class="c1"># wait for all ranks to start the task</span>
+        <span class="c1"># Pin one task to each rank before any worker can accept another task.</span>
         <span class="n">mpi_barrier</span><span class="p">()</span>
 
         <span class="k">try</span><span class="p">:</span>
@@ -2003,79 +2021,15 @@ window.runMermaid = runMermaid;</script>
                 <span class="sa">f</span><span class="s2">"MpiCommSession rank</span><span class="si">{</span><span class="n">mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> task [</span><span class="si">{</span><span class="n">task</span><span class="si">}</span><span class="s2">] failed with exception: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
                 <span class="s2">"red"</span><span class="p">)</span>
             <span class="n">traceback</span><span class="o">.</span><span class="n">print_exc</span><span class="p">()</span>
-            <span class="k">raise</span> <span class="n">e</span>
+            <span class="k">raise</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="n">logger_debug</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"MpiCommSession rank</span><span class="si">{</span><span class="n">mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> task [</span><span class="si">{</span><span class="n">task</span><span class="si">}</span><span class="s2">] finished</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
                 <span class="s2">"green"</span><span class="p">)</span>
-            <span class="n">mpi_barrier</span><span class="p">()</span>
+            <span class="c1"># Let exceptions reach their futures even when a peer is stuck.</span>
+            <span class="c1"># The server gates the next batch on completion of all futures.</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">serve</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer listening on </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                     <span class="s2">"yellow"</span><span class="p">)</span>
-        <span class="n">pending_futures</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
-            <span class="c1"># Wait for any pending futures from previous tasks to complete</span>
-            <span class="c1"># This ensures all ranks are ready before accepting the next task</span>
-            <span class="k">if</span> <span class="n">pending_futures</span><span class="p">:</span>
-                <span class="n">logger_debug</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer waiting for </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">pending_futures</span><span class="p">)</span><span class="si">}</span><span class="s2"> pending futures to complete</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                    <span class="s2">"grey"</span><span class="p">)</span>
-                <span class="n">n_failed</span> <span class="o">=</span> <span class="mi">0</span>
-                <span class="n">first_exc</span> <span class="o">=</span> <span class="kc">None</span>
-                <span class="c1"># Use as_completed so that failures are logged as soon as</span>
-                <span class="c1"># they occur rather than blocking behind a stuck future.</span>
-                <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">as_completed</span><span class="p">(</span><span class="n">pending_futures</span><span class="p">):</span>
-                    <span class="k">try</span><span class="p">:</span>
-                        <span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>  <span class="c1"># Wait for completion</span>
-                    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-                        <span class="n">n_failed</span> <span class="o">+=</span> <span class="mi">1</span>
-                        <span class="k">if</span> <span class="n">first_exc</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                            <span class="n">first_exc</span> <span class="o">=</span> <span class="n">e</span>
-                        <span class="n">print_colored</span><span class="p">(</span>
-                            <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer: MPI worker future "</span>
-                            <span class="sa">f</span><span class="s2">"failed: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span> <span class="s2">"red"</span><span class="p">)</span>
-                        <span class="k">if</span> <span class="n">n_failed</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending_futures</span><span class="p">):</span>
-                            <span class="c1"># All workers failed — no point waiting further.</span>
-                            <span class="k">break</span>
-                <span class="k">if</span> <span class="n">n_failed</span><span class="p">:</span>
-                    <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
-                        <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer: </span><span class="si">{</span><span class="n">n_failed</span><span class="si">}</span><span class="s2">/"</span>
-                        <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">pending_futures</span><span class="p">)</span><span class="si">}</span><span class="s2"> MPI worker(s) failed. "</span>
-                        <span class="sa">f</span><span class="s2">"First error: </span><span class="si">{</span><span class="n">first_exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-                <span class="n">pending_futures</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
-                <span class="n">logger_debug</span><span class="p">(</span>
-                    <span class="s2">"RemoteMpiCommSessionServer all pending futures completed</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                    <span class="s2">"grey"</span><span class="p">)</span>
-
-            <span class="n">message</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">RemoteTask</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
-            <span class="k">if</span> <span class="n">message</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">logger_debug</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer [rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2">] received shutdown signal</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                    <span class="s2">"green"</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">shutdown_abort</span><span class="p">()</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_close_global_comm_executor</span><span class="p">()</span>
-                <span class="k">break</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">logger_debug</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer [rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2">] received task [</span><span class="si">{</span><span class="n">message</span><span class="o">.</span><span class="n">task</span><span class="si">}</span><span class="s2">] from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                    <span class="s2">"green"</span><span class="p">)</span>
-                <span class="n">futures</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span>
-                    <span class="n">RemoteMpiCommSessionServer</span><span class="o">.</span><span class="n">task_wrapper</span><span class="p">,</span> <span class="n">message</span><span class="o">.</span><span class="n">sys_path</span><span class="p">,</span>
-                    <span class="n">message</span><span class="o">.</span><span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">message</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">message</span><span class="o">.</span><span class="n">kwargs</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">n_workers</span>
-                <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">futures</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span> <span class="o">==</span> <span class="n">mpi_world_size</span><span class="p">()</span>
-                <span class="c1"># Store futures to wait for them before the next task</span>
-                <span class="n">pending_futures</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">futures</span><span class="p">)</span>
-                <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">futures</span><span class="p">:</span>
-                    <span class="k">if</span> <span class="n">message</span><span class="o">.</span><span class="n">sync</span><span class="p">:</span>
-                        <span class="n">future</span><span class="o">.</span><span class="n">add_done_callback</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_future_callback</span><span class="p">)</span>
-                    <span class="k">else</span><span class="p">:</span>
-                        <span class="c1"># Fire-and-forget tasks have no result channel, but a</span>
-                        <span class="c1"># crashed worker must still reach the client (the</span>
-                        <span class="c1"># client-side session has no futures to watch); see</span>
-                        <span class="c1"># RemoteWorkerDeath.</span>
-                        <span class="n">future</span><span class="o">.</span><span class="n">add_done_callback</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_async_error_callback</span><span class="p">)</span>
+    <span class="n">SHUTDOWN_ACK</span> <span class="o">=</span> <span class="s2">"shutdown-ack"</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_close_global_comm_executor</span><span class="p">(</span>
@@ -2136,57 +2090,165 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"free stuck ranks..."</span><span class="p">)</span>
             <span class="n">abort</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">mpi_async_error_callback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">future</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">"""Forward a worker exception to the client for async tasks.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_shutdown_session</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">grace</span><span class="p">:</span> <span class="nb">float</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Close the world owned by this server, or abort it within the deadline.</span>
 
-<span class="sd">        Runs on the executor's callback thread, like the existing sync-path</span>
-<span class="sd">        mpi_future_callback (same pre-existing cross-thread ZMQ-put pattern).</span>
-<span class="sd">        Best-effort: the socket may already be closed at shutdown.</span>
+<span class="sd">        MpiCommSession.shutdown deliberately leaves the shared COMM_WORLD pool</span>
+<span class="sd">        alive for reuse. Only the server's final shutdown owns closing it.</span>
 <span class="sd">        """</span>
-        <span class="k">if</span> <span class="n">future</span><span class="o">.</span><span class="n">cancelled</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">grace</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">abort</span><span class="p">()</span>
             <span class="k">return</span>
-        <span class="n">exc</span> <span class="o">=</span> <span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">()</span>
-        <span class="k">if</span> <span class="n">exc</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span>
-        <span class="n">print_colored</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer: async MPI worker failed, forwarding "</span>
-            <span class="sa">f</span><span class="s2">"to client: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span> <span class="s2">"red"</span><span class="p">)</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">RemoteWorkerDeath</span><span class="o">.</span><span class="n">from_exception</span><span class="p">(</span><span class="n">exc</span><span class="p">))</span>
-        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-            <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Failed to forward worker death to client: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                         <span class="s2">"red"</span><span class="p">)</span>
+        <span class="n">deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="n">grace</span>
+        <span class="n">uses_global_pool</span> <span class="o">=</span> <span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="p">,</span> <span class="n">MpiCommSession</span><span class="p">)</span>
+                            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">mpi_pool</span>
+                            <span class="ow">is</span> <span class="n">MPINodeState</span><span class="o">.</span><span class="n">_global_mpi_pool</span><span class="p">)</span>
+        <span class="n">finished</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Event</span><span class="p">()</span>
+        <span class="n">errors</span> <span class="o">=</span> <span class="p">[]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">mpi_future_callback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">future</span><span class="p">):</span>
-        <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">"rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> got future: </span><span class="si">{</span><span class="n">future</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span> <span class="s2">"red"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">logger_debug</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"mpi_future got exception: </span><span class="si">{</span><span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">()</span><span class="si">}</span><span class="s2">, quitting</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                <span class="s2">"red"</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">())</span>
-            <span class="k">return</span>
-
-        <span class="n">result</span> <span class="o">=</span> <span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">result</span><span class="p">)</span>
-        <span class="n">logger_debug</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer working status: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">)</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_results</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-            <span class="s2">"grey"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span><span class="p">:</span>
-            <span class="n">logger_debug</span><span class="p">(</span>
-                <span class="s2">"RemoteMpiCommSessionServer received all results, sending to client</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                <span class="s2">"green"</span><span class="p">)</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">():</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put_noblock</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">,</span> <span class="n">retry</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
-            <span class="k">except</span> <span class="n">zmq</span><span class="o">.</span><span class="n">ZMQError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-                <span class="c1"># The client could be shutdown first.</span>
-                <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">errno</span> <span class="o">==</span> <span class="n">zmq</span><span class="o">.</span><span class="n">EAGAIN</span><span class="p">:</span>
-                    <span class="k">pass</span>
-                <span class="k">else</span><span class="p">:</span>
-                    <span class="k">raise</span> <span class="n">e</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+            <span class="k">except</span> <span class="ne">BaseException</span> <span class="k">as</span> <span class="n">error</span><span class="p">:</span>
+                <span class="n">errors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">error</span><span class="p">)</span>
+            <span class="k">finally</span><span class="p">:</span>
+                <span class="n">finished</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
 
-            <span class="n">logger_debug</span><span class="p">(</span><span class="s2">"RemoteMpiCommSessionServer sent results to client</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
-                         <span class="s2">"green"</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="n">thread</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Thread</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">shutdown</span><span class="p">,</span>
+                                  <span class="n">name</span><span class="o">=</span><span class="s2">"RemoteMpiSessionShutdown"</span><span class="p">,</span>
+                                  <span class="n">daemon</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">thread</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">finished</span><span class="o">.</span><span class="n">wait</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">deadline</span> <span class="o">-</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">())):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Remote MPI shutdown exceeded </span><span class="si">{</span><span class="n">grace</span><span class="si">}</span><span class="s2">s; aborting"</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">abort</span><span class="p">()</span>
+        <span class="k">elif</span> <span class="n">errors</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Remote MPI shutdown failed: </span><span class="si">{</span><span class="n">errors</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">!r}</span><span class="s2">; aborting"</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">abort</span><span class="p">()</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">thread</span><span class="o">.</span><span class="n">join</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">uses_global_pool</span><span class="p">:</span>
+                <span class="n">remaining</span> <span class="o">=</span> <span class="n">deadline</span> <span class="o">-</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">remaining</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">abort</span><span class="p">()</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_close_global_comm_executor</span><span class="p">(</span><span class="n">grace</span><span class="o">=</span><span class="n">remaining</span><span class="p">,</span>
+                                                     <span class="n">abort</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">abort</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">serve</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Handle completions and control messages without waiting on a rank.</span>
+
+<span class="sd">        All socket operations run here, never in executor callbacks. Normal</span>
+<span class="sd">        tasks are serialized by batch; a stop request can bypass that gate.</span>
+<span class="sd">        """</span>
+        <span class="n">grace</span> <span class="o">=</span> <span class="n">_mgmn_shutdown_grace_seconds</span><span class="p">()</span>
+        <span class="c1"># A disconnected client must not prevent world teardown. Allow a short</span>
+        <span class="c1"># delivery window, including for the first worker-death notification.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">socket</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">SNDTIMEO</span><span class="p">,</span> <span class="mi">1000</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">socket</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LINGER</span><span class="p">,</span> <span class="mi">1000</span><span class="p">)</span>
+        <span class="n">queued_tasks</span> <span class="o">=</span> <span class="n">deque</span><span class="p">()</span>
+        <span class="n">pending</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">sync</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">first_error</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">async_failed</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">drain_deadline</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">stop_deadline</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">pending</span><span class="p">[:]:</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">():</span>
+                        <span class="k">continue</span>
+                    <span class="n">pending</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">future</span><span class="p">)</span>
+                    <span class="c1"># Inspect stored worker failures without raising them here;</span>
+                    <span class="c1"># server-local interrupts must still propagate normally.</span>
+                    <span class="n">error</span> <span class="o">=</span> <span class="p">(</span><span class="n">CancelledError</span><span class="p">()</span>
+                             <span class="k">if</span> <span class="n">future</span><span class="o">.</span><span class="n">cancelled</span><span class="p">()</span> <span class="k">else</span> <span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">())</span>
+                    <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">())</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Remote MPI worker failed: </span><span class="si">{</span><span class="n">error</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">first_error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="n">first_error</span> <span class="o">=</span> <span class="n">error</span>
+                            <span class="c1"># Preserve the sync API's one exception response,</span>
+                            <span class="c1"># but never mix partial results into the next batch.</span>
+                            <span class="n">response</span> <span class="o">=</span> <span class="p">(</span><span class="n">error</span> <span class="k">if</span> <span class="n">sync</span> <span class="k">else</span>
+                                        <span class="n">RemoteWorkerDeath</span><span class="o">.</span><span class="n">from_exception</span><span class="p">(</span><span class="n">error</span><span class="p">))</span>
+                            <span class="k">try</span><span class="p">:</span>
+                                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+                            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">send_error</span><span class="p">:</span>
+                                <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                                    <span class="sa">f</span><span class="s2">"Failed to send MPI worker error: </span><span class="si">{</span><span class="n">send_error</span><span class="si">!r}</span><span class="s2">"</span>
+                                <span class="p">)</span>
+                                <span class="k">raise</span>
+                            <span class="n">drain_deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="n">grace</span>
+                            <span class="k">if</span> <span class="ow">not</span> <span class="n">sync</span><span class="p">:</span>
+                                <span class="c1"># Keep the error channel alive until the client</span>
+                                <span class="c1"># stops or its observation window expires.</span>
+                                <span class="n">async_failed</span> <span class="o">=</span> <span class="kc">True</span>
+                                <span class="n">queued_tasks</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+
+                <span class="k">if</span> <span class="n">async_failed</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="p">(</span><span class="n">stop_deadline</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                            <span class="ow">or</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">&gt;=</span> <span class="n">drain_deadline</span><span class="p">):</span>
+                        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">"Remote MPI asynchronous task failed"</span>
+                                           <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">first_error</span>
+                <span class="k">elif</span> <span class="n">drain_deadline</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">pending</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">&gt;=</span> <span class="n">drain_deadline</span><span class="p">:</span>
+                        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                            <span class="s2">"MPI workers did not drain after a task failure"</span>
+                        <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">first_error</span>
+
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">pending</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">async_failed</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">sync</span> <span class="ow">and</span> <span class="n">first_error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">results</span><span class="p">)</span>
+                    <span class="c1"># Results and error state belong to a single submitted batch.</span>
+                    <span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>
+                    <span class="n">sync</span> <span class="o">=</span> <span class="kc">False</span>
+                    <span class="n">first_error</span> <span class="o">=</span> <span class="kc">None</span>
+                    <span class="n">drain_deadline</span> <span class="o">=</span> <span class="kc">None</span>
+                    <span class="k">if</span> <span class="n">queued_tasks</span><span class="p">:</span>
+                        <span class="n">message</span> <span class="o">=</span> <span class="n">queued_tasks</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+                        <span class="n">pending</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">task_wrapper</span><span class="p">,</span>
+                                                <span class="n">message</span><span class="o">.</span><span class="n">sys_path</span><span class="p">,</span> <span class="n">message</span><span class="o">.</span><span class="n">task</span><span class="p">,</span>
+                                                <span class="o">*</span><span class="n">message</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
+                                                <span class="o">**</span><span class="n">message</span><span class="o">.</span><span class="n">kwargs</span><span class="p">))</span>
+                        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">n_workers</span>
+                        <span class="n">sync</span> <span class="o">=</span> <span class="n">message</span><span class="o">.</span><span class="n">sync</span>
+
+                <span class="k">if</span> <span class="n">stop_deadline</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="n">pending</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">queued_tasks</span><span class="p">:</span>
+                        <span class="k">break</span>
+                    <span class="k">if</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">&gt;=</span> <span class="n">stop_deadline</span><span class="p">:</span>
+                        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                            <span class="s2">"Remote MPI shutdown deadline expired"</span><span class="p">)</span>
+                    <span class="c1"># Keep servicing reconnecting stop clients while the</span>
+                    <span class="c1"># original shutdown deadline bounds the worker drain.</span>
+
+                <span class="c1"># Keep receiving stop requests even while workers are stuck.</span>
+                <span class="c1"># Other requests wait until every future in the batch is done.</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="mf">0.1</span><span class="p">):</span>
+                    <span class="n">message</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+                    <span class="k">if</span> <span class="n">message</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put_noblock</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">SHUTDOWN_ACK</span><span class="p">,</span> <span class="n">retry</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">stop_deadline</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="n">stop_deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="n">grace</span>
+                    <span class="k">elif</span> <span class="n">stop_deadline</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">async_failed</span><span class="p">:</span>
+                        <span class="n">queued_tasks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">message</span><span class="p">)</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">deadlines</span> <span class="o">=</span> <span class="p">[</span>
+                    <span class="n">deadline</span> <span class="k">for</span> <span class="n">deadline</span> <span class="ow">in</span> <span class="p">(</span><span class="n">drain_deadline</span><span class="p">,</span> <span class="n">stop_deadline</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">deadline</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="p">]</span>
+                <span class="k">if</span> <span class="n">deadlines</span><span class="p">:</span>
+                    <span class="n">grace</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span>
+                                <span class="nb">min</span><span class="p">(</span><span class="n">grace</span><span class="p">,</span>
+                                    <span class="nb">min</span><span class="p">(</span><span class="n">deadlines</span><span class="p">)</span> <span class="o">-</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()))</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_shutdown_session</span><span class="p">(</span><span class="n">grace</span><span class="p">)</span>
+            <span class="k">finally</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">find_free_port</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -2362,9 +2424,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

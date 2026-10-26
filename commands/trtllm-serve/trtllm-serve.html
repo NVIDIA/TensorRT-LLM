@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -72,14 +72,14 @@
 
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="Run benchmarking with trtllm-serve" href="run-benchmark-with-trtllm-serve.html" />
+    <link rel="next" title="Render endpoints" href="render-endpoints.html" />
     <link rel="prev" title="trtllm-serve" href="index.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">trtllm-serve</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2 current active"><a aria-current="page" class="current reference internal" href="#">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -688,8 +689,9 @@
 <li><p><code class="docutils literal notranslate"><span class="pre">/version</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">/start_profile</span></code> (prototype)</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code> (prototype)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/chat/completions/render</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/completions/render</span></code> (prototype, enabled with <code class="docutils literal notranslate"><span class="pre">TRTLLM_ENABLE_RENDER_ENDPOINTS=1</span></code>)</p></li>
 </ul>
-<p>The <code class="docutils literal notranslate"><span class="pre">metrics</span></code> endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The <code class="docutils literal notranslate"><span class="pre">start_profile</span></code> and <code class="docutils literal notranslate"><span class="pre">stop_profile</span></code> endpoints control iteration-scoped profiling of the backend engine; see <a class="reference internal" href="#runtime-profiling-endpoints"><span class="std std-ref">Runtime Profiling Endpoints</span></a> below.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">metrics</span></code> endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The <code class="docutils literal notranslate"><span class="pre">start_profile</span></code> and <code class="docutils literal notranslate"><span class="pre">stop_profile</span></code> endpoints control iteration-scoped profiling of the backend engine; see <a class="reference internal" href="#runtime-profiling-endpoints"><span class="std std-ref">Runtime Profiling Endpoints</span></a> below. The render endpoints return the prompt token ids that the server would use for a request, without running the model; see <a class="reference internal" href="render-endpoints.html"><span class="doc">Render endpoints</span></a>.</p>
 <p>For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">embeddings</span></code> subcommand starts a server that exposes an OpenAI-compatible <code class="docutils literal notranslate"><span class="pre">/v1/embeddings</span></code> endpoint with native dynamic batching. See <a class="reference internal" href="../../features/embeddings.html"><span class="doc">Embeddings</span></a> for details.</p>
 </section>
 <section id="starting-a-server">
@@ -699,6 +701,39 @@
 </pre></div>
 </div>
 <p>For the full syntax and argument descriptions, refer to <a class="reference internal" href="#syntax"><span class="std std-ref">Syntax</span></a>.</p>
+<section id="tool-call-parser-selection">
+<span id="tool-parser-selection"></span><h3>Tool-call Parser Selection<a class="headerlink" href="#tool-call-parser-selection" title="Link to this heading">#</a></h3>
+<p>Select <code class="docutils literal notranslate"><span class="pre">--tool_parser</span></code> to match the tool-call syntax specified by the checkpoint’s
+chat template. Models from different families can share a parser when they emit
+the same format.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">qwen3_coder</span></code> parser handles the following function/parameter format, shared
+by Qwen3-Coder, Nemotron 3 Nano, Nemotron 3 Super, Nemotron 3 Ultra, and
+Nemotron 3.5 Super VL:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>&lt;tool_call&gt;
+&lt;function=get_weather&gt;
+&lt;parameter=city&gt;
+Taipei
+&lt;/parameter&gt;
+&lt;/function&gt;
+&lt;/tool_call&gt;
+</pre></div>
+</div>
+<p>The official chat templates specify this syntax and use it to serialize previous
+assistant tool calls:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/chat_template.jinja">Qwen3-Coder</a></p></li>
+<li><p><a class="reference external" href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/main/chat_template.jinja">Nemotron 3 Nano</a></p></li>
+<li><p><a class="reference external" href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/blob/main/chat_template.jinja">Nemotron 3 Super</a></p></li>
+<li><p><a class="reference external" href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/blob/main/chat_template.jinja">Nemotron 3 Ultra</a></p></li>
+<li><p><a class="reference external" href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/blob/main/chat_template.jinja">Nemotron 3.5 Super VL</a></p></li>
+</ul>
+<p>Among these Nemotron models, <code class="docutils literal notranslate"><span class="pre">--tool_parser</span> <span class="pre">auto</span></code> selects <code class="docutils literal notranslate"><span class="pre">qwen3_coder</span></code> only
+for Nemotron 3.5 Super VL (<code class="docutils literal notranslate"><span class="pre">nemotron_h_omni</span></code>). For Nemotron 3 Nano, Super, and
+Ultra (<code class="docutils literal notranslate"><span class="pre">nemotron_h</span></code>), specify <code class="docutils literal notranslate"><span class="pre">--tool_parser</span> <span class="pre">qwen3_coder</span></code> explicitly.</p>
+<p>The module <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py</span></code> implements this
+shared format. <code class="docutils literal notranslate"><span class="pre">--reasoning_parser</span></code> separately controls reasoning extraction;
+<code class="docutils literal notranslate"><span class="pre">nemotron-v3</span></code> and <code class="docutils literal notranslate"><span class="pre">nano-v3</span></code> are aliases for the same Nemotron reasoning parser.</p>
+</section>
 </section>
 <section id="inference-endpoints">
 <h2>Inference Endpoints<a class="headerlink" href="#inference-endpoints" title="Link to this heading">#</a></h2>
@@ -817,7 +852,7 @@
 <p>For multimodal models, you need to create a configuration file and start the server with additional options due to the following limitations:</p>
 <ul class="simple">
 <li><p>TRT-LLM multimodal is currently not compatible with <code class="docutils literal notranslate"><span class="pre">kv_cache_reuse</span></code></p></li>
-<li><p>Multimodal models require <code class="docutils literal notranslate"><span class="pre">chat_template</span></code>, so only the Chat API is supported</p></li>
+<li><p>Multimodal models require <code class="docutils literal notranslate"><span class="pre">chat_template</span></code>, so only the Chat API and the Responses API are supported</p></li>
 </ul>
 <p>To set up multimodal models:</p>
 <p>First, create a configuration file:</p>
@@ -928,6 +963,17 @@
 </pre></div>
 </div>
 </section>
+<section id="multimodal-responses-api">
+<h3>Multimodal Responses API<a class="headerlink" href="#multimodal-responses-api" title="Link to this heading">#</a></h3>
+<p>The Responses API takes an image as an <code class="docutils literal notranslate"><span class="pre">input_image</span></code> content part whose <code class="docutils literal notranslate"><span class="pre">image_url</span></code> is the image URL or a base64 data URL:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">"role"</span><span class="p">:</span><span class="w"> </span><span class="s2">"user"</span><span class="p">,</span><span class="w"> </span><span class="nt">"content"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"input_text"</span><span class="p">,</span><span class="w"> </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"What's in this image?"</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"input_image"</span><span class="p">,</span><span class="w"> </span><span class="nt">"image_url"</span><span class="p">:</span><span class="w"> </span><span class="s2">"data:image/jpeg;base64,{image_base64}"</span><span class="p">}</span>
+<span class="p">]}</span>
+</pre></div>
+</div>
+<p>Images referenced by <code class="docutils literal notranslate"><span class="pre">file_id</span></code> and <code class="docutils literal notranslate"><span class="pre">input_file</span></code> content are not supported; a request that carries them is rejected with a 400 error.</p>
+</section>
 <section id="multimodal-modality-coverage">
 <h3>Multimodal Modality Coverage<a class="headerlink" href="#multimodal-modality-coverage" title="Link to this heading">#</a></h3>
 <p>TRT-LLM multimodal supports the following modalities and data types (depending on the model):</p>
@@ -1035,6 +1081,25 @@ trtllm-serve<span class="w"> </span>nvidia/Cosmos3-Nano<span class="w"> </span><
 <p>For full details, see the <span class="xref std std-doc">../../models/visual-generation.md</span> feature documentation. Example client scripts are available in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve">examples/visual_gen/serve/</a> directory.</p>
 </section>
 </section>
+<section id="render-endpoints">
+<h2>Render Endpoints<a class="headerlink" href="#render-endpoints" title="Link to this heading">#</a></h2>
+<p>The render endpoints accept the same request body as <code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/completions</span></code> and return the
+prompt token ids that a <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> server would build from it, including its chat template, tool and reasoning
+handling, and tokenization. They do not run the model. The response is a <em>rendered request</em>: the <code class="docutils literal notranslate"><span class="pre">token_ids</span></code> plus
+the original request body.</p>
+<p>Typical uses:</p>
+<ul class="simple">
+<li><p><strong>Routing.</strong> A KV-cache-aware router or gateway, such as Dynamo’s endpoint picker, calls a render endpoint to get
+exactly the token ids the server will see. It hashes them to find the server with the longest cached prefix, then
+forwards the original request to that server.</p></li>
+<li><p><strong>Skipping rendering on the server.</strong> A client can send the ids to a server’s chat or completions endpoint, so the
+server does not apply the chat template and tokenize again.</p></li>
+</ul>
+<p>The render endpoints are a prototype and are not registered with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> by default. Set
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_ENABLE_RENDER_ENDPOINTS=1</span></code> to register them on a <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> server, or run the standalone, CPU-only
+<code class="docutils literal notranslate"><span class="pre">trtllm-render</span></code> next to your servers. See <a class="reference internal" href="render-endpoints.html"><span class="doc">Render endpoints</span></a> for the response format and for how to send a
+rendered request to the chat and completions endpoints.</p>
+</section>
 <section id="multi-node-serving-with-slurm">
 <h2>Multi-node Serving with Slurm<a class="headerlink" href="#multi-node-serving-with-slurm" title="Link to this heading">#</a></h2>
 <p>You can deploy <a class="reference external" href="https://huggingface.co/deepseek-ai/DeepSeek-V3">DeepSeek-V3</a> model across two nodes with Slurm and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></p>
@@ -1070,7 +1135,8 @@ srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><s
 </pre></div>
 </div>
 <p>After sending at least one inference request to the server, you can fetch runtime iteration statistics by polling the <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> endpoint.
-Since the statistics are stored in an internal queue and removed once retrieved, it’s recommended to poll the endpoint shortly after each request and store the results if needed.</p>
+Since the statistics are stored in an internal queue and removed once retrieved, it’s recommended to poll the endpoint shortly after each request and store the results if needed.
+Each statistic is returned to only one caller, so poll the endpoint from a single client: when several clients poll at once, one of them may receive an empty list.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>GET<span class="w"> </span>http://localhost:8000/metrics
 </pre></div>
 </div>
@@ -2160,11 +2226,11 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
       </div>
     </a>
     <a class="right-next"
-       href="run-benchmark-with-trtllm-serve.html"
+       href="render-endpoints.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></p>
+        <p class="prev-next-title">Render endpoints</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -2190,17 +2256,22 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#about">About</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#starting-a-server">Starting a Server</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#starting-a-server">Starting a Server</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tool-call-parser-selection">Tool-call Parser Selection</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#inference-endpoints">Inference Endpoints</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#chat-api">Chat API</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#completions-api">Completions API</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#responses-api">Responses API</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-serving">Multimodal Serving</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-chat-api">Multimodal Chat API</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-responses-api">Multimodal Responses API</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-modality-coverage">Multimodal Modality Coverage</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-generation-serving">Visual Generation Serving</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#render-endpoints">Render Endpoints</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-serving-with-slurm">Multi-node Serving with Slurm</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics-endpoint">Metrics Endpoint</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-profiling-endpoints">Runtime Profiling Endpoints</a><ul class="nav section-nav flex-column">
@@ -2315,9 +2386,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

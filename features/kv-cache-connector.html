@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -762,7 +763,7 @@
 </thead>
 <tbody>
 <tr class="row-even"><td><p>per-layer-group</p></td>
-<td><p>every model, VSWA included</p></td>
+<td><p>single-layer-group models and VSWA with KVCacheManagerV2</p></td>
 </tr>
 <tr class="row-odd"><td><p>flat</p></td>
 <td><p>non-VSWA, non-hybrid only</p></td>
@@ -770,13 +771,15 @@
 </tbody>
 </table>
 </div>
-<p>A set is complete when both of its methods are defined. Mixing the two — one method from each — is rejected during executor bring-up, naming the method that is missing. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See <a class="reference internal" href="#running-under-vswa">Running under VSWA</a>.</p>
+<p>A set is complete when both of its methods are defined. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See <a class="reference internal" href="#running-under-vswa">Running under VSWA</a>.</p>
 </li>
 </ul>
 </li>
 </ul>
 <section id="running-under-vswa">
 <h5>Running under VSWA<a class="headerlink" href="#running-under-vswa" title="Link to this heading">#</a></h5>
+<p>KVCacheManagerV2 supports multiple layer groups with a connector implementing the grouped APIs below. KVCacheManagerV1 registers a single primary pool and cannot describe VSWA to a connector. Single-window SWA remains allowed with either manager.</p>
+<p>With V2, a connector that transfers KV rejects requests carrying <code class="docutils literal notranslate"><span class="pre">KvCacheRetentionConfig</span></code> when the cache has multiple layer groups: <code class="docutils literal notranslate"><span class="pre">RequestData.priorities</span></code> is a single list and cannot describe priorities per group. This is a request validation error; the service can start and process requests without an explicit retention config. Capacity-only connectors are exempt from this restriction because they do not transfer KV or emit this priority metadata. Native V2 retention without a connector remains supported across layer groups.</p>
 <p>Under variable sliding-window attention the KV cache allocates one pool per attention window size, and a page index only means something inside its own layer group. A single tensor and a single flat block list cannot describe that, so three methods have to be implemented together:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -798,7 +801,7 @@
 </table>
 </div>
 <p>Implementing the per-layer-group form of a pair is enough — the flat method it replaces does not also have to be defined.</p>
-<p>All three are checked during executor bring-up, before any request is admitted. <code class="docutils literal notranslate"><span class="pre">register_kv_cache_layout</span></code> refuses there, naming the group and region counts it could not describe, and the two scheduler methods are checked alongside it. Nothing is deferred to the first request, so a partial implementation costs a start-up failure rather than one after the model is loaded.</p>
+<p>The executor checks that both per-layer-group scheduler callbacks are implemented during bring-up for a multi-group cache. The worker then receives the layout through <code class="docutils literal notranslate"><span class="pre">register_kv_cache_layout</span></code>; its default implementation rejects multiple groups if only flat registration is implemented.</p>
 <p><code class="docutils literal notranslate"><span class="pre">examples/llm-api/llm_kv_cache_connector_vswa.py</span></code> is a worked connector for this case. A VSWA connector has to do five things:</p>
 <ol class="arabic simple">
 <li><p><strong>Address pages per group.</strong> <code class="docutils literal notranslate"><span class="pre">layout.groups[g].regions[r]</span></code> gives the byte ranges; <code class="docutils literal notranslate"><span class="pre">region.slot_tensor(i)</span></code> is page slot <code class="docutils literal notranslate"><span class="pre">i</span></code> <em>of that group</em>. <code class="docutils literal notranslate"><span class="pre">layout.group_of_layer(layer_id)</span></code> maps a model layer back to its group, which is what the per-layer <code class="docutils literal notranslate"><span class="pre">wait_for_layer_load</span></code> / <code class="docutils literal notranslate"><span class="pre">save_kv_layer</span></code> hooks need.</p></li>
@@ -989,13 +992,13 @@ the same page-list shrink happens there.</p>
 <td><p>No block-hash accessor exists on this path. Nothing in the runtime reads the field, and neither example connector uses it — both hash the token sequence themselves. A connector that keys its external store on <code class="docutils literal notranslate"><span class="pre">block_hashes</span></code> gets no key and therefore no hits and no saves; it does not mis-address a transfer.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">priorities</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">KvCacheRetentionConfig</span></code> is not honoured, so every page carries the default priority. A warning is logged the first time a request carrying a retention config is reported. The gap is wider than the connector: the retention config has no effect either way in that configuration.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code> when the request has no explicit <code class="docutils literal notranslate"><span class="pre">KvCacheRetentionConfig</span></code></p></td>
+<td><p>Priority metadata is omitted; this does not imply that reused pages have default priority. For a single-group V2 cache, requests with an explicit retention config report native page priorities aligned with <code class="docutils literal notranslate"><span class="pre">new_block_ids</span></code>. Multi-group retention requests are rejected as described above.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>Both are gaps to be closed rather than intended behaviour.</p>
+<p>The missing V2 block hashes remain a gap. Omitting priority metadata for requests without an explicit retention config is intentional.</p>
 </section>
 <section id="blocks-with-no-page">
 <h5>Blocks with no page<a class="headerlink" href="#blocks-with-no-page" title="Link to this heading">#</a></h5>
@@ -1319,7 +1322,7 @@ says only what the engine then does with the pool.</p>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">capacity</span></code></p></td>
 <td><p>no</p></td>
 <td><p>no</p></td>
-<td><p>A generation server: it lends memory and moves no KV</p></td>
+<td><p>A generation server: it lends memory and needs no GPUDirect RDMA</p></td>
 </tr>
 </tbody>
 </table>
@@ -1372,12 +1375,63 @@ sliding-window attention, and <code class="docutils literal notranslate"><span c
 <code class="docutils literal notranslate"><span class="pre">sparse_disable_index_value=True</span></code>; it bypasses individual requests that carry a LoRA adapter or
 multimodal content without hashes, leaving the rest of the deployment served.</p>
 </section>
-<section id="how-pages-reach-the-pool">
-<h3>How pages reach the pool<a class="headerlink" href="#how-pages-reach-the-pool" title="Link to this heading">#</a></h3>
-<p>Every page passes through a pinned host buffer. <code class="docutils literal notranslate"><span class="pre">stage_through_host</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">true</span></code> and is the
-only supported value today, so <code class="docutils literal notranslate"><span class="pre">false</span></code> is ignored with a warning; registering the KV pools with
-Mooncake instead is planned for a later release. Staging costs a copy each way and needs no
-GPUDirect RDMA. A <code class="docutils literal notranslate"><span class="pre">capacity</span></code> server stages nothing, holding no KV in the pool.</p>
+<section id="gpudirect-rdma">
+<h3>GPUDirect RDMA<a class="headerlink" href="#gpudirect-rdma" title="Link to this heading">#</a></h3>
+<p>By default the connector registers the KV pools with Mooncake so the NIC reads and writes pages in
+GPU memory directly. A KV cache manager V2 pool is many <code class="docutils literal notranslate"><span class="pre">cuMemCreate</span></code> allocations mapped back to back,
+and no registration may cross two of them, so the connector registers one allocation at a time.
+Which registration path Mooncake then takes is decided by <code class="docutils literal notranslate"><span class="pre">WITH_NVIDIA_PEERMEM</span></code>, and each path has
+its own preconditions:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">WITH_NVIDIA_PEERMEM</span></code></p></th>
+<th class="head"><p>Mooncake calls</p></th>
+<th class="head"><p>Requires</p></th>
+<th class="head"><p>Typical failure</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>unset or nonzero (default)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ibv_reg_mr</span></code></p></td>
+<td><p>the <code class="docutils literal notranslate"><span class="pre">nvidia_peermem</span></code> kernel module, and KV pools allocated with <code class="docutils literal notranslate"><span class="pre">gpuDirectRDMACapable=1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EFAULT</span></code> (“Bad address”)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ibv_reg_dmabuf_mr</span></code></p></td>
+<td><p>dma-buf support in the driver and NIC stack</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EINVAL</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Under <code class="docutils literal notranslate"><span class="pre">ibv_reg_mr</span></code>, a missing module and memory without <code class="docutils literal notranslate"><span class="pre">gpuDirectRDMACapable</span></code> both fail with the
+same <code class="docutils literal notranslate"><span class="pre">EFAULT</span></code> as a range crossing two allocations, so the error code alone does not say which. The
+cache manager asks for <code class="docutils literal notranslate"><span class="pre">gpuDirectRDMACapable</span></code> and logs a warning when the platform refuses it and it
+falls back to memory without it; <code class="docutils literal notranslate"><span class="pre">nvidia_peermem</span></code> cannot register such memory, while dma-buf can.</p>
+<p>Hosts with the open kernel modules and no <code class="docutils literal notranslate"><span class="pre">nvidia_peermem</span></code>, common on GB200 and GB300, need the
+dma-buf path. When the protocol is <code class="docutils literal notranslate"><span class="pre">rdma</span></code>, <code class="docutils literal notranslate"><span class="pre">WITH_NVIDIA_PEERMEM</span></code> is unset, neither <code class="docutils literal notranslate"><span class="pre">nvidia_peermem</span></code>
+nor the legacy <code class="docutils literal notranslate"><span class="pre">nv_peer_mem</span></code> module is loaded, and every visible device reports dma-buf support, the
+connector sets <code class="docutils literal notranslate"><span class="pre">WITH_NVIDIA_PEERMEM=0</span></code> itself and logs a warning saying so. A value the deployment
+sets is never overridden.</p>
+<p>Mooncake reads <code class="docutils literal notranslate"><span class="pre">WITH_NVIDIA_PEERMEM</span></code> once per process, when the first Mooncake client starts, so the
+connector only chooses for that first client. A later client that registers the KV pools over RDMA
+fails at startup when the path Mooncake already read is not the one it needs, for example after a
+TCP client started first on a host without <code class="docutils literal notranslate"><span class="pre">nvidia_peermem</span></code>. In a process that starts more than one
+Mooncake client, export the variable before the first one.</p>
+<p>A failed registration fails startup with a report of what the driver says about each range. At
+debug log level (<code class="docutils literal notranslate"><span class="pre">TLLM_LOG_LEVEL=debug</span></code>) the same report is logged before registering.</p>
+<p>The pools are registered once, at startup, and stay registered until shutdown. That is only valid
+while the memory behind them stays mapped, which is why <code class="docutils literal notranslate"><span class="pre">enable_kv_pool_rebalance</span></code> is
+<a class="reference internal" href="#kv-cache-tiers-are-gpu-only-under-a-connector">ignored under a connector</a>: a rebalance remaps
+pool memory, and every range would have to be unregistered before it is unmapped and registered
+again afterwards.</p>
+</section>
+<section id="without-gpudirect-rdma">
+<h3>Without GPUDirect RDMA<a class="headerlink" href="#without-gpudirect-rdma" title="Link to this heading">#</a></h3>
+<p>A host without <code class="docutils literal notranslate"><span class="pre">nvidia_peermem</span></code> usually needs only <code class="docutils literal notranslate"><span class="pre">WITH_NVIDIA_PEERMEM=0</span></code>, which the connector
+selects on its own where it can. When neither path is available, set <code class="docutils literal notranslate"><span class="pre">stage_through_host:</span> <span class="pre">true</span></code> to
+copy pages through a pinned host buffer instead, at the cost of a copy each way. A <code class="docutils literal notranslate"><span class="pre">capacity</span></code> server
+needs neither, since it registers no pages.</p>
 </section>
 </section>
 </section>
@@ -1466,7 +1520,8 @@ GPUDirect RDMA. A <code class="docutils literal notranslate"><span class="pre">c
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#roles">Roles</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#settings-this-connector-overrides">Settings this connector overrides</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#restrictions">Restrictions</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-pages-reach-the-pool">How pages reach the pool</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#gpudirect-rdma">GPUDirect RDMA</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#without-gpudirect-rdma">Without GPUDirect RDMA</a></li>
 </ul>
 </li>
 </ul>
@@ -1560,9 +1615,9 @@ GPUDirect RDMA. A <code class="docutils literal notranslate"><span class="pre">c
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -888,8 +889,7 @@ the sampling parameters and the random seed and offset per row. A seeded request
 therefore depends only on its own seed and how far it has decoded, not on where it sits in the
 batch. The sampled tokens can still differ across batch sizes, because the kernel picks its
 algorithm by the number of rows. The kernel computes the complete set of token sampling
-probabilities (after top-k / top-p masking etc.) only when the user requests them or speculative
-decoding (rejection sampling) requires them.</p>
+probabilities (after top-k / top-p masking etc.) only when the user requests them.</p>
 <p>Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised
 of requests with very heterogeneous sampling strategies (e.g. a mix of requests using greedy and top-p-after-top-k sampling).</p>
@@ -1044,7 +1044,7 @@ schema rather than silently reinterpreted.</p>
 <p>Logits processors allow you to modify the logits produced by the network before sampling, enabling custom generation behavior and constraints.</p>
 <p>To use a custom logits processor:</p>
 <ol class="arabic simple">
-<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
+<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
 <li><p>Pass an instance of this class to the <code class="docutils literal notranslate"><span class="pre">logits_processor</span></code> parameter of <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></p></li>
 </ol>
 <p>The following example demonstrates logits processing:</p>
@@ -1072,7 +1072,7 @@ schema rather than silently reinterpreted.</p>
 <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">"Hello, my name is"</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/llm-api/llm_logits_processor.py">here</a>.</p>
+<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/llm-api/llm_logits_processor.py">here</a>.</p>
 </section>
 </section>
 
@@ -1228,9 +1228,9 @@ schema rather than silently reinterpreted.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

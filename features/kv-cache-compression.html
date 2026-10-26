@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -880,7 +881,7 @@ NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets <code class="docutils literal notranslate"><span class="pre">KvCacheConfig(dtype=&quot;nvfp4&quot;)</span></code> and keeps active GPU KV in
 NVFP4. See <a class="reference internal" href="quantization.html"><span class="std std-doc">Quantization</span></a> for active KV-cache quantization.</p>
 <p>For complete single-GPU and disaggregated-serving configurations, see the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>.</p>
 <section id="skipping-rope-quantization">
 <h4>Skipping RoPE Quantization<a class="headerlink" href="#skipping-rope-quantization" title="Link to this heading">#</a></h4>
 <p>In some models, part of each K vector carries positional information (RoPE).
@@ -897,7 +898,7 @@ precision, such as FP8 or BF16. The remaining values use NVFP4.</p></li>
 64 RoPE values. Set it to <code class="docutils literal notranslate"><span class="pre">0</span></code> with <code class="docutils literal notranslate"><span class="pre">skip_rope_quantization:</span> <span class="pre">false</span></code>
 for single NVFP4 throughout the row. Only <code class="docutils literal notranslate"><span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">64</span></code> are supported. Setting
 <code class="docutils literal notranslate"><span class="pre">skip_rope_quantization</span></code> to <code class="docutils literal notranslate"><span class="pre">true</span></code> preserves RoPE regardless of the residual
-option. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/nvfp4_cold_page.md">DeepSeek-V4 example</a>
+option. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/kv_cache_compression/nvfp4_cold_page.md">DeepSeek-V4 example</a>
 for the three formats.</p>
 <p>Preserving RoPE increases cold-cache storage relative to single NVFP4. These
 formats are exploratory; validate accuracy on your model and workload. Skipping
@@ -940,7 +941,7 @@ implementation runs over the compacted cache.</p>
 </pre></div>
 </div>
 <p>For calibration, configuration parameters, and current requirements, see the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>.</p>
 </section>
 </section>
 <section id="support">
@@ -1014,8 +1015,8 @@ examples for method-specific requirements.</p>
 <section id="further-reading">
 <h2>Further Reading<a class="headerlink" href="#further-reading" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 Cold-Page KV-Cache Compression example</a></p></li>
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/triattention.md">TriAttention KV-Cache Compression example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 Cold-Page KV-Cache Compression example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/kv_cache_compression/triattention.md">TriAttention KV-Cache Compression example</a></p></li>
 <li><p><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html"><span class="std std-doc">KV Cache Compression Development Guide</span></a></p></li>
 <li><p><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html"><span class="std std-doc">KVCacheManagerV2 Cold-Page Codec Design</span></a></p></li>
 <li><p><a class="reference internal" href="kvcache.html"><span class="std std-doc">KV Cache System</span></a></p></li>
@@ -1034,14 +1035,14 @@ KVCM V2, and an NVIDIA GPU with compute capability SM100, SM103, or SM107.</p>
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id2">2</a><span class="fn-bracket">]</span></span>
 <p>NVFP4 cold-page quantization additionally requires
 the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>
 for its remaining requirements and validated modes.</p>
 </aside>
 <aside class="footnote brackets" id="triattention-requirements" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">3</a><span class="fn-bracket">]</span></span>
 <p>TriAttention requires a model-specific offline
 calibration file. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>
 for its remaining requirements and validated modes.</p>
 </aside>
 <aside class="footnote brackets" id="deepseek-v4" role="doc-footnote">
@@ -1214,9 +1215,9 @@ is not used.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -701,7 +702,7 @@ limitations under the License.
 </section>
 <section id="ci-pipelines">
 <h2>CI pipelines<a class="headerlink" href="#ci-pipelines" title="Link to this heading">#</a></h2>
-<p>Pull requests do not start testing by themselves. Developers trigger the CI by commenting <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> (optionally with arguments) on the pull request (see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/.github/pull_request_template.md">Pull Request Template</a> for more details). That kicks off the <strong>merge-request pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code>), which runs unit tests and integration tests whose YAML entries specify <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code>. Once a pull request is merged, a separate <strong>post-merge pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>) runs every test marked <code class="docutils literal notranslate"><span class="pre">post_merge</span></code> across all supported GPU configurations.</p>
+<p>Pull requests do not start testing by themselves. Developers trigger the CI by commenting <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> (optionally with arguments) on the pull request (see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43/.github/pull_request_template.md">Pull Request Template</a> for more details). That kicks off the <strong>merge-request pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code>), which runs unit tests and integration tests whose YAML entries specify <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code>. Once a pull request is merged, the <strong>post-merge pipeline</strong> runs the same <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code> as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with <code class="docutils literal notranslate"><span class="pre">Post-Merge</span></code> in its name. In both pipelines, the test stages run in child jobs defined by <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>, which maps each stage name to a test-db YAML file.</p>
 <p><code class="docutils literal notranslate"><span class="pre">stage</span></code> tags live in the YAML files under <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/</span></code>. Searching those files for <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code> shows exactly which tests the merge-request pipeline covers.</p>
 </section>
 <section id="test-definitions">
@@ -722,7 +723,7 @@ limitations under the License.
 </section>
 <section id="unit-tests">
 <h2>Unit tests<a class="headerlink" href="#unit-tests" title="Link to this heading">#</a></h2>
-<p>Unit tests live under <code class="docutils literal notranslate"><span class="pre">tests/unittest/</span></code> and run during the merge-request pipeline. They are invoked from <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code> and do not require mapping to specific hardware stages.</p>
+<p>Unit tests live under <code class="docutils literal notranslate"><span class="pre">tests/unittest/</span></code>. They are listed in the same test-db YAML files as integration tests, as entries starting with <code class="docutils literal notranslate"><span class="pre">unittest/</span></code> (see the <code class="docutils literal notranslate"><span class="pre">l0_a30.yml</span></code> example above), and run in the <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code> stages mapped to those files, like any other test.</p>
 </section>
 <section id="jenkins-stage-names">
 <h2>Jenkins stage names<a class="headerlink" href="#jenkins-stage-names" title="Link to this heading">#</a></h2>
@@ -997,9 +998,9 @@ behavior.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

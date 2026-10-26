@@ -419,7 +419,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -434,7 +434,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -785,6 +785,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -1042,11 +1043,6 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">tracing</span>
 
-<span class="k">try</span><span class="p">:</span>
-    <span class="k">pass</span>
-<span class="k">except</span> <span class="ne">ModuleNotFoundError</span><span class="p">:</span>
-    <span class="k">pass</span>
-
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">nvtx_range_debug</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..disaggregated_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">DisaggregatedParams</span>
@@ -1092,9 +1088,8 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">LogProbsResult</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Optional log probability outputs computed post runtime."""</span>
+<span class="w">    </span><span class="sd">"""Optional prompt log probabilities computed post runtime."""</span>
     <span class="n">prompt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenLogprobs</span> <span class="o">|</span> <span class="n">SimpleTokenLogprobs</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">generation</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenLogprobs</span> <span class="o">|</span> <span class="n">SimpleTokenLogprobs</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_SpecDecCounters</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
@@ -1119,11 +1114,6 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_response</span> <span class="o">=</span> <span class="n">response</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">logprobs</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="o">=</span> <span class="n">request_perf_metrics</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_is_llm_response</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="n">response</span> <span class="o">=</span> <span class="nb">object</span><span class="o">.</span><span class="fm">__getattribute__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">'_response'</span><span class="p">)</span>
-        <span class="k">return</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Response</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__getattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
         <span class="n">response</span> <span class="o">=</span> <span class="nb">object</span><span class="o">.</span><span class="fm">__getattribute__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">'_response'</span><span class="p">)</span>
@@ -1408,15 +1398,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">output</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span>
         <span class="n">output</span><span class="o">.</span><span class="n">_last_token_ids_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span>
         <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
-        <span class="c1"># With n &gt; 1 each candidate is its own child request with its own</span>
-        <span class="c1"># counters, while the request-level copies on self are overwritten by</span>
-        <span class="c1"># every candidate's response. Capture this sequence's here so a choice</span>
-        <span class="c1"># never reports whichever candidate happened to respond last.</span>
-        <span class="n">output</span><span class="o">.</span><span class="n">_spec_dec_counters</span> <span class="o">=</span> <span class="n">_SpecDecCounters</span><span class="p">(</span>
-            <span class="n">per_pos_drafted</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'per_pos_drafted'</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
-            <span class="n">per_pos_accepted</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'per_pos_accepted'</span><span class="p">,</span>
-                                     <span class="kc">None</span><span class="p">),</span>
-            <span class="n">spec_dec_totals</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'spec_dec_totals'</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span>
+        <span class="n">output</span><span class="o">.</span><span class="n">_spec_dec_counters</span> <span class="o">=</span> <span class="n">_SpecDecCounters</span><span class="p">()</span>
         <span class="n">decoder_output_prefix</span> <span class="o">=</span> <span class="p">()</span>
         <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">exclude_input_from_output</span>
                 <span class="ow">or</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_streaming"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)):</span>
@@ -1437,14 +1419,10 @@ window.runMermaid = runMermaid;</script>
             <span class="n">output</span><span class="o">.</span><span class="n">cumulative_logprob</span> <span class="o">=</span> <span class="n">cum_log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
 
         <span class="c1"># prompt logprobs handling</span>
-        <span class="k">if</span> <span class="n">logprobs_result</span> <span class="ow">and</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">prompt</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>  <span class="c1"># both backends</span>
+        <span class="k">if</span> <span class="n">logprobs_result</span> <span class="ow">and</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">prompt</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">output</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="o">=</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">prompt</span>
-        <span class="c1"># generation logprobs handling (provenance varies by backend)</span>
-        <span class="k">if</span> <span class="n">logprobs_result</span> <span class="ow">and</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">generation</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>  <span class="c1"># TRT backend</span>
-            <span class="c1"># update logprobs from ResponseWrapper (TRT top logprobs WAR)</span>
-            <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">+=</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">generation</span>
-        <span class="k">elif</span> <span class="p">(</span><span class="n">log_probs</span> <span class="o">:=</span>
-              <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>  <span class="c1"># PyTorch backend</span>
+        <span class="c1"># Generation logprobs are computed by the sampler.</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">log_probs</span> <span class="o">:=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># handle logprobs directly from response tensors given by sampler</span>
             <span class="k">if</span> <span class="n">decoder_output_prefix</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">:</span>
                 <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="p">[</span>
@@ -1463,7 +1441,6 @@ window.runMermaid = runMermaid;</script>
                         <span class="bp">self</span><span class="o">.</span><span class="n">_get_decoder_output_prefix_logprobs</span><span class="p">())</span>
                 <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">+=</span> <span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
 
-            <span class="c1"># overcome some WAR in the cpp executor</span>
             <span class="k">if</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">!=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_logprobs_reported_cumulatively</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span>
                         <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">:</span>
@@ -1492,20 +1469,32 @@ window.runMermaid = runMermaid;</script>
                         <span class="sa">f</span><span class="s2">"logprobs length: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span><span class="si">}</span><span class="s2"> != "</span>
                         <span class="sa">f</span><span class="s2">"output.length: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="p">(</span><span class="n">generation_logits</span> <span class="o">:=</span>
-                <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">output</span><span class="o">.</span><span class="n">generation_logits</span> <span class="o">=</span> <span class="n">generation_logits</span><span class="p">[</span>
-                <span class="n">src_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Result</span><span class="p">):</span>
+            <span class="c1"># With n &gt; 1 each candidate is its own child request with its own</span>
+            <span class="c1"># counters, while the request-level copies on self are overwritten by</span>
+            <span class="c1"># every candidate's response. Capture this sequence's here so a choice</span>
+            <span class="c1"># never reports whichever candidate happened to respond last.</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">_spec_dec_counters</span> <span class="o">=</span> <span class="n">_SpecDecCounters</span><span class="p">(</span>
+                <span class="n">per_pos_drafted</span><span class="o">=</span><span class="n">response_tensors</span><span class="o">.</span><span class="n">per_pos_drafted</span><span class="p">,</span>
+                <span class="n">per_pos_accepted</span><span class="o">=</span><span class="n">response_tensors</span><span class="o">.</span><span class="n">per_pos_accepted</span><span class="p">,</span>
+                <span class="n">spec_dec_totals</span><span class="o">=</span><span class="n">response_tensors</span><span class="o">.</span><span class="n">spec_dec_totals</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="p">(</span><span class="n">additional_context_outputs</span> <span class="o">:=</span>
-                <span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'additional_context_outputs'</span><span class="p">,</span>
-                        <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">output</span><span class="o">.</span><span class="n">additional_context_outputs</span> <span class="o">=</span> <span class="n">additional_context_outputs</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">generation_logits</span> <span class="o">:=</span>
+                    <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">generation_logits</span> <span class="o">=</span> <span class="n">generation_logits</span><span class="p">[</span>
+                    <span class="n">src_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">]</span>
 
-        <span class="k">if</span> <span class="p">(</span><span class="n">additional_generation_outputs</span> <span class="o">:=</span>
-                <span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'additional_generation_outputs'</span><span class="p">,</span>
-                        <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">output</span><span class="o">.</span><span class="n">additional_generation_outputs</span> <span class="o">=</span> <span class="n">additional_generation_outputs</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">additional_context_outputs</span> <span class="o">:=</span>
+                    <span class="n">response_tensors</span><span class="o">.</span><span class="n">additional_context_outputs</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">additional_context_outputs</span> <span class="o">=</span> <span class="n">additional_context_outputs</span>
+
+            <span class="k">if</span> <span class="p">(</span><span class="n">additional_generation_outputs</span> <span class="o">:=</span>
+                    <span class="n">response_tensors</span><span class="o">.</span><span class="n">additional_generation_outputs</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">additional_generation_outputs</span> <span class="o">=</span> <span class="n">additional_generation_outputs</span>
+
+            <span class="k">if</span> <span class="p">(</span><span class="n">time_breakdown_metrics</span> <span class="o">:=</span>
+                    <span class="n">response_tensors</span><span class="o">.</span><span class="n">time_breakdown_metrics</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">time_breakdown_metrics</span> <span class="o">=</span> <span class="n">time_breakdown_metrics</span>
 
         <span class="c1"># when sampling_params.n &gt; 1 and is cancelled, make sure all the outputs</span>
         <span class="c1"># be marked as cancelled.</span>
@@ -1517,12 +1506,6 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">response_tensors</span><span class="o">.</span><span class="n">request_perf_metrics</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">output</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="o">=</span> <span class="n">request_perf_metrics</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_fill_spec_dec_perf_metrics</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">request_perf_metrics</span><span class="p">)</span>
-
-        <span class="c1"># Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.</span>
-        <span class="k">if</span> <span class="p">(</span><span class="n">time_breakdown_metrics</span> <span class="o">:=</span>
-                <span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'time_breakdown_metrics'</span><span class="p">,</span>
-                        <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">time_breakdown_metrics</span> <span class="o">=</span> <span class="n">time_breakdown_metrics</span>
 
         <span class="c1"># Check if this specific sequence is finished (not just if the entire request is done)</span>
         <span class="c1"># This is important for best_of &gt; n sampling where sequences finish at different times</span>
@@ -1642,6 +1625,16 @@ window.runMermaid = runMermaid;</script>
 
             <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">metrics</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">metrics</span><span class="p">)</span>
+                <span class="c1"># The postprocess worker's record carries no prompt, so it cannot</span>
+                <span class="c1"># count prompt tokens. It reports cached tokens only for a</span>
+                <span class="c1"># request's finished first candidate, which is where</span>
+                <span class="c1"># `record_stats` counts the prompt too.</span>
+                <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"prompt_token_ids"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PROMPT_CACHE_CACHED_TOKENS</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">metrics</span>
+                        <span class="ow">and</span> <span class="n">MetricNames</span><span class="o">.</span><span class="n">PROMPT_TOKENS</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span>
+                        <span class="ow">and</span> <span class="n">prompt_token_ids</span><span class="p">):</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PROMPT_TOKENS</span><span class="p">]</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span>
+                        <span class="n">prompt_token_ids</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
                 <span class="n">req_perf_metrics_dict</span> <span class="o">=</span> <span class="n">_build_perf_metrics_dict</span><span class="p">(</span>
@@ -1754,7 +1747,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="o">.</span><span class="n">first_gen_logits</span> <span class="o">=</span> \
                         <span class="n">first_gen_logits</span>
 
-            <span class="k">if</span> <span class="p">(</span><span class="n">context_logits</span> <span class="o">:=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_logits</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Result</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span>
+                    <span class="n">context_logits</span> <span class="o">:=</span>
+                    <span class="n">response_result</span><span class="o">.</span><span class="n">context_logits</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span> <span class="o">=</span> <span class="n">context_logits</span>
 
             <span class="k">if</span> <span class="p">(</span><span class="n">mm_embedding_handles</span> <span class="o">:=</span>
@@ -2188,9 +2183,6 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_logprob_params"</span><span class="p">):</span>
             <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_logprob_params</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_handle_ray_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">response</span>
-
     <span class="k">def</span><span class="w"> </span><span class="nf">_result_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="c1"># Honor `timeout`: a bounded `queue.get()` lets the caller regain control if the executor</span>
         <span class="c1"># worker dies silently without pushing a terminal response, instead of blocking potentially</span>
@@ -2370,33 +2362,16 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">StopAsyncIteration</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">compute_logprobs</span><span class="p">(</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">compute_prompt_logprobs</span><span class="p">(</span>
     <span class="n">k_prompt_logprobs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">k_logprobs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">context_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
-    <span class="n">generation_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
-    <span class="n">output_token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
     <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">simple_prompt_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-    <span class="n">simple_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LogProbsResult</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Compute top-K logprobs from logits when engine doesn't provide them directly.</span>
+<span class="w">    </span><span class="sd">"""Compute prompt token logprobs from context logits.</span>
 
-<span class="sd">    Used for post-processing logits into logprobs.</span>
-<span class="sd">    - Prompt logprobs (from context_logits): always used.</span>
-<span class="sd">    - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).</span>
-<span class="sd">    - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.</span>
-
-<span class="sd">    When `simple_prompt_logprobs` / `simple_logprobs` is True and the corresponding</span>
-<span class="sd">    `k_*` is 0, the result is a flat ``SimpleTokenLogprobs`` (``list[float]``,</span>
-<span class="sd">    one logprob per token) instead of ``TokenLogprobs``. This avoids the</span>
-<span class="sd">    per-token dict allocation overhead when only the sampled-token logprob is</span>
-<span class="sd">    needed.</span>
-
-<span class="sd">    Returns:</span>
-<span class="sd">        LogProbsResult, a NamedTuple containing:</span>
-<span class="sd">            - prompt: Optional[TokenLogprobs | SimpleTokenLogprobs] logprobs for prompt tokens.</span>
-<span class="sd">            - generation: Optional[TokenLogprobs | SimpleTokenLogprobs] logprobs for generated tokens.</span>
+<span class="sd">    When ``simple_prompt_logprobs`` is True and ``k_prompt_logprobs`` is 0,</span>
+<span class="sd">    return a flat list of sampled-token logprobs instead of per-token dicts.</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_topk_logprobs</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">top_k</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -2407,8 +2382,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">logits</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">):</span>
-            <span class="c1"># WAR for nvbug 5324291 where TRT backend might return more logits</span>
-            <span class="c1"># than output tokens.</span>
+            <span class="c1"># Only consume logits corresponding to the supplied tokens.</span>
             <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:</span><span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">)]</span>
 
         <span class="n">logprobs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">logits</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
@@ -2461,12 +2435,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">context_logits</span><span class="p">,</span> <span class="n">k_prompt_logprobs</span><span class="p">,</span> <span class="n">prompt_token_ids</span><span class="p">,</span>
         <span class="n">simple_prompt_logprobs</span>
     <span class="p">)</span> <span class="k">if</span> <span class="n">k_prompt_logprobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">context_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
-    <span class="n">generation_logprobs</span> <span class="o">=</span> <span class="n">_topk_logprobs</span><span class="p">(</span>
-        <span class="n">generation_logits</span><span class="p">,</span> <span class="n">k_logprobs</span><span class="p">,</span> <span class="n">output_token_ids</span><span class="p">,</span> <span class="n">simple_logprobs</span>
-    <span class="p">)</span> <span class="k">if</span> <span class="n">k_logprobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
-
-    <span class="k">return</span> <span class="n">LogProbsResult</span><span class="p">(</span><span class="n">prompt</span><span class="o">=</span><span class="n">prompt_logprobs</span><span class="p">,</span>
-                          <span class="n">generation</span><span class="o">=</span><span class="n">generation_logprobs</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">LogProbsResult</span><span class="p">(</span><span class="n">prompt</span><span class="o">=</span><span class="n">prompt_logprobs</span><span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_build_perf_metrics_dict</span><span class="p">(</span>
@@ -2611,9 +2580,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       

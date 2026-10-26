@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc1" />
+  <meta name="docsearch:version" content="1.4.0rc2" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -434,6 +434,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
@@ -954,7 +955,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>Qwen-Image-Layered</strong></p></td>
+<tr class="row-odd"><td><p><strong>Qwen-Image-Layered</strong> <a href="#id2"><span class="problematic" id="id1">[^6]</span></a></p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -978,7 +979,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1286,7 +1287,7 @@ for a Wan 2.2 VAE NVFP4 calibration and checkpoint-generation recipe.</p>
 </pre></div>
 </div>
 <p>The loader accepts safetensors adapters that use Comfy/Kohya-style <code class="docutils literal notranslate"><span class="pre">lora_down</span></code> / <code class="docutils literal notranslate"><span class="pre">lora_up</span></code> keys or PEFT-style <code class="docutils literal notranslate"><span class="pre">lora_A</span></code> / <code class="docutils literal notranslate"><span class="pre">lora_B</span></code> keys. It applies <code class="docutils literal notranslate"><span class="pre">.alpha</span></code> tensors when present, and reads <code class="docutils literal notranslate"><span class="pre">lora_alpha</span></code> from a colocated <code class="docutils literal notranslate"><span class="pre">adapter_config.json</span></code> for PEFT adapters. <code class="docutils literal notranslate"><span class="pre">scale</span></code> multiplies the resulting alpha/rank factor.</p>
-<p>By default, <code class="docutils literal notranslate"><span class="pre">strict=True</span></code> raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set <code class="docutils literal notranslate"><span class="pre">target_components</span></code> explicitly for pipelines with multiple transformer components. Runtime LoRA is not supported with VisualGen weight quantization, and startup fusion does not support per-request adapter switching.</p>
+<p>By default, <code class="docutils literal notranslate"><span class="pre">strict=True</span></code> raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set <code class="docutils literal notranslate"><span class="pre">target_components</span></code> explicitly for pipelines with multiple transformer components. Runtime LoRA cannot target a transformer component with weight quantization enabled, and startup fusion does not support per-request adapter switching.</p>
 </section>
 <section id="quantized-attention">
 <h3>Quantized Attention<a class="headerlink" href="#quantized-attention" title="Link to this heading">#</a></h3>
@@ -1457,7 +1458,7 @@ for a Wan 2.2 VAE NVFP4 calibration and checkpoint-generation recipe.</p>
 <li><p><strong>CFG Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2</span></code>): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.</p></li>
 <li><p><strong>Ulysses Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">ulysses_size:</span> <span class="pre">N</span></code>): Splits the sequence dimension across GPUs for longer sequences.</p>
 <ul>
-<li><p><strong>Async Ulysses A2A pipeline</strong> (<code class="docutils literal notranslate"><span class="pre">async_ulysses:</span> <span class="pre">true</span></code> in <code class="docutils literal notranslate"><span class="pre">parallel_config</span></code>): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires <code class="docutils literal notranslate"><span class="pre">ulysses_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> and an NVLink-connected GPU domain (uses PyTorch <code class="docutils literal notranslate"><span class="pre">_SymmetricMemory</span></code> with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.</p></li>
+<li><p><strong>Async Ulysses A2A pipeline</strong> (<code class="docutils literal notranslate"><span class="pre">async_ulysses:</span> <span class="pre">true</span></code> in <code class="docutils literal notranslate"><span class="pre">parallel_config</span></code>): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires <code class="docutils literal notranslate"><span class="pre">ulysses_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> and an NVLink-connected GPU domain (uses PyTorch <code class="docutils literal notranslate"><span class="pre">_SymmetricMemory</span></code> with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN, LTX-2 and MiniMax-H3 self-attention. MiniMax-H3 async is validated in BF16 only; FP8/NVFP4 combinations remain unvalidated.</p></li>
 </ul>
 </li>
 <li><p><strong>Parallel VAE</strong> (<code class="docutils literal notranslate"><span class="pre">parallel_vae_size:</span> <span class="pre">N</span></code>): Parallelizes the final VAE decode (constraint: <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span> <span class="pre">≤</span> <span class="pre">world_size</span></code>). WAN/Cosmos3 shard along a spatial axis; LTX-2 and MiniMax-H3 distribute independent tiles.</p></li>
@@ -1794,9 +1795,9 @@ unvalidated. The checkpoint-backed regression is
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2026.</p>
+  <p>Last updated on October 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b96ba43">b96ba43</a>.</p>
   
 </div></div>
       
