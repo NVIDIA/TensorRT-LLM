@@ -1059,14 +1059,20 @@ class DriverConformance:
         if driver is None:
             pytest.skip("this driver cannot stage a store that raises mid-operation")
         with self.harness(driver) as h:
-            h.needs(put=True, get=True)
-            writer = h.endpoint(["A"])
-            writer.fill_row(0, b"aaaaaaaa")
-            reader = h.endpoint(["A"], fill=0x2D)
-            for direction, start, rows in (
-                ("put", h.put, writer.rows()),
-                ("get", h.get, reader.rows()),
-            ):
+            # Each declared direction is checked on its own: a get of an unpublished key still
+            # reaches the store, so a get-only driver is checked through its get alone.
+            capabilities = h.driver.capabilities
+            if not (capabilities.put or capabilities.get):
+                pytest.skip("this driver declares neither put nor get")
+            cases = []
+            if capabilities.put:
+                writer = h.endpoint(["A"])
+                writer.fill_row(0, b"aaaaaaaa")
+                cases.append(("put", h.put, writer.rows()))
+            if capabilities.get:
+                reader = h.endpoint(["A"], fill=0x2D)
+                cases.append(("get", h.get, reader.rows()))
+            for direction, start, rows in cases:
                 try:
                     op = start(rows)
                 except Exception as error:  # noqa: BLE001 - the check is that nothing escapes

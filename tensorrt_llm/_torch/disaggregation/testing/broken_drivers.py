@@ -514,6 +514,9 @@ LIMITED = DriverCapabilities(
 GET_ONLY = DriverCapabilities(
     get=True, put=False, cancel=True, probe=True, max_rows_per_op=None, absent_is_miss=True
 )
+PUT_ONLY = DriverCapabilities(
+    get=False, put=True, cancel=True, probe=True, max_rows_per_op=None, absent_is_miss=True
+)
 HOST_ONLY = DriverCapabilities(
     get=True,
     put=True,
@@ -663,7 +666,7 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
     ),
     "a recorded operation never raises": (
         LetsRaisesEscape,
-        DEFAULT_CAPABILITIES,
+        PUT_ONLY,  # a one-direction driver: the check must run, not skip
         "test_a_raise_after_the_operation_is_recorded_becomes_a_row_fault",
     ),
     "drain returns at once on an unprovable operation": (
@@ -748,7 +751,7 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
     ),
     "a recorded get never raises": (
         GetLetsACrashEscape,
-        DEFAULT_CAPABILITIES,
+        GET_ONLY,  # a one-direction driver: the check must run, not skip
         "test_a_raise_after_the_operation_is_recorded_becomes_a_row_fault",
     ),
 }
