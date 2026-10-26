@@ -277,7 +277,7 @@ def test_minimax_m3_fp8_indexer_ignores_a_padded_slot_tail(
     _assert_all_zero(cache[:, 0][~written])
 
 
-@pytest.mark.parametrize("num_tokens", [16, 300])
+@pytest.mark.parametrize("num_tokens", [16, 300, 600])
 def test_minimax_m3_fp8_indexer_stores_bit_exact_nvfp4_index_k(num_tokens: int) -> None:
     """An NVFP4-E cache receives the reference quantization of K; Q is unchanged.
 
@@ -288,7 +288,7 @@ def test_minimax_m3_fp8_indexer_stores_bit_exact_nvfp4_index_k(num_tokens: int) 
     """
     torch.manual_seed(3579)
     num_heads_q = 4
-    num_pages = 4
+    num_pages = 6
     bound = torch.tensor([0, 1, 2, 4, 15, 15, 64, 255], device="cuda").repeat_interleave(16)
     noise = torch.rand(num_tokens, num_heads_q + 1, 128, device="cuda") * 2 - 1
     qk = (noise * bound).round().to(torch.bfloat16).flatten(1)

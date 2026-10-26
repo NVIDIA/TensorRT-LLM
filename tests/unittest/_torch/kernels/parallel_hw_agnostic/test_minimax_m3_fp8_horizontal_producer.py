@@ -385,7 +385,7 @@ def test_minimax_m3_horizontal_producer_ignores_out_of_range_cache_slot():
     assert torch.equal(index_cache.view(torch.uint8), index_before.view(torch.uint8))
 
 
-@pytest.mark.parametrize("num_tokens", [16, 300])
+@pytest.mark.parametrize("num_tokens", [16, 300, 600])
 def test_minimax_m3_horizontal_producer_stores_bit_exact_nvfp4_index_k(num_tokens):
     """NVFP4-E index-K gets the reference bytes; other outputs match the E4M3 index-K launch.
 
@@ -395,7 +395,7 @@ def test_minimax_m3_horizontal_producer_stores_bit_exact_nvfp4_index_k(num_token
     loudest one, so the stored scales reach both clamps.
     """
     torch.manual_seed(2468)
-    num_heads_q, num_kv_heads, num_pages = 8, 2, 4
+    num_heads_q, num_kv_heads, num_pages = 8, 2, 6
     total_heads = num_heads_q + 3 * num_kv_heads + 1
     bound = torch.tensor([0, 1, 2, 4, 15, 15, 64, 255], device="cuda").repeat_interleave(16)
     noise = torch.rand(num_tokens, total_heads, 128, device="cuda") * 2 - 1

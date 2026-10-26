@@ -568,8 +568,8 @@ __global__ void minimaxM3Fp8QKNormRopeKVInsertKernel(__nv_bfloat16 const* qkvInp
 // Horizontal sparse producer for a packed [Q|K|V|index-Q|index-K] row.
 // One warp owns one (token, head slot). All four norm/RoPE branches share the
 // model's precomputed FP32 RoPE table, eliminating per-head powf/sincos work.
-// kNvfp4EIndexK stores index-K as NVFP4-E pages instead of FP8 HND pages.
-template <bool kNvfp4EIndexK>
+// kNvfp4EIndexK stores index-K as NVFP4-E pages instead of FP8 HND pages, with kIndexKWarps warps per token.
+template <bool kNvfp4EIndexK, int kIndexKWarps>
 __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const* packedInput, __nv_fp8_e4m3* qOutput,
     __nv_fp8_e4m3* indexQOutput, __nv_fp8_e4m3* kvCache, __nv_fp8_e4m3* indexKCache, int const* outCacheLoc,
     int64_t kvPageStride, int64_t kvPlaneStride, int64_t kvHeadStride, int64_t kvTokenStride, int64_t indexPageStride,
@@ -581,9 +581,11 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     int const warpId = threadIdx.x / 32;
     int const laneId = threadIdx.x % 32;
     int const globalWarp = blockIdx.x * warpsPerBlock + warpId;
+    // NVFP4-E index-K may take kIndexKWarps warps per token, all reading the index-K head.
     int const totalHeads = numHeadsQ + 2 * numHeadsKV + numHeadsIndex + 1;
-    int const tokenIdx = globalWarp / totalHeads;
-    int const localHead = globalWarp % totalHeads;
+    int const warpsPerToken = totalHeads + kIndexKWarps - 1;
+    int const tokenIdx = globalWarp / warpsPerToken;
+    int const localWarp = globalWarp % warpsPerToken;
     if (tokenIdx >= numTokens)
     {
         return;
@@ -593,6 +595,7 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     int const vBegin = kBegin + numHeadsKV;
     int const indexQBegin = vBegin + numHeadsKV;
     int const indexKHead = indexQBegin + numHeadsIndex;
+    int const localHead = kIndexKWarps > 1 ? min(localWarp, indexKHead) : localWarp;
     bool const isQ = localHead < kBegin;
     bool const isK = localHead >= kBegin && localHead < vBegin;
     bool const isV = localHead >= vBegin && localHead < indexQBegin;
@@ -698,9 +701,16 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     {
         if constexpr (kNvfp4EIndexK)
         {
-            minimaxM3StoreNvfp4EIndexK(elements,
-                reinterpret_cast<uint8_t*>(indexKCache) + static_cast<int64_t>(page) * indexPageStride, withinPage,
-                laneId);
+            uint8_t* const pageBase
+                = reinterpret_cast<uint8_t*>(indexKCache) + static_cast<int64_t>(page) * indexPageStride;
+            if constexpr (kIndexKWarps == 1)
+            {
+                minimaxM3StoreNvfp4EIndexK(elements, pageBase, withinPage, laneId);
+            }
+            else
+            {
+                minimaxM3StoreNvfp4EIndexKQuarter(elements, pageBase, withinPage, laneId, localWarp - indexKHead);
+            }
         }
         else
         {
@@ -725,7 +735,7 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
 // four-lane SF16 groups, and written directly to the packed-data and scale
 // pools.  K scales are token-major; V scales use the runtime's 4x4 token-quad
 // swizzle.
-template <bool kNvfp4EIndexK>
+template <bool kNvfp4EIndexK, int kIndexKWarps>
 __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const* packedInput, __nv_fp8_e4m3* qOutput,
     __nv_fp8_e4m3* indexQOutput, uint8_t* kvDataCache, uint8_t* kvScaleCache, __nv_fp8_e4m3* indexKCache,
     int const* outCacheLoc, float const* kvQuantScale, int64_t dataPageStride, int64_t dataPlaneStride,
@@ -739,9 +749,11 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
     int const warpId = threadIdx.x / 32;
     int const laneId = threadIdx.x % 32;
     int const globalWarp = blockIdx.x * warpsPerBlock + warpId;
+    // NVFP4-E index-K may take kIndexKWarps warps per token, all reading the index-K head.
     int const totalHeads = numHeadsQ + 2 * numHeadsKV + numHeadsIndex + 1;
-    int const tokenIdx = globalWarp / totalHeads;
-    int const localHead = globalWarp % totalHeads;
+    int const warpsPerToken = totalHeads + kIndexKWarps - 1;
+    int const tokenIdx = globalWarp / warpsPerToken;
+    int const localWarp = globalWarp % warpsPerToken;
     if (tokenIdx >= numTokens)
     {
         return;
@@ -751,6 +763,7 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
     int const vBegin = kBegin + numHeadsKV;
     int const indexQBegin = vBegin + numHeadsKV;
     int const indexKHead = indexQBegin + numHeadsIndex;
+    int const localHead = kIndexKWarps > 1 ? min(localWarp, indexKHead) : localWarp;
     bool const isQ = localHead < kBegin;
     bool const isK = localHead >= kBegin && localHead < vBegin;
     bool const isV = localHead >= vBegin && localHead < indexQBegin;
@@ -852,9 +865,16 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
     {
         if constexpr (kNvfp4EIndexK)
         {
-            minimaxM3StoreNvfp4EIndexK(elements,
-                reinterpret_cast<uint8_t*>(indexKCache) + static_cast<int64_t>(page) * indexPageStride, withinPage,
-                laneId);
+            uint8_t* const pageBase
+                = reinterpret_cast<uint8_t*>(indexKCache) + static_cast<int64_t>(page) * indexPageStride;
+            if constexpr (kIndexKWarps == 1)
+            {
+                minimaxM3StoreNvfp4EIndexK(elements, pageBase, withinPage, laneId);
+            }
+            else
+            {
+                minimaxM3StoreNvfp4EIndexKQuarter(elements, pageBase, withinPage, laneId, localWarp - indexKHead);
+            }
         }
         else
         {
@@ -1036,11 +1056,14 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
-    int const slotsPerToken = num_heads_q + 2 * num_heads_kv + num_heads_index + 1;
+    bool const splitIndexK = index_k_nvfp4 && num_tokens <= kMinimaxM3Nvfp4EIndexKSplitMaxTokens;
+    int const slotsPerToken
+        = num_heads_q + 2 * num_heads_kv + num_heads_index + (splitIndexK ? kMinimaxM3Nvfp4EIndexKWarps : 1);
     int const totalWarps = num_tokens * slotsPerToken;
     int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
-    auto* const kernel = index_k_nvfp4 ? &minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<true>
-                                       : &minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<false>;
+    auto* const kernel = !index_k_nvfp4 ? &minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<false, 1>
+        : splitIndexK ? &minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<true, kMinimaxM3Nvfp4EIndexKWarps>
+                      : &minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<true, 1>;
     common::launchWithPdlWhenEnabled("minimaxM3Fp8QKVIndexerNormRopeKVInsert", kernel, gridSize, kBlockSize, 0, stream,
         static_cast<__nv_bfloat16 const*>(packed_input), static_cast<__nv_fp8_e4m3*>(q_output),
         static_cast<__nv_fp8_e4m3*>(index_q_output), static_cast<__nv_fp8_e4m3*>(kv_cache),
@@ -1072,7 +1095,9 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
-    int const slotsPerToken = num_heads_q + 2 * num_heads_kv + num_heads_index + 1;
+    bool const splitIndexK = index_k_nvfp4 && num_tokens <= kMinimaxM3Nvfp4EIndexKSplitMaxTokens;
+    int const slotsPerToken
+        = num_heads_q + 2 * num_heads_kv + num_heads_index + (splitIndexK ? kMinimaxM3Nvfp4EIndexKWarps : 1);
     int const totalWarps = num_tokens * slotsPerToken;
     int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
     cudaLaunchConfig_t config{};
@@ -1085,8 +1110,9 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
     attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    auto* const kernel = index_k_nvfp4 ? &minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel<true>
-                                       : &minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel<false>;
+    auto* const kernel = !index_k_nvfp4 ? &minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel<false, 1>
+        : splitIndexK ? &minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel<true, kMinimaxM3Nvfp4EIndexKWarps>
+                      : &minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel<true, 1>;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, static_cast<__nv_bfloat16 const*>(packed_input),
         static_cast<__nv_fp8_e4m3*>(q_output), static_cast<__nv_fp8_e4m3*>(index_q_output),
         static_cast<uint8_t*>(kv_data_cache), static_cast<uint8_t*>(kv_scale_cache),
