@@ -31,7 +31,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs, _make_single_token_context_graph_batch)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
-    DecoderInputBuffers, DecoderInputPreparer,
+    DecoderInputBuffers, DecoderInputPreparer, HostInputs,
     _get_context_prompt_lookahead_token, _zero_fill_row_spans)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import \
     DecoderMetadata
@@ -1893,6 +1893,67 @@ class DecoderForwardTestCase(unittest.TestCase):
                                    expected,
                                    atol=0,
                                    rtol=0)
+
+    def test_mrope_multi_beam_generation_positions(self) -> None:
+        """Every beam row gets its request's `past + delta` on all 3 axes."""
+        beam_width = 2
+        engine, kv_cache_manager = create_model_engine_and_kvcache(
+            llm_args=TorchLlmArgs(model="dummy",
+                                  max_batch_size=4,
+                                  max_num_tokens=64,
+                                  max_beam_width=beam_width),
+            model=DummyModel(torch.half, rope_scaling={"type": "mrope"}))
+        self.addCleanup(kv_cache_manager.shutdown)
+        preparer = engine._runner._inputs
+        # (num_tokens, delta): one delta arrives on the host and one is
+        # already a CUDA int32 scalar.
+        cases = ((4, torch.tensor([[10]], dtype=torch.int32)),
+                 (7, torch.tensor([[-3]], dtype=torch.int32, device="cuda")))
+        requests = []
+        for seq_slot, (num_tokens, delta) in enumerate(cases):
+            request = LlmRequest(
+                request_id=seq_slot + 1,
+                max_new_tokens=1,
+                input_tokens=list(range(1, num_tokens + 1)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    SamplingParams(
+                        n=beam_width,
+                        use_beam_search=True)._get_sampling_config()),
+                is_streaming=False)
+            request.py_seq_slot = seq_slot
+            request.py_multimodal_data = {
+                "mrope_config": {
+                    "mrope_position_deltas": delta
+                }
+            }
+            requests.append(request)
+        host = HostInputs(use_mrope=True,
+                          mrope_dummy_seq_slot=engine.max_num_tokens,
+                          extra_inputs=preparer._new_extra_inputs(),
+                          context_prompt_lookahead=None)
+        host.lists.generation_requests.extend(requests)
+
+        preparer._pack_generation_requests(host, frozenset(), None)
+        host.total_num_tokens = len(host.lists.position_ids)
+        preparer._copy_position_ids_to_device(host)
+
+        # Both deltas take the batched scalar path, one row per beam.
+        self.assertEqual(
+            [row for row, _, _ in host.lists.generation_mrope_positions],
+            [0, 1, 2, 3])
+        self.assertEqual(host.lists.mrope_position_ids, [])
+        # Without a previous tensor the past length is num_tokens - 1.
+        expected_row = [
+            num_tokens - 1 + int(delta) for num_tokens, delta in cases
+            for _ in range(beam_width)
+        ]
+        self.assertEqual(expected_row, [13, 13, 3, 3])
+        torch.testing.assert_close(
+            preparer._buffers.mrope_position_ids_cuda[:, :, :4],
+            torch.tensor([[expected_row]] * 3, dtype=torch.int32,
+                         device="cuda"),
+            atol=0,
+            rtol=0)
 
     def test_mrope_all_text_only_drops_deltas(self) -> None:
         """A generation batch with no MRoPE metadata at all emits no delta
