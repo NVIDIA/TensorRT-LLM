@@ -29,12 +29,15 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import MoEActivation, SwigluActivation, activation_constant_names
+from .cutedsl import (
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
 from .cutlass import CUTLASS_LEAVES
-from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE
-from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
-from .fused_moe_densegemm import TrtllmCutedslDenseGemmNvfp4Impl
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase
@@ -45,6 +48,7 @@ from .impl_contract import (
     MoERejection,
     MoERejectReason,
     MoEResolutionReport,
+    activation_rejection_detail,
     canonical_activation,
     canonical_quant,
     canonical_routing,
@@ -99,7 +103,9 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     CuteDslB12xW4a16Nvfp4FusedMoE,
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     TrtllmCutedslMegaMoeNvfp4Impl,
-    CuteDslFusedMoE,
+    # Disjoint ``quant`` segments, so the order between the two does not matter.
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
     # for the same format because the opt-in flag is what selects it: with the
@@ -138,7 +144,12 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl}),
     "CUTEDSL": frozenset(
-        {CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE, CuteDslFusedMoE}
+        {
+            CuteDslB12xNvfp4FusedMoE,
+            CuteDslB12xW4a16Nvfp4FusedMoE,
+            TrtllmCutedslGroupedGemmNvfp4Impl,
+            TrtllmCutedslGroupedGemmBf16Impl,
+        }
     ),
     "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
@@ -483,15 +494,7 @@ def _reject_unsupported_activation(
     ``PER_EXPERT_TENSOR`` to ``UNIFORM_SCALAR``; no instance turns a shape into
     ``UNSUPPORTED``, so no instance refuses a constant its class admits.
     """
-    support = getattr(candidate, "activation_support", None)
-    if support is None:
-        return None
-    detail = support.rejection_detail(
-        candidate.__name__,
-        problem.activation_type,
-        clamp_after_silu=problem.clamp_after_silu,
-        constants=problem.activation_constants,
-    )
+    detail = activation_rejection_detail(candidate, problem)
     if detail is None:
         return None
     return MoERejection(

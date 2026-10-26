@@ -223,7 +223,6 @@ tensorrt_llm/_torch/modules/fla/wy_fast.py
 tensorrt_llm/_torch/moe/fused_moe/__init__.py
 tensorrt_llm/_torch/moe/fused_moe/create_moe.py
 tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py
-tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py
 tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py
 tensorrt_llm/_torch/moe/fused_moe/fused_moe_deepgemm.py
 tensorrt_llm/_torch/moe/fused_moe/fused_moe_triton.py
