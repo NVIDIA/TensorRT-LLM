@@ -3302,8 +3302,12 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             onehot_vocab = spec_metadata.draft_probs_vocab_size
             spec_metadata.draft_probs_last_dim = onehot_vocab
-        spec_metadata.draft_probs[ctx_slot_ids, :draft_len, :onehot_vocab] = 0.0
-        spec_metadata.draft_probs[ctx_slot_ids, :draft_len, 0] = 1.0
+        # index_fill_ takes the value as a kernel argument. Assigning a Python
+        # scalar through an advanced index stages it as a pageable host tensor
+        # and blocks the host until the stream drains.
+        draft_probs = spec_metadata.draft_probs
+        draft_probs[:, :draft_len, :onehot_vocab].index_fill_(0, ctx_slot_ids, 0.0)
+        draft_probs[:, :draft_len, 0].index_fill_(0, ctx_slot_ids, 1.0)
 
     def sample_draft_tokens(self,
                             logits,

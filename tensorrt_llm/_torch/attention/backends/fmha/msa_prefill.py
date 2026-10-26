@@ -22,6 +22,7 @@ module-scope import here would close a cycle.
 from __future__ import annotations
 
 import functools
+import sys
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -304,6 +305,176 @@ def _k2q_csr_with_schedule(
     return row_ptr, q_indices, schedule
 
 
+@functools.lru_cache(maxsize=1)
+def _nvfp4_attention_parts():
+    """(validate inputs, validate schedule, forward launch, combine) behind
+    sparse.sparse_atten_nvfp4_kv_func, or None.
+
+    Internals of the packaged MSA entry point, resolved once; a build that
+    moves them leaves every call on sparse_atten_nvfp4_kv_func itself.
+    """
+    _msa_sparse_api()  # puts the CuTe-DSL sources on sys.path
+    interface = sys.modules.get("interface")
+    names = (
+        "_validate_csr_varlen_nvfp4_kv_inputs",
+        "_validate_fwd_schedule",
+        "_call_sparse_forward_sm100_csr_varlen_nvfp4_kv",
+        "combine",
+    )
+    if interface is None or not all(callable(getattr(interface, name, None)) for name in names):
+        return None
+    return tuple(getattr(interface, name) for name in names)
+
+
+def _tensor_geometry(tensor: Optional[torch.Tensor]) -> Optional[tuple]:
+    if tensor is None:
+        return None
+    return (tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.is_contiguous())
+
+
+def _nvfp4_sparse_attention_into(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    k_global_scale: torch.Tensor,
+    v_global_scale: torch.Tensor,
+    k2q_row_ptr: torch.Tensor,
+    k2q_q_indices: torch.Tensor,
+    schedule,
+    topk: int,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    blk_kv: int,
+    softmax_scale: float,
+    page_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    out: torch.Tensor,
+    metadata,
+) -> bool:
+    """sparse_atten_nvfp4_kv_func(..., causal=True) with the result combined straight into `out`.
+
+    The packaged entry point validates every input and allocates an output
+    the caller then copies into place, on every layer. The inputs' geometry is
+    fixed for a step, so this validates it once per geometry (recorded on the
+    metadata) and hands `out` to the combine kernel as its destination. Same
+    two kernels on the same arguments, so the same bytes.
+    Returns False, having done nothing, where it does not apply.
+    """
+    parts = _nvfp4_attention_parts()
+    if (
+        parts is None
+        or schedule is None
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or tuple(out.shape) != tuple(q.shape)
+    ):
+        return False
+    validate_inputs, validate_schedule, launch_forward, combine = parts
+    total_q, head_q, head_dim = (int(x) for x in q.shape)
+    key = (
+        q.device,
+        topk,
+        int(blk_kv),
+        tuple(
+            _tensor_geometry(t)
+            for t in (
+                q,
+                k,
+                v,
+                k_scale,
+                v_scale,
+                k_global_scale,
+                v_global_scale,
+                k2q_row_ptr,
+                k2q_q_indices,
+                schedule.qsplit_indices,
+                schedule.split_counts,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                page_table,
+                seqused_k,
+            )
+        ),
+    )
+    cached = getattr(metadata, "_msa_nvfp4_attn_validated", None)
+    if cached is None or cached[0] != key:
+        _, head_kv = validate_inputs(
+            q,
+            k,
+            v,
+            k_scale,
+            v_scale,
+            k_global_scale,
+            v_global_scale,
+            k2q_row_ptr,
+            k2q_q_indices,
+            topk,
+            blk_kv,
+            page_table,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_k,
+        )
+        validate_schedule(schedule, q=q, k2q_q_indices=k2q_q_indices, head_kv=head_kv)
+        cached = (key, int(head_kv))
+        metadata._msa_nvfp4_attn_validated = cached
+    head_kv = cached[1]
+    # Allocated per call as the entry point does: a long prefill's partials run
+    # to gigabytes, which the layers between two attentions need back.
+    device = q.device
+    o_partial = torch.empty((topk, total_q, head_q, head_dim), dtype=torch.bfloat16, device=device)
+    lse_partial = torch.empty((topk, total_q, head_q), dtype=torch.float32, device=device)
+    lse_out = torch.empty((total_q, head_q), dtype=torch.float32, device=device)
+    # The packaged entry point makes these contiguous on the way in (each a
+    # no-op on the views production passes); so does this.
+    launch_forward(
+        q.contiguous(),
+        k,
+        v,
+        k_scale,
+        v_scale,
+        k_global_scale.contiguous(),
+        v_global_scale.contiguous(),
+        k2q_row_ptr.contiguous(),
+        k2q_q_indices.contiguous(),
+        schedule.qsplit_indices.contiguous(),
+        schedule.split_counts.contiguous(),
+        cu_seqlens_q.contiguous(),
+        cu_seqlens_k.contiguous(),
+        page_table.contiguous(),
+        seqused_k.contiguous(),
+        o_partial,
+        lse_partial,
+        None,
+        float(softmax_scale),
+        1.0,
+        False,
+        int(k2q_row_ptr.shape[1] - 1),
+        int(blk_kv),
+        head_kv,
+        int(max_seqlen_q),
+        causal=True,
+        schedule=schedule,
+    )
+    combine(
+        o_partial,
+        lse_partial,
+        out,
+        lse_out,
+        lse_temperature_partial=None,
+        lse_temperature_out=None,
+        cu_seqlens=cu_seqlens_q,
+        split_counts=schedule.split_counts,
+        output_scale=None if q.dtype == torch.float8_e4m3fn else v_global_scale,
+        use_pdl=True,
+    )
+    return True
+
+
 def run_msa_nvfp4_sparse_gqa(
     q: torch.Tensor,
     k_paged: torch.Tensor,
@@ -383,12 +554,41 @@ def run_msa_nvfp4_sparse_gqa(
         qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
         metadata=metadata,
     )
+    k_data = k_paged.view(torch.uint8)
+    v_data = v_paged.view(torch.uint8)
+    k_scale = scale_buffers[:, 0].view(torch.uint8)
+    v_scale = scale_buffers[:, 1].view(torch.uint8)
+    page_table = metadata.msa_block_table[:batch]
+    seqused_k = metadata.msa_seq_lens_cuda[:batch]
+    if _nvfp4_sparse_attention_into(
+        q,
+        k_data,
+        v_data,
+        k_scale,
+        v_scale,
+        k_global_scale,
+        v_global_scale,
+        k2q_row_ptr,
+        k2q_q_indices,
+        schedule,
+        topk,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_kv,
+        max_seqlen_q=max_q_len,
+        blk_kv=page_size,
+        softmax_scale=sm_scale,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        out=out,
+        metadata=metadata,
+    ):
+        return
     result = sparse.sparse_atten_nvfp4_kv_func(
         q,
-        k_paged.view(torch.uint8),
-        v_paged.view(torch.uint8),
-        scale_buffers[:, 0].view(torch.uint8),
-        scale_buffers[:, 1].view(torch.uint8),
+        k_data,
+        v_data,
+        k_scale,
+        v_scale,
         k_global_scale,
         v_global_scale,
         k2q_row_ptr,
@@ -403,8 +603,8 @@ def run_msa_nvfp4_sparse_gqa(
         softmax_scale=sm_scale,
         partial_dtype=torch.bfloat16,
         return_softmax_lse=False,
-        page_table=metadata.msa_block_table[:batch],
-        seqused_k=metadata.msa_seq_lens_cuda[:batch],
+        page_table=page_table,
+        seqused_k=seqused_k,
         schedule=schedule,
     )
     out.copy_(result)

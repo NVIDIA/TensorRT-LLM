@@ -5,7 +5,8 @@
 * the prefill tile select (minimax_m31_select_prefill_tile, sm_103) against minimax_m3_select_blocks;
 * the context proxy's unfilled max-score block against fmha_sm100's -inf filled one;
 * the reused k2q CSR workspace against sparse.build_k2q_csr;
-* the NumPy per_token_valid_blocks against the torch expansion it replaced.
+* the NumPy per_token_valid_blocks against the torch expansion it replaced;
+* the NVFP4 attention combined straight into its output against sparse_atten_nvfp4_kv_func.
 """
 
 import math
@@ -671,3 +672,36 @@ def test_reused_k2q_csr_workspace_matches_build_k2q_csr(monkeypatch, prefixes, c
     want_other = _run_csr_attention(case, other, monkeypatch, reuse=False)
     assert torch.equal(_run_csr_attention(case, other, monkeypatch, reuse=True), want_other)
     assert torch.equal(_run_csr_attention(case, topk, monkeypatch, reuse=True), stock)
+
+
+# ------------------------------------------------------------------------ NVFP4 attention combined straight into place
+
+
+@needs_sm100f
+@pytest.mark.parametrize(
+    ("prefixes", "chunks"),
+    [([0], [300]), ([1024, 9000], [2048, 513]), ([600_000], [1291])],
+)
+def test_nvfp4_attention_into_place_matches_entry_point(monkeypatch, prefixes, chunks):
+    from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
+
+    case = _csr_case(prefixes, chunks, seed=len(chunks) * 11 + chunks[0])
+    _, _, _, (topk, other), metadata, _, _ = case
+    resolve_parts = msa_prefill._nvfp4_attention_parts
+    assert resolve_parts() is not None, (
+        "the packaged entry point's internals moved; the in-place path is dead"
+    )
+
+    def run(table, in_place: bool) -> torch.Tensor:
+        parts = resolve_parts if in_place else (lambda: None)
+        monkeypatch.setattr(msa_prefill, "_nvfp4_attention_parts", parts)
+        return _run_csr_attention(case, table, monkeypatch, reuse=True)
+
+    stock = run(topk, in_place=False)
+    assert metadata._msa_nvfp4_attn_validated is None
+    assert torch.equal(run(topk, in_place=True), stock)
+    assert metadata._msa_nvfp4_attn_validated is not None
+    # A second layer's table on the already validated geometry.
+    stock_other = run(other, in_place=False)
+    assert torch.equal(run(other, in_place=True), stock_other)
+    assert torch.equal(run(topk, in_place=True), stock)

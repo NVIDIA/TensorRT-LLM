@@ -69,14 +69,24 @@ from .msa_indexer import MsaIndexer, cutedsl_score_runner, segmented_proxy_plan
 
 
 def _cache_device(meta) -> torch.device:
-    """Device hosting the paged KV buffers, else the current CUDA device."""
+    """Device hosting the paged KV buffers, else the current CUDA device.
+
+    A manager's pool never changes device, so the answer is kept on the
+    metadata per manager instead of fetching a layer buffer every call.
+    """
     kv_cache_manager = meta.kv_cache_manager
     if kv_cache_manager is not None:
+        cached = meta._msa_cache_device
+        if cached is not None and cached[0] is kv_cache_manager:
+            return cached[1]
         try:
-            return kv_cache_manager.get_buffers(0).device
+            device = kv_cache_manager.get_buffers(0).device
         except (AttributeError, IndexError, KeyError):
             # A manager that exposes no layer-0 buffer, as in a focused test.
             pass
+        else:
+            meta._msa_cache_device = (kv_cache_manager, device)
+            return device
     return torch.device(f"cuda:{torch.cuda.current_device()}")
 
 
@@ -236,6 +246,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # (geometry key, k2q row_ptr, k2q q_indices, schedule) the NVFP4 prefill builds its CSR worklist into. Sized by
     # the step geometry alone, so every layer, and every later step of the same geometry, reuses it.
     _msa_csr_workspace: Optional[tuple] = None
+    # (geometry key, KV heads) of the inputs the NVFP4 prefill attention last validated; every layer of a step
+    # shares them (see _nvfp4_sparse_attention_into).
+    _msa_nvfp4_attn_validated: Optional[tuple] = None
+    # (KV cache manager, device of its pool), see _cache_device.
+    _msa_cache_device: Optional[tuple] = None
     # This step's per-request host lengths, staged by _stage_host_lengths.
     _msa_qo_lens_cpu: Optional[torch.Tensor] = None
     _msa_kv_lens_cpu: Optional[torch.Tensor] = None

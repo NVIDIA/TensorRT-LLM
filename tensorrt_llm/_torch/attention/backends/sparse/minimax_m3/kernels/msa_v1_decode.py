@@ -167,6 +167,11 @@ def _get_or_plan(
     return plan
 
 
+@functools.lru_cache(maxsize=None)
+def _device_supported(device: torch.device) -> bool:
+    return torch.cuda.get_device_capability(device) in _SUPPORTED_CAPABILITIES
+
+
 def try_decode(
     q: torch.Tensor,
     k_paged: torch.Tensor,
@@ -202,7 +207,7 @@ def try_decode(
         return False
     if any(t is None for t in (k_block_scale, v_block_scale, k_global_scale, v_global_scale)):
         return False
-    if torch.cuda.get_device_capability(q.device) not in _SUPPORTED_CAPABILITIES:
+    if not _device_supported(q.device):
         return False
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
