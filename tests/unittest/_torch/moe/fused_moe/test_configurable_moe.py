@@ -98,7 +98,8 @@ def _create_backend(
     wrapper: ConfigurableMoE,
     model_config: ModelConfig,
     override_quant_config: QuantConfig | None = None,
-) -> Mock:
+) -> tuple[Mock, ModelConfig]:
+    """Build a mock backend; returns it and the config it was built with."""
     backend = _backend_mock()
     with (
         patch(
@@ -108,14 +109,16 @@ def _create_backend(
         patch(
             "tensorrt_llm._torch.moe.fused_moe.create_moe.create_moe_backend",
             return_value=backend,
-        ),
+        ) as create_moe_backend,
     ):
-        wrapper._create_and_sync_backend(
+        backend_config = wrapper._create_and_sync_backend(
             model_config=model_config,
             routing_method=Mock(),
             override_quant_config=override_quant_config,
         )
-    return backend
+    # The wrapper reads its own settings from what it returns.
+    assert backend_config is create_moe_backend.call_args.kwargs["model_config"]
+    return backend, backend_config
 
 
 def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
@@ -128,7 +131,7 @@ def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
     wrapper = _wrapper()
     wrapper.quant_config = global_config
 
-    backend = _create_backend(wrapper, model_config)
+    backend, _ = _create_backend(wrapper, model_config)
 
     backend.create_weights.assert_not_called()
     wrapper.quant_config = layer_config
@@ -136,6 +139,24 @@ def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
 
     assert backend.quant_config is layer_config
     backend.create_weights.assert_called_once_with()
+
+
+def test_override_builds_the_backend_on_a_shallow_copy() -> None:
+    """The backend sees the override; the caller's config, and the per-weight
+    ``quant_config_dict`` every layer shares, are left as they were."""
+    global_config = QuantConfig()
+    override = QuantConfig(quant_algo=QuantAlgo.FP8)
+    model_config = ModelConfig(
+        quant_config=global_config,
+        quant_config_dict={"model.layers.0.mlp.experts": override},
+    )
+
+    _, backend_config = _create_backend(_wrapper(), model_config, override)
+
+    assert backend_config is not model_config
+    assert backend_config.quant_config is override
+    assert backend_config.quant_config_dict is model_config.quant_config_dict
+    assert model_config.quant_config is global_config
 
 
 def test_exclusions_only_recreate_matching_moe_weights() -> None:
@@ -147,7 +168,7 @@ def test_exclusions_only_recreate_matching_moe_weights() -> None:
     wrapper = _wrapper()
     wrapper.quant_config = quant_config
 
-    backend = _create_backend(wrapper, model_config)
+    backend, _ = _create_backend(wrapper, model_config)
 
     assert backend.quant_config is quant_config
     backend.create_weights.assert_called_once_with()

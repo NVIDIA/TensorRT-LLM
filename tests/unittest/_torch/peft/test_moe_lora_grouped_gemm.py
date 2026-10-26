@@ -31,10 +31,9 @@ import pytest
 import torch
 from utils.util import skip_pre_ada
 
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassFp8Impl
 from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora, reference_swiglu_moe_lora
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 _TRTLLM_AVAILABLE = hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_moe")
 
@@ -525,15 +524,12 @@ def _build_fp8_moe_inputs(x, w3_w1, w2):
 
 
 def _make_fp8_qdq_moe_layer(w3_w1_fp8, top_k, dtype=torch.bfloat16):
-    """A CutlassFusedMoE carrying just the state
-    reserve_moe_lora_cuda_graph_workspace reads, with a real FP8-qdq QuantConfig
-    so has_fp8_qdq and has_any_quant report what they do on a loaded layer. The
-    tests drive the real method rather than restating its key derivation.
+    """A CUTLASS FP8 leaf carrying just the state
+    reserve_moe_lora_cuda_graph_workspace reads. The tests drive the real
+    method rather than restating its key derivation.
     """
-    layer = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    layer = TrtllmCutlassFp8Impl.__new__(TrtllmCutlassFp8Impl)
     layer._moe_lora_enabled = True
-    layer._weights_created = True  # gates the has_* quant properties
-    layer.quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     layer.dtype = dtype
     layer.w3_w1_weight = w3_w1_fp8
     layer.routing_method = SimpleNamespace(experts_per_token=top_k)
@@ -576,7 +572,9 @@ def test_fp8_qdq_reserve_resolves_to_runtime_runner():
     x_fp8, w3_w1_fp8, w2_fp8, quant_scales = _build_fp8_moe_inputs(x, w3_w1, w2)
 
     layer = _make_fp8_qdq_moe_layer(w3_w1_fp8, top_k, dtype=dtype)
-    CutlassFusedMoE.reserve_moe_lora_cuda_graph_workspace(layer, num_tokens, rank, max_lora_size)
+    TrtllmCutlassFp8Impl.reserve_moe_lora_cuda_graph_workspace(
+        layer, num_tokens, rank, max_lora_size
+    )
 
     assert len(MoERunner.runner_dict) == 1, (
         f"reservation must build exactly one cached runner; got {list(MoERunner.runner_dict)}"
@@ -642,7 +640,9 @@ def test_fp8_qdq_reserve_prevents_growth_across_captures():
     x_fp8, w3_w1_fp8, w2_fp8, quant_scales = _build_fp8_moe_inputs(x, w3_w1, w2)
 
     layer = _make_fp8_qdq_moe_layer(w3_w1_fp8, top_k, dtype=dtype)
-    CutlassFusedMoE.reserve_moe_lora_cuda_graph_workspace(layer, num_tokens, rank, max_lora_size)
+    TrtllmCutlassFp8Impl.reserve_moe_lora_cuda_graph_workspace(
+        layer, num_tokens, rank, max_lora_size
+    )
 
     baseline = _call_fused_moe(
         x_fp8, w3_w1_fp8, w2_fp8, topk_ids, topk_scores, dtype, {}, quant_scales=quant_scales

@@ -368,7 +368,7 @@ def test_op_rejects_unsupported_domains() -> None:
             "deepseek fp8 block scale on bf16",
             lambda: fused_moe(*args, use_deepseek_fp8_block_scale=True),
         ),
-        ("int8 woq on bf16", lambda: fused_moe(*args, use_int8_woq_per_channel=True)),
+        ("int8 woq on bf16", lambda: fused_moe(*args, use_woq_per_channel=True)),
         (
             "mxfp8 weight scaling on bf16",
             lambda: fused_moe(*args, use_mxfp8_weight_scaling=True),

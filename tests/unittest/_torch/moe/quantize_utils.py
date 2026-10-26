@@ -212,8 +212,7 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
         # Plain W4A16: INT4 weight-only, per-channel scales. QuantConfig ->
         # quant_mode maps W4A16 to use_weight_only(use_int4_weights=True) with no
         # PER_GROUP bit, so is_int4_weight_only() is true and
-        # has_per_group_scaling() is false -- which is exactly what
-        # has_int4_woq_per_channel keys off in fused_moe_cutlass.py.
+        # has_per_group_scaling() is false.
         quantize_util_cls = W4A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
     elif quant_algo == QuantAlgo.W4A8_AWQ:

@@ -328,6 +328,8 @@ class DisaggregatedParams(OpenAIBaseModel):
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
     resolved_thinking: Optional[bool] = None
+    # Orchestrator -> generation worker: seconds since arrival at the orchestrator.
+    orig_elapsed_s: Optional[float] = None
 
     @model_validator(mode="after")
     def validate_multimodal_spans(self) -> "DisaggregatedParams":
@@ -724,7 +726,6 @@ class CompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             if backend == "pytorch" or gather_generation_logits:
                 sampling_logprobs = self.logprobs
@@ -732,8 +733,6 @@ class CompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             best_of=self.best_of,
@@ -777,8 +776,6 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -1090,6 +1087,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
+    # the server keeps no copy of a chat completion, so there is nothing to
+    # store or to leave unstored.
+    store: Optional[bool] = None
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None
@@ -1253,7 +1254,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
             if backend == "pytorch" or gather_generation_logits:
@@ -1262,8 +1262,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`gather_generation_logits` must be `True` to use `top_logprobs`"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -1307,8 +1305,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -2025,6 +2021,7 @@ def to_llm_disaggregated_params(
         remote_tail_start=disaggregated_params.remote_tail_start,
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
+        orig_elapsed_s=disaggregated_params.orig_elapsed_s,
     )
 
 
