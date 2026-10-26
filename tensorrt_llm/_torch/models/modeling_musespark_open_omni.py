@@ -165,12 +165,15 @@ class MuseSparkOpenOmniInputProcessor(
     semantics rather than imported from a shim.
     """
 
+    supports_tokenization_cache = True
+
     def __init__(
         self,
         model_path: str,
         config: PretrainedConfig,
         tokenizer,
         trust_remote_code: bool = True,
+        enable_tokenization_cache: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -183,6 +186,12 @@ class MuseSparkOpenOmniInputProcessor(
         self._config = config
         self._tokenizer = tokenizer
         self._model_path = model_path
+        # A media-free prompt is ``tokenizer.encode(text, add_special_tokens=False)``
+        # (``_encode``), which is exactly what the prefix-tokenization cache
+        # computes, so its spliced ids are the ids this processor would produce.
+        # A processor built without a tokenizer (the engine's geometry copy)
+        # never tokenizes a served prompt and gets no cache.
+        self._init_tokenization_cache(enable_tokenization_cache, tokenizer)
         # `config.json` is not the whole preprocessing config on newer exports:
         # they drop `vision_config.navit_config` and declare the same knobs in
         # `processor_config.json` under HuggingFace spellings. Without this the
@@ -541,7 +550,12 @@ class MuseSparkOpenOmniInputProcessor(
         mm_data = inputs.get("multi_modal_data") or {}
 
         if not mm_data:
-            return self._encode(text_prompt), None
+            ids = (
+                self._encode_with_tokenization_cache(text_prompt, sampling_params)
+                if text_prompt
+                else None
+            )
+            return (self._encode(text_prompt) if ids is None else ids), None
 
         # Every modality key must be consumed below. Anything else -- including
         # "audio" against a checkpoint whose config does not enable the
