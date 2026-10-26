@@ -328,6 +328,8 @@ class DisaggregatedParams(OpenAIBaseModel):
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
     resolved_thinking: Optional[bool] = None
+    # Orchestrator -> generation worker: seconds since arrival at the orchestrator.
+    orig_elapsed_s: Optional[float] = None
 
     @model_validator(mode="after")
     def validate_multimodal_spans(self) -> "DisaggregatedParams":
@@ -1085,6 +1087,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
+    # the server keeps no copy of a chat completion, so there is nothing to
+    # store or to leave unstored.
+    store: Optional[bool] = None
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None
@@ -2019,6 +2025,7 @@ def to_llm_disaggregated_params(
         remote_tail_start=disaggregated_params.remote_tail_start,
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
+        orig_elapsed_s=disaggregated_params.orig_elapsed_s,
     )
 
 

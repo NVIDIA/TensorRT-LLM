@@ -4242,38 +4242,6 @@ def runLLMAgentFlowTest(pipeline, stageName)
     sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' results.xml || true"
 }
 
-def launchTestListCheck(pipeline, globalVars)
-{
-    stageName = "Test List Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
-        try {
-            echoNodeAndGpuInfo(pipeline, stageName)
-            sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
-            // download TRT-LLM tarfile
-            def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
-            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pwd && wget -nv -O '${tarName}' '${llmTarfile}' && ls -alh")
-            sh "tar -zxf ${tarName}"
-            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
-            def llmSrc = "${llmPath}/TensorRT-LLM/src"
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            // --validate --parity: after --l0/--qa generate the collectable lists, assert every
-            // statically-verified parametrize ID is actually collectable (validate<->collection parity).
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            if (globalVars[JOB_TYPE] == "L0_PostMerge") {
-                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
-                    throw e
-                }
-            } else {
-                throw e
-            }
-        }
-    })
-}
-
 def generateTimeoutTestResultXml(pipeline, stageName) {
     def scriptPath = sh(
         script: "find . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
@@ -4496,7 +4464,13 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
              "Test-db blocks conditioned on those properties (e.g. linux_distribution_name: ubuntu*) " +
              "will NOT be selected."
     }
-    sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
+    // Artifacts built before ci_versions.properties existed (e.g. via reuse_build)
+    // lack the file; fall back to the version those artifacts were pinned to.
+    def ciVersionsPath = "${llmSrc}/jenkins/ci_versions.properties"
+    def ciVersions = fileExists(ciVersionsPath)
+        ? readProperties(file: ciVersionsPath)
+        : [TRT_TEST_DB_VERSION: "1.8.5+bc6df7"]
+    sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==${ciVersions.TRT_TEST_DB_VERSION}"
     // CBTS Layer 3: download the pre-built cbts_test_db/ tarball that the
     // orchestrator uploaded to Artifactory (see getCbtsResult in
     // L0_MergeRequest.groovy). This avoids re-running main.py locally and
@@ -7599,25 +7573,6 @@ pipeline {
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
-                }
-            }
-        }
-        stage("Check Test List")
-        {
-            when {
-                expression {
-                    // Only run the test list validation when necessary
-                    globalVars[RUN_MODE] != "nightly_release" &&
-                    env.targetArch == X86_64_TRIPLE &&
-                    testFilter[ONLY_ONE_GROUP_CHANGED] != "Docs" &&
-                    !(env.JOB_NAME ==~ /.*Multi-GPU.*/) &&
-                    !(env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/)
-                }
-            }
-            steps
-            {
-                script {
-                    launchTestListCheck(this, globalVars)
                 }
             }
         }

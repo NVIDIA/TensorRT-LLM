@@ -1717,6 +1717,58 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
 @pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
+    def test_automatic_buckets_need_only_max_batch_size(self):
+        config = MultimodalEncoderCudaGraphConfig(max_batch_size=8)
+        assert config.max_batch_size == 8
+        assert config.max_num_tokens is None
+        assert config.buckets is None
+
+    def test_automatic_buckets_accept_token_cap(self):
+        config = MultimodalEncoderCudaGraphConfig(max_batch_size=8,
+                                                  max_num_tokens=1024)
+        assert config.max_num_tokens == 1024
+
+    @pytest.mark.parametrize("kwargs", [
+        {
+            "max_batch_size": 0
+        },
+        {
+            "max_batch_size": -1
+        },
+        {
+            "max_batch_size": 8,
+            "max_num_tokens": 0
+        },
+        {
+            "max_num_tokens": 1024
+        },
+        {
+            "buckets": [(256, 1)],
+            "max_batch_size": 8
+        },
+        {
+            "buckets": [(256, 1)],
+            "max_num_tokens": 1024
+        },
+    ])
+    def test_rejects_invalid_automatic_config(self, kwargs):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(**kwargs)
+
+    def test_both_modalities_accept_automatic_config(self):
+        config = MultimodalConfig(
+            encoder_cuda_graph={
+                "vision": {
+                    "max_batch_size": 8
+                },
+                "audio": {
+                    "max_batch_size": 4,
+                    "max_num_tokens": 2048
+                },
+            })
+        assert config.encoder_cuda_graph["vision"].max_batch_size == 8
+        assert config.encoder_cuda_graph["audio"].max_num_tokens == 2048
+
     def test_minimal_required_fields(self):
         config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])
         assert config.buckets == [(1035, 1)]

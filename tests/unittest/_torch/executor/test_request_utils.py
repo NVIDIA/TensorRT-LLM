@@ -6,6 +6,7 @@
 This module tests:
 - Request merging functions (merge_requests, merge_helix_requests)
 - Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request)
+- Rank-0 clock piggyback in RequestBroadcaster
 
 """
 
@@ -1071,3 +1072,99 @@ def test_executor_request_to_llm_request_adopts_return_routed_experts() -> None:
 
     assert _build(None).py_return_routed_experts is False  # default: opted out
     assert _build(True).py_return_routed_experts is True
+
+
+class TestBroadcasterClock:
+    """RequestBroadcaster(sync_clock=True): rank 0's clock and aux ride along
+    with the request count."""
+
+    def _dist(self, rank, world_size=2):
+        dist = Mock()
+        dist.rank = rank
+        dist.world_size = world_size
+        dist.has_pp = False
+        dist.supports_single_round_broadcast = False
+        return dist
+
+    def _hang_detector(self):
+        hd = Mock()
+        hd.pause.return_value.__enter__ = Mock(return_value=None)
+        hd.pause.return_value.__exit__ = Mock(return_value=False)
+        return hd
+
+    def test_default_probe_unchanged(self):
+        dist = self._dist(rank=1)
+        dist.broadcast_int64 = Mock(return_value=[0])
+        b = RequestBroadcaster(dist, self._hang_detector())
+        assert b.broadcast([]) == ([], None)
+        (values,), _ = dist.broadcast_int64.call_args
+        assert list(values) == [0]
+        assert b.rank0_now is None
+
+    def test_sync_clock_keeps_the_count_probe(self):
+        """The single-round broadcast has no room for the clock."""
+        for sync_clock, probes in ((False, 0), (True, 1)):
+            dist = self._dist(rank=1)
+            dist.supports_single_round_broadcast = True
+            dist.broadcast_or_none = Mock(return_value=None)
+            dist.broadcast_int64 = Mock(return_value=[0, 1_000_000, -1])
+            b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=sync_clock)
+            assert b.broadcast([]) == ([], None)
+            assert dist.broadcast_int64.call_count == probes
+            assert dist.broadcast_or_none.call_count == 1 - probes
+
+    def test_default_probe_pp_forwards_count(self):
+        dist = self._dist(rank=4, world_size=8)
+        dist.has_pp = True
+        dist.is_first_pp_rank = False
+        dist.is_last_pp_rank = False
+        dist.pp_size = 2
+        dist.prev_pp_rank, dist.next_pp_rank = 0, 1
+        dist.recv_object = Mock(return_value=[0])
+        dist.send_object = Mock()
+        b = RequestBroadcaster(dist, self._hang_detector())
+        assert b.broadcast([]) == ([], None)
+        dist.send_object.assert_called_once_with([0], 1, 3)
+        assert b.rank0_now is None
+
+    def test_sync_clock_single_rank(self):
+        dist = self._dist(rank=0, world_size=1)
+        b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
+        assert b.broadcast([]) == ([], None)
+        assert b.rank0_now is not None and b.rank0_now > 0
+
+    def test_sync_clock_pp_forwards_header(self):
+        dist = self._dist(rank=4, world_size=8)
+        dist.has_pp = True
+        dist.is_first_pp_rank = False
+        dist.is_last_pp_rank = False
+        dist.pp_size = 2
+        dist.prev_pp_rank, dist.next_pp_rank = 0, 1
+        dist.recv_object = Mock(return_value=[0, 5_000_000, -1])
+        dist.send_object = Mock()
+        b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
+        assert b.broadcast([]) == ([], None)
+        dist.send_object.assert_called_once_with([0, 5_000_000, -1], 1, 3)
+        assert b.rank0_now == pytest.approx(5.0)
+
+    def test_sync_clock_aux_rides_along(self):
+        root = self._dist(rank=0)
+        root.broadcast_int64 = Mock(side_effect=lambda header, root, prefer_cpu: header)
+        b = RequestBroadcaster(root, self._hang_detector(), sync_clock=True)
+        b.aux = 0.25
+        b.broadcast([])
+        (values,), _ = root.broadcast_int64.call_args
+        assert len(values) == 3 and values[2] == 250_000
+        assert b.rank0_aux == pytest.approx(0.25)
+        b.aux = None  # nothing to send yet
+        b.broadcast([])
+        assert b.rank0_aux is None
+
+        other = self._dist(rank=1)
+        other.broadcast_int64 = Mock(return_value=[0, 1_000_000, 170_000])
+        b = RequestBroadcaster(other, self._hang_detector(), sync_clock=True)
+        b.aux = 9.0  # ignored off rank 0
+        b.broadcast([])
+        (values,), _ = other.broadcast_int64.call_args
+        assert list(values) == [0, 0, -1]
+        assert b.rank0_aux == pytest.approx(0.17) and b.rank0_now == pytest.approx(1.0)

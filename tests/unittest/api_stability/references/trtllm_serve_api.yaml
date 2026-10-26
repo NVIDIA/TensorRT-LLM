@@ -592,6 +592,12 @@ models:
         default: <factory:list>
         status: stable
         required: false
+      store:
+        kind: openai
+        type: Optional[bool]
+        default: null
+        status: stable
+        required: false
       stream:
         kind: openai
         type: Optional[bool]
