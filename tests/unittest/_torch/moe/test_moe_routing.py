@@ -22,8 +22,8 @@ from tensorrt_llm._torch.moe.fused_moe import (
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
 from tensorrt_llm._torch.moe.fused_moe import routing as moe_routing
-from tensorrt_llm._torch.moe.fused_moe.routing import \
-    get_cached_perfect_router_logits
+from tensorrt_llm._torch.moe.fused_moe.routing import (
+    get_cached_perfect_router_expert_ids, get_cached_perfect_router_logits)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     discard_nccl_window_tensor_outputs
 from tensorrt_llm._utils import mpi_rank
@@ -634,6 +634,66 @@ def test_perfect_router_get_cached_logits_e2e(routing_name, shape):
                                                 dtype=dtype,
                                                 routing_method=routing)
     assert torch.equal(logits, logits_2)
+
+
+@pytest.mark.parametrize(
+    "num_experts,top_k,moe_ep_size",
+    [
+        pytest.param(64, 6, 4, id="small"),
+        pytest.param(384, 6, 8, id="dsv4_pro_ep8"),
+    ],
+)
+def test_perfect_router_expert_ids_balanced(num_experts, top_k, moe_ep_size):
+    """ENABLE_PERFECT_ROUTER=expert_ids: balanced ids for any token count.
+
+    Checks, on CPU, for every sender rank and a range of token counts:
+      - every EP rank and every expert receives an equal share of the routes,
+        within one;
+      - a token's routes land on distinct EP ranks and distinct experts;
+      - every call returns a view of the same table, sized to the token bound;
+      - a call above the bound raises instead of growing the table.
+    """
+    device = torch.device("cpu")
+    experts_per_rank = num_experts // moe_ep_size
+    max_num_tokens = 8192
+    moe_routing._PERFECT_ROUTER_EXPERT_IDS_CACHE.clear()
+
+    def get_ids(num_tokens, ep_rank):
+        return get_cached_perfect_router_expert_ids(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=top_k,
+            moe_ep_size=moe_ep_size,
+            ep_rank=ep_rank,
+            max_num_tokens=max_num_tokens,
+            device=device)
+
+    for ep_rank in range(moe_ep_size):
+        table_ptr = None
+        for num_tokens in [1, 3, 7, 100, 1000, max_num_tokens]:
+            ids = get_ids(num_tokens, ep_rank)
+            assert ids.shape == (num_tokens, top_k)
+            assert ids.dtype == torch.int32
+            assert ids.is_contiguous()
+            if table_ptr is None:
+                table_ptr = ids.data_ptr()
+            assert ids.data_ptr() == table_ptr
+
+            rank_counts = torch.bincount(ids.flatten() // experts_per_rank,
+                                         minlength=moe_ep_size)
+            assert rank_counts.max() - rank_counts.min() <= 1
+            expert_counts = torch.bincount(ids.flatten(), minlength=num_experts)
+            assert expert_counts.max() - expert_counts.min() <= 1
+
+            if top_k <= moe_ep_size:
+                ranks = ids // experts_per_rank
+                assert all(len(set(row)) == top_k for row in ranks.tolist())
+            assert all(len(set(row)) == top_k for row in ids.tolist())
+
+        with pytest.raises(ValueError, match="max_num_tokens"):
+            get_ids(max_num_tokens + 1, ep_rank)
+
+    assert len(moe_routing._PERFECT_ROUTER_EXPERT_IDS_CACHE) == moe_ep_size
 
 
 # -----------------------------------------------------------------

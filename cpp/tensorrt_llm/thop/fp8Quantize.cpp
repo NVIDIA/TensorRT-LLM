@@ -151,7 +151,8 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
 // so each UE8M0 scale is replicated into four adjacent K32 slots. The legacy
 // deep_gemm MN-major packed layout remains available while that consumer still
 // requires it.
-std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor const& self, bool useR128c4Layout)
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0_sm_budget(
+    at::Tensor const& self, bool useR128c4Layout, int64_t reservedSms)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
@@ -168,6 +169,8 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
     TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
     auto const num_n_blocks = (n + 127) / 128;
     auto const num_packed_sf_k = (num_n_blocks + 3) / 4;
+    TORCH_CHECK(reservedSms >= 0, "reserved_sms must be nonnegative");
+    TORCH_CHECK(reservedSms == 0 || useR128c4Layout, "reserved_sms requires the R128c4 scale layout");
     auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
 
     if (useR128c4Layout)
@@ -188,11 +191,13 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
         {
 #ifdef ENABLE_BF16
             const thread_local int multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+            TORCH_CHECK(reservedSms < multiProcessorCount, "reserved_sms must be smaller than the device SM count");
+            int const availableSms = multiProcessorCount - static_cast<int>(reservedSms);
             tensorrt_llm::kernels::invokeMxFP8Quantization<__nv_bfloat16, kQuantSfVecSize, kOutputSfVecSize>(1,
                 static_cast<int>(m), static_cast<int>(n), static_cast<int>(n),
                 reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()),
                 reinterpret_cast<int64_t*>(valueE4M3.data_ptr()), reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()),
-                tensorrt_llm::QuantizationSFLayout::SWIZZLED, multiProcessorCount, stream);
+                tensorrt_llm::QuantizationSFLayout::SWIZZLED, availableSms, stream);
 #else
             C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize a BF16 tensor to MXFP8.");
 #endif
@@ -230,6 +235,11 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
         /* deleter */ [keep = packedBuf](void*) mutable {}, packedBuf.options());
 
     return {valueE4M3.slice(0, 0, m), packedScale};
+}
+
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor const& self, bool useR128c4Layout)
+{
+    return fp8_quantize_1x128_packed_ue8m0_sm_budget(self, useR128c4Layout, 0);
 }
 
 std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_cutedsl_ue8m0(at::Tensor const& self)
@@ -336,6 +346,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("fp8_batched_quantize_1x128_permute102(Tensor input) -> (Tensor, Tensor)");
     m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input, bool use_r128c4_layout=True) -> (Tensor, Tensor)");
+    m.def(
+        "fp8_quantize_1x128_packed_ue8m0.sm_budget(Tensor input, bool use_r128c4_layout=True, "
+        "int reserved_sms=0) -> (Tensor, Tensor)");
     m.def("fp8_quantize_1x128_cutedsl_ue8m0(Tensor input) -> (Tensor, Tensor)");
     m.def(
         "silu_and_mul_fp8_quantize_1x128_packed_ue8m0(Tensor input, float? swiglu_limit=None, bool "
@@ -347,6 +360,8 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fp8_quantize_1x128", &tensorrt_llm::torch_ext::fp8_quantize_1x128);
     m.impl("fp8_batched_quantize_1x128_permute102", &tensorrt_llm::torch_ext::fp8_batched_quantize_1x128_permute102);
     m.impl("fp8_quantize_1x128_packed_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_packed_ue8m0);
+    m.impl("fp8_quantize_1x128_packed_ue8m0.sm_budget",
+        &tensorrt_llm::torch_ext::fp8_quantize_1x128_packed_ue8m0_sm_budget);
     m.impl("fp8_quantize_1x128_cutedsl_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_cutedsl_ue8m0);
     m.impl("silu_and_mul_fp8_quantize_1x128_packed_ue8m0",
         &tensorrt_llm::torch_ext::silu_and_mul_fp8_quantize_1x128_packed_ue8m0);

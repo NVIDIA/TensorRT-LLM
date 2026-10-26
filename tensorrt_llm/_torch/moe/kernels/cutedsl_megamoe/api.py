@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Stable construction API for composable kernel implementations."""
 
 import types
@@ -10,6 +7,7 @@ from types import MappingProxyType
 from typing import Dict, Union, get_args, get_origin
 
 from cutlass.cute.typing import SymInt
+
 
 RuntimeIntegerType = SymInt
 StaticIntegerType = int
@@ -29,15 +27,16 @@ Requirement = Union[type, OptionalRequirement]
 
 
 def _required_type(requirement: Requirement):
-    return (
-        requirement.expected_type if isinstance(requirement, OptionalRequirement) else requirement
-    )
+    return requirement.expected_type if isinstance(requirement, OptionalRequirement) else requirement
 
 
 def _matches_type(value, expected_type) -> bool:
     origin = get_origin(expected_type)
     if origin in (Union, types.UnionType):
-        return any(_matches_type(value, candidate) for candidate in get_args(expected_type))
+        return any(
+            _matches_type(value, candidate)
+            for candidate in get_args(expected_type)
+        )
     return isinstance(value, expected_type)
 
 
@@ -66,7 +65,9 @@ class Desc(Mapping[str, object]):
             if name not in self._values:
                 if isinstance(requirement, OptionalRequirement):
                     continue
-                raise KeyError(f"{component_name} requires descriptor field {name!r}.")
+                raise KeyError(
+                    f"{component_name} requires descriptor field {name!r}."
+                )
             expected_type = _required_type(requirement)
             value = self._values[name]
             if not _matches_type(value, expected_type):
@@ -96,11 +97,13 @@ class KernelComponent(ABC, metaclass=_KernelComponentMeta):
 
     @classmethod
     @abstractmethod
-    def problem_desc_require(cls) -> Dict[str, Requirement]: ...
+    def problem_desc_require(cls) -> Dict[str, Requirement]:
+        ...
 
     @classmethod
     @abstractmethod
-    def impl_desc_require(cls) -> Dict[str, Requirement]: ...
+    def impl_desc_require(cls) -> Dict[str, Requirement]:
+        ...
 
     def _validate_desc_inputs(
         self,
@@ -108,10 +111,14 @@ class KernelComponent(ABC, metaclass=_KernelComponentMeta):
         impl_desc: ImplDesc,
     ) -> None:
         component_name = type(self).__name__
-        overlap = self.problem_desc_require().keys() & self.impl_desc_require().keys()
+        overlap = (
+            self.problem_desc_require().keys()
+            & self.impl_desc_require().keys()
+        )
         if overlap:
             raise ValueError(
-                f"{component_name} requires fields from both descriptors: {sorted(overlap)}."
+                f"{component_name} requires fields from both descriptors: "
+                f"{sorted(overlap)}."
             )
         problem_desc.validate(
             self.problem_desc_require(),
@@ -132,26 +139,33 @@ class KernelComponent(ABC, metaclass=_KernelComponentMeta):
             if not hasattr(self, name):
                 if isinstance(requirement, OptionalRequirement):
                     continue
-                raise RuntimeError(f"{component_name} did not bind required field {name!r}.")
+                raise RuntimeError(
+                    f"{component_name} did not bind required field {name!r}."
+                )
             expected_type = _required_type(requirement)
             value = getattr(self, name)
             if not _matches_type(value, expected_type):
                 raise TypeError(
-                    f"{component_name}.{name} must have type {expected_type}, got {type(value)}."
+                    f"{component_name}.{name} must have type "
+                    f"{expected_type}, got {type(value)}."
                 )
         for name, value in vars(self).items():
             if isinstance(value, Desc):
-                raise RuntimeError(f"{component_name}.{name} retains a descriptor.")
+                raise RuntimeError(
+                    f"{component_name}.{name} retains a descriptor."
+                )
 
 
 class KernelClass(KernelComponent):
     """Top-level host wrapper for one composable kernel implementation."""
 
     @abstractmethod
-    def name(self) -> str: ...
+    def name(self) -> str:
+        ...
 
     @abstractmethod
-    def aot_compile(self): ...
+    def aot_compile(self):
+        ...
 
 
 __all__ = [

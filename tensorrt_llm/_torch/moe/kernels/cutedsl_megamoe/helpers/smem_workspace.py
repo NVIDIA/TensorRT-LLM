@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Pure-Python SMEM declarations with lifetime-aware overlay placement."""
 
 import dataclasses
@@ -12,10 +9,11 @@ import cutlass.cute as cute
 from .utils import (
     cosize_from_shape_stride_tuples,
     is_power_of_two,
-    round_up,
     row_major_stride,
+    round_up,
     validate_static_integer_tuple,
 )
+
 
 SmemRegionKind = Literal["mbarrier", "tensor"]
 SwizzleSpec = Tuple[int, int, int]
@@ -110,7 +108,9 @@ class SmemOverlay:
         if not name:
             raise ValueError("An SMEM lifetime needs a non-empty name.")
         if name in self._lifetime_names:
-            raise ValueError(f"Duplicate lifetime {name!r} in overlay {self.name!r}.")
+            raise ValueError(
+                f"Duplicate lifetime {name!r} in overlay {self.name!r}."
+            )
         lifetime = SmemLifetime(self._workspace, self, name)
         self._lifetimes.append(lifetime)
         self._lifetime_names.add(name)
@@ -121,7 +121,13 @@ _TopLevelDeclaration = Union[SmemRegion, SmemOverlay]
 
 
 class SmemWorkspace:
-    """Collect static SMEM declarations and finalize one physical placement."""
+    """Collect static SMEM declarations and finalize one physical placement.
+
+    A kernel whose CTAs take different roles builds one workspace per role and lays every resulting offset
+    table over the same arena. The tables overlap by design: a CTA only reads the table of the role it took,
+    so a region name a role never registers raises at trace time rather than silently reading another role's
+    bytes.
+    """
 
     def __init__(
         self,
@@ -235,17 +241,29 @@ class SmemWorkspace:
             stride = row_major_stride(shape)
         validate_static_integer_tuple(stride, field_name=f"{name}.stride")
         if len(shape) != len(stride):
-            raise ValueError(f"SMEM region {name!r} shape and stride ranks differ.")
+            raise ValueError(
+                f"SMEM region {name!r} shape and stride ranks differ."
+            )
         if swizzle is not None:
-            if len(swizzle) != 3 or not all(isinstance(parameter, int) for parameter in swizzle):
-                raise TypeError(f"SMEM region {name!r} swizzle must be three Python ints.")
+            if len(swizzle) != 3 or not all(
+                isinstance(parameter, int) for parameter in swizzle
+            ):
+                raise TypeError(
+                    f"SMEM region {name!r} swizzle must be three Python ints."
+                )
             if swizzle[0] < 0 or swizzle[1] < 0:
-                raise ValueError(f"SMEM region {name!r} swizzle bits/base must be non-negative.")
+                raise ValueError(
+                    f"SMEM region {name!r} swizzle bits/base must be non-negative."
+                )
 
         natural_alignment = max(1, (int(dtype.width) + 7) // 8)
-        explicit_alignment = natural_alignment if byte_alignment is None else byte_alignment
+        explicit_alignment = (
+            natural_alignment if byte_alignment is None else byte_alignment
+        )
         if not is_power_of_two(explicit_alignment):
-            raise ValueError(f"SMEM region {name!r} alignment must be a positive power of two.")
+            raise ValueError(
+                f"SMEM region {name!r} alignment must be a positive power of two."
+            )
         swizzle_alignment = _swizzle_alignment(swizzle)
         effective_alignment = max(
             explicit_alignment,
@@ -268,7 +286,10 @@ class SmemWorkspace:
         )
 
     def _claim_region_name(self, region: SmemRegion) -> None:
-        if region.name in self._region_by_name or region.name in self._overlay_names:
+        if (
+            region.name in self._region_by_name
+            or region.name in self._overlay_names
+        ):
             raise ValueError(f"Duplicate SMEM region {region.name!r}.")
         self._region_by_name[region.name] = region
 
@@ -287,7 +308,9 @@ class SmemWorkspace:
             raise RuntimeError("SmemWorkspace.finalize() may only be called once.")
         offsets, total_bytes = self._build_placement()
         if max_bytes is not None and total_bytes > max_bytes:
-            raise ValueError(f"SMEM plan needs {total_bytes} bytes, exceeding {max_bytes} bytes.")
+            raise ValueError(
+                f"SMEM plan needs {total_bytes} bytes, exceeding {max_bytes} bytes."
+            )
         self._offset = offsets
         self._total_bytes = total_bytes
         self._finalized = True
@@ -305,7 +328,9 @@ class SmemWorkspace:
                 offsets[declaration.name] = cursor
                 cursor += declaration.nbytes
                 continue
-            relative_offsets, overlay_alignment, overlay_bytes = self._layout_overlay(declaration)
+            relative_offsets, overlay_alignment, overlay_bytes = (
+                self._layout_overlay(declaration)
+            )
             cursor = round_up(cursor, overlay_alignment)
             for region_name, relative_offset in relative_offsets.items():
                 offsets[region_name] = cursor + relative_offset
@@ -323,7 +348,9 @@ class SmemWorkspace:
         overlay_bytes = 0
         for lifetime in overlay.lifetimes:
             if not lifetime.regions:
-                raise ValueError(f"SMEM lifetime {overlay.name}.{lifetime.name} has no regions.")
+                raise ValueError(
+                    f"SMEM lifetime {overlay.name}.{lifetime.name} has no regions."
+                )
             lifetime_cursor = 0
             for region in lifetime.regions:
                 overlay_alignment = max(
@@ -369,10 +396,24 @@ class SmemWorkspace:
 
         return SmemStorage
 
+    def assert_fits_arena(self, arena_bytes: int) -> None:
+        """Check this role's placement against the arena every CTA of the launch allocates."""
+        self._require_finalized()
+        if self._total_bytes > arena_bytes:
+            raise ValueError(
+                f"SMEM workspace needs {self._total_bytes} bytes but the shared arena is only "
+                f"{arena_bytes} bytes. The arena is what every CTA allocates, so it cannot be widened for "
+                "one role without taking the difference away from every other role."
+            )
+
     @cute.jit
     def ptr(self, name: str, smem_base: cute.Pointer) -> cute.Pointer:
         region = self._region_by_name[name]
-        swizzle = None if region.swizzle is None else cute.make_swizzle(*region.swizzle)
+        swizzle = (
+            None
+            if region.swizzle is None
+            else cute.make_swizzle(*region.swizzle)
+        )
         return cute.make_ptr(
             region.dtype,
             smem_base.toint() + self._offset[name],
@@ -400,3 +441,4 @@ __all__ = [
     "SmemWorkspace",
     "SwizzleSpec",
 ]
+

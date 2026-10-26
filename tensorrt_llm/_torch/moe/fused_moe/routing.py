@@ -15,6 +15,9 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 # Global cache for perfect router logits shared across MoE modules
 _PERFECT_ROUTER_LOGITS_CACHE = {}
+# Global cache for perfect router expert-id tables shared across MoE modules,
+# keyed by expert geometry, sender rank, token bound and device
+_PERFECT_ROUTER_EXPERT_IDS_CACHE = {}
 
 
 def _get_perfect_router_cache_signature(routing_method):
@@ -232,6 +235,73 @@ def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
 
         _PERFECT_ROUTER_LOGITS_CACHE[cache_key] = logits
         return logits
+
+
+def get_cached_perfect_router_expert_ids(num_tokens: int, num_experts: int,
+                                         experts_per_token: int,
+                                         moe_ep_size: int, ep_rank: int,
+                                         max_num_tokens: int,
+                                         device: torch.device) -> torch.Tensor:
+    """
+    Return perfectly balanced expert ids for ``num_tokens`` local tokens.
+
+    This is the ``ENABLE_PERFECT_ROUTER=expert_ids`` counterpart of
+    ``get_cached_perfect_router_logits``: instead of synthesizing logits for
+    the routing method to consume, it replaces the routed expert ids after
+    routing. It therefore also covers routers whose ids do not come from the
+    logits (DeepSeek-V4 hash layers) and needs no per-token-count planning.
+
+    The ids follow ``FlatTopKPerfectRouterPlanner._get_balanced_expert_indices``:
+    slot ``t * experts_per_token + j``, rotated by ``ep_rank``, goes to EP rank
+    ``slot % moe_ep_size`` and to expert ``(slot // moe_ep_size) %
+    (num_experts // moe_ep_size)`` on it. A slot's expert depends only on its
+    own index, so the ids for ``n`` tokens are the leading ``n`` rows of a
+    longer table. One table of ``max_num_tokens`` rows per geometry, bound and
+    device is built on the first call and never replaced, so CUDA graphs
+    captured later keep reading valid memory. Every call returns a view of its
+    leading rows, with no kernel launch.
+
+    Args:
+        num_tokens: Number of local tokens on the current EP rank.
+        num_experts: Total number of experts across all EP ranks.
+        experts_per_token: Number of experts selected for each token.
+        moe_ep_size: Number of EP ranks.
+        ep_rank: Sender EP rank used to rotate the assignment stream.
+        max_num_tokens: Upper bound on ``num_tokens`` in every call; it sizes
+            the table.
+        device: Device of the routed expert ids.
+
+    Returns:
+        torch.Tensor: Contiguous int32 expert ids of shape
+        ``[num_tokens, experts_per_token]``.
+
+    Raises:
+        ValueError: If ``num_tokens`` exceeds ``max_num_tokens``.
+        RuntimeError: If the table would be built while a CUDA graph is being
+            captured.
+    """
+    if num_tokens > max_num_tokens:
+        raise ValueError(
+            f"ENABLE_PERFECT_ROUTER=expert_ids got {num_tokens} tokens in one "
+            f"MoE call, more than max_num_tokens ({max_num_tokens}), which "
+            "sizes its expert-id table")
+    cache_key = (num_experts, experts_per_token, moe_ep_size, ep_rank,
+                 max_num_tokens, device)
+    table = _PERFECT_ROUTER_EXPERT_IDS_CACHE.get(cache_key)
+    if table is None:
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "ENABLE_PERFECT_ROUTER=expert_ids builds its expert-id table on "
+                "the first MoE call, which must run before CUDA graph capture")
+        table = FlatTopKPerfectRouterPlanner._get_balanced_expert_indices(
+            max_num_tokens, num_experts, experts_per_token, moe_ep_size,
+            ep_rank, device).to(torch.int32)
+        if table.is_cuda:
+            # Other streams, such as the MoE chunking aux stream, read the
+            # table without waiting for the stream that built it.
+            torch.cuda.current_stream(table.device).synchronize()
+        _PERFECT_ROUTER_EXPERT_IDS_CACHE[cache_key] = table
+    return table[:num_tokens]
 
 
 # The type of method in top-K routing, for use in torch custom op
