@@ -383,12 +383,15 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Enable prefill scratch reuse for TRTLLM attention on SM90 and newer."""
+        """Default to prefill scratch reuse on SM90+ when block reuse is disabled."""
+        enable_scratch = (getattr(llm_args, "attn_backend", "TRTLLM").upper()
+                          == "TRTLLM" and get_sm_version() >= 90)
+        kv_cache_config = llm_args.kv_cache_config
+        if enable_scratch and kv_cache_config.enable_block_reuse:
+            enable_scratch = False
         return {
             "kv_cache_config": {
-                "enable_swa_scratch_reuse":
-                getattr(llm_args, "attn_backend", "TRTLLM").upper() == "TRTLLM"
-                and get_sm_version() >= 90,
+                "enable_swa_scratch_reuse": enable_scratch,
             },
         }
 
