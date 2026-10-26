@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention
+from fmha_test_utils import FakeAttention, metadata_stub
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
@@ -84,7 +84,7 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
     manager.dtype = None
     manager.trtllm_gen_extra_tokens_per_block = frozenset({128})
     manager.impl = SimpleNamespace(get_page_index_upper_bound=lambda *args: 32)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         num_contexts=num_contexts,
         num_generations=num_generations,
         helix_position_offsets=None,
@@ -168,7 +168,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
     q_hidden_size = attn.num_heads * attn.head_dim
     qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
     q = torch.empty((1, qkv_hidden_size), dtype=dtype)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         num_contexts=1,
         helix_position_offsets=None,
         num_sparse_topk=0,
@@ -276,7 +276,7 @@ def test_sm107_serves_only_extra_page_sizes(
     q_hidden_size = attn.num_heads * attn.head_dim
     qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
     q = torch.empty((num_tokens, qkv_hidden_size), dtype=torch.bfloat16)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         num_contexts=1 if is_context else 0,
         num_generations=0 if is_context else 1,
         helix_position_offsets=None,

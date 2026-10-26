@@ -53,8 +53,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from ..attention.backends.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention.backends.interface import AttentionMetadata, PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..distributed import (
     AllReduce,
@@ -1309,7 +1308,7 @@ class DeepseekV4MTPHead(nn.Module):
         self,
         hidden_states: torch.Tensor,
         lm_head: Linear,
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
         return_context_logits: bool = False,
     ) -> torch.Tensor:
         if not return_context_logits:
@@ -1372,7 +1371,7 @@ class DeepseekV4LogitsProcessor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         lm_head: Linear,
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
         return_context_logits: bool = False,
     ) -> torch.Tensor:
         if not self.model_config.mapping.is_last_pp_rank():
@@ -2128,7 +2127,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         self,
         position_ids: torch.IntTensor,
         hc_state,
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
         engram_embeddings=None,
@@ -2295,7 +2294,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
     def forward_MoE(
         self,
         hidden_states: torch.Tensor,
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
         *,
@@ -2484,7 +2483,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         embed_tokens: Embedding,
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
@@ -2636,7 +2635,7 @@ class DeepseekV4Model(DecoderModel):
 
     def forward(
         self,
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -2790,7 +2789,7 @@ class DeepseekV4Model(DecoderModel):
         self,
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor],
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
         *,
         token_mask: Optional[torch.Tensor] = None,
     ) -> Dict[int, torch.Tensor]:
@@ -2810,7 +2809,7 @@ class DeepseekV4Model(DecoderModel):
         layer_id: int,
         hash_indices: torch.Tensor,
         dtype: torch.dtype,
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         """Launch a lookup; sharded variants may first redistribute hash rows."""
         return self.layers[layer_id].engram.precompute(hash_indices, dtype=dtype)
@@ -3092,7 +3091,7 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
 
     def forward(
         self,
-        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        attn_metadata: AttentionMetadata,
         input_ids: torch.IntTensor = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,

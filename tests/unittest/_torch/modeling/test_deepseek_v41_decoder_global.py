@@ -12,6 +12,7 @@ from _deepseek_v41_test_utils import cache_config as shared_cache_config
 from _deepseek_v41_test_utils import model_and_config as shared_model_and_config
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
 cache_config = shared_cache_config
@@ -111,7 +112,7 @@ def test_explicit_global_production_matches_original(model_and_config, overlap, 
                 values.update(
                     {f"cache{i}": (v.clone().view(torch.uint8),) for i, v in enumerate(buffers)}
                 )
-                assert not metadata.csa2_precomputed_kv_layers
+                assert not metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers
                 runs.append(values)
             differences = []
             for run_id, run in enumerate(runs[1:], 1):

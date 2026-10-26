@@ -217,7 +217,7 @@ registration alone.
 
 | Algorithm | Sparse backend | Metadata | Cache manager |
 |---|---|---|---|
-| `csa2` | `CSA2TrtllmAttention`, with hardware-selected Flash helpers | `CSA2TrtllmMetadata` | `CSA2CacheManager` (V2) |
+| `csa2` | `CSA2TrtllmAttention`, with hardware-selected Flash helpers | `TrtllmAttentionMetadata` + `CSA2Metadata` | `CSA2CacheManager` (V2) |
 
 CSA2 implements DeepSeek-V4.1 compressed sparse MLA. Its module adapter owns
 compression and shared KV/index sources; per-phase query tiles feed selected
@@ -282,7 +282,8 @@ All backends implement the `AttentionBackend` interface.
 The core contract is:
 
 - `forward(q, k, v, metadata, forward_args=..., **kwargs)`
-- `Metadata` subtype
+- `Metadata` core family and `metadata_extensions`; build metadata with
+  `Backend.create_metadata(...)` so the backend's extensions are attached
 - `AttentionForwardArgs` for per-forward optional arguments such as masks,
   output buffers, scales, RoPE/mRoPE inputs, MLA buffers, and sparse inputs
 - coarse capability hooks:
@@ -352,14 +353,35 @@ metadata and cache behavior.
 All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
 parameters, runtime feature flags, and optional CUDA-graph buffer management.
-Sparse metadata subtypes consume only `SparseMetadataParams`, not
-backend-owned `SparseParams`.
+
+Everything a feature, a sparse algorithm or a model adds on top of a core
+family is a `MetadataExtension` (`backends/extensions.py`) attached to the
+metadata, not a metadata subclass. Callers reach one with `metadata.ext(T)`
+(raises when absent) or `metadata.find_ext(T)` (returns None). The metadata
+drives every extension through fixed hooks: `allocate()` on creation and on
+every CUDA-graph copy, `prepare_scope()` / `pre_derive_lengths()` /
+`override_kv_lens()` / `prepare()` / `post_derive()` around the core's
+`prepare()`, `on_kv_lens_changed()` after device-side length updates,
+`draft_swap()` / `draft_restore()` around a draft forward, and the
+attention-DP and workspace hooks. Extensions come from three places:
+
+- the core family's own configuration (`_default_extension_types()`), such as
+  `HelixMetadata`, `DraftKVMetadata`, `Fp4MlaState`, `SpecDecodingMetadata`
+  and `RecurrentMetadata`;
+- the backend's `metadata_extensions`, such as a sparse algorithm's
+  `SparseAlgorithmExtension` (at most one per metadata); and
+- the caller's `extension_types`, such as `FlashMlaMetadata`.
+
+Sparse algorithm extensions consume only `SparseMetadataParams`, not
+backend-owned `SparseParams`. Algorithms that share one MTP draft-loop
+selection subclass `MTPIndexShareExtension`.
 
 **`TrtllmAttentionMetadata`** is the main metadata family. It adds paged-KV
-block information, TRTLLM runtime state, chunked-prefill/speculative-decode/Helix
-state, and MLA-specific state. If a source attention needs paged KV, chunked
-prefill, FlashMLA, speculative decoding, or Helix-aware execution, the fit
-question is mostly a `TrtllmAttentionMetadata` fit question.
+block information, TRTLLM runtime state, and MLA-specific state; its features
+(speculative decoding, Helix, FlashMLA, FP4 MLA, separate draft KV cache) are
+extensions. If a source attention needs paged KV, chunked prefill, FlashMLA,
+speculative decoding, or Helix-aware execution, the fit question is mostly a
+`TrtllmAttentionMetadata` fit question.
 
 **`VanillaAttentionMetadata`** is lighter — base metadata plus simple
 cache-index information. Use it when the `Attention` module boundary fits but
@@ -368,9 +390,9 @@ the fused TRTLLM path is too restrictive.
 **`FlashInferAttentionMetadata`** adds a planning-oriented contract with
 workspace, page-table KV metadata, and prefill/decode wrapper state.
 
-**Sparse metadata** families extend the base backend metadata with
-sparse-specific runtime state (indexer buffers, routing state, side-cache
-state).
+**Sparse metadata** is a `SparseAlgorithmExtension` on a core family that
+holds sparse-specific runtime state (indexer buffers, routing state,
+side-cache state).
 
 `SparseRuntimeParams` is the backend-to-`AttentionOp` carrier only on the
 `TrtllmAttention` path. Its fields are algorithm-specific, not a generic
@@ -438,7 +460,7 @@ reuse is enabled (Encoder SWA is `PRIVATE` when reuse is disabled):
 | Decoder SWA | Per layer; same row format | `PRIVATE` for eligible bounded replay; ordinary lifecycle for full prefill |
 | Ratio-two compressor state | Source owners; FP32 partial-group values/scores | Managed with the owner's page lifecycle |
 
-`CSA2TrtllmMetadata.prepare()` publishes owner tables, compression inputs,
+Preparing `CSA2Metadata` publishes owner tables, compression inputs,
 visibility and SWA read/write slots. Live accepted-length updates refresh
 captured buffers in place. Graph clones share reserved index arenas and query
 tiles; eager shape eviction must preserve every graph-owned allocation.

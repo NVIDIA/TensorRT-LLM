@@ -30,6 +30,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
+from ..attention.backends.features import RecurrentMetadata
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from .interface import SpecMetadata, SpecWorkerBase
 from .suffix_automaton import SuffixAutomatonManager
@@ -189,7 +190,7 @@ class SAWorker(SpecWorkerBase):
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
+                state_indices=attn_metadata.ext(RecurrentMetadata).mamba_metadata.state_indices,
             )
 
         # Step 3-4: Extend SA and generate next draft tokens using GPU kernel

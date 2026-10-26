@@ -29,8 +29,11 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention.backends.sparse.dsa import (
-    DSACacheManagerV2, DSAtrtllmAttentionMetadata)
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import \
+    SpecDecodingMetadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
+from tensorrt_llm._torch.attention.backends.sparse.params import \
+    MTPIndexShareExtension
 from tensorrt_llm._torch.attention.backends.trtllm import \
     TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -59,11 +62,7 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     state = {}
     draft_manager = object.__new__(DSACacheManagerV2)
 
-    class _Metadata(DSAtrtllmAttentionMetadata):
-
-        def __init__(self):
-            self._seq_lens_cuda = torch.tensor([1], dtype=torch.int32)
-            self._num_ctx_tokens = 0
+    class _IndexShare(MTPIndexShareExtension):
 
         def set_in_mtp_draft_loop(self, active):
             state["in_mtp_draft_loop"] = active
@@ -73,6 +72,13 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
 
         def set_skip_topk(self, value):
             state["skip_topk"] = value
+
+    class _Metadata(TrtllmAttentionMetadata):
+
+        def __init__(self):
+            self._seq_lens_cuda = torch.tensor([1], dtype=torch.int32)
+            self._num_ctx_tokens = 0
+            self.replace_ext(_IndexShare(self))
 
         def on_update_kv_lens(self):
             events.append("refresh")
@@ -144,11 +150,11 @@ def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
 
     metadata.update_spec_dec_param(is_spec_dec_dynamic_tree=True,
                                    **common_kwargs)
-    assert metadata.force_prepare_spec_dec_tree_mask
+    assert metadata.ext(SpecDecodingMetadata).force_prepare_tree_mask
 
     metadata.update_spec_dec_param(is_spec_dec_dynamic_tree=False,
                                    **common_kwargs)
-    assert not metadata.force_prepare_spec_dec_tree_mask
+    assert not metadata.ext(SpecDecodingMetadata).force_prepare_tree_mask
 
 
 def test_mtp_dynamic_tree_relocation_uses_full_attention_window(
@@ -588,7 +594,7 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
     attn_metadata = TrtllmAttentionMetadata(**metadata_kwargs)
     if spec_signal == "is_spec_decoding_enabled":
-        attn_metadata.is_spec_decoding_enabled = True
+        attn_metadata.ext(SpecDecodingMetadata).is_spec_decoding_enabled = True
     elif spec_signal == "has_speculative_draft_tokens":
         attn_metadata.runtime_features.has_speculative_draft_tokens = True
 

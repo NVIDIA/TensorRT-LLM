@@ -87,7 +87,7 @@ def _run_context(
         sparse_params=sparse_params,
     )
 
-    metadata = AttentionCls.Metadata(
+    metadata = AttentionCls.create_metadata(
         max_num_requests=len(seq_lens),
         max_num_tokens=8192,
         kv_cache_manager=None,

@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 from torch import nn
 
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -132,7 +133,7 @@ def test_output_gate_runs_between_attention_and_output_projection(
 ) -> None:
     mla_layer = _OutputGateStub(register_to_config)
     hidden_states = torch.randn(2, 4)
-    attn_metadata = SimpleNamespace(num_contexts=0, num_tokens=2)
+    attn_metadata = metadata_stub(num_contexts=0, num_tokens=2)
 
     with patch.object(torch.ops.trtllm, "create_mla_outputs", return_value=mla_layer.attn_output):
         output = mla_layer.forward(None, hidden_states, attn_metadata)
@@ -241,7 +242,7 @@ def test_create_mla_outputs_custom_op_returns_tensor() -> None:
 
 def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
     mla_layer = _make_dsv4_epilogue_layer()
-    metadata = SimpleNamespace(num_contexts=1, num_generations=1)
+    metadata = metadata_stub(num_contexts=1, num_generations=1)
     hidden_states = torch.empty(8, 16)
 
     with (
@@ -265,7 +266,7 @@ def test_dsv4_epilogue_fusion_supports_sm107_direct_output(
     num_contexts: int, num_generations: int
 ) -> None:
     mla_layer = _make_dsv4_epilogue_layer()
-    metadata = SimpleNamespace(num_contexts=num_contexts, num_generations=num_generations)
+    metadata = metadata_stub(num_contexts=num_contexts, num_generations=num_generations)
     hidden_states = torch.empty(8, 16)
 
     with (
@@ -286,7 +287,7 @@ def test_dsv4_epilogue_fusion_rejects_sm107_without_direct_output() -> None:
     mla_layer = _make_dsv4_epilogue_layer()
     fallback = torch.empty(8, 16)
     mla_layer.create_output.return_value = fallback
-    metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    metadata = metadata_stub(num_contexts=1, num_generations=0)
     hidden_states = torch.empty(8, 16)
 
     with (
@@ -302,7 +303,7 @@ def test_dsv4_epilogue_fusion_rejects_sm107_without_direct_output() -> None:
 
 def test_dsv4_fusion_create_output_uses_bucket_token_count() -> None:
     mla_layer = _make_dsv4_epilogue_layer()
-    metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    metadata = metadata_stub(num_contexts=1, num_generations=0)
     hidden_states = torch.empty(8, 16)
 
     with (

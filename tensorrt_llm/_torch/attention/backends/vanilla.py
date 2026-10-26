@@ -63,12 +63,12 @@ def generate_sliding_window_mask(batch_size: int, target_length: int,
 
 class VanillaAttentionMetadata(AttentionMetadata):
 
-    def __post_init__(self) -> None:
-        super().__post_init__()
+    def _post_init_core(self) -> None:
+        super()._post_init_core()
         self.kv_layout = "NHD"
 
-    def prepare(self) -> None:
-        super().prepare()
+    def _prepare_core(self) -> None:
+        super()._prepare_core()
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(

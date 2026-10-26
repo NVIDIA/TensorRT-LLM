@@ -31,6 +31,7 @@ from ...inputs import (
     register_input_processor,
 )
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.features import RecurrentMetadata
 from ..attention.backends.sparse.qsa.indexer import QSAIndexer
 from ..attention.backends.sparse.qsa.params import QSASparseParams
 from ..distributed import AllReduce, AllReduceParams, allgather
@@ -791,15 +792,16 @@ class Qwen4ExpModel(DecoderModel):
             )
 
         # Refresh mamba metadata for the batch size, mirroring Qwen3NextModel.
-        mamba_metadata = getattr(attn_metadata, "mamba_metadata", None)
+        recurrent = attn_metadata.find_ext(RecurrentMetadata)
+        mamba_metadata = recurrent.mamba_metadata if recurrent is not None else None
         if (
             mamba_metadata is not None
             and getattr(mamba_metadata, "max_batch_size", None) != attn_metadata.max_num_requests
         ):
-            attn_metadata.mamba_metadata = Mamba2Metadata(
+            recurrent.mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests, chunk_size=128
             )
-            mamba_metadata = attn_metadata.mamba_metadata
+            mamba_metadata = recurrent.mamba_metadata
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1119,7 +1121,7 @@ class Qwen4ExpMTP(Qwen4ExpDecoderLayer):
                 position_ids=position_ids,
                 hidden_states=hidden_states.flatten(start_dim=-2),
                 attn_metadata=attn_metadata,
-                mamba_metadata=attn_metadata.mamba_metadata,
+                mamba_metadata=attn_metadata.ext(RecurrentMetadata).mamba_metadata,
                 spec_metadata=spec_metadata,
                 **kwargs,
             )

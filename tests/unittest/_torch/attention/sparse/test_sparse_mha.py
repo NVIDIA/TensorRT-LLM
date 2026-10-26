@@ -33,17 +33,17 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import (
+    SpecDecodingMetadata,
+    generate_spec_decoding_packed_mask,
+    generate_spec_decoding_position_offsets,
+)
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseParams
-from tensorrt_llm._torch.attention.backends.trtllm import (
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
-    generate_spec_decoding_packed_mask,
-    generate_spec_decoding_position_offsets,
-)
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
@@ -275,28 +275,26 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
             runtime_features=AttentionRuntimeFeatures(
                 has_speculative_draft_tokens=scenario.has_draft_tokens
             ),
-            is_spec_decoding_enabled=scenario.has_draft_tokens,
-            use_spec_decoding=scenario.has_draft_tokens,
-            is_spec_dec_tree=False,
-            max_total_draft_tokens=(
-                scenario.max_query_len - 1 if scenario.has_draft_tokens else None
-            ),
+        )
+        spec = metadata.ext(SpecDecodingMetadata)
+        spec.is_spec_decoding_enabled = scenario.has_draft_tokens
+        spec.use_spec_decoding = scenario.has_draft_tokens
+        spec.max_total_draft_tokens = (
+            scenario.max_query_len - 1 if scenario.has_draft_tokens else None
         )
         if scenario.has_draft_tokens:
             draft_len = scenario.max_query_len - 1
-            metadata.spec_decoding_position_offsets = generate_spec_decoding_position_offsets(
+            spec.position_offsets = generate_spec_decoding_position_offsets(
                 scenario.batch_size, draft_len
             )
-            metadata.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
-                scenario.batch_size, draft_len
-            )
-            metadata.spec_decoding_generation_lengths = torch.tensor(
+            spec.packed_mask = generate_spec_decoding_packed_mask(scenario.batch_size, draft_len)
+            spec.generation_lengths = torch.tensor(
                 [scenario.query_len] * scenario.batch_size,
                 dtype=torch.int32,
                 device=device,
             )
-            metadata.update_position_offsets_for_cpp(scenario.max_query_len)
-            metadata.spec_decoding_param_prepare_for_blackwell()
+            spec.update_position_offsets_for_cpp(scenario.max_query_len)
+            spec.prepare_for_blackwell()
         metadata.prepare()
         cleanup.pop_all()
         return MhaGenerationInputs(

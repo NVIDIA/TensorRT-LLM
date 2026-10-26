@@ -30,6 +30,8 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
+from ..features import HelixMetadata
+from ..features.spec_decoding import find_spec_decoding
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
@@ -456,17 +458,19 @@ class CuteDslMlaFmha(PhasedFmha):
         # [0, K - (seq_len_q - 1) + t)). Tree / dynamic-tree spec-decode carries
         # an explicit packed mask the kernel cannot express, and an explicit
         # CUSTOM mask is likewise unsupported -> fall back to TRTLLM for those.
+        spec = find_spec_decoding(meta)
         if (
             fwd.attention_mask == CustomAttentionMask.CUSTOM
             or fwd.attention_mask_data is not None
-            or getattr(meta, "is_spec_dec_tree", False)
-            or getattr(meta, "is_spec_dec_dynamic_tree", False)
+            or (spec is not None and (spec.is_spec_dec_tree or spec.is_spec_dec_dynamic_tree))
         ):
             return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
-        if meta.helix_position_offsets is not None:
-            if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
+        helix = meta.find_ext(HelixMetadata)
+        helix_active = helix is not None and helix.position_offsets is not None
+        if helix_active:
+            if seq_len_q != 1 and not helix.spec_tokens_valid:
                 # Multi-token decode under helix needs the per-token bound /
                 # write-slot buffers of the speculative verify-group path.
                 return False, "CuTe DSL MLA FMHA only supports single-token decode with Helix."
@@ -495,11 +499,9 @@ class CuteDslMlaFmha(PhasedFmha):
         # _PERF_MIN_BATCH_FP8, which stays a pure measured-win table.
         # Single-token H=96 is already a measured table entry and still goes
         # through the gate. Helix with seq_len_q > 1 implies
-        # _helix_spec_tokens_valid -- the helix block above returns False
+        # spec_tokens_valid -- the helix block above returns False
         # otherwise.
-        helix_h96_verify_group = (
-            attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
-        )
+        helix_h96_verify_group = attn.num_heads == 96 and seq_len_q > 1 and helix_active
         # The same failure without Helix: an FP8-KV multi-token verify group
         # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
         # is not in the FP8 perf table, and on SM100/SM103 the next library is
@@ -512,7 +514,7 @@ class CuteDslMlaFmha(PhasedFmha):
         fp8_wide_head_verify_group = (
             64 < attn.num_heads < 128
             and seq_len_q > 1
-            and meta.helix_position_offsets is None
+            and not helix_active
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
             and get_sm_version() in (100, 103)
         )
@@ -571,6 +573,7 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> None:
         attn = params.attn
         meta = params.meta
+        helix = meta.find_ext(HelixMetadata)
 
         # dtype / batch / MLA-dim validity is already enforced before dispatch
         # (``is_available`` + ``_is_supported_with_reason`` + the kernel's
@@ -702,8 +705,12 @@ class CuteDslMlaFmha(PhasedFmha):
             # Per-token rank-local bounds, filled by
             # recompute_helix_spec_buffers. None everywhere else.
             (
-                meta.helix_kv_bounds[:num_tokens]
-                if (meta.helix_position_offsets is not None and meta._helix_spec_tokens_valid)
+                helix.kv_bounds[:num_tokens]
+                if (
+                    helix is not None
+                    and helix.position_offsets is not None
+                    and helix.spec_tokens_valid
+                )
                 else None
             ),
             block_split_kvs,

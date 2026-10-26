@@ -20,10 +20,12 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 from tensorrt_llm.mapping import Mapping
 
+from ..attention.backends.features import RecurrentMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
@@ -178,6 +180,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
         super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
         batch_size = attn_metadata.num_seqs
@@ -189,20 +192,18 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._saved_kv_lens_cuda = None
 
         # Restore verify metadata after the draft loop mutates it.
-        if attn_metadata.spec_decoding_packed_mask is not None:
-            self._saved_packed_mask = attn_metadata.spec_decoding_packed_mask[:batch_size].clone()
+        if spec.packed_mask is not None:
+            self._saved_packed_mask = spec.packed_mask[:batch_size].clone()
         else:
             self._saved_packed_mask = None
-        if attn_metadata.spec_decoding_position_offsets is not None:
-            self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone()
-            self._saved_position_offsets_cpp = attn_metadata.spec_decoding_position_offsets_cpp
+        if spec.position_offsets is not None:
+            self._saved_position_offsets = spec.position_offsets.clone()
+            self._saved_position_offsets_cpp = spec.position_offsets_cpp
         else:
             self._saved_position_offsets = None
             self._saved_position_offsets_cpp = None
-        if attn_metadata.spec_decoding_generation_lengths is not None:
-            self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[
-                :batch_size
-            ].clone()
+        if spec.generation_lengths is not None:
+            self._saved_generation_lengths = spec.generation_lengths[:batch_size].clone()
         else:
             self._saved_generation_lengths = None
 
@@ -212,6 +213,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         return position_ids, last_tokens_idx
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
 
         if self._saved_kv_lens_cuda is not None:
@@ -221,18 +223,16 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
         if self._saved_packed_mask is not None:
             batch_size = self._saved_packed_mask.shape[0]
-            attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(self._saved_packed_mask)
+            spec.packed_mask[:batch_size].copy_(self._saved_packed_mask)
             self._saved_packed_mask = None
         if self._saved_position_offsets is not None:
-            attn_metadata.spec_decoding_position_offsets.copy_(self._saved_position_offsets)
-            attn_metadata.spec_decoding_position_offsets_cpp = self._saved_position_offsets_cpp
+            spec.position_offsets.copy_(self._saved_position_offsets)
+            spec.position_offsets_cpp = self._saved_position_offsets_cpp
             self._saved_position_offsets = None
             self._saved_position_offsets_cpp = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
-            attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
-                self._saved_generation_lengths
-            )
+            spec.generation_lengths[:batch_size].copy_(self._saved_generation_lengths)
             self._saved_generation_lengths = None
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
@@ -245,7 +245,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             return
         (
             attn_metadata.all_rank_num_tokens,
-            attn_metadata.force_prepare_spec_dec_tree_mask,
+            attn_metadata.ext(SpecDecodingMetadata).force_prepare_tree_mask,
         ) = self._saved_extra_state
         self._saved_extra_state = None
 
@@ -254,24 +254,18 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
     # ------------------------------------------------------------------ #
     def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
         """Set spec-dec gen lengths and refresh the C++ position-offset view."""
-        attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
-        attn_metadata.update_position_offsets_for_cpp(query_len)
+        attn_metadata.ext(SpecDecodingMetadata).generation_lengths[:batch_size] = query_len
+        attn_metadata.ext(SpecDecodingMetadata).update_position_offsets_for_cpp(query_len)
 
     def _refresh_blackwell_tree_mask_metadata(self, attn_metadata):
-        if not getattr(attn_metadata, "use_spec_decoding", False):
-            return
-        if not getattr(attn_metadata, "is_spec_dec_dynamic_tree", False):
-            return
-
-        first_sparse = getattr(attn_metadata, "spec_bl_tree_first_sparse_mask_offset_kv", None)
-        bl_tree_mask = getattr(attn_metadata, "spec_decoding_bl_tree_mask", None)
-        if first_sparse is None and bl_tree_mask is None:
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
+        if spec is None or not spec.use_spec_decoding or not spec.is_spec_dec_dynamic_tree:
             return
 
-        if bl_tree_mask is not None:
-            bl_tree_mask.zero_()
-        if first_sparse is not None:
-            attn_metadata.update_blackwell_first_sparse_mask_offset()
+        if spec.bl_tree_mask is not None:
+            spec.bl_tree_mask.zero_()
+        if spec.bl_tree_first_sparse_mask_offset_kv is not None:
+            spec.update_blackwell_first_sparse_mask_offset()
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
         """Compact padded masks into the flat prefix XQA expects."""
@@ -401,13 +395,14 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self, cur_draft_idx, attn_metadata, selected_parents=None
     ):
         """Prepare mask and position offsets for the next draft layer."""
-        if attn_metadata.spec_decoding_packed_mask is None:
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
+        if spec.packed_mask is None:
             return
         spec_tree_manager = self.spec_tree_manager
         batch_size = attn_metadata.num_seqs
         num_tokens_current_layer = self.K * (cur_draft_idx + 1)
         num_tokens_previous_layer = self.K * cur_draft_idx
-        packed_mask = attn_metadata.spec_decoding_packed_mask
+        packed_mask = spec.packed_mask
         if cur_draft_idx == 0:
             spec_tree_manager.compute_spec_dec_packed_mask(
                 self.tree_mask_init_buffer[:batch_size],
@@ -416,7 +411,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self.tree_mask_buffer[
                 : batch_size * num_tokens_current_layer * num_tokens_current_layer
             ].copy_(self.tree_mask_init_buffer[:batch_size].view(-1))
-            attn_metadata.spec_decoding_position_offsets.fill_(0)
+            spec.position_offsets.fill_(0)
             self._apply_spec_metadata(attn_metadata, batch_size, num_tokens_current_layer)
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
@@ -425,9 +420,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             )
 
             prev_total = batch_size * num_tokens_previous_layer
-            previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
-                :prev_total
-            ].view(batch_size, num_tokens_previous_layer)
+            previous_position_offsets = spec.position_offsets[:prev_total].view(
+                batch_size, num_tokens_previous_layer
+            )
 
             current_mask, new_positions = _build_mask_and_position(
                 parent_mask,
@@ -445,7 +440,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             ].copy_(current_mask.reshape(-1))
 
             cur_total = batch_size * num_tokens_current_layer
-            attn_metadata.spec_decoding_position_offsets[:cur_total] = new_positions.reshape(-1)
+            spec.position_offsets[:cur_total] = new_positions.reshape(-1)
             self._apply_spec_metadata(attn_metadata, batch_size, num_tokens_current_layer)
 
         if self._needs_mask_repack:
@@ -703,7 +698,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
+                state_indices=attn_metadata.ext(RecurrentMetadata).mamba_metadata.state_indices,
                 accepted_leaf_positions=accepted_leaf_positions,
             )
 
@@ -712,10 +707,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         # draft loop raises (see SpecWorkerBase.forward try/finally).
         self._saved_extra_state = (
             attn_metadata.all_rank_num_tokens,
-            attn_metadata.force_prepare_spec_dec_tree_mask,
+            attn_metadata.ext(SpecDecodingMetadata).force_prepare_tree_mask,
         )
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
-        attn_metadata.force_prepare_spec_dec_tree_mask = True
+        attn_metadata.ext(SpecDecodingMetadata).force_prepare_tree_mask = True
 
         # (c) Run the MTP draft tree loop -> build + store the next tree.
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
@@ -738,10 +733,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         (
             attn_metadata.all_rank_num_tokens,
-            attn_metadata.force_prepare_spec_dec_tree_mask,
+            attn_metadata.ext(SpecDecodingMetadata).force_prepare_tree_mask,
         ) = self._saved_extra_state
         self._saved_extra_state = None
-        attn_metadata.use_spec_decoding = True
+        attn_metadata.ext(SpecDecodingMetadata).use_spec_decoding = True
 
         # (d) Prepare next_new_tokens for overlap scheduler.
         next_new_tokens = self._prepare_next_new_tokens(
@@ -876,6 +871,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         batch_size,
     ):
         """Draft the next dynamic tree with growing context."""
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
         spec_tree_manager = self.spec_tree_manager
 
         assert batch_size <= self._max_batch_size, (
@@ -898,21 +894,19 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
         # Reset verify-time tree metadata to accepted-path width.
         num_step0_tokens = self._max_path_len
-        if attn_metadata.spec_decoding_generation_lengths is not None:
+        if spec.generation_lengths is not None:
             total = num_gens * num_step0_tokens
-            dst = attn_metadata.spec_decoding_position_offsets[:total].view(
-                num_gens, num_step0_tokens
-            )
+            dst = spec.position_offsets[:total].view(num_gens, num_step0_tokens)
             dst.copy_(self._causal_offs[:num_step0_tokens].unsqueeze(0).expand(num_gens, -1))
             self._apply_spec_metadata(attn_metadata, num_gens, num_step0_tokens)
-            packed_mask = attn_metadata.spec_decoding_packed_mask
+            packed_mask = spec.packed_mask
             packed_mask[:num_gens].zero_()
             packed_mask[:num_gens, :num_step0_tokens, 0] = self._step0_causal_mask[
                 :num_step0_tokens
             ]
             if self._needs_mask_repack:
                 self._repack_mask_padded_to_packed(packed_mask, num_gens, num_step0_tokens)
-        attn_metadata.use_spec_decoding = num_gens > 0
+        spec.use_spec_decoding = num_gens > 0
         if num_gens > 0 and hasattr(attn_metadata, "kv_lens_cuda"):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self._kv_correction
         self._refresh_blackwell_tree_mask_metadata(attn_metadata)
@@ -1073,7 +1067,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                         self._max_path_len
                     ) - num_accepted_tokens[num_contexts:batch_size]
                 attn_metadata.kv_lens_cuda[:batch_size] += self.K
-            attn_metadata.use_spec_decoding = True
+            attn_metadata.ext(SpecDecodingMetadata).use_spec_decoding = True
             self._refresh_blackwell_tree_mask_metadata(attn_metadata)
         else:
             num_tokens_previous_layer = cur_draft_idx * self.K

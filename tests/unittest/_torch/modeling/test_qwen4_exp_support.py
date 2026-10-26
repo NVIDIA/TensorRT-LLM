@@ -10,6 +10,16 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
+
+
+def _recurrent_stub(mamba_metadata, **fields) -> SimpleNamespace:
+    """A metadata stub serving ``mamba_metadata`` through its recurrent extension."""
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: recurrent if cls is RecurrentMetadata else None
+    return metadata
+
 
 def _text_config_dict() -> dict:
     return {
@@ -289,7 +299,7 @@ def test_multimodal_forward_uses_original_token_ids_for_ple(monkeypatch) -> None
     monkeypatch.setattr(Qwen4ExpModel, "_prepare_ple_state", capture_ple_ids)
     orig_input_ids = torch.tensor([10, 11, 12])
     inputs_embeds = torch.randn(3, 8)
-    attn_metadata = SimpleNamespace(mamba_metadata=None, max_num_requests=1)
+    attn_metadata = _recurrent_stub(mamba_metadata=None, max_num_requests=1)
 
     output = model(
         attn_metadata=attn_metadata,
@@ -309,7 +319,7 @@ def test_multimodal_forward_requires_original_token_ids_on_a_ple_rank() -> None:
     model.model_config = SimpleNamespace(mapping=SimpleNamespace(has_pp=lambda: False))
     model.has_ple = True
     model.ple_layer_index = 0
-    attn_metadata = SimpleNamespace(mamba_metadata=None, max_num_requests=1)
+    attn_metadata = _recurrent_stub(mamba_metadata=None, max_num_requests=1)
 
     with pytest.raises(ValueError, match="requires original token IDs"):
         model(
@@ -361,7 +371,7 @@ def test_model_forward_aborts_unconsumed_ple_prefetch(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="simulated layer failure"):
         model(
-            attn_metadata=SimpleNamespace(mamba_metadata=None, max_num_requests=1),
+            attn_metadata=_recurrent_stub(mamba_metadata=None, max_num_requests=1),
             inputs_embeds=torch.randn(1, 8),
             orig_input_ids=torch.ones(1, dtype=torch.long),
         )
@@ -1372,7 +1382,7 @@ def test_mtp_worker_commits_hybrid_target_state(monkeypatch) -> None:
     worker._is_mamba_hybrid_cache = None
     state_indices = torch.tensor([3], dtype=torch.int32)
     accepted = torch.tensor([2], dtype=torch.int32)
-    attn_metadata = SimpleNamespace(
+    attn_metadata = _recurrent_stub(
         num_contexts=0,
         kv_cache_manager=manager,
         mamba_metadata=SimpleNamespace(state_indices=state_indices),

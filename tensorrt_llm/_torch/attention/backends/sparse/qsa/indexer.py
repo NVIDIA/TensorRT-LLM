@@ -22,12 +22,12 @@ from .constants import (
     QSA_INDEX_K_CACHE_DTYPE,
     QSA_POSITION_COORDINATE_AXES,
 )
+from .metadata import QSAMetadata
 from .params import QSASparseParams
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.attention import Attention
-
-    from .metadata import QSAAttentionMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 _GROUP_START_MEMBER = 0
@@ -79,17 +79,21 @@ def _position_coordinates(position_ids: torch.Tensor, num_tokens: int) -> torch.
 
 
 def _logical_to_pages(
-    metadata: "QSAAttentionMetadata",
+    metadata: "TrtllmAttentionMetadata",
     request_indices: torch.Tensor,
     logical_positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens_per_block = metadata.kv_cache_manager.tokens_per_block
     logical_positions = logical_positions.to(torch.long)
     page_columns = logical_positions // tokens_per_block
-    pages = metadata.qsa_block_table[
-        request_indices.to(torch.long),
-        page_columns,
-    ].to(torch.long)
+    pages = (
+        metadata.ext(QSAMetadata)
+        .block_table[
+            request_indices.to(torch.long),
+            page_columns,
+        ]
+        .to(torch.long)
+    )
     within = logical_positions % tokens_per_block
     return pages, within
 
@@ -281,7 +285,7 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         layer_idx: int,
-        metadata: "QSAAttentionMetadata",
+        metadata: "TrtllmAttentionMetadata",
     ) -> torch.Tensor:
         """Project the index Q/K and update its paged side cache.
 
@@ -290,6 +294,7 @@ class QSAIndexer(nn.Module):
         speculative verification, CPU execution, and unsupported RoPE layouts
         retain the reference path below.
         """
+        qsa = metadata.find_ext(QSAMetadata)
         num_tokens = hidden_states.shape[0]
         qk = self.index_qk_proj(hidden_states)
         q_width = self.params.index_n_heads * self.params.index_head_dim
@@ -337,9 +342,9 @@ class QSAIndexer(nn.Module):
                 q=q_raw,
                 token_k=token_k,
                 position_coordinates=coordinates,
-                request_indices=metadata.qsa_req_idx_per_token[:num_tokens],
-                logical_positions=metadata.qsa_logical_positions[:num_tokens],
-                block_table=metadata.qsa_block_table,
+                request_indices=qsa.req_idx_per_token[:num_tokens],
+                logical_positions=qsa.logical_positions[:num_tokens],
+                block_table=qsa.block_table,
                 index_cache=index_cache,
                 position_cache=position_cache,
                 q_norm_weight=self.q_layernorm.weight,
@@ -366,7 +371,7 @@ class QSAIndexer(nn.Module):
         layer_idx: int,
         token_k: torch.Tensor,
         position_coordinates: torch.Tensor,
-        metadata: "QSAAttentionMetadata",
+        metadata: "TrtllmAttentionMetadata",
     ) -> None:
         """Store raw index keys and replace completed group anchors.
 
@@ -376,9 +381,10 @@ class QSAIndexer(nn.Module):
         index side cache is overwritten; the main K/V cache retains every raw
         token required by exact sparse attention.
         """
+        qsa = metadata.find_ext(QSAMetadata)
         num_tokens = token_k.shape[0]
-        req_idx = metadata.qsa_req_idx_per_token[:num_tokens]
-        logical = metadata.qsa_logical_positions[:num_tokens]
+        req_idx = qsa.req_idx_per_token[:num_tokens]
+        logical = qsa.logical_positions[:num_tokens]
         pages, within = _logical_to_pages(metadata, req_idx, logical)
         index_cache = metadata.kv_cache_manager.get_index_k_buffer(layer_idx)
         position_cache = metadata.kv_cache_manager.get_qsa_position_buffer()
@@ -418,7 +424,7 @@ class QSAIndexer(nn.Module):
             triton_qsa_prefill_compress(
                 logical_positions=logical,
                 request_indices=req_idx,
-                block_table=metadata.qsa_block_table,
+                block_table=qsa.block_table,
                 index_cache=index_cache,
                 position_cache=position_cache,
                 k_norm_weight=self.k_layernorm.weight,
@@ -512,7 +518,7 @@ class QSAIndexer(nn.Module):
         within: torch.Tensor,
         index_cache: torch.Tensor,
         position_cache: torch.Tensor,
-        metadata: "QSAAttentionMetadata",
+        metadata: "TrtllmAttentionMetadata",
     ) -> None:
         """Snapshot QSA side-cache entries that target verification may reject."""
         self._pending_speculative_cache = None
@@ -524,7 +530,7 @@ class QSAIndexer(nn.Module):
             return
         # Mixed-IFB forwards are eager. Derive this branch once from the host
         # query lengths rather than synchronizing a device reduction per layer.
-        if not metadata.is_cuda_graph and not metadata.qsa_needs_speculative_snapshot:
+        if not metadata.is_cuda_graph and not metadata.ext(QSAMetadata).needs_speculative_snapshot:
             return
         seq_lens = metadata.seq_lens_cuda[:num_seqs].to(torch.long)
         generation_lens = seq_lens[num_contexts:]

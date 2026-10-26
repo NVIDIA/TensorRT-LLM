@@ -9,6 +9,8 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.features import RecurrentMetadata
+from ..attention.backends.fp4_mla.state import Fp4MlaState
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -299,7 +301,8 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
+                state_indices=attn_metadata.ext(
+                    RecurrentMetadata).mamba_metadata.state_indices,
             )
 
     def _forward_impl(
@@ -437,7 +440,8 @@ class MTPWorker(SpecWorkerBase):
         if self._auxiliary_state_handlers:
             self.commit_auxiliary_speculative_states(
                 num_accepted_tokens,
-                attn_metadata.mamba_metadata.state_indices[:batch_size],
+                attn_metadata.ext(RecurrentMetadata).mamba_metadata.
+                state_indices[:batch_size],
                 attn_metadata.num_contexts,
             )
 
@@ -951,7 +955,7 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size].clamp_(
                 min=runtime_draft_len)
             attn_metadata.on_update_kv_lens()
-            if getattr(attn_metadata, "fp4_mla_state", None) is not None:
+            if attn_metadata.find_ext(Fp4MlaState) is not None:
                 attn_metadata.update_for_spec_dec()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:

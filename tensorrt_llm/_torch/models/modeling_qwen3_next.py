@@ -45,6 +45,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.features import RecurrentMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
@@ -1104,10 +1105,11 @@ class Qwen3NextModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        mamba_metadata = attn_metadata.mamba_metadata
-        if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            attn_metadata.mamba_metadata = Mamba2Metadata(
+        recurrent = attn_metadata.ext(RecurrentMetadata)
+        if recurrent.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
+            recurrent.mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests, chunk_size=128)
+        mamba_metadata = recurrent.mamba_metadata
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)

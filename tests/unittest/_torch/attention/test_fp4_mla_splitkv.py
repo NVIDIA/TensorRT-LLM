@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Split-KV reduction and per-bucket CUDA Graph workspace regressions."""
 
-import copy
 import importlib
 from types import ModuleType, SimpleNamespace
 
@@ -105,7 +104,14 @@ def test_splitkv_reduce_strides_empty_splits_and_graph_replay(
 
 def test_splitkv_workspace_is_sized_per_graph_bucket() -> None:
     adapter = _module("fp4_mla_splitkv")
+    state_module = _module("state")
     heads, columns, splits, query_capacity = 128, 512, 4, 32
+
+    def metadata_stub(is_cuda_graph: bool) -> SimpleNamespace:
+        state = SimpleNamespace(workspaces={})
+        metadata = SimpleNamespace(is_cuda_graph=is_cuda_graph)
+        metadata.find_ext = lambda cls: state if cls is state_module.Fp4MlaState else None
+        return metadata
 
     def partial_launch(*args, split_kv_buffers, **kwargs) -> None:
         # Isolate workspace ownership from the main attention kernel. These CUDA
@@ -121,15 +127,11 @@ def test_splitkv_workspace_is_sized_per_graph_bucket() -> None:
         FP4_MLA_P_GLOBAL_SCALE=1.0,
         run_trtllm_fp4_mla_decode_page_native_from_raw=partial_launch,
     )
-    base_metadata = SimpleNamespace(
-        is_cuda_graph=False, fp4_mla_state=SimpleNamespace(workspaces={})
-    )
+    base_metadata = metadata_stub(is_cuda_graph=False)
     buckets = []
     storage_pointers = set()
     for queries in [1, 4, 8]:
-        metadata = copy.copy(base_metadata)
-        metadata.is_cuda_graph = True
-        metadata.fp4_mla_state = SimpleNamespace(workspaces={})
+        metadata = metadata_stub(is_cuda_graph=True)
         q = torch.full((queries, heads, 320), queries, dtype=torch.uint8, device="cuda")
         sf = torch.zeros((queries, heads, 40), dtype=torch.uint8, device="cuda")
         output = torch.empty((queries, heads, columns), dtype=torch.bfloat16, device="cuda")
@@ -176,7 +178,7 @@ def test_splitkv_workspace_is_sized_per_graph_bucket() -> None:
         forward()
         workspace = {
             key: value
-            for key, value in metadata.fp4_mla_state.workspaces.items()
+            for key, value in state_module.find_fp4_mla(metadata).workspaces.items()
             if key.startswith("_fp4_mla_splitkv_")
         }
         tasks = splits * queries
@@ -209,8 +211,8 @@ def test_splitkv_workspace_is_sized_per_graph_bucket() -> None:
             graph.replay()
             torch.testing.assert_close(output, torch.full_like(output, value), rtol=0, atol=0)
             for name, pointer in pointers.items():
-                assert metadata.fp4_mla_state.workspaces[name].data_ptr() == pointer
-    assert not base_metadata.fp4_mla_state.workspaces
+                assert state_module.find_fp4_mla(metadata).workspaces[name].data_ptr() == pointer
+    assert not state_module.find_fp4_mla(base_metadata).workspaces
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

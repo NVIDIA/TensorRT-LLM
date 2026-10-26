@@ -139,7 +139,7 @@ def test_optimized_two_pool_prefill_and_decode(
 
     def forward(begin, end, context):
         nonlocal decode_graph, native_output
-        metadata = backend.Metadata(
+        metadata = backend.create_metadata(
             seq_lens=torch.tensor([end - begin] * batch, dtype=torch.int32),
             num_contexts=batch if context else 0,
             kv_cache_params=KVCacheParams(
@@ -473,7 +473,7 @@ def test_mla_cached_context_and_decode(backend):
                 )
                 assert cache.resize(end)
                 manager._restore_page_index_bufs(0, cache)
-            metadata = backend.Metadata(
+            metadata = backend.create_metadata(
                 seq_lens=torch.tensor([end - begin], dtype=torch.int32),
                 num_contexts=int(context),
                 kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[begin]),

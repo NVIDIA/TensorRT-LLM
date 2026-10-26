@@ -33,6 +33,7 @@ import torch
 
 from tensorrt_llm._utils import get_sm_version
 
+from ...features import RecurrentMetadata
 from ...interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -241,7 +242,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                 "glm_kpool metadata has no kv_cache_manager; the hybrid "
                 "KVCacheManagerV2 owns the latent/indexer pools"
             )
-        mamba_metadata = metadata.mamba_metadata
+        mamba_metadata = metadata.ext(RecurrentMetadata).mamba_metadata
         assert isinstance(mamba_metadata, Glm5NextMamba2Metadata), (
             "glm_kpool requires Glm5NextMamba2Metadata"
         )

@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...attention.backends import AttentionMetadata
+from ...attention.backends.features import RecurrentMetadata
 from ...model_config import ModelConfig
 from ...peft.lora.layer import LoraLayer, LoraModuleType
 from ...pyexecutor.breakable_cuda_graph import (eager_on_graph,
@@ -83,9 +84,10 @@ def mamba2_custom_op_inplace(zxbcdt: torch.Tensor, layer_idx: str,
     # every surrounding piece stays uniform in the num_tokens dim.
     attn_metadata, mamba_layer, spec_metadata = _extract_mamba2_extra_attrs(
         layer_idx)
-    mamba_layer.forward_core(zxbcdt, attn_metadata,
-                             attn_metadata.mamba_metadata, spec_metadata,
-                             ssm_out)
+    mamba_layer.forward_core(
+        zxbcdt, attn_metadata,
+        attn_metadata.ext(RecurrentMetadata).mamba_metadata, spec_metadata,
+        ssm_out)
 
 
 maybe_bcg_mamba2_custom_op_inplace = eager_on_graph(mamba2_custom_op_inplace)

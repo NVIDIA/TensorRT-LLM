@@ -12,10 +12,9 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.sparse.rocket import (
     RocketKVCacheManager,
+    RocketMetadata,
     RocketTrtllmAttention,
-    RocketTrtllmAttentionMetadata,
     RocketVanillaAttention,
-    RocketVanillaAttentionMetadata,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -140,7 +139,7 @@ def create_test_metadata(
     request_ids,
     kv_cache_manager,
     sparse_attn_config,
-    metadata_cls,
+    backend_cls,
 ):
     sparse_metadata_params = sparse_attn_config.to_sparse_metadata_params()
     prompt_lens = []
@@ -150,7 +149,7 @@ def create_test_metadata(
         else:
             prompt_lens.append(past_token + seq_len)
 
-    metadata = metadata_cls(
+    metadata = backend_cls.create_metadata(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int),
         num_contexts=num_contexts,
         kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
@@ -291,7 +290,7 @@ def test_sparse_kv_predict(batch_size, num_contexts):
         request_ids,
         trtllm_kv_cache_manager,
         sparse_attn_config,
-        RocketTrtllmAttentionMetadata,
+        RocketTrtllmAttention,
     )
     _ = create_test_metadata(
         seq_lens,
@@ -300,7 +299,7 @@ def test_sparse_kv_predict(batch_size, num_contexts):
         request_ids,
         vanilla_kv_cache_manager,
         sparse_attn_config,
-        RocketVanillaAttentionMetadata,
+        RocketVanillaAttention,
     )
 
     total_tokens = sum(seq_lens)
@@ -518,7 +517,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         request_ids,
         trtllm_kv_cache_manager,
         sparse_attn_config_trtllm,
-        RocketTrtllmAttentionMetadata,
+        RocketTrtllmAttention,
     )
     vanilla_metadata = create_test_metadata(
         seq_lens,
@@ -527,7 +526,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         request_ids,
         vanilla_kv_cache_manager,
         sparse_attn_config_vanilla,
-        RocketVanillaAttentionMetadata,
+        RocketVanillaAttention,
     )
 
     total_tokens = sum(seq_lens)
@@ -552,8 +551,8 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         trtllm_kt_tokens_per_block = trtllm_kv_cache_manager.kt_tokens_per_block
         vanilla_kv_cache_manager.kt_tokens_per_block
 
-        trtllm_block_offsets = trtllm_metadata.kt_cache_block_offsets
-        vanilla_block_offsets = vanilla_metadata.kt_cache_block_offsets
+        trtllm_block_offsets = trtllm_metadata.ext(RocketMetadata).kt_cache_block_offsets
+        vanilla_block_offsets = vanilla_metadata.ext(RocketMetadata).kt_cache_block_offsets
 
         for req_idx in range(num_contexts, batch_size):
             # Get the number of KT tokens for this request

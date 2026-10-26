@@ -20,6 +20,7 @@ from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 from packaging.version import Version
 
 import tensorrt_llm._torch.attention.backends.fmha.prims_ts as prims_ts_module
@@ -229,7 +230,7 @@ def _support_result(
                 dtype=torch.int32,
             ),
         )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         helix_position_offsets=None,
         num_sparse_topk=0,
         use_spec_decoding=use_spec_decoding,
@@ -418,7 +419,7 @@ def test_is_supported_accepts_and_forwards_phase_keyword(
     support_check = Mock(return_value=(True, ""))
     monkeypatch.setattr(fmha, "_is_supported_with_reason", support_check)
     q = Mock(spec=torch.Tensor)
-    metadata = SimpleNamespace()
+    metadata = metadata_stub()
     forward_args = AttentionForwardArgs()
 
     assert fmha.is_supported(
@@ -788,7 +789,7 @@ def test_v2_total_page_bound_is_not_expanded() -> None:
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     get_page_index_upper_bound = Mock(return_value=4096)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_manager=_make_v2_manager(
             impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
         )
@@ -803,7 +804,7 @@ def test_v1_total_page_bound_excludes_slots_before_selected_layer(is_mla: bool) 
     attn = _Attention(is_mla=is_mla)
     attn.local_layer_idx = 3
     fmha = PrimsTSFmha(attn)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_manager=_make_v1_manager(
             impl=SimpleNamespace(
                 get_primary_pool_data=lambda _: torch.empty(64, dtype=torch.uint8)
@@ -821,7 +822,7 @@ def test_v1_total_page_bound_excludes_slots_before_selected_layer(is_mla: bool) 
 def test_kv_page_offset_uses_v2_manager_displacement() -> None:
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_manager=_make_v2_manager(
             impl=SimpleNamespace(get_page_index_upper_bound=lambda *args: 128),
             kv_offset=torch.tensor([0, 128]),
@@ -847,7 +848,7 @@ def test_kv_page_offset_is_inferred_from_v1_host_tables() -> None:
         [[[[0, 1, 2], [64, 65, 66]], [[3, 4, 5], [67, 68, 69]]]],
         dtype=torch.int32,
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_manager=_make_v1_manager(
             impl=SimpleNamespace(),
             host_kv_cache_block_offsets=host_offsets,
@@ -975,7 +976,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         ],
         dtype=torch.int32,
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_block_offsets=torch.empty((3, 2, 4), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
@@ -1183,7 +1184,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     )
 
     get_page_index_upper_bound = Mock(return_value=12)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         beam_width=1,
         kv_cache_block_offsets=torch.empty((2, 2, 4), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
@@ -1528,7 +1529,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         wrapper_factory,
     )
 
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         is_cuda_graph=False,
         beam_width=1,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
@@ -1835,7 +1836,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     )
 
     get_page_index_upper_bound = Mock(return_value=20)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         is_cuda_graph=is_cuda_graph,
         beam_width=1,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
@@ -1940,7 +1941,7 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 1
     q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         is_cuda_graph=is_cuda_graph,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         max_num_requests=2,
@@ -1995,7 +1996,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
     wrapper = Mock()
     fmha._mla_decode_wrappers[2] = wrapper
     q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         is_cuda_graph=True,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         max_num_requests=2,
@@ -2033,7 +2034,7 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 1
     q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         is_cuda_graph=False,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         max_num_requests=2,
@@ -2079,7 +2080,7 @@ def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 1
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_block_offsets=torch.empty((2, 2, 4), dtype=torch.int32),
         max_num_requests=2,
         num_contexts=0,
@@ -2139,7 +2140,7 @@ def test_decode_workspace_tail_is_stable_across_mixed_context_layouts(
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 1
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_block_offsets=torch.empty((4, 2, 4), dtype=torch.int32),
         max_num_requests=4,
         num_contexts=2,
@@ -2185,7 +2186,7 @@ def test_workspace_cannot_grow_during_capture(monkeypatch: pytest.MonkeyPatch) -
         "get_prims_ts_batch_decode_workspace_size",
         lambda *args, **kwargs: 32,
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_block_offsets=torch.empty((2, 2, 4), dtype=torch.int32),
         max_num_requests=2,
         num_contexts=0,
@@ -2262,7 +2263,7 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
         else fmha.context_out_head_size
     )
     output = torch.empty((num_tokens, attn.num_heads * out_head_size))
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_block_offsets=torch.empty(1),
         effective_workspace=torch.empty(0, dtype=torch.int8),
         num_contexts=1,
@@ -2348,7 +2349,7 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
     output = torch.empty(
         (batch_size * seq_len, attn.num_heads * attn.head_dim), dtype=torch.bfloat16
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_manager=None,
         num_contexts=batch_size,
         num_generations=0,

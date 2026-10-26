@@ -68,10 +68,11 @@ from ...interface import (
     AttentionMetadata,
     merge_attention_forward_args,
 )
+from ...trtllm import TrtllmAttentionMetadata
 from .common import _INIT_SCORE, _LOCAL_SCORE, MiniMaxM3SparseConfig, write_kv_slots
 from .triton_kernels import triton_block_max_score, triton_sparse_softmax
 from .triton_metadata import (
-    MiniMaxM3AttentionMetadata,
+    MiniMaxM3TritonMetadata,
     MiniMaxM3TritonSparseAttentionMetadata,
     ensure_metadata_on_device,
 )
@@ -121,7 +122,7 @@ def _gather_paged_batched(
 
     ``req_to_token`` and ``slot_ids`` must already live on the cache
     device — the production
-    :class:`MiniMaxM3AttentionMetadata.prepare` builds them there, and
+    :class:`MiniMaxM3TritonMetadata.prepare` builds them there, and
     test callers do the same. ``.to(dtype=torch.long)`` below is a
     same-device dtype conversion (capture-safe).
     """
@@ -918,7 +919,8 @@ class MiniMaxM3SparseRuntimeBackend(AttentionBackend[AttentionMetadata]):
     :meth:`forward_sparse` when ``idx_q`` is supplied.
     """
 
-    Metadata = MiniMaxM3AttentionMetadata
+    Metadata = TrtllmAttentionMetadata
+    metadata_extensions = (MiniMaxM3TritonMetadata,)
 
     def __init__(
         self,
@@ -1014,7 +1016,7 @@ class MiniMaxM3SparseRuntimeBackend(AttentionBackend[AttentionMetadata]):
         idx_k_view = idx_k.view(num_tokens, 1, sparse_index_dim)
 
         # Production paths build the M3 metadata on the cache
-        # device in ``MiniMaxM3AttentionMetadata.prepare`` (called
+        # device in ``MiniMaxM3TritonMetadata.prepare`` (called
         # outside any CUDA-graph capture window), and test paths
         # construct it directly on the desired device. So all
         # metadata tensors should already live on ``k_cache.device``

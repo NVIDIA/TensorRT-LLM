@@ -29,6 +29,7 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
 from .flash_mla import DeepSeekV4FlashMLA
+from .metadata import DeepseekV4Metadata
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.mla import MLA
@@ -660,7 +661,8 @@ def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
         return False
     cu_q_seqlens = attn_metadata.cu_q_seqlens
     if cu_q_seqlens is None and num_contexts == 0:
-        generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+        dsv4 = attn_metadata.find_ext(DeepseekV4Metadata)
+        generation_cu_seqlens = getattr(dsv4, "cu_seq_lens_cuda", None)
         if generation_cu_seqlens is not None:
             cu_q_seqlens = generation_cu_seqlens[: num_generations + 1]
     kv_cache_lengths = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
@@ -690,7 +692,8 @@ def _dsv4_q_b_gemm_cu_q_seqlens(
     if attn_metadata.num_contexts > 0:
         prep_ctx = getattr(attn_metadata, "mla_prepare_ctx_cu_seqlens", None)
         return prep_ctx() if prep_ctx is not None else None
-    generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+    dsv4 = attn_metadata.find_ext(DeepseekV4Metadata)
+    generation_cu_seqlens = getattr(dsv4, "cu_seq_lens_cuda", None)
     if generation_cu_seqlens is None:
         return None
     return generation_cu_seqlens[: attn_metadata.num_generations + 1]
@@ -794,8 +797,9 @@ def _fused_q_rope_specs(
         num_gen_tokens = num_tokens - num_ctx_tokens
         if num_gen_tokens <= 0:
             return None, []
-        if bool(getattr(attn_metadata, "is_ragged_verify", False)):
-            prep_gen = getattr(attn_metadata, "mla_prepare_fused_q_gen_cu_seqlens", None)
+        dsv4 = attn_metadata.find_ext(DeepseekV4Metadata)
+        if bool(getattr(dsv4, "is_ragged_verify", False)):
+            prep_gen = getattr(dsv4, "mla_prepare_fused_q_gen_cu_seqlens", None)
             if prep_gen is None:
                 return None, []
             cu_q_seqlens = prep_gen()

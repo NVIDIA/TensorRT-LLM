@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.attention.backends.features import HelixMetadata, RecurrentMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
@@ -671,8 +672,11 @@ class DecoderInputPreparer:
             num_extra_kv_tokens=get_num_extra_kv_tokens(None),
         )
         attn_metadata.kv_cache_manager = kv_cache_manager
-        if hasattr(self.model.model_config.pretrained_config, "chunk_size"):
-            attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
+        recurrent = attn_metadata.find_ext(RecurrentMetadata)
+        if recurrent is not None and hasattr(
+            self.model.model_config.pretrained_config, "chunk_size"
+        ):
+            recurrent.chunk_size = self.model.model_config.pretrained_config.chunk_size
         with nvtx_range("steady_gen_metadata_prepare"):
             attn_metadata.prepare()
 
@@ -2064,13 +2068,15 @@ class DecoderInputPreparer:
             # arm the spec path for ordinary helix generation and send its
             # consumers to uninitialized buffers.
             helix_spec_active = bool(enable_spec_decode and host.lists.helix_owned_new_tokens)
-            attn_metadata.update_helix_param(
-                helix_position_offsets=host.lists.helix_position_offsets,
-                helix_is_inactive_rank=host.lists.helix_is_inactive_rank,
-                helix_owned_new_tokens=(
-                    host.lists.helix_owned_new_tokens if helix_spec_active else None
-                ),
-            )
+            helix = attn_metadata.find_ext(HelixMetadata)
+            if helix is not None:
+                helix.update(
+                    position_offsets=host.lists.helix_position_offsets,
+                    is_inactive_rank=host.lists.helix_is_inactive_rank,
+                    owned_new_tokens=(
+                        host.lists.helix_owned_new_tokens if helix_spec_active else None
+                    ),
+                )
 
         if not attn_metadata.is_cuda_graph:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
@@ -2147,22 +2153,23 @@ class DecoderInputPreparer:
         )
         attn_metadata.kv_cache_manager = kv_cache_manager
 
-        if hasattr(self.model.model_config.pretrained_config, "chunk_size"):
-            attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
+        recurrent = attn_metadata.find_ext(RecurrentMetadata)
+        if recurrent is not None and hasattr(
+            self.model.model_config.pretrained_config, "chunk_size"
+        ):
+            recurrent.chunk_size = self.model.model_config.pretrained_config.chunk_size
         # Some sparse backends (RocketKV) clamp
         # kv_cache_params.num_cached_tokens_per_seq in place during prepare(),
         # and KVCacheParams holds the list by reference. Snapshot the true
         # pre-prepare counts so the steady-gen recording below stores values
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
-        prepare_context_replay = getattr(attn_metadata, "prepare_context_replay", None)
-        if prepare_context_replay is not None:
-            prepare_context_replay(
-                scheduled_requests.context_requests,
-                allow_final_window=(
-                    self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
-                ),
-            )
+        attn_metadata.bind_context_requests(
+            scheduled_requests.context_requests,
+            prefill_cuda_graphs=(
+                self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED
+            ),
+        )
         attn_metadata.prepare()
         host.num_cached_tokens_snapshot = num_cached_tokens_snapshot
         host.remote_tail_modes = remote_tail_modes
@@ -2484,20 +2491,21 @@ class DecoderInputPreparer:
             # first apply the same accepted-count correction position_ids
             # got above; without overlap the host values are already exact.
             md = inputs.get("attn_metadata")
-            if (
-                md is not None
-                and md.kv_cache_manager is not None
-                and getattr(md, "_helix_spec_tokens_valid", False)
-            ):
+            helix = (
+                md.find_ext(HelixMetadata)
+                if md is not None and self.mapping.has_cp_helix()
+                else None
+            )
+            if helix is not None and md.kv_cache_manager is not None and helix.spec_tokens_valid:
                 helix_gen_tokens = inputs["input_ids"].shape[0] - md.num_ctx_tokens
                 if not self._config.disable_overlap_scheduler:
                     # The kv_lens override in the recompute supersedes the
                     # generic previous_kv_lens_offsets adjustment above,
                     # which is not ownership-aware.
-                    md.helix_position_offsets[:helix_gen_tokens] += (
+                    helix.position_offsets[:helix_gen_tokens] += (
                         self._buffers.previous_pos_id_offsets_cuda[:helix_gen_tokens]
                     )
-                md.recompute_helix_spec_buffers(
+                helix.recompute_spec_buffers(
                     helix_gen_tokens, self.get_runtime_tokens_per_gen_step(runtime_draft_len)
                 )
                 md.on_update_kv_lens()
@@ -2556,14 +2564,17 @@ class DecoderInputPreparer:
                         restore=True,
                     )
 
-                if self.mapping.has_cp_helix() and getattr(
-                    inputs["attn_metadata"], "_helix_spec_tokens_valid", False
-                ):
+                helix = (
+                    inputs["attn_metadata"].find_ext(HelixMetadata)
+                    if self.mapping.has_cp_helix()
+                    else None
+                )
+                if helix is not None and helix.spec_tokens_valid:
                     # Mirror of the helix position correction in
                     # preprocess_inputs (capture symmetry, like position_ids
                     # above). The recompute's OVERWRITES (slots/bounds/
                     # kv_lens) need no reversal: every consumer buffer is
                     # rewritten from host state at the next step's prepare.
-                    inputs["attn_metadata"].helix_position_offsets[:previous_batch_tokens] -= (
+                    helix.position_offsets[:previous_batch_tokens] -= (
                         self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )

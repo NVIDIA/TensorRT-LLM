@@ -23,12 +23,12 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from _torch.attention.sparse.csa2._utils import _FakeMetadata
+from _torch.attention.sparse.csa2._utils import _bare_csa2_metadata, _FakeMetadata
 from torch import nn
 from transformers import AutoConfig
 from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.configs import deepseek_v41 as v41_config
 from tensorrt_llm._torch.configs.deepseek_v41 import (
     DeepseekV41Config,
@@ -1902,13 +1902,18 @@ def test_csa2_subtrees_load_once_before_shared_walk(monkeypatch, case):
 
 
 class _ReplayMetadata(_FakeMetadata):
-    _get_csa2_buffer = CSA2TrtllmMetadata._get_csa2_buffer
-    _copy_host = CSA2TrtllmMetadata._copy_host
-    _copy_csa2_tensor = CSA2TrtllmMetadata._copy_csa2_tensor
-    get_adp_token_counts = CSA2TrtllmMetadata.get_adp_token_counts
-    set_adp_token_counts = CSA2TrtllmMetadata.set_adp_token_counts
+    _get_csa2_buffer = CSA2Metadata._get_csa2_buffer
+    _copy_host = CSA2Metadata._copy_host
+    _copy_csa2_tensor = CSA2Metadata._copy_csa2_tensor
     decoder_replay_plan = None
     padded_num_tokens = None
+
+    def get_adp_token_counts(self) -> list[int]:
+        return [self.num_tokens, *CSA2Metadata.adp_token_counts(self)]
+
+    def set_adp_token_counts(self, counts: list[list[int]]) -> list[int]:
+        CSA2Metadata.set_adp_token_counts(self, counts[1:], counts[0])
+        return counts[0]
 
     def __init__(self, lengths, num_contexts):
         super().__init__(lengths, num_contexts)
@@ -2056,7 +2061,7 @@ def test_remote_tail_attention_dp_never_enables_local_row_compaction(
 
     assert model._plan_bounded_replay(metadata, all_token_states_required) == (None, None)
     torch.testing.assert_close(metadata.seq_lens, saved_lengths)
-    assert metadata.csa2_replay_query_rows is None
+    assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
     assert metadata.prepare_calls == 0
 
 
@@ -2116,7 +2121,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
     metadata.mapping = Mapping(world_size=2, tp_size=2, rank=0, enable_attention_dp=True)
     metadata.kv_cache_manager.has_private_swa_suffix = Mock(return_value=True)
     if mode in ("final_window", "all_empty"):
-        metadata.decoder_context_ends = (1024,)
+        metadata.ext(CSA2Metadata).decoder_context_ends = (1024,)
     local_rows = 512 if mode == "padded" else 257
     metadata.padded_num_tokens = 512 if mode == "padded" else None
     metadata.is_cuda_graph = mode == "decode_graph"
@@ -2185,7 +2190,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
         assert metadata.all_rank_num_tokens is saved_counts
         return
     assert split == 20
-    assert plan is metadata.decoder_replay_plan
+    assert plan is metadata.ext(CSA2Metadata).decoder_replay_plan
     assert plan.replay_all_rank_num_tokens == [decoder_rows, peer_rows]
     assert plan.replays_local_tokens is (mode in ("compact", "final_window", "all_empty"))
     if not plan.replays_local_tokens:
@@ -2233,14 +2238,14 @@ def test_final_window_replay_freezes_endpoints_and_preserves_mixed_consumers(ful
         SimpleNamespace(prompt_len=50, py_ced_replay=None, py_return_context_logits=full_output),
         SimpleNamespace(prompt_len=6, py_ced_replay=None),
     ]
-    CSA2TrtllmMetadata.prepare_context_replay(metadata, reqs)
+    CSA2Metadata.prepare_context_replay(metadata, reqs)
     reqs[0].prompt_len = 10  # Later scheduling must not change this forward's selection.
     plan = plan_decoder_replay(metadata, 8, reqs, private_decoder=True)
     assert plan.replay_seq_lens.tolist() == ([10, 3, 6] if full_output else [0, 3, 6])
     assert plan.swa_floors == ([0, 0, 0] if full_output else [42, 0, 0])
     assert plan.rows.tolist() == list(range(0 if full_output else 10, 19))
     enter_decoder_replay(metadata, plan)
-    assert metadata.csa2_positions[-6:].tolist() == list(range(97, 103))
+    assert metadata.ext(CSA2Metadata).csa2_positions[-6:].tolist() == list(range(97, 103))
     exit_decoder_replay(metadata, plan)
     assert metadata.seq_lens.tolist() == [10, 3, 6]
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [0, 3, 100]
@@ -2258,7 +2263,7 @@ def test_final_window_zero_queries_still_publish_global_and_restore_outputs(peer
     layer, state = _make_boundary(129)
     model.layers[20] = layer
     metadata = _ReplayMetadata([129], num_contexts=1)
-    metadata.decoder_context_ends = (512,)
+    metadata.ext(CSA2Metadata).decoder_context_ends = (512,)
     plan = plan_decoder_replay(metadata, 128)
     plan.saved_all_rank_num_tokens = [129, 257]
     plan.replay_all_rank_num_tokens = [0, peer_tokens]
@@ -2267,13 +2272,13 @@ def test_final_window_zero_queries_still_publish_global_and_restore_outputs(peer
     assert replay_state.residual.shape == (0, 4, 64)
     layer.self_attn.prepare_global_cache.assert_called_once()
     assert layer.self_attn.prepare_global_cache.call_args.args[0].shape[0] == 129
-    assert metadata.csa2_precomputed_kv_layers == {20}
+    assert metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers == {20}
     assert metadata.prepare_calls == 0
     assert metadata.all_rank_num_tokens == [0, peer_tokens]
     restored = model._exit_bounded_replay(plan, metadata, replay_state.residual[:, 0])
     assert restored.shape == (129, 64)
     assert not restored.count_nonzero()
-    assert metadata.csa2_decoder_capture_lens == (0,)
+    assert metadata.ext(CSA2Metadata).csa2_decoder_capture_lens == (0,)
     assert metadata.all_rank_num_tokens == [129, 257]
     assert metadata.seq_lens.tolist() == [129]
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [0]
@@ -2286,7 +2291,7 @@ def test_final_window_prefill_graph_capability_keeps_intermediate_history():
 
     metadata = _ReplayMetadata([257], num_contexts=1)
     reqs = [SimpleNamespace(prompt_len=2048, py_ced_replay=None)]
-    CSA2TrtllmMetadata.prepare_context_replay(metadata, reqs, allow_final_window=False)
+    CSA2Metadata.prepare_context_replay(metadata, reqs, allow_final_window=False)
     plan = plan_decoder_replay(metadata, 128, reqs, private_decoder=True)
     assert plan.replay_seq_lens.tolist() == [128]
     assert plan.rows.tolist() == list(range(129, 257))
@@ -2362,7 +2367,7 @@ def _make_boundary(tokens: int) -> tuple[SimpleNamespace, HCState]:
 
     def publish(values, metadata):
         assert values.shape[0] == int(metadata.seq_lens.sum())
-        metadata.csa2_precomputed_kv_layers.add(20)
+        metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers.add(20)
 
     attention = SimpleNamespace(
         layer=SimpleNamespace(kv_source=20, compress_ratio=1, mode=CSA2Mode.FULL),
@@ -2404,8 +2409,8 @@ def test_model_boundary_preserves_full_cache_and_compacts_query_rows(
     new_positions, new_ids, new_state = model._enter_bounded_replay(
         plan, metadata, positions, ids, state
     )
-    assert metadata.csa2_precomputed_kv_layers == {20}
-    assert metadata.csa2_replay_query_rows is plan.rows
+    assert metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers == {20}
+    assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is plan.rows
     writer = layer.self_attn.prepare_global_cache
     writer.assert_called_once()
     actual, passed_metadata = writer.call_args.args
@@ -2428,11 +2433,11 @@ def test_model_boundary_preserves_full_cache_and_compacts_query_rows(
     torch.testing.assert_close(restored[plan.rows], new_state.residual)
     assert metadata.seq_lens.tolist() == lengths
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [0, 0, 0]
-    assert metadata.csa2_replay_query_rows is None
-    assert not metadata.csa2_precomputed_kv_layers
+    assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
+    assert not metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers
     metadata.prepare()
-    assert not metadata.csa2_precomputed_kv_layers
-    assert not metadata.csa2_indices
+    assert not metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers
+    assert not metadata.ext(CSA2Metadata).csa2_indices
     assert metadata.seq_lens.tolist() == lengths
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [0, 0, 0]
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "0")
@@ -2475,7 +2480,7 @@ def test_remote_tail_source_reuses_boundary_collapse(
         metadata = _ReplayMetadata(lengths, num_contexts=num_contexts)
         metadata.mapping = model.model_config.mapping
         metadata.csa2_remote_tail_mode = None if context_only else "source"
-        metadata.begin_model_forward = Mock()
+        metadata.begin_forward = Mock()
         post_mapping = Mock(return_value=resolved.residual)
         state = resolved
         if deferred:
@@ -2513,17 +2518,17 @@ def test_remote_tail_source_reuses_boundary_collapse(
             assert post_args["post_layer_mix"] is state.post_mix
             assert post_args["comb_res_mix"] is state.comb_mix
         encoder.assert_called_once()
-        metadata.begin_model_forward.assert_called_once()
+        metadata.begin_forward.assert_called_once()
         writer = layer.self_attn.prepare_global_cache
         if ced_precompute:
             writer.assert_called_once()
             actual, passed_metadata = writer.call_args.args
             torch.testing.assert_close(actual, layer.input_layernorm(expected), atol=0, rtol=0)
             assert passed_metadata is metadata
-            assert metadata.csa2_precomputed_kv_layers == {20}
+            assert metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers == {20}
         else:
             writer.assert_not_called()
-            assert not metadata.csa2_precomputed_kv_layers
+            assert not metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers
         collapse.reset_mock()
         finalize.reset_mock()
 
@@ -2545,9 +2550,9 @@ def test_remote_tail_destination_keeps_decoder_state(attention_dp: bool) -> None
     metadata.csa2_remote_tail_mode = "destination"
     metadata.csa2_remote_tail_starts = [1024]
     saved_lengths = metadata.seq_lens.clone()
-    saved_positions = metadata.csa2_positions.clone()
-    metadata._ensure_swa_slots()  # As the encoder's first layer does.
-    saved_indices = metadata.csa2_swa_indices[0].clone()
+    saved_positions = metadata.ext(CSA2Metadata).csa2_positions.clone()
+    metadata.ext(CSA2Metadata)._ensure_swa_slots()  # As the encoder's first layer does.
+    saved_indices = metadata.ext(CSA2Metadata).csa2_swa_indices[0].clone()
     saved_residual = state.residual.clone()
     saved_pre_mix = state.pre_mix.clone()
 
@@ -2556,18 +2561,18 @@ def test_remote_tail_destination_keeps_decoder_state(attention_dp: bool) -> None
     assert result is None
     assert decoder_state is state
     layer.self_attn.prepare_global_cache.assert_called_once()
-    assert metadata.csa2_precomputed_kv_layers == {20}
+    assert metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers == {20}
     torch.testing.assert_close(state.residual, saved_residual, atol=0, rtol=0)
     torch.testing.assert_close(state.pre_mix, saved_pre_mix, atol=0, rtol=0)
     torch.testing.assert_close(metadata.seq_lens, saved_lengths)
-    torch.testing.assert_close(metadata.csa2_positions, saved_positions)
+    torch.testing.assert_close(metadata.ext(CSA2Metadata).csa2_positions, saved_positions)
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [1024, 63]
-    assert metadata.csa2_replay_query_rows is None
+    assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
     assert metadata.prepare_calls == 1
     expected_indices = saved_indices.clone()
     expected_indices[:128].masked_fill_(expected_indices[:128] < 1024, -1)
-    metadata._ensure_swa_slots()  # As the first decoder layer does.
-    torch.testing.assert_close(metadata.csa2_swa_indices[0], expected_indices)
+    metadata.ext(CSA2Metadata)._ensure_swa_slots()  # As the first decoder layer does.
+    torch.testing.assert_close(metadata.ext(CSA2Metadata).csa2_swa_indices[0], expected_indices)
 
 
 @pytest.mark.parametrize(
@@ -2606,7 +2611,7 @@ def test_remote_tail_attention_dp_generation_keeps_all_layers(
     metadata.is_cuda_graph = is_cuda_graph
     metadata.csa2_remote_tail_mode = remote_mode
     metadata.csa2_remote_tail_starts = [1024] if remote_mode == "destination" else []
-    metadata.begin_model_forward = Mock()
+    metadata.begin_forward = Mock()
     enter_decoder = Mock()
     monkeypatch.setattr(v41, "enter_remote_tail_decoder", enter_decoder)
 
@@ -2622,8 +2627,8 @@ def test_remote_tail_attention_dp_generation_keeps_all_layers(
         assert layer.call_args.kwargs["hc_state"].residual.shape[0] == num_tokens
     assert enter_decoder.call_count == int(remote_mode == "destination")
     assert boundary.self_attn.prepare_global_cache.call_count == int(remote_mode == "destination")
-    assert metadata.csa2_replay_query_rows is None
-    metadata.begin_model_forward.assert_called_once()
+    assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
+    metadata.begin_forward.assert_called_once()
 
 
 def test_context_decoder_skipping_requires_bounded_replay(
@@ -2685,7 +2690,7 @@ def test_context_only_forward_routes_warmup_to_source_and_refuses_destination(mo
     nn.Module.__init__(model)
     model.disagg_context_only = True
     metadata = SimpleNamespace(
-        csa2_remote_tail_mode=mode, begin_model_forward=Mock(), all_rank_num_tokens=None
+        csa2_remote_tail_mode=mode, begin_forward=Mock(), all_rank_num_tokens=None
     )
     result = object()
 
@@ -2701,7 +2706,7 @@ def test_context_only_forward_routes_warmup_to_source_and_refuses_destination(mo
             model.forward(metadata)
     else:
         assert model.forward(metadata) is result
-    metadata.begin_model_forward.assert_called_once()
+    metadata.begin_forward.assert_called_once()
 
 
 def test_context_only_model_rejects_speculative_decoding_before_construction(monkeypatch):
@@ -3006,8 +3011,8 @@ def test_model_boundary_resets_routing_and_preserves_layer_guard(monkeypatch):
     from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4Model
     from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41Model
 
-    metadata = CSA2TrtllmMetadata.__new__(CSA2TrtllmMetadata)
-    metadata.reset_routing()
+    metadata = _bare_csa2_metadata()
+    metadata.ext(CSA2Metadata).reset_routing()
     layout = CSA2Layout((1, 1), (0,), (0,))
     model = DeepseekV41Model.__new__(DeepseekV41Model)
     torch.nn.Module.__init__(model)
@@ -3018,27 +3023,30 @@ def test_model_boundary_resets_routing_and_preserves_layer_guard(monkeypatch):
     def body(self, attn_metadata, value, *, check_value):
         assert self is model and attn_metadata is metadata
         assert value is argument and check_value is argument
-        assert not metadata.csa2_indices and not metadata.csa2_candidates
-        assert not metadata.csa2_precomputed_kv_layers
-        assert metadata.csa2_replay_query_rows is None
-        metadata.enter_layer(layout.layer(0))
+        assert (
+            not metadata.ext(CSA2Metadata).csa2_indices
+            and not metadata.ext(CSA2Metadata).csa2_candidates
+        )
+        assert not metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers
+        assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
+        metadata.ext(CSA2Metadata).enter_layer(layout.layer(0))
         producer = torch.tensor([len(outputs)])
-        metadata.csa2_indices[0] = producer
-        metadata.csa2_candidates[0] = producer
-        metadata.enter_layer(layout.layer(1))
-        assert metadata.csa2_indices[0] is producer
+        metadata.ext(CSA2Metadata).csa2_indices[0] = producer
+        metadata.ext(CSA2Metadata).csa2_candidates[0] = producer
+        metadata.ext(CSA2Metadata).enter_layer(layout.layer(1))
+        assert metadata.ext(CSA2Metadata).csa2_indices[0] is producer
         with pytest.raises(ValueError, match="reordered layers"):
-            metadata.enter_layer(layout.layer(0))
+            metadata.ext(CSA2Metadata).enter_layer(layout.layer(0))
         outputs.append(producer)
         return producer
 
     monkeypatch.setattr(DeepseekV4Model, "forward", body)
     for _ in range(3):
-        old_indices = metadata.csa2_indices
-        metadata.csa2_precomputed_kv_layers = {0}
-        metadata.csa2_replay_query_rows = torch.tensor([1])
+        old_indices = metadata.ext(CSA2Metadata).csa2_indices
+        metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers = {0}
+        metadata.ext(CSA2Metadata).csa2_replay_query_rows = torch.tensor([1])
         result = model.forward(metadata, argument, check_value=argument)
-        assert metadata.csa2_indices is not old_indices
+        assert metadata.ext(CSA2Metadata).csa2_indices is not old_indices
         assert result is outputs[-1]
     assert [output.item() for output in outputs] == [0, 1, 2]
 

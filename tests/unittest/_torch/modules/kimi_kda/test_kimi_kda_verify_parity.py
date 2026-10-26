@@ -26,9 +26,18 @@ pytest.importorskip("fla")
 from kimi_kda_test_utils import get_production_decode_kernel_path
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+
+def _recurrent_stub(mamba_metadata, **fields) -> SimpleNamespace:
+    """A metadata stub serving ``mamba_metadata`` through its recurrent extension."""
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: recurrent if cls is RecurrentMetadata else None
+    return metadata
 
 
 class _Cfg:
@@ -75,7 +84,7 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
             attention.head_k_dim,
         ),
     )
-    metadata = SimpleNamespace(
+    metadata = _recurrent_stub(
         mamba_metadata=SimpleNamespace(
             state_indices=state_indices,
             query_start_loc_long=torch.zeros(1, dtype=torch.long),
@@ -155,7 +164,8 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         ),
     )
     mamba_metadata.prepare(metadata)
-    metadata.mamba_metadata = mamba_metadata
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata.ext = lambda cls: recurrent
     hidden_states = torch.empty(4, _Cfg.hidden_size, dtype=torch.bfloat16, device="cuda")
     generation_slice = mamba_metadata.state_indices[1:]
     aligned_indices = mamba_metadata.generation_state_indices
@@ -193,7 +203,7 @@ def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -
         _arange_buffer=torch.arange(batch + 1, device=slot_indices.device, dtype=torch.int32),
     )
     cache_manager = SimpleNamespace(mamba_layer_cache=lambda _: layer_cache)
-    return SimpleNamespace(
+    return _recurrent_stub(
         mamba_metadata=mamba_metadata,
         num_contexts=0,
         num_ctx_tokens=0,
@@ -215,7 +225,7 @@ def _prefill_metadata(
         use_initial_states=False,
     )
     cache_manager = SimpleNamespace(mamba_layer_cache=lambda _: layer_cache)
-    return SimpleNamespace(
+    return _recurrent_stub(
         mamba_metadata=mamba_metadata,
         num_contexts=batch,
         num_ctx_tokens=int(cu_seqlens[-1]),

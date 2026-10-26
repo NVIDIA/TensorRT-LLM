@@ -12,9 +12,13 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+<<<<<<< HEAD
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
+=======
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
+>>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_CONV_ROLE,
@@ -122,6 +126,15 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
 from tensorrt_llm.sampling_params import SamplingParams
+
+
+def _recurrent_stub(mamba_metadata, **fields) -> SimpleNamespace:
+    """A metadata stub serving ``mamba_metadata`` through its recurrent extension."""
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: recurrent if cls is RecurrentMetadata else None
+    return metadata
+
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -5353,8 +5366,13 @@ def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
             history_size=policy.replay_history_size,
         )
 
+<<<<<<< HEAD
         policy.commit_all_layers(
             SimpleNamespace(
+=======
+        mgr._commit_gdn_cached_replay_history_layers(
+            _recurrent_stub(
+>>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
                 mamba_metadata=SimpleNamespace(
                     replay_num_decodes=batch_size,
                     replay_work_items=replay_work_items,

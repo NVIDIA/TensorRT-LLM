@@ -967,7 +967,7 @@ class DecoderRunner(ScheduledModelRunner):
         consumers. Non-speculative overlap has the same ordering; speculative
         acceptance corrections and draft-manager swaps keep full preparation.
         """
-        defer = getattr(attn_metadata, "defer_cuda_graph_decode_outputs", None)
+        defer = attn_metadata.defer_decode_outputs()
         if (
             defer is not None
             and isinstance(key, KeyType)
@@ -982,7 +982,7 @@ class DecoderRunner(ScheduledModelRunner):
             and self._deferred_decode_outputs_supported
             and self._mapping.cp_size == 1
         ):
-            return defer()
+            return defer
         return contextlib.nullcontext()
 
     @staticmethod

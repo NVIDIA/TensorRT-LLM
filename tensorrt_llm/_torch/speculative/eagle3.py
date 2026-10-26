@@ -9,13 +9,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import (
+    SpecDecodingMetadata, set_use_spec_decoding)
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.features import FlashMlaMetadata, RecurrentMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
-from ..attention.backends.sparse.params import MTPIndexShareMetadata
+from ..attention.backends.sparse.params import MTPIndexShareExtension
 from ..model_config import ModelConfig
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
@@ -29,13 +32,6 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
-
-
-def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
-    """Clear the draft-loop state a sparse indexer reads."""
-    attn_metadata.set_skip_topk(False)
-    attn_metadata.set_in_mtp_draft_loop(False)
-    attn_metadata.set_mtp_num_accepted(None)
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -494,43 +490,39 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Without this, CUDA graph warmup's second iteration would run
         # the target model attention with stale draft-layer masks
         # instead of the correct target-tree masks.
-        if attn_metadata.spec_decoding_packed_mask is not None:
-            self._saved_packed_mask = attn_metadata.spec_decoding_packed_mask[:
-                                                                              batch_size].clone(
-                                                                              )
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
+        if spec is not None and spec.packed_mask is not None:
+            self._saved_packed_mask = spec.packed_mask[:batch_size].clone()
         else:
             self._saved_packed_mask = None
-        if attn_metadata.spec_decoding_position_offsets is not None:
-            self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
-            )
-            self._saved_position_offsets_cpp = (
-                attn_metadata.spec_decoding_position_offsets_cpp)
+        if spec is not None and spec.position_offsets is not None:
+            self._saved_position_offsets = spec.position_offsets.clone()
+            self._saved_position_offsets_cpp = spec.position_offsets_cpp
         else:
             self._saved_position_offsets = None
             self._saved_position_offsets_cpp = None
-        if attn_metadata.spec_decoding_generation_lengths is not None:
-            self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
-            )
+        if spec is not None and spec.generation_lengths is not None:
+            self._saved_generation_lengths = spec.generation_lengths[:
+                                                                     batch_size].clone(
+                                                                     )
         else:
             self._saved_generation_lengths = None
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
         if self._saved_packed_mask is not None:
             batch_size = self._saved_packed_mask.shape[0]
-            attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(
-                self._saved_packed_mask)
+            spec.packed_mask[:batch_size].copy_(self._saved_packed_mask)
             self._saved_packed_mask = None
         if self._saved_position_offsets is not None:
-            attn_metadata.spec_decoding_position_offsets.copy_(
-                self._saved_position_offsets)
-            attn_metadata.spec_decoding_position_offsets_cpp = (
-                self._saved_position_offsets_cpp)
+            spec.position_offsets.copy_(self._saved_position_offsets)
+            spec.position_offsets_cpp = (self._saved_position_offsets_cpp)
             self._saved_position_offsets = None
             self._saved_position_offsets_cpp = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
-            attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
+            spec.generation_lengths[:batch_size].copy_(
                 self._saved_generation_lengths)
             self._saved_generation_lengths = None
 
@@ -547,6 +539,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                       draft_model,
                       resource_manager=None):
 
+        recurrent = attn_metadata.find_ext(RecurrentMetadata)
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
@@ -579,7 +572,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices)
+                state_indices=recurrent.mamba_metadata.state_indices)
 
         sa_manager = getattr(spec_metadata.spec_resource_manager, 'sa_manager',
                              None)
@@ -647,7 +640,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             accepted_tokens, next_draft_tokens,
             spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
 
-        attn_metadata.use_spec_decoding = True
+        set_use_spec_decoding(attn_metadata, True)
 
         # Commit model-owned target state only after draft preparation has
         # succeeded; SpecWorkerBase aborts the still-pending snapshots on any
@@ -655,7 +648,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if self._auxiliary_state_handlers:
             self.commit_auxiliary_speculative_states(
                 num_accepted_tokens,
-                attn_metadata.mamba_metadata.state_indices[:batch_size],
+                recurrent.mamba_metadata.state_indices[:batch_size],
                 num_contexts,
             )
 
@@ -706,7 +699,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         draft_metadata.update_shared_kv_draft_lengths(attn_metadata,
                                                       num_accepted_tokens,
                                                       num_contexts)
-        draft_metadata.use_spec_decoding = False
+        set_use_spec_decoding(draft_metadata, False)
         draft_metadata.padded_num_tokens = None
         draft_metadata.all_rank_num_tokens = (
             spec_metadata.subseq_all_rank_num_tokens)
@@ -779,20 +772,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Sparse backends that can reuse one indexer selection across the draft
         # loop expose this setter; each indexer still decides whether its own
         # config turns the reuse on.
-        uses_mtp_index_share = self.is_mtp_eagle and isinstance(
-            attn_metadata, MTPIndexShareMetadata)
+        index_share = (attn_metadata.find_ext(MTPIndexShareExtension)
+                       if self.is_mtp_eagle else None)
         with contextlib.ExitStack() as draft_scope:
-            if uses_mtp_index_share:
-                attn_metadata.set_in_mtp_draft_loop(True)
+            if index_share is not None:
+                index_share.set_in_mtp_draft_loop(True)
                 # Accepted counts let the indexer stash each gen's last-accepted row.
-                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
+                index_share.set_mtp_num_accepted(num_accepted_tokens)
                 # The metadata outlives this call, so clear the state even when a
                 # draft step raises: a stale draft-loop flag would make the next
                 # target forward reuse these selections. The loop writes
-                # set_skip_topk on the metadata yielded below, which is this same
-                # object: draft_kv_cache_context swaps buffers in place for every
-                # TrtllmAttentionMetadata, and sparse metadata all derive from it.
-                draft_scope.callback(_reset_mtp_index_share, attn_metadata)
+                # set_skip_topk on the extension of the metadata yielded below,
+                # which is this same object: draft_kv_cache_context swaps buffers
+                # in place for every TrtllmAttentionMetadata.
+                draft_scope.callback(index_share.reset_mtp_index_share)
             draft_attn_metadata = draft_scope.enter_context(
                 self.draft_kv_cache_context(attn_metadata,
                                             draft_kv_cache_manager))
@@ -807,8 +800,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # writes the separate DSA indexer cache at the same positions.
                 attn_metadata.on_update_kv_lens()
             for i in range(runtime_draft_len):
-                if uses_mtp_index_share:
-                    attn_metadata.set_skip_topk(i > 0)
+                if index_share is not None:
+                    index_share.set_skip_topk(i > 0)
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
                 # handles save/restore internally (Eagle3DraftModel.forward
@@ -1014,7 +1007,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     # mode), then 1 token per step in subsequent iterations.
                     # Disable spec_decoding here so the masks/positions stay
                     # correct on subsequent iters.
-                    attn_metadata.use_spec_decoding = False
+                    set_use_spec_decoding(attn_metadata, False)
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[:batch_size] += 1
@@ -1081,7 +1074,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         With no context rows ``prepare_flash_mla`` already staged this exact
         layout, so the early return merely skips a redundant copy.
         """
-        if num_contexts <= 0 or not attn_metadata.enable_flash_mla:
+        if (num_contexts <= 0
+                or attn_metadata.find_ext(FlashMlaMetadata) is None):
             return
         attn_metadata.block_ids_per_seq[:batch_size].copy_(
             attn_metadata.kv_block_ids_per_seq[:batch_size], non_blocking=True)

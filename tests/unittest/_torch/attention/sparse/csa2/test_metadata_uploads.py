@@ -9,7 +9,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -28,17 +30,28 @@ _DEVICES = [
 ]
 
 
+def _bare_csa2_metadata() -> TrtllmAttentionMetadata:
+    """Metadata built without ``__init__``, carrying a bare CSA2 extension."""
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(CSA2Metadata(metadata))
+    metadata.replace_ext(SpecDecodingMetadata(metadata))
+    return metadata
+
+
 def _metadata(device):
-    metadata = object.__new__(CSA2TrtllmMetadata)
+    metadata = _bare_csa2_metadata()
     metadata.is_cuda_graph = False
     metadata.num_sparse_topk = 256
-    for name in ("query_lens_host", "kv_lens", "prompt_lens_cpu", "host_request_types"):
+    for name in ("kv_lens", "prompt_lens_cpu", "host_request_types"):
         setattr(metadata, name, torch.empty(4, dtype=torch.int32, device="cpu"))
-    for name in ("query_lens_device", "kv_lens_cuda", "prompt_lens_cuda"):
+    for name in ("kv_lens_cuda", "prompt_lens_cuda"):
         setattr(metadata, name, torch.empty(4, dtype=torch.int32, device=device))
     metadata.host_total_kv_lens = torch.zeros(2, dtype=torch.int32, device="cpu")
-    metadata.prepared_cu_q = torch.empty(5, dtype=torch.int32, device=device)
-    metadata.prepared_cu_kv = torch.empty(5, dtype=torch.int32, device=device)
+    csa2 = metadata.ext(CSA2Metadata)
+    csa2.query_lens_host = torch.empty(4, dtype=torch.int32, device="cpu")
+    csa2.query_lens_device = torch.empty(4, dtype=torch.int32, device=device)
+    csa2.prepared_cu_q = torch.empty(5, dtype=torch.int32, device=device)
+    csa2.prepared_cu_kv = torch.empty(5, dtype=torch.int32, device=device)
     return metadata
 
 
@@ -51,7 +64,7 @@ def test_context_uploads_refresh_changing_geometry(device):
         if stream is not None:
             torch.cuda._sleep(2_000_000)
         for lengths in ([2, 1], [1, 2], [3], [1, 1, 1], [2, 1], [2, 1]):
-            metadata._bind_context_tile(list(lengths))
+            metadata.ext(CSA2Metadata)._bind_context_tile(list(lengths))
             observed.append(
                 (
                     list(lengths),
@@ -108,34 +121,42 @@ def test_shared_context_uploads_preserve_owners_and_live_positions(device):
                 for offset in range(length)
             ]
             metadata._num_ctx_tokens = sum(lengths)
-            metadata.csa2_num_context_requests = requests
-            metadata.csa2_request_lengths = lengths
-            metadata.csa2_positions = torch.tensor(positions, dtype=torch.int32, device=device)
-            metadata.csa2_replay_start_positions = torch.tensor(floors, device=device)
-            metadata.csa2_token_requests = torch.tensor(
+            metadata.ext(CSA2Metadata).csa2_num_context_requests = requests
+            metadata.ext(CSA2Metadata).csa2_request_lengths = lengths
+            metadata.ext(CSA2Metadata).csa2_positions = torch.tensor(
+                positions, dtype=torch.int32, device=device
+            )
+            metadata.ext(CSA2Metadata).csa2_replay_start_positions = torch.tensor(
+                floors, device=device
+            )
+            metadata.ext(CSA2Metadata).csa2_token_requests = torch.tensor(
                 [request for request, length in enumerate(lengths) for _ in range(length)],
                 device=device,
             )
-            metadata._csa2_main_domain_counts = {
+            metadata.ext(CSA2Metadata)._csa2_main_domain_counts = {
                 owner: [step + owner + request + 1 for request in range(requests)]
                 for owner in (0, 1)
             }
-            metadata._csa2_shared_domains = {}
-            metadata._csa2_swa_page_tables = {
+            metadata.ext(CSA2Metadata)._csa2_shared_domains = {}
+            metadata.ext(CSA2Metadata)._csa2_swa_page_tables = {
                 layer: torch.full((requests, 2), 20 + layer + step, device=device)
                 for layer in (0, 1, 2)
             }
-            metadata.csa2_global_page_tables = {
+            metadata.ext(CSA2Metadata).csa2_global_page_tables = {
                 owner: torch.full((requests, 2), 40 + owner + step, device=device)
                 for owner in (0, 1)
             }
             q = torch.empty(sum(lengths), 1, 512, device=device)
-            plans = [metadata._shared_context_plan(q, 64, layer) for layer in (0, 1, 2)]
+            plans = [
+                metadata.ext(CSA2Metadata)._shared_context_plan(q, 64, layer) for layer in (0, 1, 2)
+            ]
             swa_offsets = list(accumulate((length + 127 for length in lengths), initial=1))
             # Read all owner plans only after the next owner's uploads have been submitted.
             for owner, plan in zip((0, 1, None), plans, strict=True):
                 main_counts = (
-                    [0] * requests if owner is None else metadata._csa2_main_domain_counts[owner]
+                    [0] * requests
+                    if owner is None
+                    else metadata.ext(CSA2Metadata)._csa2_main_domain_counts[owner]
                 )
                 expected = (
                     [max(0, start - 127, floor) for start, floor in zip(first_positions, floors)],

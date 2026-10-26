@@ -156,6 +156,8 @@ def test_fused_indexer_q_uses_serial_prepare(monkeypatch):
         _run_overlapped_indexer_prepare=overlapped_prepare,
     )
     metadata = SimpleNamespace(empty_topk_indices_buffer=torch.full((4, 2), -1))
+    # The stub carries the DeepSeek-V4 extension state itself.
+    metadata.ext = lambda cls: metadata
     qr = torch.empty((2, 4), dtype=torch.bfloat16)
     hidden_states = torch.empty_like(qr)
     position_ids = torch.arange(2)

@@ -7,18 +7,22 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.attention.backends.features import HelixMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
 
 @pytest.mark.parametrize("helix_spec_tokens_valid", [False, True])
 def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: bool) -> None:
+    helix = SimpleNamespace(
+        position_offsets=object(),
+        is_inactive_rank=object(),
+        spec_tokens_valid=helix_spec_tokens_valid,
+        local_slots=object(),
+    )
     metadata = SimpleNamespace(
         kv_cache_manager=object(),
         max_seq_len=1024,
-        helix_position_offsets=object(),
-        helix_is_inactive_rank=object(),
-        _helix_spec_tokens_valid=helix_spec_tokens_valid,
-        helix_local_slots=object(),
+        find_ext=lambda cls: helix if cls is HelixMetadata else None,
     )
     dispatch = Mock()
     attention = SimpleNamespace(
@@ -53,8 +57,8 @@ def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: b
     dispatch.assert_called_once()
     assert dispatch.call_args.args[0] is metadata
     assert dispatch.call_args.args[1:10] == tuple(tensors)
-    helix_tensor_params = [metadata.helix_position_offsets, metadata.helix_is_inactive_rank]
+    helix_tensor_params = [helix.position_offsets, helix.is_inactive_rank]
     if helix_spec_tokens_valid:
-        helix_tensor_params.append(metadata.helix_local_slots)
+        helix_tensor_params.append(helix.local_slots)
     assert dispatch.call_args.args[11] == helix_tensor_params
     assert dispatch.call_args.args[-len(controls) :] == tuple(controls.values())

@@ -22,6 +22,7 @@ from _deepseek_v41_test_utils import model_and_config as global_model_and_config
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
 from tensorrt_llm._torch.pyexecutor.ced_replay import encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -43,11 +44,11 @@ def test_global_source_selection_preserves_cold_and_generation_rows(cache_config
     # recovery rows are projected; the other requests keep their complete input.
     with cache_case(config, sparse, dtype, [130, 3, 1], [128, 0, 258], 2) as case:
         metadata = case[0]
-        metadata.set_swa_bounded_replay([256, None, None])
+        metadata.ext(CSA2Metadata).set_swa_bounded_replay([256, None, None])
         metadata.prepare()
         hidden = torch.arange(134, device="cuda").reshape(-1, 1)
         for owner in metadata.kv_cache_manager.layout.kv_source_layer_ids:
-            selected = metadata.select_global_source(owner, hidden)
+            selected = metadata.ext(CSA2Metadata).select_global_source(owner, hidden)
             assert selected.flatten().tolist() == list(range(128, 134))
 
 
@@ -66,7 +67,7 @@ def reference(model, metadata, ids, prefix=256, chunks=None, window=128):
         metadata.prompt_lens = [stop - begin]
         metadata.kv_cache_params.num_cached_tokens_per_seq = [begin]
         if index == 0:
-            metadata.set_swa_bounded_replay([prefix])
+            metadata.ext(CSA2Metadata).set_swa_bounded_replay([prefix])
         metadata.prepare()
         _apply_swa_floor(
             metadata, torch.full((stop - begin,), start, device="cuda", dtype=torch.int64)

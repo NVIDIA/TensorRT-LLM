@@ -5,15 +5,14 @@
 
 from .backend import RocketTrtllmAttention, RocketVanillaAttention
 from .cache_manager import RocketKVCacheManager
-from .metadata import RocketTrtllmAttentionMetadata, RocketVanillaAttentionMetadata
+from .metadata import RocketMetadata
 from .params import RocketKVMetadataParams, RocketKVParams
 
 __all__ = [
     "RocketKVCacheManager",
     "RocketKVMetadataParams",
     "RocketKVParams",
+    "RocketMetadata",
     "RocketTrtllmAttention",
-    "RocketTrtllmAttentionMetadata",
     "RocketVanillaAttention",
-    "RocketVanillaAttentionMetadata",
 ]

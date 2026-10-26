@@ -24,8 +24,10 @@ from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import AllReduceStrategy
 from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41Engram
 from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
@@ -349,7 +351,7 @@ def _replay_attention(layout: CSA2Layout, mapping: Mapping, layer_idx: int = 0) 
 @contextmanager
 def _replay_metadata(
     mapping: Mapping, layout: CSA2Layout, length: int, cached: int
-) -> Iterator[CSA2TrtllmMetadata]:
+) -> Iterator[TrtllmAttentionMetadata]:
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -389,7 +391,7 @@ def _replay_metadata(
             assert manager.prepare_context(request)
             assert manager.resize_context(request, request.context_chunk_size)
             manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.create_metadata(
             max_num_requests=1,
             max_num_tokens=_REPLAY_MAX_TOKENS,
             kv_cache_manager=manager,
@@ -408,8 +410,10 @@ def _replay_metadata(
             metadata.prepare()
         else:
             # A zero-row MoE peer has no attention request to prepare.
-            metadata.csa2_positions = torch.empty(0, dtype=torch.int32, device="cuda")
-            metadata.reset_routing()
+            metadata.ext(CSA2Metadata).csa2_positions = torch.empty(
+                0, dtype=torch.int32, device="cuda"
+            )
+            metadata.ext(CSA2Metadata).reset_routing()
         yield metadata
     finally:
         if request is not None:
@@ -489,13 +493,17 @@ def _check_dp_replay_case(
         reference_metadata = stack.enter_context(_replay_metadata(Mapping(), layout, count, cached))
         metadata.all_rank_num_tokens = counts
         if prompt_ends is not None and metadata.num_contexts:
-            metadata.decoder_context_ends = (prompt_ends[rank],)
+            metadata.ext(CSA2Metadata).decoder_context_ends = (prompt_ends[rank],)
         if cached:
             for attention, step_metadata in (
                 (model.layers[0].self_attn, metadata),
                 (reference_attention, reference_metadata),
             ):
-                attention(norm(full_hidden[:cached]), step_metadata.csa2_positions, step_metadata)
+                attention(
+                    norm(full_hidden[:cached]),
+                    step_metadata.ext(CSA2Metadata).csa2_positions,
+                    step_metadata,
+                )
                 step_metadata.num_contexts = 0
                 step_metadata.seq_lens = torch.tensor([count], dtype=torch.int32, device="cpu")
                 step_metadata.kv_cache_params = KVCacheParams(
@@ -503,7 +511,7 @@ def _check_dp_replay_case(
                 )
                 step_metadata.prepare()
         hidden = full_hidden[cached:]
-        positions = metadata.csa2_positions
+        positions = metadata.ext(CSA2Metadata).csa2_positions
         input_ids = torch.arange(count, device="cuda") + rank * 17
         state = HCState.resolved(hidden[:, None, :], pre_mix=torch.ones(count, 1, 1, device="cuda"))
         original_seq_lens = metadata.seq_lens.clone()
@@ -537,9 +545,9 @@ def _check_dp_replay_case(
             assert replay_state.residual is state.residual
         if not plan.updates_local_metadata:
             assert replay_state is state
-            assert metadata.csa2_replay_query_rows is None
+            assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
         else:
-            assert metadata.csa2_replay_query_rows is plan.rows
+            assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is plan.rows
 
         # Full-prefill parity is invalid for this approximation. Build the same
         # bounded replay independently of the DP planner, retaining all GLOBAL KV.
@@ -548,15 +556,17 @@ def _check_dp_replay_case(
             reference_metadata.seq_lens = torch.tensor([kept], dtype=torch.int32, device="cpu")
             reference_metadata.prompt_lens = [kept]
             reference_metadata.kv_cache_params.num_cached_tokens_per_seq = [start]
-            reference_metadata.set_swa_bounded_replay([count], decoder=True)
+            reference_metadata.ext(CSA2Metadata).set_swa_bounded_replay([count], decoder=True)
             reference_metadata.prepare()
-            reference_metadata.csa2_precomputed_kv_layers = {0}
+            reference_metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers = {0}
         if kept:
             actual_attention = model.layers[0].self_attn(
                 norm(replay_state.residual[:, 0]), new_positions, metadata
             )
             expected_attention = reference_attention(
-                norm(hidden[start:]), reference_metadata.csa2_positions, reference_metadata
+                norm(hidden[start:]),
+                reference_metadata.ext(CSA2Metadata).csa2_positions,
+                reference_metadata,
             )
             torch.testing.assert_close(actual_attention, expected_attention, rtol=0, atol=0)
         else:
@@ -581,7 +591,7 @@ def _check_dp_replay_case(
         torch.testing.assert_close(metadata.seq_lens, original_seq_lens, rtol=0, atol=0)
         assert metadata.prompt_lens == original_prompt_lens
         assert metadata.kv_cache_params.num_cached_tokens_per_seq == ([cached] if count else [])
-        assert metadata.csa2_replay_query_rows is None
+        assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
 
 
 def _check_dp_encoder_replay_case(
@@ -640,7 +650,7 @@ def _check_dp_encoder_replay_case(
         try:
             assert manager._decoder_replay_window == _REPLAY_WINDOW
             assert manager._encoder_optional_groups
-            metadata = CSA2TrtllmMetadata(
+            metadata = CSA2TrtllmAttention.create_metadata(
                 max_num_requests=1,
                 max_num_tokens=_REPLAY_MAX_TOKENS,
                 kv_cache_manager=manager,
@@ -671,7 +681,7 @@ def _check_dp_encoder_replay_case(
         manager.prepare_resources(scheduled)
         return request
 
-    def global_bytes(metadata: CSA2TrtllmMetadata, end: int) -> dict:
+    def global_bytes(metadata: TrtllmAttentionMetadata, end: int) -> dict:
         manager = metadata.kv_cache_manager
         result = {}
         logical = torch.arange(end, device="cuda")
@@ -690,11 +700,11 @@ def _check_dp_encoder_replay_case(
                 result[layer, role] = values.view(torch.uint8).clone()
         return result
 
-    def check_floor(metadata: CSA2TrtllmMetadata, layer: int, floor: int) -> None:
-        metadata._ensure_swa_slots()
-        logical = metadata.csa2_positions[:, None] - _REPLAY_WINDOW + 1
+    def check_floor(metadata: TrtllmAttentionMetadata, layer: int, floor: int) -> None:
+        metadata.ext(CSA2Metadata)._ensure_swa_slots()
+        logical = metadata.ext(CSA2Metadata).csa2_positions[:, None] - _REPLAY_WINDOW + 1
         logical = logical + torch.arange(_REPLAY_WINDOW, device="cuda")
-        assert (metadata.csa2_swa_indices[layer][logical < floor] == -1).all()
+        assert (metadata.ext(CSA2Metadata).csa2_swa_indices[layer][logical < floor] == -1).all()
 
     with pytest.MonkeyPatch.context() as settings, ExitStack() as stack:
         settings.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
@@ -727,16 +737,18 @@ def _check_dp_encoder_replay_case(
                     use_cache=True, num_cached_tokens_per_seq=[start]
                 )
                 if step_metadata is metadata:
-                    step_metadata.prepare_context_replay([step_request])
+                    step_metadata.ext(CSA2Metadata).prepare_context_replay([step_request])
                 elif encoder_replay_tokens(step_request):
-                    step_metadata.set_swa_bounded_replay([step_request.context_current_position])
+                    step_metadata.ext(CSA2Metadata).set_swa_bounded_replay(
+                        [step_request.context_current_position]
+                    )
                 step_metadata.prepare()
-                step_metadata.begin_model_forward()
+                step_metadata.begin_forward()
                 check_floor(step_metadata, 0, start)
             metadata.all_rank_num_tokens = counts
             assert MPI.COMM_WORLD.allgather(metadata.num_tokens) == counts
             hidden = inputs[start : start + length]
-            positions = metadata.csa2_positions
+            positions = metadata.ext(CSA2Metadata).csa2_positions
             ids = torch.arange(start, start + length, device="cuda")
             _prepare_replay(model, metadata, False, [request])
             _, plan = model._plan_bounded_replay(metadata, False, [request])
@@ -745,13 +757,19 @@ def _check_dp_encoder_replay_case(
             def layer_output(
                 layer: int, actual_hidden: torch.Tensor, expected_hidden: torch.Tensor
             ) -> torch.Tensor:
-                actual = attention[layer](norm(actual_hidden), metadata.csa2_positions, metadata)
+                actual = attention[layer](
+                    norm(actual_hidden), metadata.ext(CSA2Metadata).csa2_positions, metadata
+                )
                 expected = reference_attention[layer](
-                    norm(expected_hidden), reference_metadata.csa2_positions, reference_metadata
+                    norm(expected_hidden),
+                    reference_metadata.ext(CSA2Metadata).csa2_positions,
+                    reference_metadata,
                 )
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 logits = torch.arange(8, device="cuda", dtype=torch.float32)[None, :]
-                logits = torch.sin(logits + metadata.csa2_positions[:, None].float() + rank)
+                logits = torch.sin(
+                    logits + metadata.ext(CSA2Metadata).csa2_positions[:, None].float() + rank
+                )
                 output = moe(actual, logits, all_rank_num_tokens=metadata.all_rank_num_tokens)
                 reference = reference_moe(expected, logits)
                 assert torch.isfinite(output).all()
@@ -768,13 +786,17 @@ def _check_dp_encoder_replay_case(
             reference_metadata.seq_lens = torch.tensor([kept], dtype=torch.int32, device="cpu")
             reference_metadata.prompt_lens = [kept]
             reference_metadata.kv_cache_params.num_cached_tokens_per_seq = [decoder_start]
-            reference_metadata.set_decoder_query_boundary(1)
+            reference_metadata.ext(CSA2Metadata).set_decoder_query_boundary(1)
             reference_metadata.prepare()
-            reference_metadata.csa2_precomputed_kv_layers = {1}
-            reference_metadata._ensure_swa_slots()
-            logical = reference_metadata.csa2_positions[:, None] - _REPLAY_WINDOW + 1
+            reference_metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers = {1}
+            reference_metadata.ext(CSA2Metadata)._ensure_swa_slots()
+            logical = (
+                reference_metadata.ext(CSA2Metadata).csa2_positions[:, None] - _REPLAY_WINDOW + 1
+            )
             logical = logical + torch.arange(_REPLAY_WINDOW, device="cuda")
-            reference_metadata.csa2_swa_indices[1].masked_fill_(logical < decoder_start, -1)
+            reference_metadata.ext(CSA2Metadata).csa2_swa_indices[1].masked_fill_(
+                logical < decoder_start, -1
+            )
             new_positions, new_ids, replay_state = model._enter_bounded_replay(
                 plan, metadata, positions, ids, state
             )
@@ -794,7 +816,7 @@ def _check_dp_encoder_replay_case(
             assert metadata.seq_lens.tolist() == [length]
             assert metadata.prompt_lens == [length]
             assert metadata.kv_cache_params.num_cached_tokens_per_seq == [start]
-            assert metadata.csa2_replay_query_rows is None
+            assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
             if frozen:
                 for step_metadata, snapshot in zip((metadata, reference_metadata), frozen):
                     for key, value in global_bytes(step_metadata, prefix).items():

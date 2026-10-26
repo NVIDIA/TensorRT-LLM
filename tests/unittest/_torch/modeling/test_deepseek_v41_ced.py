@@ -20,6 +20,7 @@ from _deepseek_v41_test_utils import (
 from _deepseek_v41_test_utils import cache_config as shared_cache_config
 from _deepseek_v41_test_utils import model_and_config as global_model_and_config
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
 
 skip_pre_blackwell = pytest.mark.skipif(
@@ -80,7 +81,7 @@ def independent_window_reference(model, metadata, ids, window=128, chunks=None):
             metadata.prompt_lens = [end - start]
             metadata.kv_cache_params.num_cached_tokens_per_seq = [start]
             metadata.prepare()
-            metadata.csa2_precomputed_kv_layers = {5}
+            metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers = {5}
             _apply_swa_floor(
                 metadata,
                 torch.full((end - start,), floor, device=ids.device, dtype=torch.int64),
@@ -120,26 +121,31 @@ def test_prepared_encoder_replay_preserves_live_speculative_endpoints(
             req.py_ced_replay = EncoderReplay(
                 0, id(metadata.kv_cache_manager.kv_cache_map[0]), 256, start
             )
-        metadata.prepare_context_replay([req])
+        metadata.ext(CSA2Metadata).prepare_context_replay([req])
         metadata.prepare()
         # Host reservation ends at134; accepting one of five drafts moves the
         # actual six verification rows back to [124,130). The allocator may
         # only have pages covering that live interval.
         metadata.kv_lens_cuda[:2].copy_(torch.tensor([end, 130], device="cuda"))
         metadata.on_update_kv_lens()
-        positions = metadata.csa2_positions.clone()
-        swa_slots = {layer: slots.clone() for layer, slots in metadata.csa2_swa_write_slots.items()}
+        positions = metadata.ext(CSA2Metadata).csa2_positions.clone()
+        swa_slots = {
+            layer: slots.clone()
+            for layer, slots in metadata.ext(CSA2Metadata).csa2_swa_write_slots.items()
+        }
         for _ in range(2):
-            metadata.begin_model_forward()
+            metadata.begin_forward()
             metadata.on_update_kv_lens()
             assert metadata.kv_lens_cuda[:2].tolist() == [end, 130]
-            torch.testing.assert_close(metadata.csa2_positions, positions)
-            assert metadata.csa2_positions[-6:].tolist() == list(range(124, 130))
-            assert metadata.csa2_replay_start_positions.tolist() == [start, 0]
+            torch.testing.assert_close(metadata.ext(CSA2Metadata).csa2_positions, positions)
+            assert metadata.ext(CSA2Metadata).csa2_positions[-6:].tolist() == list(range(124, 130))
+            assert metadata.ext(CSA2Metadata).csa2_replay_start_positions.tolist() == [start, 0]
             for layer, slots in swa_slots.items():
-                torch.testing.assert_close(metadata.csa2_swa_write_slots[layer], slots)
-                assert (metadata.csa2_swa_indices[layer][0, :-1] == -1).all()
-            for batch in metadata._csa2_compression.values():
+                torch.testing.assert_close(
+                    metadata.ext(CSA2Metadata).csa2_swa_write_slots[layer], slots
+                )
+                assert (metadata.ext(CSA2Metadata).csa2_swa_indices[layer][0, :-1] == -1).all()
+            for batch in metadata.ext(CSA2Metadata)._csa2_compression.values():
                 assert batch.kv_lengths.tolist() == [end, 130]
                 assert batch.start_positions.tolist() == [256 if recovering else 0, 124]
         if recovering:
@@ -147,14 +153,14 @@ def test_prepared_encoder_replay_preserves_live_speculative_endpoints(
             req.context_current_position = end
             metadata.seq_lens = torch.tensor([1, 6], dtype=torch.int32)
             metadata.kv_cache_params.num_cached_tokens_per_seq = [end, 128]
-            metadata.prepare_context_replay([req])
+            metadata.ext(CSA2Metadata).prepare_context_replay([req])
             metadata.prepare()
-            assert metadata.csa2_replay_mode is None
-            assert metadata.csa2_replay_start_positions.tolist() == [start, 0]
+            assert metadata.ext(CSA2Metadata).csa2_replay_mode is None
+            assert metadata.ext(CSA2Metadata).csa2_replay_start_positions.tolist() == [start, 0]
             req.py_ced_replay = None
-            metadata.prepare_context_replay([req])
+            metadata.ext(CSA2Metadata).prepare_context_replay([req])
             metadata.prepare()
-            assert metadata.csa2_replay_start_positions.tolist() == [0, 0]
+            assert metadata.ext(CSA2Metadata).csa2_replay_start_positions.tolist() == [0, 0]
 
 
 @pytest.mark.parametrize("recovering", [False, True])
@@ -360,7 +366,7 @@ def test_final_window_mixed_batch_keeps_finished_context_and_generation(
             buffer.copy_(saved)
         reqs[0].prompt_len = 1024
         actual = run(model, metadata, reqs, ids, [0, 0, 0], lengths, 2)
-        assert metadata.csa2_decoder_capture_lens == (0, 128)
+        assert metadata.ext(CSA2Metadata).csa2_decoder_capture_lens == (0, 128)
         assert metadata.seq_lens.tolist() == lengths
         assert actual.shape == expected.shape == (3, 1024)
         torch.testing.assert_close(actual[1:], expected[1:], atol=0.02, rtol=0.02)
@@ -450,8 +456,8 @@ def test_chunked_ced_matches_independent_window_reference(
                             ].flatten().tolist() == list(range(offset + n - rows, offset + n))
                     assert out.shape == (1, 1024)
                     assert metadata.seq_lens.tolist() == [n]
-                    assert metadata.csa2_decoder_capture_lens == (rows,)
-                    assert not metadata.csa2_precomputed_kv_layers
+                    assert metadata.ext(CSA2Metadata).csa2_decoder_capture_lens == (rows,)
+                    assert not metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers
                     if rows and not final:
                         # Decoder KV, rather than retained HC tensors, carries
                         # the partial window across ordinary suspend/resume.

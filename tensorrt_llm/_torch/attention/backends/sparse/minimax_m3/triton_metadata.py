@@ -8,8 +8,8 @@ Contains:
     dataclass with a CUDA-graph-safe :meth:`prepare`.
   * Helpers to migrate metadata across devices, build it from a real
     :class:`KVCacheManagerV2`, and pre-allocate CUDA-graph-stable buffers.
-  * :class:`MiniMaxM3AttentionMetadata` -- the :class:`AttentionMetadata`
-    subclass the pyexecutor wires into the M3 sparse layer's forward path.
+  * :class:`MiniMaxM3TritonMetadata` -- the :class:`AttentionMetadata`
+    extension the pyexecutor wires into the M3 sparse layer's forward path.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from ...trtllm import TrtllmAttentionMetadata
+from ..params import SparseAlgorithmExtension
 from .common import build_paged_kv_slot_mapping
 
 
@@ -435,7 +435,7 @@ def build_runtime_metadata_from_kv_manager(
     ``device`` selects the placement of the returned tensors. Default
     is ``seq_lens.device`` so existing callers (focused tests) keep
     their behaviour; the production
-    :class:`MiniMaxM3AttentionMetadata.prepare` path passes the cache
+    :class:`MiniMaxM3TritonMetadata.prepare` path passes the cache
     device explicitly so the forward never needs a CPU->GPU copy.
 
     ``static_buffers`` is the CUDA-graph-stable buffer dict produced by
@@ -664,28 +664,24 @@ def build_runtime_metadata_from_kv_manager(
     return meta, out_cache_loc
 
 
-class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
-    """:class:`TrtllmAttentionMetadata` that pre-builds MiniMax-M3 metadata.
+class MiniMaxM3TritonMetadata(SparseAlgorithmExtension):
+    """:class:`TrtllmAttentionMetadata` extension that pre-builds MiniMax-M3 metadata.
 
-    Subclasses :class:`TrtllmAttentionMetadata` (like
-    ``DSAtrtllmAttentionMetadata``) so one-model Eagle3 draft layers can run
-    :class:`TrtllmAttention` on this metadata.
+    Extends :class:`TrtllmAttentionMetadata` so one-model Eagle3 draft layers
+    can run :class:`TrtllmAttention` on the same metadata.
 
-    Overrides :meth:`prepare` so the M3-sparse
+    :meth:`prepare` builds the M3-sparse
     :class:`MiniMaxM3TritonSparseAttentionMetadata` and the per-new-token
-    ``out_cache_loc`` are built **once per scheduler step**, on the
-    cache device, before the model forward runs.  The result is
-    stored as ``self.minimax_m3 = {"metadata": m3_meta,
-    "out_cache_loc": out_cache_loc}`` so the model layer's
-    ``_dense_forward`` and ``_sparse_forward`` can read it without
-    any device migration.
-
-    Test paths that build their own metadata can short-circuit by
-    attaching ``attn_metadata.minimax_m3`` directly before calling
-    the forward; those paths do not go through :meth:`prepare`.
+    ``out_cache_loc`` **once per scheduler step**, on the cache device,
+    before the model forward runs, as ``sparse_metadata`` and
+    ``out_cache_loc``, so the model layer's ``_dense_forward`` and
+    ``_sparse_forward`` can read them without any device migration.
     """
 
-    minimax_m3: Optional[dict] = None
+    # This step's M3-sparse metadata and per-new-token cache slots; None until
+    # prepare() builds them.
+    sparse_metadata: Optional[MiniMaxM3TritonSparseAttentionMetadata] = None
+    out_cache_loc: Optional[torch.Tensor] = None
     # Lazily allocated dict of persistent device buffers used to keep
     # ``MiniMaxM3TritonSparseAttentionMetadata`` tensor addresses stable
     # across CUDA-graph capture/replay. None until the first
@@ -703,7 +699,7 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
         needed and caches it on ``self._m3_static_buffers``. We
         allocate the buffers under two conditions:
 
-          * ``self.is_cuda_graph`` is True -- the captured graph
+          * the metadata's ``is_cuda_graph`` is True -- the captured graph
             requires stable ``data_ptr()`` across replays; OR
           * the previous prepare() already allocated buffers --
             we keep using them so the algorithm sees the same
@@ -714,9 +710,8 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
         Returns ``None`` when no static buffers should be used (e.g.
         eager-only test paths that rely on per-call allocations).
         """
-        need_static = (
-            bool(getattr(self, "is_cuda_graph", False)) or self._m3_static_buffers is not None
-        )
+        md = self.metadata
+        need_static = bool(md.is_cuda_graph) or self._m3_static_buffers is not None
         if not need_static:
             return None
         if self._m3_static_buffers is not None:
@@ -740,20 +735,16 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
             # Caller-provided hints used by the lazy allocator below
             # when it sizes the persistent buffers on the first real
             # prepare() call.
-            "max_num_sequences_hint": int(
-                getattr(self, "max_num_sequences", None) or self.max_num_requests
-            ),
+            "max_num_sequences_hint": int(md.max_num_sequences or md.max_num_requests),
             "max_num_tokens_hint": int(
-                getattr(self, "max_num_tokens", None)
-                or (int(getattr(self, "max_num_sequences", None) or self.max_num_requests))
+                md.max_num_tokens or md.max_num_sequences or md.max_num_requests
             ),
         }
         self._m3_static_buffers = placeholder
         return placeholder
 
     def prepare(self) -> None:
-        super().prepare()
-
+        md = self.metadata
         # Always rebuild the M3 metadata block on each prepare()
         # call so it reflects the current scheduler step's seq_lens
         # / request_ids / num_cached_tokens. Production
@@ -768,22 +759,23 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
         # over ``req_to_token``/``slot_ids`` reads from freed warmup
         # memory and either produces wrong tokens or fires
         # ``Indexing.cu:1515`` ``srcIndex < srcSelectDimSize``.
-        self.minimax_m3 = None
+        self.sparse_metadata = None
+        self.out_cache_loc = None
 
         # Production path: build the M3 metadata from the standard
         # AttentionMetadata fields. Requires kv_cache_manager + the
         # M3 sparse-cache contract.
-        kv_cache_manager = getattr(self, "kv_cache_manager", None)
+        kv_cache_manager = md.kv_cache_manager
         if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
             # Not an M3 KV cache manager: nothing to build. The
             # forward path will raise a clear error if the M3
             # backend ends up dispatched without the M3 cache.
             return
-        request_ids = getattr(self, "request_ids", None)
-        seq_lens = self.seq_lens
+        request_ids = md.request_ids
+        seq_lens = md.seq_lens
         if request_ids is None or seq_lens is None:
             return
-        num_contexts = int(getattr(self, "num_contexts", 0) or 0)
+        num_contexts = int(md.num_contexts or 0)
         batch_size = int(seq_lens.shape[0])
         if batch_size == 0:
             return
@@ -797,14 +789,14 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
             cache_device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
         seq_lens_cpu = (
-            getattr(self, "seq_lens_cpu", None)
-            if hasattr(self, "seq_lens_cpu")
+            getattr(md, "seq_lens_cpu", None)
+            if hasattr(md, "seq_lens_cpu")
             else seq_lens.detach().to("cpu")
         )
         if seq_lens_cpu is None:
             seq_lens_cpu = seq_lens.detach().to("cpu")
 
-        kv_cache_params = getattr(self, "kv_cache_params", None)
+        kv_cache_params = md.kv_cache_params
         num_cached_per_seq = (
             kv_cache_params.num_cached_tokens_per_seq
             if kv_cache_params is not None
@@ -860,29 +852,25 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
                 static_buffers=static_buffers,
             )
 
-        self.minimax_m3 = {
-            "metadata": m3_meta,
-            "out_cache_loc": out_cache_loc,
-        }
+        self.sparse_metadata = m3_meta
+        self.out_cache_loc = out_cache_loc
 
-    def on_update_kv_lens(self) -> None:
+    def on_kv_lens_changed(self, spec_dec_step: bool) -> None:
         """Re-derive the M3 attachment from the corrected ``kv_lens_cuda``.
 
         With the overlap scheduler and speculative decoding, prepare() runs
         with optimistic lengths and the engine corrects ``kv_lens_cuda`` on
-        device before calling this (as DSAtrtllmAttentionMetadata does).
+        device before calling ``on_update_kv_lens``.
         Device-only and idempotent. ``seq_lens_cpu`` / ``max_seqlen_k`` keep
         the optimistic values; they only bound widths the kernels mask by
         ``seq_lens``.
         """
-        super().on_update_kv_lens()
-        attachment = self.minimax_m3
-        if not attachment:
+        meta = self.sparse_metadata
+        if spec_dec_step or meta is None:
             return
-        meta = attachment["metadata"]
-        out_cache_loc = attachment["out_cache_loc"]
+        out_cache_loc = self.out_cache_loc
         batch = int(meta.slot_ids.shape[0])
-        kv_lens = self.kv_lens_cuda[:batch]
+        kv_lens = self.metadata.kv_lens_cuda[:batch]
         meta.seq_lens[:batch].copy_(kv_lens)
         if meta.is_prefill:
             # Only the K-side prefix moves with rejections; the Q-side layout
@@ -904,7 +892,7 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
 
 
 __all__ = [
-    "MiniMaxM3AttentionMetadata",
+    "MiniMaxM3TritonMetadata",
     "MiniMaxM3TritonSparseAttentionMetadata",
     "allocate_minimax_m3_static_buffers",
     "build_runtime_metadata_from_kv_manager",

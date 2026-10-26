@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 
 from tensorrt_llm._torch.attention.backends.fmha import (
     flashinfer_trtllm_gen as flashinfer_trtllm_gen_module,
@@ -39,7 +40,7 @@ def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
     fmha._v1_total_num_blocks_cache = None
     attn = SimpleNamespace(local_layer_idx=7)
     fmha._attn_ref = lambda: attn
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_manager=manager,
         host_kv_cache_pool_mapping=None,
     )
@@ -74,7 +75,7 @@ def test_flashinfer_uses_remaining_v1_selected_pool_extent(kv_factor: int) -> No
     fmha._v1_total_num_blocks_cache = None
     attn = SimpleNamespace(local_layer_idx=4)
     fmha._attn_ref = lambda: attn
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_manager=manager,
         host_kv_cache_pool_mapping=pool_mapping,
     )
@@ -90,7 +91,7 @@ def test_phased_fmha_rejects_unknown_kv_cache_manager_type() -> None:
     fmha.kv_factor = 2
     fmha._v1_total_num_blocks_cache = None
     fmha._attn_ref = lambda: SimpleNamespace(local_layer_idx=0)
-    metadata = SimpleNamespace(kv_cache_manager=SimpleNamespace())
+    metadata = metadata_stub(kv_cache_manager=SimpleNamespace())
 
     with pytest.raises(TypeError, match="Unsupported KV cache manager: SimpleNamespace"):
         fmha._get_total_num_blocks(metadata)
@@ -141,7 +142,7 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
         attn=SimpleNamespace(num_heads=num_heads),
         _multi_processor_count=sm_count,
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         max_num_requests=max_num_requests,
         beam_width=beam_width,
         max_num_sequences=max_num_sequences,
@@ -213,7 +214,7 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         rotary_cos_sin=None,
         rope_params=SimpleNamespace(dim=0, theta=1.0, scale_type=0, scale=1.0, max_positions=1),
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         beam_width=2,
         kv_cache_block_offsets=torch.empty(0),
         host_kv_cache_pool_pointers=torch.empty(0),
@@ -280,7 +281,7 @@ def _cute_dsl_mla_helix_support(
         qk_rope_head_dim=64,
         layer_idx=0,
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         num_contexts=0,
         num_generations=batch_size,
         beam_width=1,
@@ -326,7 +327,7 @@ def test_cute_dsl_mla_rejects_h96_mixed_batch(monkeypatch: pytest.MonkeyPatch) -
         qk_rope_head_dim=64,
         layer_idx=0,
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         num_contexts=1,
         num_generations=1,
         beam_width=1,

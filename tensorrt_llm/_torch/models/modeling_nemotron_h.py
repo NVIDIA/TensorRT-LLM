@@ -34,6 +34,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.features import RecurrentMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -751,7 +752,7 @@ class NemotronHModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        mamba_metadata = attn_metadata.mamba_metadata
+        mamba_metadata = attn_metadata.ext(RecurrentMetadata).mamba_metadata
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1250,7 +1251,8 @@ class NemotronHMTP(nn.Module):
                 attn_metadata=attn_metadata,
                 all_rank_num_tokens=all_rank_num_tokens,
                 spec_metadata=spec_metadata,
-                mamba_metadata=attn_metadata.mamba_metadata,
+                mamba_metadata=attn_metadata.ext(
+                    RecurrentMetadata).mamba_metadata,
                 lora_params=lora_params,
             )
         return hidden_states

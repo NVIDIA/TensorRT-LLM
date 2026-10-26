@@ -26,6 +26,8 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.logger import logger
 
+from ..features import FlashMlaMetadata, HelixMetadata
+from ..features.spec_decoding import SpecDecodingMetadata
 from .interface import Fmha, FmhaPhase
 
 if TYPE_CHECKING:
@@ -58,6 +60,11 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
 # rich object owns them). Sync test enforces both the kwarg name and the
 # literal value.
 _THOP_LITERALS: dict = {}
+
+# Stand-ins for absent extensions: every field reads as None or off.
+_NO_HELIX = HelixMetadata(None)
+_NO_FLASH_MLA = FlashMlaMetadata(None)
+_NO_SPEC = SpecDecodingMetadata(None)
 
 
 class FallbackFmha(Fmha):
@@ -270,9 +277,11 @@ class FallbackFmha(Fmha):
         # gate both assume the new KV entries are the trailing slots of one
         # rank's kv_len. Reject rather than run it silently wrong; being last
         # in the library list, this makes dispatch raise.
+        helix = metadata.find_ext(HelixMetadata)
         if (
-            metadata.helix_position_offsets is not None
-            and metadata._helix_spec_tokens_valid
+            helix is not None
+            and helix.position_offsets is not None
+            and helix.spec_tokens_valid
             and metadata.num_generations > 0
             # Count generation tokens only: in a mixed batch ``q`` also holds
             # the context tokens, which would otherwise trip this on a batch
@@ -297,6 +306,10 @@ class FallbackFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         attn = self.attn
+        # Extensions this call reads; an absent one reads as all-None.
+        helix = metadata.find_ext(HelixMetadata) or _NO_HELIX
+        flash_mla = metadata.find_ext(FlashMlaMetadata) or _NO_FLASH_MLA
+        spec = metadata.find_ext(SpecDecodingMetadata) or _NO_SPEC
         if forward_args.sage_attn_smooth_v:
             logger.warning_once(
                 "The attention op quantizes V without the V smoothing this SageAttention "
@@ -333,22 +346,22 @@ class FallbackFmha(Fmha):
             max_num_sequences=metadata.max_num_sequences,
             beam_width=metadata.effective_beam_width,
             use_paged_context_fmha=metadata.use_paged_context_fmha,
-            helix_position_offsets=metadata.helix_position_offsets,
-            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
-            is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
-            use_spec_decoding=metadata.use_spec_decoding,
-            is_spec_dec_tree=metadata.is_spec_dec_tree,
-            spec_decoding_generation_lengths=metadata.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=metadata.spec_decoding_position_offsets_for_cpp,
-            spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
-            spec_decoding_bl_tree_mask_offset=metadata.spec_decoding_bl_tree_mask_offset,
-            spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
-            spec_decoding_target_max_draft_tokens=metadata.max_total_draft_tokens,
-            force_prepare_spec_dec_tree_mask=metadata.force_prepare_spec_dec_tree_mask,
-            spec_bl_tree_first_sparse_mask_offset_kv=metadata.spec_bl_tree_first_sparse_mask_offset_kv,
+            helix_position_offsets=helix.position_offsets,
+            helix_is_inactive_rank=helix.is_inactive_rank,
+            is_spec_decoding_enabled=spec.is_spec_decoding_enabled,
+            use_spec_decoding=spec.use_spec_decoding,
+            is_spec_dec_tree=spec.is_spec_dec_tree,
+            spec_decoding_generation_lengths=spec.generation_lengths,
+            spec_decoding_position_offsets_for_cpp=spec.position_offsets_for_cpp,
+            spec_decoding_packed_mask=spec.packed_mask,
+            spec_decoding_bl_tree_mask_offset=spec.bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=spec.bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=spec.max_total_draft_tokens,
+            force_prepare_spec_dec_tree_mask=spec.force_prepare_tree_mask,
+            spec_bl_tree_first_sparse_mask_offset_kv=spec.bl_tree_first_sparse_mask_offset_kv,
             num_sparse_topk=metadata.num_sparse_topk,
-            flash_mla_tile_scheduler_metadata=metadata.flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits=metadata.flash_mla_num_splits,
+            flash_mla_tile_scheduler_metadata=flash_mla.tile_scheduler_metadata,
+            flash_mla_num_splits=flash_mla.num_splits,
             num_contexts=metadata.num_contexts,
             num_ctx_tokens=metadata.num_ctx_tokens,
             max_context_length=metadata.max_context_length,

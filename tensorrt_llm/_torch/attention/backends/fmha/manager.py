@@ -35,6 +35,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
+from ..features.spec_decoding import SpecDecodingMetadata
 from .combined import CombinedFmha
 from .interface import Fmha, FmhaPhase
 from .phased import PhasedFmha
@@ -387,7 +388,7 @@ class FmhaManager:
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
-            use_spec_decoding=metadata.use_spec_decoding,
+            use_spec_decoding=metadata.ext(SpecDecodingMetadata).use_spec_decoding,
             has_block_sparse_inputs=block_sparse_inputs is not None,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,

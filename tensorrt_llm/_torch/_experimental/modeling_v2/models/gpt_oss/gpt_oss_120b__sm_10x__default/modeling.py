@@ -75,6 +75,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
     mxfp8_quantize,
 )
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -151,6 +153,12 @@ _SF_LINEAR = False
 # is independent through routing, quantization and the expert GEMMs, so the
 # chunks re-joined are the whole call.
 _MOE_MAX_T = 8192
+
+
+def _flash_mla_field(md: TrtllmAttentionMetadata, name: str):
+    """A FlashMLA metadata field, or None when FlashMLA is not attached."""
+    flash_mla = md.find_ext(FlashMlaMetadata)
+    return getattr(flash_mla, name) if flash_mla is not None else None
 
 
 def _in_chunks(experts: Callable, x: torch.Tensor, L: "_LayerWeights") -> torch.Tensor:
@@ -529,6 +537,7 @@ class PrefillTarget:
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
+        spec = md.find_ext(SpecDecodingMetadata)
         return dict(
             sequence_length=md.kv_lens_cuda_runtime,
             host_past_key_value_lengths=md.kv_lens_runtime,
@@ -553,21 +562,21 @@ class PrefillTarget:
             block_ids_per_seq=md.block_ids_per_seq,
             max_context_q_len_override=md.max_context_q_len_override,
             is_cross=md.is_cross,
-            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-            use_spec_decoding=md.use_spec_decoding,
-            is_spec_dec_tree=md.is_spec_dec_tree,
-            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            is_spec_decoding_enabled=spec.is_spec_decoding_enabled,
+            use_spec_decoding=spec.use_spec_decoding,
+            is_spec_dec_tree=spec.is_spec_dec_tree,
+            spec_decoding_generation_lengths=spec.generation_lengths,
+            spec_decoding_position_offsets_for_cpp=spec.position_offsets_for_cpp,
+            spec_decoding_packed_mask=spec.packed_mask,
+            spec_decoding_bl_tree_mask_offset=spec.bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=spec.bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=spec.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=spec.bl_tree_first_sparse_mask_offset_kv,
             num_sparse_topk=md.num_sparse_topk,
-            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits=md.flash_mla_num_splits,
+            flash_mla_tile_scheduler_metadata=_flash_mla_field(md, "tile_scheduler_metadata"),
+            flash_mla_num_splits=_flash_mla_field(md, "num_splits"),
             max_num_sequences=md.max_num_sequences,
-            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+            force_prepare_spec_dec_tree_mask=spec.force_prepare_tree_mask,
         )
 
     def forward(
@@ -766,6 +775,7 @@ class DecodeTarget:
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
+        spec = md.find_ext(SpecDecodingMetadata)
         return dict(
             sequence_length=md.kv_lens_cuda_runtime,
             host_past_key_value_lengths=md.kv_lens_runtime,
@@ -790,21 +800,21 @@ class DecodeTarget:
             block_ids_per_seq=md.block_ids_per_seq,
             max_context_q_len_override=md.max_context_q_len_override,
             is_cross=md.is_cross,
-            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-            use_spec_decoding=md.use_spec_decoding,
-            is_spec_dec_tree=md.is_spec_dec_tree,
-            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            is_spec_decoding_enabled=spec.is_spec_decoding_enabled,
+            use_spec_decoding=spec.use_spec_decoding,
+            is_spec_dec_tree=spec.is_spec_dec_tree,
+            spec_decoding_generation_lengths=spec.generation_lengths,
+            spec_decoding_position_offsets_for_cpp=spec.position_offsets_for_cpp,
+            spec_decoding_packed_mask=spec.packed_mask,
+            spec_decoding_bl_tree_mask_offset=spec.bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=spec.bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=spec.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=spec.bl_tree_first_sparse_mask_offset_kv,
             num_sparse_topk=md.num_sparse_topk,
-            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits=md.flash_mla_num_splits,
+            flash_mla_tile_scheduler_metadata=_flash_mla_field(md, "tile_scheduler_metadata"),
+            flash_mla_num_splits=_flash_mla_field(md, "num_splits"),
             max_num_sequences=md.max_num_sequences,
-            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+            force_prepare_spec_dec_tree_mask=spec.force_prepare_tree_mask,
         )
 
     def forward(

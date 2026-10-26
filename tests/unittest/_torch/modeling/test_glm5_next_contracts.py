@@ -10,6 +10,7 @@ import pytest
 import torch
 from transformers import AutoConfig, PretrainedConfig
 
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextMamba2Metadata
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -36,6 +37,14 @@ from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_mask
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_cuda_graphs
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.mapping import Mapping
+
+
+def _recurrent_stub(mamba_metadata, **fields) -> SimpleNamespace:
+    """A metadata stub serving ``mamba_metadata`` through its recurrent extension."""
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: recurrent if cls is RecurrentMetadata else None
+    return metadata
 
 
 @pytest.mark.cpu_only
@@ -445,7 +454,6 @@ def test_runtime_context_uses_prepared_schedules_and_live_lengths(is_cuda_graph)
     prepared.glm_cached_lens_host = [3, 5]
     metadata = SimpleNamespace(
         kv_cache_manager=object(),
-        mamba_metadata=prepared,
         seq_lens=torch.tensor([3, 4]),
         num_contexts=1,
         num_ctx_tokens=3,
@@ -453,6 +461,8 @@ def test_runtime_context_uses_prepared_schedules_and_live_lengths(is_cuda_graph)
         kv_lens_cuda=live_lengths,
         is_cuda_graph=is_cuda_graph,
     )
+    recurrent = SimpleNamespace(mamba_metadata=prepared)
+    metadata.ext = lambda cls: recurrent
     context = build_glm5_next_runtime_context(metadata)
     assert context.ctx_cu_seqlens is prepared.glm_ctx_cu_seqlens
     assert context.cached_lens is prepared.glm_cached_lens_host
@@ -473,7 +483,7 @@ def test_runtime_context_uses_prepared_schedules_and_live_lengths(is_cuda_graph)
         build_glm5_next_runtime_context(metadata)
     metadata.kv_lens_cuda = live_lengths
     for invalid in (None, False, SimpleNamespace(glm_block_tables=prepared.glm_block_tables)):
-        metadata.mamba_metadata = invalid
+        recurrent.mamba_metadata = invalid
         with pytest.raises(AssertionError, match="Glm5NextMamba2Metadata"):
             build_glm5_next_runtime_context(metadata)
 
@@ -1081,7 +1091,7 @@ def test_sparse_prefill_continuation_preserves_partial_pools():
             if cached and discard_prefix:
                 latent.zero_()
                 index.zero_()
-            metadata = SimpleNamespace(
+            metadata = _recurrent_stub(
                 kv_cache_manager=manager,
                 seq_lens=torch.tensor([length]),
                 num_contexts=1,

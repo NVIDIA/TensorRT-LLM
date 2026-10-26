@@ -22,8 +22,7 @@ from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
 from .params import DeepSeekV4Params
 
 if TYPE_CHECKING:
-    from ..dsa.metadata import DSAtrtllmAttentionMetadata
-    from .metadata import DeepseekV4TrtllmAttentionMetadata
+    from ...trtllm import TrtllmAttentionMetadata
 
 
 class DeepseekV4Indexer(Indexer):
@@ -214,7 +213,7 @@ class DeepseekV4Indexer(Indexer):
         self,
         k_fp8: Optional[torch.Tensor],
         k_scale: Optional[torch.Tensor],
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
     ) -> None:
         if k_fp8 is None:
             return
@@ -231,7 +230,7 @@ class DeepseekV4Indexer(Indexer):
     def precompute_aux(
         self,
         hidden_states: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         start_event: Optional[torch.cuda.Event] = None,
     ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
         """Pre-launch the qr-independent half of the indexer prepare phase.
@@ -265,7 +264,7 @@ class DeepseekV4Indexer(Indexer):
         self,
         qr: torch.Tensor,
         hidden_states: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
         pre_aux: Optional[
             Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
@@ -338,7 +337,7 @@ class DeepseekV4Indexer(Indexer):
         self,
         qr: torch.Tensor,
         hidden_states: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
@@ -357,7 +356,7 @@ class DeepseekV4Indexer(Indexer):
         self,
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
     ) -> None:
         # DSV4's indexer compressor already scatters INDEXER_COMPRESS. The
         # shared DSA scatter would duplicate that write.
@@ -367,12 +366,15 @@ class DeepseekV4Indexer(Indexer):
         self,
         qr: torch.Tensor,
         hidden_states: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
         pre_aux: Optional[
             Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
         ] = None,
     ):
+        from .metadata import DeepseekV4Metadata
+
+        dsv4 = metadata.ext(DeepseekV4Metadata)
         use_overlapped_prepare = (
             do_multi_stream()
             and self.aux_stream is not None
@@ -394,7 +396,7 @@ class DeepseekV4Indexer(Indexer):
 
         # If there are no compressed tokens, return an topk indices buffer with all -1s in the tensor.
         if k_fp8 is None:
-            topk_indices = metadata.empty_topk_indices_buffer[: hidden_states.shape[0]]
+            topk_indices = dsv4.empty_topk_indices_buffer[: hidden_states.shape[0]]
         else:
             topk_indices = self.sparse_attn_indexer(
                 metadata,

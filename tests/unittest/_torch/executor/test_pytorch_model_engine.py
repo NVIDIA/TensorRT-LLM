@@ -2116,12 +2116,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         warmup forward was skipped it is built on demand so the engines still
         compile before serving."""
         from tensorrt_llm._torch.attention.backends.sparse.dsa import \
-            DSAtrtllmAttentionMetadata
+            DSAMetadata
 
         engine = object.__new__(DecoderWarmup)
         engine._config = SimpleNamespace(
             attention_backend=SimpleNamespace(
-                Metadata=DSAtrtllmAttentionMetadata),
+                metadata_extensions=(DSAMetadata, )),
             original_max_draft_len=2,
             cuda_graph_batch_sizes=[8],
             spec_config=None,
@@ -2131,7 +2131,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                            model=None,
                                            buffers=None,
                                            attention_runtime_features=None)
-        metadata = Mock(spec=DSAtrtllmAttentionMetadata)
+        dsa = Mock(spec=DSAMetadata)
+        metadata = Mock()
+        metadata.find_ext.side_effect = lambda cls: dsa if cls is DSAMetadata else None
 
         def build(kv_cache_manager, draft_kv_cache_manager):
             engine._metadata.attn_metadata = metadata
@@ -2147,9 +2149,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         engine._metadata.setup_attention.assert_called_once_with(
             kv_cache_manager, None)
-        metadata.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
-        metadata.warmup_selfsampling_topk.assert_called_once_with(
-            3, batch_sizes=[8])
+        dsa.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
+        dsa.warmup_selfsampling_topk.assert_called_once_with(3, batch_sizes=[8])
 
     def test_warmup_does_not_build_metadata_for_non_dsa_backend(self) -> None:
         from tensorrt_llm._torch.attention.backends.trtllm import \
@@ -4009,10 +4010,19 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
     @staticmethod
     def _metadata():
         from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import \
-            CSA2TrtllmMetadata
-        metadata = object.__new__(CSA2TrtllmMetadata)
+            CSA2Metadata
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttentionMetadata
+        metadata = object.__new__(TrtllmAttentionMetadata)
+        metadata.replace_ext(CSA2Metadata(metadata))
         metadata.is_cuda_graph = True
         return metadata
+
+    @staticmethod
+    def _defers_outputs(metadata) -> bool:
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import \
+            CSA2Metadata
+        return metadata.ext(CSA2Metadata)._csa2_defer_decode_outputs
 
     def test_scope_requires_selected_ordinary_decode_graph(self):
         key = KeyType(batch_size=1, draft_len=0)
@@ -4063,9 +4073,9 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                         batch,
                         promoted,
                         enable_spec_decode=enable_spec_decode):
-                    self.assertEqual(metadata._csa2_defer_decode_outputs, case
+                    self.assertEqual(self._defers_outputs(metadata), case
                                      in ("ordinary", "ordinary_overlap"))
-                self.assertFalse(metadata._csa2_defer_decode_outputs)
+                self.assertFalse(self._defers_outputs(metadata))
 
     def test_forward_scopes_proof_to_prepare_for_capture_replay_and_fallback(
             self):
@@ -4091,7 +4101,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
 
                 def prepare(*args, **kwargs):
                     self.assertIs(metadata.trtllm_gen_jit_warmup, False)
-                    self.assertEqual(metadata._csa2_defer_decode_outputs, mode
+                    self.assertEqual(self._defers_outputs(metadata), mode
                                      != "fallback")
                     if mode == "prepare_error":
                         raise RuntimeError("prepare failed")
@@ -4112,7 +4122,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                         })
                         self.assertIs(actual_outputs["logits"],
                                       outputs["logits"])
-                self.assertFalse(metadata._csa2_defer_decode_outputs)
+                self.assertFalse(self._defers_outputs(metadata))
                 if mode in ("warmup", "capture"):
                     runner.capture.assert_called_once()
                 if mode in ("capture", "replay"):

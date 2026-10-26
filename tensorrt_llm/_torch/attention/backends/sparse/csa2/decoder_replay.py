@@ -23,10 +23,12 @@ from .....pyexecutor.ced_replay import (
     EncoderReplay,
     requires_full_decoder_prefill,
 )
+from .metadata import CSA2Metadata
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
     from .....pyexecutor.llm_request import LlmRequest
-    from .metadata import CSA2TrtllmMetadata
 
 __all__ = [
     "DecoderReplayPlan",
@@ -85,7 +87,7 @@ class DecoderReplayPlan:
 
 
 def plan_decoder_replay(
-    metadata: "CSA2TrtllmMetadata",
+    metadata: TrtllmAttentionMetadata,
     window: int,
     requests: Optional[list[LlmRequest]] = None,
     *,
@@ -126,7 +128,8 @@ def plan_decoder_replay(
     host_seq_lens = seq_lens[:num_requests].tolist()
     num_cached = list(metadata.kv_cache_params.num_cached_tokens_per_seq[:num_requests])
 
-    context_ends = getattr(metadata, "decoder_context_ends", None)
+    csa2 = metadata.find_ext(CSA2Metadata)
+    context_ends = csa2.decoder_context_ends if csa2 is not None else None
     if context_ends is None and requests and all(hasattr(req, "prompt_len") for req in requests):
         context_ends = tuple(req.prompt_len for req in requests)
     replay_lens = list(host_seq_lens)
@@ -208,7 +211,7 @@ def plan_decoder_replay(
     # moment they exist and the only moment they are about to be cleared.
 
 
-def _swa_is_reused(metadata: "CSA2TrtllmMetadata") -> bool:
+def _swa_is_reused(metadata: TrtllmAttentionMetadata) -> bool:
     """Whether a later request could read this pass's sliding-window KV.
 
     Read off the manager rather than the config so a manager that disabled the
@@ -222,22 +225,23 @@ def _swa_is_reused(metadata: "CSA2TrtllmMetadata") -> bool:
 
 
 def enter_decoder_replay(
-    metadata: "CSA2TrtllmMetadata",
+    metadata: TrtllmAttentionMetadata,
     plan: DecoderReplayPlan,
     first_layer: Optional[int] = None,
 ) -> None:
     """Rebuild query views and carry encoder publications across the boundary."""
+    csa2 = metadata.ext(CSA2Metadata)
     if plan.replay_all_rank_num_tokens is not None:
         metadata.all_rank_num_tokens = plan.replay_all_rank_num_tokens
     if not plan.updates_local_metadata:
         return
-    saved_indices = dict(metadata.csa2_indices)
+    saved_indices = dict(csa2.csa2_indices)
     saved_candidates = {
-        name: dict(getattr(metadata, name))
+        name: dict(getattr(csa2, name))
         for name in ("csa2_candidates", "csa2_candidate_blocks", "csa2_candidate_counts")
     }
-    saved_last_layer = metadata._csa2_last_layer
-    precomputed = set(getattr(metadata, "csa2_precomputed_kv_layers", ()))
+    saved_last_layer = csa2._csa2_last_layer
+    precomputed = set(getattr(csa2, "csa2_precomputed_kv_layers", ()))
     live_kv_lens = metadata.kv_lens_cuda[: metadata.num_seqs].clone()
     metadata.kv_cache_params.num_cached_tokens_per_seq[: len(plan.replay_num_cached)] = (
         plan.replay_num_cached
@@ -247,27 +251,27 @@ def enter_decoder_replay(
     if plan.num_replay_tokens == 0:
         # No local attention runs. Keep GLOBAL publication and live KV lengths,
         # but do not ask attention backends to prepare an empty query batch.
-        metadata.reset_routing()
-        metadata.csa2_precomputed_kv_layers = precomputed
-        metadata.csa2_replay_query_rows = plan.rows
+        csa2.reset_routing()
+        csa2.csa2_precomputed_kv_layers = precomputed
+        csa2.csa2_replay_query_rows = plan.rows
         return
     if first_layer is not None:
-        metadata.set_decoder_query_boundary(first_layer)
+        csa2.set_decoder_query_boundary(first_layer)
     metadata.prepare()
     metadata.kv_lens_cuda[: metadata.num_seqs].copy_(live_kv_lens)
     metadata.on_update_kv_lens()
-    metadata.csa2_precomputed_kv_layers = precomputed
-    metadata.csa2_replay_query_rows = plan.rows
+    csa2.csa2_precomputed_kv_layers = precomputed
+    csa2.csa2_replay_query_rows = plan.rows
     for layer, indices in saved_indices.items():
-        metadata.csa2_indices[layer] = indices.index_select(0, plan.rows)
+        csa2.csa2_indices[layer] = indices.index_select(0, plan.rows)
     for name, published in saved_candidates.items():
-        target = getattr(metadata, name)
+        target = getattr(csa2, name)
         for layer, value in published.items():
             target[layer] = value.index_select(0, plan.rows)
-    metadata._csa2_last_layer = saved_last_layer
+    csa2._csa2_last_layer = saved_last_layer
     # Only context SWA is truncated. Generation rows and global visibility
     # retain their original logical positions and cache history.
-    starts = metadata._copy_csa2_tensor(
+    starts = csa2._copy_csa2_tensor(
         "decoder_starts",
         torch.tensor(
             plan.swa_floors,
@@ -278,7 +282,7 @@ def enter_decoder_replay(
     _apply_decoder_swa_floor(metadata, starts)
 
 
-def enter_remote_tail_decoder(metadata: "CSA2TrtllmMetadata", context_starts: List[int]) -> None:
+def enter_remote_tail_decoder(metadata: TrtllmAttentionMetadata, context_starts: List[int]) -> None:
     """Hide pre-handoff SWA when a generation worker enters decoder layers.
 
     Unlike ordinary decoder replay, the query rows are already exactly the
@@ -286,9 +290,10 @@ def enter_remote_tail_decoder(metadata: "CSA2TrtllmMetadata", context_starts: Li
     decoder layers must see only SWA written at or after each context's split.
     Generation rows retain their ordinary visibility.
     """
+    csa2 = metadata.ext(CSA2Metadata)
     if len(context_starts) != metadata.num_contexts:
         raise ValueError("remote-tail starts must match the context rows")
-    starts = metadata._copy_csa2_tensor(
+    starts = csa2._copy_csa2_tensor(
         "remote_tail_starts",
         torch.tensor(
             list(context_starts) + [0] * metadata.num_generations,
@@ -299,25 +304,26 @@ def enter_remote_tail_decoder(metadata: "CSA2TrtllmMetadata", context_starts: Li
     _apply_decoder_swa_floor(metadata, starts)
 
 
-def _apply_decoder_swa_floor(metadata: "CSA2TrtllmMetadata", starts: torch.Tensor) -> None:
+def _apply_decoder_swa_floor(metadata: TrtllmAttentionMetadata, starts: torch.Tensor) -> None:
     """Hide cached SWA positions below one logical floor per request from reads.
 
     Writes keep the prepared floors: query rows below the floor still store
     their SWA. The next layer resolves its slots against the raised floors.
     """
-    replay = metadata.csa2_replay_start_positions
-    floors = metadata._get_csa2_buffer("swa_read_floors", tuple(replay.shape), torch.int64)
-    previous = getattr(metadata, "_csa2_swa_read_floors", None)
+    csa2 = metadata.ext(CSA2Metadata)
+    replay = csa2.csa2_replay_start_positions
+    floors = csa2._get_csa2_buffer("swa_read_floors", tuple(replay.shape), torch.int64)
+    previous = getattr(csa2, "_csa2_swa_read_floors", None)
     torch.maximum(replay if previous is None else previous, starts, out=floors)
-    metadata._csa2_swa_read_floors = floors
+    csa2._csa2_swa_read_floors = floors
     # Earlier layers of this forward may have resolved slots below the floors.
-    metadata._csa2_swa_resolved = False
+    csa2._csa2_swa_resolved = False
     # The steady fast path skips the full prepare that restores the floors.
-    metadata._csa2_steady_snapshot = None
+    csa2._csa2_steady_snapshot = None
 
 
 def exit_decoder_replay(
-    metadata: "CSA2TrtllmMetadata",
+    metadata: TrtllmAttentionMetadata,
     plan: DecoderReplayPlan,
 ) -> None:
     """Restore the encoder pass's shape.
@@ -328,6 +334,7 @@ def exit_decoder_replay(
     values: every forward rebuilds them from these inputs in ``prepare()``, and
     copying them back would cost a second rebuild to no observable end.
     """
+    csa2 = metadata.ext(CSA2Metadata)
     if plan.saved_all_rank_num_tokens is not None:
         metadata.all_rank_num_tokens = plan.saved_all_rank_num_tokens
     if not plan.updates_local_metadata:
@@ -337,10 +344,10 @@ def exit_decoder_replay(
     )
     metadata.prompt_lens = plan.saved_prompt_lens
     metadata.seq_lens = plan.saved_seq_lens
-    metadata.csa2_replay_query_rows = None
+    csa2.csa2_replay_query_rows = None
     # Publications are indexed in the compact query space and cannot survive
     # shape restoration.
-    metadata.reset_routing()
+    csa2.reset_routing()
 
 
 def gather_replayed_rows(

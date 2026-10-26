@@ -181,6 +181,9 @@ def run_msa_nvfp4_sparse_gqa(
         require_msa_module,
     )
 
+    from ..sparse.minimax_m3.msa_backend import MiniMaxM3MsaMetadata
+
+    msa = metadata.ext(MiniMaxM3MsaMetadata)
     fmha_sm100 = require_msa_module()
     sparse = getattr(fmha_sm100, "sparse", None)
     if sparse is None:
@@ -207,27 +210,27 @@ def run_msa_nvfp4_sparse_gqa(
             f"got {tuple(scale_buffers.shape)} for K {tuple(k_paged.shape)}"
         )
 
-    batch = int(getattr(metadata, "_msa_live_batch", 0))
+    batch = int(getattr(msa, "_msa_live_batch", 0))
     if batch <= 0:
         raise RuntimeError("MiniMax-M3 NVFP4 sparse attention metadata was not prepared")
-    max_q_len = int(metadata._msa_max_q_len)
-    max_kv_len = int(metadata._msa_max_kv_len_all)
-    total_k = int(metadata._msa_total_k)
-    total_k_rows = int(metadata._msa_total_k_rows)
+    max_q_len = int(msa._msa_max_q_len)
+    max_kv_len = int(msa._msa_max_kv_len_all)
+    total_k = int(msa._msa_total_k)
+    total_k_rows = int(msa._msa_total_k_rows)
     if num_rows is not None:
         if not 0 < num_rows <= batch:
             raise ValueError(f"MiniMax-M3 NVFP4 row limit ({num_rows}) must lie in (0, {batch}].")
         batch = num_rows
         # Staged by prepare() over the context rows, which are exactly the rows
         # a narrowed call covers; see _stage_step_fields.
-        max_q_len, max_kv_len, total_k, total_k_rows = metadata._msa_context_prefix_bounds
+        max_q_len, max_kv_len, total_k, total_k_rows = msa._msa_context_prefix_bounds
         if total_k_rows <= 0:
             raise RuntimeError(
                 "MiniMax-M3 NVFP4 attention was narrowed to a context prefix of "
                 f"{num_rows} row(s), but prepare() staged no bounds for one."
             )
-    cu_q = metadata.msa_cu_q_lens[: batch + 1]
-    cu_kv = metadata.msa_cu_kv_lens[: batch + 1]
+    cu_q = msa.msa_cu_q_lens[: batch + 1]
+    cu_kv = msa.msa_cu_kv_lens[: batch + 1]
     q2k = kv_block_indexes.permute(1, 0, 2).contiguous()
     topk = int(q2k.shape[-1])
     page_size = int(k_paged.shape[2])
@@ -266,8 +269,8 @@ def run_msa_nvfp4_sparse_gqa(
         softmax_scale=sm_scale,
         partial_dtype=torch.bfloat16,
         return_softmax_lse=False,
-        page_table=metadata.msa_block_table[:batch],
-        seqused_k=metadata.msa_seq_lens_cuda[:batch],
+        page_table=msa.msa_block_table[:batch],
+        seqused_k=msa.msa_seq_lens_cuda[:batch],
         schedule=schedule,
     )
     out.copy_(result)
@@ -297,7 +300,9 @@ def run_msa_prefill_gqa(
     inline plan would read.
     """
     from ..sparse.minimax_m3.kernels.msa_utils import msa_paged_kv
+    from ..sparse.minimax_m3.msa_backend import MiniMaxM3MsaMetadata
 
+    msa = metadata.ext(MiniMaxM3MsaMetadata)
     head_dim = attn.head_dim
     num_tokens = int(q.shape[0])
     if num_tokens == 0:
@@ -352,11 +357,11 @@ def run_msa_prefill_gqa(
         k_paged,
         v_paged,
         kv_block_indexes,
-        kv_indices=metadata.msa_kv_indices,
+        kv_indices=msa.msa_kv_indices,
         sm_scale=sm_scale,
-        qo_lens_cpu=rows_of(metadata.msa_qo_lens_cpu),
-        kv_lens_cpu=rows_of(metadata.msa_kv_lens_cpu),
-        qo_offset_cpu=rows_of(metadata.msa_qo_offset_cpu),
+        qo_lens_cpu=rows_of(msa.msa_qo_lens_cpu),
+        kv_lens_cpu=rows_of(msa.msa_kv_lens_cpu),
+        qo_offset_cpu=rows_of(msa.msa_qo_offset_cpu),
         causal=True,
         head_dim=head_dim,
         plan=plan,
@@ -405,6 +410,9 @@ class MsaPrefillFmha(PhasedFmha):
         from ..sparse.minimax_m3.kernels.msa_utils import write_msa_phase_kv
 
         metadata = params.meta
+        from ..sparse.minimax_m3.msa_backend import MiniMaxM3MsaMetadata
+
+        msa = metadata.ext(MiniMaxM3MsaMetadata)
         write_msa_phase_kv(
             params.attn,
             params.key_input,
@@ -428,11 +436,7 @@ class MsaPrefillFmha(PhasedFmha):
             metadata,
             params.output,
             kv_block_indexes=kv_block_indexes,
-            plan=(
-                metadata.msa_prefill_gqa_plan
-                if is_sparse_layer
-                else metadata.msa_prefill_dense_plan
-            ),
+            plan=(msa.msa_prefill_gqa_plan if is_sparse_layer else msa.msa_prefill_dense_plan),
             row_first=params.seq_offset,
             num_rows=metadata.num_contexts,
             kv_scale_quant_orig=params.fwd.kv_scale_quant_orig,

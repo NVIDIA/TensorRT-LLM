@@ -15,6 +15,8 @@ from utils.llm_data import llm_models_root
 from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import \
+    SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -546,12 +548,13 @@ class TestLlama(unittest.TestCase):
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
-            is_spec_decoding_enabled=is_spec_decoding_enabled,
-            use_spec_decoding=use_spec_decoding,
-            is_spec_dec_tree=is_spec_dec_tree,
-            is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
             max_num_heads_per_kv=num_heads_per_kv,
         )
+        spec_phase_0 = attn_metadata_gen_phase_0.ext(SpecDecodingMetadata)
+        spec_phase_0.is_spec_decoding_enabled = is_spec_decoding_enabled
+        spec_phase_0.use_spec_decoding = use_spec_decoding
+        spec_phase_0.is_spec_dec_tree = is_spec_dec_tree
+        spec_phase_0.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
         cache = kv_cache_manager.kv_cache_map[request.py_request_id]
         assert cache.resize(input_ids.size(-1) + gen_input_ids_0.size(-1))
         attn_metadata_gen_phase_0.prepare()
@@ -605,9 +608,9 @@ class TestLlama(unittest.TestCase):
             [gen_input_ids_1.size(-1)], dtype=torch.int)
         attn_metadata_gen_phase_0.kv_cache_params.num_cached_tokens_per_seq = num_cached_tokens_per_seq_1
 
-        attn_metadata_gen_phase_0.spec_decoding_position_offsets = None
-        attn_metadata_gen_phase_0.spec_decoding_packed_mask = None
-        attn_metadata_gen_phase_0.spec_decoding_generation_lengths = None
+        spec_phase_0.position_offsets = None
+        spec_phase_0.packed_mask = None
+        spec_phase_0.generation_lengths = None
         assert cache.resize(num_cached_tokens_per_seq_1[0] +
                             gen_input_ids_1.size(-1))
         attn_metadata_gen_phase_0.prepare()
@@ -672,16 +675,12 @@ class TestLlama(unittest.TestCase):
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
-            is_spec_decoding_enabled=is_spec_decoding_enabled,
-            use_spec_decoding=use_spec_decoding,
-            is_spec_dec_tree=is_spec_dec_tree,
-            is_spec_dec_dynamic_tree=False,
             max_num_heads_per_kv=num_heads_per_kv,
         )
-
-        attn_metadata_ref.spec_decoding_position_offsets = None
-        attn_metadata_ref.spec_decoding_packed_mask = None
-        attn_metadata_ref.spec_decoding_generation_lengths = None
+        spec_ref = attn_metadata_ref.ext(SpecDecodingMetadata)
+        spec_ref.is_spec_decoding_enabled = is_spec_decoding_enabled
+        spec_ref.use_spec_decoding = use_spec_decoding
+        spec_ref.is_spec_dec_tree = is_spec_dec_tree
         attn_metadata_ref.prepare()
         is_tree_ref = is_spec_dec_tree if get_sm_version() < 100 else False
         spec_tree_mgr_ref = None

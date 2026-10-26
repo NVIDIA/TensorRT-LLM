@@ -30,7 +30,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+<<<<<<< HEAD
 from ..modules.logits_processor import LogitsProcessor
+=======
+from ..attention.backends.features import DraftKVMetadata, RecurrentMetadata
+>>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -1165,14 +1169,15 @@ class DFlashWorker(SpecWorkerBase):
         """
         if self._ctx_block_tables is None or num_seqs <= 0:
             return False
-        src = getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
+        draft_kv = attn_metadata.find_ext(DraftKVMetadata)
+        src = draft_kv.kv_cache_block_offsets if draft_kv is not None else None
         if src is None:
             # The table is bound but unfillable. Leaving it at zeros would send
             # every request's every layer to pool block 0 -- silently.
             raise RuntimeError(
                 "DFlash: bound to the draft KV pool but "
                 f"{type(attn_metadata).__name__} carries no "
-                "draft_kv_cache_block_offsets this iteration."
+                "draft KV block offsets this iteration."
             )
         # Field 0 of the K/V pair: both name the same block for a kv_factor=2
         # pool, and the drafter addresses blocks, not planes. The block count
@@ -1191,12 +1196,10 @@ class DFlashWorker(SpecWorkerBase):
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
     ):
         self._validate_draft_attention_backend(draft_model)
-        # Only TrtllmAttentionMetadata builds draft_kv_cache_block_offsets.
-        # Without it the table stays all-zero and every request would read and
-        # write pool block 0 -- silently, at acceptance 1.0.
-        if draft_kv_cache_manager is not None and not hasattr(
-            attn_metadata, "draft_kv_cache_block_offsets"
-        ):
+        # Only TrtllmAttentionMetadata attaches the draft KV block offsets.
+        # Without them the table stays all-zero and every request would read
+        # and write pool block 0 -- silently, at acceptance 1.0.
+        if draft_kv_cache_manager is not None and attn_metadata.find_ext(DraftKVMetadata) is None:
             logger.warning(
                 f"DFlash: {type(attn_metadata).__name__} carries no draft KV block offsets; "
                 "using the private ctx arena."
@@ -1868,7 +1871,7 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
+                state_indices=attn_metadata.ext(RecurrentMetadata).mamba_metadata.state_indices,
             )
 
         self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)

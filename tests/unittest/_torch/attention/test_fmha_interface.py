@@ -21,6 +21,7 @@ import pytest
 import torch
 from fmha_test_utils import FakeAttention
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
@@ -89,9 +90,9 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     metadata.token_major_gen_view.return_value = None
     metadata.presented_token_major.return_value = nullcontext()
     metadata.is_cross = False
-    metadata.enable_flash_mla = False
-    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
-    metadata.spec_decoding_bl_tree_mask = None
+    extensions = {SpecDecodingMetadata: SpecDecodingMetadata(metadata)}
+    metadata.find_ext.side_effect = extensions.get
+    metadata.ext.side_effect = extensions.__getitem__
     metadata.max_context_q_len_override = None
     metadata.kv_cache_manager = None
     lengths = torch.ones(1, dtype=torch.int32)

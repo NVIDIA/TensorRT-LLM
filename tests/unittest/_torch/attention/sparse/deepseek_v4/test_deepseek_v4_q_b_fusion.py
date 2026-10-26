@@ -43,9 +43,13 @@ def test_q_b_gemm_cu_seqlens_per_phase() -> None:
         num_generations=4,
         cu_seq_lens_cuda=gen_cu,
     )
+    # The stub serves as its own DeepSeek-V4 extension.
+    generation_only.find_ext = lambda cls: generation_only
     assert torch.equal(_dsv4_q_b_gemm_cu_q_seqlens(owner, generation_only), gen_cu[:5])
 
 
 def test_q_b_gemm_cu_seqlens_absent_without_dsa_metadata() -> None:
-    metadata = SimpleNamespace(cu_q_seqlens=None, num_contexts=0, num_generations=4)
+    metadata = SimpleNamespace(
+        cu_q_seqlens=None, num_contexts=0, num_generations=4, find_ext=lambda cls: None
+    )
     assert _dsv4_q_b_gemm_cu_q_seqlens(SimpleNamespace(), metadata) is None

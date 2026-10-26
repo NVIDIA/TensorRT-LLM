@@ -10,6 +10,16 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa import metadata as dsa_metadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAMetadataParams
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+
+def _dsa_without_init(md: TrtllmAttentionMetadata) -> dsa_metadata.DSAMetadata:
+    """A DSA extension of ``md`` with only the defaults allocate() reads."""
+    dsa = object.__new__(dsa_metadata.DSAMetadata)
+    dsa.metadata = md
+    dsa.enable_ragged_verification = False
+    dsa.ragged_verify_lens = None
+    return dsa
 
 
 @pytest.mark.parametrize("enable_heuristic", [False, True])
@@ -22,8 +32,8 @@ def test_topk_flags_initialized_before_buffer_allocation(
     dsl_available: bool,
     sm_version: int,
 ) -> None:
-    metadata = object.__new__(dsa_metadata.DSAtrtllmAttentionMetadata)
-    metadata.sparse_metadata_params = DSAMetadataParams(
+    md = object.__new__(TrtllmAttentionMetadata)
+    md.sparse_metadata_params = DSAMetadataParams(
         indexer_max_chunk_size=8192,
         max_sparse_topk=512,
         index_head_dim=128,
@@ -34,12 +44,13 @@ def test_topk_flags_initialized_before_buffer_allocation(
         q_split_threshold=8192,
         use_self_sampling_topk=use_self_sampling,
     )
-    metadata.kv_cache_manager = SimpleNamespace(
+    md.kv_cache_manager = SimpleNamespace(
         tokens_per_block=128,
         compressed_block_sizes={},
         get_cache_indices=Mock(),
     )
-    metadata.is_cuda_graph = False
+    md.is_cuda_graph = False
+    metadata = _dsa_without_init(md)
     enabled = enable_heuristic and sm_version >= 100
     self_sampling_supported = enabled and dsl_available and sm_version in (100, 103)
     temporal_supported = enabled and dsl_available and sm_version in (100, 103)
@@ -54,11 +65,10 @@ def test_topk_flags_initialized_before_buffer_allocation(
     metadata.create_buffers_for_indexer = Mock(side_effect=check_flags)
 
     with (
-        patch.object(dsa_metadata.TrtllmAttentionMetadata, "__post_init__"),
         patch.object(dsa_metadata, "IS_CUTLASS_DSL_AVAILABLE", dsl_available),
         patch.object(dsa_metadata, "get_sm_version", return_value=sm_version),
     ):
-        metadata.__post_init__()
+        metadata.allocate(None)
 
     metadata.create_buffers_for_mla_rope_append.assert_called_once_with(capture_graph=False)
     metadata.create_buffers_for_indexer.assert_called_once_with(capture_graph=False)
@@ -68,8 +78,8 @@ def test_topk_flags_initialized_before_buffer_allocation(
 @pytest.mark.parametrize("num_local_layers", [1, 3])
 def test_temporal_gvr_allocates_real_prior_buffers(num_local_layers: int) -> None:
     """Allocate actual CUDA buffers and size the zeroed prior by local layers."""
-    metadata = object.__new__(dsa_metadata.DSAtrtllmAttentionMetadata)
-    metadata.sparse_metadata_params = DSAMetadataParams(
+    md = object.__new__(TrtllmAttentionMetadata)
+    md.sparse_metadata_params = DSAMetadataParams(
         indexer_max_chunk_size=32,
         max_sparse_topk=512,
         index_head_dim=128,
@@ -80,30 +90,30 @@ def test_temporal_gvr_allocates_real_prior_buffers(num_local_layers: int) -> Non
         q_split_threshold=32,
         use_self_sampling_topk=False,
     )
-    metadata.kv_cache_manager = SimpleNamespace(
+    md.kv_cache_manager = SimpleNamespace(
         tokens_per_block=128,
         compressed_block_sizes={},
         get_cache_indices=Mock(),
         max_blocks_per_seq=2,
         num_local_layers=num_local_layers,
     )
-    metadata.draft_kv_cache_manager = None
-    metadata.is_cuda_graph = False
-    metadata.cuda_graph_buffers = None
-    metadata.max_num_sequences = 4
-    metadata.max_num_tokens = 16
+    md.draft_kv_cache_manager = None
+    md.is_cuda_graph = False
+    md.cuda_graph_buffers = None
+    md.max_num_sequences = 4
+    md.max_num_tokens = 16
+    md.enable_context_mla_with_cached_kv = False
+    metadata = _dsa_without_init(md)
     metadata.max_draft_tokens = 3
     metadata.num_sms = 16
-    metadata.enable_context_mla_with_cached_kv = False
     # object.__new__ skips __init__, which is where this default is set.
     metadata._radix_rows_per_sequence = 1
     with (
-        patch.object(dsa_metadata.TrtllmAttentionMetadata, "__post_init__"),
         patch.object(metadata, "create_buffers_for_mla_rope_append"),
         patch.object(dsa_metadata, "IS_CUTLASS_DSL_AVAILABLE", True),
         patch.object(dsa_metadata, "get_sm_version", return_value=100),
     ):
-        metadata.__post_init__()
+        metadata.allocate(None)
 
     assert metadata.enable_gvr_topk
     assert metadata.needs_gvr_prior

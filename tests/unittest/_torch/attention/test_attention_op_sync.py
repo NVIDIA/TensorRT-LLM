@@ -20,7 +20,8 @@ function declaration in ``attentionOp.h`` (text/regex), and enforces:
 
 1. Every C++ parameter name appears at the call site (and nothing extra).
 2. Every call-site kwarg sourced as ``root.attr[.attr...]`` resolves on
-   exactly one of ``attn`` / ``metadata`` / ``forward_args``, and its
+   exactly one of ``attn`` / ``metadata`` / ``forward_args`` or a metadata
+   extension the call reads (``helix`` / ``flash_mla`` / ``spec``), and its
    declared C++ type matches the source attribute's Python type at a
    coarse-category level (tensor / int / bool / float / list-of-X).
 3. Every dataclass field reachable from ``AttentionForwardArgs`` (including
@@ -46,6 +47,8 @@ from types import SimpleNamespace, UnionType
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata, HelixMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.fmha.fallback import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
@@ -63,20 +66,31 @@ _SOURCE_CLASSES = {
     "attn": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
+    "helix": HelixMetadata,
+    "flash_mla": FlashMlaMetadata,
+    "spec": SpecDecodingMetadata,
 }
 
 _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     "beam_width": ("metadata", ("effective_beam_width",)),
     "context_lengths": ("metadata", ("prompt_lens_cuda_runtime",)),
+    "flash_mla_num_splits": ("flash_mla", ("num_splits",)),
+    "flash_mla_tile_scheduler_metadata": ("flash_mla", ("tile_scheduler_metadata",)),
+    "helix_is_inactive_rank": ("helix", ("is_inactive_rank",)),
+    "helix_position_offsets": ("helix", ("position_offsets",)),
     "head_size": ("attn", ("head_dim",)),
     "host_context_lengths": ("metadata", ("prompt_lens_cpu_runtime",)),
     "host_past_key_value_lengths": ("metadata", ("kv_lens_runtime",)),
     "host_request_types": ("metadata", ("host_request_types_runtime",)),
     "sequence_length": ("metadata", ("kv_lens_cuda_runtime",)),
-    "spec_decoding_target_max_draft_tokens": (
-        "metadata",
-        ("max_total_draft_tokens",),
-    ),
+    "force_prepare_spec_dec_tree_mask": ("spec", ("force_prepare_tree_mask",)),
+    "spec_bl_tree_first_sparse_mask_offset_kv": ("spec", ("bl_tree_first_sparse_mask_offset_kv",)),
+    "spec_decoding_bl_tree_mask": ("spec", ("bl_tree_mask",)),
+    "spec_decoding_bl_tree_mask_offset": ("spec", ("bl_tree_mask_offset",)),
+    "spec_decoding_generation_lengths": ("spec", ("generation_lengths",)),
+    "spec_decoding_packed_mask": ("spec", ("packed_mask",)),
+    "spec_decoding_position_offsets_for_cpp": ("spec", ("position_offsets_for_cpp",)),
+    "spec_decoding_target_max_draft_tokens": ("spec", ("max_total_draft_tokens",)),
     "skip_softmax_threshold_scale_factor_decode": (
         "forward_args",
         (
@@ -685,10 +699,10 @@ def test_no_sequence_kwargs_at_thop_attention_boundary():
 def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_cache, expected):
     """Do not dispatch requests that the native attention op rejects."""
     fmha = object.__new__(FallbackFmha)
-    # ``num_contexts=0`` skips the paged-context kernel gate and
-    # ``helix_position_offsets=None`` the Helix verify-group check; both are
-    # what the real metadata carries for a generation batch off the helix path.
-    metadata = SimpleNamespace(is_cross=is_cross, helix_position_offsets=None, num_contexts=0)
+    # ``num_contexts=0`` skips the paged-context kernel gate and no attached
+    # Helix extension the Helix verify-group check; both are what the real
+    # metadata carries for a generation batch off the helix path.
+    metadata = SimpleNamespace(is_cross=is_cross, num_contexts=0, find_ext=lambda cls: None)
     forward_args = AttentionForwardArgs(update_kv_cache=update_kv_cache)
 
     assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
@@ -697,7 +711,7 @@ def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_ca
 def test_fallback_rejects_raw_fp8_input():
     """Do not dispatch raw FP8 QKV to the native attention op."""
     fmha = object.__new__(FallbackFmha)
-    metadata = SimpleNamespace(is_cross=False, helix_position_offsets=None, num_contexts=0)
+    metadata = SimpleNamespace(is_cross=False, num_contexts=0, find_ext=lambda cls: None)
     forward_args = AttentionForwardArgs(update_kv_cache=True)
     q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
 

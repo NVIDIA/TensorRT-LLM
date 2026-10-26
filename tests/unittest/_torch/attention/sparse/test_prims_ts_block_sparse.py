@@ -20,6 +20,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.attention.backends import prims_ts
@@ -145,7 +146,7 @@ def _contiguous_case():
     q = torch.zeros((128, 256), dtype=torch.bfloat16)
     k = torch.zeros((512, 128), dtype=torch.bfloat16)
     v = torch.zeros_like(k)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         is_cross=False,
         num_sparse_topk=0,
         helix_position_offsets=None,
@@ -173,7 +174,7 @@ def _paged_metadata():
     manager.dtype = torch.bfloat16
     manager.num_pools = manager.num_local_layers = 1
     manager.host_kv_cache_block_offsets = block_offsets
-    return SimpleNamespace(
+    return metadata_stub(
         is_cross=False,
         num_sparse_topk=0,
         helix_position_offsets=None,
@@ -657,7 +658,7 @@ def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
         dtype=torch.bfloat16,
         shape=(2, 512),
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_manager=object(),
         kv_cache_block_offsets=SimpleNamespace(device=query_device, shape=(1, 2, 4)),
         max_num_requests=2,
@@ -773,7 +774,7 @@ def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries() -> None:
             ),
         ),
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         is_cross=False,
         kv_cache_manager=None,
         seq_lens=torch.tensor([64], dtype=torch.int32),

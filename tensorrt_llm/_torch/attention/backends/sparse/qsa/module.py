@@ -19,11 +19,12 @@ from .constants import (
     QSA_VALUE_ROLE_INDEX,
 )
 from .indexer import _is_power_of_two, _logical_to_pages
-from .metadata import QSAAttentionMetadata
+from .metadata import QSAMetadata
 from .params import QSASparseParams
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.attention import Attention
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 _DEFAULT_SCORE_WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -158,7 +159,7 @@ def qsa_sparse_gqa(
     selected_tokens: torch.Tensor,
     request_idx: int | None = None,
     request_indices: torch.Tensor | None = None,
-    metadata: "QSAAttentionMetadata",
+    metadata: "TrtllmAttentionMetadata",
     softmax_scale: float,
     query_positions: torch.Tensor | None = None,
     compress_ratio: int | None = None,
@@ -190,7 +191,7 @@ def qsa_sparse_gqa(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            block_table=metadata.qsa_block_table,
+            block_table=metadata.ext(QSAMetadata).block_table,
             selected_tokens=selected_tokens,
             request_indices=request_indices.contiguous(),
             tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
@@ -221,7 +222,7 @@ def qsa_sparse_gqa_reference(
     v_cache: torch.Tensor,
     selected_tokens: torch.Tensor,
     request_indices: torch.Tensor,
-    metadata: "QSAAttentionMetadata",
+    metadata: "TrtllmAttentionMetadata",
     softmax_scale: float,
 ) -> torch.Tensor:
     """Torch reference sparse GQA over V2 paged K/V."""
@@ -259,7 +260,7 @@ def qsa_sparse_gqa_reference(
 
 
 def _capture_mtp_shared_topk(
-    metadata: "QSAAttentionMetadata",
+    metadata: "TrtllmAttentionMetadata",
     slot: int,
     indices: torch.Tensor,
     visible_blocks: torch.Tensor,
@@ -272,7 +273,8 @@ def _capture_mtp_shared_topk(
     The row kept for each request is its last accepted one, so the reuse starts
     from the ranking the target actually committed to.
     """
-    shared = metadata.qsa_shared_topk_indices
+    qsa = metadata.find_ext(QSAMetadata)
+    shared = qsa.shared_topk_indices
     if shared is None:
         return
     num_seqs = metadata.num_seqs
@@ -285,7 +287,7 @@ def _capture_mtp_shared_topk(
     # reads back through ``request_indices``.
     seq_lens = metadata.seq_lens_cuda[:num_seqs].to(torch.int64)
     row_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
-    num_accepted = metadata.qsa_mtp_num_accepted
+    num_accepted = qsa.mtp_num_accepted
     if num_accepted is None:
         offsets = seq_lens - 1
     else:
@@ -293,10 +295,8 @@ def _capture_mtp_shared_topk(
     rows = (row_starts + offsets).clamp_(0, num_rows - 1)
 
     shared[slot, :num_seqs].copy_(indices.index_select(0, rows))
-    metadata.qsa_shared_topk_visible_blocks[slot, :num_seqs].copy_(
-        visible_blocks.index_select(0, rows)
-    )
-    metadata.qsa_shared_topk_captured_slots.add(slot)
+    qsa.shared_topk_visible_blocks[slot, :num_seqs].copy_(visible_blocks.index_select(0, rows))
+    qsa.shared_topk_captured_slots.add(slot)
 
 
 def select_qsa_tokens(
@@ -365,7 +365,7 @@ def select_qsa_paged_tokens(
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
     request_indices: torch.Tensor,
-    metadata: "QSAAttentionMetadata",
+    metadata: "TrtllmAttentionMetadata",
     params: QSASparseParams,
     *,
     top_k: TopK | None = None,
@@ -389,19 +389,20 @@ def select_qsa_paged_tokens(
     """
     from .kernels import triton_qsa_mtp_reuse_topk, triton_qsa_paged_index_scores
 
+    qsa = metadata.find_ext(QSAMetadata)
     if visible_blocks is None:
         visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
 
     if (
         mtp_share_slot is not None
-        and metadata.qsa_indexer_skip_topk
-        and mtp_share_slot in metadata.qsa_shared_topk_captured_slots
+        and qsa.indexer_skip_topk
+        and mtp_share_slot in qsa.shared_topk_captured_slots
         and top_k_output is not None
         and q.is_cuda
     ):
         indices = triton_qsa_mtp_reuse_topk(
-            shared_indices=metadata.qsa_shared_topk_indices[mtp_share_slot],
-            shared_visible_blocks=metadata.qsa_shared_topk_visible_blocks[mtp_share_slot],
+            shared_indices=qsa.shared_topk_indices[mtp_share_slot],
+            shared_visible_blocks=qsa.shared_topk_visible_blocks[mtp_share_slot],
             request_indices=request_indices,
             visible_blocks=visible_blocks,
             output=top_k_output[: q.shape[0]],
@@ -417,7 +418,7 @@ def select_qsa_paged_tokens(
     logits = triton_qsa_paged_index_scores(
         q=q,
         index_cache=index_cache,
-        block_table=metadata.qsa_block_table,
+        block_table=qsa.block_table,
         query_positions=query_positions,
         request_indices=request_indices,
         tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
@@ -482,7 +483,7 @@ class QSASparseHooks(AttentionSparseHooks):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
-        attn_metadata: QSAAttentionMetadata,
+        attn_metadata: "TrtllmAttentionMetadata",
         attention_mask: AttentionMask,
         attention_window_size: Optional[int],
         attention_mask_data: Optional[torch.Tensor],
@@ -494,6 +495,7 @@ class QSASparseHooks(AttentionSparseHooks):
         output_gate: Optional[torch.Tensor],
         **kwargs: object,
     ) -> Optional[torch.Tensor]:
+        qsa = attn_metadata.find_ext(QSAMetadata)
         if attention_mask is not PredefinedAttentionMask.CAUSAL:
             raise NotImplementedError("QSA sparse attention supports only a causal mask")
         unsupported = {
@@ -514,7 +516,7 @@ class QSASparseHooks(AttentionSparseHooks):
         # The model's QKNormRoPEAttention preprocesses q/k before this hook;
         # mrope_config is therefore backend state, not work for the QSA kernel.
         del mrope_config
-        if not isinstance(attn_metadata, QSAAttentionMetadata):
+        if qsa is None:
             raise TypeError("QSA sparse attention received incompatible metadata")
         num_tokens = attn_metadata.num_tokens
         if num_tokens == 0:
@@ -587,8 +589,8 @@ class QSASparseHooks(AttentionSparseHooks):
             raise RuntimeError("QSA sparse attention requires adjacent paged HND K/V buffers")
         k_cache = kv_pool[:, QSA_KEY_ROLE_INDEX]
         v_cache = kv_pool[:, QSA_VALUE_ROLE_INDEX]
-        req_idx = attn_metadata.qsa_req_idx_per_token[:num_tokens]
-        logical = attn_metadata.qsa_logical_positions[:num_tokens]
+        req_idx = qsa.req_idx_per_token[:num_tokens]
+        logical = qsa.logical_positions[:num_tokens]
         tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
         # The direct row-wise kernel removes launch overhead for small decode
         # batches. Larger batches and prefill chunks have enough work for
@@ -614,7 +616,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 v_cache=v_cache,
                 request_indices=req_idx,
                 logical_positions=logical,
-                block_table=attn_metadata.qsa_block_table,
+                block_table=qsa.block_table,
                 tokens_per_block=tokens_per_block,
             )
         else:
@@ -625,7 +627,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 v_cache,
                 req_idx,
                 logical,
-                attn_metadata.qsa_block_table,
+                qsa.block_table,
                 tokens_per_block,
             )
 
@@ -642,9 +644,9 @@ class QSASparseHooks(AttentionSparseHooks):
             # KV-length mirror: speculative decoding advances the authoritative
             # lengths on device and the host mirror is not updated between its
             # sub-steps.
-            sequence_lengths = attn_metadata.qsa_sequence_lengths[:num_tokens]
+            sequence_lengths = qsa.sequence_lengths[:num_tokens]
             mtp_share_slot = None
-            if params.mtp_index_share and attn_metadata.qsa_in_mtp_draft_loop:
+            if params.mtp_index_share and qsa.in_mtp_draft_loop:
                 mtp_share_slot = attn_metadata.kv_cache_manager.qsa_shared_topk_slots[
                     attention.layer_idx
                 ]
@@ -657,9 +659,9 @@ class QSASparseHooks(AttentionSparseHooks):
                 attn_metadata,
                 params,
                 top_k=attention.indexer.top_k,
-                top_k_output=attn_metadata.qsa_topk_indices,
-                top_k_row_starts=attn_metadata.qsa_topk_row_starts,
-                visible_blocks=attn_metadata.qsa_visible_blocks[:num_tokens],
+                top_k_output=qsa.topk_indices,
+                top_k_row_starts=qsa.topk_row_starts,
+                visible_blocks=qsa.visible_blocks[:num_tokens],
                 mtp_share_slot=mtp_share_slot,
             )
             fuse_output_gate = False
@@ -695,10 +697,8 @@ class QSASparseHooks(AttentionSparseHooks):
         index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
         if index_cache is None:
             raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")
-        sequence_lengths = attn_metadata.qsa_sequence_lengths[:num_tokens]
-        score_columns = (
-            attn_metadata.qsa_block_table.shape[1] * tokens_per_block // params.compress_ratio
-        )
+        sequence_lengths = qsa.sequence_lengths[:num_tokens]
+        score_columns = qsa.block_table.shape[1] * tokens_per_block // params.compress_ratio
         chunk_size = _query_chunk_size(num_tokens, score_columns)
         output = torch.empty_like(q)
         for start in range(0, num_tokens, chunk_size):
@@ -713,9 +713,9 @@ class QSASparseHooks(AttentionSparseHooks):
                 attn_metadata,
                 params,
                 top_k=attention.indexer.top_k,
-                top_k_output=attn_metadata.qsa_topk_indices[packed_slice],
-                top_k_row_starts=attn_metadata.qsa_topk_row_starts[packed_slice],
-                visible_blocks=attn_metadata.qsa_visible_blocks[packed_slice],
+                top_k_output=qsa.topk_indices[packed_slice],
+                top_k_row_starts=qsa.topk_row_starts[packed_slice],
+                visible_blocks=qsa.visible_blocks[packed_slice],
                 context_rows=True,
             )
             output[packed_slice] = qsa_sparse_gqa(

@@ -30,6 +30,7 @@ from torch import nn
 from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
+from ...attention.backends.features import RecurrentMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
@@ -489,7 +490,7 @@ class KimiKDALinearAttention(nn.Module):
         verify-only batch without ``output`` may instead return the fused
         verify epilogue's MXFP8 core (see ``forward_verify_fused``).
         """
-        mamba_metadata = attn_metadata.mamba_metadata
+        mamba_metadata = attn_metadata.ext(RecurrentMetadata).mamba_metadata
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_tokens = attn_metadata.num_tokens

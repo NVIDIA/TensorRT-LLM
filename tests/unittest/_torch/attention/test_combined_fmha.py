@@ -16,7 +16,7 @@
 from types import SimpleNamespace
 
 import torch
-from fmha_test_utils import FakeAttention, FakePhasedFmha
+from fmha_test_utils import FakeAttention, FakePhasedFmha, metadata_stub
 
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
@@ -56,7 +56,7 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         generation_fmha.supports_workspace_reclamation = generation_support
         combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
         assert combined_fmha.supports_workspace_reclamation is expected
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         kv_cache_block_offsets=object(),
         effective_workspace=torch.empty(0, dtype=torch.uint8),
         num_contexts=2,

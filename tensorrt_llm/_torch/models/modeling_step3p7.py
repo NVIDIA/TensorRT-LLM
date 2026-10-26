@@ -42,6 +42,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention.attention import Attention
@@ -597,12 +598,14 @@ class Step3p7Attention(Attention):
             attention_window_size if attention_window_size is not None else self.sliding_window
         )
 
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
         if (
             not self.rope_fusion
-            and getattr(attn_metadata, "is_spec_dec_dynamic_tree", False)
-            and getattr(attn_metadata, "use_spec_decoding", False)
-            and getattr(attn_metadata, "spec_decoding_position_offsets", None) is not None
-            and attn_metadata.spec_decoding_position_offsets.dim() == 1
+            and spec is not None
+            and spec.is_spec_dec_dynamic_tree
+            and spec.use_spec_decoding
+            and spec.position_offsets is not None
+            and spec.position_offsets.dim() == 1
             and position_ids is not None
         ):
             position_ids = self._adjust_position_ids_for_spec_dec(

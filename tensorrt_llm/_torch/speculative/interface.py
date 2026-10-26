@@ -28,6 +28,7 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
+from ..attention.backends.features import DraftKVMetadata
 from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
@@ -181,37 +182,22 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     """
     if draft_kv_cache_manager is None:
         return None
-    if not isinstance(attn_metadata, TrtllmAttentionMetadata):
-        return None
-    draft_block_offsets = getattr(attn_metadata, 'draft_kv_cache_block_offsets',
-                                  None)
-    if draft_block_offsets is None:
+    draft_kv = attn_metadata.find_ext(DraftKVMetadata)
+    if draft_kv is None:
         return None
 
-    # Marks that a swap happened and carries the backend's state for its
-    # restore hook; swap_for_draft records the originals on attn_metadata.
+    # Marks that a swap happened and carries the extensions' state for their
+    # restore hooks; swap_for_draft records the originals on attn_metadata.
     saved = {}
-    if attn_metadata.enable_flash_mla:
-        if (attn_metadata.draft_block_ids_per_seq is None
-                or attn_metadata.draft_kv_block_ids_per_seq is None):
-            raise RuntimeError(
-                "FlashMLA separate draft KV cache requires dedicated draft block-ID buffers"
-            )
-        attn_metadata.swap_for_draft('block_ids_per_seq',
-                                     attn_metadata.draft_block_ids_per_seq)
-        attn_metadata.swap_for_draft('kv_block_ids_per_seq',
-                                     attn_metadata.draft_kv_block_ids_per_seq)
     attn_metadata.swap_for_draft('kv_cache_manager', draft_kv_cache_manager)
     attn_metadata.swap_for_draft('kv_cache_block_offsets',
-                                 attn_metadata.draft_kv_cache_block_offsets)
+                                 draft_kv.kv_cache_block_offsets)
     attn_metadata.swap_for_draft(
         'host_kv_cache_block_offsets',
         draft_kv_cache_manager.host_kv_cache_block_offsets)
-    if attn_metadata.enable_flash_mla:
-        attn_metadata.prepare_flash_mla()
 
-    # Backends select any additional draft-forward state, such as native DSA
-    # indexer buffers or DeepSeek-V4 sparse tables and pool pointers.
+    # Extensions select any additional draft-forward state, such as FlashMLA
+    # block IDs, native DSA indexer buffers or DeepSeek-V4 sparse tables.
     backend_saved = attn_metadata.prepare_for_draft_forward()
     if backend_saved is not None:
         saved['saved_backend_state'] = backend_saved
@@ -223,11 +209,6 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
     if saved_state is None:
         return
     attn_metadata.restore_draft_swaps()
-    if attn_metadata.enable_flash_mla:
-        # Target and draft block-ID buffers are independent. Restoring only
-        # needs to invalidate the scheduler metadata; refreshing the unchanged
-        # target buffers would repeat request-specific H2D work.
-        attn_metadata._flash_mla_metadata_valid = False
     attn_metadata.restore_after_draft_forward(
         saved_state.get('saved_backend_state'))
 

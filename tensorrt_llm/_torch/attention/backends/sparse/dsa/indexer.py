@@ -75,7 +75,19 @@ _INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
-    from .metadata import DSAtrtllmAttentionMetadata
+    from ...trtllm import TrtllmAttentionMetadata
+    from .metadata import DSAMetadata
+
+
+def _dsa_state(metadata: "TrtllmAttentionMetadata") -> "DSAMetadata":
+    """The DSA extension of ``metadata``.
+
+    Imported on use: the metadata module imports this one.
+    """
+    from .metadata import DSAMetadata
+
+    return metadata.ext(DSAMetadata)
+
 
 # Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
 try:
@@ -293,7 +305,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 def transform_local_topk_and_prepare_pool_view(
     topk_indices: torch.Tensor,
-    attn_metadata: "DSAtrtllmAttentionMetadata",
+    attn_metadata: "TrtllmAttentionMetadata",
     layer_idx: int,
     is_generation: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -302,36 +314,37 @@ def transform_local_topk_and_prepare_pool_view(
     Uses cached values from attn_metadata._ensure_pool_view_cached()
     to avoid redundant Python/CUDA overhead across layers.
     """
+    dsa = _dsa_state(attn_metadata)
     assert topk_indices.dtype == torch.int32
 
-    attn_metadata._ensure_pool_view_cached()
+    dsa._ensure_pool_view_cached()
     page_index_scale, layer_offset = (
         attn_metadata.kv_cache_manager.get_primary_pool_page_index_params(layer_idx)
     )
 
     if is_generation:
-        block_table = attn_metadata._cached_block_table_gen
-        req_idx = attn_metadata._cached_req_idx_gen
+        block_table = dsa._cached_block_table_gen
+        req_idx = dsa._cached_req_idx_gen
     else:
-        block_table = attn_metadata._cached_block_table_ctx
-        req_idx = attn_metadata._cached_req_idx_ctx
+        block_table = dsa._cached_block_table_ctx
+        req_idx = dsa._cached_req_idx_ctx
 
     global_indices = torch.ops.trtllm.convert_req_index_to_global(
         req_idx,
         block_table,
         topk_indices,
-        attn_metadata._cached_tokens_per_block,
+        dsa._cached_tokens_per_block,
         topk_indices.shape[1],
-        page_index_scale * attn_metadata._cached_tokens_per_block,
+        page_index_scale * dsa._cached_tokens_per_block,
         layer_offset,
     )
 
-    return global_indices, attn_metadata._cached_pool_view
+    return global_indices, dsa._cached_pool_view
 
 
 def transform_local_topk_and_prepare_pool_view_grouped(
     topk_indices: torch.Tensor,
-    attn_metadata: "DSAtrtllmAttentionMetadata",
+    attn_metadata: "TrtllmAttentionMetadata",
     layer_ids: torch.Tensor,
     page_index_scale: int,
     is_generation: bool = False,
@@ -351,24 +364,25 @@ def transform_local_topk_and_prepare_pool_view_grouped(
     is bit-identical to ``transform_local_topk_and_prepare_pool_view`` for the
     member with offset ``layer_ids[z]``. MLA-only path.
     """
+    dsa = _dsa_state(attn_metadata)
     assert topk_indices.dtype == torch.int32
 
-    attn_metadata._ensure_pool_view_cached()
+    dsa._ensure_pool_view_cached()
 
     if is_generation:
-        block_table = attn_metadata._cached_block_table_gen
-        req_idx = attn_metadata._cached_req_idx_gen
+        block_table = dsa._cached_block_table_gen
+        req_idx = dsa._cached_req_idx_gen
     else:
-        block_table = attn_metadata._cached_block_table_ctx
-        req_idx = attn_metadata._cached_req_idx_ctx
+        block_table = dsa._cached_block_table_ctx
+        req_idx = dsa._cached_req_idx_ctx
 
     global_indices = torch.ops.trtllm.convert_req_index_to_global_grouped(
         req_idx,
         block_table,
         topk_indices,
-        attn_metadata._cached_tokens_per_block,
+        dsa._cached_tokens_per_block,
         topk_indices.shape[1],
-        page_index_scale * attn_metadata._cached_tokens_per_block,
+        page_index_scale * dsa._cached_tokens_per_block,
         layer_ids,
     )
 
@@ -686,13 +700,13 @@ def _split_prefill_queries(
     return count * rank // size, count * (rank + 1) // size, sizes
 
 
-def _prefill_q_split_threshold(metadata: DSAtrtllmAttentionMetadata) -> int:
+def _prefill_q_split_threshold(metadata: TrtllmAttentionMetadata) -> int:
     """Query-token count from which prefill indexer queries are split across TP ranks."""
     sparse_metadata_params = metadata.sparse_metadata_params
     return sparse_metadata_params.q_split_threshold if sparse_metadata_params is not None else 8192
 
 
-def _packed_logits_elem_budget(metadata: DSAtrtllmAttentionMetadata) -> int:
+def _packed_logits_elem_budget(metadata: TrtllmAttentionMetadata) -> int:
     """Packed-logits cap for grouping context requests into one prefill chunk.
 
     A single request's logits tile is at most ``min(_INDEXER_MQA_LOGITS_ELEM_BUDGET,
@@ -1028,7 +1042,7 @@ class Indexer(nn.Module):
 
     @staticmethod
     def prepare_one_prefill_chunk(
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         chunk_specs: List[Tuple[int, int, int, int]],
     ) -> IndexerPrefillChunkMetadata:
         """
@@ -1044,9 +1058,10 @@ class Indexer(nn.Module):
 
         Note: Cached token counts are derived from metadata.host_ctx_cached_token_indptr
         """
-        device = metadata.cu_seqlen_ks.device
+        dsa = _dsa_state(metadata)
+        device = dsa.cu_seqlen_ks.device
         compress_ratio = _effective_compress_ratio_divisor(
-            _select_indexer_compress_ratio(metadata.compress_ratios)
+            _select_indexer_compress_ratio(dsa.compress_ratios)
         )
         if len(chunk_specs) == 1:
             # Single request or intra-request Q-block
@@ -1158,25 +1173,26 @@ class Indexer(nn.Module):
         )
 
     @staticmethod
-    def build_indexer_params(metadata: DSAtrtllmAttentionMetadata) -> Optional[IndexerParams]:
+    def build_indexer_params(metadata: TrtllmAttentionMetadata) -> Optional[IndexerParams]:
+        dsa = _dsa_state(metadata)
         kv_cache_manager = metadata.kv_cache_manager
         if kv_cache_manager is None or not hasattr(kv_cache_manager, "index_head_dim"):
             return None
 
-        head_dim = metadata.indexer_head_dim
+        head_dim = dsa.indexer_head_dim
         data_bytes_per_token = (
             head_dim // 2 if getattr(kv_cache_manager, "use_fp4", False) else head_dim
         )
         compress_ratio = _effective_compress_ratio_divisor(
-            _select_indexer_compress_ratio(metadata.compress_ratios)
+            _select_indexer_compress_ratio(dsa.compress_ratios)
         )
         return IndexerParams(
             num_contexts=metadata.num_contexts,
             num_generations=metadata.num_generations,
             num_ctx_tokens=metadata.num_ctx_tokens,
             head_dim=head_dim,
-            quant_block_size=metadata.indexer_quant_block_size,
-            tokens_per_block=metadata._tokens_per_block,
+            quant_block_size=dsa.indexer_quant_block_size,
+            tokens_per_block=dsa._tokens_per_block,
             compress_ratio=compress_ratio,
             request_ids=metadata.request_ids,
             num_past_tokens=metadata.kv_cache_params.num_cached_tokens_per_seq,
@@ -1186,7 +1202,7 @@ class Indexer(nn.Module):
 
     @staticmethod
     def recompute_slot_mappings(
-        metadata: DSAtrtllmAttentionMetadata, indexer_params: Optional[IndexerParams] = None
+        metadata: TrtllmAttentionMetadata, indexer_params: Optional[IndexerParams] = None
     ):
         """Recompute slot_mapping_fp8/scale from current block offsets.
 
@@ -1195,6 +1211,7 @@ class Indexer(nn.Module):
         isolation after a caller has swapped the active KV cache manager and
         block-offset buffers, such as during draft KV-cache replay.
         """
+        dsa = _dsa_state(metadata)
         if indexer_params is None:
             indexer_params = Indexer.build_indexer_params(metadata)
             if indexer_params is None:
@@ -1222,14 +1239,14 @@ class Indexer(nn.Module):
         # Block indices/pos for all kv tokens in the batch
         block_indices_in_seq = global_positions // tokens_per_block
 
-        max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
+        max_blocks = dsa.host_indexer_k_cache_block_offsets.shape[1]
         assert (block_indices_in_seq < max_blocks).all(), (
             f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
         )
 
         fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
             global_positions,
-            metadata.host_indexer_k_cache_block_offsets,
+            dsa.host_indexer_k_cache_block_offsets,
             req_indices,
             head_dim,
             tokens_per_block,
@@ -1237,25 +1254,26 @@ class Indexer(nn.Module):
             data_bytes_per_token=data_bytes_per_token,
         )
 
-        metadata.host_slot_mapping_fp8[:total_new_kv_tokens] = fp8_flat_indices
-        metadata.host_slot_mapping_scale[:total_new_kv_tokens] = scale_flat_indices
+        dsa.host_slot_mapping_fp8[:total_new_kv_tokens] = fp8_flat_indices
+        dsa.host_slot_mapping_scale[:total_new_kv_tokens] = scale_flat_indices
 
-        metadata.slot_mapping_fp8[:total_new_kv_tokens].copy_(
-            metadata.host_slot_mapping_fp8[:total_new_kv_tokens], non_blocking=True
+        dsa.slot_mapping_fp8[:total_new_kv_tokens].copy_(
+            dsa.host_slot_mapping_fp8[:total_new_kv_tokens], non_blocking=True
         )
-        metadata.slot_mapping_scale[:total_new_kv_tokens].copy_(
-            metadata.host_slot_mapping_scale[:total_new_kv_tokens], non_blocking=True
+        dsa.slot_mapping_scale[:total_new_kv_tokens].copy_(
+            dsa.host_slot_mapping_scale[:total_new_kv_tokens], non_blocking=True
         )
 
     @staticmethod
     def recompute_context_kv_gather_mappings(
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         indexer_params: Optional[IndexerParams] = None,
     ) -> None:
         """Recompute context KV-cache gather mappings for the active cache manager."""
+        dsa = _dsa_state(metadata)
         if not metadata.enable_context_mla_with_cached_kv:
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            dsa.slot_mapping_fp8_fullkv = dsa.slot_mapping_fp8
+            dsa.slot_mapping_scale_fullkv = dsa.slot_mapping_scale
             return
 
         if indexer_params is None:
@@ -1270,11 +1288,11 @@ class Indexer(nn.Module):
             # while capturing generation CUDA graphs.
             return
 
-        if metadata.skip_indexer_for_ctx_reqs:
+        if dsa.skip_indexer_for_ctx_reqs:
             # The dense short-context path does not gather from the indexer K
             # cache, so full-KV mappings would be allocated but never consumed.
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            dsa.slot_mapping_fp8_fullkv = dsa.slot_mapping_fp8
+            dsa.slot_mapping_scale_fullkv = dsa.slot_mapping_scale
             return
 
         cached_kv_tokens = indexer_params.cached_kv_tokens[:num_contexts]
@@ -1282,8 +1300,8 @@ class Indexer(nn.Module):
             # Without compression or cached tokens, the regular mappings cover
             # every context KV token in the same order and remain equivalent
             # when on_update_kv_lens() refreshes them in place.
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            dsa.slot_mapping_fp8_fullkv = dsa.slot_mapping_fp8
+            dsa.slot_mapping_scale_fullkv = dsa.slot_mapping_scale
             return
 
         total_kv_per_request = indexer_params.kv_lens[:num_contexts]
@@ -1291,8 +1309,8 @@ class Indexer(nn.Module):
         if total_kv_len == 0:
             # No chunk can gather indexer KV, so avoid zero-length allocation
             # and H2D work for short compressed contexts.
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            dsa.slot_mapping_fp8_fullkv = dsa.slot_mapping_fp8
+            dsa.slot_mapping_scale_fullkv = dsa.slot_mapping_scale
             return
 
         host_slot_mapping_fp8_fullkv = torch.empty(
@@ -1314,7 +1332,7 @@ class Indexer(nn.Module):
 
         fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
             kv_positions,
-            metadata.host_indexer_k_cache_block_offsets,
+            dsa.host_indexer_k_cache_block_offsets,
             req_indices,
             indexer_params.head_dim,
             indexer_params.tokens_per_block,
@@ -1324,12 +1342,12 @@ class Indexer(nn.Module):
 
         host_slot_mapping_fp8_fullkv.copy_(fp8_flat_indices)
         host_slot_mapping_scale_fullkv.copy_(scale_flat_indices)
-        metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(non_blocking=True)
-        metadata.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(non_blocking=True)
+        dsa.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(non_blocking=True)
+        dsa.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(non_blocking=True)
 
     @staticmethod
     def prepare_for_update_k_cache(
-        metadata: DSAtrtllmAttentionMetadata, indexer_params: IndexerParams
+        metadata: TrtllmAttentionMetadata, indexer_params: IndexerParams
     ):
         """
         Prepare indexer for the update_k_cache stage.
@@ -1341,14 +1359,15 @@ class Indexer(nn.Module):
 
     @staticmethod
     def prepare_for_chunked_prefill(
-        metadata: DSAtrtllmAttentionMetadata, indexer_params: IndexerParams
+        metadata: TrtllmAttentionMetadata, indexer_params: IndexerParams
     ):
         """
         Prepare indexer for the chunked prefill.
         """
+        dsa = _dsa_state(metadata)
         num_contexts = indexer_params.num_contexts
         seq_lens = indexer_params.seq_lens
-        metadata.indexer_prefill_q_split = None
+        dsa.indexer_prefill_q_split = None
 
         # When MLA chunked prefill is active, it already bounds the new tokens per
         # request, so requests are not split by length here. From
@@ -1362,7 +1381,7 @@ class Indexer(nn.Module):
         )
         if has_mla_chunked_prefill:
             compress_ratio = _effective_compress_ratio_divisor(
-                _select_indexer_compress_ratio(metadata.compress_ratios)
+                _select_indexer_compress_ratio(dsa.compress_ratios)
             )
             q_lens = seq_lens[:num_contexts].tolist()
             cached_indptr = metadata.host_ctx_cached_token_indptr[: num_contexts + 1].tolist()
@@ -1374,8 +1393,8 @@ class Indexer(nn.Module):
                 sum(q_lens), metadata.mapping, _prefill_q_split_threshold(metadata)
             )
             if q_sizes is not None:
-                metadata.indexer_prefill_q_split = (q_begin, q_end, q_sizes)
-            metadata.indexer_prefill_chunks = [
+                dsa.indexer_prefill_q_split = (q_begin, q_end, q_sizes)
+            dsa.indexer_prefill_chunks = [
                 Indexer.prepare_one_prefill_chunk(metadata, chunk_specs)
                 for chunk_specs in plan_mla_chunked_prefill_chunks(
                     q_lens, kv_lens, _packed_logits_elem_budget(metadata), q_begin, q_end
@@ -1391,7 +1410,7 @@ class Indexer(nn.Module):
                 int(indexer_params.kv_lens[:num_contexts].max().item()) if num_contexts > 0 else 0
             )
             effective_chunk_size = select_indexer_chunk_size(
-                metadata.indexer_max_chunk_size, max_k_compressed
+                dsa.indexer_max_chunk_size, max_k_compressed
             )
             chunk_groups = split_prefill_chunks(
                 seq_lens[:num_contexts],
@@ -1400,7 +1419,7 @@ class Indexer(nn.Module):
             )
 
             if len(chunk_groups) > 1 or metadata.enable_context_mla_with_cached_kv:
-                metadata.indexer_prefill_chunks = [
+                dsa.indexer_prefill_chunks = [
                     Indexer.prepare_one_prefill_chunk(
                         metadata,
                         chunk_specs,
@@ -1408,53 +1427,54 @@ class Indexer(nn.Module):
                     for chunk_specs in chunk_groups
                 ]
             else:
-                metadata.indexer_prefill_chunks = None
+                dsa.indexer_prefill_chunks = None
 
         # Chunked prefill and KV-cache reuse require gather mappings that cover
         # all cached and newly appended indexer tokens.
         Indexer.recompute_context_kv_gather_mappings(metadata, indexer_params)
 
     @staticmethod
-    def prepare_scheduler_metadata(metadata: DSAtrtllmAttentionMetadata):
+    def prepare_scheduler_metadata(metadata: TrtllmAttentionMetadata):
         """
         Prepare scheduler metadata for the DeepGEMM decode MQA kernel.
         """
+        dsa = _dsa_state(metadata)
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
-        gen_seq_lens = metadata.get_indexer_kv_lens(
+        gen_seq_lens = dsa.get_indexer_kv_lens(
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
-        metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
-        if not metadata.use_expanded_buffers_for_mtp:
-            scheduler_context_lens = metadata.update_indexer_kv_lens_2d(gen_seq_lens)
+        dsa.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
+        if not dsa.use_expanded_buffers_for_mtp:
+            scheduler_context_lens = dsa.update_indexer_kv_lens_2d(gen_seq_lens)
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                gen_seq_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, metadata.num_sms
+                gen_seq_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, dsa.num_sms
             )
-            metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-            if metadata.max_draft_tokens > 0:
+            dsa.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
+            if dsa.max_draft_tokens > 0:
                 scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
                     scheduler_context_lens.contiguous(),
                     _DG_SCHEDULE_BLOCK_KV,
-                    metadata.num_sms,
+                    dsa.num_sms,
                 )
-                metadata.scheduler_metadata_buffer_full_next_n.copy_(
+                dsa.scheduler_metadata_buffer_full_next_n.copy_(
                     scheduler_metadata_buffer_full_next_n, non_blocking=True
                 )
         else:
             # Expand schedule metadata buffer (only generation). The DeepGEMM
             # API requires 2D; each expanded token becomes a (1,) row.
-            num_tokens = sum(metadata.gen_token_repeat_list())
+            num_tokens = sum(dsa.gen_token_repeat_list())
             scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                metadata.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                dsa.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
                 _DG_SCHEDULE_BLOCK_KV,
-                metadata.num_sms,
+                dsa.num_sms,
             )
-            metadata.scheduler_metadata_buffer_expanded.copy_(
+            dsa.scheduler_metadata_buffer_expanded.copy_(
                 scheduler_metadata_buffer_expanded, non_blocking=True
             )
 
     @staticmethod
-    def prepare(metadata: DSAtrtllmAttentionMetadata) -> None:
+    def prepare(metadata: TrtllmAttentionMetadata) -> None:
         """
         Prepare indexer for the forward pass.
         This should be called during metadata.prepare() stage.
@@ -1468,6 +1488,7 @@ class Indexer(nn.Module):
         # This can happen when the metadata is being used with a draft KV cache manager
         # during MTP speculative decoding, which uses a regular KVCacheManager instead
         # of DSACacheManager.
+        dsa = _dsa_state(metadata)
         indexer_params = Indexer.build_indexer_params(metadata)
         if indexer_params is None:
             return
@@ -1477,10 +1498,10 @@ class Indexer(nn.Module):
         num_ctx_tokens = metadata.num_ctx_tokens
         seq_lens = metadata.seq_lens
         compress_ratio = _effective_compress_ratio_divisor(
-            _select_indexer_compress_ratio(metadata.compress_ratios)
+            _select_indexer_compress_ratio(dsa.compress_ratios)
         )
         # Store compressed KV token count for context requests
-        metadata.num_ctx_kv_tokens = indexer_params.new_kv_tokens[:num_contexts].sum().item()
+        dsa.num_ctx_kv_tokens = indexer_params.new_kv_tokens[:num_contexts].sum().item()
 
         # Prepare for update_k_cache
         Indexer.prepare_for_update_k_cache(metadata, indexer_params)
@@ -1502,10 +1523,10 @@ class Indexer(nn.Module):
                 compress_ratio,
             )
 
-            metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(
+            dsa.cu_seqlen_ks[:num_ctx_tokens].copy_(
                 maybe_pin_memory(host_cu_seqlen_ks), non_blocking=True
             )
-            metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(
+            dsa.cu_seqlen_ke[:num_ctx_tokens].copy_(
                 maybe_pin_memory(host_cu_seqlen_ke), non_blocking=True
             )
             Indexer.prepare_for_chunked_prefill(metadata, indexer_params)
@@ -1517,7 +1538,7 @@ class Indexer(nn.Module):
             Indexer.prepare_scheduler_metadata(metadata)
 
     def _update_k_cache(
-        self, k_fp8: torch.Tensor, k_scale: torch.Tensor, metadata: DSAtrtllmAttentionMetadata
+        self, k_fp8: torch.Tensor, k_scale: torch.Tensor, metadata: TrtllmAttentionMetadata
     ) -> None:
         """
         Insert/append k values and scales into the indexer k cache using pre-computed slot mappings.
@@ -1527,7 +1548,8 @@ class Indexer(nn.Module):
             k_fp8: FP8 quantized k tensor, shape [total_tokens, head_dim]
             k_scale: Scaling factors, shape [total_tokens, head_dim // quant_block_size]
         """
-        if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
+        dsa = _dsa_state(metadata)
+        if metadata.kv_cache_manager is None or dsa.slot_mapping_fp8 is None:
             return
 
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
@@ -1544,14 +1566,14 @@ class Indexer(nn.Module):
             k_fp8,
             k_scale,
             k_cache,
-            metadata.slot_mapping_fp8,
-            metadata.slot_mapping_scale,
+            dsa.slot_mapping_fp8,
+            dsa.slot_mapping_scale,
             num_tokens,
         )
 
     def _gather_k_cache_for_chunk(
         self,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         chunk: IndexerPrefillChunkMetadata,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1568,7 +1590,8 @@ class Indexer(nn.Module):
             k_fp8: FP8 quantized k tensor, shape [num_k_tokens, head_dim]
             k_scale: Scaling factors, shape [num_k_tokens, 1]
         """
-        assert metadata.slot_mapping_fp8_fullkv is not None, (
+        dsa = _dsa_state(metadata)
+        assert dsa.slot_mapping_fp8_fullkv is not None, (
             "_gather_k_cache_for_chunk requires extended slot mappings (only available with cached tokens)"
         )
 
@@ -1583,8 +1606,8 @@ class Indexer(nn.Module):
         k_token_end = chunk.k_token_end
         num_k_tokens = k_token_end - k_token_start
 
-        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8_fullkv[k_token_start:k_token_end]
-        slot_mapping_scale_chunk = metadata.slot_mapping_scale_fullkv[k_token_start:k_token_end]
+        slot_mapping_fp8_chunk = dsa.slot_mapping_fp8_fullkv[k_token_start:k_token_end]
+        slot_mapping_scale_chunk = dsa.slot_mapping_scale_fullkv[k_token_start:k_token_end]
 
         # Vectorized gather using pre-computed slot mappings
         # Gather FP8 data
@@ -1779,7 +1802,7 @@ class Indexer(nn.Module):
 
     def sparse_attn_indexer(
         self,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         hidden_states: torch.Tensor,
         q_fp8: torch.Tensor,
         k_fp8: torch.Tensor,
@@ -1799,6 +1822,7 @@ class Indexer(nn.Module):
         # 128 (FP8 path) or 32 (MXFP4 path); both round-trip to the same
         # 4-byte scale word per token at index_head_dim=128, so the slot
         # mapping arithmetic is unchanged in either mode.
+        dsa = _dsa_state(metadata)
         assert metadata.kv_cache_manager is None or metadata.kv_cache_manager.quant_block_size in (
             32,
             128,
@@ -1814,9 +1838,9 @@ class Indexer(nn.Module):
         num_gen_tokens = num_tokens - num_ctx_tokens
         gvr_prior_indices = None
         if self.top_k.needs_gvr_prior:
-            assert metadata.gvr_prior_indices is not None
+            assert dsa.gvr_prior_indices is not None
             local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
-            gvr_prior_indices = metadata.gvr_prior_indices[local_layer]
+            gvr_prior_indices = dsa.gvr_prior_indices[local_layer]
         if is_generation is None:
             has_prefill = num_contexts > 0
             has_decode = num_generations > 0
@@ -1843,13 +1867,13 @@ class Indexer(nn.Module):
             capture_graph=metadata.is_cuda_graph,
         )
 
-        if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
+        if has_prefill and not dsa.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
-            if metadata.indexer_prefill_chunks is not None:
+            if dsa.indexer_prefill_chunks is not None:
                 q_split_threshold = _prefill_q_split_threshold(metadata)
                 # Chunks planned for this rank's share of the queries only are
                 # never split again; their top-k rows are gathered after the loop.
-                batch_q_split = metadata.indexer_prefill_q_split
+                batch_q_split = dsa.indexer_prefill_q_split
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
                 # FP4 packs two codes per byte so the gathered row holds half
                 # as many bytes as in the FP8 path. The scale (4 bytes) is the
@@ -1857,7 +1881,7 @@ class Indexer(nn.Module):
                 # into one int32 to match FP8's float32 scale width.
                 gather_head_dim = self.head_dim // 2 if self.use_fp4 else self.head_dim
 
-                for chunk in metadata.indexer_prefill_chunks:
+                for chunk in dsa.indexer_prefill_chunks:
                     # Skip chunks with no compressed KV tokens (e.g., warmup
                     # sequences shorter than compress_ratio produce zero KV).
                     if chunk.k_token_start >= chunk.k_token_end:
@@ -1866,8 +1890,8 @@ class Indexer(nn.Module):
                     num_k_tokens = chunk.k_token_end - chunk.k_token_start
                     chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
                         k_cache_4d,
-                        metadata.slot_mapping_fp8_fullkv,
-                        metadata.slot_mapping_scale_fullkv,
+                        dsa.slot_mapping_fp8_fullkv,
+                        dsa.slot_mapping_scale_fullkv,
                         chunk.k_token_start,
                         num_k_tokens,
                         gather_head_dim,
@@ -1935,14 +1959,14 @@ class Indexer(nn.Module):
                         dim=0,
                         sizes=q_sizes,
                     )
-            elif metadata.num_ctx_kv_tokens == 0:
+            elif dsa.num_ctx_kv_tokens == 0:
                 # No compressed KV tokens — fill with -1 (no valid indices)
                 topk_indices_buffer[:num_ctx_tokens, :].fill_(-1)
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
-                num_ctx_kv_tokens = metadata.num_ctx_kv_tokens
-                cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
-                cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
+                num_ctx_kv_tokens = dsa.num_ctx_kv_tokens
+                cu_seqlen_ks = dsa.cu_seqlen_ks[:num_ctx_tokens]
+                cu_seqlen_ke = dsa.cu_seqlen_ke[:num_ctx_tokens]
 
                 ctx_q_scale = q_scale[:num_ctx_tokens, ...] if self.use_fp4 else None
                 self.forward_prepared(
@@ -1955,11 +1979,9 @@ class Indexer(nn.Module):
                     topk_indices_buffer[:num_ctx_tokens, :],
                     ctx_q_scale,
                 )
-        elif has_prefill and metadata.skip_indexer_for_ctx_reqs:
+        elif has_prefill and dsa.skip_indexer_for_ctx_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
-            topk_indices_buffer[:num_ctx_tokens, :] = metadata.topk_indices_buffer[
-                :num_ctx_tokens, :
-            ]
+            topk_indices_buffer[:num_ctx_tokens, :] = dsa.topk_indices_buffer[:num_ctx_tokens, :]
 
         # Dense skip outputs remain valid priors if a later step enters GVR.
         if has_prefill:
@@ -1981,19 +2003,19 @@ class Indexer(nn.Module):
 
         reuse_topk = (
             self.mtp_index_share
-            and metadata.in_mtp_draft_loop
-            and metadata.indexer_skip_topk
-            and metadata.shared_topk_indices is not None
+            and dsa.in_mtp_draft_loop
+            and dsa.indexer_skip_topk
+            and dsa.shared_topk_indices is not None
         )
 
-        if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
+        if has_decode and not dsa.skip_indexer_for_gen_reqs and reuse_topk:
             topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
-                metadata.shared_topk_indices[:num_generations, :]
+                dsa.shared_topk_indices[:num_generations, :]
             )
-        elif has_decode and not metadata.skip_indexer_for_gen_reqs:
+        elif has_decode and not dsa.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
-            if not metadata.is_ragged_verify:
+            if not dsa.is_ragged_verify:
                 max_decode_len = gen_seq_lens.max().item()
                 min_decode_len = gen_seq_lens.min().item()
                 assert max_decode_len == min_decode_len, (
@@ -2007,17 +2029,17 @@ class Indexer(nn.Module):
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
             # next_n == 1/2 on sm90, for other next_n, we need to flatten the q_decode tensor
             # and expand the corresponding metadata.
-            if metadata.is_ragged_verify:
+            if dsa.is_ragged_verify:
                 take_strided_path = False
             else:
-                take_strided_path = not metadata.use_expanded_buffers_for_mtp or next_n == 1
+                take_strided_path = not dsa.use_expanded_buffers_for_mtp or next_n == 1
             if take_strided_path:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
                 # 2D context_lens slice from the pre-allocated buffer; matches
                 # q_decode's (batch, next_n) layout required by the new
                 # DeepGEMM paged MQA logits API.
-                context_lens = metadata.kv_lens_cuda_2d[:num_generations, :next_n].contiguous()
-                block_table = metadata.indexer_k_cache_block_offsets[
+                context_lens = dsa.kv_lens_cuda_2d[:num_generations, :next_n].contiguous()
+                block_table = dsa.indexer_k_cache_block_offsets[
                     num_contexts : num_contexts + num_generations
                 ]
                 # The 2D-context_lens metadata kernel encodes next_n into the
@@ -2028,21 +2050,21 @@ class Indexer(nn.Module):
                 # uses its own schedule buffer (built with num_next_n_atoms=1
                 # via a (num_gen, 1) input shape) and overrides this below.
                 if next_n == 1:
-                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
+                    scheduler_metadata_buffer = dsa.scheduler_metadata_buffer
                 else:
-                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_full_next_n
+                    scheduler_metadata_buffer = dsa.scheduler_metadata_buffer_full_next_n
             else:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
                 num_tokens = q_decode.shape[0]
                 # New API requires 2D; each expanded token becomes a (1,) row.
-                context_lens = metadata.kv_lens_expanded_cuda[:num_tokens].view(-1, 1)
-                block_table = metadata.block_table_expanded[:num_tokens]
-                scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
+                context_lens = dsa.kv_lens_expanded_cuda[:num_tokens].view(-1, 1)
+                block_table = dsa.block_table_expanded[:num_tokens]
+                scheduler_metadata_buffer = dsa.scheduler_metadata_buffer_expanded
 
-            if metadata.is_ragged_verify:
-                assert num_gen_tokens == sum(metadata.ragged_verify_lens), (
+            if dsa.is_ragged_verify:
+                assert num_gen_tokens == sum(dsa.ragged_verify_lens), (
                     f"ragged gen tokens {num_gen_tokens} != "
-                    f"sum(verify_lens) {sum(metadata.ragged_verify_lens)}"
+                    f"sum(verify_lens) {sum(dsa.ragged_verify_lens)}"
                 )
             else:
                 assert num_gen_tokens == batch_size * next_n
@@ -2052,9 +2074,9 @@ class Indexer(nn.Module):
             # with prepared decode metadata.
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
-            indexer_max_seq_len = metadata.get_indexer_max_seq_len()
+            indexer_max_seq_len = dsa.get_indexer_max_seq_len()
 
-            if self.use_cute_dsl_paged_mqa_logits and not metadata.is_ragged_verify:
+            if self.use_cute_dsl_paged_mqa_logits and not dsa.is_ragged_verify:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
                 # kNumNextNAtoms = 1 for any real next_n. The matching schedule
                 # is `scheduler_metadata_buffer` — built in `Indexer.prepare()`
@@ -2065,7 +2087,7 @@ class Indexer(nn.Module):
                 # the same KV length on this path (kv_lens_cuda_2d broadcasts),
                 # so passing the 1D contiguous kv_lens slice for context_lens
                 # avoids materializing a 2D contiguous tensor per call.
-                dsl_context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+                dsl_context_lens = dsa.gen_indexer_kv_lens_cuda_runtime
                 assert dsl_context_lens is not None
                 # Wave-aware atom-split: the picker in `_pick_dsl_expand` caches
                 # (factor, atom) on metadata with invariant
@@ -2078,19 +2100,16 @@ class Indexer(nn.Module):
                 # tokens; gate here so i≥1 draft calls fall back to the
                 # kernel-native next_n=1 path.
                 dsl_atom_split = (
-                    metadata.dsl_expand_factor > 1
-                    and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
+                    dsa.dsl_expand_factor > 1 and next_n == dsa.dsl_expand_factor * dsa.dsl_atom
                 )
                 # In-kernel uneven split (next_n with no exact atom divisor):
                 # native Q / context_lens / block_table, schedule over the
                 # staggered per-atom rows. Same full-window gate as above.
-                dsl_kernel_split = (
-                    metadata.dsl_kernel_atoms > 1 and next_n == metadata.dsl_kernel_next_n
-                )
+                dsl_kernel_split = dsa.dsl_kernel_atoms > 1 and next_n == dsa.dsl_kernel_next_n
                 dsl_split_kwargs: dict = {}
                 if dsl_kernel_split:
                     dsl_split_kwargs = dict(
-                        num_next_n_atoms=metadata.dsl_kernel_atoms, atom=metadata.dsl_atom
+                        num_next_n_atoms=dsa.dsl_kernel_atoms, atom=dsa.dsl_atom
                     )
                 gvr_emit_kwargs: dict = {}
                 # emitting for a step the Top-K cannot consume only churns
@@ -2104,7 +2123,7 @@ class Indexer(nn.Module):
                     and num_gen_tokens <= 256
                     # ext tiers are single-CTA/sort-path only; row reordering
                     # routes the Top-K through order_row, which excludes them
-                    and metadata.kv_lens_row_reorder is None
+                    and dsa.kv_lens_row_reorder is None
                 ):
                     gvr_emit_kwargs = self.top_k.prepare_gvr_emission(
                         num_generations,
@@ -2124,18 +2143,18 @@ class Indexer(nn.Module):
                     )
                     dsl_q = q_decode.view(torch.uint8)
                     dsl_block_table = block_table
-                    dsl_schedule_meta = metadata.scheduler_metadata_buffer
+                    dsl_schedule_meta = dsa.scheduler_metadata_buffer
                     if dsl_atom_split:
-                        factor = metadata.dsl_expand_factor
-                        eff_next_n = metadata.dsl_atom
+                        factor = dsa.dsl_expand_factor
+                        eff_next_n = dsa.dsl_atom
                         exp_B = num_generations * factor
                         dsl_q = dsl_q.reshape(exp_B, eff_next_n, self.n_heads, self.head_dim // 2)
                         decode_q_scale = decode_q_scale.reshape(exp_B, eff_next_n, self.n_heads)
-                        dsl_context_lens = metadata.kv_lens_expanded_cuda[:exp_B]
-                        dsl_block_table = metadata.block_table_expanded[:exp_B]
-                        dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                        dsl_context_lens = dsa.kv_lens_expanded_cuda[:exp_B]
+                        dsl_block_table = dsa.block_table_expanded[:exp_B]
+                        dsl_schedule_meta = dsa.scheduler_metadata_buffer_expanded
                     elif dsl_kernel_split:
-                        dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                        dsl_schedule_meta = dsa.scheduler_metadata_buffer_expanded
 
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q,
@@ -2158,17 +2177,17 @@ class Indexer(nn.Module):
                     dsl_q = q_decode
                     fp8_ctx_lens = dsl_context_lens
                     fp8_block_table = block_table
-                    fp8_schedule_meta = metadata.scheduler_metadata_buffer
+                    fp8_schedule_meta = dsa.scheduler_metadata_buffer
                     if dsl_atom_split:
-                        factor = metadata.dsl_expand_factor
-                        atom = metadata.dsl_atom
+                        factor = dsa.dsl_expand_factor
+                        atom = dsa.dsl_atom
                         exp_B = num_generations * factor
                         dsl_q = q_decode.reshape(exp_B, atom, self.n_heads, self.head_dim)
-                        fp8_ctx_lens = metadata.kv_lens_expanded_cuda[:exp_B]
-                        fp8_block_table = metadata.block_table_expanded[:exp_B]
-                        fp8_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                        fp8_ctx_lens = dsa.kv_lens_expanded_cuda[:exp_B]
+                        fp8_block_table = dsa.block_table_expanded[:exp_B]
+                        fp8_schedule_meta = dsa.scheduler_metadata_buffer_expanded
                     elif dsl_kernel_split:
-                        fp8_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                        fp8_schedule_meta = dsa.scheduler_metadata_buffer_expanded
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q,
                         k_cache,
@@ -2208,47 +2227,45 @@ class Indexer(nn.Module):
             gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
                 num_contexts : num_contexts + num_generations
             ]
-            scan_lengths = metadata.gen_indexer_kv_lens_cuda_runtime
+            scan_lengths = dsa.gen_indexer_kv_lens_cuda_runtime
             assert scan_lengths is not None
 
             gvr_ext_kwargs = (
                 {
                     "gvr_prior_indices": gvr_prior_indices[:num_generations],
-                    "gvr_row_order": metadata.kv_lens_row_reorder,
+                    "gvr_row_order": dsa.kv_lens_row_reorder,
                 }
                 if gvr_prior_indices is not None
                 else None
             )
-            assert metadata.radix_aux_indices is not None
-            assert metadata.radix_aux_logits is not None
+            assert dsa.radix_aux_indices is not None
+            assert dsa.radix_aux_logits is not None
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
                 is_prefill=False,
                 sequence_lengths=gen_kv_lens_cuda,
                 scan_lengths=scan_lengths,
-                row_kv_lens=metadata.ragged_row_kv_lens(num_gen_tokens),
-                next_n=1 if metadata.is_ragged_verify else next_n,
+                row_kv_lens=dsa.ragged_row_kv_lens(num_gen_tokens),
+                next_n=1 if dsa.is_ragged_verify else next_n,
                 max_seq_len=indexer_max_seq_len,
                 gvr_ext_kwargs=gvr_ext_kwargs,
-                radix_aux_indices=metadata.radix_aux_indices,
-                radix_aux_logits=metadata.radix_aux_logits,
+                radix_aux_indices=dsa.radix_aux_indices,
+                radix_aux_logits=dsa.radix_aux_logits,
             )
 
-        elif has_decode and metadata.skip_indexer_for_gen_reqs:
+        elif has_decode and dsa.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
-                metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
+                dsa.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
             )
 
         # Keep the GVR prior current for computed, reused, and dense-skip TopK.
         if gvr_prior_indices is not None and has_decode:
             decode_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
-            if metadata.is_ragged_verify:
+            if dsa.is_ragged_verify:
                 last_rows = (
-                    torch.cumsum(metadata.gen_token_repeats_cuda[:num_generations], dim=0).to(
-                        torch.long
-                    )
+                    torch.cumsum(dsa.gen_token_repeats_cuda[:num_generations], dim=0).to(torch.long)
                     - 1
                 )
                 last_mtp_topk = decode_topk[last_rows]
@@ -2267,7 +2284,7 @@ class Indexer(nn.Module):
             else:
                 prev_topk_dst.copy_(last_mtp_topk)
 
-        if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:
+        if self.mtp_index_share and dsa.in_mtp_draft_loop and not reuse_topk:
             rows = None
             if has_decode:
                 next_n = num_gen_tokens // num_generations
@@ -2282,9 +2299,9 @@ class Indexer(nn.Module):
                 ctx_rows = topk_indices_buffer[ctx_last]
                 rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
             if rows is not None:
-                shared_topk_indices = metadata.shared_topk_indices
+                shared_topk_indices = dsa.shared_topk_indices
                 if shared_topk_indices is None:
-                    metadata.shared_topk_indices = rows.contiguous()
+                    dsa.shared_topk_indices = rows.contiguous()
                 else:
                     row_start = num_contexts if is_generation else 0
                     shared_topk_indices[
@@ -2295,13 +2312,14 @@ class Indexer(nn.Module):
     def _mtp_last_accepted_rows(
         self,
         gen_topk: torch.Tensor,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         num_contexts: int,
         num_generations: int,
         next_n: int,
     ) -> torch.Tensor:
         """Select each generation request's last accepted TopK row."""
-        num_accepted = metadata.mtp_num_accepted
+        dsa = _dsa_state(metadata)
+        num_accepted = dsa.mtp_num_accepted
         if num_accepted is None:
             return gen_topk[next_n - 1 :: next_n]
         gen_num_accepted = num_accepted[num_contexts : num_contexts + num_generations]
@@ -2430,7 +2448,7 @@ class Indexer(nn.Module):
 
     def forward_from_projected(
         self,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         hidden_states: torch.Tensor,
         indexer_intermediates: List[torch.Tensor],
         is_generation: Optional[bool] = None,
@@ -2472,7 +2490,7 @@ class Indexer(nn.Module):
         self,
         qr: torch.Tensor,
         hidden_states: torch.Tensor,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
     ):
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(

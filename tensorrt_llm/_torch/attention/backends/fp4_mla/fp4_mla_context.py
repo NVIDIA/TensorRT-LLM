@@ -25,6 +25,7 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
+from .state import Fp4MlaState, find_fp4_mla
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -338,7 +339,7 @@ def _build_fp8_mla_context_metadata(
     if kv_lens_cpu is None:
         kv_lens_cpu = meta.prompt_lens_cpu_runtime[: meta.num_contexts]
     fp8_meta = copy.copy(meta)
-    fp8_meta.fp4_mla_state = None
+    fp8_meta.remove_ext(Fp4MlaState)
     fp8_meta.kv_cache_manager = scratch.cache_manager_view
     fp8_meta.kv_cache_block_offsets = scratch.block_offsets
     fp8_meta.block_ids_per_seq = scratch.block_ids_per_seq
@@ -354,7 +355,12 @@ def _build_fp8_mla_context_metadata(
     # Scratch lengths intentionally start from zero. Preserve the actual
     # absolute positions for Q/K RoPE through the native kernel's explicit
     # per-token position-offset input.
-    fp8_meta.helix_position_offsets = meta.fp4_mla_state.positions[: meta.num_ctx_tokens]
+    from ..features import HelixMetadata
+
+    helix = meta.find_ext(HelixMetadata)
+    helix = helix.clone_for(fp8_meta) if helix is not None else HelixMetadata(fp8_meta)
+    helix.position_offsets = find_fp4_mla(meta).positions[: meta.num_ctx_tokens]
+    fp8_meta.replace_ext(helix)
     return fp8_meta
 
 
@@ -363,11 +369,12 @@ def _get_fp8_mla_context_metadata(
     scratch: _Fp8MlaContextScratch,
 ) -> "TrtllmAttentionMetadata":
     """Prepare and reuse one direct metadata view for all layers in a step."""
-    state = meta.fp4_mla_state.fp8_context_state
+    fp4_mla_state = find_fp4_mla(meta)
+    state = fp4_mla_state.fp8_context_state
     if state is not None and state[0] is scratch:
         return state[1]
 
     scratch.prepare(meta)
     fp8_meta = _build_fp8_mla_context_metadata(meta, scratch)
-    meta.fp4_mla_state.fp8_context_state = (scratch, fp8_meta)
+    fp4_mla_state.fp8_context_state = (scratch, fp8_meta)
     return fp8_meta

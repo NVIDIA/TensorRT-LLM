@@ -163,7 +163,6 @@ class TestFlashInferAttention(unittest.TestCase):
             kv_cache_manager=manager,
             request_ids=[7],
             workspace_buffer=torch.empty(1, dtype=torch.uint8, device="cuda"),
-            mamba_metadata=False,
         )
 
         self.assertEqual(metadata._primary_kv_layer_idx, 20)

@@ -61,6 +61,8 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from ..features import HelixMetadata
+from ..features.spec_decoding import SpecDecodingMetadata
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 from .utils import (
@@ -662,7 +664,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             or fwd.sage_attn_num_elts_per_blk_v > 0
         ):
             return False, "sage attention."
-        if meta.helix_position_offsets is not None:
+        helix = meta.find_ext(HelixMetadata)
+        if helix is not None and helix.position_offsets is not None:
             return False, "helix parallelism."
         sparse_kv_indices = fwd.sparse_runtime_params.sparse_kv_indices
         sparse_attn_indices = fwd.sparse_runtime_params.sparse_attn_indices
@@ -677,7 +680,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "skip-softmax attention."
         if fwd.relative_attention_bias is not None:
             return False, "relative attention bias."
-        if meta.use_spec_decoding and meta.is_spec_dec_tree:
+        spec_dec = meta.ext(SpecDecodingMetadata)
+        if spec_dec.use_spec_decoding and spec_dec.is_spec_dec_tree:
             return False, "spec-dec tree/custom masks."
         if is_mla_enable and has_context_phase:
             return False, "MLA context attention."
@@ -719,7 +723,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 return False, "cross attention with NVFP4 KV cache."
             if is_mla_enable:
                 return False, "cross attention with MLA."
-            if meta.is_spec_decoding_enabled or meta.use_spec_decoding:
+            if spec_dec.is_spec_decoding_enabled or spec_dec.use_spec_decoding:
                 return False, "cross attention with speculative decoding."
             if fwd.update_kv_cache and fwd.cross_kv is None:
                 return False, "cross attention with a missing cross_kv when update_kv_cache=True."

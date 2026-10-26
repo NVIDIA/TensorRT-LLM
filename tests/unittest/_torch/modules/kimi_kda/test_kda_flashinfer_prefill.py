@@ -11,6 +11,17 @@ pytest.importorskip("fla")
 
 from kda_module_test_utils import compare, make_attention, make_batch
 
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
+
+
+def _recurrent_stub(mamba_metadata, **fields) -> SimpleNamespace:
+    """A metadata stub serving ``mamba_metadata`` through its recurrent extension."""
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: recurrent if cls is RecurrentMetadata else None
+    return metadata
+
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
@@ -301,7 +312,7 @@ def test_production_forward_updates_live_cache(state_dtype: torch.dtype) -> None
         **replay_caches,
     )
     old_replay = [getattr(cache, f"kda_conv_{label}").clone() for label in ("q", "k", "v")]
-    metadata = SimpleNamespace(
+    metadata = _recurrent_stub(
         mamba_metadata=batch.metadata,
         num_contexts=batch.n,
         num_ctx_tokens=batch.hidden.shape[0],

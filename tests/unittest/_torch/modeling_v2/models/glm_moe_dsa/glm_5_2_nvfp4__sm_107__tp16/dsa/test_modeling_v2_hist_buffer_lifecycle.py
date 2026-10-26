@@ -45,7 +45,7 @@ def _target() -> DecodeTarget:
 
 def _metadata(max_seq_len: int, kv_len: int, tokens_per_block: int = 64) -> SimpleNamespace:
     pages = -(-max_seq_len // tokens_per_block)
-    return SimpleNamespace(
+    metadata = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
             max_seq_len=max_seq_len, tokens_per_block=tokens_per_block
         ),
@@ -55,6 +55,9 @@ def _metadata(max_seq_len: int, kv_len: int, tokens_per_block: int = 64) -> Simp
             torch.arange(pages, dtype=torch.int32, device="cuda") + 1000
         ).view(1, -1),
     )
+    # The stub carries the DSA extension state itself.
+    metadata.ext = lambda cls: metadata
+    return metadata
 
 
 def _assert_metadata(target: DecodeTarget, metadata: SimpleNamespace) -> None:

@@ -9,11 +9,10 @@ from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 
-from ..dsa.metadata import DSAtrtllmAttentionMetadata
+from ..dsa.metadata import DSAMetadata
 from .indexer import DeepseekV4Indexer
 from .offload import SparseOffloadState
 from .params import (
@@ -28,7 +27,9 @@ if TYPE_CHECKING:
     from .cache_manager import DeepseekV4CacheManager
 
 
-class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
+class DeepseekV4Metadata(DSAMetadata):
+    """DeepSeek-V4 compressed and sliding-window state on top of the DSA indexer state."""
+
     # The set of compress ratios for the layers
     compress_ratio_set: Set[int]
     # The set of (compress ratio, attention type) for the layers
@@ -38,21 +39,19 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     # The max number of context compressed tokens for each compress ratio
     max_ctx_compressed_tokens: Dict[int, int]
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def _invalidate_mla_scheduler_buffers(self) -> None:
+    def invalidate_length_derived_buffers(self) -> None:
         """Invalidate request- and token-prefix buffers derived from sequence lengths."""
-        super()._invalidate_mla_scheduler_buffers()
+        super().invalidate_length_derived_buffers()
         self._fused_q_gen_cu_seqlens_valid = False
 
-    def __post_init__(self):
-        super().__post_init__()
+    def allocate(self, buffers) -> None:
+        md = self.metadata
+        super().allocate(buffers)
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
         self.nvfp4_compress_fp8_scratch: Optional[torch.Tensor] = None
         self._ctx_output_sizes: Optional[Dict[int, int]] = None
-        sparse_metadata_params = self.sparse_metadata_params
+        sparse_metadata_params = md.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
             raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
         self.window_size = sparse_metadata_params.window_size
@@ -61,7 +60,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
             f"TileSizeKV of the FMHA kernel. (got {window_size})."
         )
-        capture_graph = self.is_cuda_graph
+        capture_graph = md.is_cuda_graph
         self.compress_ratio_set = set(self.compress_ratios)
         # Cache a sorted list for deterministic iteration order across
         # torch.compile traces. Avoids repeated set→list conversion and
@@ -98,9 +97,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # Create buffers for the compressor
         # cu_seq_lens_cuda is the cumulative sequence lengths for the requests
-        self.cu_seq_lens_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_sequences + 1,),
+        self.cu_seq_lens_cuda = md.get_empty(
+            md.cuda_graph_buffers,
+            (md.max_num_sequences + 1,),
             dtype=torch.int,
             cache_name="cu_seq_lens_cuda",
             capture_graph=capture_graph,
@@ -117,18 +116,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if self.enable_ragged_verification:
             # The fused Q normalization op consumes request-major token
             # prefixes, rather than the sparse-MLA token-major row view.
-            self.fused_q_gen_cu_seqlens = self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences + 1,),
+            self.fused_q_gen_cu_seqlens = md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_sequences + 1,),
                 cache_name="fused_q_gen_cu_seqlens",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
             self.fused_q_gen_cu_seqlens[:1].zero_()
             # Exact tokens appended by each generation request.
-            self.gen_new_tokens_per_seq_cuda = self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences,),
+            self.gen_new_tokens_per_seq_cuda = md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_sequences,),
                 dtype=torch.int,
                 cache_name="gen_new_tokens_per_seq_cuda",
                 capture_graph=capture_graph,
@@ -136,9 +135,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # new_comp_kv_lens_cuda is the number of new compressed tokens for the requests
         self.new_comp_kv_lens_cuda = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences,),
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_sequences,),
                 dtype=torch.int,
                 cache_name=f"new_comp_kv_lens_cuda_{compress_ratio}",
                 capture_graph=capture_graph,
@@ -148,9 +147,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # cu_new_comp_kv_cuda is the cumulative number of new compressed tokens for the requests
         self.cu_new_comp_kv_cuda = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences + 1,),
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_sequences + 1,),
                 dtype=torch.int,
                 cache_name=f"cu_new_comp_kv_cuda_{compress_ratio}",
                 capture_graph=capture_graph,
@@ -160,9 +159,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # compressed_kv_lens_cuda is the number of compressed tokens for the requests
         self.compressed_kv_lens_cuda = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences,),
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_sequences,),
                 dtype=torch.int,
                 cache_name=f"compressed_kv_lens_cuda_{compress_ratio}",
                 capture_graph=capture_graph,
@@ -172,9 +171,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # past_kv_lens_cuda is the number of past compressed tokens for the requests
         self.past_kv_lens_cuda = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences,),
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_sequences,),
                 dtype=torch.int,
                 cache_name=f"past_kv_lens_cuda_{compress_ratio}",
                 capture_graph=capture_graph,
@@ -184,9 +183,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # compressed_position_ids_cuda is the compressed position ids for the requests
         self.compressed_position_ids_cuda = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_tokens,),
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_tokens,),
                 dtype=torch.int,
                 cache_name=f"compressed_position_ids_cuda_{compress_ratio}",
                 capture_graph=capture_graph,
@@ -195,8 +194,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
 
         # Device scalar batch size for the shape-static compressed_mask graph.
-        self.batch_size_cuda = self.get_empty(
-            self.cuda_graph_buffers,
+        self.batch_size_cuda = md.get_empty(
+            md.cuda_graph_buffers,
             (1,),
             dtype=torch.int,
             cache_name="batch_size_cuda",
@@ -206,9 +205,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # compressed_mask_cuda: per-token bool mask for postprocess scatter.
         # Precomputed from new_comp_kv_lens to skip padded generation slots.
         self.compressed_mask_cuda = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_tokens,),
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_tokens,),
                 dtype=torch.bool,
                 cache_name=f"compressed_mask_cuda_{compress_ratio}",
                 capture_graph=capture_graph,
@@ -223,9 +222,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
 
         # empty topk indices buffer with all -1s in the tensor
-        self.empty_topk_indices_buffer = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_tokens, self.sparse_mla_topk),
+        self.empty_topk_indices_buffer = md.get_empty(
+            md.cuda_graph_buffers,
+            (md.max_num_tokens, self.sparse_mla_topk),
             cache_name="empty_topk_indices_buffer",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -233,9 +232,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.empty_topk_indices_buffer.fill_(-1)
 
         # SWA local indices
-        self.swa_local_indices_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_tokens, self.window_size),
+        self.swa_local_indices_cuda = md.get_empty(
+            md.cuda_graph_buffers,
+            (md.max_num_tokens, self.window_size),
             cache_name="swa_local_indices_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -256,7 +255,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # Compute max_compressed_indices for CUDA graph compatibility.
         # For ratio=4, the indexer selects index_topk compressed tokens.
         # For ratio=128, use max_seq_len / 128 rounded up to next power of 2
-        raw_128 = math.ceil(self.max_seq_len / 128)
+        raw_128 = math.ceil(md.max_seq_len / 128)
         po2_128 = 1 << (raw_128 - 1).bit_length() if raw_128 > 0 else 1
         self.max_compressed_indices = {
             1: 0,  # No compressed indices
@@ -266,9 +265,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # Compressed local indices for compress_ratio=128
         # Note: ratio=4 uses dynamic topk_indices from indexer, so we only pre-allocate for ratio=128
-        self.compressed_local_indices_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_tokens, self.max_compressed_indices[128]),
+        self.compressed_local_indices_cuda = md.get_empty(
+            md.cuda_graph_buffers,
+            (md.max_num_tokens, self.max_compressed_indices[128]),
             cache_name="compressed_local_indices_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -279,13 +278,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # uses ratio-shared page indices, and INDEXER_COMPRESS keeps a separate
         # compatibility table for the generic DSA indexer path.
         block_table_shape = (
-            self.kv_cache_manager.num_local_layers,
+            md.kv_cache_manager.num_local_layers,
             len(DEEPSEEK_V4_SLIDING_ATTENTION),
-            self.max_num_sequences,
-            self.kv_cache_manager.max_blocks_per_seq,
+            md.max_num_sequences,
+            md.kv_cache_manager.max_blocks_per_seq,
         )
-        self.sliding_block_tables = self.get_empty(
-            self.cuda_graph_buffers,
+        self.sliding_block_tables = md.get_empty(
+            md.cuda_graph_buffers,
             block_table_shape,
             cache_name="sliding_block_tables",
             dtype=torch.int32,
@@ -293,12 +292,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
 
         compress_block_table_shape = (
-            self.max_num_sequences,
-            self.kv_cache_manager.max_blocks_per_seq,
+            md.max_num_sequences,
+            md.kv_cache_manager.max_blocks_per_seq,
         )
         self.compress_block_tables = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
                 compress_block_table_shape,
                 cache_name=f"compress_block_tables_{compress_ratio}",
                 dtype=torch.int32,
@@ -312,9 +311,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
         # Shape: [max_num_tokens] per compress_ratio
         self.sparse_mla_topk_lens = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_tokens,),
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_tokens,),
                 cache_name=f"sparse_mla_topk_lens_{compress_ratio}",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
@@ -345,9 +344,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
 
         # cached_token_lens_cuda: number of tokens already cached per request
-        self.cached_token_lens_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_sequences,),
+        self.cached_token_lens_cuda = md.get_empty(
+            md.cuda_graph_buffers,
+            (md.max_num_sequences,),
             cache_name="cached_token_lens_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -365,19 +364,20 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def _init_sparse_offload_state(self) -> None:
         """Validate fixed offload configuration and allocate persistent metadata."""
+        md = self.metadata
         self.sparse_offload_state: SparseOffloadState | None = None
-        if not self.sparse_metadata_params.enable_kv_cache_offload:
+        if not md.sparse_metadata_params.enable_kv_cache_offload:
             return
-        manager = self.kv_cache_manager
+        manager = md.kv_cache_manager
         # Per-batch beam/draft values start at defaults. Also check the manager's
         # configured limits before allocating any offload buffers.
         if (
-            self.beam_width != 1
+            md.beam_width != 1
             or manager.max_beam_width != 1
             or self.max_draft_tokens
             or manager.max_draft_len
             or manager.max_total_draft_tokens
-            or self.draft_kv_cache_manager is not None
+            or md.draft_kv_cache_manager is not None
         ):
             raise NotImplementedError(
                 "Sparse offload requires single-beam, non-speculative execution"
@@ -392,16 +392,16 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             return
         if self.sparse_mla_topk <= 0:
             raise ValueError("Sparse offload metadata requires positive top-k")
-        batch = self.max_num_sequences
-        max_blocks = self.kv_cache_manager.max_blocks_per_seq
+        batch = md.max_num_sequences
+        max_blocks = md.kv_cache_manager.max_blocks_per_seq
 
         def allocate(name: str, shape: tuple[int, ...], value: int) -> torch.Tensor:
-            tensor = self.get_empty(
-                self.cuda_graph_buffers,
+            tensor = md.get_empty(
+                md.cuda_graph_buffers,
                 shape,
                 dtype=torch.int32,
                 cache_name=f"dsv4_sparse_offload_{name}",
-                capture_graph=self.is_cuda_graph,
+                capture_graph=md.is_cuda_graph,
             )
             tensor.fill_(value)
             return tensor
@@ -435,13 +435,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         into graph-owned storage once per iteration; device-window graph
         replay therefore updates values without changing the captured address.
         """
-        if not self.is_ragged_verify or self.num_generations <= 0:
+        md = self.metadata
+        if not self.is_ragged_verify or md.num_generations <= 0:
             return None
 
-        num_contexts = self.num_contexts
-        num_generations = self.num_generations
+        num_contexts = md.num_contexts
+        num_generations = md.num_generations
         cu_seqlens = getattr(self, "fused_q_gen_cu_seqlens", None)
-        seq_lens_cuda = getattr(self, "seq_lens_cuda", None)
+        seq_lens_cuda = getattr(md, "seq_lens_cuda", None)
         if cu_seqlens is None or seq_lens_cuda is None or num_generations + 1 > cu_seqlens.shape[0]:
             return None
 
@@ -462,24 +463,26 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         kv_correction: torch.Tensor,
     ) -> None:
         """Install device-selected windows and invalidate derived Q prefixes."""
+        md = self.metadata
         super().apply_device_ragged_layout(verify_lens, req_idx, kv_correction)
         # This call precedes the first model layer. Its fixed-address cumsum is
         # therefore captured once after the layout update and replayed in order.
-        self._invalidate_mla_scheduler_buffers()
+        md._invalidate_mla_scheduler_buffers()
 
     def prepare_for_indexer_k_cache(self):
         """Prepare the shared indexer K-cache decode table for DSA kernels."""
         # INDEXER_COMPRESS uses shared page indices, so the generic DSA
         # indexer path only needs one 2D block table.
-        self.kv_cache_manager.copy_batch_indexer_compress_block_tables(
+        md = self.metadata
+        md.kv_cache_manager.copy_batch_indexer_compress_block_tables(
             self.host_indexer_k_cache_block_offsets,
-            self.request_ids,
-            beam_width=self.beam_width,
-            num_contexts=self.num_contexts,
-            num_seqs=self.num_seqs,
+            md.request_ids,
+            beam_width=md.beam_width,
+            num_contexts=md.num_contexts,
+            num_seqs=md.num_seqs,
         )
-        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
-            self.host_indexer_k_cache_block_offsets[: self.num_seqs],
+        self.indexer_k_cache_block_offsets[: md.num_seqs].copy_(
+            self.host_indexer_k_cache_block_offsets[: md.num_seqs],
             non_blocking=True,
         )
         # Columns beyond each sequence's allocated indexer blocks contain BAD_PAGE_INDEX (-1).
@@ -489,45 +492,47 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def prepare_for_block_tables(self):
         """Prepare block tables for sliding-window and compressed attention."""
-        self.kv_cache_manager.copy_batch_sliding_block_tables(
+        md = self.metadata
+        md.kv_cache_manager.copy_batch_sliding_block_tables(
             self.sliding_block_tables,
-            self.request_ids,
-            self.num_contexts,
-            self.num_seqs,
+            md.request_ids,
+            md.num_contexts,
+            md.num_seqs,
         )
         for compress_ratio, compress_block_table in self.compress_block_tables.items():
             if (
                 compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
-                and self.sparse_metadata_params.enable_kv_cache_offload
+                and md.sparse_metadata_params.enable_kv_cache_offload
             ):
                 if self.sparse_offload_state is None:
                     compress_block_table.fill_(-1)
                 else:
-                    self.kv_cache_manager.prepare_sparse_offload(
+                    md.kv_cache_manager.prepare_sparse_offload(
                         self.sparse_offload_state,
-                        self.request_ids,
+                        md.request_ids,
                         compress_block_table,
-                        beam_width=self.beam_width,
+                        beam_width=md.beam_width,
                     )
                 continue
-            self.kv_cache_manager.copy_batch_compress_block_tables(
+            md.kv_cache_manager.copy_batch_compress_block_tables(
                 compress_block_table,
-                self.request_ids,
+                md.request_ids,
                 compress_ratio=compress_ratio,
-                beam_width=self.beam_width,
-                num_contexts=self.num_contexts,
-                num_seqs=self.num_seqs,
+                beam_width=md.beam_width,
+                num_contexts=md.num_contexts,
+                num_seqs=md.num_seqs,
             )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
+        md = self.metadata
         window_size = self.window_size
         device = self.swa_local_indices_cuda.device
 
         if token_positions is None:
             # Initial prepare() path — build token_positions from CPU data.
-            num_tokens = self.num_tokens
-            num_requests = self.num_seqs
+            num_tokens = md.num_tokens
+            num_requests = md.num_seqs
 
             # cu_seq_lens_cuda must already be populated before this call
             cu_seq_lens = self.cu_seq_lens_cuda[: num_requests + 1]
@@ -640,6 +645,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def _init_cache_buffer_data_pointers(self):
         # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1.
+        md = self.metadata
         extend_compress_ratios = self.compress_ratios + [self.compress_ratios[-1]] * (
             self.max_draft_tokens - 1
         )
@@ -647,15 +653,16 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.sparse_mla_base_ptrs,
             self.swa_buffer_ptrs,
             self.compressed_buffer_ptrs,
-        ) = self._build_cache_buffer_data_pointers(self.kv_cache_manager, extend_compress_ratios)
+        ) = self._build_cache_buffer_data_pointers(md.kv_cache_manager, extend_compress_ratios)
 
     def _init_draft_sparse_buffers(self):
         """Initialize sparse buffers for a separate one-model MTP draft cache."""
+        md = self.metadata
         self.draft_sliding_block_tables = None
         self.draft_sparse_mla_base_ptrs = None
         self.draft_swa_buffer_ptrs = None
 
-        draft_mgr = self.draft_kv_cache_manager
+        draft_mgr = md.draft_kv_cache_manager
         from .cache_manager import DeepseekV4CacheManager
 
         if not isinstance(draft_mgr, DeepseekV4CacheManager):
@@ -673,15 +680,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         draft_block_table_shape = (
             draft_mgr.num_local_layers,
             len(DEEPSEEK_V4_SLIDING_ATTENTION),
-            self.max_num_sequences,
+            md.max_num_sequences,
             draft_mgr.max_blocks_per_seq,
         )
-        self.draft_sliding_block_tables = self.get_empty(
-            self.cuda_graph_buffers,
+        self.draft_sliding_block_tables = md.get_empty(
+            md.cuda_graph_buffers,
             draft_block_table_shape,
             cache_name="draft_sliding_block_tables",
             dtype=torch.int32,
-            capture_graph=self.is_cuda_graph,
+            capture_graph=md.is_cuda_graph,
         )
         extend_compress_ratios = self.compress_ratios + [draft_ratio] * (self.max_draft_tokens - 1)
         (
@@ -696,18 +703,20 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         "swa_buffer_ptrs",
     )
 
-    def prepare_for_draft_forward(self) -> dict | None:
-        """Repoint sparse fields to the draft buffers for a draft forward."""
+    def draft_swap(self) -> dict | None:
+        """Repoint sparse fields to the draft buffers for a draft forward.
+
+        Replaces the DSA swap: the DeepSeek-V4 indexer buffers stay bound.
+        """
         if self.draft_sliding_block_tables is None:
             return None
-        saved_state = {field: getattr(self, field) for field in self._DRAFT_SPARSE_FIELDS}
-        for field in self._DRAFT_SPARSE_FIELDS:
-            self.swap_for_draft(field, getattr(self, f"draft_{field}"))
-        return saved_state
+        return self.swap_attrs_for_draft(
+            {field: getattr(self, f"draft_{field}") for field in self._DRAFT_SPARSE_FIELDS}
+        )
 
-    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
-        """No-op: restore_draft_swaps() restores the sparse fields, and DSA's hook must not run."""
-        return None
+    def draft_restore(self, saved_state: dict | None) -> None:
+        if saved_state is not None:
+            self.restore_swapped_attrs(saved_state)
 
     def validate_sparse_offload_batch(self) -> None:
         """Reject unsupported layouts on the host before any model writes.
@@ -717,34 +726,35 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         the per-layer path consumes the resulting phase and device metadata.
         Fixed configuration is validated during offload metadata initialization.
         """
-        if not self.sparse_metadata_params.enable_kv_cache_offload:
+        md = self.metadata
+        if not md.sparse_metadata_params.enable_kv_cache_offload:
             return
         state = self.sparse_offload_state
         if state is not None:
             state.prepared = False
             state.is_prefill = False
-        if self.num_contexts and self.num_generations:
+        if md.num_contexts and md.num_generations:
             raise NotImplementedError(
                 "Sparse offload does not support mixed context/decode batches"
             )
-        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
+        if md.seq_lens.device.type != "cpu" or md.seq_lens_kv.device.type != "cpu":
             raise ValueError("Sparse offload batch validation requires host sequence lengths")
-        if not torch.equal(self.seq_lens, self.seq_lens_kv):
+        if not torch.equal(md.seq_lens, md.seq_lens_kv):
             raise NotImplementedError("Sparse offload requires matching query and new-KV lengths")
-        if not self.num_contexts:
-            if not torch.all(self.seq_lens == 1):
+        if not md.num_contexts:
+            if not torch.all(md.seq_lens == 1):
                 raise NotImplementedError("Sparse offload decode requires one query per request")
             return
-        cached = self.kv_cache_params.num_cached_tokens_per_seq
+        cached = md.kv_cache_params.num_cached_tokens_per_seq
         if (
-            self.prompt_lens is None
-            or len(self.prompt_lens) < self.num_contexts
-            or len(cached) < self.num_contexts
-            or any(cached[: self.num_contexts])
-            or self.seq_lens.tolist() != self.prompt_lens[: self.num_contexts]
+            md.prompt_lens is None
+            or len(md.prompt_lens) < md.num_contexts
+            or len(cached) < md.num_contexts
+            or any(cached[: md.num_contexts])
+            or md.seq_lens.tolist() != md.prompt_lens[: md.num_contexts]
             or any(
-                self.kv_cache_manager.kv_cache_map[request_id].history_length != 0
-                for request_id in self.request_ids
+                md.kv_cache_manager.kv_cache_map[request_id].history_length != 0
+                for request_id in md.request_ids
             )
         ):
             raise NotImplementedError(
@@ -753,44 +763,46 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if state is not None:
             state.is_prefill = True
 
-    def prepare(self) -> None:
+    def pre_derive_lengths(self) -> None:
+        md = self.metadata
         self._validate_ragged_verification()
-        assert self.kv_cache_manager is not None
-        assert self.request_ids is not None
+        assert md.kv_cache_manager is not None
+        assert md.request_ids is not None
         self.validate_sparse_offload_batch()
 
-        self.kv_cache_manager.compute_sliding_block_tables(
-            self.request_ids,
-            self.num_contexts,
+        md.kv_cache_manager.compute_sliding_block_tables(
+            md.request_ids,
+            md.num_contexts,
         )
 
         # Prepare the draft manager's tables before the generic prepare copies
         # its block offsets, and populate the dedicated DSv4 draft sparse table.
-        draft_mgr = self.draft_kv_cache_manager
+        draft_mgr = md.draft_kv_cache_manager
         if draft_mgr is not None and hasattr(draft_mgr, "compute_sliding_block_tables"):
             draft_mgr.compute_sliding_block_tables(
-                self.request_ids,
-                self.num_contexts,
+                md.request_ids,
+                md.num_contexts,
             )
             if self.draft_sliding_block_tables is not None:
                 draft_mgr.copy_batch_sliding_block_tables(
                     self.draft_sliding_block_tables,
-                    self.request_ids,
-                    self.num_contexts,
-                    self.num_seqs,
+                    md.request_ids,
+                    md.num_contexts,
+                    md.num_seqs,
                 )
 
-        TrtllmAttentionMetadata.prepare(self)
-
-        num_requests = self.num_contexts + self.num_generations
-        num_gen_tokens = self.num_tokens - self.num_ctx_tokens
+    def prepare(self) -> None:
+        """Derive the DeepSeek-V4 state; replaces the DSA prepare."""
+        md = self.metadata
+        num_requests = md.num_contexts + md.num_generations
+        num_gen_tokens = md.num_tokens - md.num_ctx_tokens
 
         self.cached_token_lens_cpu[:num_requests] = torch.tensor(
-            self.kv_cache_params.num_cached_tokens_per_seq[:num_requests],
+            md.kv_cache_params.num_cached_tokens_per_seq[:num_requests],
             dtype=torch.int32,
         )
         cached_token_lens = self.cached_token_lens_cpu
-        kv_lens = cached_token_lens[:num_requests] + self.seq_lens_kv[:num_requests]
+        kv_lens = cached_token_lens[:num_requests] + md.seq_lens_kv[:num_requests]
 
         kv_lens = self._prepare_device_window_kv_lens(kv_lens)
 
@@ -799,7 +811,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
 
         # Prepare cu_seq_lens early — needed by prepare_for_deepseek_v4_indices
-        self.cu_seq_lens[1 : num_requests + 1] = self.seq_lens.cumsum(0)
+        self.cu_seq_lens[1 : num_requests + 1] = md.seq_lens.cumsum(0)
         self.cu_seq_lens_cuda[: num_requests + 1].copy_(
             self.cu_seq_lens[: num_requests + 1], non_blocking=True
         )
@@ -824,14 +836,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # Prepare metadata for indexer (only needed when sparse layers exist)
         if has_sparse_layers:
-            DeepseekV4Indexer.prepare(metadata=self)
+            DeepseekV4Indexer.prepare(metadata=md)
 
         # --- Per-ratio metadata ---
         # 1) CPU-side: compute scalar metadata (num_total_compressed_tokens, etc.)
         # 2) CUDA-side: fill *_cuda buffers via prepare_compressed_kv_metadata()
         num_gen_tokens_per_seq = self._sync_gen_tokens_per_seq(num_gen_tokens)
-        num_contexts = self.num_contexts
-        num_generations = self.num_generations
+        num_contexts = md.num_contexts
+        num_generations = md.num_generations
         kv_lens_slice = kv_lens[:num_requests]
         cached_slice = cached_token_lens[:num_requests]
 
@@ -869,9 +881,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self._ctx_output_sizes = ctx_output_sizes
 
         # 2) CUDA-side: fill *_cuda buffers on device.
-        kv_lens_cuda = (
-            self.cached_token_lens_cuda[:num_requests] + self._seq_lens_cuda[:num_requests]
-        )
+        kv_lens_cuda = self.cached_token_lens_cuda[:num_requests] + md._seq_lens_cuda[:num_requests]
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
         self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda, ctx_output_sizes)
 
@@ -894,16 +904,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         observes device-window rewrites instead of reloading the captured host
         shape split.
         """
-        if self.is_ragged_verify and self.num_generations > 0:
+        md = self.metadata
+        if self.is_ragged_verify and md.num_generations > 0:
             self.num_gen_tokens_per_seq = 1 + self.max_draft_tokens
-            num_contexts = self.num_contexts
-            num_generations = self.num_generations
+            num_contexts = md.num_contexts
+            num_generations = md.num_generations
             gen_new_tokens = self.gen_new_tokens_per_seq_cuda[:num_generations]
-            gen_new_tokens.copy_(self._seq_lens_cuda[num_contexts : num_contexts + num_generations])
+            gen_new_tokens.copy_(md._seq_lens_cuda[num_contexts : num_contexts + num_generations])
             self.gen_new_tokens_per_seq = gen_new_tokens
         else:
             self.num_gen_tokens_per_seq = (
-                num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
+                num_gen_tokens // md.num_generations if md.num_generations > 0 else 0
             )
             self.gen_new_tokens_per_seq = None
         return self.num_gen_tokens_per_seq
@@ -928,9 +939,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 reuses the cached copy unless the extend_ctx path may have
                 mutated ctx-row kv_lens on device.
         """
+        md = self.metadata
         batch_size = kv_lens.shape[0]
-        num_contexts = self.num_contexts
-        num_generations = self.num_generations
+        num_contexts = md.num_contexts
+        num_generations = md.num_generations
 
         self._compute_per_ratio_kv_lens(
             kv_lens,
@@ -972,24 +984,25 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 gen_output_offsets,
             )
 
-    def on_update_kv_lens(self):
+    def on_kv_lens_changed(self, spec_dec_step: bool) -> None:
         """Recompute kv-lens-dependent DeepSeek-V4 metadata on device."""
-        super().on_update_kv_lens()
+        md = self.metadata
+        super().on_kv_lens_changed(spec_dec_step)
 
-        batch_size = self.num_seqs
-        num_tokens = self.num_tokens
-        kv_lens = self.kv_lens_cuda[:batch_size]
-        seq_lens = self._seq_lens_cuda[:batch_size]
+        batch_size = md.num_seqs
+        num_tokens = md.num_tokens
+        kv_lens = md.kv_lens_cuda[:batch_size]
+        seq_lens = md._seq_lens_cuda[:batch_size]
         cached_tokens = kv_lens - seq_lens
 
-        num_gen_tokens = num_tokens - self.num_ctx_tokens
+        num_gen_tokens = num_tokens - md.num_ctx_tokens
         self._sync_gen_tokens_per_seq(num_gen_tokens)
 
         # Reuse prepare()'s host-computed ctx sizes unless the extend_ctx path
         # (num_chunked_ctx_requests > 0) may have mutated ctx-row kv_lens on
         # device; every other path only changes gen rows.
         ctx_output_sizes = (
-            self._ctx_output_sizes if getattr(self, "num_chunked_ctx_requests", 0) == 0 else None
+            self._ctx_output_sizes if getattr(md, "num_chunked_ctx_requests", 0) == 0 else None
         )
         self.prepare_compressed_kv_metadata(kv_lens, cached_tokens, ctx_output_sizes)
 

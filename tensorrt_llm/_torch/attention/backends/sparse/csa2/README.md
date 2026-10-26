@@ -80,7 +80,7 @@ and delegates attention to the independent CSA2 module.
 ## Projections, compression and indexing
 
 `DeepseekV41Attention` owns projections, normalization, RoPE, compression and
-grouped output projection. It consumes prepared `CSA2TrtllmMetadata`, retains
+grouped output projection. It consumes the prepared `CSA2Metadata` extension, retains
 CSA2's omission of projected-Q head normalization, and derives index K from
 the compressed main latent before main-KV RoPE. Ratio-two compression reuses
 the native V4 non-overlap compressor with FP32 value/gate state and zero APE
@@ -352,9 +352,10 @@ existing output contract; this does not add arbitrary hidden-state exports.
 
 ## Metadata, graphs and workspace
 
-`CSA2TrtllmMetadata.prepare()` resolves real request IDs, cached lengths and V2
-page converters. Layer-specific SWA/visibility, owner page tables/write slots,
-compression inputs, candidates and routing results live directly on metadata.
+Preparing a metadata that carries `CSA2Metadata` resolves real request IDs,
+cached lengths and V2 page converters. Layer-specific SWA/visibility, owner page
+tables/write slots, compression inputs, candidates and routing results live on
+the extension.
 `global_slot_tile()` resolves pages without a persistent token-by-context map.
 As in DeepSeek-V4, the manager converts every per-layer page table of a batch
 (SWA, GLOBAL and compressor state) in one CuTe DSL launch from a prepare-time

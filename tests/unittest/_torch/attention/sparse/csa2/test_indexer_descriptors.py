@@ -12,11 +12,12 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import INDEX_PAGE_ROWS
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 from . import test_metadata
+from ._utils import _bare_csa2_metadata
 from .test_metadata import _prepare_decode_metadata
 
 skip_pre_blackwell = pytest.mark.skipif(
@@ -153,8 +154,8 @@ def test_indexer_descriptors_follow_live_graph_inputs(
 ) -> None:
     """Replay changed contents against eager and scalar references with exact integer parity."""
     monkeypatch.setattr("tensorrt_llm._torch.utils.is_piecewise_running", lambda: False)
-    eager = CSA2TrtllmMetadata._fill_indexer_descriptors
-    captured = CSA2TrtllmMetadata._fill_indexer_descriptors
+    eager = CSA2Metadata._fill_indexer_descriptors
+    captured = CSA2Metadata._fill_indexer_descriptors
     host_inputs = _inputs(query_count, request_count, source_pages, page_capacity, 0)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -203,16 +204,13 @@ def test_indexer_descriptors_follow_live_graph_inputs(
 
 
 @pytest.mark.cpu_only
-def test_graph_clone_post_init_clears_decode_deferral_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    metadata = object.__new__(CSA2TrtllmMetadata)
-    metadata._csa2_deferred_decode_outputs = True
+def test_graph_clone_post_init_clears_decode_deferral_state() -> None:
+    metadata = _bare_csa2_metadata()
+    metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs = True
     clone = copy(metadata)
-    monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
-    clone.__post_init__()
-    assert not clone._csa2_deferred_decode_outputs
-    assert metadata._csa2_deferred_decode_outputs
+    clone._attach_extensions()
+    assert not clone.ext(CSA2Metadata)._csa2_deferred_decode_outputs
+    assert metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
 
 
 @pytest.mark.cpu_only
@@ -220,8 +218,8 @@ def test_graph_clone_post_init_clears_decode_deferral_state(
 def test_failed_prepare_clears_decode_deferral_state(
     monkeypatch: pytest.MonkeyPatch, entrypoint: str
 ) -> None:
-    metadata = object.__new__(CSA2TrtllmMetadata)
-    metadata._csa2_deferred_decode_outputs = True
+    metadata = _bare_csa2_metadata()
+    metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs = True
     metadata.kv_cache_manager = SimpleNamespace()
     metadata.is_cuda_graph = False
     metadata.kv_lens_cuda = torch.empty(0)
@@ -234,8 +232,9 @@ def test_failed_prepare_clears_decode_deferral_state(
     error = ValueError if entrypoint == "prepare" else TypeError
     message = "injected prepare failure" if entrypoint == "prepare" else "CSA2CacheManager"
     with pytest.raises(error, match=message):
-        getattr(metadata, entrypoint)()
-    assert not metadata._csa2_deferred_decode_outputs
+        target = metadata if entrypoint == "prepare" else metadata.ext(CSA2Metadata)
+        getattr(target, entrypoint)()
+    assert not metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
 
 
 @skip_pre_blackwell
@@ -246,23 +245,25 @@ def test_selected_decode_prepare_controls_indexer_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, requests = manager_requests
-    base = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    base = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     # A shallow graph clone must discard any eligibility inherited from its source.
-    base._csa2_deferred_decode_outputs = True
+    base.ext(CSA2Metadata)._csa2_deferred_decode_outputs = True
     metadata = base.create_cuda_graph_metadata(2)
-    assert not metadata._csa2_deferred_decode_outputs
-    assert base._csa2_deferred_decode_outputs
+    assert not metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
+    assert base.ext(CSA2Metadata)._csa2_deferred_decode_outputs
     starts = [127, 128]
     calls = []
-    eager = CSA2TrtllmMetadata._fill_indexer_descriptors
+    eager = CSA2Metadata._fill_indexer_descriptors
 
     def record_refresh(*args: torch.Tensor | int) -> None:
-        calls.append(metadata._csa2_deferred_decode_outputs)
+        calls.append(metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs)
         return eager(*args)
 
     # The same fused dispatcher serves every preparation mode. Graph parity
     # is checked above; isolate per-owner reuse and preparation state here.
-    monkeypatch.setattr(metadata, "_fill_indexer_descriptors", record_refresh)
+    monkeypatch.setattr(metadata.ext(CSA2Metadata), "_fill_indexer_descriptors", record_refresh)
     monkeypatch.setattr("tensorrt_llm._torch.utils.is_piecewise_running", lambda: True)
     monkeypatch.setattr(
         "tensorrt_llm.deep_gemm.get_paged_mqa_logits_metadata",
@@ -272,28 +273,28 @@ def test_selected_decode_prepare_controls_indexer_dispatch(
     )
 
     _prepare_decode_metadata(metadata, requests, starts, deferred=True)
-    assert metadata._csa2_deferred_decode_outputs
-    assert not metadata._csa2_defer_decode_outputs
+    assert metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
+    assert not metadata.ext(CSA2Metadata)._csa2_defer_decode_outputs
     metadata.on_update_kv_lens()
-    assert metadata.prepare_indexer(1) is metadata
+    assert metadata.ext(CSA2Metadata).prepare_indexer(1) is metadata.ext(CSA2Metadata)
     assert calls == [True]
     # Layers 1 and 2 share an owner. One serial refresh serves both layers.
-    metadata.prepare_indexer(1)
-    metadata.prepare_indexer(2)
+    metadata.ext(CSA2Metadata).prepare_indexer(1)
+    metadata.ext(CSA2Metadata).prepare_indexer(2)
     assert calls == [True]
 
     _prepare_decode_metadata(metadata, requests, starts)
-    assert not metadata._csa2_deferred_decode_outputs
+    assert not metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
     metadata.on_update_kv_lens()
-    metadata.prepare_indexer(1)
+    metadata.ext(CSA2Metadata).prepare_indexer(1)
     assert calls == [True, False]
 
     _prepare_decode_metadata(metadata, requests, starts, deferred=True)
-    assert metadata._csa2_deferred_decode_outputs
-    metadata.set_source_batch([1, 1], starts)
+    assert metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
+    metadata.ext(CSA2Metadata).set_source_batch([1, 1], starts)
     _prepare_decode_metadata(metadata, requests, starts, deferred=True)
-    assert not hasattr(metadata, "_csa2_source_batch")
-    assert not metadata._csa2_deferred_decode_outputs
+    assert not hasattr(metadata.ext(CSA2Metadata), "_csa2_source_batch")
+    assert not metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
     metadata.on_update_kv_lens()
-    metadata.prepare_indexer(1)
+    metadata.ext(CSA2Metadata).prepare_indexer(1)
     assert calls == [True, False, False]

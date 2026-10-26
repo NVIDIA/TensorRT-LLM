@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from typing import Callable
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.features import HelixMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams, PhasedFmha
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
@@ -145,3 +148,44 @@ class FakeFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         self._events.append(("forward", self._name))
+
+
+_SPEC_FIELDS = (
+    "is_spec_decoding_enabled",
+    "use_spec_decoding",
+    "is_spec_dec_tree",
+    "is_spec_dec_dynamic_tree",
+    "max_total_draft_tokens",
+)
+_HELIX_FIELDS = {
+    "helix_position_offsets": "position_offsets",
+    "helix_is_inactive_rank": "is_inactive_rank",
+    "helix_kv_bounds": "kv_bounds",
+    "helix_local_slots": "local_slots",
+    "_helix_spec_tokens_valid": "spec_tokens_valid",
+}
+
+
+def metadata_stub(**fields) -> SimpleNamespace:
+    """A duck-typed metadata serving its spec-dec and Helix fields through extensions.
+
+    The spec-dec extension is always attached, as on TRTLLM metadata; Helix only
+    when one of its fields is set.
+    """
+    spec = SpecDecodingMetadata(None)
+    for name in _SPEC_FIELDS:
+        if name in fields:
+            setattr(spec, name, fields.pop(name))
+    extensions = {SpecDecodingMetadata: spec}
+    helix_fields = {
+        _HELIX_FIELDS[name]: fields.pop(name) for name in list(fields) if name in _HELIX_FIELDS
+    }
+    if any(value is not None and value is not False for value in helix_fields.values()):
+        helix = HelixMetadata(None)
+        for name, value in helix_fields.items():
+            setattr(helix, name, value)
+        extensions[HelixMetadata] = helix
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = extensions.get
+    metadata.ext = extensions.__getitem__
+    return metadata

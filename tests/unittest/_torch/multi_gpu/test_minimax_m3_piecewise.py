@@ -14,7 +14,11 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+    MiniMaxM3MsaMetadata,
+)
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
 from tensorrt_llm._torch.distributed import Distributed
@@ -33,6 +37,14 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 
 # Match the other MPIPoolExecutor tests: its worker thread outlives the test.
 pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+def _msa_metadata() -> TrtllmAttentionMetadata:
+    """An uninitialized TRTLLM metadata carrying a bare MSA extension."""
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(MiniMaxM3MsaMetadata(metadata))
+    metadata.replace_ext(SpecDecodingMetadata(metadata))
+    return metadata
 
 
 @torch.inference_mode()
@@ -64,20 +76,20 @@ def _run_empty_adp_rank(world_size: int) -> int:
 
     # Reuse the metadata fixture pattern from test_msa_backend. Only the cache
     # allocator is stubbed; slot construction/clearing and GPU writes are real.
-    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
-    metadata = metadata_cls.__new__(metadata_cls)
-    metadata._msa_buffers_ready = True
+    metadata = _msa_metadata()
+    msa = metadata.ext(MiniMaxM3MsaMetadata)
+    msa._msa_buffers_ready = True
     metadata.kv_cache_manager = SimpleNamespace(
         tokens_per_block=128,
         get_buffers=lambda layer_idx: main_cache,
         get_block_ids_per_seq=lambda request_ids: torch.tensor([[1]], dtype=torch.int32),
     )
-    metadata.msa_out_cache_loc = torch.full((bucket,), -1, dtype=torch.int32, device="cuda")
-    metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
-    metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32, device="cuda")
-    metadata.msa_subpage_block_table = None
-    metadata._msa_runs_no_fmha = lambda: True
-    metadata._msa_kv_lens_may_change = lambda: False
+    msa.msa_out_cache_loc = torch.full((bucket,), -1, dtype=torch.int32, device="cuda")
+    msa.msa_block_table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    msa.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32, device="cuda")
+    msa.msa_subpage_block_table = None
+    msa._msa_runs_no_fmha = lambda: True
+    msa._msa_kv_lens_may_change = lambda: False
 
     def producer(
         projection: torch.Tensor,
@@ -141,21 +153,21 @@ def _run_empty_adp_rank(world_size: int) -> int:
                 set_per_request_prefill_cuda_graph_flag(eligible)
 
                 metadata.request_ids = [0] if live_tokens else []
-                metadata._msa_qo_lens_cpu = torch.tensor(
+                msa._msa_qo_lens_cpu = torch.tensor(
                     [live_tokens] if live_tokens else [], dtype=torch.int32
                 )
-                metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
-                metadata._msa_qo_offset_cpu = torch.zeros(local_contexts, dtype=torch.int32)
+                msa._msa_kv_lens_cpu = msa._msa_qo_lens_cpu.clone()
+                msa._msa_qo_offset_cpu = torch.zeros(local_contexts, dtype=torch.int32)
                 # What the base seq_lens setter would derive; the cache writers
                 # read the live (unpadded) count off it.
                 metadata._num_tokens = live_tokens
-                metadata._build_msa_fields()
-                assert metadata.msa_out_cache_loc.tolist() == list(
-                    range(128, 128 + live_tokens)
-                ) + [-1] * (bucket - live_tokens)
+                msa._build_msa_fields()
+                assert msa.msa_out_cache_loc.tolist() == list(range(128, 128 + live_tokens)) + [
+                    -1
+                ] * (bucket - live_tokens)
                 packed.normal_()
                 before_main, before_index = main_backing.clone(), index_backing.clone()
-                args = (packed, main_cache, index_cache, metadata.msa_out_cache_loc)
+                args = (packed, main_cache, index_cache, msa.msa_out_cache_loc)
                 if empty_rank is None:
                     with capture_piecewise_cuda_graph(True):
                         # Three warmups, then capture. Keep the capture outputs

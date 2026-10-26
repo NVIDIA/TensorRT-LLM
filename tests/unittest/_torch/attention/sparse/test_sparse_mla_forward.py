@@ -1343,7 +1343,7 @@ def populate_gen_dsa_kv_cache(mla: MLA, AttentionCls: AttentionBackend,
             offset += cached_len
 
         # Single batched metadata for all generation cache population
-        cached_metadata = AttentionCls.Metadata(
+        cached_metadata = AttentionCls.create_metadata(
             seq_lens=torch.tensor(gen_cached_lens, dtype=torch.int),
             request_ids=gen_with_cache,
             max_num_requests=len(gen_with_cache),
@@ -1355,7 +1355,7 @@ def populate_gen_dsa_kv_cache(mla: MLA, AttentionCls: AttentionBackend,
                                           num_cached_tokens_per_seq=[0] *
                                           len(gen_with_cache)),
             mapping=mapping,
-            sparse_attention_config=sparse_config,
+            sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
         )
         cached_metadata.prepare()
 
@@ -1539,7 +1539,7 @@ def populate_gen_deepseek_v4_kv_cache(
                   f"({num_indexer_compressed} indexer)")
 
         # Step 2: Run TRT-LLM forward to populate actual KV cache
-        cached_metadata = AttentionCls.Metadata(
+        cached_metadata = AttentionCls.create_metadata(
             seq_lens=torch.tensor(gen_cached_lens, dtype=torch.int),
             request_ids=gen_with_cache,
             max_num_requests=len(gen_with_cache),
@@ -1554,7 +1554,7 @@ def populate_gen_deepseek_v4_kv_cache(
                 len(gen_with_cache)  # No prior cache
             ),
             mapping=mapping,
-            sparse_attention_config=sparse_config,
+            sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
         )
         cached_metadata.prepare()
         _ = mla_forward_impl_with_deepseek_v4_wo_linear(
@@ -2160,7 +2160,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                          device=device)
     sparse_metadata_params = sparse_config.to_sparse_metadata_params()
 
-    attn_metadata = AttentionCls.Metadata(
+    attn_metadata = AttentionCls.create_metadata(
         seq_lens=torch.tensor(batch_query_lens, dtype=torch.int),
         request_ids=batch_order,
         max_num_requests=batch_spec.batch_size,

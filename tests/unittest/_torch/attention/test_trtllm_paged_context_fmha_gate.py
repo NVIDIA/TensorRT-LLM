@@ -27,6 +27,7 @@ from unittest import mock
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -158,7 +159,7 @@ def test_no_reuse_features_no_gate():
 def _make_dispatch_inputs(num_contexts):
     """Stub metadata/forward_args pairs for exercising the real
     ``is_supported`` entry point on a blocked configuration."""
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         use_paged_context_fmha=True,
         kv_cache_manager=SimpleNamespace(head_dim=64),
         runtime_features=ALL_FEATURES,

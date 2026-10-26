@@ -31,6 +31,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...attention.backends import AttentionMetadata
+from ...attention.backends.features import RecurrentMetadata
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
@@ -127,7 +128,7 @@ def gdn_custom_op_inplace(
         a[:num_tokens],
         b[:num_tokens],
         attn_metadata,
-        attn_metadata.mamba_metadata,
+        attn_metadata.ext(RecurrentMetadata).mamba_metadata,
         spec_metadata=spec_metadata,
         output=output[:, :num_tokens, :, :],
     )

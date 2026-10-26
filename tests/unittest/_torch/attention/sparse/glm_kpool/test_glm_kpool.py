@@ -395,23 +395,24 @@ def test_cache_state_uses_prepared_metadata_without_fallback(is_cuda_graph):
         num_contexts=0,
         is_cuda_graph=is_cuda_graph,
         kv_lens_cuda=live_lengths,
-        mamba_metadata=prepared,
     )
+    recurrent = SimpleNamespace(mamba_metadata=prepared)
+    metadata.ext = lambda cls: recurrent
     state = backend._cache_state(metadata)
     assert state.block_tables.data_ptr() == tables.data_ptr()
     assert state.kv_lens.data_ptr() == live_lengths.data_ptr()
     torch.testing.assert_close(state.kv_lens, live_lengths)
-    metadata.mamba_metadata.glm_block_tables = None
+    recurrent.mamba_metadata.glm_block_tables = None
     with patch("torch.zeros", side_effect=AssertionError("must not allocate fallback tables")):
         with pytest.raises(RuntimeError, match="requires prepared glm_block_tables"):
             backend._cache_state(metadata)
-    metadata.mamba_metadata.glm_block_tables = tables
+    recurrent.mamba_metadata.glm_block_tables = tables
     metadata.kv_lens_cuda = None
     with pytest.raises(ValueError, match="kv_lens_cuda"):
         backend._cache_state(metadata)
     metadata.kv_lens_cuda = live_lengths
     for invalid in (None, False, SimpleNamespace(glm_block_tables=tables)):
-        metadata.mamba_metadata = invalid
+        recurrent.mamba_metadata = invalid
         with pytest.raises(AssertionError, match="Glm5NextMamba2Metadata"):
             backend._cache_state(metadata)
 

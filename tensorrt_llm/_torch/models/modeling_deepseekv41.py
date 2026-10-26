@@ -38,9 +38,10 @@ from ..attention.backends.sparse.csa2.decoder_replay import (
     plan_decoder_replay,
     scatter_replayed_rows,
 )
-from ..attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from ..attention.backends.sparse.csa2.metadata import CSA2Metadata
 from ..attention.backends.sparse.csa2.module import DeepseekV41Attention as CSA2Attention
 from ..attention.backends.sparse.csa2.params import CSA2Mode
+from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..configs.deepseek_v41 import (
     DeepseekV41QuantLayout,
     assert_weight_layout,
@@ -622,7 +623,9 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         if capture_this_layer and spec_metadata.spec_dec_mode.is_dspark():
             # Capture the post-Engram entry state, not V4's post-MoE state.
             # DSpark averages the mult axis of the flat [N, mult * hidden] stream.
-            capture_rows = getattr(attn_metadata, "csa2_replay_query_rows", None)
+            capture_rows = getattr(
+                attn_metadata.find_ext(CSA2Metadata), "csa2_replay_query_rows", None
+            )
             capture_input = residual.reshape(residual.shape[0], -1)
             if capture_rows is None:
                 spec_metadata.maybe_capture_hidden_states(self.layer_idx, capture_input, None)
@@ -778,7 +781,7 @@ class DeepseekV41Model(DeepseekV4Model):
     def forward(self, attn_metadata, *args, **kwargs):
         from ..pyexecutor.ced_replay import uses_private_decoder_cache
 
-        attn_metadata.begin_model_forward()
+        attn_metadata.begin_forward()
         spec_metadata = kwargs.get("spec_metadata")
         if isinstance(spec_metadata, DSparkSpecMetadata):
             spec_metadata.context_capture_lens = None
@@ -802,7 +805,9 @@ class DeepseekV41Model(DeepseekV4Model):
             requests = None
         output = super().forward(attn_metadata, *args, **kwargs)
         if isinstance(spec_metadata, DSparkSpecMetadata):
-            spec_metadata.context_capture_lens = attn_metadata.csa2_decoder_capture_lens
+            spec_metadata.context_capture_lens = attn_metadata.ext(
+                CSA2Metadata
+            ).csa2_decoder_capture_lens
         if requests and self.encoder_replay_enabled:
             from ..attention.backends.sparse.csa2.ced import complete_encoder_replay
 
@@ -813,7 +818,7 @@ class DeepseekV41Model(DeepseekV4Model):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None,
-        attn_metadata: CSA2TrtllmMetadata,
+        attn_metadata: TrtllmAttentionMetadata,
         *,
         token_mask: torch.Tensor | None = None,
         padded_num_tokens: int | None = None,
@@ -846,7 +851,7 @@ class DeepseekV41Model(DeepseekV4Model):
         layer_id: int,
         hash_indices: torch.Tensor,
         dtype: torch.dtype,
-        attn_metadata: CSA2TrtllmMetadata,
+        attn_metadata: TrtllmAttentionMetadata,
     ) -> torch.Tensor | _AttentionDPEngramEmbeddings:
         return self.layers[layer_id].engram.precompute(
             hash_indices, dtype=dtype, all_rank_num_tokens=attn_metadata.all_rank_num_tokens
@@ -986,7 +991,7 @@ class DeepseekV41Model(DeepseekV4Model):
 
     def prepare_adp_inputs(
         self,
-        attn_metadata: CSA2TrtllmMetadata,
+        attn_metadata: TrtllmAttentionMetadata,
         *,
         all_token_states_required: bool,
         requests: list["LlmRequest"] | None = None,
@@ -996,13 +1001,13 @@ class DeepseekV41Model(DeepseekV4Model):
         Direct ADP callers use this before the normal input count exchange too;
         full-state requirements must not change after counts are exchanged.
         """
-        attn_metadata.decoder_replay_plan = self._make_bounded_replay_plan(
+        attn_metadata.ext(CSA2Metadata).decoder_replay_plan = self._make_bounded_replay_plan(
             attn_metadata, all_token_states_required, requests
         )
 
     def _plan_bounded_replay(
         self,
-        attn_metadata: CSA2TrtllmMetadata,
+        attn_metadata: TrtllmAttentionMetadata,
         all_token_states_required: bool,
         requests: list["LlmRequest"] | None = None,
     ) -> tuple[int | None, DecoderReplayPlan | None]:
@@ -1014,7 +1019,7 @@ class DeepseekV41Model(DeepseekV4Model):
             # Captured forwards retain the full, padded input on every rank.
             if attn_metadata.is_cuda_graph or get_per_request_prefill_cuda_graph_flag():
                 return None, None
-            plan = getattr(attn_metadata, "decoder_replay_plan", None)
+            plan = attn_metadata.ext(CSA2Metadata).decoder_replay_plan
             if plan is not None:
                 if plan.replay_all_rank_num_tokens is None:
                     raise ValueError("Exchange ADP token counts after prepare_adp_inputs().")
@@ -1050,7 +1055,7 @@ class DeepseekV41Model(DeepseekV4Model):
 
     def _make_bounded_replay_plan(
         self,
-        attn_metadata: CSA2TrtllmMetadata,
+        attn_metadata: TrtllmAttentionMetadata,
         all_token_states_required: bool,
         requests: list["LlmRequest"] | None = None,
     ) -> DecoderReplayPlan | None:
@@ -1133,7 +1138,7 @@ class DeepseekV41Model(DeepseekV4Model):
     def _enter_bounded_replay(
         self,
         plan: DecoderReplayPlan,
-        attn_metadata: CSA2TrtllmMetadata,
+        attn_metadata: TrtllmAttentionMetadata,
         position_ids: torch.Tensor | None,
         input_ids: torch.Tensor | None,
         hc_state: HCState,
@@ -1154,7 +1159,7 @@ class DeepseekV41Model(DeepseekV4Model):
             if uses_private_decoder_cache(self, attn_metadata.kv_cache_manager)
             else None,
         )
-        attn_metadata.csa2_replay_query_rows = plan.rows
+        attn_metadata.ext(CSA2Metadata).csa2_replay_query_rows = plan.rows
         return (
             gather_replayed_rows(position_ids, plan),
             gather_replayed_rows(input_ids, plan),
@@ -1168,10 +1173,11 @@ class DeepseekV41Model(DeepseekV4Model):
         """Restore the output layout and metadata after successful Decoder execution."""
         hidden_states = scatter_replayed_rows(hidden_states, plan)
         exit_decoder_replay(attn_metadata, plan)
-        attn_metadata.csa2_decoder_capture_lens = tuple(
+        csa2 = attn_metadata.ext(CSA2Metadata)
+        csa2.csa2_decoder_capture_lens = tuple(
             plan.replay_seq_lens[: attn_metadata.num_contexts].tolist()
         )
-        attn_metadata.csa2_precomputed_kv_layers.clear()
+        csa2.csa2_precomputed_kv_layers.clear()
         return hidden_states
 
     def _resolve_hc_state(self, hc_state: HCState) -> HCState:
@@ -2265,7 +2271,7 @@ class _ContextOnlyLogitsProcessor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         lm_head: nn.Module,
-        attn_metadata: CSA2TrtllmMetadata,
+        attn_metadata: TrtllmAttentionMetadata,
         return_context_logits: bool = False,
     ) -> torch.Tensor:
         if return_context_logits:

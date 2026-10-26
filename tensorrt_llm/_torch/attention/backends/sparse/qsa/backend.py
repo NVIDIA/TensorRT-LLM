@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """TRT-LLM backend wrapper for QSA sparse metadata."""
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
-from .metadata import QSAAttentionMetadata
+from .metadata import QSAMetadata
 
 
 class QSATrtllmAttention(TrtllmAttention):
@@ -14,7 +14,8 @@ class QSATrtllmAttention(TrtllmAttention):
     this class only installs metadata required by both paths.
     """
 
-    Metadata = QSAAttentionMetadata
+    Metadata = TrtllmAttentionMetadata
+    metadata_extensions = (QSAMetadata,)
 
 
 __all__ = ["QSATrtllmAttention"]

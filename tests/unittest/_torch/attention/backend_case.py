@@ -510,7 +510,7 @@ def _run_mla_gen_backend(
         return out[0] if isinstance(out, tuple) else out
 
     def _create_metadata(AttentionCls, case, mgr):
-        return AttentionCls.Metadata(
+        return AttentionCls.create_metadata(
             num_contexts=0,
             kv_cache_params=KVCacheParams(
                 use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
@@ -699,7 +699,7 @@ def _run_mla_context_backend(
     )
     expected_latents = _split_packed_tokens(expected_latent_cache, case.seq_lens)
     cache_atol, cache_rtol = _tolerances(case, kv_dtype) if fuse_rope else (0.0, 0.0)
-    metadata = AttentionCls.Metadata(
+    metadata = AttentionCls.create_metadata(
         num_contexts=case.num_contexts,
         kv_cache_params=KVCacheParams(
             use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
@@ -936,7 +936,7 @@ def run_backend(
 
     mgr = None
     if case.cache == "none":
-        metadata = AttentionCls.Metadata(
+        metadata = AttentionCls.create_metadata(
             max_num_requests=case.num_seqs,
             max_num_tokens=case.max_num_tokens,
             kv_cache_manager=None,
@@ -958,7 +958,7 @@ def run_backend(
 
         def create_metadata(AttentionCls, case, mgr, *, num_contexts: int = 0):
             seq_lens_kv = torch.tensor(case.seq_lens_kv, dtype=torch.int) if case.is_cross else None
-            return AttentionCls.Metadata(
+            return AttentionCls.create_metadata(
                 num_contexts=num_contexts,
                 kv_cache_params=KVCacheParams(
                     use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens

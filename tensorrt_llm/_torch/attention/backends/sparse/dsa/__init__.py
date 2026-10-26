@@ -24,7 +24,7 @@ from .indexer import (
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
-from .metadata import DSAtrtllmAttentionMetadata, build_req_idx_per_token
+from .metadata import DSAMetadata, build_req_idx_per_token
 from .params import DSABackendForwardArgs, DSAMetadataParams, DSAParams
 
 __all__ = [
@@ -32,10 +32,10 @@ __all__ = [
     "DSABackendForwardArgs",
     "DSACacheManager",
     "DSACacheManagerV2",
+    "DSAMetadata",
     "DSAMetadataParams",
     "DSAParams",
     "DSATrtllmAttention",
-    "DSAtrtllmAttentionMetadata",
     "Indexer",
     "IndexerParams",
     "IndexerPrefillChunkMetadata",

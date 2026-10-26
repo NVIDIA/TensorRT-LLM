@@ -60,8 +60,10 @@ from .backends import (
     TrtllmAttention,
     TrtllmAttentionMetadata,
 )
+from .backends.features import HelixMetadata
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
 from .backends.sparse.hooks import get_sparse_mla_hooks
+from .backends.sparse.params import SparseAlgorithmExtension
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
 
@@ -843,10 +845,9 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
-            # helix_kv_bounds is non-None only on TrtllmAttentionMetadata,
-            # where _helix_spec_tokens_valid is a declared field.
-            if helix_kv_bounds is not None and attn_metadata._helix_spec_tokens_valid:
+            helix = attn_metadata.find_ext(HelixMetadata)
+            helix_kv_bounds = helix.kv_bounds if helix is not None else None
+            if helix_kv_bounds is not None and helix.spec_tokens_valid:
                 # Speculative verify groups: KV ownership is per-TOKEN. A rank
                 # owning only the tail page of a group has zero visible KV for
                 # the group's leading tokens while its per-sequence kv_len is
@@ -1621,7 +1622,7 @@ class MLA(nn.Module):
         # allocation rather than scaling these temporary buffers by K.
         cu_seqlens_rows = (
             max(num_seqs, num_tokens) + 1
-            if getattr(attn_metadata, "is_ragged_verify", False)
+            if getattr(attn_metadata.find_ext(SparseAlgorithmExtension), "is_ragged_verify", False)
             else num_seqs + 1
         )
         cu_q_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)

@@ -20,6 +20,7 @@ import torch
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features import HelixMetadata
 from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -81,17 +82,12 @@ def split_inputs_for_rank(input_ctx, position_ids_ctx, scenario, rank, world_siz
 
 def activate_all_ranks_for_context(attn_metadata, position_ids):
     """Override helix metadata so all ranks participate in the context step."""
-    attn_metadata.helix_position_offsets = position_ids
-    if (
-        hasattr(attn_metadata, "helix_is_inactive_rank")
-        and attn_metadata.helix_is_inactive_rank is not None
-    ):
-        attn_metadata.helix_is_inactive_rank.fill_(False)
-    if (
-        hasattr(attn_metadata, "helix_is_inactive_rank_cpu")
-        and attn_metadata.helix_is_inactive_rank_cpu is not None
-    ):
-        attn_metadata.helix_is_inactive_rank_cpu.fill_(False)
+    helix = attn_metadata.add_ext(HelixMetadata)
+    helix.position_offsets = position_ids
+    if helix.is_inactive_rank is not None:
+        helix.is_inactive_rank.fill_(False)
+    if helix.is_inactive_rank_cpu is not None:
+        helix.is_inactive_rank_cpu.fill_(False)
 
 
 def create_helix_gen_metadata(
@@ -125,19 +121,11 @@ def create_helix_gen_metadata(
         ),
         **kwargs,
     )
-    attn_metadata.enable_helix = True
-    attn_metadata.helix_is_inactive_rank = torch.tensor(
-        helix_is_inactive_rank, dtype=torch.bool, device="cuda"
-    )
-    attn_metadata.helix_is_inactive_rank_cpu = attn_metadata.helix_is_inactive_rank.to(
-        device="cpu"
-    ).pin_memory()
-    attn_metadata.helix_position_offsets = torch.tensor(
-        position_ids_gen, dtype=torch.int, device="cuda"
-    )
-    attn_metadata.helix_position_offsets_cpu = attn_metadata.helix_position_offsets.to(
-        device="cpu"
-    ).pin_memory()
+    helix = attn_metadata.add_ext(HelixMetadata)
+    helix.is_inactive_rank = torch.tensor(helix_is_inactive_rank, dtype=torch.bool, device="cuda")
+    helix.is_inactive_rank_cpu = helix.is_inactive_rank.to(device="cpu").pin_memory()
+    helix.position_offsets = torch.tensor(position_ids_gen, dtype=torch.int, device="cuda")
+    helix.position_offsets_cpu = helix.position_offsets.to(device="cpu").pin_memory()
     attn_metadata.prepare()
     return attn_metadata
 

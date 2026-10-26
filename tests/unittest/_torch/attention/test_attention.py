@@ -237,7 +237,7 @@ def produce_outputs(
                                              use_kv_cache_manager_v2)
     try:
 
-        metadata = Attention.Metadata(
+        metadata = Attention.create_metadata(
             num_contexts=num_contexts
             if num_contexts is not None else s.batch_size,
             kv_cache_params=kv_cache_params,

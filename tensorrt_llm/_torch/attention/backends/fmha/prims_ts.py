@@ -38,6 +38,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.mode import QuantMode
 
+from ..features import HelixMetadata
+from ..features.spec_decoding import SpecDecodingMetadata
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 from .utils import get_kv_page_offset, get_multi_processor_count_for_device
@@ -107,13 +109,14 @@ def get_paged_kv_policy_unsupported_reason(
     metadata: "TrtllmAttentionMetadata",
 ) -> Optional[str]:
     """Return why the request's decoding policy is outside the fixed page-table envelope."""
+    spec = metadata.find_ext(SpecDecodingMetadata)
     if metadata.beam_width != 1:
         return "beam search is not supported."
     if (
-        metadata.is_spec_decoding_enabled
-        or metadata.use_spec_decoding
-        or metadata.is_spec_dec_tree
-        or metadata.is_spec_dec_dynamic_tree
+        spec.is_spec_decoding_enabled
+        or spec.use_spec_decoding
+        or spec.is_spec_dec_tree
+        or spec.is_spec_dec_dynamic_tree
     ):
         return "speculative decoding is not supported by the initial adapter."
     position_embedding_type = int(attn.position_embedding_type)
@@ -139,7 +142,8 @@ def get_attention_feature_unsupported_reason(
     forward_args: "AttentionForwardArgs",
 ) -> Optional[str]:
     """Return which optional attention feature the fused-kernel adapters do not implement."""
-    if metadata.helix_position_offsets is not None:
+    helix = metadata.find_ext(HelixMetadata)
+    if helix is not None and helix.position_offsets is not None:
         return "Helix parallelism is not supported."
     if forward_args.relative_attention_bias is not None:
         return "relative attention bias is not supported."

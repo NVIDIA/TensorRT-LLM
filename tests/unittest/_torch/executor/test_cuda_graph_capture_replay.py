@@ -35,6 +35,7 @@ import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 
+from tensorrt_llm._torch.attention.backends.features import DraftKVMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cuda_graph_runner_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
@@ -426,11 +427,12 @@ class _DraftReplayMetadataStub(TrtllmAttentionMetadata):
         self.kv_cache_manager = object()
         self.kv_cache_block_offsets = torch.full((1,), value, device="cuda", dtype=torch.int32)
         self.host_kv_cache_block_offsets = torch.zeros(1, dtype=torch.int32)
-        self.draft_kv_cache_block_offsets = torch.full(
+        draft_kv = DraftKVMetadata(self)
+        draft_kv.kv_cache_block_offsets = torch.full(
             (1,), value + 1000, device="cuda", dtype=torch.int32
         )
+        self.replace_ext(draft_kv)
         self.some_alias = self.kv_cache_block_offsets
-        self.enable_flash_mla = False
 
     def prepare_for_draft_forward(self):
         # Mirrors DSA's _fullkv aliases, rebound as a side effect of the swap.
@@ -614,7 +616,10 @@ class TestStrictBufferCheck:
         saved = prepare_attn_metadata_for_draft_replay(attn_metadata, draft_mgr)
         assert attn_metadata.draft_replay_swapped_attrs["kv_cache_block_offsets"] is target_buf
         assert attn_metadata.draft_replay_swapped_attrs["some_alias"] is target_buf
-        assert attn_metadata.kv_cache_block_offsets is attn_metadata.draft_kv_cache_block_offsets
+        assert (
+            attn_metadata.kv_cache_block_offsets
+            is attn_metadata.ext(DraftKVMetadata).kv_cache_block_offsets
+        )
 
         # A repeated swap keeps the first recorded original.
         attn_metadata.swap_for_draft("kv_cache_block_offsets", torch.zeros(1, device="cuda"))

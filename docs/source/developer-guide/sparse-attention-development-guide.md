@@ -146,7 +146,7 @@ Dynamic generation-phase KV eviction is tracked as future work.
 | Public config / lowering | `CSA2SparseAttentionConfig(algorithm="csa2")` → `CSA2Params`, `CSA2MetadataParams`; checkpoint-owned `CSA2Layout` |
 | Registry | TRTLLM sparse backend → `CSA2TrtllmAttention`; cache manager → `CSA2CacheManager` (V2) |
 | Module | Typed MLA adapter in `sparse/csa2/module.py`; compression, shared KV/index source routing and per-phase prediction |
-| Metadata | `CSA2TrtllmMetadata`; SWA slots/visibility, owner page tables, compressor inputs, graph-stable index descriptors and query tiles |
+| Metadata | `CSA2Metadata` extension; SWA slots/visibility, owner page tables, compressor inputs, graph-stable index descriptors and query tiles |
 | Compute | SM100-family trtllm-gen; SM90 FlashMLA BF16 and SM120/121 FlashInfer BF16 helpers |
 
 CSA2 GLOBAL pages couple 288-byte main and 68-byte index records under one

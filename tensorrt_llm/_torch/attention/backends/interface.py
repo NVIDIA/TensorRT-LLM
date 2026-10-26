@@ -8,16 +8,16 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+                    Protocol, Sequence, Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
     from ...model_config import ModelConfig
-    from ...modules.mamba.mamba2_metadata import Mamba2Metadata
     from ...pyexecutor.kv_cache.mixed_precision_staging import \
         MixedPrecisionKVStaging
+    from ...pyexecutor.llm_request import LlmRequest
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from ..kernels.sage_quant import SageQuantized
@@ -29,6 +29,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...host_staging import copy_host_to_device
 from ...memory_buffer_utils import Buffers, get_memory_buffers
 from ...metadata import KVCacheParams
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -36,8 +37,12 @@ from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
+from .extensions import ExtensionRegistry, MetadataExtension
 from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
                             SparseRuntimeParams)
+
+ExtensionT = TypeVar("ExtensionT", bound=MetadataExtension)
+_NO_EXTENSIONS = ExtensionRegistry()
 
 try:
     # Transformers v5
@@ -91,7 +96,6 @@ class AttentionMetadata:
     # HND: [max_num_pages, 2, num_kv_heads, page_size, head_dim]
     kv_layout: Literal["NHD", "HND"] = "HND"
 
-    enable_flash_mla: bool = False
     enable_context_mla_with_cached_kv: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
@@ -170,11 +174,24 @@ class AttentionMetadata:
     all_rank_num_tokens: Optional[List[int]] = None
 
     def get_adp_token_counts(self) -> List[int]:
-        """Local execution-stage counts carried by the input count exchange."""
-        return [self.num_tokens]
+        """Local execution-stage counts carried by the input count exchange.
+
+        The first stage is the input; each extension may append its own.
+        """
+        counts = [self.num_tokens]
+        for extension in self._attached_extensions():
+            counts.extend(extension.adp_token_counts() or ())
+        return counts
 
     def set_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
         """Save stage counts and return the input-stage counts for padding."""
+        stage = 1
+        for extension in self._attached_extensions():
+            num_stages = len(extension.adp_token_counts() or ())
+            if num_stages:
+                extension.set_adp_token_counts(counts[stage:stage + num_stages],
+                                               counts[0])
+                stage += num_stages
         return counts[0]
 
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
@@ -183,10 +200,6 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
-
-    mamba_metadata: Optional[Any] = None
-    mamba_chunk_size: int = 128
-    mamba_metadata_cls: Optional[Type["Mamba2Metadata"]] = None
 
     # The number of tokens in the padded sequence.
     padded_num_tokens: Optional[int] = None
@@ -213,18 +226,150 @@ class AttentionMetadata:
     mixed_precision_staging: Optional["MixedPrecisionKVStaging"] = field(
         init=False, default=None, repr=False, compare=False)
 
+    # Feature, sparse-algorithm and model state attached to this metadata; see
+    # extensions.py. The types are attached, with their requirements, when the
+    # metadata is created.
+    extension_types: Sequence[Type[MetadataExtension]] = ()
+    _extensions: ExtensionRegistry = field(init=False,
+                                           default_factory=ExtensionRegistry,
+                                           repr=False,
+                                           compare=False)
+    # Pinned staging rings for stage_to_device, shared with metadata copies.
+    _host_staging: Dict[Any, Any] = field(init=False,
+                                          default_factory=dict,
+                                          repr=False,
+                                          compare=False)
+
     def __post_init__(self) -> None:
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
             self.cross = self
-            return
+        else:
+            assert self.cross is None or type(self) is type(
+                self.cross
+            ), "Top level and cross attention sub metadata type mismatched"
+        self._post_init_core()
+        self._attach_extensions()
 
-        assert self.cross is None or type(self) is type(
-            self.cross
-        ), "Top level and cross attention sub metadata type mismatched"
+    def _post_init_core(self) -> None:
+        """Allocate the core's buffers; runs again on every metadata copy."""
+
+    def _default_extension_types(self) -> list:
+        """Extensions this core family attaches from its own configuration."""
+        if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
+            from .features.recurrent import RecurrentMetadata
+            return [RecurrentMetadata]
+        return []
+
+    def _attach_extensions(self) -> None:
+        # A copy made by copy.copy shares its source's registry; give it its own
+        # extensions before anything allocates into them.
+        self._extensions = self._attached_extensions().bound_to(self)
+        self._extensions.attach(
+            self, [*self._default_extension_types(), *self.extension_types])
+        for extension in self._attached_extensions():
+            extension.allocate(self.cuda_graph_buffers)
+
+    def _attached_extensions(self) -> ExtensionRegistry:
+        # Metadata built without __init__ (as some tests do) has no registry.
+        return self.__dict__.get("_extensions", _NO_EXTENSIONS)
+
+    def ext(self, cls: Type[ExtensionT]) -> ExtensionT:
+        """The attached extension of type ``cls``; raises when none is."""
+        found = self._attached_extensions().find(cls)
+        if found is None:
+            raise LookupError(
+                f"{type(self).__name__} has no {cls.__name__} extension attached."
+            )
+        return found
+
+    def find_ext(self, cls: Type[ExtensionT]) -> Optional[ExtensionT]:
+        """The attached extension of type ``cls``, or None."""
+        return self._attached_extensions().find(cls)
+
+    def add_ext(self, cls: Type[ExtensionT]) -> ExtensionT:
+        """Attach ``cls`` and its requirements if absent; return the extension."""
+        self._extensions = self._attached_extensions().bound_to(self)
+        for extension in self._extensions.attach(self, (cls, )):
+            extension.allocate(self.cuda_graph_buffers)
+        return self.ext(cls)
+
+    def replace_ext(self, extension: MetadataExtension) -> None:
+        """Attach a built extension in place of any of its type.
+
+        For derived views made by ``copy.copy``: binds this metadata to its own
+        registry first, so the source keeps its extensions.
+        """
+        assert extension.metadata is self, "the extension must be built for this metadata"
+        self._extensions = self._attached_extensions().bound_to(self)
+        self._extensions.replace(extension)
+
+    def remove_ext(self, cls: Type[MetadataExtension]) -> None:
+        """Detach the extension of type ``cls`` from a derived view.
+
+        Like ``replace_ext``, binds this metadata to its own registry first.
+        """
+        self._extensions = self._attached_extensions().bound_to(self)
+        self._extensions.remove(cls)
+
+    @property
+    def extensions(self) -> List[MetadataExtension]:
+        """The attached extensions in dependency order."""
+        return list(self._attached_extensions())
+
+    def get_buffer(self, shape: Sequence[int], dtype: torch.dtype,
+                   name: str) -> torch.Tensor:
+        """A persistent buffer from this metadata's pool, graph-stable under capture."""
+        return self.get_empty(self.cuda_graph_buffers,
+                              list(shape),
+                              dtype=dtype,
+                              cache_name=name,
+                              capture_graph=self.is_cuda_graph)
+
+    def stage_to_device(self, key: Any, destination: torch.Tensor,
+                        value: torch.Tensor) -> None:
+        """Copy a host tensor into ``destination`` through pinned staging."""
+        copy_host_to_device(self._host_staging, key, destination, value)
+
+    def begin_forward(self) -> None:
+        """Hook to be called before the model forward of each step."""
+        for extension in self._attached_extensions():
+            extension.begin_forward()
+
+    def bind_context_requests(self, requests: List["LlmRequest"], *,
+                              prefill_cuda_graphs: bool) -> None:
+        """Hand the scheduled context requests to the extensions before ``prepare()``."""
+        for extension in self._attached_extensions():
+            extension.bind_context_requests(
+                requests, prefill_cuda_graphs=prefill_cuda_graphs)
+
+    def defer_decode_outputs(
+            self) -> Optional[contextlib.AbstractContextManager[None]]:
+        """A scope for preparing a decode CUDA graph's metadata, or None.
+
+        None when no extension can leave outputs to the graph's own
+        preprocessing; otherwise the extensions' scopes entered together.
+        """
+        scopes = [
+            scope for scope in (extension.defer_decode_outputs()
+                                for extension in self._attached_extensions())
+            if scope is not None
+        ]
+        if not scopes:
+            return None
+
+        @contextlib.contextmanager
+        def deferring():
+            with contextlib.ExitStack() as stack:
+                for scope in scopes:
+                    stack.enter_context(scope)
+                yield
+
+        return deferring()
 
     def on_update_kv_lens(self):
-        pass
+        for extension in self._attached_extensions():
+            extension.on_kv_lens_changed(False)
 
     def on_update(self):
         if (self._seq_lens is not None
@@ -351,7 +496,50 @@ class AttentionMetadata:
         """
         Hook to be called before the forward step of the model.
         """
-        self._prepare_mamba_metadata()
+        with contextlib.ExitStack() as scope:
+            for extension in self._attached_extensions():
+                scope.enter_context(extension.prepare_scope())
+            for extension in self._attached_extensions():
+                extension.pre_derive_lengths()
+            self._prepare_core()
+            for extension in self._attached_extensions():
+                extension.prepare()
+            for extension in self._attached_extensions():
+                extension.post_derive()
+
+    def _prepare_core(self) -> None:
+        """Derive the core's per-step state; ``prepare`` runs the extensions around it."""
+
+    def _override_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
+        """Let the extensions rewrite freshly derived host KV lengths."""
+        if len(self._attached_extensions()) == 0:
+            return kv_lens
+        if kv_lens is self._seq_lens or kv_lens is self._seq_lens_kv:
+            kv_lens = kv_lens.clone()
+        for extension in self._attached_extensions():
+            extension.override_kv_lens(kv_lens)
+        return kv_lens
+
+    def _needs_full_block_table_width(self) -> bool:
+        return any(extension.needs_full_block_table_width()
+                   for extension in self._attached_extensions())
+
+    def prepare_for_draft_forward(self) -> dict | None:
+        """Point the extensions at the draft model's state before a draft forward."""
+        saved = {}
+        for extension in self._attached_extensions():
+            state = extension.draft_swap()
+            if state is not None:
+                saved[type(extension)] = state
+        return saved or None
+
+    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
+        """Undo prepare_for_draft_forward."""
+        if not saved_state:
+            return
+        for extension in self._attached_extensions():
+            if type(extension) in saved_state:
+                extension.draft_restore(saved_state[type(extension)])
 
     def _has_mixed_precision_kv(self) -> bool:
         """Whether the KV cache manager holds mixed-precision layers."""
@@ -442,26 +630,6 @@ class AttentionMetadata:
         """
         self.prepare()
 
-    def _prepare_mamba_metadata(self):
-        if self.mamba_metadata is False:
-            return
-
-        if self.mamba_metadata is None:
-            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                metadata_cls = self.mamba_metadata_cls
-                if metadata_cls is None:
-                    from ...modules.mamba.mamba2_metadata import Mamba2Metadata
-                    metadata_cls = Mamba2Metadata
-                self.mamba_metadata = metadata_cls(
-                    self.max_num_requests,
-                    self.mamba_chunk_size,
-                    max_num_tokens=self.max_num_tokens)
-            else:
-                self.mamba_metadata = False
-                return
-
-        self.mamba_metadata.prepare(self)
-
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
@@ -502,17 +670,6 @@ class AttentionMetadata:
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
-        if self.enable_flash_mla:
-            if self.kv_cache_manager is not None:
-                cuda_graph_metadata.block_ids_per_seq = torch.zeros(
-                    [
-                        self.kv_cache_manager.max_batch_size,
-                        self.kv_cache_manager.max_blocks_per_seq
-                    ],
-                    dtype=torch.int32,
-                    device='cuda',
-                )
-
         if not encode_only:
             # Decoder CUDA graphs are always generation-only (no context
             # requests). Encoder CUDA graphs are the opposite (all context);
@@ -537,6 +694,8 @@ class AttentionMetadata:
         for f, v in self._saved_tensors.items():
             setattr(self, f, v)
         self._saved_tensors.clear()
+        for extension in self._attached_extensions():
+            extension.on_spec_dec_restored()
 
     @property
     def has_spec_dec_saved_state(self) -> bool:
@@ -562,16 +721,9 @@ class AttentionMetadata:
         Backends that consume gen-only slots (e.g. dynamic tree) must skip
         these rows to align with the XQA kernel's expected row layout.
         """
-
-    def update_helix_param(
-        self,
-        helix_position_offsets: List[int],
-        helix_is_inactive_rank: List[bool],
-        helix_owned_new_tokens: Optional[List[int]] = None,
-    ) -> None:
-        """
-        Hook to be called when using helix parallelism.
-        """
+        for extension in self._attached_extensions():
+            extension.on_spec_dec_param(max_draft_len, max_total_draft_tokens,
+                                        spec_tree_manager)
 
     def create_cross_metadata(
         self,
@@ -703,6 +855,8 @@ class AttentionMetadata:
         """
         Hook to be called during forward when using spec-dec one-model mode.
         """
+        for extension in self._attached_extensions():
+            extension.on_kv_lens_changed(True)
 
     @staticmethod
     def get_empty(buffers: Buffers,
@@ -1135,6 +1289,16 @@ class AttentionBackend(Generic[TMetadata]):
     Base class for attention backends.
     """
     Metadata: Type[TMetadata] = AttentionMetadata
+    # Extensions every metadata of this backend carries, e.g. a sparse
+    # algorithm's state; see extensions.py.
+    metadata_extensions: Tuple[Type[MetadataExtension], ...] = ()
+
+    @classmethod
+    def create_metadata(cls, **kwargs) -> TMetadata:
+        """Build this backend's metadata with its extensions attached."""
+        extension_types = (*cls.metadata_extensions,
+                           *kwargs.pop("extension_types", ()))
+        return cls.Metadata(extension_types=extension_types, **kwargs)
 
     def __init__(
         self,

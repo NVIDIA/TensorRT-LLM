@@ -16,7 +16,7 @@
 from .backend import DeepseekV4TrtllmAttention
 from .cache_manager import DeepseekV4CacheManager
 from .indexer import DeepseekV4Indexer
-from .metadata import DeepseekV4TrtllmAttentionMetadata
+from .metadata import DeepseekV4Metadata
 from .params import DeepseekV4AttentionType, DeepSeekV4MetadataParams, DeepSeekV4Params
 
 __all__ = [
@@ -26,5 +26,5 @@ __all__ = [
     "DeepseekV4CacheManager",
     "DeepseekV4Indexer",
     "DeepseekV4TrtllmAttention",
-    "DeepseekV4TrtllmAttentionMetadata",
+    "DeepseekV4Metadata",
 ]

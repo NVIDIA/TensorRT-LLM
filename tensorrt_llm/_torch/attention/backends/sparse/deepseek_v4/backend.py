@@ -27,7 +27,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PositionalEmbeddingParams,
     merge_attention_forward_args,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
@@ -37,7 +37,7 @@ from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
 from .kernels import deepseek_v4_local_to_global_indices
-from .metadata import DeepseekV4TrtllmAttentionMetadata
+from .metadata import DeepseekV4Metadata
 from .params import DeepseekV4AttentionType, DeepSeekV4Params
 
 if TYPE_CHECKING:
@@ -70,7 +70,8 @@ def _alloc_nvfp4_compress_fp8_scratch(
 
 
 class DeepseekV4TrtllmAttention(TrtllmAttention):
-    Metadata = DeepseekV4TrtllmAttentionMetadata
+    Metadata = TrtllmAttentionMetadata
+    metadata_extensions = (DeepseekV4Metadata,)
 
     @property
     def uses_fp4_mla_attention(self) -> bool:
@@ -203,9 +204,10 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
     def _prepare_sparse_forward_args(
         self,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> None:
+        dsv4 = metadata.ext(DeepseekV4Metadata)
         attention_input_type = forward_args.attention_input_type
         if attention_input_type == AttentionInputType.context_only:
             start_idx = 0
@@ -218,17 +220,17 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             end_idx = metadata.num_tokens
 
         sparse_args = forward_args.sparse_runtime_params
-        sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
+        sparse_args.sparse_attn_kv_lens = dsv4.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]
         if self.compress_ratio > 1:
-            sparse_args.aux_kv_cache_pool_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
+            sparse_args.aux_kv_cache_pool_ptr = dsv4.sparse_mla_base_ptrs[self.compress_ratio]
         else:
             sparse_args.aux_kv_cache_pool_ptr = None
 
         metadata.num_sparse_topk = (
             self.sparse_attention_config.window_size
-            + metadata.max_compressed_indices[self.compress_ratio]
+            + dsv4.max_compressed_indices[self.compress_ratio]
         )
 
     def forward(
@@ -236,7 +238,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         forward_args: Optional[AttentionForwardArgs] = None,
         **kwargs,
     ):
@@ -261,18 +263,19 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Convert local indices (SWA + compressed) to global pool indices."""
+        dsv4 = metadata.ext(DeepseekV4Metadata)
         layer_idx = self.layer_idx
         kv_cache_manager = metadata.kv_cache_manager
         attention_input_type = forward_args.attention_input_type
 
-        swa_pool_base_ptr = metadata.sparse_mla_base_ptrs[1]
+        swa_pool_base_ptr = dsv4.sparse_mla_base_ptrs[1]
 
         # Get cached buffer pointers
-        swa_buffer_ptr = metadata.swa_buffer_ptrs[layer_idx]
+        swa_buffer_ptr = dsv4.swa_buffer_ptrs[layer_idx]
 
         # Token stride
         index_head_dim = self.sparse_attention_config.index_head_dim
@@ -298,18 +301,18 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             end_idx = metadata.num_tokens
 
         # Use global req_id directly
-        req_id = metadata.req_idx_per_token[start_idx:end_idx]
-        swa_local_indices = metadata.swa_local_indices_cuda[start_idx:end_idx]
+        req_id = dsv4.req_idx_per_token[start_idx:end_idx]
+        swa_local_indices = dsv4.swa_local_indices_cuda[start_idx:end_idx]
         local_layer_idx = kv_cache_manager.layer_offsets[layer_idx]
-        block_table_swa = metadata.sliding_block_tables[
+        block_table_swa = dsv4.sliding_block_tables[
             local_layer_idx, DeepseekV4AttentionType.SWA.value
         ]
 
         active_request_count = None
         if self.compress_ratio > 1:
-            compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
-            compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
-            block_table_compressed = metadata.compress_block_tables[self.compress_ratio]
+            compressed_buffer_ptr = dsv4.compressed_buffer_ptrs[layer_idx]
+            compress_pool_base_ptr = dsv4.sparse_mla_base_ptrs[self.compress_ratio]
+            block_table_compressed = dsv4.compress_block_tables[self.compress_ratio]
             if self.compress_ratio == 4:
                 sparse_backend_args = forward_args.sparse_backend_args
                 assert sparse_backend_args is not None, (
@@ -324,7 +327,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     self.sparse_attention_config.enable_kv_cache_offload
                     and attention_input_type == AttentionInputType.generation_only
                 ):
-                    state = metadata.sparse_offload_state
+                    state = dsv4.sparse_offload_state
                     assert state is not None, "Sparse offload metadata must be initialized"
                     # module.forward_sparse_attn has joined both producer
                     # streams. Keep fetch before the conversion kernel's
@@ -334,14 +337,14 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         layer_idx,
                         topk_indices,
                         req_id,
-                        metadata.compressed_kv_lens_cuda[self.compress_ratio],
+                        dsv4.compressed_kv_lens_cuda[self.compress_ratio],
                         block_table_compressed,
                     )
                     # Metadata counts include CUDA graph dummy rows. The active
                     # count is refreshed in place before replay to mask them.
                     active_request_count = state.active_request_count
             else:
-                compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
+                compressed_local_indices = dsv4.compressed_local_indices_cuda[start_idx:end_idx]
         else:
             compressed_buffer_ptr = 0
             compress_pool_base_ptr = 0
@@ -401,7 +404,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compress_pool_base_ptr=compress_pool_base_ptr,
             compressed_buffer_ptr=compressed_buffer_ptr,
             compress_ratio=self.compress_ratio,
-            num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
+            num_compressed_indices=dsv4.max_compressed_indices[self.compress_ratio],
             **sched_kwargs,
             split_extra=self.use_fp8_ds_mla,
             active_request_count=active_request_count,
@@ -413,7 +416,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         global_indices = result
 
         if self._uses_nvfp4_compress and self.compress_ratio > 1:
-            num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
+            num_compressed_indices = dsv4.max_compressed_indices[self.compress_ratio]
             compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
             data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(self.compress_ratio)
             num_pool_tokens = data_pool.numel() // (
@@ -422,7 +425,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             # The previous layer has already enqueued its attention on this stream.
             # Release its Python reference before allocating the next scratch so
             # the caching allocator can reuse the storage in stream order.
-            metadata.nvfp4_compress_fp8_scratch = None
+            dsv4.nvfp4_compress_fp8_scratch = None
             if attention_input_type == AttentionInputType.generation_only:
                 num_scratch_rows = compressed_indices.numel()
                 scratch = _alloc_nvfp4_compress_fp8_scratch(
@@ -443,7 +446,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     if attention_input_type == AttentionInputType.context_only
                     else metadata.num_seqs
                 )
-                compressed_kv_lengths = metadata.compressed_kv_lens_cuda[self.compress_ratio][
+                compressed_kv_lengths = dsv4.compressed_kv_lens_cuda[self.compress_ratio][
                     :request_count
                 ].contiguous()
                 total_raw_kv_tokens = int(metadata.host_total_kv_lens[0].item())
@@ -478,7 +481,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )
-            metadata.nvfp4_compress_fp8_scratch = scratch
+            dsv4.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
 
@@ -488,7 +491,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return None, None

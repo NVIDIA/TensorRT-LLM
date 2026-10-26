@@ -6,11 +6,12 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheManager,
     CSA2CacheRole,
 )
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -58,7 +59,7 @@ def test_context_metadata_omits_decoder_swa_and_preserves_boundary_global(length
         assert manager.prepare_context(request)
         assert manager.resize_context(request, length)
         manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.create_metadata(
             max_num_requests=1, max_num_tokens=8192, kv_cache_manager=manager
         )
         metadata.request_ids = [71]
@@ -72,16 +73,16 @@ def test_context_metadata_omits_decoder_swa_and_preserves_boundary_global(length
         # live metadata, then its device-side address refresh.
         for direct in (False, True):
             if direct:
-                metadata.prepare_csa2()
+                metadata.ext(CSA2Metadata).prepare_csa2()
             metadata.on_update_kv_lens()
-            metadata._ensure_swa_slots()
-            assert set(metadata.csa2_swa_indices) == set(range(40))
-            assert set(metadata._csa2_swa_page_tables) == set(range(20))
-            assert set(metadata.csa2_global_page_tables) == {2, 8, 14, 20}
+            metadata.ext(CSA2Metadata)._ensure_swa_slots()
+            assert set(metadata.ext(CSA2Metadata).csa2_swa_indices) == set(range(40))
+            assert set(metadata.ext(CSA2Metadata)._csa2_swa_page_tables) == set(range(20))
+            assert set(metadata.ext(CSA2Metadata).csa2_global_page_tables) == {2, 8, 14, 20}
             positions = torch.arange(length, dtype=torch.int64, device="cuda")
             for layer in range(40):
-                reads = metadata.csa2_swa_indices[layer]
-                writes = metadata.csa2_swa_write_slots[layer]
+                reads = metadata.ext(CSA2Metadata).csa2_swa_indices[layer]
+                writes = metadata.ext(CSA2Metadata).csa2_swa_write_slots[layer]
                 if direct:
                     assert initial_pointers[layer] == (reads.data_ptr(), writes.data_ptr())
                 else:
@@ -100,12 +101,14 @@ def test_context_metadata_omits_decoder_swa_and_preserves_boundary_global(length
                 expected_visible = (
                     (positions + 1) // ratio if ratio else torch.zeros_like(positions)
                 )
-                torch.testing.assert_close(metadata.csa2_visible_lengths[layer], expected_visible)
-            assert torch.all(metadata.csa2_main_write_slots[20] >= 0)
+                torch.testing.assert_close(
+                    metadata.ext(CSA2Metadata).csa2_visible_lengths[layer], expected_visible
+                )
+            assert torch.all(metadata.ext(CSA2Metadata).csa2_main_write_slots[20] >= 0)
             assert manager.get_main_buffer(20).data_ptr() == manager.get_main_buffer(39).data_ptr()
         metadata.num_contexts = 0
         with pytest.raises(ValueError, match="context-only cache cannot prepare generation"):
-            metadata.prepare_csa2()
+            metadata.ext(CSA2Metadata).prepare_csa2()
     finally:
         manager.free_resources(request)
         manager.shutdown()
