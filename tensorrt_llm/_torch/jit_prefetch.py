@@ -101,6 +101,8 @@ import importlib
 import json
 import os
 import queue
+import subprocess  # nosec B404 - runs this package's helper scripts with sys.executable, no shell
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -165,7 +167,7 @@ def _helper_env(keep_pythonpath: bool = False, **extra: str) -> Dict[str, str]:
     """The environment of a CPU-only helper process: this process's, without
     the job launcher's variables, with no visible GPU and no user site, plus
     ``extra``. The JIT cache locations are made absolute, since helpers run
-    in ``/tmp``: a relative one would otherwise name another directory than
+    in the temporary directory: a relative one would otherwise name another directory than
     the one this process loads from. ``PYTHONPATH`` is dropped unless
     ``keep_pythonpath``: helpers that import no ``tensorrt_llm`` module load
     only what they are given by path."""
@@ -338,7 +340,6 @@ def start_flashinfer_build(
     except Exception as e:  # noqa: BLE001 - the build then happens in place
         logger.warning(f"[JIT prefetch] FlashInfer build not started: {type(e).__name__}: {e}")
         return False
-    import subprocess
     import sys
 
     env = _helper_env(FLASHINFER_CUDA_ARCH_LIST=archs)
@@ -354,7 +355,7 @@ def start_flashinfer_build(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             env=env,
-            cwd="/tmp",
+            cwd=tempfile.gettempdir(),
             text=True,
             start_new_session=True,
         )
@@ -382,8 +383,6 @@ def wait_flashinfer_build(
     was none to join. Called where warmup needs the modules: a failed or
     timed-out build only means the module is built in place. ``timeout_s``
     bounds the whole join."""
-    import subprocess
-
     joining = [b for b in _fi_builds if modules is None or set(b[0]) & set(modules)]
     if not joining:
         return None
@@ -472,7 +471,6 @@ def _stop_flashinfer_helper(proc) -> None:
     left running would write into the directory the in-place build uses.
     """
     import signal
-    import subprocess
 
     sig, deadline = signal.SIGTERM, time.monotonic() + 60.0
     while proc.poll() is None:
@@ -986,8 +984,6 @@ class JitPrefetcher:
         )
 
     def _spawn(self, kind: str, argv: List[str], env: Dict[str, str], n: int) -> None:
-        import subprocess
-
         q = self._queues[kind]
         for _ in range(n):
             p = subprocess.Popen(
@@ -996,7 +992,7 @@ class JitPrefetcher:
                 stdout=subprocess.PIPE,
                 stderr=None,
                 env=env,
-                cwd="/tmp",
+                cwd=tempfile.gettempdir(),
                 text=True,
                 bufsize=1,
             )
@@ -1146,8 +1142,6 @@ class JitPrefetcher:
         a request queued later is never started, and the launch that needs
         it builds it in place without waiting.
         """
-        import subprocess
-
         released: List[str] = []
         with self._lock:
             if proc.pid in self._exited:

@@ -58,7 +58,7 @@ _FI_NORM = "flashinfer_norm"
 
 
 def spec_key(spec: str) -> str:
-    return hashlib.sha1(spec.encode()).hexdigest()[:20]
+    return hashlib.sha1(spec.encode(), usedforsecurity=False).hexdigest()[:20]
 
 
 def fi_norm_spec(
