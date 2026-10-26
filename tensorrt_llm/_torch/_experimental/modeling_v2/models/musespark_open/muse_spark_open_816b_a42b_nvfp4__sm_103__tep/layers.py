@@ -1053,8 +1053,9 @@ def adopt_model(
         full_attention.install_multi(model)
     decode_kv_splits = None
     if plan.enabled("decode_kv_splits"):
-        # Re-classes nothing: DecodeTarget arms it around a forward of 72..512 rows.
-        # Its refusal is agreed over the TP group, as the other attention installs.
+        # DecodeTarget arms it around a decode forward of 72..512 rows; the mixed-step
+        # mixin is installed after every other attention re-class (below). Its refusal is
+        # agreed over the TP group, as the other attention installs.
         from .kernels.decode_kv_splits import splits as _decode_kv_splits
 
         decode_kv_splits = _tp_agreement.agreed_install(
@@ -1094,6 +1095,13 @@ def adopt_model(
         _tp_agreement.agreed_install(
             model.layers[0].mapping, lambda: multi_request_append.install(model, min_seqs)
         )
+    if decode_kv_splits is not None:
+        # After every other attention re-class: the mixed-step mixin goes in front of all of
+        # them on the full-attention layers and arms the split rule only on mixed steps, which
+        # none of the others intercept.
+        from .kernels.decode_kv_splits import mixed as _mixed_kv_splits
+
+        _mixed_kv_splits.install(model, decode_kv_splits)
     if preattn_prep_on:
         logger.info(
             f"[musespark_open] preattn_prep: fused pre-attention prep on the decode path of all "
@@ -1109,6 +1117,15 @@ def adopt_model(
         swa_attention_block.log_installed(model.layers, swa_block)
         if plan.enabled("wide_swa_block"):
             swa_attention_block.install_multi(model)
+    if plan.enabled("mixed_step_gen_rows"):
+        # After every other attention re-class and after select_decode_fmha: the mixin goes
+        # in front of all of them and acts only on mixed steps, which none of the others
+        # intercept. Agreed like multi_request_split_kv's.
+        from .kernels.mixed_step_gen_rows import attention as mixed_step_gen_rows
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: mixed_step_gen_rows.install(model)
+        )
     layer_kwargs = {}
     if plan.enabled("projection_gathers"):
         # Imported only when planned: with no fast path the target imports

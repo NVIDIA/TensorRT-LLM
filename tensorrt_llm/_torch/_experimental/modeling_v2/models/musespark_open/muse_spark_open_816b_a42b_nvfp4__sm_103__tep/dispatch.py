@@ -131,6 +131,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "multi-request decode FMHA over an over-subscribed KV split, 72..512 rows",
         "construct",
     ),
+    FastPath(
+        "mixed_step_gen_rows",
+        "full-attention generation rows of mixed steps with 9..64 generation requests on "
+        "multi_request_split_kv, context rows on the thop op",
+        "construct",
+        ("multi_request_split_kv",),
+    ),
     # Dense projections and prefetch.
     FastPath("dense_gemms", "dense projections on one named kernel per shape", "construct"),
     FastPath(
@@ -305,6 +312,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("persistent_experts", "moe_prologue"),
     ),
     FastPath("replicated_embedding", "token embedding gathered from a replicated table", "load"),
+    FastPath(
+        "model_boundary",
+        "decode input boundary (gather, embed norm, residual, layer 0 pre-QKV norm) in one launch; "
+        "last-layer join storing BF16",
+        "load",
+        ("replicated_embedding",),
+    ),
     # Drafter.
     FastPath("drafter_block_conv", "drafter block convolutions as one fused kernel", "draft"),
     FastPath(
@@ -359,6 +373,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("drafter_block_decode",),
     ),
     FastPath(
+        "wide_drafter_hops",
+        "the drafter all-reduce hops of 9..56-row (sm107: 9..64-row) block decodes on a wide "
+        "one-shot transport",
+        "draft",
+        ("drafter_hops",),
+    ),
+    FastPath(
         "drafter_pdl_chain",
         "drafter and draft head launches releasing their GEMMs early",
         "draft",
@@ -380,6 +401,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     FastPath(
         "lm_head_inbox",
         "LM-head GEMM into a multicast inbox the sampler gathers",
+        "draft",
+        ("split_sampler",),
+    ),
+    FastPath(
+        "vocab_parallel_head",
+        "the verify head of 16..1024-row decode steps on each rank's own vocabulary shard (no logits all-gather)",
         "draft",
         ("split_sampler",),
     ),

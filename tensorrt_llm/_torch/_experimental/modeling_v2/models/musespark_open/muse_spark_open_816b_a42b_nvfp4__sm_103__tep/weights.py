@@ -11,7 +11,7 @@ perception towers when they are built. The drafter's weights come from the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenModel
 from tensorrt_llm._torch.models.modeling_musespark_open_omni import (
@@ -38,7 +38,10 @@ def load(
 
 
 def install_loaded_features(
-    text_model: MuseSparkOpenModel, mapping, plan: "_dispatch.Plan"
+    text_model: MuseSparkOpenModel,
+    mapping,
+    plan: "_dispatch.Plan",
+    compute_capability: Optional[Tuple[int, int]] = None,
 ) -> None:
     """Install the plan's expert paths on a text model whose weights are final.
 
@@ -60,6 +63,10 @@ def install_loaded_features(
 
     Then ``hot_replicas`` (``hot_replicas.install``: hooks only, at tp 4; the copies are
     gathered on the first forward of a deployment that serves 33..512-row decode steps),
+    then, on Rubin (sm107) at tp 4 (``prefill_cutedsl_experts.serves`` of
+    ``compute_capability``, the device's; None installs it nowhere),
+    ``prefill_cutedsl_experts`` (``prefill_cutedsl_experts.install``: the
+    4096..8192-row expert calls of the NVFP4 layers on the Rubin CuTe DSL GEMMs),
     then ``early_expert_ids`` (``early_ids.install``, on the layers just installed),
     then ``pool_into_route`` (``DirectPool.install_sites``, whose routed kernel
     variants carry the placement and the early expert ids), each collective over the
@@ -76,6 +83,13 @@ def install_loaded_features(
 
         # After the owner-window install, whose expert and routing hooks it wraps.
         _hot_replicas.install(text_model, mapping)
+    if compute_capability is not None:
+        from .kernels.prefill_cutedsl_experts import install as _prefill_cutedsl
+
+        if _prefill_cutedsl.serves(compute_capability, mapping.tp_size):
+            # After the expert paths above, whose expert forwards it wraps for the large
+            # prefill calls only.
+            _prefill_cutedsl.install(text_model, mapping)
     if plan.enabled("early_expert_ids"):
         _install_early_expert_ids(text_model, mapping)
     if plan.enabled("pool_into_route"):
@@ -180,3 +194,9 @@ def install_embedding_features(
         from .kernels.replicated_embedding import embedding as _replicated_embedding
 
         _replicated_embedding.install(text_model, mapping)
+    if plan.enabled("model_boundary"):
+        # After replicated_embedding, whose table it gathers from. Collective (agreed refusal).
+        from .kernels.boundary_early_release import triggers as _pdl_triggers
+        from .kernels.model_boundary import boundary as _model_boundary
+
+        _model_boundary.install(text_model, _pdl_triggers.capture_layers(text_model), mapping)
