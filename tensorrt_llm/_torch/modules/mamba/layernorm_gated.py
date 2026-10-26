@@ -475,6 +475,15 @@ class RMSNorm(torch.nn.Module):
         # fp8_scale will be attached from the downstream static FP8 linear.
         self.fp8_scale: torch.Tensor | None = None
 
+    def uses_fused_nvfp4_quant(self, gated: bool) -> bool:
+        """Whether ``forward`` runs the fused CUDA SiLU gate + group RMSNorm +
+        NVFP4 quantize kernel instead of the Triton kernels; ``gated`` is
+        whether it is given ``z``."""
+        return (self.is_nvfp4 and gated and not self.norm_before_gate
+                and get_sm_version() >= 100
+                and fused_gated_rmsnorm_quant_shape_ok(self.hidden_size,
+                                                       self.group_size))
+
     def forward(
         self,
         x: torch.Tensor,
@@ -504,9 +513,7 @@ class RMSNorm(torch.nn.Module):
 
         # NVFP4 quantized path - uses optimized fused CUDA kernel
         # Fuses: SiLU gating + Group RMSNorm + FP4 quantization
-        if self.is_nvfp4 and z is not None and not self.norm_before_gate and \
-            get_sm_version() >= 100 and \
-           fused_gated_rmsnorm_quant_shape_ok(self.hidden_size, self.group_size):
+        if self.uses_fused_nvfp4_quant(z is not None):
             if self.nvfp4_scale is None:
                 raise ValueError(
                     "RMSNormGated NVFP4 output requested but no `nvfp4_scale` is attached. "

@@ -7,6 +7,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
                     Tuple, Type, Union)
 
@@ -18,7 +19,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import mpi_disabled, release_gc
+from tensorrt_llm._utils import get_sm_version, mpi_disabled, release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -185,6 +186,11 @@ def _configure_deep_gemm_pdl() -> None:
 
 
 class PyTorchModelEngine(ModelEngine):
+    # Set by _init_jit_prefetch at the end of warmup: the JIT prefetcher, and
+    # whether the next forward outside warmup is still to bind its executor
+    # thread (the JIT stats count from there).
+    _jit_prefetcher = None
+    _jit_bind_pending = False
 
     def __init__(
         self,
@@ -981,7 +987,164 @@ class PyTorchModelEngine(ModelEngine):
         assert resource_manager is not None, (
             "scheduled warmup requires a resource manager")
         assert isinstance(self._runner, ScheduledModelRunner)
-        self._runner.warmup(resource_manager)
+        from ..jit_prefetch import prefetch_enabled
+        record_decode = prefetch_enabled()
+        if record_decode:
+            # The Mamba decode provider plans from the launches warmup makes.
+            from ..modules.mamba import jit_prefetch_decode
+            jit_prefetch_decode.start_recording(self.model)
+        # The Triton providers that follow from the model and the engine
+        # limits start before the runner's first warmup forward, and each
+        # warmup forward's batch is then planned before it runs.
+        early_start = record_decode and hasattr(
+            self._runner, "before_warmup_forwards_callable")
+        if early_start:
+            self._runner.before_warmup_forwards_callable = functools.partial(
+                self._start_warmup_triton_builds, resource_manager)
+            self._runner.warmup_batch_callable = self._plan_warmup_batch
+        try:
+            self._runner.warmup(resource_manager)
+        finally:
+            if early_start:
+                self._runner.before_warmup_forwards_callable = None
+                self._runner.warmup_batch_callable = None
+            if record_decode:
+                jit_prefetch_decode.stop_recording()
+        try:
+            self._init_jit_prefetch()
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
+            logger.warning(
+                f"[JIT prefetch] setup failed, serving without prefetch: "
+                f"{type(e).__name__}: {e}")
+
+    def _start_warmup_triton_builds(
+            self, resource_manager: Optional[ResourceManager]) -> None:
+        """Register the Triton providers that follow from the model and the
+        engine limits alone before warmup's first forward, so they plan the
+        warmup forwards' batches (``_plan_warmup_batch``), and queue the
+        variants warmup's first forwards launch and the batches tune ahead
+        will run at the end of warmup (``JitPrefetcher.queue_early_batches``).
+        The Mamba decode provider starts from the native state-update launch
+        each mixer's decode step will make (``seed_native_decode_records``)."""
+        try:
+            from ..jit_prefetch import JitPrefetcher
+            from ..modules.mamba import jit_prefetch_decode
+            prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
+            if prefetcher is None:
+                return
+            self._register_triton_providers(prefetcher)
+            kv_cache_manager = (resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER)
+                                if resource_manager is not None else None)
+            if jit_prefetch_decode.seed_native_decode_records(
+                    self.model, kv_cache_manager):
+                prefetcher.register(
+                    "mamba_decode",
+                    jit_prefetch_decode.MambaDecodeProvider(self.batch_size))
+            prefetcher.queue_early_batches()
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
+            logger.warning(
+                f"[JIT prefetch] Triton providers not started before warmup: "
+                f"{type(e).__name__}: {e}")
+
+    def _plan_warmup_batch(self, batch: ScheduledRequests) -> None:
+        """Queue the not yet compiled variants of a warmup forward's batch for
+        the JIT helpers before it runs (``JitPrefetcher.plan_warmup_batch``).
+        A batch without context requests is skipped: warmup's generation
+        batches reach no provider that plans warmup batches."""
+        ctx = batch.context_requests
+        if not ctx:
+            return
+        try:
+            from ..jit_prefetch import JitPrefetcher
+            from ..modules.mamba.mamba2_metadata import Mamba2Metadata
+            prefetcher = JitPrefetcher.get()
+            if prefetcher is None:
+                return
+            # The facts the runner's inputs and Mamba2Metadata.prepare derive:
+            # each request's chunk length, and whether a request has a cached
+            # prefix (initial states), which Mamba's warmup can force.
+            any_cached = Mamba2Metadata._warmup_force_initial_states or any(
+                r.context_current_position - r.py_num_compressed_tokens > 0
+                for r in ctx)
+            prefetcher.plan_warmup_batch(
+                SimpleNamespace(
+                    ctx_chunk_lens=[r.context_chunk_size for r in ctx],
+                    any_ctx_cached=any_cached))
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail warmup
+            logger.warning_once(
+                f"[JIT prefetch] warmup batch not planned: "
+                f"{type(e).__name__}: {e}",
+                key="jitp_engine_warmup_batch")
+
+    def _init_jit_prefetch(self) -> None:
+        """Start JIT compile ahead, tune ahead and the JIT stats at the end of
+        warmup (env-gated, see ``tensorrt_llm/_torch/jit_prefetch.py``)."""
+        from ..jit_prefetch import (JitPrefetcher, jit_engine_enabled,
+                                    prefetch_enabled, tune_ahead_enabled)
+        if not jit_engine_enabled():
+            return
+        prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
+        self._jit_prefetcher = prefetcher
+        self._jit_bind_pending = prefetcher is not None
+        if prefetcher is None:
+            return
+        if not prefetch_enabled():
+            # Tune ahead alone (TLLM_JIT_TUNE_AHEAD=1 without TLLM_JIT_AHEAD):
+            # no helpers, no planning; only the providers that tune ahead,
+            # whose candidates compile in this process.
+            if tune_ahead_enabled():
+                self._register_triton_providers(prefetcher)
+                prefetcher.tune()
+            return
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+        if IS_CUTLASS_DSL_AVAILABLE and get_sm_version() in (100, 103):
+            from .. import jit_prefetch_cute_dsl as jcd
+
+            # Started once the model was constructed; the loaded model's
+            # norms add only the variants not queued then.
+            norm_provider = jcd.FlashInferNormProvider(self.model)
+            if norm_provider:
+                prefetcher.enable_flashinfer_norm(norm_provider)
+        self._register_triton_providers(prefetcher)
+        from ..modules.mamba import jit_prefetch_decode
+        decode_provider = jit_prefetch_decode.MambaDecodeProvider(
+            self.batch_size)
+        if decode_provider:
+            logger.info(
+                f"[JIT prefetch] Mamba decode launches recorded in warmup: "
+                f"{jit_prefetch_decode.recorded_launchers()}")
+            prefetcher.register("mamba_decode", decode_provider)
+        # Helpers were started when the prefetcher was created; make sure
+        # their start-up is paid here, inside warmup, not by a request.
+        prefetcher.wait_ready()
+        # Benchmark the untuned autotune keys the providers reach on the
+        # GPU now (their candidates compiled by the helpers), before the
+        # background enumeration fills the helpers' queue. A no-op unless
+        # tune ahead is on (TLLM_JIT_TUNE_AHEAD, default: TLLM_JIT_AHEAD).
+        prefetcher.tune()
+        prefetcher.start_background()
+
+    def _register_triton_providers(self, prefetcher) -> None:
+        """Register the Triton providers that follow from the model and the
+        engine limits: the Mamba2 SSD prefill (which also tunes ahead,
+        ``tune_batches``), the Mamba2 mixers' gated RMSNorm and the relu2
+        MLP activation. Once per process (later calls change nothing)."""
+        from ..modules.jit_prefetch_mlp import Relu2Provider
+        from ..modules.mamba.jit_prefetch import (MambaGatedNormProvider,
+                                                  MambaSSDProvider)
+        provider = MambaSSDProvider(self.model,
+                                    max_num_tokens=self.max_num_tokens,
+                                    max_batch_size=self.batch_size,
+                                    max_seq_len=self.max_seq_len)
+        if provider and prefetcher.register("mamba_ssd", provider):
+            logger.info(f"[JIT prefetch] Mamba SSD provider: "
+                        f"{len(provider.shapes)} distinct layer shape(s)")
+        for name, extra in (("mamba_gated_norm",
+                             MambaGatedNormProvider(self.model)),
+                            ("relu2", Relu2Provider(self.model))):
+            if extra:
+                prefetcher.register(name, extra)
 
     ### Helper methods promoted from the original warmup method ###
 
@@ -1394,6 +1557,11 @@ class PyTorchModelEngine(ModelEngine):
             return self._runner.forward(batch)
         assert resource_manager is not None, (
             "scheduled execution requires a resource manager")
+        if self._jit_bind_pending and self._warmup_depth == 0:
+            # The first forward outside warmup runs on the executor thread:
+            # the JIT stats count the compiles on that thread from here.
+            self._jit_bind_pending = False
+            self._jit_prefetcher.bind_executor_thread()
         inputs = make_scheduled_inputs(batch,
                                        new_tensors_device,
                                        cache_indirection_buffer,

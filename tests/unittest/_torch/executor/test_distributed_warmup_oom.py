@@ -541,3 +541,99 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
     # The remaining shape is never attempted: recovering locally would leave
     # peers waiting in a forward this rank has abandoned.
     engine._dummy_requests.create_warmup_request.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "env,covered,helpers_running,forwards,forced",
+    [
+        # Tuned ahead: only the multi-sequence pass, no forced initial states,
+        # with compile ahead or without it.
+        ({"TLLM_JIT_AHEAD": "1"}, True, True, 1, 0),
+        ({"TLLM_JIT_TUNE_AHEAD": "1"}, True, False, 1, 0),
+        ({"TLLM_JIT_AHEAD": "1", "TLLM_WARMUP_JIT_COVERAGE": "1"}, True, True, 1, 0),
+        # Compiled ahead, not tuned ahead: only the forced-initial-states pass.
+        ({"TLLM_JIT_AHEAD": "1"}, False, True, 1, 1),
+        ({"TLLM_JIT_AHEAD": "1", "TLLM_JIT_TUNE_AHEAD": "0"}, True, True, 1, 1),
+        # Both passes: no Triton helper builds the multi-sequence variants,
+        # or the JIT-coverage passes are forced on, or JIT ahead is off.
+        ({"TLLM_JIT_AHEAD": "1"}, False, False, 2, 1),
+        ({"TLLM_JIT_TUNE_AHEAD": "1"}, False, False, 2, 1),
+        (
+            {"TLLM_JIT_AHEAD": "1", "TLLM_JIT_TUNE_AHEAD": "0", "TLLM_WARMUP_JIT_COVERAGE": "1"},
+            True,
+            True,
+            2,
+            1,
+        ),
+        ({}, True, False, 2, 1),
+    ],
+)
+def test_mamba_warmup_passes_with_jit_ahead(
+    env, covered, helpers_running, forwards, forced, monkeypatch
+) -> None:
+    """With JIT tune ahead on, and every recurrent layer covered by it, the
+    Mamba warmup skips its forced-initial-states pass; with compile ahead's
+    Triton helpers building the multi-sequence variants, it skips the
+    multi-sequence pass; otherwise it runs both, as without JIT ahead."""
+    from tensorrt_llm._torch import jit_prefetch
+
+    for var in ("TLLM_JIT_AHEAD", "TLLM_JIT_TUNE_AHEAD", "TLLM_WARMUP_JIT_COVERAGE"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    monkeypatch.setattr(jit_prefetch, "prefetch_helpers_running", lambda kind: helpers_running)
+    engine, resource_manager = _mamba_engine()
+    engine._dummy_requests.create_warmup_request = mock.Mock(return_value=object())
+    engine._forward_warmup = mock.Mock()
+    engine._mamba_prefill_tuned_ahead = mock.Mock(return_value=covered)
+
+    with (
+        _no_cuda_side_effects(),
+        mock.patch.object(warmup_module, "MambaHybridCacheManager", _StandInMambaCacheManager),
+        mock.patch.object(
+            warmup_module.Mamba2Metadata,
+            "force_initial_states_for_warmup",
+            side_effect=contextlib.nullcontext,
+        ) as force_initial_states,
+        mock.patch.object(warmup_module, "clear_memory_buffers"),
+    ):
+        engine._run_mamba_hybrid_warmup(resource_manager)
+
+    assert engine._forward_warmup.call_count == forwards
+    assert force_initial_states.call_count == forced
+
+
+@pytest.mark.parametrize(
+    "triton_ssd,gdn,provider_fails,expected",
+    [
+        ((), False, False, True),
+        ((True, True), False, False, True),
+        ((True, False), False, False, False),
+        ((True,), True, False, False),
+        ((True,), False, True, False),
+    ],
+    ids=["no_recurrent_layers", "triton_ssd", "flashinfer_ssd", "gdn", "unknown"],
+)
+def test_mamba_prefill_tuned_ahead_needs_every_recurrent_layer_covered(
+    triton_ssd, gdn, provider_fails, expected, monkeypatch
+) -> None:
+    """Tune ahead stands in for the forced-initial-states pass only when every
+    recurrent layer on the rank is a Mamba2 mixer on the Triton SSD kernels;
+    a layer it does not tune (FlashInfer's SSD, GDN), or a model it cannot
+    inspect, keeps the pass."""
+    from tensorrt_llm._torch.modules.mamba import jit_prefetch as mamba_plan
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+
+    class _Gdn(Qwen3NextGatedDeltaNet):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+    def provider(model):
+        if provider_fails:
+            raise RuntimeError("cannot inspect")
+        return SimpleNamespace(shapes=[SimpleNamespace(triton_ssd=t) for t in triton_ssd])
+
+    monkeypatch.setattr(mamba_plan, "MambaSSDProvider", provider)
+    engine, _ = _mamba_engine()
+    engine.model = torch.nn.Sequential(torch.nn.Linear(2, 2), *([_Gdn()] if gdn else []))
+    assert engine._mamba_prefill_tuned_ahead() is expected

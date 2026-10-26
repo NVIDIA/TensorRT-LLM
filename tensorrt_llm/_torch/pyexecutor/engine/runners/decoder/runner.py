@@ -126,6 +126,10 @@ class PrefillCompiledModel(torch.nn.Module):
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
+    # Called with each warmup forward's batch before it runs (the engine
+    # queues that batch's JIT variants for its compile-ahead helpers).
+    warmup_batch_callable: Callable[[ScheduledRequests], None] | None = None
+
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
     _context_graph_promotion_supported = True
@@ -313,6 +317,16 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs.guided_decoder = value
 
     @property
+    def before_warmup_forwards_callable(self) -> Callable[[], None] | None:
+        """Called once the pre-JIT prewarms are done, before the first warmup
+        forward (the engine starts JIT compile-ahead work there)."""
+        return self._warmup.before_warmup_forwards_callable
+
+    @before_warmup_forwards_callable.setter
+    def before_warmup_forwards_callable(self, value: Callable[[], None] | None) -> None:
+        self._warmup.before_warmup_forwards_callable = value
+
+    @property
     def cuda_graph_runner(self) -> CUDAGraphRunner | None:
         return self._graphs.cuda_graph_runner
 
@@ -477,6 +491,8 @@ class DecoderRunner(ScheduledModelRunner):
         trtllm_gen_jit_warmup: bool = False,
     ) -> Any:
         """Run a dummy scheduled pass with this call's speculation values."""
+        if self.warmup_batch_callable is not None:
+            self.warmup_batch_callable(batch)
         inputs = make_scheduled_inputs(
             batch,
             None,
