@@ -94,6 +94,10 @@ class TokenMajorGenView:
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
+    # Mixed-precision KV: page table of the retained-token twin (-1 = page not retained) and
+    # the absolute positions of this step's context tokens; None unless mixed precision is on.
+    retained_block_table = None
+    retained_context_positions = None
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -1111,8 +1115,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
         # Mixed-precision KV: retained-pool page table in block_table row order, -1 = not retained.
-        self.retained_block_table = None
-        self.retained_context_positions = None
         if getattr(self.kv_cache_manager, "high_layers", None):
             self.retained_block_table = self.get_empty(
                 self.cuda_graph_buffers,
@@ -2094,8 +2096,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table[: self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True
         )
-        high_table = getattr(self, "retained_block_table", None)
-        if high_table is not None and self.kv_cache_manager.high_layers:
+        high_table = self.retained_block_table
+        if high_table is not None:
             table = torch.full(
                 (self.num_seqs, max_blocks_used), -1, dtype=torch.int32, pin_memory=prefer_pinned()
             )

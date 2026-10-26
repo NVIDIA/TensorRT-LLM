@@ -307,10 +307,16 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
-        # Mixed-precision KV: page table of the retained twins, -1 where a page is not retained.
-        self.retained_block_table = None
-        if getattr(self.kv_cache_manager, "high_layers", None):
-            # Twins of the two compression ratios have different page sizes and pools.
+        # Mixed-precision KV: one retained-twin page table per compression ratio (the twins of
+        # the two ratios have different page sizes), -1 where a page is not retained.
+        manager = self.kv_cache_manager
+        if getattr(manager, "high_layers", None):
+            self._retained_table_layers = {}
+            for local in manager.high_layers:
+                layer_idx = manager.pp_layers[local]
+                self._retained_table_layers.setdefault(
+                    manager._compress_ratios[layer_idx], layer_idx
+                )
             self.retained_block_table = {
                 compress_ratio: self.get_empty(
                     self.cuda_graph_buffers,
@@ -319,7 +325,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
-                for compress_ratio in self.compress_block_tables
+                for compress_ratio in self._retained_table_layers
             }
         self._init_sparse_offload_state()
 
@@ -532,21 +538,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
-        high_tables = getattr(self, "retained_block_table", None)
-        if high_tables and self.kv_cache_manager.high_layers:
+        if self.retained_block_table is not None:
             manager = self.kv_cache_manager
-            for compress_ratio, high_table in high_tables.items():
+            for compress_ratio, high_table in self.retained_block_table.items():
                 # Any twin of this ratio: all of them share one pool and page scale.
-                layer_idx = next(
-                    (
-                        manager.pp_layers[local]
-                        for local in manager.high_layers
-                        if manager._compress_ratios[manager.pp_layers[local]] == compress_ratio
-                    ),
-                    None,
-                )
-                if layer_idx is None:
-                    continue
+                layer_idx = self._retained_table_layers[compress_ratio]
                 table = torch.full(
                     (self.num_seqs, high_table.shape[1]),
                     -1,
