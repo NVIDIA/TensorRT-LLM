@@ -644,11 +644,19 @@ function(_modeling_v2_add_family_library family)
   endforeach()
   add_library(${library} MODULE "${registration}" ${object_sources})
   _modeling_v2_link_libraries(dep_libraries ${deps})
-  # Linked the way th_common is: torch, th_utils and libtensorrt_llm.so, whose
-  # singletons (logger, mcast registry, driver wrapper) stay single.
+  # Linked the way th_common is: torch, th_utils, Python (which
+  # <torch/extension.h>, included by stock headers such as thop/thUtils.h,
+  # references) and libtensorrt_llm.so, whose singletons (logger, mcast
+  # registry, driver wrapper) stay single.
   target_link_libraries(
-    ${library} PRIVATE ${TORCH_LIBRARIES} th_utils ${SHARED_TARGET}
-                       ${CUDA_RT_LIB} ${CUDA_DRV_LIB} ${dep_libraries})
+    ${library}
+    PRIVATE ${TORCH_LIBRARIES}
+            th_utils
+            ${Python3_LIBRARIES}
+            ${SHARED_TARGET}
+            ${CUDA_RT_LIB}
+            ${CUDA_DRV_LIB}
+            ${dep_libraries})
   set(version_script
       "${PROJECT_SOURCE_DIR}/tensorrt_llm/modeling_v2/common/familyLibrary.version"
   )
