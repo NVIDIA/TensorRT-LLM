@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from defs.conftest import skip_no_hopper
 from defs.model_express.mx_harness import (
     ROLES,
     MxE2ECase,
@@ -116,7 +117,7 @@ _MX_CASES = (
             tp_size=1,
         ),
         id="qwen3-fp8-block-tp1",
-        marks=pytest.mark.skip_less_device(2),
+        marks=(pytest.mark.skip_less_device(2), skip_no_hopper),
     ),
     pytest.param(
         MxE2ECase(
@@ -126,7 +127,7 @@ _MX_CASES = (
             tp_size=2,
         ),
         id="qwen3-fp8-block-tp2",
-        marks=pytest.mark.skip_less_device(4),
+        marks=(pytest.mark.skip_less_device(4), skip_no_hopper),
     ),
     pytest.param(
         MxE2ECase(

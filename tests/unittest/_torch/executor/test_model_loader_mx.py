@@ -1002,8 +1002,15 @@ def _mx_e2e_cases() -> dict[str, dict[str, object]]:
         (case,) = param.args
         options = {keyword.arg: keyword.value for keyword in param.keywords}
         row = {keyword.arg: ast.literal_eval(keyword.value) for keyword in case.keywords}
-        assert ast.unparse(options["marks"].func) == "pytest.mark.skip_less_device"
-        row["min_devices"] = ast.literal_eval(options["marks"].args[0])
+        marks = options["marks"]
+        # A row may add architecture marks, but it has exactly one device-count mark.
+        (device_mark,) = (
+            mark
+            for mark in (marks.elts if isinstance(marks, ast.Tuple) else [marks])
+            if isinstance(mark, ast.Call)
+            and ast.unparse(mark.func) == "pytest.mark.skip_less_device"
+        )
+        row["min_devices"] = ast.literal_eval(device_mark.args[0])
         case_id = ast.literal_eval(options["id"])
         assert case_id not in rows
         rows[case_id] = row

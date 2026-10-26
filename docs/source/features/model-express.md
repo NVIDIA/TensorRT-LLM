@@ -231,7 +231,8 @@ checkpoint path. The Qwen2, Qwen3, Mistral, and Phi3 profile rows use
 and `TRTLLM_MX_PHI3_MODEL`.
 The Qwen3 FP8 block-scale profile rows use `qwen3-fp8-block-tp1` /
 `qwen3-fp8-block-tp2` with Qwen3-8B-FP8, overridable through
-`TRTLLM_MX_QWEN3_FP8_MODEL`; the H100 CI stages satisfy its SM90 constraint.
+`TRTLLM_MX_QWEN3_FP8_MODEL`; they run only on SM90 GPUs, which the H100 CI
+stages provide, and skip elsewhere.
 `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
