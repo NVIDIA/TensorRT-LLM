@@ -14,6 +14,17 @@
 # the License.
 
 if(${BUILD_PYT})
+  add_tllm_gtest(
+    profilerTest
+    OWNER
+    common
+    SOURCES
+    profilerTest.cpp
+    ../../../tensorrt_llm/common/profiler.cpp
+    LINK_LIBRARIES
+    ${TORCH_LIBRARIES}
+    LABELS
+    "unit;common;host")
   add_gtest(thUtilsTest thUtilsTest.cpp eagerMoeWorkspaceTest.cpp)
   target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
                                            ${TORCH_LIBRARIES})
