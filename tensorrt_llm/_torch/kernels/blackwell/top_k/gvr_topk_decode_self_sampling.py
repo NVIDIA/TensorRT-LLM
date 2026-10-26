@@ -10852,9 +10852,13 @@ class GvrRegClusKernel:
         cr_shift: int = 0,
         hint_free: bool = False,
         det: bool = False,
+        kh: int = 1,
     ) -> None:
         self.det = bool(det)
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
+        # hint slots per thread: ceil(K / BLK)
+        assert kh in (1, 2)
+        self.kh = kh
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
         self.blk = blk
         self.vpt = vpt
@@ -10927,11 +10931,13 @@ class GvrRegClusKernel:
                 n = nv
             if short != cutlass.Int32(0):
                 if rank == cutlass.Int32(0):
-                    if tid < kq:
-                        ov = cutlass.Int32(-1)
-                        if tid < nv:
-                            ov = tid
-                        out[row, tid] = ov
+                    for h in cutlass.range_constexpr(self.kh):
+                        th = tid + cutlass.Int32(h * self.blk)
+                        if th < kq:
+                            ov = cutlass.Int32(-1)
+                            if th < nv:
+                                ov = th
+                            out[row, th] = ov
 
         # ------------------------------------------------------------------
         # Predeclarations (DSL AST rule: every scalar (re)assigned under a
@@ -10972,6 +10978,7 @@ class GvrRegClusKernel:
         nT = cutlass.Int32(0)
         tie_m = cutlass.Int32(0)
         pv0 = cutlass.Int32(-1)
+        pv1 = cutlass.Int32(-1)
         okc = cutlass.Int32(0)
         whole = cutlass.Int32(0)
         degen = cutlass.Int32(0)
@@ -11034,15 +11041,21 @@ class GvrRegClusKernel:
             base4 = rank * cutlass.Int32(self.span)
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
 
-            # ---- P0: redundant hint gather, EVERY CTA (k<=BLK by dispatch
-            # gate). One coalesced word per thread, NO cluster barrier —
+            # ---- P0: redundant hint gather, EVERY CTA (k<=KH*BLK by dispatch
+            # gate). One coalesced word per thread per slot, NO cluster barrier —
             # GMIN/GMAX identical everywhere by construction.
             if cutlass.const_expr(self.hint_free):
                 if tid < k:
                     pv0 = tid
+                if cutlass.const_expr(self.kh == 2):
+                    if tid + cutlass.Int32(self.blk) < k:
+                        pv1 = tid + cutlass.Int32(self.blk)
             else:
                 if tid < k:
                     pv0 = ld_g_i32(p_addr, tid)
+                if cutlass.const_expr(self.kh == 2):
+                    if tid + cutlass.Int32(self.blk) < k:
+                        pv1 = ld_g_i32(p_addr, tid + cutlass.Int32(self.blk))
 
             # ---- P1: row load — predicated flat float4[VPT] batch (the CUDA
             # has NO exact-fit peel here, guard is per-load). Issue all loads
@@ -11077,6 +11090,13 @@ class GvrRegClusKernel:
                 uk = fkey(ldg_f32(x_addr, pv0))  # __ldg(X+pv0)
                 lmin = uk
                 lmax = uk
+            if cutlass.const_expr(self.kh == 2):
+                if cutlass.Uint32(pv1) < cutlass.Uint32(n):
+                    uk = fkey(ldg_f32(x_addr, pv1))
+                    if uk < lmin:
+                        lmin = uk
+                    if uk > lmax:
+                        lmax = uk
             lmin = warp_min_u32(lmin)
             lmax = warp_max_u32(lmax)
             if lane == cutlass.Int32(0):
@@ -12112,7 +12132,7 @@ def get_compiled__regclus(
     hint_free: bool = False,
     det: bool = False,
 ) -> Any:
-    """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
+    """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS[, KH])."""
     key = (
         tuple(tpl),
         bool(pdl),
@@ -12126,7 +12146,7 @@ def get_compiled__regclus(
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
-        blk, vpt, cs = tpl
+        blk, vpt, cs = tpl[:3]
         kernel = GvrRegClusKernel(
             blk,
             vpt,
@@ -12137,6 +12157,7 @@ def get_compiled__regclus(
             cr_shift=cr_shift,
             hint_free=hint_free,
             det=det,
+            kh=tpl[3] if len(tpl) > 3 else 1,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()

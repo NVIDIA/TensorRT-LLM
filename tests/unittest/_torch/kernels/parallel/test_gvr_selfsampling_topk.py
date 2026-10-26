@@ -1078,6 +1078,64 @@ def test_selfsampling_varlen_regclus_cuda_graph():
         assert torch.equal(got, ref_v)
 
 
+def test_selfsampling_route_k2048_regclus() -> None:
+    """K=2048 rows above the register window take reg_clus with two hint
+    slots per thread, except where the one-wave K=2048 register rung applies."""
+    k = 2048
+    for b, n in ((1, 16399), (8, 32771), (8, 65551), (16, 32771)):
+        plan = ss_host.route(b, n, (n + 63) // 64 * 64, k)
+        assert plan["kernel"] == "reg_clus" and plan["tpl"][3] == 2, (b, n, plan["kernel"])
+    for b in (32, 64):
+        assert ss_host.route(b, 16399, 16448, k)["kernel"] == "reg"
+    assert ss_host.route(1, 131087, 131136, k)["kernel"] == "main"
+    assert len(ss_host.route(1, 65536, 65536, 1024)["tpl"]) == 3
+
+
+@pytest.mark.parametrize("pattern", ["randn", "ties", "equal"])
+@pytest.mark.parametrize("b,n", [(1, 16399), (4, 65551), (16, 32771)], ids=lambda v: str(v))
+def test_selfsampling_varlen_regclus_k2048_exact(b: int, n: int, pattern: str) -> None:
+    """K=2048 reg_clus is exact on random, heavily tied and all-equal rows."""
+    k, npad = 2048, (n + 63) // 64 * 64
+    key = _varlen_cache_key(b, npad, k, n, 1, 1)
+    gen = torch.Generator(device=_DEV).manual_seed(n + b)
+    lg = torch.randn((b, npad), generator=gen, dtype=torch.float32, device=_DEV)
+    if pattern == "ties":
+        lg = (lg * 4).round() / 4
+    elif pattern == "equal":
+        lg.fill_(0.5)
+    lg[:, n:] = 3e38
+    kv = torch.full((b,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((b, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, max_seq_len=n)
+    torch.cuda.synchronize()
+    assert ss_host._VARLEN_CACHE[key][0] == "reg_clus"
+    _check_exact(lg, out, n, torch.topk(lg[:, :n], k, dim=1).values)
+
+
+def test_selfsampling_varlen_regclus_k2048_short_rows():
+    """K=2048 reg_clus engine: short rows (n <= k, identity spans both hint
+    slots), a zero-window row and long rows in one MTP launch."""
+    k, msl, nn = 2048, 32771, 2
+    npad = (msl + 63) // 64 * 64
+    torch.manual_seed(13)
+    lg = torch.randn(4 * nn, npad, dtype=torch.float32, device=_DEV)
+    kv = torch.tensor([msl, 1500, nn - 1, 20000], dtype=torch.int32, device=_DEV)
+    out = torch.full((4 * nn, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=1, max_seq_len=msl)
+    assert ss_host._VARLEN_CACHE[_varlen_cache_key(4 * nn, npad, k, msl, nn, 1)][0] == "reg_clus"
+    torch.cuda.synchronize()
+    ref = _reference_varlen_indices(lg, kv, nn, 1, k)
+    for r in range(4 * nn):
+        if (ref[r] >= 0).any():
+            row = lg[r]
+            got = row[out[r].long().clamp_min(0)].sort().values
+            want = row[ref[r].long().clamp_min(0)].sort().values
+            assert torch.equal(got, want), f"row {r} value multiset mismatch"
+            assert torch.equal(out[r] < 0, ref[r] < 0), f"row {r} pad mask mismatch"
+        else:
+            assert torch.equal(out[r], ref[r]), f"row {r} expected all -1"
+
+
 def test_selfsampling_varlen_reg_parity_and_oracle():
     """The varlen launcher must admit the register-resident family (and its
     img flavor) exactly where the free route picks it (route() parity tier 2),
