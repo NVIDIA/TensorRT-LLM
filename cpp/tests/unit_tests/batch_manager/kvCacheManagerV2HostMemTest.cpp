@@ -440,4 +440,66 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
     }
 }
 
+//! Data written to the start of a deferred initial fill as soon as it is usable
+//! must survive the helpers still populating the rest of it.
+TEST(KvCacheManagerV2HostMemTest, DeferredParallelFillKeepsEarlyWrites)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    constexpr size_t kChunk = HostMem::kFillChunkSize;
+    constexpr size_t kSize = 4 * kChunk;
+
+    HostMem memory(kSize, kSize, HostMemBackingOptions{}, /*waitForFill=*/false);
+    auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
+    auto const pattern
+        = [](size_t offset) { return static_cast<unsigned char>((offset / HostMem::kAlignment) * 5 + 3); };
+    for (size_t chunkEnd = kChunk; chunkEnd <= kSize; chunkEnd += kChunk)
+    {
+        memory.waitUsable(chunkEnd);
+        for (size_t offset = chunkEnd - kChunk; offset < chunkEnd; offset += HostMem::kAlignment)
+        {
+            bytes[offset] = pattern(offset);
+        }
+    }
+
+    memory.waitUsable(kSize);
+    for (size_t offset = 0; offset < kSize; offset += HostMem::kAlignment)
+    {
+        ASSERT_EQ(bytes[offset], pattern(offset)) << "byte at " << offset << " lost during the fill";
+    }
+}
+
+//! The initial fill is populated by helper threads ahead of the commits; a grow
+//! is not. Either way every unit must end up registered, and the contents below
+//! the old size must survive a grow from inside a fill chunk.
+TEST(KvCacheManagerV2HostMemTest, ParallelInitialFillThenGrow)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    constexpr size_t kChunk = HostMem::kFillChunkSize;
+    constexpr size_t kInitial = 2 * kChunk + kChunk / 2;
+    constexpr size_t kGrown = 4 * kChunk + kChunk / 4;
+
+    HostMem memory(kGrown, kInitial);
+    auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
+    for (size_t offset = 0; offset < kInitial; offset += HostMem::kAlignment)
+    {
+        bytes[offset] = static_cast<unsigned char>((offset / HostMem::kAlignment) * 7 + 1);
+    }
+
+    memory.resize(kGrown);
+    for (size_t offset = 0; offset < kGrown; offset += HostMem::kAlignment)
+    {
+        if (offset < kInitial)
+        {
+            ASSERT_EQ(bytes[offset], static_cast<unsigned char>((offset / HostMem::kAlignment) * 7 + 1))
+                << "byte at " << offset << " lost by the grow";
+        }
+        else
+        {
+            bytes[offset] = 0x5A;
+        }
+        unsigned int flags = 0;
+        ASSERT_EQ(cudaHostGetFlags(&flags, bytes + offset), cudaSuccess) << "unit at " << offset << " not registered";
+    }
+}
+
 } // namespace
