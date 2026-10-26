@@ -111,8 +111,16 @@ add_tllm_gtest(
   "unit;runtime;gpu")
 add_tllm_gtest(transposeKVKernelTest SOURCES transposeKVKernelTest.cpp
                FULL_STACK LABELS "unit;full-stack;gpu")
-add_tllm_gtest(utilsTest SOURCES utilsTest.cpp FULL_STACK LABELS
-               "unit;full-stack;gpu")
+add_tllm_gtest(
+  utilsTest
+  OWNER
+  runtime
+  SOURCES
+  utilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_numpy
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   virtualMemoryTest
   OWNER
