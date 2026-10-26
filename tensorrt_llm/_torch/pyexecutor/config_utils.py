@@ -990,6 +990,12 @@ def load_pretrained_config(model_name_or_path: str,
         vision_config = getattr(model_config, "vision_config", None)
         if getattr(vision_config, "num_hidden_layers", 0) > 0:
             model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
+    elif model_type == "muse_spark":
+        # The runtime reads a flat config; the translation from the composite
+        # one rejects any value the runtime does not implement.
+        from tensorrt_llm._torch.configs import MuseSparkOpenConfig
+        model_config = MuseSparkOpenConfig.from_open_format(config_dict)
+        model_config.architectures = ["MuseSparkForConditionalGeneration"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

@@ -842,7 +842,7 @@ class DecoderRunner(ScheduledModelRunner):
         The gather and its copy are queued before the forward pass, so the
         processors wait for the copy rather than for the forward pass.
         """
-        if self.start_beam_histories_callable is None or not self.mapping.is_last_pp_rank():
+        if self.start_beam_histories_callable is None or not self._mapping.is_last_pp_rank():
             return None
         beam_requests = [
             request
