@@ -5264,6 +5264,37 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert json.loads(result.calls[0].parameters) == {}
 
+    @pytest.mark.parametrize("nested", [
+        "opts:" + "{a:" * 5000 + "1" + "}" * 5000,
+        "tags:" + "[" * 5000 + "]" * 5000,
+    ],
+                             ids=["object", "array"])
+    def test_deeply_nested_arguments_do_not_raise(self, sample_tools, parser,
+                                                  nested):
+        """Arguments nested deeper than the recursion limit skip that call."""
+        text = ("Sure. " + _g4_tc("get_weather", nested) +
+                _g4_tc("search_web", f'query:{_g4_s("AI")}'))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == "Sure."
+        assert [(call.name, json.loads(call.parameters))
+                for call in result.calls] == [("search_web", {
+                    "query": "AI"
+                })]
+
+        streaming = Gemma4ToolParser()
+        names = []
+        for i in range(0, len(text), 4):
+            result = streaming.parse_streaming_increment(
+                text[i:i + 4], sample_tools)
+            names += [call.name for call in result.calls if call.name]
+        names += [
+            call.name for call in streaming.finish(sample_tools).calls
+            if call.name
+        ]
+        assert names[-1] == "search_web"
+
     def test_structure_info(self, parser):
         info_fn = parser.structure_info()
         info = info_fn("get_weather")
