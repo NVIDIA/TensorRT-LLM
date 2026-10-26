@@ -207,6 +207,12 @@ struct AttentionLayerConfig
     // Private working pages never constrain prefix matching or enter the tree.
     AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
 
+    // A layer whose model spreads pages round-robin over pageStride ranks holds a
+    // page only at the block ordinals b with b % pageStride == pagePhase: exactly
+    // this rank's share of the request's pages, block b being page b.
+    int pageStride = 1;
+    int pagePhase = 0;
+
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;
@@ -220,6 +226,28 @@ struct AttentionLayerConfig
             if (buf.isSparse != buffers.front().isSparse)
             {
                 throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
+            }
+        }
+        if (pageStride < 1 || pagePhase < 0 || pagePhase >= pageStride)
+        {
+            throw std::invalid_argument("AttentionLayerConfig: need pageStride >= 1 and 0 <= pagePhase < pageStride");
+        }
+        if (pageStride > 1)
+        {
+            bool const sparse = !buffers.empty() && buffers.front().isSparse;
+            bool const sinks = numSinkTokens.value_or(0) > 0;
+            if (slidingWindowSize.has_value() || sinks || sparse || reusePolicy != AttentionReusePolicy::PRIVATE)
+            {
+                throw std::invalid_argument(
+                    "AttentionLayerConfig: a pageStride above 1 requires a private, full-attention, dense layer");
+            }
+            for (auto const& buf : buffers)
+            {
+                if (buf.tokensPerBlockOverride.has_value())
+                {
+                    throw std::invalid_argument(
+                        "AttentionLayerConfig: a pageStride above 1 does not support tokensPerBlockOverride");
+                }
             }
         }
     }

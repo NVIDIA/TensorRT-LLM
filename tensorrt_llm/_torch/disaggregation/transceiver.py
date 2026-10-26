@@ -568,7 +568,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # prompt positions through beam 0's block table), so the
                 # positional path applies to every beam width.
                 ordinals = adapter.get_block_ordinals(req, idx, lg)
-                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
+                owned_pages = (
+                    self._owned_prompt_pages(req, idx, tpb) if remote_tail_start is None else None
+                )
+                group = self._positional_window(
+                    ordinals,
+                    prompt_blocks if owned_pages is None else owned_pages,
+                    cached_per_lg[idx] // tpb,
+                )
             groups.append(group)
 
         return Chunk(
@@ -578,6 +585,35 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             is_last=True,
             excluded_pool_views=excluded_pool_views,
         )
+
+    def _owned_prompt_pages(self, req: LlmRequest, layer_group_idx: int, tpb: int) -> Optional[int]:
+        """Prompt pages this rank holds of the model a layer group belongs to, if published.
+
+        A group's table lists its rank's pages of its model in order (entry
+        ``k`` is logical page ``k * cp_size + cp_rank``), so its window spans
+        the pages of the whole prompt that this rank's CP rank in that model's
+        layout owns. None for groups described by the rank-wide mapping.
+        """
+        owners = getattr(self._page_table, "owners", None)
+        if not isinstance(owners, list) or not owners:
+            return None
+        owner = next(
+            (
+                pv.owner
+                for pv in self._page_table.layer_groups[layer_group_idx].pool_views
+                if pv.owner is not None
+            ),
+            None,
+        )
+        if owner is None:
+            return None
+        layout = owners[owner]
+        mapping = self._mapping
+        cp_rank = mapping.rank % (mapping.tp_size * mapping.cp_size) % layout.cp_size
+        # A helix rank's prompt_len is its own share; the global length decides the pages.
+        prompt_len = req.total_input_len_cp if mapping.has_cp_helix() else req.prompt_len
+        prompt_pages = (prompt_len + tpb - 1) // tpb
+        return max(0, -(-(prompt_pages - cp_rank) // layout.cp_size))
 
     @staticmethod
     def _positional_window(
@@ -1612,6 +1648,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # a piece short of the whole prompt, so a prompt that fits one chunk would slip past it.
         if self._mapping.cp_size > 1:
             blockers.append(f"context parallelism (cp_size={self._mapping.cp_size})")
+        owners = getattr(self._kv_cache_manager, "get_disagg_owner_layouts", lambda: None)() or []
+        owner_cp = max((owner.cp_size for owner in owners), default=1)
+        if self._mapping.cp_size == 1 and owner_cp > 1:
+            blockers.append(f"a model with its own context parallelism (cp_size={owner_cp})")
         # Policies other than all_reusable defer the whole prompt's commit to the final
         # chunk. Committing a prefix block that a concurrent request already committed
         # rebases it onto that request's page and frees ours, which an earlier chunk's

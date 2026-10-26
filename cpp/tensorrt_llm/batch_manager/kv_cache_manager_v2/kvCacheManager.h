@@ -248,6 +248,28 @@ public:
     // Mirrors Python's clamp_max_seq_len_for_mem().
     int clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) const;
 
+    // ---- Strided admission ------------------------------------------------
+
+    // A strided lifecycle holds a different number of pages on each of the ranks that share its
+    // layout (its CP ranks), so admitting by the pages a rank actually allocates would let the
+    // ranks of one model disagree near capacity. Strided pool groups are instead admitted by a
+    // rank-independent charge: ceil(numBlocks / pageStride) per request and lifecycle, the most
+    // any of those ranks holds. The charge owns no storage; it bounds what may be allocated.
+
+    // Charge a request's growth from oldNumBlocks to newNumBlocks blocks (or release on shrink).
+    // Returns false, charging nothing, when growth exceeds a strided pool group's slots.
+    bool admitStridedBlocks(int oldNumBlocks, int newNumBlocks);
+    // Charged slots per pool group (zero for unstrided pool groups).
+    std::vector<int64_t> stridedAdmittedSlots() const;
+    // Hot-level utilization for admission: charged slots for strided pool groups, used slots
+    // for the others. Every rank of a strided layout sees the same value.
+    float admissionUtilization() const;
+
+    bool hasStridedLifeCycles() const noexcept
+    {
+        return !mStridedLifeCycles.empty();
+    }
+
     // ---- Resize -----------------------------------------------------------
 
     bool resize(CacheLevel level, size_t quota, bool bestEfforts = false);
@@ -463,6 +485,17 @@ private:
 
     TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
     TypedVec<PoolGroupIndex, float> mTargetRatioListCold;
+
+    // (lifecycle, pool group, page stride) of every strided lifecycle.
+    struct StridedLifeCycle
+    {
+        LifeCycleId lifeCycle;
+        PoolGroupIndex poolGroup;
+        int pageStride;
+    };
+
+    std::vector<StridedLifeCycle> mStridedLifeCycles;
+    TypedVec<PoolGroupIndex, SlotCount> mStridedAdmittedSlots;
 
     int mNumCreatedKvCaches{0};
     int mNumSampledKvCaches{0};

@@ -237,6 +237,7 @@ def _build_pool_views_for_variant(
     ignored_roles: frozenset[DataRole] = frozenset(),
     view_partition: Optional[Callable] = None,
     kv_heads_for_layer: Optional[Callable[[int], Optional[int]]] = None,
+    owner_for_layer: Optional[Callable[[int], Optional[int]]] = None,
 ) -> List[PoolView]:
     """Bucket one slot-desc variant's coalesced buffers into pool views.
 
@@ -248,7 +249,9 @@ def _build_pool_views_for_variant(
     model) so layers that differ in head geometry never share a view even
     when their buffers share a physical pool. ``kv_heads_for_layer`` gives a
     layer's per-rank KV-head count, which head-sharded views record; all
-    layers of a view must agree on it.
+    layers of a view must agree on it. ``owner_for_layer`` gives the index of
+    the model a layer belongs to, which head-sharded views record; the
+    partition keeps one model per view.
     """
     role_layouts = role_layouts or {}
     bucket_entries: Dict[tuple, list] = defaultdict(list)
@@ -332,6 +335,12 @@ def _build_pool_views_for_variant(
                     "in separate views"
                 )
             num_kv_heads = layer_heads.pop() if layer_heads else None
+        owner = None
+        if owner_for_layer is not None and mapper_kind != MapperKind.REPLICATED:
+            owners = {owner_for_layer(layer) for layer in bucket_layers[bucket_key]}
+            if len(owners) > 1:
+                raise ValueError(f"{context} mixes layers of different models {sorted(owners)}")
+            owner = owners.pop()
         pool_views.append(
             PoolView(
                 pool_idx=pool_idx,
@@ -344,6 +353,7 @@ def _build_pool_views_for_variant(
                 ),
                 bytes_per_head=layout.bytes_per_head,
                 num_kv_heads=num_kv_heads,
+                owner=owner,
             )
         )
 
@@ -397,6 +407,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     default_mapper_kind = role_mapper_kinds[Role.ALL]
     role_layouts = manager.get_disagg_role_layouts()
     view_partition = getattr(manager, "get_disagg_pool_view_partition", None)
+    owners = getattr(manager, "get_disagg_owner_layouts", lambda: None)()
+    owner_for_layer = manager.get_disagg_layer_owner if owners is not None else None
     for role, layout in role_layouts.items():
         if not isinstance(layout, RoleLayout):
             raise ValueError(f"Invalid disaggregation role layout {layout!r} for role {role!s}")
@@ -486,6 +498,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 ignored_roles=ignored_roles,
                 view_partition=view_partition,
                 kv_heads_for_layer=None if is_recurrent else _kv_heads_for_layer,
+                owner_for_layer=None if is_recurrent else owner_for_layer,
             )
             for pool_view in pool_views:
                 if pool_view.mapper_kind not in _MAPPER_KINDS_BY_CACHE_KIND[cache_kind]:
@@ -534,6 +547,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         tokens_per_block=config.tokens_per_block,
         layer_groups=layer_groups,
         pool_groups=pool_groups,
+        owners=list(owners or []),
     )
 
 

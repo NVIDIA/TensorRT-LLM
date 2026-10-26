@@ -1947,12 +1947,10 @@ void StorageManager::shrinkPoolGroup(
 // adjustCacheLevel — mirrors Python _storage_manager.py::adjust_cache_level
 // ---------------------------------------------------------------------------
 
-void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
-    TypedVec<PoolGroupIndex, float> const& ratioList,
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::slotCountsForQuota(
+    CacheLevel level, std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList) const
 {
-    auto& lvlStorage = *mLevels.at(level).storage;
-    auto oldNumSlots = lvlStorage.slotCountList();
+    auto const& lvlStorage = *mLevels.at(level).storage;
     size_t quota = newQuota.has_value()
         ? roundUp(newQuota.value(), static_cast<size_t>(lvlStorage.poolSizeGranularity()))
         : lvlStorage.totalQuota();
@@ -1972,7 +1970,16 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         throw std::invalid_argument("Quota " + std::to_string(quota) + " exceeds the reserved maximum of "
             + std::to_string(*maxQuota) + " for this cache level (raise the tier's max_quota)");
     }
-    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
+    return lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
+}
+
+void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
+    TypedVec<PoolGroupIndex, float> const& ratioList,
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
+{
+    auto& lvlStorage = *mLevels.at(level).storage;
+    auto oldNumSlots = lvlStorage.slotCountList();
+    auto newNumSlots = slotCountsForQuota(level, newQuota, ratioList);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
@@ -2031,6 +2038,11 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
         {
             // One recurrent-state block per beam.
             numRequiredBlocks = effBeamWidth;
+        }
+        else if (int const stride = pageStrideOf(lifeCycles[lifeCycle]); stride > 1)
+        {
+            // Strided (beam width 1, nothing stale): its admission bound, the same on every rank.
+            numRequiredBlocks = std::max(divUp(numBlocks, stride), 1);
         }
         else
         {
@@ -2201,6 +2213,16 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
                 ssmBlocks += static_cast<size_t>(std::max(1, kv.beamWidth));
             }
             numSlots[lcIdx] += slotCountValueFromSize(ssmBlocks);
+            continue;
+        }
+        if (int const stride = pageStrideOf(lc); stride > 1)
+        {
+            // Strided lifecycles are private (no shared prefix), beam width 1 and have
+            // nothing stale: each request counts its admission bound.
+            for (auto const& kv : batch.kvCaches)
+            {
+                numSlots[lcIdx] += static_cast<SlotCount>(divUp(divUp(kv.capacity, tokensPerBlock), stride));
+            }
             continue;
         }
         // Shared sys blocks (counted once): union of non-stale sys blocks across all requests.

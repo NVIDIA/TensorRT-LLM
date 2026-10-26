@@ -35,7 +35,7 @@ import numpy as np
 import torch
 from strenum import StrEnum
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, OwnerLayout, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
@@ -1407,7 +1407,91 @@ def _spec_recompute_claim_limit(
     return max(0, (req.prompt_len - tail) // tokens_per_block * tokens_per_block)
 
 
+@dataclass(frozen=True)
+class OwnerPageLayout:
+    """How one manager places each owner's pages (see ``owner_page_layout``).
+
+    ``ledger_cp`` is the number of CP ranks a native block spans (one page on
+    each). ``strides`` and ``phases`` give, per local layer, the block stride
+    at which the layer holds pages and the phase it holds them at.
+    """
+
+    ledger_cp: int
+    strides: tuple[int, ...]
+    phases: tuple[int, ...]
+
+    @property
+    def is_strided(self) -> bool:
+        return any(stride > 1 for stride in self.strides)
+
+
+def owner_page_layout(
+    layer_specs: Optional[Sequence[KVCacheLayerSpec]],
+    owner_mappings: Optional[Dict[KVCacheLayerOwner, Mapping]],
+    mapping: Mapping,
+) -> OwnerPageLayout:
+    """Place every owner's exact pages in one manager.
+
+    An owner whose ``Mapping`` splits pages over CP holds global page ``p`` on
+    its CP rank ``p % cp_size``; an owner without CP holds every page. When all
+    owners split pages over the manager's helix CP (or none has CP), a native
+    block is ``cp_size`` global pages, one per rank (the helix ledger), and
+    every layer holds a page per block. Otherwise a native block is one global
+    page, and each layer holds the blocks of its owner's pages on this rank:
+    stride ``cp_size``, phase this rank's CP rank in the owner's mapping. No
+    owner's pages are rounded to another owner's layout.
+
+    Raises:
+        ValueError: When an owner mapping does not run on this rank's PP stage
+            or splits pages other than round-robin.
+    """
+    if layer_specs is None:
+        return OwnerPageLayout(1, (), ())
+    helix_cp = mapping.cp_size if mapping.has_cp_helix() else 1
+    owner_mappings = dict(owner_mappings or {})
+    stage_size = mapping.tp_size * mapping.cp_size
+    owners = {layer.owner for layer in layer_specs}
+    for owner in owners:
+        owner_mapping = owner_mappings.setdefault(owner, mapping)
+        if (
+            owner_mapping.rank != mapping.rank
+            or owner_mapping.world_size != mapping.world_size
+            or owner_mapping.pp_size != mapping.pp_size
+            or owner_mapping.tp_size * owner_mapping.cp_size != stage_size
+        ):
+            raise ValueError(
+                f"the {owner.value} mapping (rank {owner_mapping.rank}, tp_size="
+                f"{owner_mapping.tp_size}, cp_size={owner_mapping.cp_size}, pp_size="
+                f"{owner_mapping.pp_size}) does not run on the ranks of the manager's mapping "
+                f"(rank {mapping.rank}, tp_size={mapping.tp_size}, cp_size={mapping.cp_size}, "
+                f"pp_size={mapping.pp_size})"
+            )
+        if owner_mapping.enable_attention_dp != mapping.enable_attention_dp:
+            raise ValueError(
+                f"the {owner.value} mapping's enable_attention_dp differs from the manager's"
+            )
+        if owner_mapping.cp_size > 1 and not owner_mapping.has_cp_helix():
+            raise ValueError(
+                f"the {owner.value} mapping splits pages over cp_size={owner_mapping.cp_size} "
+                "without the helix (round-robin) page layout"
+            )
+    owner_cps = {owner_mappings[owner].cp_size for owner in owners}
+    ledger_cp = helix_cp if owner_cps <= {helix_cp} else 1
+    strides = []
+    phases = []
+    for layer in layer_specs:
+        owner_mapping = owner_mappings[layer.owner]
+        stride = 1 if owner_mapping.cp_size == ledger_cp else owner_mapping.cp_size
+        strides.append(stride)
+        phases.append(owner_mapping.cp_rank if stride > 1 else 0)
+    return OwnerPageLayout(ledger_cp, tuple(strides), tuple(phases))
+
+
 class KVCacheManagerV2(BaseResourceManager):
+    # Declared on the class so instances built without running __init__ (tests)
+    # see a manager whose owners all follow its mapping.
+    owner_mappings: Dict["KVCacheLayerOwner", Mapping] = {}
+    _page_layout: OwnerPageLayout = OwnerPageLayout(1, (), ())
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
@@ -1487,12 +1571,31 @@ class KVCacheManagerV2(BaseResourceManager):
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        owner_mappings: Optional[Dict[KVCacheLayerOwner, Mapping]] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
         self.layer_specs = tuple(layer_specs) if layer_specs is not None else None
+        # Each owner's actual model mapping (the manager's mapping by default).
+        # It decides which pages and heads of the owner's layers this rank holds.
+        if owner_mappings and self.layer_specs is None:
+            raise ValueError("owner_mappings requires explicit layer_specs")
+        self.owner_mappings: Dict[KVCacheLayerOwner, Mapping] = {
+            owner: (owner_mappings or {}).get(owner, mapping)
+            for owner in {layer.owner for layer in self.layer_specs or ()}
+        }
+        self._page_layout = owner_page_layout(self.layer_specs, self.owner_mappings, mapping)
+        if self._page_layout.is_strided:
+            # Beams would multiply strided pages per rank, past the admission
+            # charge every rank shares (KvCacheManager::admitStridedBlocks).
+            # Block reuse is rejected with helix below.
+            if max_beam_width > 1:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support beam search when target and draft split "
+                    "their pages over different context-parallel sizes"
+                )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
@@ -1603,7 +1706,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._has_cp_helix = mapping.has_cp_helix()
         self._helix_cp_rank = mapping.cp_rank if self._has_cp_helix else 0
         self._helix_cp_size = mapping.cp_size if self._has_cp_helix else 1
-        self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
+        # A ledger block spans ledger_cp ranks: the helix CP when every owner
+        # splits pages over it, else one page (each owner strided, see
+        # owner_page_layout).
+        self._ledger_tokens_per_block = tokens_per_block * (
+            1 if self._page_layout.is_strided else self._helix_cp_size
+        )
         if self._has_cp_helix:
             if kv_cache_config.enable_block_reuse:
                 raise ValueError(
@@ -2754,8 +2862,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         if self.layer_specs is not None:
+            # A strided layer holds one page per stride global pages on a rank.
             return (
-                [layer.bytes_per_token() for layer in self.layer_specs],
+                [
+                    -(-layer.bytes_per_token() // stride)
+                    for layer, stride in zip(
+                        self.layer_specs,
+                        self._page_layout.strides or (1,) * len(self.layer_specs),
+                    )
+                ],
                 list(self.max_attention_window_vec),
             )
         layer_sizes = []
@@ -2775,11 +2890,14 @@ class KVCacheManagerV2(BaseResourceManager):
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
         tokens = self._get_max_tokens_from_quota_impl(quota)
         if self._has_cp_helix and not math.isinf(tokens):
+            # A ledger block spans the helix CP ranks, one page on each, unless
+            # target and draft split pages differently (see owner_page_layout).
+            ledger_cp = self._ledger_tokens_per_block // self.tokens_per_block
             # Floor to whole physical pages before scaling: a ledger block
             # allocates one full page on every CP rank, so a partial
             # trailing page in the rank-local budget is never usable.
             tokens = int(tokens) // self.tokens_per_block * self.tokens_per_block
-            tokens *= self._helix_cp_size
+            tokens *= ledger_cp
         return tokens
 
     def _get_max_tokens_from_quota_impl(self, quota: int) -> float:
@@ -3295,7 +3413,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     ],
                     sliding_window_size=self.max_attention_window_vec[local_layer_id],
                     num_sink_tokens=layer.num_sink_tokens,
-                    reuse_policy=layer.reuse_policy,
+                    # Strided pages hold one rank's share of a request: private.
+                    reuse_policy=(
+                        layer.reuse_policy
+                        if self._page_layout.strides[local_layer_id] == 1
+                        else AttentionReusePolicy.PRIVATE
+                    ),
+                    page_stride=self._page_layout.strides[local_layer_id],
+                    page_phase=self._page_layout.phases[local_layer_id],
                 )
                 for local_layer_id, layer in enumerate(self.layer_specs)
             ]
@@ -3527,6 +3652,38 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             return None
         return layer_specs[int(layer_id)].owner.value
+
+    def get_layer_group_page_stride_phase(self, layer_group_id: int) -> Tuple[int, int]:
+        """(stride, phase) of the block ordinals at which a layer group holds pages."""
+        if not self._page_layout.strides:
+            return 1, 0
+        local_layer_id = int(self.impl.layer_grouping[layer_group_id][0])
+        return (
+            self._page_layout.strides[local_layer_id],
+            self._page_layout.phases[local_layer_id],
+        )
+
+    def get_disagg_owner_layouts(self) -> Optional[List[OwnerLayout]]:
+        """Layouts of the models whose layers this manager holds, target first.
+
+        Published whenever the manager holds owner-tagged layers, also when
+        they match the manager's mapping, so a peer can tell a peer that
+        routes by model layouts from one that cannot. None otherwise.
+        """
+        if not self.owner_mappings:
+            return None
+        return [
+            OwnerLayout.from_mapping(self.owner_mappings[owner])
+            for owner in KVCacheLayerOwner
+            if owner in self.owner_mappings
+        ]
+
+    def get_disagg_layer_owner(self, layer_id: LayerId) -> Optional[int]:
+        """Index into ``get_disagg_owner_layouts()`` of a local layer's owner."""
+        if self.get_disagg_owner_layouts() is None:
+            return None
+        owners = [owner for owner in KVCacheLayerOwner if owner in self.owner_mappings]
+        return owners.index(self.layer_specs[int(layer_id)].owner)
 
     def get_layer_cache_spec(self, global_layer_id: int) -> KVCacheLayerSpec:
         """Return an explicitly supplied rank-local layer specification."""
@@ -6108,6 +6265,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 release_resources(req)
                 return None
             dummy_capacity = token_num + self._kv_alloc_extra_tokens
+            if self._has_cp_helix and self._ledger_tokens_per_block == self.tokens_per_block:
+                # A dummy's frozen helix fields give every CP rank token_num
+                # tokens, so it spans whole helix ledgers (a page per rank each)
+                # even where a block is one page.
+                ledger = self.tokens_per_block * self._helix_cp_size
+                dummy_capacity = -(-dummy_capacity // ledger) * ledger
             if is_gen and not materialize_history:
                 kv_cache.enable_swa_scratch_reuse = False
             # Need to hint the committed history to activate stale-block

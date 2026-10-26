@@ -1414,11 +1414,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
             nb::arg("tokens_per_block"), nb::arg("is_sparse") = false,
-            nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
+            nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED, nb::arg("page_stride") = 1,
+            nb::arg("page_phase") = 0)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
         .def_ro("is_sparse", &kv::AttnLifeCycle::isSparse)
         .def_ro("reuse_policy", &kv::AttnLifeCycle::reusePolicy)
+        .def_ro("page_stride", &kv::AttnLifeCycle::pageStride)
+        .def_ro("page_phase", &kv::AttnLifeCycle::pagePhase)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1627,14 +1630,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
-                 kv::AttentionReusePolicy>(),
+                 kv::AttentionReusePolicy, int, int>(),
             nb::arg("layer_id"), nb::arg("buffers"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED,
+            nb::arg("page_stride") = 1, nb::arg("page_phase") = 0)
         .def_rw("layer_id", &kv::AttentionLayerConfig::layerId)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)
         .def_rw("num_sink_tokens", &kv::AttentionLayerConfig::numSinkTokens)
         .def_rw("reuse_policy", &kv::AttentionLayerConfig::reusePolicy)
+        .def_rw("page_stride", &kv::AttentionLayerConfig::pageStride)
+        .def_rw("page_phase", &kv::AttentionLayerConfig::pagePhase)
         .def_prop_ro("window_size", &kv::AttentionLayerConfig::windowSize) DEF_COPY(kv::AttentionLayerConfig);
 
     nb::enum_<kv::LayerType>(m, "LayerType")
@@ -2914,6 +2920,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             })
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_strided_admitted_slots", &kv::KvCacheManager::stridedAdmittedSlots,
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
         .def_prop_ro("enable_partial_match", &kv::KvCacheManager::enablePartialMatch)
         .def_prop_ro("enable_partial_commit", &kv::KvCacheManager::enablePartialCommit)

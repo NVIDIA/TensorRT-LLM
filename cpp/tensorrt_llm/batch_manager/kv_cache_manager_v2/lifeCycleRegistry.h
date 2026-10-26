@@ -42,6 +42,28 @@ struct AttnLifeCycle
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
     bool isSparse = false;
     AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+    // Pages exist only at block ordinals congruent to pagePhase modulo pageStride.
+    int pageStride = 1;
+    int pagePhase = 0;
+
+    //! Whether the lifecycle keeps a page at block ordinal `ordinal`.
+    bool holdsPage(BlockOrdinal ordinal) const noexcept
+    {
+        return ordinal.value() % pageStride == pagePhase;
+    }
+
+    //! Pages held at block ordinals [0, numBlocks).
+    int numPagesBelow(int numBlocks) const noexcept
+    {
+        return numBlocks <= pagePhase ? 0 : divUp(numBlocks - pagePhase, pageStride);
+    }
+
+    //! Entry of a held ordinal in the page index buffer: a strided lifecycle lists
+    //! only its pages, the k-th held ordinal at entry k.
+    int pageIndexEntry(BlockOrdinal ordinal) const noexcept
+    {
+        return pageStride == 1 ? ordinal.value() : numPagesBelow(ordinal.value());
+    }
 
     bool isPrivate() const noexcept
     {
@@ -75,7 +97,7 @@ struct AttnLifeCycle
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
         return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && isSparse == o.isSparse
-            && reusePolicy == o.reusePolicy;
+            && reusePolicy == o.reusePolicy && pageStride == o.pageStride && pagePhase == o.pagePhase;
     }
 
     bool operator<(AttnLifeCycle const& o) const noexcept
@@ -92,18 +114,23 @@ struct AttnLifeCycle
         {
             return isSparse < o.isSparse;
         }
-        return reusePolicy < o.reusePolicy;
+        if (reusePolicy != o.reusePolicy)
+        {
+            return reusePolicy < o.reusePolicy;
+        }
+        return std::pair(pageStride, pagePhase) < std::pair(o.pageStride, o.pagePhase);
     }
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock,
-        bool isSparse = false, AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED)
+        bool isSparse = false, AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED, int pageStride = 1,
+        int pagePhase = 0)
     {
         TLLM_CHECK_DEBUG(tokensPerBlock > 0);
         TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
         TLLM_CHECK_DEBUG(!numSinkTokens.has_value() || *numSinkTokens >= 0);
         TLLM_CHECK_DEBUG((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
-        return AttnLifeCycle{ws, sinkBlocks, isSparse, reusePolicy};
+        return AttnLifeCycle{ws, sinkBlocks, isSparse, reusePolicy, pageStride, pagePhase};
     }
 };
 
@@ -145,6 +172,20 @@ inline bool requiresPrefixCoverage(LifeCycle const& lc)
 {
     auto const* attn = std::get_if<AttnLifeCycle>(&lc);
     return !attn || attn->requiresPrefixCoverage();
+}
+
+//! The page stride of a lifecycle: above 1 for an attention layer that holds a page every pageStride blocks.
+inline int pageStrideOf(LifeCycle const& lc)
+{
+    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+    return attn ? attn->pageStride : 1;
+}
+
+//! Whether a lifecycle keeps a page at a block ordinal (always, unless it is strided).
+inline bool holdsPage(LifeCycle const& lc, BlockOrdinal ordinal)
+{
+    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+    return !attn || attn->holdsPage(ordinal);
 }
 
 // Free function: compute stale range via std::visit.

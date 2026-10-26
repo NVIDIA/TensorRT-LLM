@@ -88,7 +88,12 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    CacheKind,
+    KVCachePageTable,
+    MapperKind,
+    pair_owned_pages,
+)
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -1338,10 +1343,11 @@ class Sender(SenderBase):
         # Only a piece short of the whole prompt runs the chunk projection below, and that is the
         # part with no answer under CP; a sole piece covering everything takes the untouched path.
         is_partial = token_range.start > 0 or token_range.end < task._prompt_len
-        if is_partial and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
+        if is_partial and self._registrar.splits_pages(peer_ri):
             raise ValueError(
                 "enable_pipelined_transfer is not supported with context parallelism "
-                f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
+                f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size}"
+                + (", in a model's own layout)" if self_ri.cp_size == peer_ri.cp_size == 1 else ")")
             )
         timer = task._perf_timer
         if timer:
@@ -1395,16 +1401,29 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
-                    # Helix: the receiver owns global blocks [cp_rank::cp_size]
-                    # (same protocol as partition_context_for_helix), so its
-                    # table is the strided subset of ours; block reuse is
-                    # rejected under helix.
-                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
                 tpb = extractor.page_table.tokens_per_block
                 dst_start_block = (
                     req_info.dst_start_token // tpb if req_info.dst_start_token is not None else 0
                 )
+                view_ris = self._registrar.view_rank_infos(peer_ri).get(
+                    (self_lg, self_pi), (self_ri, peer_ri)
+                )
+                if view_ris[0].cp_size > 1 or view_ris[1].cp_size > 1:
+                    # Each table lists its rank's pages of the view's model:
+                    # entry k is logical page k * cp_size + cp_rank (the helix
+                    # layout, as partition_context_for_helix splits a prompt).
+                    # Pair the pages both ranks hold; block reuse is rejected
+                    # wherever a model's pages are split.
+                    if dst_start_block > 0:
+                        raise ValueError(
+                            "a reused prefix cannot be transferred into pages split over CP ranks"
+                        )
+                    src_block_ids, dst_block_ids = pair_owned_pages(
+                        src_block_ids,
+                        dst_block_ids,
+                        (view_ris[0].cp_size, view_ris[0].cp_rank),
+                        (view_ris[1].cp_size, view_ris[1].cp_rank),
+                    )
                 # Both tables are positional (index == block ordinal, -1 == not
                 # held), so pairing is a plain intersection: SWA eviction, prefix
                 # reuse, and pipelined chunk bounds are all already encoded as
@@ -2776,6 +2795,9 @@ class Receiver(ReceiverBase):
         the mismatched case, so this only needs the count to split evenly."""
         # Any duplicated head, rank-wide or in a single view pair, leaves some
         # writers without a share (sender side) or doubles one (receiver side).
+        # Writers paired through different models' layouts send different shares.
+        if not getattr(overlap, "uniform_writers", True):
+            return False
         view_factors = getattr(overlap, "view_duplicate_head_factors", {}).values()
         if overlap.duplicate_head_factor != 1 or any(
             factor != 1 for pair in view_factors for factor in pair
@@ -2882,6 +2904,8 @@ class Receiver(ReceiverBase):
         # sender, the rest empty), so the fan-in equal split would overflow
         # into neighboring reservations; use the per-fragment path.
         cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
+        splits_pages = getattr(self._registrar, "splits_pages", None)
+        cp_involved = cp_involved or (splits_pages is not None and splits_pages(peer_infos))
         allow_bounce = task.expected_transfers == 1 or (
             sender_dp_rank is not None
             and not cp_involved

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import FrozenSet, List, Optional, Tuple
@@ -207,6 +208,10 @@ class PoolView:
             draft layers) may shard or replicate heads differently. ``None``
             in tables from older builders and for views without KV heads;
             consumers then fall back to ``AttentionInfo.kv_heads_per_rank``.
+        owner: Attention K/V views only. Index into
+            ``KVCachePageTable.owners`` of the layout of the model whose layers
+            the view holds. ``None`` when the table publishes no owners; the
+            rank-wide ``RankInfo`` mapping then describes the view.
     """
 
     pool_idx: int
@@ -217,6 +222,7 @@ class PoolView:
     section_bytes: Optional[List[int]] = None
     bytes_per_head: Optional[int] = None
     num_kv_heads: Optional[int] = None
+    owner: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -234,6 +240,7 @@ class PoolView:
                 int(self.bytes_per_head) if self.bytes_per_head is not None else None
             ),
             "num_kv_heads": int(self.num_kv_heads) if self.num_kv_heads is not None else None,
+            "owner": int(self.owner) if self.owner is not None else None,
         }
 
     @staticmethod
@@ -263,7 +270,102 @@ class PoolView:
             num_kv_heads=(
                 int(data["num_kv_heads"]) if data.get("num_kv_heads") is not None else None
             ),
+            owner=int(data["owner"]) if data.get("owner") is not None else None,
         )
+
+
+@dataclass(frozen=True)
+class OwnerLayout:
+    """How a model's ``Mapping`` lays its attention out over the ranks of a PP stage.
+
+    Derived from the model's actual mapping, never configured on its own: the
+    TP and CP sizes and whether attention DP gives every TP rank its own
+    requests. Ranks are CP-minor like ``Mapping``: stage rank ``r`` is TP rank
+    ``r // cp_size`` and CP rank ``r % cp_size``, and CP rank ``c`` holds the
+    logical pages ``p`` with ``p % cp_size == c`` (the helix layout). A model
+    run without CP on ranks its sibling uses for CP has ``cp_size`` 1 and holds
+    every page on each of those ranks.
+    """
+
+    tp_size: int
+    cp_size: int = 1
+    enable_attention_dp: bool = False
+
+    @staticmethod
+    def from_mapping(mapping) -> "OwnerLayout":
+        return OwnerLayout(
+            tp_size=int(mapping.tp_size),
+            cp_size=int(mapping.cp_size),
+            enable_attention_dp=bool(mapping.enable_attention_dp),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "tp_size": self.tp_size,
+            "cp_size": self.cp_size,
+            "enable_attention_dp": self.enable_attention_dp,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "OwnerLayout":
+        return OwnerLayout(
+            tp_size=int(data["tp_size"]),
+            cp_size=int(data["cp_size"]),
+            enable_attention_dp=bool(data["enable_attention_dp"]),
+        )
+
+
+def cp_ranks_sharing_pages(self_cp_size: int, self_cp_rank: int, peer_cp_size: int) -> List[int]:
+    """Peer CP ranks holding a logical page that this CP rank also holds.
+
+    CP rank ``c`` of ``n`` holds the pages ``p`` with ``p % n == c``. Two such
+    residue classes intersect exactly when they agree modulo ``gcd`` of the
+    two CP sizes; this is not the contiguous partition used for TP.
+    """
+    common = math.gcd(self_cp_size, peer_cp_size)
+    return [rank for rank in range(peer_cp_size) if rank % common == self_cp_rank % common]
+
+
+def pair_owned_pages(
+    src_table: np.ndarray,
+    dst_table: np.ndarray,
+    src_layout: Tuple[int, int],
+    dst_layout: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Align two per-rank page tables on the logical pages both ranks hold.
+
+    A table with layout ``(cp_size, cp_rank)`` lists that rank's pages in
+    order: entry ``k`` is logical page ``k * cp_size + cp_rank``, ``-1`` where
+    the rank holds no block. The result lists, in page order, the entries of
+    every logical page present in both tables.
+
+    Raises:
+        ValueError: When the tables cover different numbers of shared pages,
+            i.e. they do not describe the same prompt.
+    """
+    (src_cp, src_rank), (dst_cp, dst_rank) = src_layout, dst_layout
+    period = math.lcm(src_cp, dst_cp)
+    first = next(
+        (page for page in range(period) if page % src_cp == src_rank and page % dst_cp == dst_rank),
+        None,
+    )
+    empty = np.array([], dtype=np.int64)
+    if first is None:
+        return empty, empty
+
+    def shared_pages(table: np.ndarray, cp_size: int) -> int:
+        # Shared pages first + period * m below the table's coverage.
+        return max(0, -(-(table.size * cp_size - first) // period))
+
+    count = shared_pages(src_table, src_cp)
+    if count != shared_pages(dst_table, dst_cp):
+        raise ValueError(
+            f"page tables of {src_table.size} (layout {src_layout}) and {dst_table.size} "
+            f"(layout {dst_layout}) entries share different numbers of pages; both sides must "
+            "describe the same prompt"
+        )
+    pages = first + period * np.arange(count, dtype=np.int64)
+    return src_table[(pages - src_rank) // src_cp], dst_table[(pages - dst_rank) // dst_cp]
 
 
 @dataclass
@@ -377,15 +479,39 @@ class MambaLayerGroup(LayerGroup):
 
 @dataclass
 class KVCachePageTable:
+    """A rank's KV-cache layout as published to transfer peers.
+
+    ``owners`` lists the layouts of the models whose layers the cache holds,
+    referenced by the attention views' ``owner``. It is empty when every view
+    follows the rank-wide mapping.
+    """
+
     tokens_per_block: int
     layer_groups: List[LayerGroup]
     pool_groups: List[PhysicalPoolGroup]  # indexed by LayerGroup.pool_group_idx
+    owners: List[OwnerLayout] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for layer_group in self.layer_groups:
+            for pool_view in layer_group.pool_views:
+                owner = getattr(pool_view, "owner", None)
+                if owner is not None and not 0 <= owner < len(self.owners):
+                    raise ValueError(
+                        f"pool view {sorted(pool_view.pool_role)} references owner {owner}, "
+                        f"but the page table has {len(self.owners)}"
+                    )
+
+    def view_owner(self, layer_group_idx: int, pool_idx: int) -> Optional[OwnerLayout]:
+        """The layout of the model a view belongs to, or None when the rank-wide one applies."""
+        owner = getattr(self.layer_groups[layer_group_idx].pool_views[pool_idx], "owner", None)
+        return self.owners[owner] if owner is not None else None
 
     def to_dict(self) -> dict:
         return {
             "tokens_per_block": int(self.tokens_per_block),
             "layer_groups": [lg.to_dict() for lg in self.layer_groups],
             "pool_groups": [pg.to_dict() for pg in self.pool_groups],
+            "owners": [owner.to_dict() for owner in self.owners],
         }
 
     @staticmethod
@@ -394,4 +520,5 @@ class KVCachePageTable:
             tokens_per_block=int(data["tokens_per_block"]),
             layer_groups=[LayerGroup.from_dict(lg) for lg in data.get("layer_groups", [])],
             pool_groups=[PhysicalPoolGroup.from_dict(pg) for pg in data.get("pool_groups", [])],
+            owners=[OwnerLayout.from_dict(owner) for owner in data.get("owners", [])],
         )

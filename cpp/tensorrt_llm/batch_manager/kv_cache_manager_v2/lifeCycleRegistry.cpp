@@ -41,8 +41,8 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
             else
             {
                 bool const isSparse = !cfg.buffers.empty() && cfg.buffers.front().isSparse;
-                return AttnLifeCycle::make(
-                    cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, isSparse, cfg.reusePolicy);
+                return AttnLifeCycle::make(cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, isSparse,
+                    cfg.reusePolicy, cfg.pageStride, cfg.pagePhase);
             }
         },
         layer);

@@ -26,7 +26,13 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import Atte
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    CacheKind,
+    MapperKind,
+    OwnerLayout,
+    PoolView,
+    cp_ranks_sharing_pages,
+)
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_layer_to_layer_group,
@@ -49,6 +55,15 @@ class PeerOverlap:
     # differ from the rank-wide ones above, keyed by (self layer group, self
     # pool view). Views without an entry use the rank-wide factors.
     view_duplicate_head_factors: Dict["LGPoolKey", Tuple[int, int]] = field(default_factory=dict)
+    # Peer ranks the rank-wide mapping pairs; ``ranks`` is their union with
+    # every ``view_ranks`` entry.
+    rank_wide_ranks: List[int] = field(default_factory=list)
+    # Peer ranks of the view pairs whose models are laid out other than the
+    # rank-wide mapping, keyed by (self layer group, self pool view).
+    view_ranks: Dict["LGPoolKey", List[int]] = field(default_factory=dict)
+    # Whether every writer sends the same share of every view, so a receiver
+    # may split one region equally among them.
+    uniform_writers: bool = True
 
     def duplicate_head_factors_for(self, pool_key: "LGPoolKey") -> Tuple[int, int]:
         """(self, peer) duplication factors of one view pair."""
@@ -80,10 +95,22 @@ class PeerRegistrar:
         self._lg_pool_mapping_cache: Dict[
             str, Dict[LGPoolKey, LGPoolKey]
         ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
+        # peer_key -> {(self_lg, self_pi) -> (self, peer) as laid out by the view's model}
+        self._view_ri_cache: Dict[str, Dict[LGPoolKey, Tuple[RankInfo, RankInfo]]] = {}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
         assert self._self_ext_cache is not None
-        if not self._check_peer_compatible(peer_ri):
+        # Routing cached for an earlier registration under this name may
+        # describe another layout; it is recomputed from peer_ri. A rejected
+        # registration must not leave routing of the rejected layout behind.
+        self._drop_routing(peer_name, peer_rank, peer_ri.dp_size)
+        try:
+            compatible = self._check_peer_compatible(peer_ri)
+        except ValueError:
+            self._drop_routing(peer_name, peer_rank, peer_ri.dp_size)
+            raise
+        if not compatible:
+            self._drop_routing(peer_name, peer_rank, peer_ri.dp_size)
             raise ValueError(
                 f"PeerRegistrar.register: peer {peer_name} (rank={peer_rank}) is incompatible with local rank."
             )
@@ -126,6 +153,15 @@ class PeerRegistrar:
                 key=f"native-nhd-head-mismatch-{heads_key}-{nhd_fragments_per_token}",
             )
 
+    def _drop_routing(self, peer_name: str, peer_rank: int, peer_dp_size: int) -> None:
+        key = self._unique_key(peer_name, peer_rank)
+        self._lg_pool_mapping_cache.pop(key, None)
+        self._view_ri_cache.pop(key, None)
+        for map_key in [k for k in self._kv_map_cache if k[0] == key]:
+            del self._kv_map_cache[map_key]
+        for dp_rank in range(max(1, peer_dp_size)):
+            self._overlap_cache.pop(self._unique_key(peer_name, dp_rank), None)
+
     def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
         return self._peer_ext_cache[self._unique_key(peer_name, peer_rank)]
 
@@ -147,6 +183,7 @@ class PeerRegistrar:
             del self._kv_map_cache[k]
         if key in self._lg_pool_mapping_cache:
             del self._lg_pool_mapping_cache[key]
+        self._view_ri_cache.pop(key, None)
 
     def get_peer_rank_info(self, peer_name: str, peer_rank: int):
         return self._peer_ri_cache[self._unique_key(peer_name, peer_rank)]
@@ -196,6 +233,7 @@ class PeerRegistrar:
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
         self._validate_view_head_geometry(peer_ri)
+        self.view_rank_infos(peer_ri)
         if self._ri.num_draft_layers != peer_ri.num_draft_layers:
             # The layer-count tolerance below would transfer only the target
             # layers and leave the drafter's prompt KV unset on the receiver.
@@ -521,8 +559,15 @@ class PeerRegistrar:
             pool_idx=peer_pi,
         )
 
-        # Polymorphic dispatch: attention vs mamba policy
+        # Polymorphic dispatch: attention vs mamba policy. Attention views use
+        # their own model's layout on both sides for head placement.
         policy = self._get_policy(self_lg.kind)
+        mapper_peer_ri = peer_ri
+        if self_lg.kind == CacheKind.PAGED:
+            view_ris = self.view_rank_infos(peer_ri).get(self_pool_key)
+            if view_ris is not None:
+                policy = AttentionPolicy(view_ris[0])
+                mapper_peer_ri = view_ris[1]
 
         # For mamba, compute ptr-array layer offsets for partial PP overlap.
         # extract_slot returns ptrs for ALL local_layer_ids in sorted order;
@@ -545,7 +590,7 @@ class PeerRegistrar:
             )
 
         mapper = policy.build_mapper(
-            peer_ri=peer_ri,
+            peer_ri=mapper_peer_ri,
             mapper_kind=self_pv.mapper_kind,
             self_layer_offsets=self_layer_offsets,
             peer_layer_offsets=peer_layer_offsets,
@@ -633,31 +678,26 @@ class PeerRegistrar:
         peer_start_pp = tgt_pp_ranks[0]
         overlap_pp_size = len(tgt_pp_ranks)
         peer_end_pp = peer_start_pp + overlap_pp_size
+        pp_ranks = range(peer_start_pp, peer_end_pp)
 
-        self_tp_per_dp = self._ri.tp_size_per_dp_group
-        peer_tp_per_dp = peer_ri.tp_size_per_dp_group
-        self_tp_rank_in_dp = self._ri.tp_rank % self_tp_per_dp
-
-        overlap_tp_size, peer_start_tp, peer_end_tp = self._find_overlap(
-            self_tp_per_dp, peer_tp_per_dp, self_tp_rank_in_dp, peer_dp_rank
+        overlap_tp_size, overlap_cp_size, ranks = self._paired_ranks(
+            self._ri, peer_ri, peer_dp_rank, pp_ranks
         )
-        overlap_cp_size, peer_start_cp, peer_end_cp = self._find_overlap(
-            self._ri.cp_size, peer_ri.cp_size, self._ri.cp_rank
-        )
-
-        ranks: List[int] = []
-        for pp in range(peer_start_pp, peer_end_pp):
-            for tp in range(peer_start_tp, peer_end_tp):
-                for cp in range(peer_start_cp, peer_end_cp):
-                    # CP-minor flat rank (ppRank*(TP*CP) + tpRank*CP +
-                    # cpRank), matching Mapping and the C++ transceiver; a
-                    # TP-minor formula mis-routes when tp > 1 and cp > 1.
-                    # Loop nesting mirrors the layout so ranks come out in
-                    # ascending order.
-                    ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + tp * peer_ri.cp_size + cp)
-
         dup_head, peer_dup_head = self._get_policy(CacheKind.PAGED).duplicate_head_factors(peer_ri)
         view_dup_factors = self._view_duplicate_head_factors(peer_ri, (dup_head, peer_dup_head))
+
+        # Views of a model laid out other than the rank-wide mapping pair with
+        # the peer ranks of that model's layout.
+        view_ranks: Dict[LGPoolKey, List[int]] = {}
+        uniform_writers = self._ri.cp_size == peer_ri.cp_size == 1
+        for pool_key, (self_vri, peer_vri) in self.view_rank_infos(peer_ri).items():
+            view_ranks[pool_key] = self._paired_ranks(self_vri, peer_vri, peer_dp_rank, pp_ranks)[2]
+            # Round-robin pages give the writers of a split view different page counts.
+            uniform_writers = uniform_writers and self_vri.cp_size == peer_vri.cp_size == 1
+        all_ranks = sorted(set(ranks).union(*view_ranks.values()))
+        uniform_writers = uniform_writers and all(
+            view_set == all_ranks for view_set in (ranks, *view_ranks.values())
+        )
 
         targets = PeerOverlap(
             overlap_pp_size=overlap_pp_size,
@@ -665,11 +705,117 @@ class PeerRegistrar:
             overlap_cp_size=overlap_cp_size,
             duplicate_head_factor=dup_head,
             peer_duplicate_head_factor=peer_dup_head,
-            ranks=ranks,
+            ranks=all_ranks,
             view_duplicate_head_factors=view_dup_factors,
+            rank_wide_ranks=ranks,
+            view_ranks=view_ranks,
+            uniform_writers=uniform_writers,
         )
         self._overlap_cache[key] = targets
         return targets
+
+    @classmethod
+    def _paired_ranks(
+        cls, self_ri: RankInfo, peer_ri: RankInfo, peer_dp_rank: int, pp_ranks: range
+    ) -> Tuple[int, int, List[int]]:
+        """(TP overlap, CP overlap, peer ranks) pairing one layout of this rank with the peer's.
+
+        TP ranks pair as contiguous blocks of the larger side; CP ranks pair
+        when their round-robin pages intersect. Ranks are CP-minor flat ranks
+        (ppRank*(TP*CP) + tpRank*CP + cpRank), matching Mapping and the C++
+        transceiver, in ascending order.
+        """
+        self_tp_per_dp = self_ri.tp_size_per_dp_group
+        peer_tp_per_dp = peer_ri.tp_size_per_dp_group
+        overlap_tp_size, peer_start_tp, peer_end_tp = cls._find_overlap(
+            self_tp_per_dp, peer_tp_per_dp, self_ri.tp_rank % self_tp_per_dp, peer_dp_rank
+        )
+        peer_cps = cp_ranks_sharing_pages(self_ri.cp_size, self_ri.cp_rank, peer_ri.cp_size)
+        stage = peer_ri.tp_size * peer_ri.cp_size
+        ranks = [
+            pp * stage + tp * peer_ri.cp_size + cp
+            for pp in pp_ranks
+            for tp in range(peer_start_tp, peer_end_tp)
+            for cp in peer_cps
+        ]
+        return overlap_tp_size, len(peer_cps), ranks
+
+    def view_rank_infos(self, peer_ri: RankInfo) -> Dict[LGPoolKey, Tuple[RankInfo, RankInfo]]:
+        """This rank and the peer as laid out by the model of each matched attention view pair.
+
+        A view's page table entry names its model's layout; a view without one
+        follows its rank's own mapping. Only view pairs whose coordinates
+        differ from the rank-wide ones on either side are returned; every other
+        view is routed by the rank-wide ``RankInfo``.
+
+        Raises:
+            ValueError: When one side publishes a layout other than its
+                rank-wide mapping and the other side publishes none, so it
+                could not route that model's data.
+        """
+        key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
+        cached = self._view_ri_cache.get(key)
+        if cached is not None:
+            return cached
+        self_pt = self._self_ext_cache.page_table
+        peer_pt = peer_ri.page_table
+        pairs: Dict[LGPoolKey, Tuple[RankInfo, RankInfo]] = {}
+        for (self_lg, self_pi), (peer_lg, peer_pi) in self.get_pool_mapping(peer_ri).items():
+            layer_group = self_pt.layer_groups[self_lg]
+            if (
+                layer_group.kind != CacheKind.PAGED
+                or layer_group.pool_views[self_pi].mapper_kind == MapperKind.REPLICATED
+            ):
+                continue
+            self_owner = self_pt.view_owner(self_lg, self_pi)
+            peer_owner = peer_pt.view_owner(peer_lg, peer_pi)
+            if (self_owner is None) != (peer_owner is None):
+                side, ri, owner = (
+                    ("local", self._ri, self_owner)
+                    if self_owner is not None
+                    else ("peer", peer_ri, peer_owner)
+                )
+                if owner != self._rank_layout(ri):
+                    raise ValueError(
+                        f"PeerRegistrar: the {side} view "
+                        f"{sorted(layer_group.pool_views[self_pi].pool_role)} belongs to a model "
+                        f"laid out as {owner}, other than its rank's mapping, but the other "
+                        "side publishes no model layouts to route it by"
+                    )
+            self_vri = self._ri.for_owner(self_owner)
+            peer_vri = peer_ri.for_owner(peer_owner)
+            if (self_vri.cp_size > 1 or peer_vri.cp_size > 1) and (
+                self._ri.attention.tokens_per_block != peer_ri.attention.tokens_per_block
+            ):
+                raise ValueError(
+                    "PeerRegistrar: a model whose pages are split over CP ranks needs equal "
+                    "tokens_per_block on both sides (local="
+                    f"{self._ri.attention.tokens_per_block}, peer="
+                    f"{peer_ri.attention.tokens_per_block})"
+                )
+            if not (self._same_coords(self_vri, self._ri) and self._same_coords(peer_vri, peer_ri)):
+                pairs[(self_lg, self_pi)] = (self_vri, peer_vri)
+        self._view_ri_cache[key] = pairs
+        return pairs
+
+    @staticmethod
+    def _same_coords(a: RankInfo, b: RankInfo) -> bool:
+        fields = ("tp_size", "tp_rank", "cp_size", "cp_rank", "dp_size", "dp_rank")
+        return all(getattr(a, name) == getattr(b, name) for name in fields)
+
+    @staticmethod
+    def _rank_layout(ri: RankInfo) -> OwnerLayout:
+        enable_attention_dp = ri.attention is not None and ri.attention.enable_attention_dp
+        return OwnerLayout(ri.tp_size, ri.cp_size, enable_attention_dp)
+
+    def splits_pages(self, peer_ri: RankInfo) -> bool:
+        """Whether either side splits a model's pages over CP ranks, rank-wide or in a view pair."""
+        if self._ri.cp_size > 1 or peer_ri.cp_size > 1:
+            return True
+        return any(
+            self_vri.cp_size > 1 or peer_vri.cp_size > 1
+            for self_vri, peer_vri in self.view_rank_infos(peer_ri).values()
+        )
 
     def _view_duplicate_head_factors(
         self, peer_ri: RankInfo, rank_wide: Tuple[int, int]
@@ -680,17 +826,18 @@ class PeerRegistrar:
         rank that shard or replicate heads differently (target and draft
         layers) get their own factor.
         """
-        policy = self._get_policy(CacheKind.PAGED)
         self_page_table = self._self_ext_cache.page_table
         peer_page_table = peer_ri.page_table
         factors: Dict[LGPoolKey, Tuple[int, int]] = {}
+        view_ris = self.view_rank_infos(peer_ri)
         for (self_lg, self_pi), (peer_lg, peer_pi) in self.get_pool_mapping(peer_ri).items():
             layer_group = self_page_table.layer_groups[self_lg]
             self_pv = layer_group.pool_views[self_pi]
             if layer_group.kind != CacheKind.PAGED or self_pv.mapper_kind == MapperKind.REPLICATED:
                 continue
             peer_pv = peer_page_table.layer_groups[peer_lg].pool_views[peer_pi]
-            pair = policy.duplicate_head_factors(peer_ri, self_pv, peer_pv)
+            self_vri, peer_vri = view_ris.get((self_lg, self_pi), (self._ri, peer_ri))
+            pair = AttentionPolicy(self_vri).duplicate_head_factors(peer_vri, self_pv, peer_pv)
             if pair != rank_wide:
                 factors[(self_lg, self_pi)] = pair
         return factors
@@ -734,8 +881,20 @@ class PeerRegistrar:
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
+        pool_key = (layer_group_id, pool_idx)
+        if peer_overlap.view_ranks:
+            # Views exchange with the peer ranks their own model's layout pairs;
+            # the peer may have contacted this rank for another view only.
+            paired = peer_overlap.view_ranks.get(pool_key, peer_overlap.rank_wide_ranks)
+            if peer_rank_info.instance_rank not in paired:
+                return False
         # Delegate to the policy's should_send. None means fan-in election.
         policy = self._get_policy(layer_group.kind)
+        if layer_group.kind == CacheKind.PAGED:
+            view_ris = self.view_rank_infos(peer_rank_info).get(pool_key)
+            if view_ris is not None:
+                policy = AttentionPolicy(view_ris[0])
+                peer_rank_info = view_ris[1]
         kwargs = {}
         if layer_group.kind == CacheKind.PAGED:
             # The sending-side duplication factor of this view pair, not one
@@ -750,6 +909,19 @@ class PeerRegistrar:
 
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated
+
+        # Aux is elected among the rank-wide pairing; a rank paired with the
+        # receiver only through another model's view adds no copy.
+        overlap = self.get_peer_overlap(peer_rank_info, peer_rank_info.dp_rank)
+        if overlap.view_ranks and peer_rank_info.instance_rank not in overlap.rank_wide_ranks:
+            return False
+
+        # CP: only the first of this rank's CP peers the receiver pairs with sends aux.
+        peer_cps = cp_ranks_sharing_pages(
+            peer_rank_info.cp_size, peer_rank_info.cp_rank, self._ri.cp_size
+        )
+        if self._ri.cp_rank != peer_cps[0]:
+            return False
 
         # TP: only the first rank in each peer-TP-sized group sends aux
         ratio = max(1, self._ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group)

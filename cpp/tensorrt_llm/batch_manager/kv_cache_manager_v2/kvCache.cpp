@@ -394,9 +394,12 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
             }
         }
 
-        // Window blocks: [staleEnd, numBlocks) — skip scratch blocks.
+        // Window blocks: [staleEnd, numBlocks) — skip scratch blocks and, for a strided
+        // lifecycle, the ordinals whose pages other ranks hold.
         for (BlockOrdinal ord{staleEnd}; ord < mBlocks.size(); ++ord)
         {
+            if (!holdsPage(lc, ord))
+                continue;
             auto& block = mBlocks[ord];
             for (BeamIndex bi{0}; bi < block.pages.size(); ++bi)
             {
@@ -610,9 +613,9 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         throw std::invalid_argument("OPTIONAL reuse selection is only valid before the first resume");
     }
 
-    // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
-    float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
+    // Check utilization against threshold. Strided pool groups count their admission charge,
+    // which every rank of a strided layout shares, so the ranks decide alike.
+    float const utilization = mManager->admissionUtilization();
     if (utilization > mManager->config().maxUtilForResume)
     {
         return false;
@@ -706,7 +709,10 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
                 }
                 for (BlockOrdinal ord = stale.end; ord < mBlocks.size(); ++ord)
                 {
-                    privateOrdinals[lc].push_back(ord);
+                    if (holdsPage(lifeCycle, ord))
+                    {
+                        privateOrdinals[lc].push_back(ord);
+                    }
                 }
                 numSlotsNeeded[lc] += static_cast<SlotCount>(privateOrdinals[lc].size());
             }
@@ -1127,6 +1133,7 @@ void KvCache::close()
     // Python always enters _record_event() here; _cuda_stream is valid for both ACTIVE and SUSPENDED.
     {
         auto scope = recordEventScope();
+        TLLM_CHECK(mManager->admitStridedBlocks(numBlocks().value(), 0));
         _clearBlocks();
     }
     if (mPageStorageBatch != nullptr)
@@ -1329,9 +1336,21 @@ void KvCache::_recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdi
     }
 
     bool changed = false;
-    for (auto const& [lifeCycle, unused] : mManager->lifeCycles().attentionLifeCycles())
+    for (auto const& [lifeCycle, attention] : mManager->lifeCycles().attentionLifeCycles())
     {
-        (void) unused;
+        if (attention->pageStride > 1)
+        {
+            // Strided lifecycles have no excluded ranges; count only the ordinals holding a page.
+            for (BlockOrdinal ord = blockBegin; ord < blockEnd; ++ord)
+            {
+                if (attention->holdsPage(ord))
+                {
+                    changed |= mPendingStats.recordAllocationRange(lifeCycle, ord, ord + 1, mBeamWidth.value(),
+                        !countAsGeneration, countAsGeneration, recordManagerStats, recordRequestStats);
+                }
+            }
+            continue;
+        }
         auto const& excluded = excludedRanges[lifeCycle];
         BlockOrdinal const firstEnd = std::min(blockEnd, excluded.beg);
         if (blockBegin < firstEnd)
@@ -1722,10 +1741,19 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         _subtractPendingAllocationRange(newNumBlocks, oldNumBlocks);
         auto scope = recordEventScope();
         _decreaseCapacity(newNumBlocks);
+        TLLM_CHECK(mManager->admitStridedBlocks(oldNumBlocks.value(), newNumBlocks.value()));
     }
 
     if (newNumBlocks >= oldNumBlocks)
     {
+        // Strided pool groups admit by a rank-independent charge before any slot is taken.
+        if (!mManager->admitStridedBlocks(oldNumBlocks.value(), newNumBlocks.value()))
+        {
+            return false;
+        }
+        auto releaseAdmission = FuncGuard(
+            [&]() { TLLM_CHECK(mManager->admitStridedBlocks(newNumBlocks.value(), oldNumBlocks.value())); });
+
         // Compute new normal slots needed per lifecycle.
         TypedVec<LifeCycleId, SlotCount> numNewSlots(numLc, 0);
         TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> staleRanges(numLc);
@@ -1735,7 +1763,14 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 continue;
             staleRanges[lc] = _getStaleRange(newHist, lcs.getLifeCycle(lc));
 
-            if (enableScratch)
+            if (auto const* attn = std::get_if<AttnLifeCycle>(&lcs.getLifeCycle(lc)); attn && attn->pageStride > 1)
+            {
+                // Strided: full attention without scratch or stale blocks; a page only at
+                // the ordinals it holds (beam width 1, see setBeamWidth).
+                numNewSlots[lc] = static_cast<SlotCount>(
+                    attn->numPagesBelow(newNumBlocks.value()) - attn->numPagesBelow(oldNumBlocks.value()));
+            }
+            else if (enableScratch)
             {
                 HalfOpenRange<BlockOrdinal> const newBlockRange{oldNumBlocks, newNumBlocks};
                 int const numNewBlocksUsingScratch = intersect(scratchRanges[lc], newBlockRange).length();
@@ -1813,6 +1848,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         }
         releaseNewSlots.cancel();
         restoreLocks.cancel();
+        releaseAdmission.cancel();
 
         // Wait on newly allocated slots.
         {
@@ -1914,6 +1950,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 {
                     if (ssmLcId.has_value() && lc == *ssmLcId)
                         continue; // SSM pages live in mSsmBlocks, not in mBlocks
+                    if (!holdsPage(lcs.getLifeCycle(lc), ord))
+                        continue; // Another rank holds this page of a strided lifecycle.
                     if (enableScratch)
                     {
                         if (scratchRanges[lc].contains(ord))
@@ -2034,6 +2072,8 @@ void KvCache::setBeamWidth(BeamIndex beamWidth)
     if (mStatus == Status::CLOSED)
         throw LogicError("Cannot change beam_width after close()");
     auto const apiLock = mManager->lockExclusive();
+    if (mManager->hasStridedLifeCycles())
+        throw std::invalid_argument("beam search is not supported with layers whose pageStride is above 1");
     if (mManager->enablePartialCommit())
         throw AssertionError("beam_width changes are not supported with partial commit");
 
@@ -2914,6 +2954,9 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
 {
     auto const& matched = match.blocks;
     int const numTokens = match.numTokens;
+    // Reused blocks would bypass strided admission; a strided layout never commits pages.
+    TLLM_CHECK_WITH_INFO(numTokens == 0 || !mManager->hasStridedLifeCycles(),
+        "Reused prefixes are not supported with layers whose pageStride is above 1");
 
     auto& lifeCycles = mManager->lifeCycles();
     auto const& allLc = lifeCycles.getAll();
@@ -3218,9 +3261,10 @@ bool KvCache::_checkSanity() const
                     continue;
                 }
 
-                if (scratchRange.contains(ordinal))
+                if (scratchRange.contains(ordinal) || !holdsPage(lcs[lc], ordinal))
                 {
-                    // Scratch blocks have no per-block pages.
+                    // Scratch blocks, and the pages of a strided lifecycle that other ranks
+                    // hold, have no per-block pages.
                     TLLM_CHECK_DEBUG(blockPageIsNull(bp));
                 }
                 else if (staleRange.beg <= ordinal && ordinal < staleRange.end)
@@ -3378,8 +3422,17 @@ PageStorageSnapshot KvCache::getPageStorageSnapshot(LayerGroupId lgId, BeamIndex
     auto const numBlocks = mBlocks.stdSize();
     if (numBlocks != 0)
     {
-        std::visit([&](auto const& indices)
-            { snapshot.mBasePageIndices.assign(indices.data(), indices.data() + numBlocks); },
+        // By block ordinal; a strided lifecycle's buffer is read through its compact entries.
+        snapshot.mBasePageIndices.assign(numBlocks, kBadPageIndex.value());
+        std::visit(
+            [&](auto const& indices)
+            {
+                for (BlockOrdinal ord{0}; ord < mBlocks.size(); ++ord)
+                {
+                    if (auto const entry = _pageIndexEntry(lgId, ord))
+                        snapshot.mBasePageIndices[toSizeT(ord)] = indices.data()[*entry];
+                }
+            },
             buf);
     }
     snapshot.mCacheLevels.resize(numBlocks);
@@ -3489,6 +3542,14 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
 {
     if (ord == kBadBlockOrdinal)
         return kBadPageIndex.value(); // SSM pages use BAD_BLOCK_ORDINAL
+    auto const entry = _pageIndexEntry(lc, ord);
+    if (!entry)
+    {
+        // Another rank holds this page of a strided lifecycle: no page and no buffer entry.
+        TLLM_CHECK_DEBUG(value == kBadPageIndex.value());
+        return kBadPageIndex.value();
+    }
+    auto const index = static_cast<size_t>(*entry);
     auto& buf = mBasePageIndices[bi][lc];
     int const old = std::visit(
         [&](auto& b) -> int
@@ -3496,16 +3557,16 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
             using T = std::decay_t<decltype(b)>;
             if constexpr (std::is_same_v<T, std::vector<int>>)
             {
-                TLLM_CHECK_DEBUG(b.size() > toSizeT(ord));
-                int old = b[toSizeT(ord)];
-                b[toSizeT(ord)] = value;
+                TLLM_CHECK_DEBUG(b.size() > index);
+                int old = b[index];
+                b[index] = value;
                 return old;
             }
             else
             {
-                TLLM_CHECK_DEBUG(ord < b.len);
-                int old = b[ord.value()];
-                b[ord.value()] = value;
+                TLLM_CHECK_DEBUG(*entry < b.len);
+                int old = b[*entry];
+                b[*entry] = value;
                 return old;
             }
         },
@@ -3513,6 +3574,16 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
     if (old != value)
         onPageStorageChanged();
     return old;
+}
+
+std::optional<int> KvCache::_pageIndexEntry(LifeCycleId lc, BlockOrdinal ord) const
+{
+    auto const* attn = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[lc]);
+    if (!attn)
+        return ord.value();
+    if (!attn->holdsPage(ord))
+        return std::nullopt;
+    return attn->pageIndexEntry(ord);
 }
 
 Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx) const
@@ -3526,7 +3597,9 @@ Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx
     // Cross-validate cached indices against freshly computed reference (mirrors Python lines ~350-354).
     if (TLLM_UNLIKELY(gDebug) && isActive())
     {
-        auto ref = getAggregatedPageIndices(lgId, beamIdx);
+        // A strided lifecycle's buffer lists only its held pages.
+        bool const strided = pageStrideOf(mManager->lifeCycles()[lgId]) > 1;
+        auto ref = getAggregatedPageIndices(lgId, beamIdx, /*validOnly=*/strided);
         auto len = static_cast<size_t>(std::min(result.len, static_cast<int32_t>(ref.size())));
         TLLM_CHECK(std::equal(result.data(), result.data() + len, ref.begin()));
     }

@@ -68,7 +68,8 @@ from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
                                            KVCacheManagerV2, Role,
-                                           _resolve_v2_max_attention_window_vec)
+                                           _resolve_v2_max_attention_window_vec,
+                                           owner_page_layout)
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
@@ -787,22 +788,28 @@ def _derive_v2_layer_type_attention_windows(
     return derived_windows
 
 
-def _get_num_storage_pool_groups(layer_specs: Sequence[KVCacheLayerSpec],
-                                 tokens_per_block: int) -> int:
+def _get_num_storage_pool_groups(
+    layer_specs: Sequence[KVCacheLayerSpec],
+    tokens_per_block: int,
+    page_strides: Sequence[int] = ()) -> int:
     """Count the pool groups KVCacheManagerV2 creates for explicit layer specs.
 
     Mirrors the grouping key of ``createStorageConfig``: a life cycle is a
-    distinct (window, sink blocks, reuse policy), its slot sizes are the sizes
-    of its coalesced buffers in descending order, and life cycles with the same
-    (reuse policy, slot sizes) share one pool group.
+    distinct (window, sink blocks, reuse policy, page stride), its slot sizes
+    are the sizes of its coalesced buffers in descending order, and life
+    cycles with the same (reuse policy, slot sizes, page stride) share one
+    pool group. A strided layer is private (see ``owner_page_layout``).
     """
     scale_roles = (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
     nvfp4 = tensorrt_llm.bindings.DataType.NVFP4
+    strides = list(page_strides) or [1] * len(layer_specs)
     life_cycles: dict[tuple, dict[tuple[int, int], int]] = {}
-    for layer in layer_specs:
+    for layer, stride in zip(layer_specs, strides):
+        reuse_policy = (layer.reuse_policy
+                        if stride == 1 else AttentionReusePolicy.PRIVATE)
         life_cycle = (layer.sliding_window_size,
                       ceil_div(layer.num_sink_tokens or 0,
-                               tokens_per_block), layer.reuse_policy)
+                               tokens_per_block), reuse_policy, stride)
         coalesced = life_cycles.setdefault(life_cycle, {})
         for role in layer.buffer_roles:
             group = 1 + int(role in scale_roles) if layer.dtype == nvfp4 else 0
@@ -812,7 +819,7 @@ def _get_num_storage_pool_groups(layer_specs: Sequence[KVCacheLayerSpec],
                  tuple(
                      sorted((size * count
                              for (_, size), count in coalesced.items()),
-                            reverse=True)))
+                            reverse=True)), life_cycle[3])
                 for life_cycle, coalesced in life_cycles.items()})
 
 
@@ -1131,6 +1138,7 @@ class KvCacheCreator:
             extra_kwargs[
                 "layer_specs"] = self._build_unified_dflash_layer_specs(
                     kv_cache_config)
+            extra_kwargs["owner_mappings"] = self._unified_owner_mappings()
         if not is_draft:
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
@@ -1644,8 +1652,13 @@ class KvCacheCreator:
             if unified_layer_specs:
                 # Target and draft layers can differ in page size and life
                 # cycle, so the group count comes from the combined layout.
+                # Only a target with CP lays its pages out apart from its
+                # drafter's (see owner_page_layout).
+                page_strides = (owner_page_layout(
+                    unified_layer_specs, self._unified_owner_mappings(),
+                    self._mapping).strides if self._mapping.cp_size > 1 else ())
                 num_pool_groups = _get_num_storage_pool_groups(
-                    unified_layer_specs, self._tokens_per_block)
+                    unified_layer_specs, self._tokens_per_block, page_strides)
             else:
                 model_cfg = self._model_engine.model.model_config
                 num_pool_groups = _get_num_pool_groups_for_estimation(
@@ -2096,9 +2109,11 @@ class KvCacheCreator:
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         self._check_shared_draft_kv_request()
         unified_layer_specs = None
+        owner_mappings = None
         if self._should_unify_dflash_kv_cache():
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 kv_cache_config)
+            owner_mappings = self._unified_owner_mappings()
             logger.info(
                 f"{self._unified_drafter_name()}: target and draft KV layers "
                 "share one KV cache manager "
@@ -2129,6 +2144,7 @@ class KvCacheCreator:
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             layer_specs=unified_layer_specs,
+            owner_mappings=owner_mappings,
         )
 
         if not self._skip_est:
@@ -2260,7 +2276,9 @@ class KvCacheCreator:
         if self._mapping.pp_size != 1:
             return f"pipeline_parallel_size is {self._mapping.pp_size}, not 1"
         if self._mapping.cp_size != 1:
-            return f"context_parallel_size is {self._mapping.cp_size}, not 1"
+            blocker = self._dflash_target_cp_blocker()
+            if blocker is not None:
+                return blocker
         if self._llm_args.attn_backend != "TRTLLM":
             return f"the target attn_backend is {self._llm_args.attn_backend}, not TRTLLM"
         if _has_variable_kv_cache_geometry(
@@ -2312,6 +2330,35 @@ class KvCacheCreator:
                     "(kv_heads, head_dim, dtype, k_only)")
         return None
 
+    def _dflash_target_cp_blocker(self) -> Optional[str]:
+        """Why a target with context parallelism cannot share its manager, or None.
+
+        A helix target shares it with the drafter it actually builds: on the
+        target's CP ranks repurposed as TP (``repurpose_helix_cp_to_tp``), the
+        drafter holds every page of its layers on each rank, while the target
+        holds its own CP rank's pages (see ``owner_page_layout``). The
+        drafter's attention reads all of its pages, so a drafter that split
+        its own pages over CP could not run.
+        """
+        if not self._mapping.has_cp_helix():
+            return (f"context_parallel_size is {self._mapping.cp_size} without "
+                    "helix context parallelism")
+        draft_mapping = self._get_draft_kv_model_config().mapping
+        if draft_mapping.cp_size != 1:
+            return (
+                f"the drafter is mapped with cp_size={draft_mapping.cp_size}; "
+                "its attention reads every page of its layers")
+        return None
+
+    def _unified_owner_mappings(self) -> dict[KVCacheLayerOwner, Mapping]:
+        """Each owner's actual model mapping in a shared target/draft manager."""
+        draft_mapping = getattr(self._get_draft_kv_model_config(), "mapping",
+                                None)
+        return {
+            KVCacheLayerOwner.TARGET: self._mapping,
+            KVCacheLayerOwner.DRAFT: draft_mapping or self._mapping,
+        }
+
     @staticmethod
     def _dflash_disagg_layouts_compatible(
             target_layout: tuple[int, int, object, bool],
@@ -2352,8 +2399,11 @@ class KvCacheCreator:
         if not isinstance(head_dim, int):
             head_dim = config.hidden_size // config.num_attention_heads
         dtype = self._layer_spec_dtype(model_config, fallback_dtype)
-        # Attention DP replicates attention weights, so every rank holds all heads.
-        tp_size = 1 if self._mapping.enable_attention_dp else self._mapping.tp_size
+        # Each model shards its heads over its own mapping (a helix target's
+        # drafter over the CP ranks repurposed as TP). Attention DP replicates
+        # attention weights, so every rank holds all heads.
+        mapping = getattr(model_config, "mapping", None) or self._mapping
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
         return ceil_div(heads, tp_size), head_dim, dtype, k_only
 
     @staticmethod
@@ -3565,38 +3615,39 @@ def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
 
 
 def _create_kv_cache_manager(
-        model_engine: Optional[PyTorchModelEngine],
-        kv_cache_manager_cls,
-        mapping: Mapping,
-        kv_cache_config: KvCacheConfig,
-        tokens_per_block: int,
-        max_seq_len: int,
-        max_batch_size: int,
-        spec_config: Optional[SpeculativeConfig],
-        sparse_attention_config: Optional[SparseAttentionConfig],
-        max_num_tokens: int,
-        max_beam_width: int,
-        kv_connector_manager: Optional[KvCacheConnectorManager],
-        max_copy_beam_width: Optional[int] = None,
-        estimating_kv_cache: bool = False,
-        enable_kv_cache_stats: bool = False,
-        execution_stream: Optional[torch.cuda.Stream] = None,
-        # Optional overrides for one-model draft case (when model_engine is None)
-        model_config: Optional[ModelConfig] = None,
-        dtype: Optional[torch.dtype] = None,
-        is_draft: bool = False,
-        layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None,
-        num_kv_heads: Optional[Union[int, List[int]]] = None,
-        head_dim: Optional[Union[int, List[int]]] = None,
-        kv_cache_type=None,
-        is_disagg: bool = False,
-        disable_overlap_scheduler: bool = False,
-        cold_page_codec_provider: Optional[object] = None,
-        kv_events_config: Optional[KVEventsConfig] = None,
-        joint_kv_cache_reuse: bool = False,
-        max_cuda_graph_batch_size: Optional[int] = None,
-        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None
+    model_engine: Optional[PyTorchModelEngine],
+    kv_cache_manager_cls,
+    mapping: Mapping,
+    kv_cache_config: KvCacheConfig,
+    tokens_per_block: int,
+    max_seq_len: int,
+    max_batch_size: int,
+    spec_config: Optional[SpeculativeConfig],
+    sparse_attention_config: Optional[SparseAttentionConfig],
+    max_num_tokens: int,
+    max_beam_width: int,
+    kv_connector_manager: Optional[KvCacheConnectorManager],
+    max_copy_beam_width: Optional[int] = None,
+    estimating_kv_cache: bool = False,
+    enable_kv_cache_stats: bool = False,
+    execution_stream: Optional[torch.cuda.Stream] = None,
+    # Optional overrides for one-model draft case (when model_engine is None)
+    model_config: Optional[ModelConfig] = None,
+    dtype: Optional[torch.dtype] = None,
+    is_draft: bool = False,
+    layer_mask: Optional[List[bool]] = None,
+    num_layers: Optional[int] = None,
+    num_kv_heads: Optional[Union[int, List[int]]] = None,
+    head_dim: Optional[Union[int, List[int]]] = None,
+    kv_cache_type=None,
+    is_disagg: bool = False,
+    disable_overlap_scheduler: bool = False,
+    cold_page_codec_provider: Optional[object] = None,
+    kv_events_config: Optional[KVEventsConfig] = None,
+    joint_kv_cache_reuse: bool = False,
+    max_cuda_graph_batch_size: Optional[int] = None,
+    layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+    owner_mappings: Optional[dict[KVCacheLayerOwner, Mapping]] = None
 ) -> KVCacheManager:
     """
     Returns:
@@ -3751,6 +3802,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         manager_extra_kwargs["layer_specs"] = layer_specs
+        manager_extra_kwargs["owner_mappings"] = owner_mappings
         # Vocab size also enables multimodal event decoding and its per-block
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:

@@ -132,6 +132,57 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     _resetIterationPeakNumBlocks();
 
     mLastAdjustmentTime = nowSeconds();
+
+    mStridedAdmittedSlots.resize(mStorage->numPoolGroups(), 0);
+    for (LifeCycleId lc{0}; lc < mLifeCycles.size(); ++lc)
+    {
+        int const stride = pageStrideOf(mLifeCycles[lc]);
+        if (stride > 1)
+        {
+            mStridedLifeCycles.push_back({lc, mStorage->getPoolGroupIndex(lc), stride});
+        }
+    }
+}
+
+bool KvCacheManager::admitStridedBlocks(int oldNumBlocks, int newNumBlocks)
+{
+    auto const apiLock = lockExclusive();
+    TypedVec<PoolGroupIndex, SlotCount> delta(mStridedAdmittedSlots.size(), 0);
+    for (auto const& strided : mStridedLifeCycles)
+    {
+        delta[strided.poolGroup] += divUp(newNumBlocks, strided.pageStride) - divUp(oldNumBlocks, strided.pageStride);
+    }
+    for (PoolGroupIndex pg{0}; pg < delta.size(); ++pg)
+    {
+        if (delta[pg] > 0 && mStridedAdmittedSlots[pg] + delta[pg] > mStorage->numSlots(pg))
+        {
+            return false;
+        }
+    }
+    for (PoolGroupIndex pg{0}; pg < delta.size(); ++pg)
+    {
+        mStridedAdmittedSlots[pg] += delta[pg];
+        TLLM_CHECK(mStridedAdmittedSlots[pg] >= 0);
+    }
+    return true;
+}
+
+std::vector<int64_t> KvCacheManager::stridedAdmittedSlots() const
+{
+    auto const apiLock = lockShared();
+    return {mStridedAdmittedSlots.begin(), mStridedAdmittedSlots.end()};
+}
+
+float KvCacheManager::admissionUtilization() const
+{
+    auto const apiLock = lockShared();
+    auto utilization = mStorage->getUtilization(kHotLevel);
+    for (auto const& strided : mStridedLifeCycles)
+    {
+        auto const pg = strided.poolGroup;
+        utilization[pg] = static_cast<float>(mStridedAdmittedSlots[pg]) / static_cast<float>(mStorage->numSlots(pg));
+    }
+    return utilization.empty() ? 0.f : *std::max_element(utilization.begin(), utilization.end());
 }
 
 KvCacheManager::~KvCacheManager()
@@ -890,7 +941,8 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
         {
             auto staleRange = getStaleRange(lcs[lifeCycleId], seqLen, tokPerBlock);
             int numStaleBlocks = staleRange.end - staleRange.beg;
-            int numSlots = divUp(seqLen, tokPerBlock) - numStaleBlocks;
+            // A strided lifecycle is bounded by its admission charge, the same on every rank.
+            int numSlots = divUp(divUp(seqLen, tokPerBlock), pageStrideOf(lcs[lifeCycleId])) - numStaleBlocks;
             auto pgIdx = lcGrouping[lifeCycleId];
             ret[pgIdx] += numSlots;
         }
@@ -952,6 +1004,23 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
 void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
 {
     auto const& ratioList = _getTargetRatioList(level);
+    if (level == kHotLevel && hasStridedLifeCycles())
+    {
+        // The ranks of a strided pool group hold different numbers of pages, all within its
+        // admission charge. Refusing a size below the charge on every rank alike keeps their pools
+        // identical; at or above it, every rank's pages fit.
+        auto const newNumSlots = mStorage->slotCountsForQuota(level, quota, ratioList);
+        for (auto const& strided : mStridedLifeCycles)
+        {
+            if (newNumSlots[strided.poolGroup] < mStridedAdmittedSlots[strided.poolGroup])
+            {
+                throw OutOfPagesError("Cannot shrink pool group " + std::to_string(strided.poolGroup.value()) + " to "
+                    + std::to_string(newNumSlots[strided.poolGroup]) + " slots, below the "
+                    + std::to_string(mStridedAdmittedSlots[strided.poolGroup])
+                    + " admitted for layers whose pageStride is above 1");
+            }
+        }
+    }
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistent = nullptr;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> persistentPages;
     if (mStorage->isLastLevel(level))

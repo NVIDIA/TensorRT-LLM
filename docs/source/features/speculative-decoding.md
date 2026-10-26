@@ -185,13 +185,26 @@ settings. An NVFP4 target KV cache requires a draft with an identical dtype
 and KV-head count. The target's and draft's K-only (MLA) or K/V cache kind must
 match, and both servers must run the same target and drafter.
 
+With helix context parallelism on the target, the drafter is built on the
+target's CP ranks regrouped as tensor-parallel ranks, so the two models lay out
+their pages differently in the shared manager: each rank holds only its own CP
+rank's pages of the target and every page of the drafter, and each model is
+allocated exactly the pages it holds. Admission charges every CP rank the
+target pages of the CP rank holding the most, so the ranks admit alike. KV
+transfers route each model's pages and heads by that model's own layout. As for
+any helix target, block reuse and pipelined KV transfer are not supported; beam
+search is not supported for this combination.
+Running a dense (GQA) helix target with a drafter also requires an attention
+kernel that verifies several draft tokens under helix, which TensorRT LLM does
+not provide yet.
+
 The drafter keeps a separate draft KV cache manager instead when any of the
-following applies: context parallelism larger than 1, a per-layer KV-head count
-on the target or drafter, a specialized KV cache manager (for example, hybrid Mamba
-models), Gemma 4 hybrid attention, or, in disaggregated serving, a draft layout
-that cannot be transferred with the target's. When the layers are shared, the
-worker log reports `target and draft KV layers share one KV cache manager` at
-startup.
+following applies: context parallelism other than helix, a per-layer KV-head
+count on the target or drafter, a specialized KV cache manager (for example,
+hybrid Mamba models), Gemma 4 hybrid attention, or, in disaggregated serving, a
+draft layout that cannot be transferred with the target's. When the layers are
+shared, the worker log reports `target and draft KV layers share one KV cache
+manager` at startup.
 
 [DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
 

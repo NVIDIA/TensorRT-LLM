@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import List, Optional
 
 import msgpack
@@ -21,7 +21,7 @@ import msgpack
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, OwnerLayout
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 
@@ -58,6 +58,45 @@ class RankInfo:
         if self.attention is None:
             return self.tp_size
         return self.tp_size // self.dp_size if self.attention.enable_attention_dp else self.tp_size
+
+    def for_owner(self, owner: Optional[OwnerLayout]) -> "RankInfo":
+        """This physical rank as seen by one model's layout.
+
+        Identity, endpoints and layers stay those of the worker; TP, CP and DP
+        coordinates follow ``owner`` (CP-minor, like ``Mapping``), so the
+        overlap, head-slicing and election helpers apply to that model's
+        views. ``None`` keeps the rank-wide coordinates.
+
+        Raises:
+            ValueError: When the layout does not cover this rank's PP stage
+                or disagrees with its attention-DP topology.
+        """
+        if owner is None:
+            return self
+        stage_size = self.tp_size * self.cp_size
+        if owner.tp_size * owner.cp_size != stage_size:
+            raise ValueError(
+                f"RankInfo: a model laid out over tp_size={owner.tp_size} x cp_size="
+                f"{owner.cp_size} does not cover the {stage_size} ranks of rank "
+                f"{self.instance_rank}'s pipeline stage"
+            )
+        enable_attention_dp = self.attention is not None and self.attention.enable_attention_dp
+        if owner.enable_attention_dp != enable_attention_dp:
+            raise ValueError(
+                f"RankInfo: a model with enable_attention_dp={owner.enable_attention_dp} cannot "
+                f"run on rank {self.instance_rank} with enable_attention_dp={enable_attention_dp}"
+            )
+        stage_rank = self.instance_rank % stage_size
+        tp_rank = stage_rank // owner.cp_size
+        return replace(
+            self,
+            tp_size=owner.tp_size,
+            tp_rank=tp_rank,
+            cp_size=owner.cp_size,
+            cp_rank=stage_rank % owner.cp_size,
+            dp_size=owner.tp_size if enable_attention_dp else self.dp_size,
+            dp_rank=tp_rank if enable_attention_dp else self.dp_rank,
+        )
 
     def to_bytes(self) -> bytes:
         data = asdict(self)

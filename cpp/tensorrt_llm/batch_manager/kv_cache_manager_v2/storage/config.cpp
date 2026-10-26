@@ -212,11 +212,14 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         bool isSparse = false;
+        // Strided lifecycles are admitted per pool group by their stride (see
+        // KvCacheManager::admitStridedBlocks), so a pool group holds one stride.
+        int pageStride = 1;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(reusePolicy, slotSizes, isSparse)
-                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse);
+            return std::tie(reusePolicy, slotSizes, isSparse, pageStride)
+                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse, other.pageStride);
         }
     };
 
@@ -227,7 +230,9 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
         bool const isSparse = attn != nullptr && attn->isSparse;
         auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
-        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
+        int const pageStride = attn ? attn->pageStride : 1;
+        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse, .pageStride = pageStride}]
+            .push_back(std::move(sg));
     }
 
     StorageConfig out;

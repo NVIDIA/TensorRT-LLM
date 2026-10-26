@@ -356,6 +356,8 @@ public:
     // Returns a non-owning Span into the page-index buffer (owned by this KvCache, or by the
     // caller when set via setBasePageIndexBuf). The span is valid until the next resize(),
     // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume() and offload.
+    // Entry i is block ordinal i, except for a layer group whose pageStride is above 1: its entry k is
+    // its k-th held page, and entries past its held pages are kBadPageIndex.
     Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // Get aggregated (slot-level) page indices for one layer group + beam.
@@ -603,6 +605,9 @@ public:
 
 private:
     friend class KvCacheIntrospection;
+    //! Entry of ordinal `ord` in lifecycle `lc`'s base page index buffer, or nullopt where a
+    //! strided lifecycle holds no page (its buffer lists only its held pages, in order).
+    std::optional<int> _pageIndexEntry(LifeCycleId lc, BlockOrdinal ord) const;
     friend class UniqPageLock;
     friend class Batch;
     friend std::vector<SharedPageLock> batchedLockPages(

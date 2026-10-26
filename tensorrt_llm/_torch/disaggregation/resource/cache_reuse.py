@@ -154,13 +154,18 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
         # valid_only=False yields one entry per block ordinal, with -1
         # (BAD_PAGE_INDEX) for out-of-window (SWA-evicted) and unbound blocks.
-        # Position is the index; no length arithmetic needed.
-        return np.fromiter(
+        # Position is the index; no length arithmetic needed. A group holding a
+        # page every ``stride`` blocks lists only those, so its entry ``k`` is
+        # its ``k``-th page, as in its attention block table.
+        ordinals = np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=False
             ),
             dtype=np.int64,
         )
+        stride_phase = getattr(self._mgr, "get_layer_group_page_stride_phase", None)
+        stride, phase = stride_phase(group_idx) if stride_phase is not None else (1, 0)
+        return ordinals[phase::stride] if stride > 1 else ordinals
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         self._mgr.try_commit_blocks(req)

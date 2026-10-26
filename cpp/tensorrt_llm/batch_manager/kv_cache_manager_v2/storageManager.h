@@ -184,6 +184,10 @@ public:
         DropRecorder const& dropRecorder = {});
 
     // Dynamic cache level resizing.
+    // Slot counts per pool group that adjustCacheLevel would give a level; throws as it does for an
+    // invalid quota.
+    TypedVec<PoolGroupIndex, SlotCount> slotCountsForQuota(
+        CacheLevel level, std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList) const;
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
         TypedVec<PoolGroupIndex, float> const& ratioList,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages);
