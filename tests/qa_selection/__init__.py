@@ -15,6 +15,7 @@
 """Select the tests a target machine can run, before Slurm allocates it.
 
     plugin.py        the pytest hooks and options, loaded with `-p qa_selection.plugin`
+    host.py          no --machine: this host's profile
     core/
       selection.py   one run's request, and its outcome per test
       report.py      the .ids lists and the JSON record

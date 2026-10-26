@@ -14,21 +14,25 @@
 # limitations under the License.
 """Pytest entry point: deselect the tests a target machine cannot run.
 
-    pytest --collect-only -p qa_selection.plugin --machine=B200 [--ladder=1,4,8]
+    pytest --collect-only -p qa_selection.plugin [--machine=B200] [--ladder=1,4,8]
 
-Load with `-p` on the command line. No hardware is touched: every decision is
-read from marks. The session header names the target, and a block after the
-run breaks the selection down by rung and the deselection by reason.
+Load with `-p` on the command line; loading it is what selects. A named machine
+is decided from its catalogue profile, touching no hardware. With none named,
+the target is this host, recorded as `local`, whose profile `host.py` generates.
+Every decision is read from marks. The session header names the target, and a
+block after the run breaks the selection down by rung and the deselection by
+reason.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
 from .core.marks import CollectedTest, Mark, default_markers
 from .core.report import ArtifactNames, SelectionOutput, SelectionReport
 from .core.selection import Selection, SelectionError, SelectionRequest
+from .host import LocalProfile, ProbeError, SavedProfileError
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -37,11 +41,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Declare the resource markers, and resolve the target before collection."""
+    """Declare the resource markers, and resolve the target before collection.
+
+    `--help` resolves no target, so it never probes this host.
+    """
     MarkerDeclaration.add_to(config)
-    request = SelectionOptions.request_from(config)
-    if request is not None:
-        config.stash[SelectionStash.REQUEST] = request
+    if not config.getoption("help"):
+        config.stash[SelectionStash.REQUEST] = SelectionOptions.request_from(config)
 
 
 def pytest_report_header(config: pytest.Config) -> List[str]:
@@ -105,12 +111,15 @@ class TerminalSummary:
 
     @classmethod
     def header(cls, request: SelectionRequest) -> str:
-        """The one header line: machine, card, node size and ladder."""
+        """The one header line: machine, card, node size and ladder.
+
+        For this host, the card's name leads, since `local` does not say it.
+        """
         profile = request.profile
-        return (
-            f"{cls.TITLE}: {request.machine} (sm {profile.sm}, "
-            f"{profile.max_gpu_per_node} GPUs/node), ladder {request.ladder}"
-        )
+        card = f"sm {profile.sm}, {profile.max_gpu_per_node} GPUs/node"
+        if request.machine == LocalProfile.NAME:
+            card = f"{profile.device_name}, {card}"
+        return f"{cls.TITLE}: {request.machine} ({card}), ladder {request.ladder}"
 
     @classmethod
     def render(cls, terminalreporter, output: SelectionOutput) -> None:
@@ -201,9 +210,10 @@ class SelectionOptions:
             metavar="NAME",
             default=None,
             choices=SelectionRequest.machines(),
-            help="target machine to select for, from the profile catalogue. "
-            "Absent leaves collection untouched, so loading this plugin "
-            "without it changes nothing",
+            help="target machine from the profile catalogue; selects for that "
+            "profile without touching hardware. Absent: select for this host, "
+            "recorded as local, its profile read from the output directory's "
+            "local.json when there is one, else generated with nvidia-smi",
         )
         group.addoption(
             "--ladder",
@@ -232,18 +242,21 @@ class SelectionOptions:
         )
 
     @classmethod
-    def request_from(cls, config: pytest.Config) -> Optional[SelectionRequest]:
-        """This run's request, or None when no machine is named.
+    def request_from(cls, config: pytest.Config) -> SelectionRequest:
+        """This run's request: the named machine's, else this host's.
 
-        The one place `core`'s `SelectionError` becomes a `pytest.UsageError`.
+        The one place `core`'s `SelectionError` and `host`'s `ProbeError` and
+        `SavedProfileError` become a `pytest.UsageError`.
         """
+        machine = config.getoption(cls.MACHINE)
+        ladder = config.getoption(cls.LADDER)
+        out_dir = config.getoption(cls.OUT_DIR)
         try:
-            return SelectionRequest.of(
-                machine=config.getoption(cls.MACHINE),
-                ladder=config.getoption(cls.LADDER),
-                out_dir=config.getoption(cls.OUT_DIR),
-            )
-        except SelectionError as error:
+            if machine:
+                return SelectionRequest.of(machine, ladder, out_dir)
+            local = LocalProfile.of(Path(out_dir) if out_dir is not None else None)
+            return SelectionRequest.for_profile(local, ladder, out_dir)
+        except (SelectionError, ProbeError, SavedProfileError) as error:
             raise pytest.UsageError(str(error)) from error
 
 

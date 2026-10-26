@@ -20,7 +20,7 @@
 One module per kind of fact selection reads:
 
     ArchCases     the card's and host's architecture    AC-1
-    DeviceCases   how many GPUs a test needs            AC-2 .. AC-6
+    DeviceCases   how many GPUs a test needs            AC-2 .. AC-5, AC-7
     MarkerCases   how marks combine across levels       AC-1 .. AC-3
 
 `cases/test_device_cases.py` is `DeviceCases`. Each id is named after its

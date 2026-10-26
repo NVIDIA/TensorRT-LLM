@@ -22,13 +22,34 @@
 Not `cases/conftest.py`, which is mock content loaded by the run under test.
 """
 
+from pathlib import Path
+from typing import Optional
+
 import pytest
 from framework import SelectionHarness
 
 pytest_plugins = ["pytester"]
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """`--probed-out-dir`: hands a probed run's output directory to a later run."""
+    parser.addoption(
+        "--probed-out-dir",
+        metavar="DIR",
+        default=None,
+        help="the default-target run copies its output directory here where "
+        "nvidia-smi exists; where it does not, the saved-profile rerun reads it back",
+    )
+
+
 @pytest.fixture
 def selection(pytester: pytest.Pytester) -> SelectionHarness:
     """The plugin's command line, bound to a fresh temporary directory."""
     return SelectionHarness(pytester)
+
+
+@pytest.fixture
+def probed_out_dir(request: pytest.FixtureRequest) -> Optional[Path]:
+    """`--probed-out-dir`, or None when it was not given."""
+    value = request.config.getoption("--probed-out-dir")
+    return None if value is None else Path(value)
