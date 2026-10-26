@@ -1058,12 +1058,17 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         mixed_modality_runs = (
             single_modality_inputs and len({modalities[0] for modalities in param_modalities}) > 1
         )
-        if single_modality_inputs:
+        if mixed_modality_runs:
             input_groups = [
                 (modality, [param.multimodal_data[modality] for _, param in param_group])
                 for modality, param_group in groupby(
                     zip(param_modalities, multimodal_params), key=lambda item: item[0][0]
                 )
+            ]
+        elif single_modality_inputs and multimodal_params:
+            modality = param_modalities[0][0]
+            input_groups = [
+                (modality, [param.multimodal_data[modality] for param in multimodal_params])
             ]
         else:
             input_groups = [
