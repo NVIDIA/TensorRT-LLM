@@ -4,7 +4,7 @@
 
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -15,7 +15,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -765,6 +765,36 @@ def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
     assert draft.mixed_precision_kv is None
     assert draft.max_attention_window is None
     assert target.mixed_precision_kv is not None
+
+
+@pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
+@pytest.mark.cpu_only
+def test_draft_forward_hides_retained_rows(backend):
+    """A draft forward runs on a manager without twin layers, so the retained-row hooks stay off."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4TrtllmAttentionMetadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+        DSAtrtllmAttentionMetadata,
+    )
+
+    cls = {"dsa": DSAtrtllmAttentionMetadata, "deepseek_v4": DeepseekV4TrtllmAttentionMetadata}[
+        backend
+    ]
+    meta = Mock()
+    meta.kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    meta.draft_sliding_block_tables = None
+    meta.draft_replay_swapped_attrs = {}
+    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+        setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
+    table = torch.full((2, 4), -1, dtype=torch.int32)
+    meta.retained_block_table = table
+
+    assert cls.prepare_for_draft_forward(meta) is None
+    assert cls.has_mixed_precision_retained_rows.fget(meta) is False
+    meta.restore_draft_swaps()
+    assert meta.retained_block_table is table
+    assert cls.has_mixed_precision_retained_rows.fget(meta) is True
 
 
 @pytest.mark.cpu_only
