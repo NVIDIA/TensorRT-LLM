@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -221,12 +222,31 @@ def test_callable_ids_with_uniform_resource_marks(splitter: ModuleType, tmp_path
         ),
     ],
 )
-def test_bad_markers_and_selectors_fail_before_writing(
-    splitter: ModuleType, tmp_path: Path, source: str, selector: str, message: str
+def test_bad_markers_and_selectors_are_skipped(
+    splitter: ModuleType,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: str,
+    selector: str,
+    message: str,
 ) -> None:
-    with pytest.raises(ValueError, match=message):
-        _split(splitter, tmp_path, source, f"test_cases.py::{selector}\n")
-    assert not (tmp_path / "out").exists()
+    result = _split(
+        splitter,
+        tmp_path,
+        dedent(source) + "\ndef test_good(): pass\n",
+        f"test_cases.py::test_good\ntest_cases.py::{selector}\ntest_cases.py::test_good\n",
+    )
+    assert result["qa_1to4gpu.txt"] == ["test_cases.py::test_good"] * 2
+    assert result["qa_5to8gpu.txt"] == []
+    assert result["qa_9to16gpu.txt"] == []
+    skipped = [
+        json.loads(line) for line in (tmp_path / "out/qa_skipped.jsonl").read_text().splitlines()
+    ]
+    assert len(skipped) == 1
+    assert skipped[0]["line"] == 2
+    assert skipped[0]["entry"] == f"test_cases.py::{selector}"
+    assert message in skipped[0]["reason"]
+    assert f"skipped test_cases.py::{selector}" in capsys.readouterr().err
 
 
 def test_inherited_class_mark_order_and_class_pytestmark(
