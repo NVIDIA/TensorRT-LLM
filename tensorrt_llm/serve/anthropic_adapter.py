@@ -815,7 +815,11 @@ class AnthropicStreamReframer:
         if block_type == "text":
             frames.extend(self._open_block(AnthropicTextBlock(text=""), "text"))
         elif block_type == "thinking":
-            frames.extend(self._open_block(AnthropicThinkingBlock(thinking=""), "thinking"))
+            # The signature arrives as the block's last delta; the opening block
+            # carries it empty, as a thinking block always has the field.
+            frames.extend(
+                self._open_block(AnthropicThinkingBlock(thinking="", signature=""), "thinking")
+            )
         else:
             raise ValueError(f"unexpected block type {block_type}")
         return frames

@@ -1243,6 +1243,21 @@ def test_stream_thinking_block_ends_with_its_signature():
     assert len(signed) == 1, "only the thinking block is signed"
 
 
+def test_stream_thinking_block_opens_with_an_empty_signature():
+    """A thinking block always has a signature field, even before its last delta fills it."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "first"}),
+            chunk({"content": "answer"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"] for n, p in events if n == "content_block_start"]
+    assert starts[0] == {"type": "thinking", "thinking": "", "signature": ""}
+    assert "signature" not in starts[1]
+
+
 def test_stream_thinking_left_open_is_signed_when_the_stream_ends():
     events = run_reframer(
         [
