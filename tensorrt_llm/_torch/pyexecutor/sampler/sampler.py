@@ -57,7 +57,13 @@ from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager
 from ..scheduler import ScheduledRequests
-from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
+from .beam_search import (
+    BeamHistoryBuilder,
+    BeamSearchHandler,
+    PendingBeamHistories,
+    finalize_beam,
+    prepare_beam_search,
+)
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import LogProbsHandler, LogProbsState, LogProbsStateList, LogProbsStore
 from .ops.flashinfer import sample_from_logits_op
@@ -482,6 +488,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if (beam_search_store := self.store.beam_search_store) is not None:
             return beam_search_store.cache_indirection
         return None
+
+    def start_beam_histories(self, requests: list[LlmRequest]) -> PendingBeamHistories:
+        """Start copying the generated tokens of each live beam of each beam-search request.
+
+        See ``BeamSearchHandler.start_beam_histories``; used by the model engine
+        to give logits post-processors each beam's real hypothesis.
+        """
+        return self._beam_search.start_beam_histories(requests)
 
     @override
     def is_generation_model(self) -> bool:
