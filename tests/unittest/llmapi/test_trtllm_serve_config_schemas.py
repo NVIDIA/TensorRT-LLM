@@ -259,6 +259,27 @@ def test_shutdown_settings(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("dwdp_config", "valid"),
+    [
+        ({"enable_dense": True, "dwdp_size": 16}, True),
+        ({"enable_dense": False}, True),
+        ({"enable_dense": "always"}, False),
+        ({"enable_dense_dwdp": True}, False),
+    ],
+)
+def test_dense_dwdp_setting(
+    schemas: dict[str, dict], filename: str, dwdp_config: dict, valid: bool
+) -> None:
+    """dwdp_config.enable_dense, at the top level or under context_servers."""
+    config = {"dwdp_config": dwdp_config}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
     """Check literal top-level config accesses, without tracing aliases or dynamic keys."""
     function = next(

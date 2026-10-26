@@ -406,6 +406,32 @@ DWDP can be applied to the prefill phase of a serving system when the context ba
 
 Usage: [`examples/dwdp/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/dwdp/README.md) and [blog19](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md).
 
+#### Dense DWDP
+
+Dense DWDP (prototype) applies the same idea to the dense weights of the MoE decoder layers: the attention, the shared expert, the router and the other dense weights of the MoE block, which every context rank otherwise holds in full. Each rank of the DWDP group keeps one row-shard of every covered layer, and dense DWDP gathers each layer into small staging slots two layers ahead of its use, on the copy stream of the expert prefetch and with its transfer. Most of the replicated dense weights are freed for the KV cache. It applies to models whose decoder layers provide dense DWDP roots, currently Kimi-K3.
+
+Turn it on in the configuration of the context servers:
+
+```yaml
+dwdp_config:
+  dwdp_size: 16
+  num_experts_per_worker: 56
+  num_prefetch_experts: 56
+  enable_dense: true
+disable_overlap_scheduler: true
+cuda_graph_config: null
+```
+
+The launch is checked before the model is built. Dense DWDP needs:
+
+- `disable_overlap_scheduler: true` and pipeline and context parallel size 1, as expert DWDP requires, and tensor parallel size 1;
+- eager execution: no `cuda_graph_config`, `torch_compile_config` or prefill CUDA graphs;
+- no `sleep_config`, `lora_config` or `speculative_config`;
+- `enable_locality_domains` off;
+- FABRIC peer memory handles (multi-node NVLink systems).
+
+Every server of a DWDP group must set the same `enable_dense`: setup compares it in its first collective, and a disagreement, or a setup failure on any rank, makes every rank of the group raise. Dense DWDP is meant for context servers; on a generation server every decode step would gather every covered layer. `trtllm-serve` refuses `enable_dense` on a server launched with `--server_role GENERATION` or as a generation server of a disaggregated MPI launch, and warns on a server without the context role, so launch context servers with `--server_role CONTEXT`. A Kimi-K3 server with expert DWDP and `enable_dense` off still runs the first collective of dense setup at startup, so that a group whose servers disagree fails at once.
+
 ## Appendix
 
 ### MoE Perf Dashboard

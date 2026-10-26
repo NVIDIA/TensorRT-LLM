@@ -139,6 +139,7 @@ from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, 
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -2116,12 +2117,65 @@ class KimiMLARuntime(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Dense DWDP: the tables its setup reads off every decoder layer.
+# ---------------------------------------------------------------------------
+
+# Plain attributes (a tensor, or a tuple of tensors) under the dense roots that dense DWDP may
+# move as weights: the fused KDA projections, decode constants and the low-M GEMM's scale copies.
+# Parameters and buffers need no entry.
+DWDP_DENSE_ATTR_ALLOW: frozenset[str] = frozenset(
+    {
+        "_low_m_weight_scale",
+        "_bfa_proj_weight",
+        "_qkvg_proj_weight",
+        "_gate_b_t",
+        "_packed_conv_weight",
+        "_mtp_conv_weights",
+        "_w_q_t",
+        "_w_k_t",
+        "_w_v_t",
+        "_A_log_f32",
+        "_dt_bias_f32",
+        "_onorm_w_f32",
+    }
+)
+
+# Names that never make dense DWDP move a storage: per-call scratch tensors and the routing bias.
+# A reference under one of these names to a storage that moves through another reference is still
+# repointed with it.
+DWDP_DENSE_EXCLUDE: frozenset[str] = frozenset(
+    {
+        "_o_dense",
+        "_fused_q_placeholder",
+        "softmax_stats_tensor",
+        "temp_softmax_stats_tensor",
+        "e_score_correction_bias",
+    }
+)
+
+_DENSE_DWDP_SEGMENTS = ("attn", "moe")
+# Children of the MoE block that hold its dense weights: the router, the shared expert and the
+# latent projections and norm. The routed experts belong to expert DWDP and are never a dense root.
+_DENSE_DWDP_MOE_ROOTS = (
+    "gate",
+    "shared_experts",
+    "routed_expert_down_proj",
+    "routed_expert_up_proj",
+    "routed_expert_norm",
+)
+
+
+# ---------------------------------------------------------------------------
 # Decoder layer.
 # ---------------------------------------------------------------------------
 
 
 @nccl_window_tensor_scoped_module
 class KimiLinearDecoderLayer(nn.Module):
+    # Read by dense DWDP setup next to ``dense_dwdp_roots``.
+    dense_dwdp_attr_allow: frozenset[str] = DWDP_DENSE_ATTR_ALLOW
+    dense_dwdp_exclude: frozenset[str] = DWDP_DENSE_EXCLUDE
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -2239,6 +2293,43 @@ class KimiLinearDecoderLayer(nn.Module):
         self.self_attention_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
         self.mlp_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
 
+        # The DWDP manager exists before the model is built; forward() reaches the dense DWDP
+        # runtime through it.
+        self._dwdp = get_global_dwdp_manager()
+
+    def dense_dwdp_roots(self, segment: str) -> list[tuple[str, nn.Module]]:
+        """The modules holding this layer's dense DWDP weights of ``segment``.
+
+        Implements ``modules.dwdp.dense.types.DenseRootsProvider``. Dense DWDP moves the
+        replicated weights reachable from these roots (see ``DWDP_DENSE_ATTR_ALLOW`` and
+        ``DWDP_DENSE_EXCLUDE``) and reads them back only inside the windows ``forward`` opens.
+
+        Args:
+            segment: ``"attn"`` for the attention weights, ``"moe"`` for the MoE-dense weights:
+                the router, the shared expert and the latent projections. The routed experts
+                are never a root.
+
+        Returns:
+            ``(path relative to this layer, module)`` pairs in walk order; [] when the layer's
+            weights stay replicated: a layer without the MoE block (layer 0 of Kimi-K3) or one
+            whose weights were removed (layer-wise benchmarks).
+
+        Raises:
+            ValueError: ``segment`` is neither ``"attn"`` nor ``"moe"``.
+        """
+        if segment not in _DENSE_DWDP_SEGMENTS:
+            raise ValueError(
+                f"Kimi K3 dense DWDP segment must be one of {_DENSE_DWDP_SEGMENTS}; got {segment!r}"
+            )
+        if not self.is_moe or not _has_weights(self):
+            return []
+        if segment == "attn":
+            if self.is_kda:
+                return [("linear_attn", self.linear_attn)]
+            return [("self_attn", self.self_attn)]
+        moe = self.block_sparse_moe
+        return [(f"block_sparse_moe.{name}", getattr(moe, name)) for name in _DENSE_DWDP_MOE_ROOTS]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2274,6 +2365,17 @@ class KimiLinearDecoderLayer(nn.Module):
         def _full_rows(t: torch.Tensor) -> torch.Tensor:
             return t if sliced is None else sliced.all_gather(t, num_tokens)
 
+        # Dense DWDP read windows: every read of this layer's attention weights happens between
+        # H1 (wait_layer) and H2 (attention_done), every read of its MoE-dense weights (router,
+        # shared expert, latent projections) between H1 and H3 (layer_done). Their staging slots
+        # are refilled with a later layer's weights once a window closes, so a read outside its
+        # window sees another layer's bytes.
+        dwdp = getattr(self, "_dwdp", None)
+        dense = dwdp.dense if dwdp is not None else None
+        if dense is not None and not dense.covers(self.layer_idx):
+            dense = None
+        if dense is not None:
+            dense.wait_layer(self.layer_idx)  # H1
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
 
@@ -2320,6 +2422,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 hidden_states = sliced.reduce_scatter(hidden_states, num_tokens)
         else:
             hidden_states = self.self_attn(hidden_states, attn_metadata)
+        if dense is not None:
+            dense.attention_done(self.layer_idx)  # H2: no attention weight is read after this.
 
         if prefix_sum is None:
             prefix_sum = hidden_states
@@ -2348,6 +2452,8 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
+        if dense is not None:
+            dense.layer_done(self.layer_idx)  # H3: no MoE-dense weight is read after this.
 
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
@@ -2439,6 +2545,10 @@ class KimiLinearModel(DecoderModel):
             key="kimi_k3_aux_capture_mode",
         )
 
+        # The DWDP manager exists before the model is built; forward() primes dense DWDP
+        # through it.
+        self._dwdp = get_global_dwdp_manager()
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -2450,6 +2560,13 @@ class KimiLinearModel(DecoderModel):
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        # Dense DWDP H0: make sure the first two layers' dense and expert weights are enqueued
+        # before any layer runs (the previous forward's end or the executor loop usually already
+        # did). After a forward that stopped midway, a WAR barrier on this stream comes first.
+        dwdp = getattr(self, "_dwdp", None)
+        if dwdp is not None and dwdp.dense is not None:
+            dwdp.ensure_primed()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -3158,6 +3275,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         return name_map, expected_keys, expert_jobs
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        if getattr(self.model, "_dense_dwdp_active", False):
+            # The dense weights are views of staging slots that several layers share: a load
+            # would write into them, and the next gather overwrites that from the row store.
+            raise RuntimeError(
+                "Kimi K3 load_weights is not supported while dense DWDP is active: the dense "
+                "weights live in staging slots shared across layers"
+            )
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)

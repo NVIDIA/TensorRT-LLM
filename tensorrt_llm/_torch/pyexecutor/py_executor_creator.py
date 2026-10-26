@@ -19,6 +19,7 @@ from strenum import StrEnum
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
+from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
 from tensorrt_llm._utils import get_sm_version
@@ -250,6 +251,21 @@ class _ExecutorMemoryMonitor:
                     free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
                     free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
                 ))
+
+
+def _check_dense_dwdp_launch(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
+    """Run the dense DWDP launch gate if ``dwdp_config.enable_dense`` asks for it.
+
+    It runs before the DWDP manager and the model are built, so a launch that
+    dense DWDP cannot serve fails before the weights load.
+
+    Raises:
+        ValueError: Dense DWDP is requested and the launch violates one of its
+            requirements (see ``validate_dense_gate``).
+    """
+    dwdp_config = llm_args.dwdp_config
+    if dwdp_config is not None and dwdp_config.enable_dense:
+        validate_dense_gate(llm_args, mapping)
 
 
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
@@ -777,6 +793,10 @@ def _create_py_executor(
         chunk_size=max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
+
+    # The dense DWDP gate runs before the DWDP block below, so that a launch
+    # dense DWDP cannot serve fails with the dense requirement it breaks.
+    _check_dense_dwdp_launch(llm_args, mapping)
 
     # Initialize DWDP Manager.
     #

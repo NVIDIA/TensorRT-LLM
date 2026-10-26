@@ -275,6 +275,21 @@ class DWDPWeightManager:
         """Total number of DWDP ranks."""
         return self._dwdp_size
 
+    @property
+    def copy_stream(self) -> torch.cuda.Stream:
+        """The CUDA stream every DWDP prefetch copy runs on."""
+        return self._copy_stream
+
+    @property
+    def use_gather(self) -> bool:
+        """Whether prefetches use the SM fabric gather (``TRTLLM_DWDP_PREFETCH_GATHER``)."""
+        return self._use_gather
+
+    @property
+    def use_batched_prefetch(self) -> bool:
+        """Whether prefetches use one batched copy-engine copy per layer (``contention_opt``)."""
+        return self._use_batched_prefetch
+
     def is_moe_layer(self, layer_idx: int) -> bool:
         """Check if a given layer index is a MoE layer.
 

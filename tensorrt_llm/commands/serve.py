@@ -630,37 +630,69 @@ def _bool_setting(value: object) -> bool:
         return False
 
 
+def _dense_dwdp_setting(dwdp_config: object) -> bool:
+    """Whether a ``dwdp_config`` value of the LLM arguments enables dense DWDP.
+
+    The value is a ``DwdpConfig`` once the YAML is merged, or a mapping; a
+    value that does not parse is left to the LLM arguments' own validation.
+    """
+    if isinstance(dwdp_config, dict):
+        return _bool_setting(dwdp_config.get("enable_dense"))
+    return getattr(dwdp_config, "enable_dense", False) is True
+
+
 def _check_context_only_settings(llm_args: dict, *, warn: bool) -> None:
     """Refuse the context-only settings on a generation server; warn without a role.
 
+    Dense DWDP (``dwdp_config.enable_dense``) gathers the dense weights of
+    every covered layer in every forward, decode steps included, and
     ``drop_inflight_requests_on_shutdown`` lets a shutdown free the KV cache
     pools while a request may still be receiving its KV cache, which happens
     on generation servers only. The role is the one the server's ranks see in
     ``TRTLLM_DISAGG_ROLE``: ``launch_server`` publishes it from
     ``--server_role``, and the disaggregated MPI worker from its server's type.
-    Without a role, a server with a cache transceiver gets a warning that
-    names the remedy. Runs before the LLM is built, so a refused launch fails
-    before the model loads.
+    A server without the context role gets a warning that names the remedy:
+    with dense DWDP any such server, with the drop setting one without a role
+    that has a cache transceiver. Runs before the LLM is built, so a refused
+    launch fails before the model loads.
 
     Args:
         llm_args: The merged LLM arguments of the server.
-        warn: Whether to log the warning; an attached frontend repeats its
-            launcher's check without it.
+        warn: Whether to log the warnings; an attached frontend repeats its
+            launcher's check without them.
 
     Raises:
         click.BadParameter: A setting is refused for the server's role.
     """
     role = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_ROLE) or None
-    if not _bool_setting(llm_args.get("drop_inflight_requests_on_shutdown")):
-        return
+    dense = _dense_dwdp_setting(llm_args.get("dwdp_config"))
+    drop = _bool_setting(llm_args.get("drop_inflight_requests_on_shutdown"))
     if role == "generation":
-        raise click.BadParameter(
-            "drop_inflight_requests_on_shutdown is for context servers only: "
-            "on a generation server a shutdown would free the KV cache pools "
-            "while a request may still be receiving its KV cache. Remove it "
-            "from this server's configuration.")
-    if (warn and role is None
-            and llm_args.get("cache_transceiver_config") is not None):
+        if dense:
+            raise click.BadParameter(
+                "dwdp_config.enable_dense is for context servers only: dense "
+                "DWDP gathers the dense weights of every covered layer in "
+                "every forward, decode steps included. Remove it from this "
+                "server's configuration.")
+        if drop:
+            raise click.BadParameter(
+                "drop_inflight_requests_on_shutdown is for context servers "
+                "only: on a generation server a shutdown would free the KV "
+                "cache pools while a request may still be receiving its KV "
+                "cache. Remove it from this server's configuration.")
+        return
+    if not warn or role == "context":
+        return
+    if dense:
+        logger.warning(
+            "dwdp_config.enable_dense is set on a server without the context "
+            "role, where dense DWDP gathers the dense weights of every covered "
+            "layer in every forward, decode steps included. It is meant for "
+            "context servers and refused on generation servers; launch "
+            "context servers with --server_role CONTEXT so that the role is "
+            "checked.")
+    if drop and role is None and llm_args.get(
+            "cache_transceiver_config") is not None:
         logger.warning(
             "drop_inflight_requests_on_shutdown is set on a disaggregated "
             "server without a role. It is meant for context servers and "

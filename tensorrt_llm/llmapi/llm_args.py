@@ -5779,7 +5779,29 @@ class DwdpConfig(StrictBaseModel):
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
     on MNNVL-connected multi-GPU systems (e.g., GB200).
+
+    Dense DWDP (enable_dense) also shards the replicated dense weights of the
+    MoE decoder layers over the DWDP group.
     """
+    enable_dense: bool = Field(
+        default=False,
+        description=
+        "Dense DWDP: row-shard the replicated dense weights of the MoE decoder "
+        "layers (attention, shared expert, router and the other dense weights "
+        "of the MoE block) over the DWDP group, and gather each layer into "
+        "small staging slots two layers ahead of its use, which frees most of "
+        "them for the KV cache. Only for models whose decoder layers provide "
+        "dense DWDP roots (Kimi-K3), on context servers: trtllm-serve refuses it "
+        "on a server launched with --server_role GENERATION or as a generation "
+        "server of a disaggregated MPI launch, and warns on any other server "
+        "without the context role, so launch context servers with "
+        "--server_role CONTEXT. Every server of the DWDP group must set the "
+        "same value. It needs eager "
+        "execution (no CUDA graphs, "
+        "torch.compile or prefill CUDA graphs), no sleep, LoRA or speculative "
+        "config, locality domains off, tensor, pipeline and context parallel "
+        "size 1, disable_overlap_scheduler=True and FABRIC peer handles.",
+        status="prototype")
     dwdp_size: int = Field(default=1,
                            description="The number of GPUs per DWDP group.")
     num_groups: int = Field(

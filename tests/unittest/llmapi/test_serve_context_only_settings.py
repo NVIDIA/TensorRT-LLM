@@ -14,10 +14,12 @@
 # limitations under the License.
 """trtllm-serve checks the settings meant for context servers against the server's role.
 
-The role is the one the server's ranks see in ``TRTLLM_DISAGG_ROLE``: ``launch_server`` publishes it
-from ``--server_role``, a disaggregated MPI worker from its server's type, and without either the
-server keeps whatever its environment holds. A generation server is refused before the LLM is
-built; a disaggregated server without a role gets one warning that names ``--server_role CONTEXT``.
+Dense DWDP (``dwdp_config.enable_dense``) and ``drop_inflight_requests_on_shutdown`` are meant for
+context servers. The role is the one the server's ranks see in ``TRTLLM_DISAGG_ROLE``:
+``launch_server`` publishes it from ``--server_role``, a disaggregated MPI worker from its server's
+type, and without either the server keeps whatever its environment holds. A generation server is
+refused before the LLM is built. Without the context role, dense DWDP gets one warning, and the
+drop setting gets one on a disaggregated server without a role; both name ``--server_role CONTEXT``.
 """
 
 import os
@@ -31,11 +33,13 @@ import pytest
 
 from tensorrt_llm.commands import serve
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.llmapi.llm_args import DwdpConfig
 
 pytestmark = pytest.mark.cpu_only
 
 _ROLE_ENV = "TRTLLM_DISAGG_ROLE"
 _DROP = {"drop_inflight_requests_on_shutdown": True}
+_DENSE = {"dwdp_config": DwdpConfig(enable_dense=True, dwdp_size=4)}
 _TRANSCEIVER = {"cache_transceiver_config": {"backend": "DEFAULT"}}
 
 
@@ -89,12 +93,16 @@ def _launch_server(tmp_path: Path, settings: dict, **kwargs: object) -> None:
     serve.launch_server("127.0.0.1", 0, llm_args, report_addr=str(tmp_path / "addr"), **kwargs)
 
 
+def _warnings_about(warnings: Mock, setting: str) -> list[str]:
+    return [call.args[0] for call in warnings.call_args_list if setting in call.args[0]]
+
+
 def _drop_warnings(warnings: Mock) -> list[str]:
-    return [
-        call.args[0]
-        for call in warnings.call_args_list
-        if "drop_inflight_requests_on_shutdown" in call.args[0]
-    ]
+    return _warnings_about(warnings, "drop_inflight_requests_on_shutdown")
+
+
+def _dense_warnings(warnings: Mock) -> list[str]:
+    return _warnings_about(warnings, "dwdp_config.enable_dense")
 
 
 @pytest.mark.parametrize("value", [True, "true", 1], ids=["bool", "string", "int"])
@@ -109,6 +117,55 @@ def test_a_generation_server_refuses_drop_inflight_before_the_llm_is_built(
             server_role=ServerRole.GENERATION,
         )
     launch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "dwdp_config",
+    [DwdpConfig(enable_dense=True, dwdp_size=4), {"enable_dense": True, "dwdp_size": 4}],
+    ids=["config", "mapping"],
+)
+def test_a_generation_server_refuses_dense_dwdp_before_the_llm_is_built(
+    launch: Mock, tmp_path: Path, dwdp_config: object
+) -> None:
+    """--server_role GENERATION refuses enable_dense, parsed or still a YAML mapping."""
+    with pytest.raises(click.BadParameter, match="dwdp_config.enable_dense is for context servers"):
+        _launch_server(tmp_path, {"dwdp_config": dwdp_config}, server_role=ServerRole.GENERATION)
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "role,dwdp_config,warned",
+    [
+        (None, DwdpConfig(enable_dense=True, dwdp_size=4), True),
+        ("", {"enable_dense": True}, True),
+        ("context", DwdpConfig(enable_dense=True, dwdp_size=4), False),
+        (None, DwdpConfig(dwdp_size=4), False),
+        (None, None, False),
+    ],
+    ids=["no-role", "unknown-role", "context", "expert-only", "no-dwdp"],
+)
+def test_dense_dwdp_without_the_context_role_is_warned_once(
+    monkeypatch: pytest.MonkeyPatch,
+    warnings: Mock,
+    role: str | None,
+    dwdp_config: object,
+    warned: bool,
+) -> None:
+    """Any server without the context role is warned about dense DWDP.
+
+    Dense DWDP gathers every covered layer in every forward, with or without a cache transceiver.
+    """
+    if role is None:
+        _clear_role(monkeypatch)
+    else:
+        monkeypatch.setenv(_ROLE_ENV, role)
+
+    serve._check_context_only_settings({"dwdp_config": dwdp_config}, warn=True)
+
+    found = _dense_warnings(warnings)
+    assert len(found) == int(warned)
+    if warned:
+        assert "--server_role CONTEXT" in found[0]
 
 
 @pytest.mark.parametrize(
@@ -150,9 +207,9 @@ def test_an_attached_frontend_does_not_repeat_the_warning(
     """The launcher warns; an attached frontend re-runs the check silently."""
     _clear_role(monkeypatch)
 
-    serve._check_context_only_settings({**_DROP, **_TRANSCEIVER}, warn=False)
+    serve._check_context_only_settings({**_DROP, **_DENSE, **_TRANSCEIVER}, warn=False)
 
-    assert _drop_warnings(warnings) == []
+    assert warnings.call_args_list == []
 
 
 def test_an_inherited_role_is_checked_like_a_published_one(
@@ -180,7 +237,10 @@ def test_a_disaggregated_mpi_worker_takes_its_role_from_the_server_type(
     refused: bool,
     warned: bool,
 ) -> None:
-    """A gen server is refused, a ctx server passes, and an unknown type has no role."""
+    """A gen server is refused, a ctx server passes, and an unknown type has no role.
+
+    With both settings set, the refusal names dense DWDP, which the check reads first.
+    """
     server = SimpleNamespace(type=server_type, hostname="127.0.0.1", port=0)
     config = SimpleNamespace(
         server_configs=[server], allow_request_chat_template=False, internal_request_auth_key=None
@@ -193,13 +253,14 @@ def test_a_disaggregated_mpi_worker_takes_its_role_from_the_server_type(
         "launch_server",
         lambda **kwargs: real_launch_server(**kwargs, report_addr=str(tmp_path / "addr")),
     )
-    llm_args = {"backend": "pytorch", "model": "dummy", **_DROP, **_TRANSCEIVER}
+    llm_args = {"backend": "pytorch", "model": "dummy", **_DROP, **_DENSE, **_TRANSCEIVER}
 
     if refused:
-        with pytest.raises(click.BadParameter, match="is for context servers only"):
+        with pytest.raises(click.BadParameter, match="dwdp_config.enable_dense is for context"):
             serve._launch_disaggregated_server("unused.yaml", llm_args)
         launch.assert_not_called()
     else:
         with pytest.raises(_LlmBuilt):
             serve._launch_disaggregated_server("unused.yaml", llm_args)
     assert len(_drop_warnings(warnings)) == int(warned)
+    assert len(_dense_warnings(warnings)) == int(warned)

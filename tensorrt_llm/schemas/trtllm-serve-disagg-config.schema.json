@@ -3429,7 +3429,7 @@
     },
     "DwdpConfig": {
       "additionalProperties": false,
-      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
+      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).\n\nDense DWDP (enable_dense) also shards the replicated dense weights of the\nMoE decoder layers over the DWDP group.",
       "properties": {
         "contention_opt": {
           "default": false,
@@ -3442,6 +3442,13 @@
           "description": "The number of GPUs per DWDP group.",
           "title": "Dwdp Size",
           "type": "integer"
+        },
+        "enable_dense": {
+          "default": false,
+          "description": "Dense DWDP: row-shard the replicated dense weights of the MoE decoder layers (attention, shared expert, router and the other dense weights of the MoE block) over the DWDP group, and gather each layer into small staging slots two layers ahead of its use, which frees most of them for the KV cache. Only for models whose decoder layers provide dense DWDP roots (Kimi-K3), on context servers: trtllm-serve refuses it on a server launched with --server_role GENERATION or as a generation server of a disaggregated MPI launch, and warns on any other server without the context role, so launch context servers with --server_role CONTEXT. Every server of the DWDP group must set the same value. It needs eager execution (no CUDA graphs, torch.compile or prefill CUDA graphs), no sleep, LoRA or speculative config, locality domains off, tensor, pipeline and context parallel size 1, disable_overlap_scheduler=True and FABRIC peer handles.",
+          "status": "prototype",
+          "title": "Enable Dense",
+          "type": "boolean"
         },
         "num_experts_per_worker": {
           "default": 0,

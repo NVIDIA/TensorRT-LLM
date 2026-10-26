@@ -306,6 +306,11 @@
       "path": "dwdp_config.dwdp_size"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_dense"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.num_experts_per_worker"

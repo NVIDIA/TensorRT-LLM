@@ -115,6 +115,7 @@ class _Harness:
         )
         self.mgr = object.__new__(DwdpManager)
         self.mgr._weight_manager = self.wm
+        self.mgr._dense = None  # expert DWDP alone
         self.backend = _Backend()
         self.compute_stream = torch.cuda.Stream()
         self.copies: List[int] = []
