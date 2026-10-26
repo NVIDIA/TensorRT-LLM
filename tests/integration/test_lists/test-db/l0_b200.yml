@@ -312,7 +312,7 @@ l0_b200:
   # remaining Muse files are cpu_only and run in l0_cpu.
   - unittest/_torch/modeling/test_modeling_musespark_open.py
   - unittest/_torch/modeling/test_musespark_open_moe_tp.py
-  - unittest/_torch/modeling/test_musespark_open_omni_weights.py::test_a_real_tiny_load_leaves_nothing_unaccounted
+  - unittest/_torch/modeling/test_musespark_open_tower_load.py
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]

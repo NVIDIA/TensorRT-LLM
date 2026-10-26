@@ -346,8 +346,11 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
         their own text embeddings and are not in :meth:`get_mm_token_ids`).
         The resample itself is not run here: ``resampled_num_samples`` is
         exactly the length ``librosa.resample(fix=True)`` produces, so the
-        count matches the real path without touching the samples. A bare array
-        with no rate is taken to be 24 kHz already.
+        count matches the real path without touching the samples. The rate
+        comes from the item alone, an ``(array, rate)`` pair or a dict with
+        ``sampling_rate``; a bare array is taken to be 24 kHz already. The
+        framework counts items without the request's processor kwargs, which
+        is why preprocessing does not read a rate from them either.
         """
         del kwargs
         if not self._audio_enabled:
@@ -585,13 +588,13 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
             if not self._audio_ids_verified:
                 verify_audio_token_ids(tokenizer_vocab(self.tokenizer))
                 self._audio_ids_verified = True
-            default_rate = (inputs.get("mm_processor_kwargs") or {}).get("sample_rate")
             waveforms: List[torch.Tensor] = []
             for audio in audios:
-                # 24 kHz mono float32; the token count is defined on THIS
+                # 24 kHz mono float32; the token count is defined on this
                 # waveform (post-resample, post-downmix), and the encoder
-                # emits exactly ceil(N/1920) rows for it by construction.
-                waveform = to_mono_24k(audio, default_rate)
+                # emits exactly ceil(N/1920) rows for it by construction. The
+                # rate comes from the item alone, as in get_num_tokens_per_audio.
+                waveform = to_mono_24k(audio)
                 waveforms.append(torch.from_numpy(waveform))
                 expansions.append(("audio", audio_placeholder_ids(num_audio_tokens(len(waveform)))))
             # Variable-length clips travel as one packed 1-D tensor plus the

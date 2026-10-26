@@ -243,8 +243,9 @@ def test_norming_twice_is_not_a_no_op(manifest, weightless_norm, index):
 
     If the encoder normed AND the decoder normed, vision rows would be normed
     twice. On a unit-RMS row that is close to idempotent, which is exactly why
-    it is easy to assume it is harmless. Measure it instead: it moves the
-    answer by far more than the tolerance the identity above passes at.
+    it is easy to assume it is harmless. Measure it instead: the second norm
+    must change the rows, and the drift is printed so a reader can set it
+    against the identity tolerance above.
     """
     root, records = _records(manifest)
     if index >= len(records):
@@ -257,9 +258,8 @@ def test_norming_twice_is_not_a_no_op(manifest, weightless_norm, index):
 
     drift = (twice - once).abs().max().item()
     relative = drift / once.abs().max().item()
-    # Not asserting a specific magnitude -- only that it is not zero, which is
-    # the claim that matters, and that it is visible next to the identity
-    # tolerance so a reader can see the trap has teeth.
+    # Only that it is not zero: that is the claim the trap rests on. The
+    # magnitude is reported, not asserted.
     assert drift > 0.0, f"{record['tag']}: second norm was a bitwise no-op"
     print(f"{record['tag']}: second-norm drift max_abs {drift:.3e}, relative {relative:.3e}")
 

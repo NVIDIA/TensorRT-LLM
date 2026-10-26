@@ -703,6 +703,10 @@ def test_exclude_module_patterns_are_anchored():
 
     assert quant.is_module_excluded_from_quantization("model.layers.0.feed_forward.experts")
     assert quant.is_module_excluded_from_quantization("model.layers.61.feed_forward.experts")
+    # The exact names MuseSparkOpenMoE asks about when it picks a layer's quant config.
+    assert quant.is_module_excluded_from_quantization("model.layers.0")
+    assert quant.is_module_excluded_from_quantization("model.layers.61")
+    assert not quant.is_module_excluded_from_quantization("model.layers.1")
     assert quant.is_module_excluded_from_quantization("model.layers.30.self_attn.qkv_proj")
     assert quant.is_module_excluded_from_quantization("lm_head")
     # Quantized layers stay quantized, including the ones whose index shares a

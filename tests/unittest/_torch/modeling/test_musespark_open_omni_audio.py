@@ -117,11 +117,34 @@ def test_token_count_refuses_an_empty_clip():
         (16_000, 16_000, 24_000),  # 1 s @ 16 kHz -> 24000 samples
         (24_000, 24_000, 24_000),  # already on rate: untouched
         (1, 16_000, 2),  # ceil(1 * 24000/16000) = 2, librosa fix=True semantics
-        (44_100, 44_100, 24_000),
+        # librosa's ratio-first float order: 44100 * (24000 / 44100) and
+        # 88200 * (24000 / 44100) land a hair above 24000 and 48000.
+        (44_100, 44_100, 24_001),
+        (88_200, 44_100, 48_001),
     ],
 )
 def test_resampled_length_matches_fix_true_semantics(num_samples, rate, expected_len):
     assert audio.resampled_num_samples(num_samples, rate) == expected_len
+
+
+@pytest.mark.parametrize(
+    "num_samples,rate",
+    [
+        (44_100, 44_100),
+        (88_200, 44_100),
+        (16_000, 16_000),
+        (12_345, 11_025),
+        (77_777, 48_000),
+        (1, 22_050),
+    ],
+)
+def test_resampled_length_matches_librosa(num_samples, rate):
+    """The count is defined on the waveform ``to_mono_24k`` actually produces."""
+    import numpy as np
+
+    pytest.importorskip("librosa")
+    wave = audio.to_mono_24k(np.zeros(num_samples, dtype=np.float32), rate)
+    assert audio.resampled_num_samples(num_samples, rate) == wave.shape[0]
 
 
 def test_to_mono_24k_downmixes_and_counts_post_downmix():

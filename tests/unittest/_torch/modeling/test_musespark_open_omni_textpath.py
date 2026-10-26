@@ -246,9 +246,7 @@ def test_the_text_path_is_shape_agnostic(num_contexts):
 #
 # Both base classes declare abstract properties. Leaving any of them out does
 # not fail at import or at definition -- it makes the class abstract, and the
-# framework simply cannot build it. The rest of this repository's MuseSparkOpen
-# tests only ever called the module-level preprocessing helpers, so nothing
-# instantiated a processor and nothing noticed. That is the gap these close.
+# framework simply cannot build it. These tests build one.
 # --------------------------------------------------------------------------
 def _tiny_vision_config():
     from test_modeling_musespark_open_vision import TINY_VISION_CONFIG  # noqa: PLC0415
@@ -274,8 +272,8 @@ class _StubTokenizer:
     true of the checkpoint tokenizer: ``<image>`` and ``<video>`` are ORDINARY
     TEXT (no added token exists for either), so each becomes a multi-id run;
     the two runs differ; and ``><`` merges into a single token, so two adjacent
-    markers do NOT tokenize as two copies of one marker. A stub without that
-    last property would let the fixed-subsequence matcher this replaced pass.
+    markers do NOT tokenize as two copies of one marker, which a splice that
+    matched marker ids instead of marker text would get wrong.
     """
 
     _VOCAB = {
@@ -689,6 +687,60 @@ def test_counting_a_video_without_a_frame_rate_says_why():
     processor = _build_processor()
     with pytest.raises(ValueError, match="frame rate"):
         processor.get_num_tokens_per_video(video=[_pil(112, 112)], video_metadata={})
+
+
+class _AudioStubTokenizer(_StubTokenizer):
+    """The stub tokenizer plus the audio token names the processor checks."""
+
+    def get_vocab(self):
+        from tensorrt_llm._torch.models.musespark_open_audio import (  # noqa: PLC0415
+            AUDIO_TOKEN_IDS,
+            AUDIO_TOKEN_NAMES,
+        )
+
+        return {name: AUDIO_TOKEN_IDS[role] for role, name in AUDIO_TOKEN_NAMES.items()}
+
+
+def _audio_item(kind):
+    import numpy as np  # noqa: PLC0415
+
+    if kind == "bare-24k":
+        return np.zeros(24_000, dtype=np.float32)
+    if kind == "pair-16k":
+        return (np.zeros(16_000, dtype=np.float32), 16_000)
+    # 88,200 samples at 44.1 kHz is where multiplying before dividing would
+    # count one sample short of what librosa produces.
+    return {"array": np.zeros(88_200, dtype=np.float32), "sampling_rate": 44_100}
+
+
+@pytest.mark.parametrize("kind", ["bare-24k", "pair-16k", "dict-44k1"])
+def test_counting_an_audio_item_matches_its_expansion(kind):
+    """`find_mm_token_lengths` counts each item without the request's
+    processor kwargs, so the expansion must follow from the item alone: a
+    `sample_rate` kwarg must not resample a bare array behind the count's back.
+    """
+    pytest.importorskip("librosa")
+    from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
+        MuseSparkInputProcessor,
+    )
+    from tensorrt_llm._torch.models.musespark_open_audio import AUDIO_TOKEN_IDS  # noqa: PLC0415
+
+    config = _tiny_vision_config()
+    config.audio_perception_modality_args = {"input_mode": "wav"}
+    processor = MuseSparkInputProcessor(
+        model_path="/nonexistent/checkpoint", config=config, tokenizer=_AudioStubTokenizer()
+    )
+    item = _audio_item(kind)
+
+    ids, _ = processor.call_with_text_prompt(
+        {
+            "prompt": "describe <audio>",
+            "multi_modal_data": {"audio": [item]},
+            "mm_processor_kwargs": {"sample_rate": 16_000},
+        },
+        SamplingParams(),
+    )
+    assert ids.count(AUDIO_TOKEN_IDS["audio"]) == processor.get_num_tokens_per_audio(audio=item)
 
 
 def test_the_multimodal_ids_do_not_route_through_the_absent_processor():
@@ -1438,6 +1490,32 @@ def test_an_interleaved_request_keeps_every_item_where_the_prompt_put_it():
         item_refs=[("image", 0), ("video", 0), ("image", 1)],
     )
     assert _encoded_order([params]) == [1.0, 2.0, 3.0]
+
+
+class _OrderRecordingAudioTower(torch.nn.Module):
+    """Stands in for the audio tower: one row per clip, holding the clip's first sample."""
+
+    def forward(self, waveforms):
+        return [torch.full((1, 3), float(waveform[0])) for waveform in waveforms]
+
+
+def test_audio_and_vision_rows_interleave_in_prompt_order():
+    """`<audio><image><audio>`: the towers run separately, and the image row
+    must land between the two clips' rows, not after them."""
+    encoder = _encoder_with_stub_tower()
+    encoder.audio_tower = _OrderRecordingAudioTower()
+    encoder._vision_config = _tiny_vision_config().vision_config
+    params = _params(
+        {
+            "image": _modality_data("image", [2.0]),
+            "audio": {
+                "waveforms": torch.tensor([1.0, 1.0, 3.0, 3.0, 3.0]),
+                "sample_counts": torch.tensor([2, 3], dtype=torch.int64),
+            },
+        },
+        item_refs=[("audio", 0), ("image", 0), ("audio", 1)],
+    )
+    assert encoder.forward([params])[:, 0].tolist() == [1.0, 2.0, 3.0]
 
 
 def test_requests_stay_in_batch_order_and_items_in_prompt_order_within_them():

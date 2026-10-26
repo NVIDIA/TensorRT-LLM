@@ -119,14 +119,17 @@ def num_audio_tokens(num_samples: int) -> int:
 def resampled_num_samples(num_samples: int, sample_rate: int) -> int:
     """Length a clip will have after the resample to 24 kHz.
 
-    ``ceil(n * target / orig)`` is exactly the output length of
-    ``librosa.resample(..., fix=True)``, which is what :func:`to_mono_24k`
-    uses -- the same pairing the Nemotron audio path relies on, so a token
-    count taken here matches one taken on the actually-resampled waveform.
+    The output length of ``librosa.resample(..., fix=True)``, which is what
+    :func:`to_mono_24k` uses, computed with librosa's own float operations:
+    the ratio first, then ``ceil(n * ratio)``. Multiplying before dividing
+    differs at some lengths (88,200 samples at 44.1 kHz resample to 48,001,
+    not 48,000), and then the placeholder count would disagree with the
+    waveform the encoder sees.
     """
     if sample_rate == AUDIO_TARGET_SAMPLE_RATE:
         return num_samples
-    return math.ceil(num_samples * AUDIO_TARGET_SAMPLE_RATE / sample_rate)
+    ratio = float(AUDIO_TARGET_SAMPLE_RATE) / sample_rate
+    return math.ceil(num_samples * ratio)
 
 
 def audio_placeholder_ids(count: int) -> List[int]:
