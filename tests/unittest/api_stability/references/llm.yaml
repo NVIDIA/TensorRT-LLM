@@ -107,8 +107,8 @@ methods:
         default: pytorch
         status: deprecated
       modeling_v2:
-        annotation: Literal['off', 'auto', 'require']
-        default: 'off'
+        annotation: Literal['default', 'off', 'auto', 'require']
+        default: 'default'
         status: prototype
       cuda_graph_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
@@ -182,6 +182,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      lm_head_output_dtype:
+        annotation: Literal['auto', 'float32']
+        default: auto
+        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta

@@ -263,14 +263,14 @@ def _host_outputs(state) -> dict[str, torch.Tensor]:
     )
 
 
-def test_store_copies_stay_on_the_main_stream_by_default():
+def test_store_copies_go_on_the_side_stream_when_the_sampler_stored_the_rows():
     sampler = _sampler()
     scheduled, outputs = _step(MAX_DRAFT_LEN)
 
     state = sampler.sample_async(scheduled, outputs, [])
 
     assert not sampler.d2h_side_stream_copies
-    assert state.sampler_event.side_stream_event is None
+    assert state.sampler_event.side_stream_event is not None
 
 
 @pytest.mark.parametrize("draft_width", [MAX_DRAFT_LEN, MAX_DRAFT_LEN - 1])

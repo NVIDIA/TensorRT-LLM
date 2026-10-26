@@ -131,7 +131,11 @@ def test_validate_and_set_kv_cache_quant_auto_uses_checkpoint():
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
-def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides():
+def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pin a non-SM107 device: on SM107 an explicit NVFP4 request falls back to FP8.
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.model_loader.get_sm_version", lambda: 100)
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     validate_and_set_kv_cache_quant(model_config, "nvfp4")
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
