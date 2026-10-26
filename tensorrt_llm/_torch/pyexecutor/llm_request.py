@@ -1003,7 +1003,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
-        # Uncached-prefill estimate published by the attention-DP router, if any.
+        # Uncached-prefill estimate published by the attention-DP router, if
+        # any. The V2 scheduler drops it when the demotion aging bound lets the
+        # request through.
         self.py_uncached_prefill_tokens: int | None = None
 
         self.py_num_connector_matched_tokens = 0

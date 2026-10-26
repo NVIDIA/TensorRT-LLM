@@ -5265,7 +5265,7 @@ class TestLongContextDemotion:
         out = self._make(self.ENV).schedule_request([still_long, short], set())
         assert ids(out.context_requests) == [1, 0]
 
-    def test_aging_bound_lets_a_demoted_request_through(self):
+    def test_aging_bound_lets_a_demoted_request_through_for_good(self):
         sched = self._make(dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"))
         long_req = self._req(0, 10_000, estimate=10_000)
         # At the threshold (`> T` is false): never demoted, leaves 64 tokens.
@@ -5274,10 +5274,13 @@ class TestLongContextDemotion:
             out = sched.schedule_request([long_req, hog], set())
             assert ids(out.context_requests) == [1, 0]
             assert long_req.context_chunk_size == 64  # crumbs do not reset the count
-        out = sched.schedule_request([long_req, hog], set())
-        assert ids(out.context_requests) == [0]  # let through in arrival order
-        assert long_req.context_chunk_size == 1024
-        assert sched._ctx_demote_skips == {}  # served: count restarts
+        # Let through in arrival order, and never demoted again: parked behind
+        # the short requests, a started prefill would hold its KV blocks.
+        for _ in range(2):
+            out = sched.schedule_request([long_req, hog], set())
+            assert ids(out.context_requests) == [0]
+            assert long_req.context_chunk_size == 1024
+        assert sched._ctx_demote_skips == {}
         sched.schedule_request([hog], set())
         assert sched._ctx_demote_skips == {}  # finished requests leave no entry
 

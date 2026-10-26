@@ -274,8 +274,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # requests from parking mid-prefill with their KV blocks held.
         demote_uncached = int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0"))
         self._ctx_demote_uncached_tokens = max(0, demote_uncached) if self.chunking_enabled else 0
-        # A request demoted this many consecutive iterations is let through in
-        # arrival order until it gets scheduled (0 = no bound).
+        # A request demoted this many iterations is let through for good: it
+        # runs in arrival order to the end of its prefill (0 = no bound).
         self._ctx_demote_max_iters = max(
             0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
         )
@@ -284,7 +284,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             logger.info(
                 f"KVCacheV2Scheduler: demoting context requests with more than "
                 f"{self._ctx_demote_uncached_tokens} uncached tokens left "
-                f"(max consecutive iterations: {self._ctx_demote_max_iters or 'unbounded'})"
+                f"(max iterations demoted: {self._ctx_demote_max_iters or 'unbounded'})"
             )
 
         # Registered by PyExecutor; see set_async_transfer_manager.
@@ -593,9 +593,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # loop's own.
         arrival_ctx = pending_ctx
         demoted_ids: set[int] = set()
-        let_through_ids: set[int] = set()
         if self._ctx_demote_uncached_tokens:
-            pending_ctx, demoted_ids, let_through_ids = self._defer_long_context(pending_ctx)
+            pending_ctx, demoted_ids = self._defer_long_context(pending_ctx)
 
         def preempt_for_pages(req: LlmRequest) -> bool:
             """Free pages for `req` by giving up one started request.
@@ -757,16 +756,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         if self._ctx_demote_uncached_tokens:
-            # Consecutive iterations spent demoted; a let-through request keeps
-            # its count until it is scheduled. Rebuilt every iteration from the
-            # requests seen this iteration, so it cannot leak.
-            scheduled_ids = {req.py_request_id for req in scheduled_ctx}
+            # Iterations spent demoted. Rebuilt every iteration from the
+            # requests demoted in it, so it cannot leak.
             self._ctx_demote_skips = {
                 rid: self._ctx_demote_skips.get(rid, 0) + 1 for rid in demoted_ids
-            } | {
-                rid: self._ctx_demote_skips.get(rid, 0)
-                for rid in let_through_ids
-                if rid not in scheduled_ids
             }
 
         # Phase and frozen-membership deferrals are not KV capacity stalls.
@@ -793,8 +786,9 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _is_long_context(self, req: LlmRequest) -> bool:
         """Whether the router's uncached-prefill estimate exceeds the threshold
         and, once mid-prefill, more than the threshold is actually left. A
-        request without an estimate is never long. No radix probe here: it
-        would walk the whole prompt for every request on every iteration."""
+        request without an estimate (none published, or dropped by the aging
+        bound) is never long. No radix probe here: it would walk the whole
+        prompt for every request on every iteration."""
         if req.state_value == self._encoder_init_state_value:
             return False
         estimate = req.py_uncached_prefill_tokens
@@ -805,17 +799,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             and req.context_remaining_length <= self._ctx_demote_uncached_tokens
         )
 
-    def _defer_long_context(
-        self, pending_ctx: RequestList
-    ) -> tuple[RequestList, set[int], set[int]]:
+    def _defer_long_context(self, pending_ctx: RequestList) -> tuple[RequestList, set[int]]:
         """Move long requests to the tail of this iteration's context order.
 
-        Returns the new order, the ids demoted, and the ids the aging bound let
-        through in arrival order.
+        Returns the new order and the ids demoted.
         """
         keep: RequestList = []
         deferred: RequestList = []
-        let_through: set[int] = set()
         for req in pending_ctx:
             if self._is_long_context(req):
                 aged_out = (
@@ -826,9 +816,15 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if not aged_out:
                     deferred.append(req)
                     continue
-                let_through.add(req.py_request_id)
+                # Let through for good: with no estimate the request is never
+                # long again, so it keeps its arrival order to the end of its
+                # prefill. Demoted again, a started prefill would hold its KV
+                # blocks without progress; a chunk that finds no pages is
+                # skipped, not suspended, so enough of them fill the pool and
+                # no context request can allocate.
+                req.py_uncached_prefill_tokens = None
             keep.append(req)
-        return keep + deferred, {req.py_request_id for req in deferred}, let_through
+        return keep + deferred, {req.py_request_id for req in deferred}
 
     # ---- Prefix-aware skip ----
 
