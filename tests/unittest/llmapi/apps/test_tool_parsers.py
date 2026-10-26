@@ -5284,16 +5284,26 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
                 })]
 
         streaming = Gemma4ToolParser()
-        names = []
+        streamed = {}
+        calls = []
         for i in range(0, len(text), 4):
-            result = streaming.parse_streaming_increment(
-                text[i:i + 4], sample_tools)
-            names += [call.name for call in result.calls if call.name]
-        names += [
-            call.name for call in streaming.finish(sample_tools).calls
-            if call.name
-        ]
-        assert names[-1] == "search_web"
+            calls += streaming.parse_streaming_increment(
+                text[i:i + 4], sample_tools).calls
+        calls += streaming.finish(sample_tools).calls
+        # Keep the last name and parameters sent for each call.
+        for call in calls:
+            entry = streamed.setdefault(call.tool_index, {})
+            if call.name:
+                entry["name"] = call.name
+            if call.parameters:
+                entry["parameters"] = call.parameters
+        assert [(entry["name"], json.loads(entry["parameters"]))
+                for _, entry in sorted(streamed.items())] == [
+                    ("get_weather", {}),
+                    ("search_web", {
+                        "query": "AI"
+                    }),
+                ]
 
     def test_structure_info(self, parser):
         info_fn = parser.structure_info()
