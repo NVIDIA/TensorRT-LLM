@@ -75,9 +75,9 @@ def validate_dense_gate(llm_args: TorchLlmArgs, mapping: Mapping) -> DenseMode:
     3. Standalone only: the MPI backend (``TLLM_DISABLE_MPI`` unset), since the dense group is an
        MPI sub-communicator over the attention-DP group; and with ``dwdp_config.copy_mode`` gather
        a registered ``trtllm::dwdp_fabric_gather``.  A standalone gather launch that passes logs
-       one warning: the gather is experimental without expert DWDP.  With expert DWDP,
-       ``copy_mode`` sets the expert transfer, which the dense copies follow, and ``DwdpManager``
-       checks the gather op.
+       one warning, which names the compute-side defaults setup applies for the gather and the
+       variable that picks its kernel.  With expert DWDP, ``copy_mode`` sets the expert transfer,
+       which the dense copies follow, and ``DwdpManager`` checks the gather op.
 
     Args:
         llm_args: The launch configuration.
@@ -154,9 +154,12 @@ def _check_standalone(copy_mode: CopyMode) -> None:
             "this build does not register it",
         )
     logger.warning(
-        f"{LOG_PREFIX} dwdp_config.copy_mode='gather' is experimental without expert DWDP: the "
-        f"gather kernel holds SMs next to the MoE all-to-all; batched, the default, runs on the "
-        f"copy engines"
+        f"{LOG_PREFIX} dwdp_config.copy_mode='gather' without expert DWDP: the gather kernel "
+        f"holds SMs next to the MoE all-to-all. Setup applies "
+        f"TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER=clc_dynamic and TLLM_ROUTING_DISABLE_COOP_LAUNCH=1, "
+        f"each unless it is set, so that the persistent dense GEMM grids do not run a second wave "
+        f"on the SMs the gather holds and cooperative routing does not wait for them; "
+        f"TRTLLM_DWDP_GATHER_KERNEL picks the gather kernel"
     )
 
 

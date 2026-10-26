@@ -22,6 +22,7 @@ message naming it.  Every launch starts with MPI on, FABRIC peer handles and a r
 op; a launch changes only what it checks.
 """
 
+import os
 import re
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -33,8 +34,17 @@ from tensorrt_llm._torch.modules.dwdp import fabric_gather, vmm
 from tensorrt_llm._torch.modules.dwdp.dense import gate
 from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
-from tensorrt_llm.llmapi.llm_args import DwdpConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    DwdpConfig,
+    MTPDecodingConfig,
+    PrefillCudaGraphBackend,
+    SleepConfig,
+    TorchCompileConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -99,7 +109,12 @@ class _Launch(NamedTuple):
         return validate_dense_gate(llm_args, Mapping(world_size=world_size, rank=0, **fields))
 
 
-_GATHER = "dwdp_config.copy_mode='gather' is experimental without expert DWDP"
+_GATHER = (
+    "Setup applies TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER=clc_dynamic and "
+    "TLLM_ROUTING_DISABLE_COOP_LAUNCH=1, each unless it is set, so that the persistent dense GEMM "
+    "grids do not run a second wave on the SMs the gather holds and cooperative routing does not "
+    "wait for them; TRTLLM_DWDP_GATHER_KERNEL picks the gather kernel"
+)
 
 LAUNCHES = {
     "attached": _Launch(ATTACHED),
@@ -119,6 +134,8 @@ LAUNCHES = {
     # copy_mode picks the standalone transfer; with expert DWDP it sets the expert transfer,
     # which DwdpManager checks, and the gate says nothing.
     "standalone-batched_copy": _Launch(STANDALONE, dwdp={"copy_mode": "batched"}),
+    # A standalone gather launch passes with one warning, which names the compute-side defaults
+    # setup applies for the gather and the variable that picks its kernel.
     "standalone-gather_copy": _Launch(STANDALONE, warning=_GATHER, dwdp={"copy_mode": "gather"}),
     "standalone-gather_without_op": _Launch(
         STANDALONE,
@@ -128,6 +145,54 @@ LAUNCHES = {
         lacks="gather_op",
     ),
     "attached-gather_copy": _Launch(ATTACHED, dwdp={"copy_mode": "gather"}, lacks="gather_op"),
+    # One launch per requirement: attached also needs tp_size 1 and the overlap scheduler off;
+    # those of both modes alternate between the modes; then those of standalone alone.
+    "attached-tp_size": _Launch(
+        ATTACHED, "this launch has expert DWDP with tp_size=2", mapping={"tp_size": 2}
+    ),
+    "attached-overlap_scheduler": _Launch(
+        ATTACHED,
+        "this launch has expert DWDP with disable_overlap_scheduler=False",
+        args={"disable_overlap_scheduler": False},
+    ),
+    **{
+        f"{mode.value}-{name}": _Launch(
+            mode, f"requires {name}=None, but {name} is set", args={name: value}
+        )
+        for mode, (name, value) in zip(
+            [ATTACHED, STANDALONE] * 3,
+            {
+                "cuda_graph_config": CudaGraphConfig(),
+                "torch_compile_config": TorchCompileConfig(),
+                "sleep_config": SleepConfig(),
+                "lora_config": LoraConfig(),
+                "speculative_config": MTPDecodingConfig(max_draft_len=1),
+            }.items(),
+        )
+    },
+    "standalone-prefill_cuda_graph_backend": _Launch(
+        STANDALONE,
+        "requires prefill_cuda_graph_backend='disabled', but prefill_cuda_graph_backend=",
+        args={"prefill_cuda_graph_backend": PrefillCudaGraphBackend.BREAKABLE},
+    ),
+    "attached-enable_locality_domains": _Launch(
+        ATTACHED,
+        "requires enable_locality_domains=False, but enable_locality_domains=True",
+        args={"enable_locality_domains": True},
+    ),
+    "standalone-pp_size": _Launch(
+        STANDALONE, "requires pp_size=1, but pp_size=2", mapping={"pp_size": 2}
+    ),
+    "attached-cp_size": _Launch(
+        ATTACHED, "requires cp_size=1, but cp_size=2", mapping={"cp_size": 2}
+    ),
+    "standalone-peer_handle_type": _Launch(
+        STANDALONE,
+        "requires FABRIC peer handles (CU_MEM_HANDLE_TYPE_FABRIC), but this host shares "
+        "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR handles",
+        lacks="fabric",
+    ),
+    "standalone-mpi": _Launch(STANDALONE, "requires the MPI backend", lacks="mpi"),
 }
 
 
@@ -145,6 +210,23 @@ def test_dense_gate(monkeypatch: pytest.MonkeyPatch, launch: _Launch) -> None:
     else:
         assert launch.check(monkeypatch) is launch.mode
     assert len(warnings) == bool(launch.warning) and all(launch.warning in w for w in warnings)
+
+
+def test_the_gather_warning_names_each_compute_side_default() -> None:
+    """The standalone gather warning names every setting that setup applies for the gather."""
+    saved = dict(os.environ)
+    try:
+        for name in ("TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER", "TLLM_ROUTING_DISABLE_COOP_LAUNCH"):
+            os.environ.pop(name, None)
+        before = dict(os.environ)
+        fabric_gather.apply_compute_side_defaults()
+        applied = {name: value for name, value in os.environ.items() if before.get(name) != value}
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    assert len(applied) == 2, applied
+    for name, value in applied.items():
+        assert f"{name}={value}" in _GATHER
 
 
 @pytest.mark.parametrize(
