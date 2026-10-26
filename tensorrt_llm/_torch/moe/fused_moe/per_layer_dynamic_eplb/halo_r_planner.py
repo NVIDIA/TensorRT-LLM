@@ -17,10 +17,17 @@ between calls (a CUDA graph capture stream, for example) but not within one.
 Each call therefore forks COPY from MAIN and joins it back, so the whole
 call can be captured into a CUDA graph and replayed.
 
+The relay copy is a programmatic dependent launch of the scheduler (set
+``TRTLLM_HALO_R_RELAY_PDL=0`` for a plain launch): it starts once the
+scheduler has published the plan and acquires it through the plan epoch,
+while the scheduler's workers still write routes. plan_ready still fires at
+scheduler completion, and the relay publishes READY only after that.
+
 MegaMoE's full grid blocks at the READY gate that the relay opens, so MAIN
 releases it only once every relay CTA holds its SM: each relay CTA adds 1 to
-the layer's relay_resident counter as its first action, and the scheduler
-zeroes it, so the stream wait has a constant target across graph replays.
+the layer's relay_resident counter once it has the plan, before any copy
+work, and the scheduler zeroes it, so the stream wait has a constant target
+across graph replays.
 
 A native context binds the layer's buffers, COPY and the four events once,
 so each step of the sequence is one native call: ``moe_rebalance_halo_r_submit``

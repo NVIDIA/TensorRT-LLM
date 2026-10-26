@@ -128,6 +128,26 @@ __device__ __forceinline__ std::uint64_t globalTimerNs()
     return now;
 }
 
+//! Lets the relay copy, a programmatic dependent launch, start once every CTA of this grid has triggered or exited
+//! (cudaTriggerProgrammaticLaunchCompletion). It orders no memory; a no-op without a dependent launch.
+__device__ __forceinline__ void triggerDependentLaunch()
+{
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+//! This launch's timing record, or null when the probe is off or full.
+__device__ __forceinline__ unsigned long long* probeRecord(MoeRebalanceHaloRParams const& p)
+{
+    if (p.probe == nullptr)
+    {
+        return nullptr;
+    }
+    unsigned const launch = *reinterpret_cast<unsigned const volatile*>(p.probeLaunchCount);
+    return launch < static_cast<unsigned>(p.probeRecords)
+        ? reinterpret_cast<unsigned long long*>(p.probe) + static_cast<std::size_t>(launch) * kHaloRProbeWords
+        : nullptr;
+}
+
 //! Wait for every cell of this rank's READY row, record errors and zero the row. One thread. The wait is bounded in
 //! wall-clock time (%globaltimer), independent of the SM clock.
 __device__ void drainAndResetReadyRow(
@@ -247,7 +267,9 @@ __device__ void materializeSelectedRoutesHome(int const* routes, int* output, in
 }
 
 //! CTA 0: count exchange, plan, plan publication and route prefix. Returns after publishing the prefix epoch.
-__device__ void planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch, unsigned long long spinCycles)
+//! Triggers the relay copy right after the plan epoch; an early return triggers it by exiting.
+__device__ void planAndPublish(
+    MoeRebalanceHaloRParams const& p, Epoch epoch, unsigned long long spinCycles, unsigned long long* probe)
 {
     extern __shared__ int shared[];
     int* counts = shared;
@@ -310,7 +332,15 @@ __device__ void planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch, un
     if (threadIdx.x == 0)
     {
         store_release_device(p.plan, epoch);
+        if (probe != nullptr)
+        {
+            probe[kHaloRProbePlanPublished] = globalTimerNs();
+        }
     }
+    // The relay needs only the plan. It acquires it through the epoch released above, so the trigger, which orders no
+    // memory, only has to follow that release in program order.
+    __syncthreads();
+    triggerDependentLaunch();
     build_route_prefix(counts, quota, p.routePrefix, p.plan, broadcasts, p.ep, p.experts, p.localRank, blockDim.x);
     __syncthreads();
     if (threadIdx.x == 0)
@@ -319,16 +349,10 @@ __device__ void planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch, un
     }
 }
 
-//! spinCycles bounds the shared passes, which count SM clock cycles. It is the wall-clock budget converted at the
-//! maximum SM clock, so those waits last at least params.spinNs; they all end before the routes are published.
-__global__ __launch_bounds__(kSchedulerThreads, 1) void haloRSchedulerKernel(
-    MoeRebalanceHaloRParams const p, unsigned long long const spinCycles)
+//! The scheduler's work. Every return is uniform across the CTA.
+__device__ __forceinline__ void schedulerBody(
+    MoeRebalanceHaloRParams const& p, unsigned long long spinCycles, unsigned long long* probe)
 {
-    // The relay copy launched after this kernel counts its resident CTAs from zero (see moeRebalanceRelay.h).
-    if (p.relayResidentCtas != nullptr && blockIdx.x == 0 && threadIdx.x == 0)
-    {
-        *p.relayResidentCtas = 0;
-    }
     // Only the caller's valid prefix is readable; clear the rest of the output capacity in the same kernel.
     for (int index = p.validRouteCount + blockIdx.x * blockDim.x + threadIdx.x; index < p.routeCapacity;
          index += gridDim.x * blockDim.x)
@@ -355,7 +379,7 @@ __global__ __launch_bounds__(kSchedulerThreads, 1) void haloRSchedulerKernel(
 
     if (blockIdx.x == 0)
     {
-        planAndPublish(p, epoch, spinCycles);
+        planAndPublish(p, epoch, spinCycles, probe);
         return;
     }
 
@@ -392,6 +416,39 @@ __global__ __launch_bounds__(kSchedulerThreads, 1) void haloRSchedulerKernel(
     }
     materializeSelectedRoutes(p.routes, p.outSlots, p.routePrefix, p.plan, p.routeAux, p.status, p.validRouteCount,
         p.ep, p.experts, p.helpers, worker, workers, epoch);
+}
+
+//! spinCycles bounds the shared passes, which count SM clock cycles. It is the wall-clock budget converted at the
+//! maximum SM clock, so those waits last at least params.spinNs; they all end before the routes are published.
+__global__ __launch_bounds__(kSchedulerThreads, 1) void haloRSchedulerKernel(
+    MoeRebalanceHaloRParams const p, unsigned long long const spinCycles)
+{
+    // The relay copy launched after this kernel counts its resident CTAs from zero (see moeRebalanceRelay.h). The zero
+    // comes first, ahead of every trigger of the relay's programmatic launch.
+    if (p.relayResidentCtas != nullptr && blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        *p.relayResidentCtas = 0;
+    }
+    unsigned long long* const probe = probeRecord(p);
+    if (probe != nullptr && threadIdx.x == 0)
+    {
+        atomicMin(probe + kHaloRProbeSchedulerStart, static_cast<unsigned long long>(globalTimerNs()));
+    }
+    // The workers write nothing the relay reads, so they trigger at once; the relay starts once CTA 0 has triggered
+    // too, after publishing the plan (planAndPublish).
+    if (blockIdx.x != 0)
+    {
+        triggerDependentLaunch();
+    }
+    schedulerBody(p, spinCycles, probe);
+    if (probe != nullptr)
+    {
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            atomicMax(probe + kHaloRProbeSchedulerEnd, static_cast<unsigned long long>(globalTimerNs()));
+        }
+    }
 }
 
 //! Per-device launch limits, queried once per device.
@@ -450,6 +507,8 @@ void invokeMoeRebalanceHaloR(MoeRebalanceHaloRParams const& params, cudaStream_t
             && params.gridSync != nullptr && params.plan != nullptr && params.routePrefix != nullptr
             && params.readyFlags != nullptr,
         "HALO-R scheduler buffers must not be null");
+    TLLM_CHECK_WITH_INFO(params.probe == nullptr || (params.probeLaunchCount != nullptr && params.probeRecords > 0),
+        "HALO-R timing probe needs a launch count and at least one record");
     halo_r::PlannerConfig const cfg{
         params.ep, params.experts, params.helpers, params.sendCount, params.sendWeight, params.localRank};
     TLLM_CHECK_WITH_INFO(params.ep >= kMinEp && halo_r::validPlannerConfig(cfg),
