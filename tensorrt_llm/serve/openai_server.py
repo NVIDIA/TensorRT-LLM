@@ -2334,9 +2334,15 @@ class OpenAIServer(_VideoRoutesMixin):
             if (request.parallel_tool_calls is False and all_tools
                     and request.tool_choice != "none"):
                 stops = _single_tool_call_stops(self.tool_parser)
+                client_stops = sampling_params.stop
+                if isinstance(client_stops, str):
+                    client_stops = [client_stops]
+                client_stops = set(client_stops or [])
                 if stops and _stop_after_first_tool_call(
                         sampling_params, stops):
-                    single_call_stops = stops
+                    # A stop the request lists itself keeps its stop reason.
+                    single_call_stops = tuple(stop for stop in stops
+                                              if stop not in client_stops)
                 else:
                     logger.warning_once(
                         "'parallel_tool_calls=false' is accepted but not "

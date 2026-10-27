@@ -301,6 +301,24 @@ def test_chat_configures_the_stop_only_when_asked_and_possible(
     )
 
 
+def test_a_stop_the_request_lists_itself_keeps_its_stop_reason(monkeypatch, server_logger):
+    """Only the stops the server adds are hidden from the reply's stop reason."""
+    server, seen = _chat_server(monkeypatch, "deepseek_v41")
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[{"role": "user", "content": "weather?"}],
+        tools=[WEATHER_TOOL],
+        parallel_tool_calls=False,
+        stop=[V41_STOPS[0]],
+        include_stop_str_in_output=True,
+    )
+    response = asyncio.run(server.openai_chat(request, _raw_request()))
+
+    assert response.status_code == 200, response.body
+    assert seen["sampling_params"].stop == list(V41_STOPS)
+    assert seen["postproc_args"].single_call_stops == V41_STOPS[1:]
+
+
 def test_anthropic_disable_parallel_tool_use_configures_the_stop(monkeypatch, server_logger):
     server, seen = _chat_server(monkeypatch, "deepseek_v41")
     request = AnthropicMessagesRequest(
