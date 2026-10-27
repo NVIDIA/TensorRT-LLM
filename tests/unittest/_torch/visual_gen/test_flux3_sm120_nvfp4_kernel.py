@@ -92,6 +92,7 @@ def test_flux3_sm120_nvfp4_epilogue(mode, shape):
         pytest.skip("requires SM120 or SM121 GPU")
 
     from flashinfer import SfLayout, nvfp4_quantize
+
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120 import flux3_sm120_nvfp4
 
     rows, columns, reduction = shape
