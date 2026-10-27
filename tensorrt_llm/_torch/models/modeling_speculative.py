@@ -1886,11 +1886,13 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 and spec_config.draft_lm_head_dtype == "mxfp8"):
             from ..modules.mxfp8_draft_head import build_mxfp8_draft_head
 
-            # Rebuilt from the current BF16 weights (idempotent on reloads).
+            # Rebuilt from the current BF16 weights (idempotent on reloads),
+            # from the LM head the draft passes project with.
+            draft_lm_head = getattr(self.draft_model, "lm_head", None)
             self.spec_worker.draft_head = None
             self.spec_worker.draft_head = build_mxfp8_draft_head(
-                self.lm_head, self.model_config.mapping,
-                self.spec_worker.key_exchange)
+                self.lm_head if draft_lm_head is None else draft_lm_head,
+                self.model_config.mapping, self.spec_worker.key_exchange)
 
     def forward(
         self,
