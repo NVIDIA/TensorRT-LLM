@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Decoder input preparation state."""
 
 import math
@@ -1658,13 +1657,20 @@ class DecoderInputPreparer:
                         # the update_helix_param call below.
                         helix_owned_new_tokens.append(0 if request.py_helix_is_inactive_rank else 1)
 
-                for beam in range(beam_width):
+                num_cached_tokens = past_seen_token_num - request.py_num_compressed_tokens
+                # Bulk extend only pays off for wide beams; plain appends are
+                # cheaper for the common beam_width == 1 case.
+                if beam_width == 1:
+                    gather_ids.append(len(position_ids))
                     position_ids.append(position_id)
-                    num_cached_tokens_per_seq.append(
-                        past_seen_token_num - request.py_num_compressed_tokens
-                    )
+                    num_cached_tokens_per_seq.append(num_cached_tokens)
                     prompt_lengths.append(request.py_prompt_len)
-                    gather_ids.append(len(position_ids) - 1)
+                else:
+                    first_gather_id = len(position_ids)
+                    position_ids.extend([position_id] * beam_width)
+                    num_cached_tokens_per_seq.extend([num_cached_tokens] * beam_width)
+                    prompt_lengths.extend([request.py_prompt_len] * beam_width)
+                    gather_ids.extend(range(first_gather_id, first_gather_id + beam_width))
 
                 if _use_mrope:
                     mrope_position_delta = self._decode_mrope_position_delta(request)
@@ -2042,8 +2048,13 @@ class DecoderInputPreparer:
                 gen_request_seq_slots_tensor = torch.tensor(
                     gen_request_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
                 ).to(device="cuda", non_blocking=True)
-                self._buffers.cache_indirection[:num_generation_requests].copy_(
-                    cache_indirection_buffer[gen_request_seq_slots_tensor]
+                # Gather straight into the persistent attention buffer: one
+                # kernel and no temporary (the rows are [beam, max_seq_len]).
+                torch.index_select(
+                    cache_indirection_buffer,
+                    0,
+                    gen_request_seq_slots_tensor,
+                    out=self._buffers.cache_indirection[:num_generation_requests],
                 )
             if cache_indirection_buffer is not None or is_dummy:
                 attn_metadata.beam_width = self._config.max_beam_width

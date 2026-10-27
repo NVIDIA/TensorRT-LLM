@@ -27,7 +27,15 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, is_gated_activation
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation, install_activation_params
 from .impl_blocks import MoEEplbWeightLayoutMixin, MoEExecutionContractMixin, MoEWeightOwnerMixin
-from .impl_contract import MoEDeployment, MoEEligibility, MoEEplbBinding, MoEProblem, MoERunContext
+from .impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEEplbBinding,
+    MoEProblem,
+    MoERunContext,
+    identity_quant_of,
+    require_layer_quant_format,
+)
 from .interface import MoESchedulerKind, MoEWeightLoadingMode, _compute_ep_partition
 from .routing import BaseMoeRoutingMethod
 
@@ -193,6 +201,18 @@ class MoEImplBase(
     # which ``impl_blocks`` cannot import without a cycle.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        descriptor = cls.__dict__.get("descriptor")
+        if descriptor is None:
+            return
+        # The scheduler reads these as class attributes and the registry
+        # publishes the descriptor; deriving one from the other leaves a single
+        # source.
+        cls.scheduler_kind = descriptor.scheduler_kind
+        cls.capabilities = descriptor.capabilities
+        cls.input_requirement = descriptor.input_requirement
+
     def __init__(self, *, eplb: Optional[MoEEplbBinding] = None) -> None:
         super().__init__()
         # Layout is known BEFORE create_weights, because weight shapes depend
@@ -233,6 +253,13 @@ class MoEImplBase(
         TRTLLMGen one.
         """
         ...
+
+    def _check_quant_config_is_my_format(self) -> None:
+        """Fail loudly if this layer ended up on a leaf of the wrong format.
+
+        See :func:`.impl_contract.require_layer_quant_format`.
+        """
+        require_layer_quant_format(self, identity_quant_of(type(self)))
 
     # ---- execution --------------------------------------------------------
     @abc.abstractmethod

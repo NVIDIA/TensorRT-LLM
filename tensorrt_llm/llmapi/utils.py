@@ -484,24 +484,25 @@ class _SyncQueue:
         self._aq = queue
         self._loop = loop or asyncio.get_event_loop()
 
-    async def _notify(self):
-        self._aq.notify()
-
     def put(self, item) -> None:
         self._aq.put_nowait(item)
 
-        if self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._notify(), self._loop)
-        else:
+        if not self._loop.is_running():
             raise AsyncQueue.EventLoopShutdownError()
+        try:
+            self._loop.call_soon_threadsafe(self._aq.notify)
+        except RuntimeError as error:
+            if self._loop.is_closed():
+                raise AsyncQueue.EventLoopShutdownError() from error
+            raise
 
     def put_nowait(self, item) -> None:
         """ Put item without notify the event. """
         self._aq.put_nowait(item)
 
-    # Notify many queues in one coroutine, to cut down context switch overhead.
+    # Notify many queues in one callback, to cut down context switch overhead.
     @staticmethod
-    async def _notify_many(queues: Iterable["_SyncQueue"]):
+    def _notify_many(queues: Iterable["_SyncQueue"]):
         for queue in queues:
             queue._aq.notify()
 
@@ -510,11 +511,15 @@ class _SyncQueue:
                     queues: List["_SyncQueue"]) -> None:
         """ Notify the events in the loop. """
 
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                _SyncQueue._notify_many(frozenset(queues)), loop)
-        else:
+        if not loop.is_running():
             raise AsyncQueue.EventLoopShutdownError()
+        try:
+            loop.call_soon_threadsafe(_SyncQueue._notify_many,
+                                      frozenset(queues))
+        except RuntimeError as error:
+            if loop.is_closed():
+                raise AsyncQueue.EventLoopShutdownError() from error
+            raise
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
