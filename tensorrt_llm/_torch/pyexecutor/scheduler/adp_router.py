@@ -58,7 +58,8 @@ if TYPE_CHECKING:
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
-# KV-balanced admission chooses among this many requests at the head of the queue.
+# KV-balanced admission chooses among this many requests at the head of the queue,
+# or among all that fit when there is room for more.
 KV_BALANCE_WINDOW = 32
 # A request passed over in this many admitting rounds while in that window is
 # admitted next (under PRIORITY, a request pushed out of the window starts over).
@@ -99,11 +100,14 @@ def plan_kv_balanced_admission(
     """Plan which candidates to admit and on which rank.
 
     A lockstep decode step waits for the rank with the most KV and for the rank
-    with the most requests, so no admission raises the largest request count
-    while another rank can take it. Groups are admitted in order. A group that
-    fits goes largest first, each candidate to the rank it leaves closest below
-    the KV maximum (best fit); otherwise each slot takes the candidate that
-    brings its rank closest to the mean load, forced candidates first.
+    with the most requests. No admission takes a rank above the largest request
+    count, or above the fair share after this round if that is higher, while
+    another rank can take it. Groups are admitted in order: whole groups first,
+    then, in the first group that does not fit, each slot takes the candidate
+    that brings its rank closest to the mean load (forced candidates first).
+    Candidates of whole groups are placed together, largest first: to the rank
+    each leaves closest below the KV maximum (best fit) when the whole window is
+    admitted, otherwise to the least-loaded rank.
 
     Args:
         candidate_tokens: KV tokens of each candidate, in queue order.
@@ -128,58 +132,66 @@ def plan_kv_balanced_admission(
         return plan
     if candidate_groups is None:
         candidate_groups = [0] * len(candidate_tokens)
+    count_cap = max(max(counts), math.ceil((sum(counts) + budget) / num_ranks))
+
+    def count_rise(rank: int) -> int:
+        return max(0, counts[rank] + 1 - count_cap)
 
     def open_ranks() -> List[int]:
         return [r for r in range(num_ranks) if counts[r] < max_requests_per_rank]
 
     def best_fit_rank(tokens: int) -> int:
-        max_count, max_load = max(counts), max(loads)
+        max_load = max(loads)
 
         def key(rank: int) -> Tuple[int, int, int, int]:
-            count_rise = max(0, counts[rank] + 1 - max_count)
             load_rise = max(0, loads[rank] + tokens - max_load)
-            if count_rise == 0 and load_rise == 0:
-                return count_rise, load_rise, max_load - loads[rank] - tokens, rank
-            return count_rise, load_rise, loads[rank], rank
+            if count_rise(rank) == 0 and load_rise == 0:
+                return 0, 0, max_load - loads[rank] - tokens, rank
+            return count_rise(rank), load_rise, loads[rank], rank
 
         return min(open_ranks(), key=key)
+
+    def least_loaded_rank() -> int:
+        return min(open_ranks(), key=lambda r: (count_rise(r), loads[r], counts[r], r))
 
     def admit(idx: int, rank: int) -> None:
         plan.append((idx, rank))
         loads[rank] += candidate_tokens[idx]
         counts[rank] += 1
 
+    whole: List[int] = []
+    partial: List[int] = []
     for group in dict.fromkeys(candidate_groups):
-        remaining = [i for i, g in enumerate(candidate_groups) if g == group]
-        if len(remaining) <= budget:
-            for idx in sorted(remaining, key=lambda i: (-candidate_tokens[i], i)):
-                admit(idx, best_fit_rank(candidate_tokens[idx]))
-            budget -= len(remaining)
-            if budget == 0:
-                break
-            continue
+        members = [i for i, g in enumerate(candidate_groups) if g == group]
+        if len(members) > budget:
+            partial = members
+            break
+        whole += members
+        budget -= len(members)
+        if budget == 0:
+            break
 
-        avg_candidate_tokens = sum(candidate_tokens[i] for i in remaining) / len(remaining)
+    # Candidates admitted in the same round start together, so queue order does
+    # not bind their placement.
+    window_admitted = len(whole) == len(candidate_tokens)
+    for idx in sorted(whole, key=lambda i: (-candidate_tokens[i], i)):
+        admit(idx, best_fit_rank(candidate_tokens[idx]) if window_admitted else least_loaded_rank())
+
+    if partial and budget:
+        avg_candidate_tokens = sum(candidate_tokens[i] for i in partial) / len(partial)
         target = (sum(loads) + avg_candidate_tokens * budget) / num_ranks
         for _ in range(budget):
-            forced = [idx for idx in remaining if candidate_forced[idx]]
+            forced = [idx for idx in partial if candidate_forced[idx]]
             if forced:
                 idx, rank = forced[0], best_fit_rank(candidate_tokens[forced[0]])
             else:
-                max_count = max(counts)
                 _, _, idx, rank = min(
-                    (
-                        max(0, counts[r] + 1 - max_count),
-                        abs(candidate_tokens[i] - (target - loads[r])),
-                        i,
-                        r,
-                    )
+                    (count_rise(r), abs(candidate_tokens[i] - (target - loads[r])), i, r)
                     for r in open_ranks()
-                    for i in remaining
+                    for i in partial
                 )
             admit(idx, rank)
-            remaining.remove(idx)
-        break
+            partial.remove(idx)
     return plan
 
 
@@ -470,7 +482,7 @@ class DefaultADPRouter(ADPRouter):
 
     With ``kv_balanced_admission`` (``AttentionDpConfig.enable_kv_balanced_admission``),
     generation-only requests are admitted by KV load: while the first
-    ``KV_BALANCE_WINDOW`` queued requests are all such requests,
+    ``KV_BALANCE_WINDOW`` queued requests (or all that fit) are all such requests,
     ``pop_requests`` plans admission and placement together
     (``plan_kv_balanced_admission``, ordered by ``WaitingQueue.admission_groups``)
     and returns the planned ranks, which ``route_requests`` follows. A single
@@ -520,7 +532,12 @@ class DefaultADPRouter(ADPRouter):
             return super().pop_requests(
                 waiting_queue, all_rank_states, max_new_requests, max_num_active_requests
             )
-        window = waiting_queue.peek_requests(KV_BALANCE_WINDOW)
+        free_slots = sum(
+            max(0, max_num_active_requests - s.num_active_requests) for s in all_rank_states
+        )
+        window = waiting_queue.peek_requests(
+            max(KV_BALANCE_WINDOW, min(max_new_requests, free_slots))
+        )
         if not window or not all(_is_kv_balanced_request(item) for item in window):
             return super().pop_requests(
                 waiting_queue, all_rank_states, max_new_requests, max_num_active_requests

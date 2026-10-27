@@ -1842,6 +1842,21 @@ def _kv_router(tp_size):
         ([9000, 100], [50000, 50000], [7, 8], 8, 1, None, [0, 1], [(0, 0)]),
         ([300, 9000], [0, 0], [7, 8], 8, 1, [False, True], [0, 1], [(0, 0)]),
         ([100, 200, 9000, 50], [0, 0], [0, 0], 8, 3, None, [0, 0, 1, 1], [(1, 0), (0, 1), (3, 0)]),
+        # Requests of different groups admitted together are placed largest first:
+        # best fit when the whole window is admitted, else the least-loaded rank.
+        ([1000, 50000], [100000, 0], [7, 7], 8, 2, None, [0, 1], [(1, 1), (0, 0)]),
+        ([1000, 50000, 3000], [100000, 0], [7, 7], 8, 2, None, [0, 1, 2], [(1, 1), (0, 0)]),
+        # A round of 7 admissions on 3 ranks may fill a rank up to ceil(7 / 3) = 3.
+        (
+            [90] + [10] * 6,
+            [0, 0, 0],
+            [0, 0, 0],
+            4,
+            7,
+            None,
+            None,
+            [(0, 0), (1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (6, 2)],
+        ),
         ([1], [0], [0], 1, 0, None, None, []),
     ],
 )
@@ -1899,6 +1914,13 @@ class TestDefaultADPRouterKVBalance:
             queue, _states([0, 0], [0, 1]), 1, max_num_active_requests=1
         )
         assert _ids(chosen) == [0]
+
+    def test_burst_is_planned_in_one_round(self):
+        router = _kv_router(4)
+        queue = _gen_queue([1000 * (1 + i % 7) for i in range(2 * KV_BALANCE_WINDOW)])
+        chosen, placement = router.pop_requests(queue, _states([0] * 4, [0] * 4), 64, 16)
+        assert len(chosen) == 2 * KV_BALANCE_WINDOW and not queue
+        assert set(placement) == set(_ids(chosen))
 
     @pytest.mark.parametrize(
         "case", ["config_off", "kv_balance_off", "context_request", "single_rank"]
@@ -2036,8 +2058,8 @@ class TestDefaultADPRouterKVBalance:
                     counts[rank] -= 1
                     tokens[rank] = tokens[rank] * counts[rank] // (counts[rank] + 1)
 
-    def test_trickle_fill_keeps_request_counts_within_one(self):
-        """Gen-only fill without departures: per-rank request counts stay within one."""
+    def test_trickle_fill_keeps_the_largest_request_count_at_the_fair_share(self):
+        """Gen-only fill without departures: no rank goes above ceil(requests / ranks)."""
         num_ranks, slots = 16, 16
         rng = random.Random(0)
         router = _kv_router(num_ranks)
@@ -2054,7 +2076,7 @@ class TestDefaultADPRouterKVBalance:
             for rank, items in assignment.items():
                 counts[rank] += len(items)
                 tokens[rank] += sum(item.request.num_input_tokens for item in items)
-            assert max(counts) - min(counts) <= 1, counts
+            assert max(counts) == -(-sum(counts) // num_ranks), counts
         assert counts == [slots] * num_ranks
 
     def test_affinity_routers_keep_fifo_admission(self):
