@@ -66,7 +66,7 @@ failed_prs: []
   captured shape instead of tracking true token count. Check the ratio between
   adjacent entries in the list the engine actually keeps rather than the list
   in the YAML —
-  `python -c "from tensorrt_llm._torch.pyexecutor.model_engine import _filter_piecewise_capture_num_tokens as f; print(f(<capture_num_tokens>, max_num_tokens=<n>, max_batch_size=<b>, max_seq_len=<s>))"`
+  `python -c "from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import filter_prefill_capture_num_tokens as f; print(f(<capture_num_tokens>, max_num_tokens=<n>, max_batch_size=<b>, max_seq_len=<s>))"`
   — and on affected builds
   `grep "exceeds reachable ceiling" <serve log>`, whose pre-fix wording
   ("Capturing the ceiling itself") names the injected entry outright. A/B
