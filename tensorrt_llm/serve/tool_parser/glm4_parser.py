@@ -210,22 +210,52 @@ class Glm4ToolParser(BaseToolParser):
         resolved = self.resolve_tool_name(name, tool_indices)
         return resolved or (name if _QUALIFIED_NAME.match(name) else None)
 
+    def _fresh_call_start(self, segment: str, args_start: int, tools: List[Tool]) -> int:
+        """Where a fresh call opens in the argument text of `segment`; -1 if none.
+
+        The last ``<tool_call>`` in the argument text opens a fresh call when
+        the name of a declared tool follows it, then directly complete pairs
+        (or none) up to the segment's ``</tool_call>``: the model abandoned the
+        call it was writing and made this one. Any other ``<tool_call>`` in the
+        argument text is part of a value.
+        """
+        body_end = len(segment) - len(self.eot_token)
+        start = segment.rfind(self.bot_token, args_start, body_end)
+        if start == -1:
+            return -1
+        parts = self._split_call(segment[start + len(self.bot_token) : body_end])
+        if (
+            parts is None
+            or parts[1]
+            or not self.resolve_tool_name(parts[0].strip(), self._get_tool_indices(tools))
+            or parse_argument_text(parts[2]) is None
+        ):
+            return -1
+        return start
+
     def _parse_call_segment(
         self, segment: str, tools: List[Tool]
     ) -> Tuple[List[ToolCallItem], str]:
         """Parse one ``<tool_call>...</tool_call>`` into (calls, text to release).
 
         A ``<tool_call>`` in the markup between the name and the argument text
-        restarts the call: the abandoned prefix is released and the rest parsed.
-        One inside the argument text is not a restart; inside a value it is part
-        of the value, so a string argument may quote it. A call is released whole
-        as text when it is not one (see ``_call_name``) or its argument text is
+        restarts the call, and so does a fresh call in the argument text (see
+        ``_fresh_call_start``): the abandoned prefix is released and the rest
+        parsed. Any other ``<tool_call>`` in the argument text is part of a
+        value, so a string argument may quote it. A call is released whole as
+        text when it is not one (see ``_call_name``) or its argument text is
         not all pairs (see ``parse_argument_text``).
         """
         parts = self._split_call(segment[len(self.bot_token) : -len(self.eot_token)])
-        restart = -1 if parts is None else parts[1].rfind(self.bot_token)
-        if restart != -1:
-            cut = len(self.bot_token) + len(parts[0]) + restart
+        cut = -1
+        if parts is not None:
+            restart = parts[1].rfind(self.bot_token)
+            if restart != -1:
+                cut = len(self.bot_token) + len(parts[0]) + restart
+            else:
+                args_start = len(segment) - len(self.eot_token) - len(parts[2])
+                cut = self._fresh_call_start(segment, args_start, tools)
+        if cut != -1:
             calls, released = self._parse_call_segment(segment[cut:], tools)
             return calls, segment[:cut] + released
         name = parts and self._call_name(parts[0], parts[1], tools)
