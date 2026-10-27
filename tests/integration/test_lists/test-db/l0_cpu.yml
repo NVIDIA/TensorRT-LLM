@@ -50,7 +50,7 @@ l0_cpu:
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_draft_exchange.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
   - unittest/_torch/executor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
@@ -121,7 +121,13 @@ l0_cpu:
   - unittest/_torch/test_custom_config_registration.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
+  - unittest/_torch/test_connector.py
+  - unittest/_torch/test_connector_adp.py
+  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
+  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
+  - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_moe_deterministic_config.py
   - unittest/_torch/test_nccl_window_graph.py
   - unittest/_torch/test_route_capture.py
   - unittest/_torch/test_tensor_lru_cache.py
@@ -202,6 +208,9 @@ l0_cpu:
   - unittest/grpc/test_grpc_optional.py::test_smg_server_startup_failure_cleans_up
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
+  - unittest/llmapi/test_deepseek_v32_encoding.py
+  - unittest/llmapi/test_deepseek_v32_tokenizer.py
+  - unittest/llmapi/test_deepseek_v41_tokenizer.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py
   - unittest/llmapi/apps/test_anthropic_gateway.py
@@ -258,6 +267,8 @@ l0_cpu:
   - unittest/llmapi/test_mpi_launcher_shutdown.py
   - unittest/llmapi/test_disagg_leader_lifecycle.py
   - unittest/llmapi/test_mpi_lifecycle.py -k "all_failure-2 or worker_system_exit-2 or mixed_collective-4 or all_hang-2 or reuse-2 or sync_recovery-2 or async_drain-2" ISOLATION
+  - unittest/llmapi/test_mpi_stop.py
+  - unittest/llmapi/test_mpi_stop_launcher.py
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py

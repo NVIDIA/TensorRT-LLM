@@ -201,6 +201,8 @@ class ADPRouter(ABC):
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
         forward_work: tuple[int, int] | None = None,
+        num_connector_transfers: int = 0,
+        connector_poll_failed: bool = False,
         include_kv_cache_load: bool = False,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
@@ -218,6 +220,10 @@ class ADPRouter(ABC):
                 piggyback on this allgather, if one is pending.
             forward_work: Context and generation work eligible before this
                 iteration polls transfers, used by conditional attention DP.
+            num_connector_transfers: Owner-local transfers or completed loads
+                awaiting response delivery before their slots can be freed.
+            connector_poll_failed: Whether the local completion poll failed;
+                all owners must then enter the executor's error vote.
         """
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -230,6 +236,8 @@ class ADPRouter(ABC):
         local_state.copy_iter_stats_from(iter_stats_payload)
         if forward_work is not None:
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
+        local_state.num_connector_transfers = num_connector_transfers
+        local_state.connector_poll_failed = connector_poll_failed
         if self.dist.has_cp_helix:
             self._use_max_load_across_cp(local_state)
         responses = self.dist.tp_allgather(local_state.serialize(include_kv_cache_load))
@@ -815,6 +823,17 @@ class ConversationAwareADPRouter(ADPRouter):
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
+        # Uncached-prefill estimate for the V2 scheduler's long-prefill
+        # demotion: within a conversation the prompt only grows and the rank
+        # that served the previous turn caches its prompt, so on that rank
+        # uncached ~= prompt_len - previous prompt_len; on any other rank, and
+        # for an unseen conversation, uncached == prompt_len. Keyed by
+        # conversation_id, not by the routing key: sub-agents that share their
+        # parent's affinity id have prompts of their own. Off until the
+        # scheduler that consumes it turns it on (set_publish_uncached_estimate).
+        self._publish_uncached_estimate_enabled = False
+        # conversation_id -> (prompt_len, rank) of its last turn on its home rank.
+        self._conv_last_prompt: "OrderedDict[str, Tuple[int, int]]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
@@ -861,6 +880,35 @@ class ConversationAwareADPRouter(ADPRouter):
         while len(self._conv_to_rank) > self._max_sessions:
             self._conv_to_rank.popitem(last=False)
 
+    def set_publish_uncached_estimate(self, enabled: bool) -> None:
+        """Publish py_uncached_prefill_tokens only while the scheduler uses it."""
+        self._publish_uncached_estimate_enabled = enabled
+
+    def _publish_uncached_estimate(
+        self, req_item: RequestQueueItem, rank: int, home_rank: Optional[int]
+    ) -> None:
+        """Estimate the request's uncached prefill on ``rank`` and publish it on
+        the request (see __init__). ``home_rank`` is the rank its routing key was
+        bound to before this placement, None for a new binding."""
+        req = req_item.request
+        if not self._publish_uncached_estimate_enabled or req is None:
+            return
+        conversation_params = req.py_conversation_params
+        conv_id = None if conversation_params is None else conversation_params.conversation_id
+        prompt = _num_input_tokens(req)
+        prev = None if conv_id is None else self._conv_last_prompt.get(conv_id)
+        if prev is not None and prev[1] == rank:
+            req.py_uncached_prefill_tokens = max(prompt - prev[0], 0)
+        else:
+            req.py_uncached_prefill_tokens = prompt
+        # An overflow turn's prefix stays off the home rank: keep the home entry
+        # so the next turn back home is measured against what that rank caches.
+        if conv_id is not None and (home_rank is None or rank == home_rank):
+            self._conv_last_prompt[conv_id] = (prompt, rank)
+            self._conv_last_prompt.move_to_end(conv_id)
+            while len(self._conv_last_prompt) > self._max_sessions:
+                self._conv_last_prompt.popitem(last=False)
+
     def _assign_new_conversation_explicit_dp_ranks(
         self,
         requests: List["RequestQueueItem"],
@@ -890,6 +938,7 @@ class ConversationAwareADPRouter(ADPRouter):
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
+                self._publish_uncached_estimate(req_item, target_dp_rank, None)
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 if conv_id is not None:
                     self._record_target_rank(conv_id, target_dp_rank)
@@ -981,6 +1030,7 @@ class ConversationAwareADPRouter(ADPRouter):
         for req_item in remaining_unscheduled:
             conv_id = self._conversation_id(req_item)
             rank = None
+            home_rank = None if conv_id is None else self._conv_to_rank.get(conv_id)
 
             if conv_id is not None and conv_id in self._conv_to_rank:
                 target_rank = self._conv_to_rank[conv_id]
@@ -1009,6 +1059,7 @@ class ConversationAwareADPRouter(ADPRouter):
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)
 
+            self._publish_uncached_estimate(req_item, rank, home_rank)
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
             if self._new_conv_placement == "least_tokens":
