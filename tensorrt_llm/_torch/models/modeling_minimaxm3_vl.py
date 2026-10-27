@@ -2015,10 +2015,10 @@ class MiniMaxM3VLInputProcessor:
         The HF processor expands one ``]<]video[>[`` marker into one bracket
         per temporal patch, ``VISION_START + VIDEO_TOKEN * (grid_h*grid_w /
         merge^2) + VISION_END`` repeated ``grid_t`` times, so the count is
-        ``grid_t * (grid_h*grid_w / merge^2 + 2)``. The brackets are
-        adjacent: the processor prefixes a timestamp only when the video
-        carries fps metadata, and the frame lists handed over here carry
-        none.
+        ``grid_t * (grid_h*grid_w / merge^2 + 2)``. A video with timing
+        also gets a timestamp before each bracket (see
+        :meth:`_video_timestamp_ids`); those are plain text tokens, outside
+        the multimodal mask, so they are not counted here.
 
         ``video_grid_thw`` is the processor's grid for this video,
         computed by the dummy-text pass of :func:`find_mm_token_lengths`
@@ -2084,6 +2084,36 @@ class MiniMaxM3VLInputProcessor:
             "frames_indices": [int(i) for i in frames_indices],
         }
 
+    def _video_timestamp_ids(self, video: Any, brackets: int) -> List[List[int]]:
+        """Token ids of the timestamp the processor writes before each bracket of a video.
+
+        For a video with timing (see :meth:`_video_metadata`), bracket ``b``
+        gets ``]<]{t:.1f} seconds[>[``, where
+        ``t = frames_indices[min(b * temporal_patch_size, n - 1)] / fps``, as
+        the checkpoint's processor writes it; a video without timing gets none.
+
+        Each timestamp is encoded on its own. That gives the processor's ids
+        after a VISION_END, where the tokenizer splits the processor's text at
+        the special token. Before the first bracket the processor's text
+        continues the prompt text before the marker: when that text ends in,
+        for example, a space or a period, the tokenizer merges it with the
+        timestamp, which prompt ids tokenized around the marker cannot
+        reproduce, and the first timestamp's ids differ. A newline before the
+        marker, as in trtllm-serve's rendered prompts, gives the same ids.
+        """
+        metadata = self._video_metadata(video, len(self._video_frames(video)))
+        if metadata["fps"] is None:
+            return [[] for _ in range(brackets)]
+        temporal = int(self.processor.video_processor.temporal_patch_size)
+        indices = metadata["frames_indices"]
+        times = [
+            indices[min(b * temporal, len(indices) - 1)] / metadata["fps"] for b in range(brackets)
+        ]
+        return [
+            self._tokenizer.encode(f"]<]{t:.1f} seconds[>[", add_special_tokens=False)
+            for t in times
+        ]
+
     def _video_bracket_count(self, video: Any) -> int:
         """Temporal patches of a video item: one framed bracket each.
 
@@ -2116,7 +2146,9 @@ class MiniMaxM3VLInputProcessor:
         (which already accounts for the +2 framing per bracket). An image is
         one bracket; a video is one bracket per temporal patch, as the
         processor lays it out (see :meth:`get_num_tokens_per_video`), so the
-        placeholder runs line up with the vision rows at merge time.
+        placeholder runs line up with the vision rows at merge time. A video
+        with timing gets the processor's timestamp before each bracket (see
+        :meth:`_video_timestamp_ids`); one without keeps adjacent brackets.
         """
         mm_data = mm_data or {}
         has_image = bool(mm_data.get("image"))
@@ -2142,6 +2174,7 @@ class MiniMaxM3VLInputProcessor:
                     f"num_mm_tokens entries ({expected})."
                 )
             brackets = self._video_bracket_count(items[consumed]) if has_video else 1
+            stamps = self._video_timestamp_ids(items[consumed], brackets) if has_video else [[]]
             total = int(num_mm_tokens_per_placeholder[consumed])
             inner, remainder = divmod(total - 2 * brackets, brackets)
             if inner < 1 or remainder:
@@ -2149,7 +2182,8 @@ class MiniMaxM3VLInputProcessor:
                     f"MiniMaxM3VL fast path: num_mm_tokens[{consumed}]={total} must be "
                     f"{brackets} x (VISION_START + >=1 placeholder + VISION_END)."
                 )
-            for _ in range(brackets):
+            for stamp in stamps:
+                expanded.extend(stamp)
                 expanded.append(self._vision_start_token_id)
                 expanded.extend([placeholder_id] * inner)
                 expanded.append(self._vision_end_token_id)
@@ -2309,7 +2343,8 @@ class MiniMaxM3VLInputProcessor:
             processor_kwargs["videos_kwargs"] = {"do_resize": True, **video_kwargs}
             # Frame timing goes in only when some video has it; the others get
             # fps=None, so the processor gives timestamps to exactly the videos
-            # with timing. The token-ID fast path does not add timestamps.
+            # with timing. ``expand_prompt_token_ids_for_mm`` writes the same
+            # timestamps on the token-ID fast path.
             video_metadata = [
                 self._video_metadata(video, len(frames))
                 for video, frames in zip(video_inputs, videos)

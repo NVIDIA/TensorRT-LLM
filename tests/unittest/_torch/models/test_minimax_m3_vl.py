@@ -1809,8 +1809,11 @@ def _real_checkpoint_input_processor():
     return cls(model_path=checkpoint, config=config, tokenizer=tokenizer), tokenizer
 
 
+@pytest.mark.parametrize("timed", [False, True], ids=["untimed", "timed"])
 @pytest.mark.parametrize("num_frames,side", [(3, 230), (4, 224), (7, 300)])
-def test_real_checkpoint_video_fast_path_matches_processor_input_ids(num_frames: int, side: int):
+def test_real_checkpoint_video_fast_path_matches_processor_input_ids(
+    num_frames: int, side: int, timed: bool
+):
     """The token-ID fast path expands a video exactly as the checkpoint's processor does.
 
     The same frames go through the text-prompt path (the HF processor writes
@@ -1820,21 +1823,40 @@ def test_real_checkpoint_video_fast_path_matches_processor_input_ids(num_frames:
     of the processor's ``video_grid_thw``. Odd and even frame counts cover the
     last-frame padding, and the frame sides are not multiples of the patch
     size, so the processor's resize is on the path.
+
+    A ``VideoData`` with timing gets a ``]<]{t:.1f} seconds[>[`` timestamp
+    before each bracket on both paths; a frame list gets none. The marker
+    follows a newline, as in trtllm-serve's rendered prompts (see
+    ``_video_timestamp_ids`` for text glued to the marker).
     """
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+
     proc, tokenizer = _real_checkpoint_input_processor()
     rng = np.random.default_rng(num_frames)
     frames = [rng.integers(0, 256, size=(side, side, 3), dtype=np.uint8) for _ in range(num_frames)]
-    prompt = "Watch: ]<]video[>[ then summarize."
+    video = frames
+    if timed:
+        # Every 7th frame of a 3 fps source: 0.0, 4.7, 9.3, 14.0, ... seconds.
+        video = VideoData(
+            frames=frames,
+            metadata={
+                "total_num_frames": 7 * num_frames,
+                "fps": 3.0,
+                "duration": 7 * num_frames / 3.0,
+                "frames_indices": list(range(0, 7 * num_frames, 7)),
+            },
+        )
+    prompt = "Watch:\n]<]video[>[ then summarize."
     sampling = SimpleNamespace(add_special_tokens=False, truncate_prompt_tokens=None)
 
     slow_ids, slow_extra = proc.call_with_text_prompt(
-        {"prompt": prompt, "multi_modal_data": {"video": [frames]}, "chat_template_applied": True},
+        {"prompt": prompt, "multi_modal_data": {"video": [video]}, "chat_template_applied": True},
         sampling,
     )
     fast_ids, fast_extra = proc.call_with_token_ids(
         {
             "prompt_token_ids": tokenizer.encode(prompt, add_special_tokens=False),
-            "multi_modal_data": {"video": [frames]},
+            "multi_modal_data": {"video": [video]},
         },
         sampling,
     )
@@ -1850,6 +1872,7 @@ def test_real_checkpoint_video_fast_path_matches_processor_input_ids(num_frames:
     assert int(grid[0, 0]) == brackets
     vs_id = tokenizer.convert_tokens_to_ids("]<]start of image[>[")
     assert fast_ids.count(vs_id) == brackets
+    assert tokenizer.decode(fast_ids).count(" seconds[>[") == (brackets if timed else 0)
     assert torch.equal(
         grid,
         torch.as_tensor(fast_extra["multimodal_data"]["video"]["video_grid_thw"]).reshape(-1, 3),
@@ -2325,6 +2348,64 @@ def test_fast_path_expand_video_one_bracket_per_temporal_patch():
         proc.expand_prompt_token_ids_for_mm(
             [100, _VID_TOK, 200], num_mm_tokens_per_placeholder=[7], mm_data={"video": [frames]}
         )
+
+
+class _CharTokenizer:
+    """Tokenizer stand-in: one id per character; ``encoded`` records every text."""
+
+    def __init__(self):
+        self.encoded = []
+
+    def encode(self, text, add_special_tokens=True):
+        assert not add_special_tokens
+        self.encoded.append(text)
+        return [ord(c) for c in text]
+
+
+@pytest.mark.cpu_only
+def test_fast_path_expand_timed_video_writes_timestamps():
+    """A video with timing gets the processor's timestamp before each bracket.
+
+    Three frames sampled at indices 0, 13 and 26 of a 10 fps source pad to
+    two temporal patches, each stamped with the time of its first frame: 0.0
+    and 2.6 seconds. A video without timing in the same request keeps
+    adjacent brackets and never reaches the tokenizer. The timestamps are
+    text outside the multimodal mask, so each video still counts 8 tokens and
+    the timed one splits into one run per bracket.
+    """
+    from tensorrt_llm.inputs.multimodal import _compute_mm_masks, _find_mm_token_runs_from_mask
+
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    proc._tokenizer = _CharTokenizer()
+    frames = [object()] * 3
+    timed = SimpleNamespace(frames=frames, metadata={"fps": 10.0, "frames_indices": [0, 13, 26]})
+    expanded, _ = proc.expand_prompt_token_ids_for_mm(
+        [100, _VID_TOK, 200, _VID_TOK, 300],
+        num_mm_tokens_per_placeholder=[8, 8],
+        mm_data={"video": [timed, frames]},
+    )
+
+    bracket = [_VS_TOK, _VID_TOK, _VID_TOK, _VE_TOK]
+    stamps = ["]<]0.0 seconds[>[", "]<]2.6 seconds[>["]
+    assert proc._tokenizer.encoded == stamps
+    stamp_ids = [[ord(c) for c in stamp] for stamp in stamps]
+    assert expanded == [
+        100,
+        *stamp_ids[0],
+        *bracket,
+        *stamp_ids[1],
+        *bracket,
+        200,
+        *bracket,
+        *bracket,
+        300,
+    ]
+    mm_mask, _, _ = _compute_mm_masks(
+        torch.tensor(expanded), None, proc.get_mm_token_ids(), proc.get_mm_special_token_ids()
+    )
+    item_run_cu_offsets, _, run_lengths = _find_mm_token_runs_from_mask(mm_mask, [8, 8])
+    assert item_run_cu_offsets == [0, 2, 3]
+    assert run_lengths == [4, 4, 8]
 
 
 @pytest.mark.cpu_only
