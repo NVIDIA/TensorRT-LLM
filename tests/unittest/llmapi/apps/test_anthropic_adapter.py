@@ -19,6 +19,8 @@ conversion functions and the streaming reframer state machine.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 
 import pytest
@@ -51,6 +53,11 @@ from tensorrt_llm.serve.openai_protocol import (
 pytestmark = pytest.mark.cpu_only
 
 MODEL = "test-model"
+
+
+def thinking_signature(thinking: str) -> str:
+    """The signature the server is expected to put on a thinking block."""
+    return base64.b64encode(hashlib.sha256(thinking.encode("utf-8")).digest()).decode("ascii")
 
 
 def make_request(**overrides) -> AnthropicMessagesRequest:
@@ -772,6 +779,18 @@ def test_reasoning_becomes_thinking_block():
     assert resp.content[1].type == "text"
 
 
+def test_thinking_block_is_signed():
+    """Clients replay a thinking block as thinking only when it carries a signature.
+
+    Without one, the pi coding agent sends the block back as text, and the
+    model then reads its reasoning as an answer it gave.
+    """
+    message = ChatMessage(role="assistant", content="answer", reasoning_content="step by step")
+    resp = convert_chat_response(make_chat_response(message))
+    assert resp.content[0].signature == thinking_signature("step by step")
+    assert resp.model_dump(exclude_none=True)["content"][0]["signature"]
+
+
 def test_empty_content_gets_placeholder_text_block():
     resp = convert_chat_response(make_chat_response(ChatMessage(role="assistant", content=None)))
     assert len(resp.content) == 1
@@ -1212,6 +1231,100 @@ def test_stream_thinking_then_text():
     assert_event_invariants(events)
     starts = [p["content_block"]["type"] for n, p in events if n == "content_block_start"]
     assert starts == ["thinking", "text"]
+
+
+def test_stream_thinking_block_ends_with_its_signature():
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "first "}),
+            chunk({"reasoning_content": "second"}),
+            chunk({"content": "answer"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    thinking = [
+        (name, payload)
+        for name, payload in events
+        if name in ("content_block_delta", "content_block_stop") and payload["index"] == 0
+    ]
+    assert [name for name, _ in thinking] == [
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    assert thinking[2][1]["delta"] == {
+        "type": "signature_delta",
+        "signature": thinking_signature("first second"),
+    }
+    signed = [
+        p
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "signature_delta"
+    ]
+    assert len(signed) == 1, "only the thinking block is signed"
+
+
+def test_stream_thinking_block_opens_with_an_empty_signature():
+    """A thinking block always has a signature field, even before its last delta fills it."""
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "first"}),
+            chunk({"content": "answer"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    starts = [p["content_block"] for n, p in events if n == "content_block_start"]
+    assert starts[0] == {"type": "thinking", "thinking": "", "signature": ""}
+    assert "signature" not in starts[1]
+
+
+def test_stream_thinking_left_open_is_signed_when_the_stream_ends():
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "unfinished"}),
+            chunk({}, finish_reason="length"),
+        ]
+    )
+    assert_event_invariants(events)
+    deltas = [p["delta"] for n, p in events if n == "content_block_delta"]
+    assert deltas[-1] == {"type": "signature_delta", "signature": thinking_signature("unfinished")}
+
+
+def test_stream_error_signs_the_open_thinking_block_before_the_error():
+    reframer = AnthropicStreamReframer(model=MODEL)
+    frames = reframer.process_chunk(chunk({"reasoning_content": "partial"}))
+    frames += reframer.error("engine failed")
+    events = parse_frames(frames)
+    (delta_name, delta), (stop_name, stop), (error_name, error) = events[-3:]
+    assert [delta_name, stop_name, error_name] == [
+        "content_block_delta",
+        "content_block_stop",
+        "error",
+    ]
+    assert delta["delta"] == {"type": "signature_delta", "signature": thinking_signature("partial")}
+    assert stop["index"] == delta["index"]
+    assert error["error"]["message"] == "engine failed"
+
+
+def test_stream_each_thinking_block_is_signed_with_its_own_text():
+    events = run_reframer(
+        [
+            chunk({"reasoning_content": "one"}),
+            chunk({"content": "text"}),
+            chunk({"reasoning_content": "two"}),
+            chunk({}, finish_reason="stop"),
+        ]
+    )
+    assert_event_invariants(events)
+    signatures = [
+        p["delta"]["signature"]
+        for n, p in events
+        if n == "content_block_delta" and p["delta"]["type"] == "signature_delta"
+    ]
+    assert signatures == [thinking_signature("one"), thinking_signature("two")]
 
 
 def test_stream_empty_generation_still_valid():
