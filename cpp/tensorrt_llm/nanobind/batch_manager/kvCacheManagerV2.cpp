@@ -69,6 +69,18 @@ namespace tensorrt_llm::nanobind::batch_manager
 namespace
 {
 
+//! A scratch range paired with the slots covering it.
+//!
+//! KvCache reports the two separately, through getSwaScratchRange() and getScratchSlots().
+//! This pairs them for Python consumers that still expect one object, and exists only so
+//! this change stands alone; remove it, and the get_scratch_desc() binding, once the full
+//! sparse attention support lands and those consumers read the two accessors directly.
+struct ScratchDescCompat
+{
+    kv::HalfOpenRange<kv::BlockOrdinal> range;
+    std::vector<int> slotIds;
+};
+
 // Exposed via introspection sub-module for tests.
 class TestPaddingColdPageCodec final : public kv::IKvCacheColdPageCodec
 {
@@ -1465,6 +1477,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__contains__", [](BlockRange const& self, int item) { return self.contains(kv::BlockOrdinal{item}); },
             nb::arg("item"));
 
+    // A scratch range and its slots as one object, which is how KvCache used to report
+    // them. Kept for consumers that still read `.range` and `.slot_ids`; the manager
+    // itself reports the two separately through get_swa_scratch_range() and
+    // get_scratch_slots(). Remove this class and get_scratch_desc() once the full sparse
+    // attention support lands and those consumers move to the two accessors -- they exist
+    // only so this change stands alone.
+    nb::class_<ScratchDescCompat>(m, "ScratchDesc")
+        .def_ro("range", &ScratchDescCompat::range)
+        .def_ro("slot_ids", &ScratchDescCompat::slotIds)
+        .def("__bool__", [](ScratchDescCompat const& self) { return static_cast<bool>(self.range); });
+
     nb::enum_<kv::PageIndexMode>(m, "PageIndexMode")
         .value("SHARED", kv::PageIndexMode::SHARED)
         .value("PER_LAYER", kv::PageIndexMode::PER_LAYER);
@@ -2043,6 +2066,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>(),
             "Page indices of this life cycle's scratch slots, in slot order.")
+        .def(
+            "get_scratch_desc",
+            [](kv::KvCache const& self, int layerGroupId) -> std::optional<ScratchDescCompat>
+            {
+                auto const lgId = kv::LayerGroupId{layerGroupId};
+                auto const range = self.getSwaScratchRange(lgId);
+                if (!range)
+                {
+                    return std::nullopt;
+                }
+                auto const slots = self.getScratchSlots(lgId);
+                return ScratchDescCompat{range, std::vector<int>(slots.begin(), slots.end())};
+            },
+            nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "get_swa_scratch_range() and get_scratch_slots() as one object, or None when this life "
+            "cycle serves nothing from scratch. Remove with the ScratchDesc class.")
         .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
         .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
             [](kv::KvCache& self, bool enable)
