@@ -253,6 +253,20 @@ class CuteDslB12xFusedMoEBase:
                 MoERejectReason.DEP_MISSING,
                 f"{cls.__name__} requires the flashinfer package",
             )
+        # CUDA 12.x CuTe DSL lowers the SM12x NVFP4 MMA atom to the internal
+        # ``_mma.block_scale...`` spelling, which ptxas rejects. CUDA 13.x
+        # emits the public ``mma.sync.aligned...kind::mxf4nvf4`` opcode. Only
+        # the pure-NVFP4 decode kernel instantiates that atom.
+        if cls.b12x_quant_algo == QuantAlgo.NVFP4 and not d.env.has_dep(MoEDep.CUTEDSL_CUDA13):
+            return _reject(
+                MoERejectReason.DEP_MISSING,
+                f"{cls.__name__} requires the active nvidia-cutlass-dsl "
+                "CUDA 13 native payload. CUDA 12.x CuTe DSL lowers FlashInfer's "
+                "B12x NVFP4 MMA to PTX that ptxas rejects with Unexpected "
+                "instruction types specified for '_mma'. Install "
+                "nvidia-cutlass-dsl[cu13] so cutlass.CUDA_VERSION reports CUDA "
+                "13.x or newer.",
+            )
         if d.eplb_enabled:
             return _reject(
                 MoERejectReason.EPLB_UNSUPPORTED,
