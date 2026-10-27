@@ -103,6 +103,7 @@ l0_h100:
   # Breakable prefill CUDA graphs (BCG) on the hybrid Mamba path; mpi_ray_parity (Ray id runs in the ray stage below).
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph[tp1] TIMEOUT (90)
   - unittest/_torch/modeling/test_multimodal_encoder_graph.py
+  - unittest/_torch/modeling/test_modeling_qwen3vl.py::test_qwen3_vision_cuda_graph_replay_matches_eager
   # Register the full EXAONE suite on Hopper to include the SM90-only
   # chunked-prefill and KV-cache-reuse scenarios.
   - unittest/_torch/modeling/test_modeling_exaone4_5.py
@@ -140,6 +141,8 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
   # Helix CP
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_helix_cp
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_kv_cache_manager_v2_accepts_attention_dp_with_helix_cp
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_kv_cache_manager_v2_rejects_attention_dp_with_helix_cp_under_pp
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py

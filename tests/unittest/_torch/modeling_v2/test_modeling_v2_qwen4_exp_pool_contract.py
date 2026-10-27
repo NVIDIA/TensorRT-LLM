@@ -20,6 +20,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import routi
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as M,
 )
+from tensorrt_llm._torch.modules.fla.cache_manager import GDNIntermediateState, GDNReplayState
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 
 pytestmark = pytest.mark.cpu_only
 
@@ -114,9 +116,75 @@ def test_valid_pools_pass() -> None:
     M.check_shared_selection(_t(2, 8, 512, dtype=torch.int32), {3: 1}, 3, 512)
 
 
-def test_position_plane_rejects_the_wrong_dtype() -> None:
-    with pytest.raises(AssertionError, match="torch.bfloat16"):
-        M.check_position_plane(G, _t(9, 32, 3))
+@pytest.mark.parametrize("replay", [False, True])
+def test_bind_step_buffers_uses_manager_layer_views(replay: bool) -> None:
+    state = GDNReplayState(tokens_per_gen_step=2) if replay else GDNIntermediateState()
+    state.intermediate_conv = _t(2, SLOTS, 2, G.conv_dim, G.conv_kernel - 1)
+    if replay:
+        state.prev_num_accepted_tokens = _t(SLOTS, dtype=torch.int32)
+        state.cache_buf_idx = _t(SLOTS, dtype=torch.int32)
+        state.old_x = _t(2, SLOTS, 2, HISTORY, G.num_v_heads, G.head_v_dim)
+        state.old_B = _t(2, SLOTS, 2, HISTORY, G.num_k_heads, G.head_k_dim)
+        state.old_dt = _t(2, SLOTS, 2, G.num_v_heads, HISTORY, dtype=torch.float32)
+        state.old_dA_cumsum = torch.empty_like(state.old_dt)
+        state._state_strides = (2, 0, 1)
+    else:
+        state.intermediate_ssm = _t(
+            2, SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32
+        )
+    state.intermediate_indices = _t(SLOTS, dtype=torch.int32)
+    manager = Qwen4ExpHybridCacheManager.__new__(Qwen4ExpHybridCacheManager)
+    manager.spec_config = SimpleNamespace(tokens_per_gen_step=2)
+    manager._speculative_state = state
+    manager.mamba_layer_offsets = {3: 1, 7: 0}
+    manager.all_conv_states = [_conv(), _conv()]
+    manager.all_ssm_states = [_ssm(), _ssm()]
+
+    core = M.Qwen4ExpTp1ModelingV2.__new__(M.Qwen4ExpTp1ModelingV2)
+    torch.nn.Module.__init__(core)
+    core.gdn_layers = [3, 7]
+    metadata = SimpleNamespace(
+        replay_work_items=_t(SLOTS, 4, dtype=torch.int32),
+        replay_n_writes=_t(1, dtype=torch.int32),
+    )
+    bound = core._bind_step_buffers(manager, G, metadata, _conv(), _ssm())
+
+    assert bound["int_idx"] is state.intermediate_indices
+    for layer, offset in manager.mamba_layer_offsets.items():
+        views = [(bound["int_conv"][layer], state.intermediate_conv)]
+        if replay:
+            assert "int_ssm" not in bound
+            replay_bound = bound["replay"]
+            assert replay_bound.all_layer_commit
+            assert replay_bound.cache_buf_idx is state.cache_buf_idx
+            assert replay_bound.prev_num_accepted is state.prev_num_accepted_tokens
+            views.extend(
+                zip(
+                    replay_bound.old[layer],
+                    (state.old_x, state.old_B, state.old_dt, state.old_dA_cumsum),
+                )
+            )
+        else:
+            assert "replay" not in bound
+            views.append((bound["int_ssm"][layer], state.intermediate_ssm))
+        for view, storage in views:
+            assert view._base is storage
+            assert view.storage_offset() == offset * storage.stride(0)
+            assert view.shape == storage.shape[1:]
+
+
+@pytest.mark.parametrize(
+    "plane, match",
+    [
+        (None, "did not allocate"),
+        (_t(9, 32, 3), "torch.bfloat16"),
+        (_t(9, 16, 3, dtype=torch.int32), "expected"),
+        (_t(9, 32, 2, dtype=torch.int32), "expected"),
+    ],
+)
+def test_position_plane_rejects(plane, match) -> None:
+    with pytest.raises(AssertionError, match=match):
+        M.check_position_plane(G, plane)
 
 
 def test_attention_pools_reject_wrong_index_plane_and_kv_layout() -> None:

@@ -676,6 +676,15 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
+    # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
+    if (mapping.has_cp_helix()
+            and not is_disagg_enabled(cache_transceiver_config)
+            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
+        raise NotImplementedError(
+            "Helix context parallelism is supported only on disaggregated "
+            "generation servers; aggregated serving with Helix is not "
+            "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
+            "development only).")
 
     has_spec_drafter = False
     if spec_config is not None:
