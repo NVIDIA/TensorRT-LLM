@@ -22,21 +22,31 @@ Alternatively a call body may carry one raw JSON block::
 
 Attribute values are escaped (``&`` -> ``&amp;``, ``"`` -> ``&quot;``).
 ``argument`` bodies are raw text for ``type="string"`` and JSON text for
-every other type. The section arrives after the response body, so streaming
-buffers the section and emits complete calls once ``<|close|>tools<|sep|>``
-is seen.
+every other type.
+
+The grammar itself (where a section, a call and a value end) is
+``KimiK3ReasoningParser``'s, shared so the reasoning parser in front of this
+one reads the same sections. Streaming buffers a section until it ends and
+then emits its calls at once; ``detect_and_parse`` is that same machine run
+over the whole text, so the two views of a generation agree for every
+chunking. Nothing the model generated is dropped: a section without a
+well-formed call, a call cut off mid-block and prose between calls all come
+out as text, and so does text after a section.
 """
 
 import json
 import os
-import re
 from typing import Any, Dict, List
 
+from tensorrt_llm.llmapi.reasoning_parser import KimiK3ReasoningParser
 from tensorrt_llm.logger import logger
 
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .base_tool_parser import BaseToolParser
 from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
+
+# The K3 XTML grammar, shared with the reasoning parser.
+_XTML = KimiK3ReasoningParser
 
 
 def _unescape_attr(value: str) -> str:
@@ -48,7 +58,20 @@ def _escape_attr(value: str) -> str:
 
 
 def _parse_attrs(header: str) -> Dict[str, str]:
-    return {key: _unescape_attr(value) for key, value in re.findall(r'(\w+)="([^"]*)"', header)}
+    return _XTML.parse_xtml_attrs(header)
+
+
+def _reject_constant(token: str) -> Any:
+    raise ValueError(f"{token} is not JSON")
+
+
+def _is_json(text: str) -> bool:
+    """Whether `text` is a JSON document (Python's json also takes NaN/Infinity; JSON does not)."""
+    try:
+        json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        return False
+    return True
 
 
 class KimiK3ToolParser(BaseToolParser):
@@ -62,39 +85,15 @@ class KimiK3ToolParser(BaseToolParser):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<|open|>tools<|sep|>"  # nosec B105
-        self.eot_token = "<|close|>tools<|sep|>"  # nosec B105
-        # Set once a complete tools section has been emitted. A K3 tools
-        # section terminates the message, so anything streamed afterwards is
-        # structural framing, not content.
-        self._section_done = False
-        # Structural leftovers that may trail the tools section when the
-        # reasoning parser is not in front of this parser.
-        self._trailing_structural = re.compile(
-            r"(?:<\|close\|>message<\|sep\|>|<\|end_of_msg\|>)+\s*$"
-        )
-
-        # Tag headers run to the next special token. The encoder escapes only
-        # ``&`` and ``"`` in attribute values, so a literal ``<`` (or ``>``)
-        # can appear inside one; only ``<|`` is impossible without ending the
-        # header, so headers match any text that doesn't contain ``<|``.
-        attrs_pattern = r"(?:(?!<\|).)*?"
-        self._call_open_regex = re.compile(r"<\|open\|>call(?![a-zA-Z])")
-        self._call_regex = re.compile(
-            r"<\|open\|>call(?P<attrs>" + attrs_pattern + r")<\|sep\|>"
-            r"(?P<body>.*?)<\|close\|>call<\|sep\|>",
-            re.DOTALL,
-        )
-        self._argument_regex = re.compile(
-            r"<\|open\|>argument(?P<attrs>" + attrs_pattern + r")<\|sep\|>"
-            r"(?P<value>.*?)<\|close\|>argument<\|sep\|>",
-            re.DOTALL,
-        )
-        self._json_regex = re.compile(
-            r"<\|open\|>json(?P<attrs>" + attrs_pattern + r")<\|sep\|>"
-            r"(?P<value>.*?)<\|close\|>json<\|sep\|>",
-            re.DOTALL,
-        )
+        self.bot_token = _XTML.TOOLS_OPEN  # nosec B105
+        self.eot_token = _XTML.TOOLS_END  # nosec B105
+        # _buffer holds an open tools section from its opening tag on.
+        self._in_section = False
+        # Characters of the open section already known not to end it.
+        self._section_checked = 0
+        # Calls are numbered across every section of the generation: the
+        # streaming assembly keys call fragments by tool_index.
+        self._next_tool_index = 0
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -202,151 +201,223 @@ class KimiK3ToolParser(BaseToolParser):
             "stop_after_first": False,
         }
 
-    @staticmethod
-    def _coerce_value(value: str, value_type: str) -> Any:
-        if value_type == "string":
-            return value
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            logger.warning(
-                f"kimi_k3 tool parser: argument declared type={value_type} but "
-                "body is not valid JSON; keeping raw text"
-            )
-            return value
+    def _ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
+        """Length of the LONGEST suffix of `buffer` that is a proper prefix of `bot_token`.
 
-    def _parse_call_arguments(self, body: str) -> str:
-        """Reconstruct the OpenAI ``function.arguments`` JSON string from a call body."""
-        json_match = self._json_regex.search(body)
-        if json_match is not None:
-            raw = json_match.group("value").strip()
-            try:
-                return json.dumps(json.loads(raw), ensure_ascii=False)
-            except json.JSONDecodeError:
+        The base class returns the shortest one, which for ``Hi<|open|>tools<``
+        is the final ``<`` - and releases ``<|open|>tools`` as text one
+        character before the opening tag completes.
+        """
+        for length in range(min(len(buffer), len(bot_token) - 1), 0, -1):
+            if bot_token.startswith(buffer[-length:]):
+                return length
+        return 0
+
+    @staticmethod
+    def _call_arguments(text: str, call: "KimiK3ReasoningParser.XtmlItem") -> str:
+        """The OpenAI ``function.arguments`` JSON string of a call.
+
+        Values keep the model's own JSON text wherever it is JSON: a
+        re-serialization would rewrite ``1e3`` as ``1000.0`` and ``1.10`` as
+        ``1.1``. String-typed values (and invalid JSON, with a warning) are
+        JSON-quoted raw text.
+        """
+        elements = call.elements
+        if elements and elements[0].kind == "json":
+            raw = text[elements[0].value_start : elements[0].value_end]
+            if not _is_json(raw):
                 logger.warning(
                     "kimi_k3 tool parser: json block is not valid JSON; passing raw text through"
                 )
-                return raw
-        arguments: Dict[str, Any] = {}
-        for match in self._argument_regex.finditer(body):
-            attrs = _parse_attrs(match.group("attrs"))
-            key = attrs.get("key")
-            if key is None:
-                continue
-            arguments[key] = self._coerce_value(match.group("value"), attrs.get("type", "string"))
-        return json.dumps(arguments, ensure_ascii=False)
-
-    def _parse_tools_section(self, section: str, tools: List[Tool]) -> List[ToolCallItem]:
-        tool_indices = self._get_tool_indices(tools)
-        calls: List[ToolCallItem] = []
-        opened_calls = len(self._call_open_regex.findall(section))
-        matched_calls = 0
-        for position, match in enumerate(self._call_regex.finditer(section)):
-            matched_calls += 1
-            attrs = _parse_attrs(match.group("attrs"))
-            name = attrs.get("tool")
-            if not name:
+            return raw
+        members: Dict[str, str] = {}
+        for element in elements:
+            key = element.attrs["key"]
+            raw = text[element.value_start : element.value_end]
+            value_type = element.attrs.get("type", "string")
+            if value_type == "string":
+                encoded = json.dumps(raw, ensure_ascii=False)
+            elif _is_json(raw):
+                encoded = raw
+            else:
                 logger.warning(
-                    f"kimi_k3 tool parser: call without tool attribute: {match.group('attrs')}"
+                    f"kimi_k3 tool parser: argument declared type={value_type} but "
+                    "body is not valid JSON; keeping raw text"
                 )
-                continue
-            if name not in tool_indices:
-                logger.warning(f"Model attempted to call undefined function: {name}")
-            calls.append(
-                ToolCallItem(
-                    tool_index=position,
-                    name=name,
-                    parameters=self._parse_call_arguments(match.group("body")),
+                encoded = json.dumps(raw, ensure_ascii=False)
+            if key in members:
+                logger.warning(
+                    f"kimi_k3 tool parser: argument {key!r} repeated in one call; "
+                    "keeping the last value"
                 )
+            members[key] = encoded
+        return (
+            "{"
+            + ", ".join(
+                f"{json.dumps(key, ensure_ascii=False)}: {value}" for key, value in members.items()
             )
-        if matched_calls < opened_calls:
+            + "}"
+        )
+
+    def _emit_section(
+        self,
+        text: str,
+        section: "KimiK3ReasoningParser.XtmlSection",
+        tools: List[Tool],
+        out_text: List[str],
+        out_calls: List[ToolCallItem],
+    ) -> None:
+        """Deliver a section's calls; everything else in it goes out as text."""
+        if not any(item.deliverable for item in section.items):
+            # Not a single call a client could run: prose about the format,
+            # or a call cut off before it was complete. Its bytes are model
+            # output and go out as the model wrote them.
             logger.warning(
-                f"kimi_k3 tool parser: {opened_calls - matched_calls} of "
-                f"{opened_calls} call blocks were malformed or truncated and "
-                "could not be parsed"
+                "kimi_k3 tool parser: tools section holds no well-formed call; "
+                f"releasing its {section.end} characters as text"
             )
-        return calls
+            out_text.append(text[: section.end])
+            return
+        if not section.terminated:
+            logger.warning(
+                f"kimi_k3 tool parser: tools section never closed with {self.eot_token}; "
+                "delivering its complete calls"
+            )
+        tool_indices = self._get_tool_indices(tools)
+        released = 0
+        for item in section.items:
+            if item.deliverable:
+                name = item.attrs["tool"]
+                if name not in tool_indices:
+                    logger.warning(f"Model attempted to call undefined function: {name}")
+                out_calls.append(
+                    ToolCallItem(
+                        tool_index=self._next_tool_index,
+                        name=name,
+                        parameters=self._call_arguments(text, item),
+                    )
+                )
+                self._next_tool_index += 1
+                continue
+            piece = text[item.start : item.end]
+            if item.kind == "gap" and piece.isspace():
+                # Whitespace between two tags of the section is formatting.
+                continue
+            out_text.append(piece)
+            released += len(piece)
+        if released:
+            logger.warning(
+                f"kimi_k3 tool parser: releasing {released} characters of the tools "
+                "section that are not a well-formed call as text"
+            )
+
+    def _step_text(self, final: bool, out_text: List[str]) -> bool:
+        """Emit text up to the next tools section; True once one has opened."""
+        buf = self._buffer
+        search = 0
+        while True:
+            start = buf.find(self.bot_token, search)
+            if start == -1:
+                break
+            opens = _XTML.tools_section_opens(buf, start + len(self.bot_token), final)
+            if opens is False:
+                # The tag is not followed by a call: the model is writing
+                # about the format, and the tag is text.
+                search = start + 1
+                continue
+            out_text.append(buf[:start])
+            self._buffer = buf[start:]
+            if opens is None:
+                return False
+            self._in_section = True
+            self._section_checked = 0
+            return True
+        if final:
+            out_text.append(_XTML.strip_trailing_framing(buf))
+            self._buffer = ""
+            return False
+        # Hold back whatever could still become an opening tag, or the
+        # framing that ends the generation (it is stripped, never emitted).
+        hold = max(
+            self._ends_with_partial_token(buf, self.bot_token),
+            _XTML.trailing_framing_hold(buf),
+        )
+        out_text.append(buf[: len(buf) - hold])
+        self._buffer = buf[len(buf) - hold :]
+        return False
+
+    def _step_section(
+        self, final: bool, tools: List[Tool], out_text: List[str], out_calls: List[ToolCallItem]
+    ) -> bool:
+        """Emit the open section once it has ended; True if it did."""
+        buf = self._buffer
+        if final:
+            buf = _XTML.strip_trailing_framing(buf)
+        elif not _XTML.section_may_end(buf, self._section_checked):
+            self._section_checked = len(buf)
+            return False
+        section = _XTML.scan_tools_section(buf, len(self.bot_token), final)
+        if section is None:
+            self._section_checked = len(buf)
+            return False
+        self._emit_section(buf, section, tools, out_text, out_calls)
+        self._buffer = buf[section.end :]
+        self._in_section = False
+        return True
+
+    def _drain(self, tools: List[Tool], final: bool) -> StreamingParseResult:
+        out_text: List[str] = []
+        out_calls: List[ToolCallItem] = []
+        while True:
+            if not self._in_section:
+                if not self._step_text(final, out_text):
+                    break
+            elif not self._step_section(final, tools, out_text, out_calls):
+                break
+            elif out_calls and not final:
+                # A result cannot say whether its text came before or after
+                # its calls, and the serving layer places text first. What
+                # follows this section waits for the next increment (or for
+                # the end-of-stream drain), so each result reads in order.
+                break
+        return StreamingParseResult(normal_text="".join(out_text), calls=out_calls)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        bot_idx = text.find(self.bot_token)
-        if bot_idx == -1:
-            return StreamingParseResult(normal_text=self._trailing_structural.sub("", text))
-        normal_text = text[:bot_idx]
-        section = text[bot_idx + len(self.bot_token) :]
-        eot_idx = section.find(self.eot_token)
-        if eot_idx != -1:
-            section = section[:eot_idx]
-        calls = self._parse_tools_section(section, tools)
+        """Parse a whole generation exactly the way the stream reads it.
+
+        The serving layer rebuilds the final response from this, and the
+        client already holds what the stream sent; running the streaming
+        machine over the full text makes the two readings one.
+        """
+        reader = type(self)()
+        head = reader.parse_streaming_increment(text, tools)
+        tail = reader.finish(tools)
+        calls = head.calls + tail.calls
         self.prev_tool_call_arr = []
         for call in calls:
             try:
                 arguments = json.loads(call.parameters)
             except json.JSONDecodeError:
                 arguments = call.parameters
-            self.prev_tool_call_arr.append(
-                {
-                    "name": call.name,
-                    "arguments": arguments,
-                }
-            )
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+            self.prev_tool_call_arr.append({"name": call.name, "arguments": arguments})
+        return StreamingParseResult(normal_text=head.normal_text + tail.normal_text, calls=calls)
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
-        self._buffer += new_text
-        if self._section_done:
-            # The completed tools section terminated the K3 message; any later
-            # text is structural framing (``<|close|>message<|sep|>``,
-            # ``<|end_of_msg|>``), never user content. Buffer it so ``finish``
-            # strips it — matching ``detect_and_parse`` — instead of emitting
-            # protocol tokens as content.
-            return StreamingParseResult()
-        bot_idx = self._buffer.find(self.bot_token)
-        if bot_idx == -1:
-            hold = self._ends_with_partial_token(self._buffer, self.bot_token)
-            emit_len = len(self._buffer) - hold
-            normal_text = self._buffer[:emit_len]
-            self._buffer = self._buffer[emit_len:]
-            return StreamingParseResult(normal_text=normal_text)
+        """Emit text once it cannot start a tools section, calls once their section ends.
 
-        # Flush any response text preceding the section, then buffer the
-        # whole section until it completes: K3 tool calls terminate the
-        # message, so latency cost is negligible and complete calls avoid
-        # partial-argument reconstruction entirely.
-        normal_text = self._buffer[:bot_idx]
-        self._buffer = self._buffer[bot_idx:]
-        eot_idx = self._buffer.find(self.eot_token)
-        if eot_idx == -1:
-            return StreamingParseResult(normal_text=normal_text)
-        section_end = eot_idx + len(self.eot_token)
-        result = self.detect_and_parse(self._buffer[:section_end], tools)
-        # The section terminates the message; hold any trailing framing in the
-        # buffer for ``finish`` to strip rather than emitting it as content.
-        self._buffer = self._buffer[section_end:]
-        self._section_done = True
-        return StreamingParseResult(
-            normal_text=normal_text + result.normal_text, calls=result.calls
-        )
+        A K3 section comes last in its message, so buffering it whole costs
+        no latency on the calls and avoids partial-argument reconstruction.
+        """
+        self._buffer += new_text
+        return self._drain(tools, final=False)
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        """Emit whatever the buffer holds when the stream ends early.
+        """Decide everything still held: the generation has ended.
 
-        ``parse_streaming_increment`` buffers the whole tools section until
-        ``<|close|>tools<|sep|>``; if generation stops first (length limit,
-        cancellation), the buffered content would otherwise be dropped.
-        Complete call blocks are salvaged; a call truncated mid-block is
-        reported by the malformed-call warning in ``_parse_tools_section``.
+        A section the model never closed delivers its complete calls; a call
+        cut off mid-block goes out as text, as does a held-back prefix of an
+        opening tag. Framing that ends the generation is stripped.
         """
-        buffer, self._buffer = self._buffer, ""
-        if not buffer:
-            return StreamingParseResult()
-        if self.bot_token not in buffer:
-            # The buffer holds either a partial bot_token prefix or the
-            # structural residue left after a completed tools section; the
-            # stream is over, so it is plain text after stripping any
-            # trailing structural tokens (matching detect_and_parse).
-            return StreamingParseResult(normal_text=self._trailing_structural.sub("", buffer))
-        logger.warning(
-            f"kimi_k3 tool parser: stream ended before {self.eot_token}; "
-            "parsing the partial tools section"
-        )
-        return self.detect_and_parse(buffer, tools)
+        result = self._drain(tools, final=True)
+        self._buffer = ""
+        return result
