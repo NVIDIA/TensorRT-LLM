@@ -60,13 +60,16 @@ def render(chat_template_kwargs: dict | None, add_generation_prompt: bool = True
 
 
 def build_args(
-    rendered_prompt: str | None, request_kwargs: dict | None, add_generation_prompt: bool = True
+    rendered_prompt: str | None,
+    request_kwargs: dict | None,
+    add_generation_prompt: bool = True,
+    reasoning_parser: str = "poolside_v1",
 ) -> ChatPostprocArgs:
     """Mirror what `openai_server` does after rendering the prompt."""
     args = ChatPostprocArgs(
         role="assistant", model="test-model", chat_template_kwargs=request_kwargs
     )
-    args.reasoning_parser = "poolside_v1"
+    args.reasoning_parser = reasoning_parser
     args.num_prompt_tokens = 3
     if args.reasoning_parser and rendered_prompt and add_generation_prompt:
         thinking = ReasoningParserFactory.resolve_prefilled_thinking(
@@ -208,3 +211,46 @@ def test_unrendered_prompt_falls_back_without_crashing() -> None:
     # Unresolved, so the pre-existing split on an emitted `<think>` applies.
     assert content == "c"
     assert reasoning == "b"
+
+
+# MiniMax-M3 adaptive mode: the prompt ends at the assistant header and the model emits its tags.
+M3_ADAPTIVE_PROMPT = "]~b]user\nhi[e~[\n]~b]ai\n"
+M3_OUTPUT = "<mm:think>hidden</mm:think>visible"
+
+
+@pytest.mark.parametrize(
+    "request_kwargs",
+    [
+        # Injected by the Anthropic adapter for `thinking: {"type": "enabled"}`.
+        {"enable_thinking": True},
+        # Passed by a caller with the unused-kwargs guard relaxed.
+        {"thinking_mode": "enabled"},
+    ],
+)
+def test_minimax_m3_adaptive_prompt_ignores_request_thinking_flag(request_kwargs: dict) -> None:
+    """A thinking flag that the prompt does not reflect must not open a block."""
+    args = build_args(M3_ADAPTIVE_PROMPT, request_kwargs, reasoning_parser="minimax_m3")
+
+    content, reasoning = apply_reasoning_parser(args, 0, M3_OUTPUT, streaming=False)
+
+    assert (content, reasoning) == ("visible", "hidden")
+
+
+def test_minimax_m3_prefilled_reasoning_text_is_left_to_thinking_mode() -> None:
+    """Text prefilled after `<mm:think>` is not the adaptive header: nothing is resolved."""
+    prompt = M3_ADAPTIVE_PROMPT + "<mm:think>Let me think."
+    args = build_args(prompt, {"thinking_mode": "enabled"}, reasoning_parser="minimax_m3")
+
+    content, reasoning = apply_reasoning_parser(
+        args, 0, "hidden</mm:think>visible", streaming=False
+    )
+
+    assert (content, reasoning) == ("visible", "hidden")
+
+
+def test_minimax_m3_context_worker_stamps_adaptive_prompt_as_off() -> None:
+    args = build_args(M3_ADAPTIVE_PROMPT, {"enable_thinking": True}, reasoning_parser="minimax_m3")
+
+    response = chat_response_post_processor(_FakeResult(M3_OUTPUT), args)
+
+    assert response.choices[0].disaggregated_params.resolved_thinking is False

@@ -252,7 +252,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/moe/fused_moe/__init__.py |
         tensorrt_llm/_torch/moe/fused_moe/create_moe.py |
         tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py |
-        tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py |
         tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py |
         tensorrt_llm/_torch/moe/fused_moe/fused_moe_deepgemm.py |
         tensorrt_llm/_torch/moe/fused_moe/fused_moe_triton.py |
@@ -982,7 +981,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/moe/fused_moe/__init__.py |
         tensorrt_llm/_torch/moe/fused_moe/create_moe.py |
         tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py |
-        tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py |
         tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py |
         tensorrt_llm/_torch/moe/fused_moe/fused_moe_deepgemm.py |
         tensorrt_llm/_torch/moe/fused_moe/fused_moe_triton.py |
@@ -1587,6 +1585,17 @@ repos:
         entry: ./scripts/check_test_list.py --validate
         language: script
         pass_filenames: false
+    -   id: check-binding-stubs
+        name: Verify collection binding stubs cover compiled extensions
+        entry: python scripts/check_binding_stubs.py
+        language: python
+        pass_filenames: false
+        files: >
+          (?x)^(
+            tests/integration/defs/stubify_bindings.py|
+            scripts/check_binding_stubs.py|
+            setup.py
+          )$
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py

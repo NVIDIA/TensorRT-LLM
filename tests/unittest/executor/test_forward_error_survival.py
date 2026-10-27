@@ -50,6 +50,7 @@ class _RejectingModel(MultimodalModelMixin):
 
 def _request(mm_data=None):
     return SimpleNamespace(
+        kv_cache_retention_config=None,
         py_disaggregated_params=None,
         sampling_config=None,
         py_multimodal_data=mm_data,
@@ -61,6 +62,7 @@ def _validating_executor(model):
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = None
     executor.kv_cache_manager = None
+    executor._is_kv_manager_v2 = False
     executor.model_engine = SimpleNamespace(model=model)
     executor.sampler = Mock()
     executor._validate_token_id_range = Mock()
@@ -109,7 +111,9 @@ def _loop_executor(monkeypatch):
     executor.drafter = None
     executor.dwdp_manager = None
     executor.speculation_gate = None
-    executor.model_engine = None
+    executor.model_engine = SimpleNamespace(
+        attn_metadata=None, kv_cache_dtype_byte_size=None, spec_metadata=None
+    )
     executor.previous_batch = None
     executor.has_previous_draft_tokens = False
     executor.enable_kv_cache_events = False

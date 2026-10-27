@@ -1541,20 +1541,35 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                 f"Weight Only Quantization currently only supports INT8. Got: {module.quant_config.layer_quant_mode}."
             )
 
+        # The INT8 mixed-GEMM preprocessor packs rows in tiles of 64
+        # (preprocess_weights_for_mixed_gemm: rows_per_tile = 128 * 8 //
+        # BITS_PER_ELT_A, and BITS_PER_ELT_A = 16 for W8A16). When the per-partition
+        # intermediate size is not a multiple of 64 - e.g. moe_intermediate_size
+        # = 1856 = 64 * 29 sharded by a power-of-2 tp_size - the sharded rows are not
+        # 64-aligned and weight loading fails at TP>1. The FP8/NVFP4/MXFP4/WFP4A16
+        # methods round the sharded intermediate up and F.pad; do the same here.
+        ALIGN = 64
+        inter_padded = ((module.intermediate_size_per_partition + ALIGN - 1) //
+                        ALIGN) * ALIGN
+        module._int8woq_inter_padded = inter_padded
+        # expand_intermediate_size_per_partition is 2*inter (gated) or inter
+        # (non-gated); scale the padded width by the same ratio.
+        expand_ratio = (module.expand_intermediate_size_per_partition //
+                        module.intermediate_size_per_partition)
+        expand_padded = inter_padded * expand_ratio
+
         # notice the weight shape for int8 weight-only is different from the original shape,
         # since the quantized weights have their own layout
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.hidden_size,
-                              module.expand_intermediate_size_per_partition)
-        w2_weight_shape = (module.expert_size_per_partition,
-                           module.intermediate_size_per_partition,
+                              module.hidden_size, expand_padded)
+        w2_weight_shape = (module.expert_size_per_partition, inter_padded,
                            module.hidden_size)
 
-        fc31_weight_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition,
-            module.expand_intermediate_size_per_partition,
-            dtype=module.dtype),
-                                         requires_grad=False)
+        fc31_weight_scale = nn.Parameter(
+            torch.empty(module.expert_size_per_partition,
+                        expand_padded,
+                        dtype=module.dtype),
+            requires_grad=False)
         module.register_parameter("fc31_weight_scale", fc31_weight_scale)
 
         fc2_weight_scale = nn.Parameter(torch.empty(
@@ -1587,6 +1602,11 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN)
+        # Pad the sharded intermediate rows up to a multiple of 64 (see
+        # create_weights); the mixed-GEMM preprocessor requires 64-aligned rows.
+        pad = module._int8woq_inter_padded - w1_weight_shard.shape[0]
+        if pad:
+            w1_weight_shard = F.pad(w1_weight_shard, (0, 0, 0, pad))
 
         # w3_weight (gate_proj) is empty for non-gated MoE (e.g. Nemotron-H squared-ReLU).
         # Only concatenate the gate projection when present; otherwise the single
@@ -1596,6 +1616,8 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
             w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
                                                 module.tp_rank,
                                                 TensorParallelMode.COLUMN)
+            if pad:
+                w3_weight_shard = F.pad(w3_weight_shard, (0, 0, 0, pad))
             w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
                                          dim=0)
         else:
@@ -1625,6 +1647,11 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW)
+        # Pad the row-sharded intermediate up to a multiple of 64 (see
+        # create_weights) so the mixed-GEMM preprocessor sees 64-aligned rows.
+        pad = module._int8woq_inter_padded - w2_weight_shard.shape[1]
+        if pad:
+            w2_weight_shard = F.pad(w2_weight_shard, (0, pad))
 
         weight_dtype = torch.int8
         if not module.quant_config.layer_quant_mode.is_int8_weight_only():
@@ -1644,19 +1671,28 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         # for non-gated MoE (e.g. Nemotron-H squared-ReLU). Only concatenate the
         # gate-projection scales when the gate weights are present; otherwise the
         # up-projection scales alone fill the (non-doubled) fc31 scale buffer.
+        # Pad each per-channel scale shard to the 64-aligned intermediate size
+        # (value=1.0 is inert: the padded weight rows are zero, so 0 * scale = 0;
+        # 1.0 merely avoids any downstream reciprocal producing NaN/Inf).
+        def _pad_scale(t):
+            p = module._int8woq_inter_padded - t.shape[-1]
+            return F.pad(t, (0, p), value=1.0) if p else t
+
         all_w1_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.COLUMN)
+            _pad_scale(
+                load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
+                                  module.tp_size, module.tp_rank,
+                                  TensorParallelMode.COLUMN))
             for expert_id in module.initial_local_expert_ids
         ]
         has_w3_scales = all(f"{expert_id}.w3.weight_scale" in weights
                             for expert_id in module.initial_local_expert_ids)
         if module.is_gated_activation and has_w3_scales:
             all_w3_scales = [
-                load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
-                                  module.tp_size, module.tp_rank,
-                                  TensorParallelMode.COLUMN)
+                _pad_scale(
+                    load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
+                                      module.tp_size, module.tp_rank,
+                                      TensorParallelMode.COLUMN))
                 for expert_id in module.initial_local_expert_ids
             ]
             w3_w1_scales = torch.cat(
@@ -2543,6 +2579,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         """
         module.tmp_raw_input_scales = {}
         module.tmp_weight_scale_2 = {}
+        # Created unconditionally even though only an NVFP4_AWQ / NVFP4_ARC
+        # checkpoint fills it: whether this checkpoint carries a pre-quant
+        # scale is not known until the first expert arrives, by which time
+        # several loader threads are already running.
+        module.tmp_pre_quant_scales = {}
         module._streamed_expert_slots = set()
 
     def _finalize_staged_w3_w1_expert(
@@ -2599,6 +2640,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         w3_weight_scale: torch.Tensor,
         w3_weight_scale_2: torch.Tensor,
         w3_input_scale: torch.Tensor,
+        w1_pre_quant_scale: Optional[torch.Tensor] = None,
+        w3_pre_quant_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """Load one NVFP4 checkpoint expert into a local slot.
 
@@ -2612,6 +2655,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         ``prepare_streaming_expert_load`` must have run first, and
         ``module.process_weights_after_loading()`` must run once the layer's
         last slot is in — nothing else calls it on this path.
+
+        ``w1_pre_quant_scale`` / ``w3_pre_quant_scale`` are the per-channel
+        pre-quant scale an NVFP4_AWQ / NVFP4_ARC checkpoint carries and a plain
+        NVFP4 one does not; passing them stages them exactly as
+        ``load_quant_scales`` does, so ``_finalize_pre_quant_scales`` lands the
+        same ``fc31_act_scale`` on either path. Leaving them out of such a
+        checkpoint's load is silently wrong rather than merely unoptimized: the
+        activation would be quantized unsmoothed against an ``input_scale``
+        calibrated on ``x * pre_quant_scale``.
 
         One deliberate difference from ``load_quant_scales``: it reduces the
         activation ``input_scale`` over every expert in the checkpoint, whereas
@@ -2644,6 +2696,18 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             if value.dtype != torch.uint8:
                 raise TypeError(f"{name} must contain packed NVFP4 uint8 data, "
                                 f"got {value.dtype}.")
+
+        has_pre_quant_scale = (w1_pre_quant_scale is not None
+                               or w3_pre_quant_scale is not None)
+        if has_pre_quant_scale:
+            if w1_pre_quant_scale is None or w3_pre_quant_scale is None:
+                raise ValueError(
+                    "w1_pre_quant_scale and w3_pre_quant_scale must be loaded "
+                    "together; fc31_act_scale is their elementwise maximum.")
+            if not module.is_gated_activation:
+                raise ValueError(
+                    "pre_quant_scale (NVFP4_AWQ / NVFP4_ARC) is not supported "
+                    "with non-gated activations.")
 
         # Cutlass stages the two halves of w3_w1 per expert and needs the slot
         # id as the staging key; other backends write straight through.
@@ -2680,6 +2744,25 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             'w3': w3_input_scale[...].reshape([]),
             'w2': w2_input_scale[...].reshape([]),
         }
+
+        # Per-channel pre-quant scale (NVFP4_AWQ / NVFP4_ARC), keyed by global
+        # expert id like the input scales above and for the same reason: it is
+        # only cross-checked and reduced, never indexed positionally. Sharded
+        # with the same ROW mode ``load_quant_scales`` uses, which for this
+        # 1-D per-channel tensor leaves it whole. Staged on the host
+        # (``load_weight_shard``'s default), where a streaming checkpoint's
+        # tensors already are, so nothing holds device memory for the length of
+        # the layer load; ``_finalize_pre_quant_scales`` moves the reduction's
+        # result onto ``fc31_act_scale``.
+        if has_pre_quant_scale:
+            module.tmp_pre_quant_scales[global_expert_id] = {
+                'w1':
+                load_weight_shard(w1_pre_quant_scale, module.tp_size,
+                                  module.tp_rank, TensorParallelMode.ROW),
+                'w3':
+                load_weight_shard(w3_pre_quant_scale, module.tp_size,
+                                  module.tp_rank, TensorParallelMode.ROW),
+            }
 
         # Backends that only stage their input here resolve this slot right
         # away, so the staged footprint stays proportional to the experts in
@@ -2782,6 +2865,37 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 tmp_weight_scale_2.setdefault(expert_idx, {})
                 tmp_weight_scale_2[expert_idx]['w2'] = w2_weight_scale_2
 
+    def _ensure_fc31_act_scale(self, module: torch.nn.Module) -> None:
+        """Register the per-channel act scale an AWQ checkpoint needs.
+
+        ``create_weights`` registers the slot as ``None`` because only a
+        checkpoint carrying ``*.pre_quant_scale`` (NVFP4_AWQ / NVFP4_ARC) has a
+        value for it. The whole-checkpoint loader creates it as soon as it sees
+        those keys; the streaming loader has no such single point, so it
+        creates it from ``_finalize_pre_quant_scales`` instead, which is the
+        first place after a layer's experts are all in.
+        """
+        if getattr(module, "fc31_act_scale", None) is not None:
+            return
+        # Shape: (1, hidden_size) - single vector for all experts (they share
+        # the same input).
+        #
+        # Named device, unlike the staging tensors around it, because this is
+        # a forward operand rather than load scratch: ``quantize_input``
+        # multiplies the activation by it on every call, so it belongs on the
+        # compute device whichever loader allocates it. The current device is
+        # the right one for both callers -- the whole-checkpoint loader runs
+        # on it, and each streaming loader thread calls
+        # ``torch.cuda.set_device`` before it loads an expert. This is the one
+        # place the device is chosen: ``_finalize_pre_quant_scales`` moves the
+        # staged scales onto this parameter.
+        fc31_act_scale = nn.Parameter(torch.empty(1,
+                                                  module.hidden_size,
+                                                  dtype=module.dtype,
+                                                  device='cuda'),
+                                      requires_grad=False)
+        module.register_parameter("fc31_act_scale", fc31_act_scale)
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Check if pre_quant_scale exists in the checkpoint (for NVFP4_AWQ)
         has_pre_quant_scale = False
@@ -2792,14 +2906,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # If pre_quant_scale exists, we need a per-channel act scale for fc31
         # All experts share the same input, so pre_quant_scale should be identical across experts
         if has_pre_quant_scale:
-            # Create fc31_act_scale parameter (for gate_up_proj / w3_w1)
-            # Shape: (1, hidden_size) - single vector for all experts (they share the same input)
-            fc31_act_scale = nn.Parameter(torch.empty(1,
-                                                      module.hidden_size,
-                                                      dtype=module.dtype,
-                                                      device='cuda'),
-                                          requires_grad=False)
-            module.register_parameter("fc31_act_scale", fc31_act_scale)
+            self._ensure_fc31_act_scale(module)
 
         # Step1: Store raw per-expert input scales individually into tmp dict.
         # Consistency check + global max computation deferred to process_weights_after_loading().
@@ -2977,6 +3084,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
         if not hasattr(module, 'tmp_pre_quant_scales'):
             return
+        if not module.tmp_pre_quant_scales:
+            # Only the streaming loader gets here: it pre-creates the container
+            # before it knows whether the checkpoint carries a pre-quant scale,
+            # and a plain NVFP4 one leaves it empty. The whole-checkpoint loader
+            # creates it only after finding the keys, so an empty-but-present
+            # container never means "the scales went missing" there either.
+            delattr(module, 'tmp_pre_quant_scales')
+            return
+        self._ensure_fc31_act_scale(module)
         # Collect all loaded w3/w1 pre_quant_scales
         all_w3 = []
         all_w1 = []
@@ -3011,10 +3127,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     logger.error(msg)
                     raise ValueError(msg)
 
-        # Take the max of w3 and w1 from the first expert
-        fc31_pre_quant_scale = torch.max(w3_reference,
-                                         w1_reference).to(dtype=module.dtype,
-                                                          device='cuda')
+        # Take the max of w3 and w1 from the first expert, moved onto the
+        # destination parameter's device: the staged scales sit wherever the
+        # loader that staged them put them -- the host for the streaming
+        # loader, ``fc31_act_scale.device`` for ``load_quant_scales``, which
+        # keys its own staging off this same parameter -- and
+        # ``_ensure_fc31_act_scale`` is the one place that chooses the device.
+        fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+            dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
 
         delattr(module, 'tmp_pre_quant_scales')

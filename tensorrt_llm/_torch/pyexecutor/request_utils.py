@@ -4,6 +4,7 @@
 """Utility functions for request processing."""
 
 import os
+import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -187,6 +188,7 @@ def get_from_waiting_queue(
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
     waiting_queue.prepend_requests(pending_requests)
+    waiting_queue.mark_admitted(items)
 
     return items
 
@@ -334,6 +336,7 @@ def merge_requests(
     cp_rank: int,
     cp_size: int,
     exclude_last_generation_logits: bool,
+    is_disagg: bool,
 ) -> List[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
@@ -347,6 +350,9 @@ def merge_requests(
         cp_rank: Current CP rank.
         cp_size: Total number of CP ranks.
         exclude_last_generation_logits: Whether to exclude last generation logits.
+        is_disagg: Whether this executor serves disaggregated generation. Only
+            disaggregated Helix slices the prompt per rank; aggregated Helix
+            keeps the full prompt on every rank.
 
     Returns:
         List of LlmRequest objects.
@@ -357,13 +363,15 @@ def merge_requests(
     if "cp_type" in cp_config:
         cp_type = cp_config["cp_type"]
         if cp_type == CpType.HELIX:
-            return merge_helix_requests(
-                new_requests,
-                cp_rank=cp_rank,
-                cp_size=cp_size,
-                tokens_per_block=cp_config["tokens_per_block"],
-                exclude_last_generation_logits=exclude_last_generation_logits,
-            )
+            if is_disagg:
+                return merge_helix_requests(
+                    new_requests,
+                    cp_rank=cp_rank,
+                    cp_size=cp_size,
+                    tokens_per_block=cp_config["tokens_per_block"],
+                    exclude_last_generation_logits=exclude_last_generation_logits,
+                )
+            return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
         else:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
@@ -373,10 +381,22 @@ def merge_requests(
 class RequestBroadcaster:
     """Broadcasts requests across distributed ranks (TP, PP, CP)."""
 
-    def __init__(self, dist: Distributed, hang_detector: HangDetector):
+    def __init__(
+        self,
+        dist: Distributed,
+        hang_detector: HangDetector,
+        sync_clock: bool = False,
+    ):
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
+        # sync_clock: rank 0's time.monotonic() and ``aux`` (>= 0) ride along
+        # with the request count, read on every rank as ``rank0_now`` and
+        # ``rank0_aux``. Must be the same on all ranks: it changes the length.
+        self.sync_clock = sync_clock
+        self.rank0_now: Optional[float] = None
+        self.aux: Optional[float] = None
+        self.rank0_aux: Optional[float] = None
 
     def broadcast(
         self, new_requests: List, prefer_cpu: bool = False
@@ -424,11 +444,13 @@ class RequestBroadcaster:
 
         Rank-consistent: ``prefer_cpu`` is so by the caller's contract, the
         rest is static topology / transport state shared by every rank. The
-        PP route keeps its probe + send/recv chain, and the idle path
-        (``prefer_cpu``) keeps the CPU-transport probe as its wake mechanism.
+        PP route keeps its probe + send/recv chain, the idle path
+        (``prefer_cpu``) keeps the CPU-transport probe as its wake mechanism,
+        and ``sync_clock`` keeps the probe that carries rank 0's clock.
         """
         return (
             not prefer_cpu
+            and not self.sync_clock
             and self.dist.world_size > 1
             and not self.dist.has_pp
             and bool(getattr(self.dist, "supports_single_round_broadcast", False))
@@ -459,28 +481,43 @@ class RequestBroadcaster:
         return received
 
     def _broadcast_request_count(self, request_count: int, prefer_cpu: bool = False) -> int:
-        """Broadcast rank 0's request count using the same PP route as requests."""
+        """Broadcast rank 0's request count and, with ``sync_clock``, its clock and aux in us."""
+        header = [request_count]
+        if self.sync_clock:
+            is_root = self.dist.rank == 0
+            header.append(int(time.monotonic() * 1e6) if is_root else 0)
+            header.append(int(self.aux * 1e6) if is_root and self.aux is not None else -1)
+        header = self._broadcast_header(header, prefer_cpu=prefer_cpu)
+        if self.sync_clock:
+            self.rank0_now = header[1] / 1e6
+            self.rank0_aux = None if header[2] < 0 else header[2] / 1e6
+        return header[0]
+
+    def _broadcast_header(self, header: List[int], prefer_cpu: bool = False) -> List[int]:
+        """Broadcast rank 0's header using the same PP route as requests."""
         if self.dist.world_size == 1:
-            return request_count
+            return header
 
         if not self.dist.has_pp:
-            return int(self.dist.broadcast_int64([request_count], root=0, prefer_cpu=prefer_cpu)[0])
+            return [
+                int(v) for v in self.dist.broadcast_int64(header, root=0, prefer_cpu=prefer_cpu)
+            ]
 
         if self.dist.is_first_pp_rank:
             with nvtx_range("tp_broadcast_request_count"):
-                request_count = int(self.dist.tp_cp_broadcast_int64([request_count], root=0)[0])
+                header = [int(v) for v in self.dist.tp_cp_broadcast_int64(header, root=0)]
 
         tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
 
         if not self.dist.is_first_pp_rank:
             with nvtx_range("recv_request_count_from_prev_pp"):
-                request_count = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+                header = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
             with nvtx_range("send_request_count_to_next_pp"):
-                self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
+                self.dist.send_object(header, self.dist.next_pp_rank, tag)
 
-        return request_count
+        return header
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""
@@ -499,6 +536,7 @@ class RequestBroadcaster:
             new_requests, "py_conversation_params", include_none=True
         )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
+        py_lora_ckpt_source = collect_py_objects_from_requests(new_requests, "py_lora_ckpt_source")
 
         return tuple(
             filter(
@@ -511,6 +549,7 @@ class RequestBroadcaster:
                     py_disaggregated_params,
                     py_conversation_params,
                     py_lora_path,
+                    py_lora_ckpt_source,
                 ],
             )
         )

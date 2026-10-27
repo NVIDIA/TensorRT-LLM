@@ -34,8 +34,19 @@ from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import moe_resolution
-from tensorrt_llm._torch.moe.fused_moe.activation import SwigluActivation
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    ActivationParamShape,
+    MoEActivationSupport,
+    SwigluActivation,
+)
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.identity import GROUPED_GEMM_FAMILY
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
     CutlassMoELoraMixin,
@@ -64,17 +75,11 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xNvfp4FusedMoE,
     CuteDslB12xW4a16Nvfp4FusedMoE,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
-    TrtllmCutedslFusedFc12Nvfp4Impl,
-)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     DeepgemmCudaFp8BlockScalesImpl,
     DeepGemmFusedMoE,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import (
-    DenseGEMMFusedMoE,
-    TrtllmCutedslDenseGemmNvfp4Impl,
-)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
@@ -84,6 +89,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoERejection,
     MoERejectReason,
     MoEResolutionReport,
+    MoEStaticCapability,
     canonical_quant,
     canonical_routing,
     identity_quant_of,
@@ -124,6 +130,7 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     trtllm_gen_leaves_in_resolution_order,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.eligibility import check_flashinfer_provider
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # Everything here is a declaration; the one test that reaches a constructor
@@ -1347,6 +1354,7 @@ _CUTLASS_QUANTIZE_INPUT = {
     TrtllmCutlassMxfp8Impl: quantize_input_mxfp8,
     TrtllmCutlassW4a8Mxfp4Mxfp8Impl: quantize_input_mxfp8,
     TrtllmCutlassNvfp4Impl: vars(TrtllmCutlassNvfp4Impl).get("quantize_input"),
+    TrtllmCutlassW4a16Nvfp4Impl: vars(TrtllmCutlassW4a16Nvfp4Impl).get("quantize_input"),
 }
 _CUTLASS_PAD_TO = {TrtllmCutlassW4a16Mxfp4Impl: 128}
 
@@ -1455,13 +1463,14 @@ def test_cutedsl_degradation_is_not_blamed_on_the_sm120_leaf():
     """The b12x leaves lead the CUTEDSL family and have SM120/121 kernels only.
 
     On SM100 the NVFP4 one passes its format gate and declines on SM, ahead of
-    the CuteDslFusedMoE rejection that is the actual reason this layer fell back.
+    the grouped-GEMM leaf's rejection that is the actual reason this layer fell
+    back.
     """
     cfg = ModelConfig()
     cfg.moe_backend = MoeBackendType.CUTEDSL.value
     problem = MoEProblem(
         quant=canonical_quant(QuantAlgo.NVFP4),
-        # CuteDslFusedMoE's output is hard-wired to bfloat16; Cutlass takes fp16.
+        # The grouped GEMM's output is hard-wired to bfloat16; Cutlass takes fp16.
         dtype_act=torch.float16,
         hidden_size=1024,
         intermediate_size=1024,
@@ -1487,7 +1496,7 @@ def test_cutedsl_degradation_is_not_blamed_on_the_sm120_leaf():
         MoERejectReason.SM_UNSUPPORTED,
     )
     assert (report.degraded_from.legacy_backend, report.degraded_from.reason) == (
-        CuteDslFusedMoE.__name__,
+        TrtllmCutedslGroupedGemmNvfp4Impl.__name__,
         MoERejectReason.DTYPE_UNSUPPORTED,
     )
 
@@ -1520,6 +1529,18 @@ def test_cutedsl_degradation_is_not_blamed_on_the_sm120_leaf():
             (QuantAlgo.W4A16_NVFP4,),
             QuantAlgo.NVFP4,
             id="b12x_w4a16_nvfp4",
+        ),
+        pytest.param(
+            TrtllmCutedslGroupedGemmNvfp4Impl,
+            (QuantAlgo.NVFP4, QuantAlgo.NVFP4_AWQ),
+            None,
+            id="cutedsl_grouped_gemm_nvfp4",
+        ),
+        pytest.param(
+            TrtllmCutedslGroupedGemmBf16Impl,
+            (None,),
+            QuantAlgo.NVFP4,
+            id="cutedsl_grouped_gemm_none",
         ),
     ],
 )
@@ -1974,6 +1995,186 @@ def test_build_gate_runs_after_the_leaf_gates(leaf, problem, deployment, reason)
 
     assert verdict.reject_reason is reason
     assert "USING_OSS_CUTLASS_MOE_GEMM" not in verdict.detail
+
+
+# =====================================================================
+# CuteDSL grouped GEMM: one leaf per format
+# =====================================================================
+# The CUTEDSL literal picks a grouped-GEMM leaf by format; the leaf is then
+# fixed for the layer's lifetime.
+
+_CUTEDSL_GROUPED_GEMM_IDS = (
+    "trtllm.cutedsl.grouped_gemm.nvfp4",
+    "trtllm.cutedsl.grouped_gemm.none",
+)
+
+
+def _cutedsl_environment(sm: int = 107) -> MoEEnvironment:
+    """``sm``, with CuTe DSL's Rubin support present on SM107."""
+    deps = (MoEDep.CUTEDSL_RUBIN.value,) if sm == 107 else ()
+    return MoEEnvironment(sm=sm, available_deps=deps)
+
+
+def _cutedsl_model_config(quant_algo: QuantAlgo | None = QuantAlgo.NVFP4) -> ModelConfig:
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+# Every CuteDSL grouped-GEMM leaf's declarations, written out by hand rather
+# than read off the leaves, so one that drifts fails here: the format it
+# serves, the SMs its gate admits (probed over SM75-124 with CuTe DSL's Rubin
+# support present), its static capabilities, and the activations and constants
+# it declares.
+_CUTEDSL_DECLARATIONS = (
+    pytest.param(
+        TrtllmCutedslGroupedGemmNvfp4Impl,
+        QuantAlgo.NVFP4,
+        {100, 103, 107},
+        MoEStaticCapability(
+            supports_dwdp=True,
+            supports_eplb=True,
+            supports_apply_router_weight_on_input=True,
+            supports_deep_ep_direct_metadata=True,
+        ),
+        MoEActivationSupport(
+            kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
+            alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
+            limit=ActivationParamShape.UNIFORM_SCALAR,
+            limit_when_absent=float("inf"),
+        ),
+        id="nvfp4",
+    ),
+    pytest.param(
+        TrtllmCutedslGroupedGemmBf16Impl,
+        None,
+        {107},
+        MoEStaticCapability(supports_eplb=True, supports_apply_router_weight_on_input=True),
+        MoEActivationSupport(kinds=frozenset({ActivationType.Swiglu})),
+        id="none",
+    ),
+)
+
+
+def test_cutedsl_declarations_cover_every_leaf():
+    """Every registered grouped-GEMM leaf is in the table and ranked by resolution."""
+    leaves = {case.values[0] for case in _CUTEDSL_DECLARATIONS}
+    assert leaves == {impl for _, impl in MOE_IMPL_REGISTRY.find(GROUPED_GEMM_FAMILY)}
+    assert leaves <= set(IMPL_PRIORITY)
+
+
+@pytest.mark.parametrize(
+    "leaf, quant_algo, sms, capabilities, activation_support", _CUTEDSL_DECLARATIONS
+)
+def test_cutedsl_leaf_declarations(leaf, quant_algo, sms, capabilities, activation_support):
+    problem = MoEProblem(quant=canonical_quant(quant_algo), dtype_act=torch.bfloat16)
+    rubin = (MoEDep.CUTEDSL_RUBIN.value,)
+    admitted = {
+        sm
+        for sm in range(75, 125)
+        if leaf.can_implement(
+            problem, _single_rank_deployment(MoEEnvironment(sm=sm, available_deps=rubin))
+        ).eligible
+    }
+    assert admitted == set(sms)
+    assert leaf.capabilities == capabilities
+    assert leaf.activation_support == activation_support
+
+    # Taken off the leaf's own descriptor, which the registry returns it for.
+    assert "descriptor" in vars(leaf)
+    assert MOE_IMPL_REGISTRY.lookup(leaf.descriptor.identity) is leaf
+    assert leaf.scheduler_kind is leaf.descriptor.scheduler_kind
+    assert leaf.capabilities is leaf.descriptor.capabilities
+    assert leaf.input_requirement is leaf.descriptor.input_requirement
+    # The root implements none of the four, so the class that publishes the
+    # identity is the one that executes it.
+    for name in _ABSTRACT_METHODS:
+        assert name in vars(leaf)
+    # Concrete, and under the family name create_moe_backend dispatches on,
+    # not under CUTLASS's, whose branch is tried first and passes ``bias``.
+    assert not leaf.__abstractmethods__
+    assert issubclass(leaf, CuteDslFusedMoE)
+    assert not issubclass(leaf, CutlassFusedMoEBase)
+
+
+@pytest.mark.parametrize(
+    "quant_algo, sm, impl_id",
+    [
+        pytest.param(QuantAlgo.NVFP4, 100, _CUTEDSL_GROUPED_GEMM_IDS[0], id="nvfp4-sm100"),
+        pytest.param(None, 107, _CUTEDSL_GROUPED_GEMM_IDS[1], id="none-sm107"),
+    ],
+)
+def test_cutedsl_literal_picks_the_leaf_that_publishes_the_format(quant_algo, sm, impl_id):
+    """``moe_backend: CUTEDSL`` names the family; the quant picks which leaf."""
+    with override_moe_environment(_cutedsl_environment(sm)):
+        report = resolve_moe_impl(_cutedsl_model_config(quant_algo))
+    assert impl_class_for(report).descriptor.identity.canonical() == impl_id
+    assert not report.degraded
+
+
+@pytest.mark.parametrize(
+    "quant_algo, impl_id",
+    [
+        pytest.param(QuantAlgo.NVFP4, _CUTEDSL_GROUPED_GEMM_IDS[0], id="nvfp4"),
+        pytest.param(None, _CUTEDSL_GROUPED_GEMM_IDS[1], id="none"),
+    ],
+)
+def test_pinned_cutedsl_grouped_gemm_identity_resolves_to_its_leaf(quant_algo, impl_id):
+    with override_moe_environment(_cutedsl_environment()):
+        report = resolve_moe_impl(_cutedsl_model_config(quant_algo), impl_id=impl_id)
+    assert impl_class_for(report).descriptor.identity.canonical() == impl_id
+    assert report.selected_by == "pinned"
+
+
+def test_a_partial_grouped_gemm_pin_resolves_by_priority_across_techniques():
+    """``grouped_gemm.nvfp4`` names the CUTLASS and the CuteDSL leaf; ``IMPL_PRIORITY`` picks."""
+    with override_moe_environment(_cutedsl_environment(100)):
+        report = resolve_moe_impl(_cutedsl_model_config(), impl_id="grouped_gemm.nvfp4")
+    assert impl_class_for(report) is TrtllmCutedslGroupedGemmNvfp4Impl
+    assert report.selected_by == "pinned"
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        MoEProblem(quant=None, dtype_act=torch.bfloat16, activation="Relu2"),
+        MoEProblem(
+            quant=None,
+            dtype_act=torch.bfloat16,
+            activation="Swiglu",
+            activation_constants=frozenset({"clamp"}),
+        ),
+    ],
+    ids=["relu2", "clamped_swiglu"],
+)
+def test_cutedsl_bf16_leaf_declines_another_activation_when_asked_directly(problem):
+    verdict = TrtllmCutedslGroupedGemmBf16Impl.can_implement(
+        problem, _single_rank_deployment(_cutedsl_environment())
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+def test_a_clamped_bf16_swiglu_leaves_the_cutedsl_literal_for_cutlass_and_fails_a_pin():
+    """The literal degrades to the CUTLASS leaf, whose epilogue applies the clamp."""
+    config = _cutedsl_model_config(None)
+    activation = SwigluActivation(clamp=7.0)
+    with override_moe_environment(_cutedsl_environment()):
+        by_literal = resolve_moe_impl(config, activation=activation)
+        by_identity = resolve_moe_impl(
+            config, activation=activation, impl_id=_CUTEDSL_GROUPED_GEMM_IDS[1]
+        )
+
+    assert impl_class_for(by_literal) is TrtllmCutlassUnquantizedImpl
+    assert by_literal.degraded
+
+    assert by_identity.winner is None
+    assert [rejection.reason for rejection in by_identity.rejected] == [
+        MoERejectReason.ACTIVATION_UNSUPPORTED
+    ]
+    with pytest.raises(ValueError, match="no MoE implementation can serve"):
+        impl_class_for(by_identity)
 
 
 # =====================================================================

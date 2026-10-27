@@ -548,7 +548,7 @@ def test_resolved_mode_overrides_whatever_the_caller_sent(
 
 @pytest.mark.parametrize("parser", [
     "deepseek-r1", "deepseek_v4", "deepseek_v41", "qwen3", "qwen3_5",
-    "minimax_m2", "minimax_m3", "gemma4", "kimi_k2", "kimi_k25"
+    "minimax_m2", "gemma4", "kimi_k2", "kimi_k25"
 ])
 def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
     """Parsers that have not opted in must never be resolved from the prompt.
@@ -1505,6 +1505,15 @@ def _m3_parser(kwargs: dict | None):
         ({
             "thinking": True
         }, f"{M3_START}a{M3_END}b", "b", "a"),
+        # The mode resolved from the rendered prompt wins over `thinking_mode`.
+        ({
+            "thinking_mode": "enabled",
+            "enable_thinking": False
+        }, f"{M3_START}a{M3_END}b", "b", "a"),
+        ({
+            "thinking_mode": "disabled",
+            "enable_thinking": True
+        }, f"a{M3_END}b", "b", "a"),
     ])
 def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
                                      content: str,
@@ -1512,6 +1521,34 @@ def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
     result = _m3_parser(kwargs).parse(text)
     assert result.content == content
     assert result.reasoning_content == reasoning_content
+
+
+# The official template: ``bos_token ~ role``, ``eos_token`` after each
+# message, and ``]~b]ai`` as the generation prompt.
+M3_HEADER = "]~b]ai\n"
+M3_PROMPT = f"]~b]user\nhi[e~[\n{M3_HEADER}"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        (f"{M3_PROMPT}{M3_START}", True),
+        (f"{M3_PROMPT}{M3_END}", False),
+        # Adaptive: nothing after the header, so the output starts outside
+        # reasoning even though a prior turn rendered its own tags.
+        (M3_PROMPT, False),
+        (f"]~b]ai\n{M3_START}a{M3_END}b[e~[\n]~b]user\nmore[e~[\n{M3_HEADER}",
+         False),
+        # Prefilled text after the opening tag is not adaptive; the tail carries
+        # no mode it can read, so `thinking_mode` decides.
+        (f"{M3_PROMPT}{M3_START}Let me think.", None),
+        # A custom template that ends elsewhere is left unresolved as before.
+        ("<user>hi</user>\n<assistant>", None),
+    ])
+def test_minimax_m3_resolves_the_prompt_tail(prompt: str,
+                                             expected: bool | None) -> None:
+    assert ReasoningParserFactory.resolve_prefilled_thinking(
+        "minimax_m3", prompt) is expected
 
 
 def _m3_stream(kwargs: dict | None, chunks: list[str]) -> tuple[str, str]:

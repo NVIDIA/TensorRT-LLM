@@ -80,8 +80,7 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCountTokensResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
-from tensorrt_llm.serve.chat_tokenization import (
-    render_chat_request_for_tokenizer, tokenize_harmony_chat_request)
+from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
@@ -117,16 +116,18 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
-from tensorrt_llm.serve.render import (RenderResources, UnsupportedRenderError,
-                                       legacy_render_enabled,
+from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
+                                       UnsupportedRenderError,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
+                                       render_chat_for_length,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
                                                 ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
+from tensorrt_llm.serve.responses_utils import guard_responses_stream
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -871,7 +872,13 @@ class OpenAIServer(_VideoRoutesMixin):
             # expect.
             if self.metrics_collector:
                 self.metrics_collector.log_request_error(http_code=400)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+            # pydantic echoes each failing input verbatim, which can be
+            # megabytes of base64; the error locations are what matters.
+            detail = str(exc)
+            if len(detail) > 4096:
+                detail = detail[:4096] + " ... [truncated %d bytes]" % (
+                    len(detail) - 4096)
+            return JSONResponse(status_code=400, content={"error": detail})
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -1163,6 +1170,25 @@ class OpenAIServer(_VideoRoutesMixin):
             speculative_config=speculative_config,
             kv_cache_config=kv_cache_config if kv_cache_config else None,
         )
+
+    @staticmethod
+    def _attach_multimodal_data(
+            prompt: Dict[str, Any],
+            request: Any,
+            mm_data: Any,
+            mm_item_order: Optional[List[Any]] = None) -> None:
+        """Attach decoded media to the prompt dict handed to the engine.
+
+        When the request carried no ``prompt_token_ids``, ``prompt`` is the
+        chat template's output with one placeholder per media item already in
+        it, so ``chat_template_applied`` tells the input processor to use it
+        verbatim instead of rendering the template a second time.
+        """
+        prompt["multi_modal_data"] = mm_data
+        if request.prompt_token_ids is None:
+            prompt["chat_template_applied"] = True
+        if mm_item_order:
+            prompt["mm_item_order"] = mm_item_order
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
@@ -2061,7 +2087,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
-            except:
+            except Exception:
+                # Only failures are logged: a consumer that stops reading closes
+                # the stream with GeneratorExit, and a client that disconnects
+                # cancels it, and neither is an error of this stream.
                 logger.error(traceback.format_exc())
                 raise
 
@@ -2356,15 +2385,14 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 mm_data, mm_embeddings = await mm_coroutines
             if mm_data:
-                prompt["multi_modal_data"] = mm_data
+                self._attach_multimodal_data(prompt, request, mm_data,
+                                             mm_item_order)
             if mm_embeddings:
                 prompt["multi_modal_embeddings"] = mm_embeddings
             if mm_data and mm_embeddings:
                 raise ValueError(
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
-            if mm_data and mm_item_order:
-                prompt["mm_item_order"] = mm_item_order
 
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
@@ -2570,25 +2598,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
 
-            def _count_estimate() -> int:
-                # The simplified renderer: used for requests the shared
-                # pipeline cannot render (media) and under
-                # TRTLLM_RENDER_LEGACY=1. Resolve the template the way
-                # openai_chat does, or a server started with --chat_template
-                # would count a prompt it never builds. getattr keeps this
-                # working for servers constructed without _init_llm, as the
-                # route tests do.
-                if chat_request.chat_template is None:
-                    chat_request.chat_template = getattr(
-                        self, "chat_template", None)
-                rendered = render_chat_request_for_tokenizer(
-                    chat_request, self.tokenizer)
-                # The renderer returns token ids when the template tokenizes
-                # for itself, and text otherwise; both are valid.
-                if isinstance(rendered, str):
-                    return len(self.tokenizer.encode(rendered))
-                return len(rendered)
-
             # Both the render and the encode are synchronous and both scale
             # with prompt size. Claude Code calls this before most turns with
             # the whole conversation attached, so running them inline would
@@ -2596,8 +2605,6 @@ class OpenAIServer(_VideoRoutesMixin):
             # request on this server -- for a full template render plus a
             # tokenizer pass. The chat path avoids this the same way.
             def _count() -> int:
-                if legacy_render_enabled():
-                    return _count_estimate()
                 # The count is over the prompt tokens the chat route would
                 # execute: same pipeline, same template, same tokenization.
                 resources = RenderResources.from_server(self)
@@ -2605,14 +2612,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     rendered = render_chat(chat_request,
                                            resources,
                                            tokenize=True)
-                except UnsupportedRenderError:
-                    return _count_estimate()
-                except RuntimeError:
-                    # Harmony cannot convert some messages (a tool without a
-                    # description); the count used to come from the template.
-                    if not resources.use_harmony:
-                        raise
-                    return _count_estimate()
+                except (UnsupportedRenderError, HarmonyConversionError):
+                    # Media, an own-processor model or an unconvertible Harmony
+                    # request: count the text, tools and template without the media.
+                    rendered = render_chat_for_length(chat_request, resources)
                 return len(rendered.token_ids)
 
             input_tokens = await asyncio.to_thread(_count)
@@ -2867,8 +2870,6 @@ class OpenAIServer(_VideoRoutesMixin):
             # Same pipeline as the chat route: the server template and the
             # model extension's tool serialization apply here too.
             render_resources = RenderResources.from_server(self)
-            if legacy_render_enabled():
-                render_resources = render_resources.legacy_view()
             tool_dicts = None if request.tools is None else [
                 render_resources.extension.serialize_tool(tool)
                 for tool in request.tools
@@ -2918,9 +2919,8 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_embeddings:
                 raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
-                prompt["multi_modal_data"] = mm_data
-                if mm_item_order:
-                    prompt["mm_item_order"] = mm_item_order
+                self._attach_multimodal_data(prompt, request, mm_data,
+                                             mm_item_order)
 
             promise = self.generator.generate_async(inputs=prompt, )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
@@ -3321,6 +3321,12 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:
+        """Serve one /v1/responses request, streaming or not.
+
+        ``parallel_tool_calls=false`` and, on the non-Harmony path,
+        ``tool_choice`` values other than "auto" and "none" are accepted but
+        not enforced (logged once). ``tool_choice="none"`` skips tool parsing.
+        """
 
         async def create_response(
                 promise: RequestOutput,
@@ -3337,12 +3343,21 @@ class OpenAIServer(_VideoRoutesMixin):
                     model_name=self.model,
                     conversation_store=self.conversation_store,
                     generation_result=None,
-                    enable_store=self.enable_store and request.store,
+                    # request.store is applied downstream.
+                    enable_store=self.enable_store,
                     use_harmony=self.use_harmony,
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
                     num_prompt_tokens=args.num_prompt_tokens,
+                    tokenizer=self.tokenizer,
                 )
+            # A postprocessing worker's result has no prompt token ids, and the
+            # context-only handoff needs them, so take them from the promise as
+            # the chat path does.
+            if (request.disaggregated_params is not None
+                    and request.disaggregated_params.request_type
+                    == "context_only"):
+                response.prompt_token_ids = promise.prompt_token_ids
 
             await self._extract_metrics(promise, raw_request)
             return response
@@ -3392,6 +3407,26 @@ class OpenAIServer(_VideoRoutesMixin):
                              f"{web_search_error}."),
                 )
 
+            # The signature check comes before anything is rendered or stored:
+            # encoded_opaque_state and ctx_info_endpoint name a peer this
+            # worker would pull KV cache from.
+            self._validate_internal_disagg_request(request, raw_request)
+
+            if ("parallel_tool_calls" in request.model_fields_set
+                    and request.parallel_tool_calls is False):
+                logger.warning_once(
+                    "Responses API: 'parallel_tool_calls=false' is accepted "
+                    "but not enforced; the model may still emit several tool "
+                    "calls in one turn.",
+                    key="responses_parallel_tool_calls_unenforced")
+            if not self.use_harmony and request.tool_choice not in ("auto",
+                                                                    "none"):
+                logger.warning_once(
+                    "Responses API: 'tool_choice' values other than 'auto' "
+                    "and 'none' are accepted but not enforced on this model "
+                    "path; generation is not constrained by them.",
+                    key="responses_tool_choice_unenforced")
+
             # Get prev response
             prev_response = None
             if self.enable_store:
@@ -3413,7 +3448,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 request=request,
                 prev_response=prev_response,
                 conversation_store=self.conversation_store,
-                enable_store=self.enable_store and request.store,
+                # Not folded with request.store: prior context is still read
+                # for a store=false follow-up; persisting checks request.store.
+                enable_store=self.enable_store,
                 use_harmony=self.use_harmony,
                 tokenizer=self.tokenizer if not self.use_harmony else None,
                 model_config=self.model_config
@@ -3434,7 +3471,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     sampling_params=sampling_params,
                     model_name=self.model,
                     conversation_store=self.conversation_store,
-                    enable_store=self.enable_store and request.store,
+                    enable_store=self.enable_store,
                     use_harmony=self.use_harmony,
                     reasoning_parser=self.generator.args.reasoning_parser,
                     tool_parser=self.tool_parser,
@@ -3454,19 +3491,23 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.stream else responses_api_post_processor,
                 postproc_args=postproc_args,
             )
+            disaggregated_params = to_llm_disaggregated_params(
+                request.disaggregated_params)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             promise = self.generator.generate_async(
                 inputs=input_tokens,
                 sampling_params=sampling_params,
                 streaming=request.stream,
+                disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
             if not self.postproc_worker_enabled:
-                # The executor records this on the postprocessing arguments,
-                # but only for the requests whose postprocessing it owns. The
-                # streamed response is assembled here instead, and it needs
-                # the prompt length to report usage.
+                # Set by the executor only for postprocessing it runs itself.
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
+                postproc_args.tokenizer = self.tokenizer
 
             if self.postproc_worker_enabled and request.store:
                 logger.warning(
@@ -3475,12 +3516,25 @@ class OpenAIServer(_VideoRoutesMixin):
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
+                return StreamingResponse(content=guard_responses_stream(
+                    create_streaming_generator(promise, postproc_params),
+                    streaming_processor.get_stream_failed_events,
+                ),
                                          media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
-                return JSONResponse(content=response.model_dump())
+                # Context-only: the orchestrator may ask for the prompt as a
+                # base64 int32 buffer, as on the chat path.
+                if (request.disaggregated_params is not None and
+                        request.disaggregated_params.return_prompt_token_ids_b64
+                        and response.prompt_token_ids is not None):
+                    import numpy as np
+                    response.prompt_token_ids_b64 = base64.b64encode(
+                        np.asarray(response.prompt_token_ids,
+                                   dtype=np.int32).tobytes()).decode("ascii")
+                    response.prompt_token_ids = None
+                # by_alias: e.g. text.format.schema goes out under its wire name.
+                return JSONResponse(content=response.model_dump(by_alias=True))
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -3507,7 +3561,7 @@ class OpenAIServer(_VideoRoutesMixin):
         if response is None:
             return self._create_response_id_not_found_error(response_id)
 
-        return JSONResponse(content=response.model_dump())
+        return JSONResponse(content=response.model_dump(by_alias=True))
 
     async def openai_responses_delete_response(
             self, response_id: str) -> JSONResponse:

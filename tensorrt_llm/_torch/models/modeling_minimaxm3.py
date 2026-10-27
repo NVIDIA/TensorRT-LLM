@@ -3091,8 +3091,10 @@ def _build_minimax_m3_vl_input_processor_registration():
         model_type="minimax_m3_vl",
         placeholder_metadata=MultimodalPlaceholderMetadata(
             placeholder_map={
-                "image": "]<]start of image[>[]<]image[>[]<]end of image[>[",
-                "video": "]<]start of image[>[]<]video[>[]<]end of image[>[",
+                # The bare per-item markers the M3 chat template renders; the
+                # HF processor adds the start/end-of-image framing.
+                "image": "]<]image[>[",
+                "video": "]<]video[>[",
             },
             placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
             content_format=ContentFormat.STRING,
@@ -3264,6 +3266,16 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
                     vid.get("pixel_values_videos") is not None
                     or vid.get("pixel_values") is not None
                 )
+                # A request whose placeholder rows are all cached or beyond
+                # this chunk needs no vision forward; dropping it here keeps
+                # the tower calls and the embedding rows to the active params.
+                # This skip must stay ahead of the append: ``find_input_mm_embeds``
+                # below advances its row cursor once per entry of
+                # ``mm_params_with_data``, so the list that feeds the vision
+                # tower has to be the list whose rows it slices.
+                runtime = getattr(param, "multimodal_runtime", None)
+                if runtime is not None and runtime.num_mm_tokens_in_chunk == 0:
+                    continue
                 if has_image_pv or has_video_pv:
                     mm_params_with_data.append(param)
 
@@ -3285,7 +3297,7 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             # ``input_ids`` for ``mm_token_ids`` — exactly the right
             # semantics for visual-input requests.
             from .modeling_minimaxm3_vl import extract_multimodal_items_in_request_order
-            from .modeling_multimodal_utils import fuse_input_embeds
+            from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 
             # Walk ``multimodal_params`` in left-to-right request order
             # and produce ``mm_embeds`` per-item so the concatenated rows
@@ -3310,15 +3322,30 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             # device for the fuse path (registry buffer device follows
             # ``model.to(device)`` automatically, but the standalone
             # unit-test path may use a different device).
-            fused_ids, fused_embeds = fuse_input_embeds(
-                embedding_layer=embed_tokens,
-                input_ids=flat_ids,
-                mm_embeds=mm_embeds,
-                mm_token_ids=self.mm_token_ids.to(flat_ids.device),
-                **kwargs,
-            )
-            input_ids = fused_ids
-            inputs_embeds = fused_embeds
+            # With KV-cache reuse or chunked prefill, part of a request's
+            # placeholder span may already be cached or lie beyond the
+            # current chunk; keep only the embedding rows whose tokens are in
+            # this forward (``multimodal_runtime`` carries the counts). The
+            # list is pre-concatenated in request order so one cursor covers
+            # multi-image requests.
+            mm_embeds = find_input_mm_embeds([torch.cat(mm_embeds, dim=0)], mm_params_with_data)
+            if mm_embeds:
+                fused_ids, fused_embeds = fuse_input_embeds(
+                    embedding_layer=embed_tokens,
+                    input_ids=flat_ids,
+                    mm_embeds=mm_embeds,
+                    mm_token_ids=self.mm_token_ids.to(flat_ids.device),
+                    **kwargs,
+                )
+                input_ids = fused_ids
+                inputs_embeds = fused_embeds
+                # ``fuse_input_embeds`` returns ``input_ids=None`` once the
+                # embeddings are materialised. The speculative-decoding
+                # workers (DSpark/DFlash, MTP, Eagle) still need the
+                # per-position token ids of the fused batch;
+                # ``SpecDecOneEngineForCausalLM`` reads them from
+                # ``orig_input_ids`` when ``input_ids`` is None.
+                kwargs["orig_input_ids"] = flat_ids
 
         return super().forward(
             attn_metadata=attn_metadata,

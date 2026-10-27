@@ -40,6 +40,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16-kv", "fp8-kv"])
+@pytest.mark.parametrize("replay", [False, True], ids=["no-replay", "replay"])
 @pytest.mark.parametrize(
     "snapshot_options,retains_page",
     [
@@ -68,20 +69,21 @@ pytestmark = pytest.mark.cpu_only
     [("tp", 1), ("adp", 1), ("mtp", 2), ("pp-linear", 0), ("pp-mtp", 2), ("draft-only", 1)],
 )
 def test_indexer_static_cache_cost(
-    fp8, snapshot_options, retains_page, layout, expected_sparse_layers
+    monkeypatch, fp8, replay, snapshot_options, retains_page, layout, expected_sparse_layers
 ):
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
         Glm5NextCacheManager,
     )
     from tensorrt_llm._torch.configs.glm5_next import Glm5NextTextConfig
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-        MambaHybridCacheManagerV2,
-    )
+    from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
     from tensorrt_llm.llmapi import KvCacheConfig, MambaStateConfig, MTPDecodingConfig
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
+    monkeypatch.setattr(
+        _kda_kernels, "kda_mtp_replay_num_spec", lambda num_spec: num_spec if replay else None
+    )
     config = Glm5NextTextConfig(
         num_hidden_layers=2,
         layer_types=["linear_attention", "deepseek_sparse_attention"],
@@ -116,9 +118,9 @@ def test_indexer_static_cache_cost(
         else None,
         is_draft=layout == "draft-only",
     )
-    base_slope, base_fixed = MambaHybridCacheManagerV2.get_cache_size_per_token(
-        model_config, mapping, **kwargs
-    )
+    # Keep GLM's recurrent/replay cost in the baseline so only indexer bytes differ.
+    base_estimator = super(Glm5NextCacheManager, Glm5NextCacheManager).get_cache_size_per_token
+    base_slope, base_fixed = base_estimator(model_config, mapping, **kwargs)
     slope, fixed = Glm5NextCacheManager.get_cache_size_per_token(model_config, mapping, **kwargs)
     # The three 128-wide BF16 indexer sections are replicated on every TP/ADP rank.
     extra_per_token = expected_sparse_layers * 3 * 128 * 2
@@ -129,9 +131,7 @@ def test_indexer_static_cache_cost(
     # budget from the base estimator, independently of where the bytes are stored.
     reference_config = deepcopy(model_config)
     reference_config.pretrained_config.kv_lora_rank += 768 if fp8 else 384
-    assert (slope, fixed) == MambaHybridCacheManagerV2.get_cache_size_per_token(
-        reference_config, mapping, **kwargs
-    )
+    assert (slope, fixed) == base_estimator(reference_config, mapping, **kwargs)
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16-kv", "fp8-kv"])
@@ -146,6 +146,7 @@ def test_indexer_runtime_cache_cost_matches_registered_buffers(fp8, snapshot_int
     from tensorrt_llm.mapping import Mapping
 
     manager = object.__new__(Glm5NextCacheManager)
+    manager.layer_specs = None
     manager.mapping = Mapping(world_size=1, tp_size=1)
     manager.pp_layers = [0, 1]
     manager.layer_offsets = {0: 0, 1: 1}
@@ -153,6 +154,8 @@ def test_indexer_runtime_cache_cost_matches_registered_buffers(fp8, snapshot_int
     manager.index_state_dim = 384
     manager.num_local_layers = 2
     manager.local_num_mamba_layers = 1
+    manager.mamba_pp_layers = [0]
+    manager._kda_replay = None
     manager.num_kv_heads_per_layer = [0, 1]
     manager.head_dim_per_layer = [512, 512]
     manager.kv_cache_type = CacheTypeCpp.SELFKONLY

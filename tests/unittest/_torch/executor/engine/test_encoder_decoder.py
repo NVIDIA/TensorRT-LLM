@@ -73,7 +73,7 @@ def test_encoder_decoder_rejects_mixed_token_and_feature_batch() -> None:
     )
 
     with pytest.raises(ValueError, match="cannot share one batch"):
-        runner.prepare_inputs(
+        runner._prepare_inputs(
             scheduled_requests,
             resource_manager=None,
         )
@@ -168,7 +168,7 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
     prepared = EncoderPreparedInputs({}, sequence_lengths=[2, 3])
     hidden_states = torch.arange(10).reshape(5, 2)
     runner = object.__new__(EncoderStage)
-    runner.prepare_inputs = Mock(return_value=prepared)
+    runner._prepare_inputs = Mock(return_value=prepared)
     runner._execute_prepared = Mock(return_value=hidden_states)
     scheduled_requests = ScheduledRequests()
     resource_manager = object()
@@ -182,7 +182,7 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
         "encoder_hidden_states": hidden_states,
         "encoder_seq_lens": [2, 3],
     }
-    runner.prepare_inputs.assert_called_once_with(
+    runner._prepare_inputs.assert_called_once_with(
         scheduled_requests,
         resource_manager=resource_manager,
     )
@@ -196,6 +196,7 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
     mapping = object()
     dist = object()
     input_processor = object()
+    features = object()
     shapes = frozenset({(1, 16)})
 
     order = Mock()
@@ -217,11 +218,20 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
             dist=dist,
             moe_load_balancer=None,
             input_processor=input_processor,
+            attention_runtime_features=features,
         )
 
     assert runner._encoder_stage is stage_type.return_value
+    assert runner._input_processor is input_processor
     assert order.mock_calls == [
-        call.stage(model, encoder_config, mapping=mapping, dist=dist, moe_load_balancer=None),
+        call.stage(
+            model,
+            encoder_config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=None,
+            attention_runtime_features=features,
+        ),
         call.decoder(
             shapes,
             model,
@@ -229,15 +239,16 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
             mapping=mapping,
             dist=dist,
             moe_load_balancer=None,
-            input_processor=input_processor,
+            attention_runtime_features=features,
         ),
     ]
 
 
 def test_encoder_decoder_runner_builds_encoder_decoder_components() -> None:
     runner = object.__new__(EncoderDecoderRunner)
-    runner.sparse_attention_config = object()
-    runner.input_processor = object()
+    runner._sparse_attention_config = object()
+    runner._input_processor = object()
+    runner._attention_runtime_features = object()
     runner._encoder_graph_shapes = frozenset({(1, 16)})
     runner._inputs = object()
     mm_item_scheduler = object()
@@ -257,11 +268,13 @@ def test_encoder_decoder_runner_builds_encoder_decoder_components() -> None:
     kw.assert_called_once_with(mm_item_scheduler)
     dummy_type.assert_called_once_with(dummy=1)
     preparer_type.assert_called_once_with(
-        inputs=2, sparse_attention_config=runner.sparse_attention_config
+        inputs=2,
+        sparse_attention_config=runner._sparse_attention_config,
+        attention_runtime_features=runner._attention_runtime_features,
     )
     graphs_type.assert_called_once_with(
         graphs=3,
-        input_processor=runner.input_processor,
+        input_processor=runner._input_processor,
         encoder_graph_shapes=runner._encoder_graph_shapes,
         inputs=runner._inputs,
     )
@@ -361,7 +374,6 @@ def _dummy_requests(
             use_mrope=False,
             max_beam_width=1,
         ),
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
         model=SimpleNamespace(
             model_config=SimpleNamespace(pretrained_config=pretrained_config or SimpleNamespace())
         ),

@@ -5083,3 +5083,224 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+class TestPregrownContextCapacity:
+    """Capacity grown by a skipped forward is replayed exactly, first, under SWA scratch reuse."""
+
+    def _make(self, scratch=True):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.enable_swa_scratch_reuse = scratch
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        return sched, mgr
+
+    @staticmethod
+    def _req(mgr, request_id, remaining, kv_start=0, grown=0):
+        """grown: capacity held past kv_start by an earlier, skipped pass."""
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, is_first_context_chunk=kv_start == 0
+        )
+        req.context_current_position = kv_start
+        mgr.kv_cache_map[request_id].capacity = kv_start + grown + mgr.num_extra_kv_tokens
+        return req
+
+    def test_pregrown_tokens_are_computed_and_clamped(self):
+        sched, mgr = self._make()
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, kv_start=1_000)) == 0
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 768
+        mgr.num_extra_kv_tokens = 3
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 768
+        mgr.num_extra_kv_tokens = 0
+        # Never more than what is left to prefill.
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 500, 1_000, grown=768)) == 500
+        req = self._req(mgr, 0, 5_000, kv_start=1_000)
+        mgr.kv_cache_map[0].capacity = 900
+        assert sched._pregrown_context_tokens(req) == 0
+
+    def test_zero_without_scratch_reuse_or_cache(self):
+        sched, mgr = self._make(scratch=False)
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 0
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 5_000, 1_000, grown=768)
+        mgr.kv_cache_map.pop(0)
+        assert sched._pregrown_context_tokens(req) == 0
+        # A manager that does not define the flag reads as off.
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        assert sched._pregrown_context_tokens(self._req(mgr, 0, 5_000, 1_000, grown=768)) == 0
+
+    def test_replays_exactly_the_pregrown_chunk(self):
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 512  # not the full 1024 budget
+        mgr.resize_context.assert_called_once_with(req, 512)
+
+    def test_mm_alignment_does_not_resize_the_pregrown_chunk(self):
+        import torch
+
+        sched, mgr = self._make()
+        req = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        # The pre-grown end was MM-aligned when first sized: a block ends there.
+        mask = torch.zeros(1_024 + 10_000, dtype=torch.int64)
+        mask[1_024 + 448 : 1_024 + 512] = 1
+        req.py_multimodal_data = {
+            "multimodal_embed_mask_cumsum": mask.cumsum(0, dtype=torch.int64),
+            "mm_bidirectional_blocks": True,
+        }
+        with patch.object(
+            sched, "_align_chunk_to_mm_block", wraps=sched._align_chunk_to_mm_block
+        ) as align:
+            out = sched.schedule_request([req], set())
+        align.assert_not_called()
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 512
+        mgr.resize_context.assert_called_once_with(req, 512)
+
+    def test_skipped_when_the_budget_cannot_cover_it(self):
+        sched, mgr = self._make()
+        first = self._req(mgr, 0, 10_000, kv_start=1_024, grown=768)
+        second = self._req(mgr, 1, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0]
+        assert first.context_chunk_size == 768
+        assert all(call.args[0] is not second for call in mgr.resize_context.call_args_list)
+
+    def test_pregrown_request_runs_first_when_reordered(self):
+        sched, mgr = self._make()
+        newcomer = self._req(mgr, 1, 256)
+        pregrown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([newcomer, pregrown], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert pregrown.context_chunk_size == 512
+        assert newcomer.context_chunk_size == 256
+
+    def test_suspended_pregrown_request_runs_first(self):
+        sched, mgr = self._make()
+        newcomer = self._req(mgr, 1, 1_024)
+        pregrown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        mgr.kv_cache_map[0].is_active = False  # suspended: capacity is kept
+        out = sched.schedule_request([newcomer, pregrown], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert pregrown.context_chunk_size == 512
+        assert newcomer.context_chunk_size == 512
+
+    def test_order_unchanged_without_scratch_reuse(self):
+        sched, mgr = self._make(scratch=False)
+        short = self._req(mgr, 1, 256)
+        grown = self._req(mgr, 0, 10_000, kv_start=1_024, grown=512)
+        out = sched.schedule_request([short, grown], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert grown.context_chunk_size == 768  # leftover budget, no clamp
+
+
+# ===========================================================================
+# Long-prefill Demotion
+# ===========================================================================
+
+
+class TestLongContextDemotion:
+    """TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS: a request whose router estimate of
+    uncached prefill exceeds the threshold goes to the tail of the iteration's
+    context order, from its first chunk on."""
+
+    OFF = {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "0", "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "0"}
+    ENV = {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024", "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "0"}
+
+    def _make(self, env=None, **mgr_kwargs):
+        with patch.dict("os.environ", env or self.OFF):
+            return make_scheduler(
+                make_kv_cache_manager(tokens_per_block=64, **mgr_kwargs),
+                max_num_tokens=1024,
+                ctx_chunk_config=(None, 64),
+            )
+
+    def _req(self, request_id, remaining, estimate=None, kv_start=0):
+        """`estimate`: the router's py_uncached_prefill_tokens (None = not
+        published). kv_start > 0: prepare_context already ran, so `remaining`
+        is the exact post-reuse remainder."""
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, is_first_context_chunk=kv_start == 0
+        )
+        req.context_current_position = kv_start
+        req.py_uncached_prefill_tokens = estimate
+        return req
+
+    def test_disabled_without_env(self):
+        long_req, short = self._req(0, 10_000, estimate=10_000), self._req(1, 256, estimate=256)
+        out = self._make().schedule_request([long_req, short], set())
+        assert ids(out.context_requests) == [0]
+        assert long_req.context_chunk_size == 1024
+
+    def test_estimated_long_request_waits_behind_short_ones_from_its_first_chunk(self):
+        long_req, short = self._req(0, 10_000, estimate=10_000), self._req(1, 256, estimate=256)
+        out = self._make(self.ENV).schedule_request([long_req, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert short.context_chunk_size == 256
+        assert long_req.context_chunk_size == 768  # leftover, not a full first chunk
+        # Only long requests left: the head of the long queue takes everything.
+        first, second = self._req(0, 10_000, estimate=10_000), self._req(1, 10_000, estimate=10_000)
+        out = self._make(self.ENV).schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0]
+        assert first.context_chunk_size == 1024
+
+    def test_request_without_estimate_is_never_demoted(self):
+        """No router estimate: plain FCFS, whether fresh or already mid-prefill."""
+        fresh_long, short = self._req(0, 10_000), self._req(1, 256, estimate=256)
+        out = self._make(self.ENV).schedule_request([fresh_long, short], set())
+        assert ids(out.context_requests) == [0]
+        mid_long = self._req(0, 10_000, kv_start=64)
+        out = self._make(self.ENV).schedule_request([mid_long, short], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_exact_remainder_releases_the_tail(self):
+        """Mid-prefill the exact remainder is known: a demoted request with no
+        more than the threshold left is not demoted any further."""
+        tail = self._req(0, 512, estimate=10_000, kv_start=9_600)
+        short = self._req(1, 256, estimate=256)
+        out = self._make(self.ENV).schedule_request([tail, short], set())
+        assert ids(out.context_requests) == [0, 1]
+        still_long = self._req(0, 5_000, estimate=10_000, kv_start=5_000)
+        out = self._make(self.ENV).schedule_request([still_long, short], set())
+        assert ids(out.context_requests) == [1, 0]
+
+    def test_aging_bound_lets_a_demoted_request_through_for_good(self):
+        sched = self._make(dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"))
+        long_req = self._req(0, 10_000, estimate=10_000)
+        # At the threshold (`> T` is false): never demoted, leaves 64 tokens.
+        hog = self._req(1, 960, estimate=960)
+        for _ in range(2):
+            out = sched.schedule_request([long_req, hog], set())
+            assert ids(out.context_requests) == [1, 0]
+            assert long_req.context_chunk_size == 64  # crumbs do not reset the count
+        # Let through in arrival order, and never demoted again: parked behind
+        # the short requests, a started prefill would hold its KV blocks.
+        for _ in range(2):
+            out = sched.schedule_request([long_req, hog], set())
+            assert ids(out.context_requests) == [0]
+            assert long_req.context_chunk_size == 1024
+        assert sched._ctx_demote_skips == {}
+        sched.schedule_request([hog], set())
+        assert sched._ctx_demote_skips == {}  # finished requests leave no entry
+
+    @pytest.mark.parametrize("long_arrived_first", [True, False])
+    def test_preemption_keeps_arrival_order(self, long_arrived_first):
+        """With GPU as the last cache tier, a request out of pages preempts a
+        started one. Demotion must not expose a long request that arrived
+        first: FCFS would have scheduled, and protected, it first."""
+        long_id, short_id = (0, 1) if long_arrived_first else (1, 0)
+        sched = self._make(
+            self.ENV,
+            resize_context_fn=lambda req, n: req.py_request_id != short_id,
+            has_cache_tier_below_gpu=False,
+        )
+        long_req = self._req(long_id, 5_000, estimate=10_000, kv_start=5_000)
+        short = self._req(short_id, 256, estimate=256)
+        reqs = [long_req, short] if long_arrived_first else [short, long_req]
+        out = sched.schedule_request(reqs, set())
+        if long_arrived_first:
+            sched.kv_cache_manager.preempt_request.assert_not_called()
+            assert ids(out.context_requests) == [long_id]
+        else:
+            assert ids(out.recompute_paused_requests) == [long_id]

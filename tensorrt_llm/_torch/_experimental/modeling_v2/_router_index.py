@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Architecture name -> routing module, and the resolver that reads the table.
+"""Architecture name -> ``route``, and the resolver that consults it.
 
 The checkpoint's own ``architectures[0]`` (``GptOssForCausalLM``,
-``DeepseekV3ForCausalLM``) selects a routing module, never a target: one
+``DeepseekV3ForCausalLM``) selects a family's ``route``, never a target: one
 architecture has many deployments and a target serves exactly one of them.
 ``modeling_v2_resolve`` returns the target *class*, the model loader records it
 on ``ModelConfig.modeling_v2_target``, and ``AutoModelForCausalLM._resolve_class``
@@ -11,35 +11,38 @@ builds that class instead of the registry's.
 
 Two levels, on purpose:
 
-* This table maps ``architectures[0]`` -> routing module. Its keys are things
-  that already exist in every checkpoint's config.json, so adding a new
-  checkpoint, GPU arch or parallel topology never touches it -- only a new
-  architecture family does.
-* The routing module's ``route`` owns the rest of the decision as one
-  forward-reading tree over the facts that fix which code runs: the
-  checkpoint's config, the parallel mapping, the GPU's compute capability, the
-  speculative-decoding config and the KV-cache algorithm the engine will run
-  with. It also receives the ``ModelConfig`` and the LLM arguments, from which a
-  family derives any other engine choice its targets depend on. It returns the
-  target class, or raises :class:`NoTarget` with the reason in words. Reading
-  that one file tells you where any configuration lands.
+* Each family's ``routing.py`` declares the ``architectures[0]`` values its
+  ``route`` serves with ``@routes(...)``, and ``models/__init__.py`` imports
+  every family's ``routing.py``, which is what registers them. The names are
+  things that already exist in every checkpoint's config.json, so adding a
+  new checkpoint, GPU arch or parallel topology never touches either -- only
+  a new architecture family does.
+* That ``route`` owns the rest of the decision as one
+  forward-reading tree over the facts that fix which code runs. It receives
+  the ``ModelConfig``, the LLM arguments and the GPU's compute capability, and
+  reads from the first two the checkpoint's config, the parallel mapping, the
+  speculative-decoding config, the KV-cache algorithm the engine will run with
+  (:func:`engine_kv_cache_quant_algo`) and any other engine choice its targets
+  depend on. It returns the target class, or raises :class:`NoTarget` with the
+  reason in words. Reading that one file tells you where any configuration
+  lands.
 
 Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
 are deliberately not routing inputs. They do not change which code runs, so a
 target claims a configuration regardless of them; ``require`` promises that the
 target ran, not that a particular knob setting was measured.
 
-Routing modules are imported lazily: resolving a GptOss config never imports
-the DeepSeek tree, and a target's modeling code is imported only on the
-``route`` branch that returns it.
+Routing modules are imported on the first resolve, all of them, and hold no
+modeling code: a target's modeling code is imported only on the ``route``
+branch that returns it, so resolving a GptOss config never imports a DeepSeek
+target.
 """
 
 from __future__ import annotations
 
 import enum
 import os
-from importlib import import_module
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -47,16 +50,29 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
+# architectures[0] -> the ``route`` that decides where it lands, filled by ``@routes``.
+_ROUTES: Dict[str, Callable[..., type]] = {}
 
-# architectures[0] -> routing module, relative to this package.
-MODELING_V2_ROUTERS = {
-    "GptOssForCausalLM": "models.gpt_oss.routing",
-    "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
-    # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
-    # config loader's composite branch writes the same name back.
-    "Qwen4ExpForConditionalGeneration": "models.qwen4_exp.routing",
-}
+
+def routes(*architectures: str):
+    """Declare that the decorated ``route`` decides where these ``architectures[0]`` values land."""
+
+    def register(route):
+        for arch in architectures:
+            assert arch not in _ROUTES, (
+                f"{arch} routed by both {_ROUTES[arch].__module__} and {route.__module__}"
+            )
+            _ROUTES[arch] = route
+        return route
+
+    return register
+
+
+def registered_routes() -> Dict[str, Callable[..., type]]:
+    """architectures[0] -> ``route``, for every family ``models/__init__.py`` imports."""
+    from . import models  # noqa: F401
+
+    return _ROUTES
 
 
 #: Turns the step contract check on. Off by default, so a served engine runs
@@ -98,7 +114,7 @@ class ModelingV2Mode(str, enum.Enum):
 
 
 class NoTarget(Exception):
-    """Raised by a routing module's ``route`` when no target fits.
+    """Raised by a family's ``route`` when no target fits.
 
     The message says, in words, which fact ruled the targets out. Under
     ``auto`` the resolver logs it and falls back to the built-in implementation;
@@ -129,14 +145,6 @@ def tp_reaches_across_nodes(mapping) -> bool:
     return MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
 
 
-def routing_module(arch: str):
-    """Import and return the routing module for ``arch``, or None."""
-    name = MODELING_V2_ROUTERS.get(arch)
-    if name is None:
-        return None
-    return import_module(f"{_PACKAGE}.{name}")
-
-
 def _device_compute_capability() -> Tuple[int, int]:
     import torch
 
@@ -147,7 +155,7 @@ def _device_compute_capability() -> Tuple[int, int]:
     return torch.cuda.get_device_capability()
 
 
-def _kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
+def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     """The KV-cache algorithm the engine will run with, which routing runs too early to read.
 
     The loader resolves the target before `validate_and_set_kv_cache_quant`
@@ -171,8 +179,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     """Decide which modeling_v2 target, if any, this deployment builds.
 
     Returns the target class, or None for the built-in implementation:
-    when ``llm_args.modeling_v2`` is ``off``, when no routing module claims the
-    architecture, or when the routing module's ``route`` raises ``NoTarget``.
+    when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
+    for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
     """
     mode = ModelingV2Mode.of(llm_args)
@@ -185,21 +193,11 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     arch = pretrained_config.architectures[0]
 
     try:
-        routing = routing_module(arch)
-        if routing is None:
-            known = ", ".join(sorted(MODELING_V2_ROUTERS)) or "(none)"
-            raise NoTarget(
-                f"no routing module for this architecture; routed architectures: {known}"
-            )
-        return routing.route(
-            pretrained_config,
-            config.mapping,
-            _device_compute_capability(),
-            config.spec_config,
-            _kv_cache_quant_algo(config, llm_args),
-            model_config=config,
-            llm_args=llm_args,
-        )
+        route = registered_routes().get(arch)
+        if route is None:
+            known = ", ".join(sorted(registered_routes())) or "(none)"
+            raise NoTarget(f"no route for this architecture; routed architectures: {known}")
+        return route(config, llm_args, _device_compute_capability())
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None

@@ -69,6 +69,13 @@ from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
     TrtllmCutlassFp8Impl,
@@ -78,20 +85,14 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassW4a16Nvfp4Impl,
     TrtllmTritonFp8BlockScalesImpl,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
-    CuteDslFusedMoE,
-    CuteDslFusedMoENvfp4Runner,
-)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xNvfp4FusedMoE,
     CuteDslB12xW4a16Nvfp4FusedMoE,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
-    CuteDslFc12FusedMoE,
-    CuteDslFc12FusedMoENvfp4Runner,
-)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
@@ -135,6 +136,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
+    NVFP4MegaMoECuteDslMethod,
     NVFP4TRTLLMGenFusedMoEBaseMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
@@ -146,7 +148,12 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
-from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+    is_gated_activation,
+)
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -444,7 +451,7 @@ def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts(
     monkeypatch: pytest.MonkeyPatch, use_direct_expert_metadata: bool
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl.get_sm_version", lambda: 100
+        "tensorrt_llm._torch.moe.fused_moe.cutedsl.runners.get_sm_version", lambda: 100
     )
     forward_impl = MagicMock(return_value=torch.empty(1))
     runner = CuteDslFusedMoENvfp4Runner(
@@ -538,7 +545,7 @@ def test_cutedsl_deep_ep_direct_metadata_disable_env(
         "model_config": ModelConfig(skip_create_weights_in_init=True),
     }
 
-    backend = CuteDslFusedMoE(**constructor_kwargs)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl(**constructor_kwargs)
     assert backend.disable_deep_ep_direct_metadata is expected_disabled
 
 
@@ -639,26 +646,20 @@ def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(
 
 
 @pytest.mark.parametrize(
-    "disabled,has_nvfp4,supports_post_quant,expected",
+    "disabled,supports_post_quant,expected",
     [
-        (False, True, True, True),
-        (True, True, True, False),
-        (False, False, True, False),
-        (False, True, False, False),
+        (False, True, True),
+        (True, True, False),
+        (False, False, False),
     ],
 )
 def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
-    disabled: bool, has_nvfp4: bool, supports_post_quant: bool, expected: bool
+    disabled: bool, supports_post_quant: bool, expected: bool
 ) -> None:
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     backend.disable_deep_ep_direct_metadata = disabled
     backend.use_fused_finalize = True
     backend._weights_created = True
-    backend.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(
-            has_nvfp4=MagicMock(return_value=has_nvfp4),
-        ),
-    )
     assert backend.can_use_deep_ep_direct_metadata(supports_post_quant) is expected
 
 
@@ -668,30 +669,20 @@ def test_other_backend_rejects_deep_ep_direct_metadata() -> None:
 
 
 def test_cutedsl_rejects_direct_metadata_without_fused_finalize() -> None:
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     backend.disable_deep_ep_direct_metadata = False
     backend.use_fused_finalize = False
     backend._weights_created = True
-    backend.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(
-            has_nvfp4=MagicMock(return_value=True),
-        ),
-    )
     assert backend.can_use_deep_ep_direct_metadata(True) is False
 
 
 def test_cutedsl_direct_metadata_request_fails_without_fused_finalize() -> None:
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     backend.activation_type = ActivationType.Swiglu
     backend._locality_domain_runtime = None
     backend.use_fused_finalize = False
     backend.hidden_size = 4
     backend._weights_created = True
-    backend.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(
-            has_nvfp4=MagicMock(return_value=True),
-        ),
-    )
     token_selected_experts = torch.full((2, 1), -1, dtype=torch.int32)
     token_final_scales = torch.ones((2, 1), dtype=torch.float32)
 
@@ -720,15 +711,10 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
         "expert_capacity": expert_capacity,
     }
     comm.enable_postquant_alltoall = False
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     backend.disable_deep_ep_direct_metadata = disabled
     backend.use_fused_finalize = True
     backend._weights_created = True
-    backend.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(
-            has_nvfp4=MagicMock(return_value=True),
-        ),
-    )
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
         backend=backend,
@@ -754,6 +740,56 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
         assert plan.recv_expert_count is None
         assert plan.deep_ep_expert_capacity is None
     assert plan.use_deep_ep_direct_metadata is expected
+
+
+@pytest.mark.parametrize(
+    "multi_stream,capturing,has_comm,router_weight_on_input,expected",
+    [
+        # Eager forward: host-bound, quantize on the main stream.
+        (False, False, False, False, False),
+        # CUDA graph runner (multi-stream) or any active capture: fork it.
+        (True, False, False, False, True),
+        (False, True, False, False, True),
+        # A comm strategy owns the quantize/dispatch order.
+        (True, False, True, False, False),
+        # x is scaled by the router weight before quantization.
+        (True, False, False, True, False),
+    ],
+)
+def test_scheduler_quantizes_input_async_only_under_multi_stream(
+    monkeypatch,
+    multi_stream: bool,
+    capturing: bool,
+    has_comm: bool,
+    router_weight_on_input: bool,
+    expected: bool,
+) -> None:
+    from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
+
+    monkeypatch.setattr(moe_scheduler, "do_multi_stream", lambda: multi_stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        backend=TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl),
+        comm=object() if has_comm else None,
+        apply_router_weight_on_input=router_weight_on_input,
+    )
+
+    assert scheduler._should_quantize_input_async(torch.empty(2, 4)) is expected
+
+
+def test_scheduler_skips_async_quantization_without_backend_support(monkeypatch) -> None:
+    from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
+
+    monkeypatch.setattr(moe_scheduler, "do_multi_stream", lambda: True)
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        backend=TrtllmCutlassNvfp4Impl.__new__(TrtllmCutlassNvfp4Impl),
+        comm=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert scheduler._should_quantize_input_async(torch.empty(2, 4)) is False
 
 
 # =====================================================================
@@ -1522,6 +1558,227 @@ def test_marlin_refuses_a_pre_quant_activation_scale(act_scale):
             method.transform_weights(module)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "leaf_cls,run_fn",
+    [
+        (TrtllmCutedslGroupedGemmNvfp4Impl, "run_moe_nvfp4"),
+        (TrtllmCutedslGroupedGemmBf16Impl, "run_moe_bf16"),
+        (CuteDslFc12FusedMoE, "run_moe_nvfp4"),
+    ],
+    ids=["grouped_gemm_nvfp4", "grouped_gemm_bf16", "fused_fc12"],
+)
+def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_cls, run_fn):
+    """The scheduler folds the top-1 weight into ``x`` and passes no scales.
+
+    The finalize epilogue multiplies by per-token scales regardless, so it gets ones.
+    """
+    captured = {}
+    backend = SimpleNamespace(
+        apply_router_weight_on_input=True,
+        _build_local_weight_view=lambda: None,
+        **{run_fn: lambda **kwargs: captured.update(kwargs)},
+    )
+    ctx = SimpleNamespace(
+        x=torch.zeros(2, 8),
+        x_sf=None,
+        x_ready_event=None,
+        token_selected_experts=torch.tensor([[3], [1]], dtype=torch.int32),
+        token_final_scales=None,
+        comm_plan=SimpleNamespace(
+            moe_output=None,
+            enable_alltoall=False,
+            recv_expert_count=None,
+            deep_ep_expert_capacity=None,
+            use_deep_ep_direct_metadata=False,
+        ),
+    )
+    leaf_cls.run_moe(backend, ctx)
+    torch.testing.assert_close(captured["token_final_scales"], torch.ones(2, 1))
+
+    backend.apply_router_weight_on_input = False
+    with pytest.raises(AssertionError, match="apply_router_weight_on_input"):
+        leaf_cls.run_moe(backend, ctx)
+
+
+# The CuteDSL NVFP4 leaves all bind the shared ``quantize_input_nvfp4``.
+_CUTEDSL_NVFP4_LEAVES = pytest.mark.parametrize(
+    "leaf_cls",
+    [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, TrtllmCutedslDenseGemmNvfp4Impl],
+    ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
+)
+
+
+def _nvfp4_input_quantizer_state(
+    act_scale: torch.Tensor | None, hidden_size: int = 32
+) -> SimpleNamespace:
+    """The backend attributes ``quantize_input`` reads, and nothing else."""
+    return SimpleNamespace(
+        hidden_size=hidden_size,
+        scaling_vector_size=16,
+        fc31_input_scale=torch.ones(()),
+        fc31_act_scale=act_scale,
+    )
+
+
+def _fake_fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+    """A CPU ``fp4_quantize`` with the real op's output shapes."""
+    num_rows, k = x.shape
+    return (
+        torch.zeros(num_rows, k // 2, dtype=torch.uint8),
+        torch.zeros(num_rows * k // sf_vec_size, dtype=torch.uint8),
+    )
+
+
+@pytest.mark.cpu_only
+@_CUTEDSL_NVFP4_LEAVES
+def test_cutedsl_nvfp4_scale_width_survives_an_empty_micro_batch(leaf_cls, monkeypatch):
+    """``view(0, -1)`` cannot infer a width from zero rows, so it is spelled out."""
+    hidden_size = 32
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", _fake_fp4_quantize)
+    _, x_sf = leaf_cls.quantize_input(
+        _nvfp4_input_quantizer_state(None, hidden_size),
+        torch.empty(0, hidden_size, dtype=torch.bfloat16),
+        post_quant_comm=False,
+    )
+
+    assert x_sf.shape == (0, hidden_size // 16)
+
+
+@pytest.mark.cpu_only
+def test_cutedsl_dense_gemm_returns_an_empty_output_for_an_empty_micro_batch():
+    """The leaf returns before ``swizzle_sf``, which cannot lay out zero rows."""
+    hidden_size, num_experts = 32, 4
+    backend = SimpleNamespace(has_nvfp4=True, hidden_size=hidden_size)
+    output = TrtllmCutedslDenseGemmNvfp4Impl.run_moe_nvfp4(
+        backend,
+        x=torch.empty(0, hidden_size // 2, dtype=torch.uint8),
+        token_selected_experts=torch.empty(0, num_experts, dtype=torch.int32),
+        token_final_scales=torch.empty(0, num_experts, dtype=torch.float32),
+        x_sf=torch.empty(0, hidden_size // 16, dtype=torch.uint8),
+    )
+    assert output.shape == (0, hidden_size)
+    assert output.dtype == torch.bfloat16
+
+
+@skip_pre_blackwell
+def test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass():
+    """CuteDSL and CUTLASS agree on an NVFP4_AWQ layer, and both match the reference.
+
+    The checkpoint is calibrated on ``x * pre_quant_scale``, which is what the
+    reference runs FC1 on. The last check is the control: the same output
+    against the reference on the unsmoothed input must fail, or this test could
+    not tell a dropped scale apart.
+    """
+    model_config = MoeModelConfig(8, 2, 512, 512)
+    seq_len = 16
+    dtype = torch.bfloat16
+    verdict = TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=dtype,
+            hidden_size=model_config.hidden_size,
+            intermediate_size=model_config.intermediate_size,
+            num_experts=model_config.num_experts,
+            top_k=model_config.top_k,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=model_config.num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+        x = torch.randn((seq_len, model_config.hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, model_config.num_experts), dtype=dtype, device="cuda")
+        # Per-channel factors in [1/e, e]: dropping them moves FC1's input far
+        # past the comparison tolerance.
+        pre_quant_scale = (
+            torch.empty(model_config.hidden_size, device="cuda").uniform_(-1, 1).exp().to(dtype)
+        )
+        x_smoothed = x * pre_quant_scale
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x_smoothed, MoeBackendType.CUTEDSL
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=model_config.num_experts,
+            dtype=dtype,
+            intermediate_size=model_config.intermediate_size,
+            hidden_size=model_config.hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            activation_type=ActivationType.Swiglu,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        for expert_id in range(model_config.num_experts):
+            weights[f"{expert_id}.w1.pre_quant_scale"] = pre_quant_scale
+            weights[f"{expert_id}.w3.pre_quant_scale"] = pre_quant_scale
+
+        outputs = {}
+        for backend_type in (MoeBackendType.CUTLASS, MoeBackendType.CUTEDSL):
+            backend = create_test_backend(
+                backend_type=backend_type,
+                routing_method=routing_method,
+                num_experts=model_config.num_experts,
+                hidden_size=model_config.hidden_size,
+                intermediate_size=model_config.intermediate_size,
+                dtype=dtype,
+                quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4_AWQ),
+                mapping=mapping,
+            )
+            backend.load_weights([weights])
+            backend.post_load_weights()
+            backend.cuda()
+            assert backend.fc31_act_scale is not None
+            with torch.inference_mode():
+                token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+                x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+                outputs[backend_type] = run_backend_moe(
+                    backend,
+                    backend_type,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    dtype,
+                    router_logits,
+                )
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x_smoothed, router_logits)
+            unsmoothed_ref_output = ref_fused_moe.forward(x, router_logits)
+
+        cutlass_output = outputs[MoeBackendType.CUTLASS]
+        cutedsl_output = outputs[MoeBackendType.CUTEDSL]
+        ref_fused_moe.check_accuracy(cutlass_output, ref_output)
+        ref_fused_moe.check_accuracy(cutedsl_output, ref_output)
+        ref_fused_moe.check_accuracy(cutedsl_output, cutlass_output)
+        with pytest.raises(Exception, match="Mismatch percentage"):
+            ref_fused_moe.check_accuracy(cutedsl_output, unsmoothed_ref_output)
+
+
 def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
     cfg = ModelConfig()
     cfg.moe_backend = "MARLIN"
@@ -2118,6 +2375,18 @@ def test_deepgemm_rejects_post_silu_clamp_materialization():
         )
 
 
+@pytest.mark.cpu_only
+def test_cutedsl_bf16_refuses_a_clamp_at_materialization():
+    """The BF16 leaf's declaration refuses the clamp its FC1 op would otherwise drop."""
+    with pytest.raises(ValueError, match="take no activation clamp"):
+        materialize_activation_params(
+            SwigluActivation(clamp=7.0),
+            TrtllmCutedslGroupedGemmBf16Impl.activation_support,
+            num_local_experts=2,
+            owner="TrtllmCutedslGroupedGemmBf16Impl",
+        )
+
+
 def test_post_silu_clamp_mode_requires_limit():
     with pytest.raises(ValueError, match="requires a clamp value"):
         SwigluActivation(clamp_after_silu=True)
@@ -2592,6 +2861,437 @@ def test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias(
         )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
+    monkeypatch: pytest.MonkeyPatch, has_pre_quant_scale: bool
+) -> None:
+    """An NVFP4_AWQ / NVFP4_ARC pre-quant scale reaches the activation quantizer.
+
+    ``canonical_quant`` folds both recipes into ``nvfp4``, so ``can_implement``
+    admits them, and ``load_quant_scales`` loads their per-channel pre-quant
+    scale into ``fc31_act_scale``. The fused kernel consumes only the quantized
+    activation, which leaves ``quantize_input`` as the one place to apply it.
+
+    ``__new__`` without ``__init__``: the real constructor wants a GPU and a
+    symmetric-memory provider, and ``quantize_input`` reads two parameters.
+    """
+    hidden_size = 64
+    backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
+    torch.nn.Module.__init__(backend)
+    backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    # Weight creation registers the slot as None, and only a checkpoint that
+    # carries ``*.pre_quant_scale`` fills it, as ``NVFP4FusedMoEMethod`` does.
+    backend.register_parameter("fc31_act_scale", None)
+    if has_pre_quant_scale:
+        backend.register_parameter(
+            "fc31_act_scale",
+            torch.nn.Parameter(
+                torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0),
+                requires_grad=False,
+            ),
+        )
+    quantizer_calls = []
+
+    def fake_fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+        quantizer_calls.append((x.clone(), global_scale))
+        num_rows, num_cols = x.shape
+        return (
+            torch.zeros(num_rows, num_cols // 2, dtype=torch.uint8),
+            torch.zeros(num_rows * num_cols // sf_vec_size, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fake_fp4_quantize, raising=False)
+    x = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    backend.quantize_input(x)
+
+    [(quantized, global_scale)] = quantizer_calls
+    expected = x * backend.fc31_act_scale if has_pre_quant_scale else x
+    torch.testing.assert_close(quantized, expected, rtol=0, atol=0)
+    assert global_scale is backend.fc31_input_scale
+
+
+def _make_cutedsl_sibling_for_quantize_input_test(
+    backend_cls: type, hidden_size: int, pre_quant_scale: Optional[torch.Tensor]
+):
+    """A CuteDSL sibling backend carrying only what ``quantize_input`` reads.
+
+    ``__new__`` without ``__init__``: the real constructors want a GPU (and,
+    for the FC12 one, Rubin), while ``quantize_input`` reads the quant config,
+    the two scales and the scale geometry. The DenseGEMM backend reads the
+    same four, so it shares this fake.
+    """
+    backend = backend_cls.__new__(backend_cls)
+    torch.nn.Module.__init__(backend)
+    # ``has_nvfp4`` asserts weights exist and reads the layer quant mode;
+    # NVFP4_AWQ folds onto the NVFP4 quant mode (quantization/mode.py), so
+    # either recipe clears that gate. Declare plain NVFP4 when no scale is
+    # given, so that case exercises a non-AWQ layer rather than an AWQ one
+    # whose checkpoint happened to carry no ``pre_quant_scale``.
+    backend._weights_created = True
+    backend.quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4_AWQ if pre_quant_scale is not None else QuantAlgo.NVFP4
+    )
+    backend.hidden_size = hidden_size
+    backend.scaling_vector_size = 16
+    backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    # ``create_weights`` registers the slot as None, and only a checkpoint
+    # that carries ``*.pre_quant_scale`` fills it, as
+    # ``NVFP4FusedMoEMethod.load_quant_scales`` does.
+    backend.register_parameter("fc31_act_scale", None)
+    if pre_quant_scale is not None:
+        backend.register_parameter(
+            "fc31_act_scale", torch.nn.Parameter(pre_quant_scale, requires_grad=False)
+        )
+    return backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "backend_cls",
+    [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, DenseGEMMFusedMoE],
+    ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
+)
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_cutedsl_quantize_input_applies_pre_quant_scale(
+    monkeypatch: pytest.MonkeyPatch, backend_cls: type, has_pre_quant_scale: bool
+) -> None:
+    """The CuteDSL siblings apply an NVFP4_AWQ / NVFP4_ARC pre-quant scale.
+
+    All three select ``NVFP4CuteDslFusedMoEMethod``, which inherits the CUTLASS
+    NVFP4 pipeline and therefore loads a checkpoint's per-channel
+    ``pre_quant_scale`` into ``fc31_act_scale``, and all three calibrate
+    ``fc31_input_scale`` on the scaled activation. Their kernels consume only
+    the quantized activation, which leaves ``quantize_input`` as the one place
+    to apply it; before this it was dropped and the output silently wrong.
+    """
+    hidden_size = 64
+    pre_quant_scale = (
+        torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0)
+        if has_pre_quant_scale
+        else None
+    )
+    backend = _make_cutedsl_sibling_for_quantize_input_test(
+        backend_cls, hidden_size, pre_quant_scale
+    )
+    quantizer_calls = []
+
+    def fake_fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+        quantizer_calls.append((x.clone(), global_scale))
+        num_rows, num_cols = x.shape
+        return (
+            torch.zeros(num_rows, num_cols // 2, dtype=torch.uint8),
+            torch.zeros(num_rows * num_cols // sf_vec_size, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fake_fp4_quantize, raising=False)
+    x = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    backend.quantize_input(x, post_quant_comm=False)
+
+    [(quantized, global_scale)] = quantizer_calls
+    expected = x * pre_quant_scale if has_pre_quant_scale else x
+    torch.testing.assert_close(quantized, expected, rtol=0, atol=0)
+    assert global_scale is backend.fc31_input_scale
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "backend_cls",
+    [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, DenseGEMMFusedMoE],
+    ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
+)
+def test_cutedsl_quantize_input_rejects_prequantized_awq_input(backend_cls: type) -> None:
+    """An already-quantized input can no longer take the pre-quant scale.
+
+    Each backend also accepts an ``Fp4QuantizedTensor`` produced upstream (a
+    fused norm+quant, or a post-quant dispatch) that never saw
+    ``fc31_act_scale``. Refuse that combination rather than serve the
+    checkpoint wrong, as ``CutlassFusedMoE.quantize_input`` does.
+    """
+    hidden_size = 64
+    backend = _make_cutedsl_sibling_for_quantize_input_test(
+        backend_cls,
+        hidden_size,
+        torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0),
+    )
+    x = Fp4QuantizedTensor(
+        fp4_tensor=torch.zeros(3, hidden_size // 2, dtype=torch.uint8),
+        scaling_factor=torch.zeros(3 * hidden_size // 16, dtype=torch.uint8),
+        is_sf_swizzled=False,
+    )
+
+    with pytest.raises(AssertionError, match="not expected for AWQ"):
+        backend.quantize_input(x, post_quant_comm=False)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_w4a16_nvfp4_quantize_input_applies_pre_quant_scale(has_pre_quant_scale: bool) -> None:
+    """The CUTLASS W4A16_NVFP4 leaf applies the pre-quant scale too.
+
+    This leaf keeps activations in high precision -- ``run_moe`` dequantizes the
+    NVFP4 weights and runs the unquantized kernel -- so unlike the ``nvfp4``
+    leaf it does no FP4 activation quantization. A pre-quant scale is not part
+    of that quantization, though: ``NVFP4FusedMoEMethod.load_quant_scales``
+    fills ``fc31_act_scale`` from the checkpoint's ``*.pre_quant_scale`` keys
+    without consulting ``quant_algo``, and the dequantized ``W / s`` fed into
+    the BF16 MoE expect the scaled activation. The dense counterpart,
+    ``W4A16NVFP4LinearMethod``, applies ``pre_quant_scale`` the same way.
+    """
+    hidden_size = 64
+    moe = TrtllmCutlassW4a16Nvfp4Impl.__new__(TrtllmCutlassW4a16Nvfp4Impl)
+    torch.nn.Module.__init__(moe)
+    # ``create_weights`` registers the slot as None, and only a checkpoint
+    # that carries ``*.pre_quant_scale`` fills it.
+    moe.register_parameter("fc31_act_scale", None)
+    pre_quant_scale = None
+    if has_pre_quant_scale:
+        pre_quant_scale = torch.linspace(0.25, 4.0, hidden_size, dtype=torch.bfloat16).unsqueeze(0)
+        moe.register_parameter(
+            "fc31_act_scale", torch.nn.Parameter(pre_quant_scale, requires_grad=False)
+        )
+    x = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    out, out_sf = moe.quantize_input(x)
+
+    assert out_sf is None
+    expected = x * pre_quant_scale if has_pre_quant_scale else x
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4_AWQ on the per-expert STREAMING loader.
+#
+# Kimi K3 never calls the MoE backend's whole-checkpoint ``load_weights``, so
+# ``load_quant_scales`` -- the only thing that read ``*.pre_quant_scale`` --
+# never runs for it. The scale therefore has to travel through
+# ``load_streaming_nvfp4_expert``, or an AWQ checkpoint served over that path
+# gets ``fc31_act_scale is None`` and the fix above does nothing for it.
+# Nothing raises in that state: the loads are silent and only accuracy moves.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cpu_only
+def test_kimi_k3_nvfp4_expert_spec_covers_the_awq_recipes() -> None:
+    """The streaming layout serves NVFP4 and both of its calibration recipes.
+
+    ``_k3_expert_ckpt_spec`` used to know only plain ``NVFP4``, so an
+    NVFP4_AWQ / NVFP4_ARC checkpoint could not reach this loader at all. The
+    weights are byte-identical across the three; only the extra per-channel
+    scale differs, so one layout covers them.
+
+    ``pre_quant_scale`` must stay OPTIONAL: ``nvidia/Kimi-K3-NVFP4`` stores
+    none, and requiring it would reject the one checkpoint on this path today.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _k3_expert_ckpt_spec
+
+    nvfp4 = _k3_expert_ckpt_spec(QuantAlgo.NVFP4)
+    for quant_algo in (QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC):
+        assert _k3_expert_ckpt_spec(quant_algo) is nvfp4, quant_algo
+    assert "pre_quant_scale" not in nvfp4.kinds
+    assert nvfp4.optional_suffixes == ("w1.pre_quant_scale", "w3.pre_quant_scale")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
+def test_kimi_k3_nvfp4_expert_loader_forwards_pre_quant_scale(
+    has_pre_quant_scale: bool,
+) -> None:
+    """The per-expert loader passes a stored pre-quant scale on, and only then.
+
+    The two getters are the seam every streaming route shares (file-grouped,
+    split-file and the shared-dict fallback): the required one raises on a
+    missing key, the optional one answers ``None``. A plain NVFP4 checkpoint
+    must still load, which is why ``None`` has to reach the quant method
+    rather than the key being demanded.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _load_nvfp4_expert
+
+    pre_quant_scale = torch.linspace(0.5, 2.0, 8)
+    stored = (
+        {
+            "experts.5.w1.pre_quant_scale": pre_quant_scale,
+            "experts.5.w3.pre_quant_scale": pre_quant_scale,
+        }
+        if has_pre_quant_scale
+        else {}
+    )
+    captured = {}
+    backend = SimpleNamespace(
+        quant_method=SimpleNamespace(
+            load_streaming_nvfp4_expert=lambda module, **kwargs: captured.update(
+                module=module, **kwargs
+            )
+        )
+    )
+
+    _load_nvfp4_expert(backend, "experts", 5, 2, lambda key: key, stored.get)
+
+    assert captured["module"] is backend
+    assert captured["global_expert_id"] == 5
+    assert captured["local_slot_id"] == 2
+    # Required tensors still come from the required getter, unchanged.
+    assert captured["w1_weight"] == "experts.5.w1.weight"
+    assert captured["w2_input_scale"] == "experts.5.w2.input_scale"
+    for w in ("w1", "w3"):
+        got = captured[f"{w}_pre_quant_scale"]
+        if has_pre_quant_scale:
+            assert got is pre_quant_scale, w
+        else:
+            assert got is None, w
+
+
+def _streaming_module_for_pre_quant_scale_test(hidden_size: int) -> torch.nn.Module:
+    """A module carrying only what the pre-quant-scale staging touches."""
+    module = torch.nn.Module()
+    module.dtype = torch.bfloat16
+    module.hidden_size = hidden_size
+    module.tp_size = 1
+    module.tp_rank = 0
+    module.is_gated_activation = True
+    # ``create_weights`` registers the slot as None; on the whole-checkpoint
+    # path ``load_quant_scales`` replaces it the moment it sees the keys.
+    module.register_parameter("fc31_act_scale", None)
+    return module
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_streaming_stages_pre_quant_scales_for_finalization() -> None:
+    """A streamed AWQ expert's scale reaches ``fc31_act_scale``.
+
+    Two halves, asserted together because either alone passes trivially: the
+    staging container has to exist before the (multi-threaded) loads, and
+    ``_finalize_pre_quant_scales`` has to consume it and allocate the
+    parameter, which on this path no ``load_quant_scales`` has created.
+
+    The real allocation is ``device='cuda'``, so it is substituted here; what
+    is asserted is that the finalizer allocates at all and lands
+    ``max(w3, w1)``, which is the reduction the whole-checkpoint path uses.
+    """
+    hidden_size = 8
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+    module = _streaming_module_for_pre_quant_scale_test(hidden_size)
+
+    # The base implementation, not MegaMoE's override: that one additionally
+    # rematerializes the raw source parameters, which needs real weights.
+    NVFP4FusedMoEMethod.prepare_streaming_expert_load(method, module)
+    assert module.tmp_pre_quant_scales == {}, "staging must predate the loader threads"
+
+    w1 = torch.linspace(0.5, 2.0, hidden_size)
+    w3 = torch.linspace(2.0, 0.5, hidden_size)
+    for global_expert_id in (3, 7):
+        module.tmp_pre_quant_scales[global_expert_id] = {"w1": w1.clone(), "w3": w3.clone()}
+
+    def allocate_on_cpu(mod: torch.nn.Module) -> None:
+        mod.register_parameter(
+            "fc31_act_scale",
+            torch.nn.Parameter(
+                torch.empty(1, mod.hidden_size, dtype=mod.dtype), requires_grad=False
+            ),
+        )
+
+    method._ensure_fc31_act_scale = allocate_on_cpu
+    method._finalize_pre_quant_scales(module)
+
+    assert not hasattr(module, "tmp_pre_quant_scales")
+    torch.testing.assert_close(
+        module.fc31_act_scale.data,
+        torch.max(w1, w3).to(torch.bfloat16).unsqueeze(0),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_streaming_plain_checkpoint_leaves_act_scale_unset() -> None:
+    """A plain NVFP4 streamed load must stay exactly as it was.
+
+    The container is now pre-created for every streamed NVFP4 load, AWQ or
+    not, so an empty one means "this checkpoint has no pre-quant scale" and
+    not "the scales went missing". Without this the ``nvidia/Kimi-K3-NVFP4``
+    load would raise ``Missing pre_quant_scale data``.
+    """
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+    module = _streaming_module_for_pre_quant_scale_test(8)
+
+    # Base implementation, for the reason given in the test above.
+    NVFP4FusedMoEMethod.prepare_streaming_expert_load(method, module)
+    method._finalize_pre_quant_scales(module)
+
+    assert module.fc31_act_scale is None
+    assert not hasattr(module, "tmp_pre_quant_scales")
+
+
+def _streaming_expert_kwargs() -> dict:
+    """The required ``load_streaming_nvfp4_expert`` arguments, as packed bytes.
+
+    Only the three weights are inspected before the pre-quant-scale checks, so
+    the scales can be placeholders: the call under test never reaches them.
+    """
+    packed = torch.zeros(2, 2, dtype=torch.uint8)
+    return {
+        f"{w}_{kind}": packed if kind == "weight" else None
+        for w in ("w1", "w2", "w3")
+        for kind in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("supplied", ["w1", "w3"])
+def test_nvfp4_streaming_rejects_half_a_pre_quant_scale_pair(supplied: str) -> None:
+    """One half of the pair cannot produce ``max(w3, w1)``.
+
+    Accepting it would stage an entry the finalizer then rejects with a
+    message about a missing expert, one layer deep and pointing at the wrong
+    thing. Refused at the argument instead.
+    """
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+    module = SimpleNamespace(
+        expert_size_per_partition=1,
+        initial_local_expert_ids=[0],
+        is_gated_activation=True,
+        _streamed_expert_slots=set(),
+    )
+
+    with pytest.raises(ValueError, match="must be loaded together"):
+        method.load_streaming_nvfp4_expert(
+            module,
+            global_expert_id=0,
+            local_slot_id=0,
+            **_streaming_expert_kwargs(),
+            **{f"{supplied}_pre_quant_scale": torch.ones(4)},
+        )
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_streaming_refuses_pre_quant_scale_without_gating() -> None:
+    """``fc31_act_scale`` is a gated-activation concept, as on the other path.
+
+    ``load_quant_scales`` asserts the same thing: without a gate there is no
+    ``max(w3, w1)`` to take, so a checkpoint in that shape is refused rather
+    than loaded with the scale dropped.
+    """
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+    module = SimpleNamespace(
+        expert_size_per_partition=1,
+        initial_local_expert_ids=[0],
+        is_gated_activation=False,
+        _streamed_expert_slots=set(),
+    )
+
+    with pytest.raises(ValueError, match="non-gated activations"):
+        method.load_streaming_nvfp4_expert(
+            module,
+            global_expert_id=0,
+            local_slot_id=0,
+            **_streaming_expert_kwargs(),
+            w1_pre_quant_scale=torch.ones(4),
+            w3_pre_quant_scale=torch.ones(4),
+        )
+
+
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2815,6 +3515,119 @@ def test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics() -> None:
         # This clamp-heavy input is intentionally wider than the generic
         # MegaMoE sweep and needs one percentage point of NVFP4 headroom.
         check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
+
+
+@pytest.mark.gpu
+def test_megamoe_cutedsl_nvfp4_awq_matches_cutlass() -> None:
+    """MegaMoE and CUTLASS agree on an NVFP4_AWQ layer, and both match the reference.
+
+    The checkpoint carries the per-channel ``w1`` / ``w3`` ``pre_quant_scale``
+    an AWQ calibration writes, and its input scale is calibrated on
+    ``x * pre_quant_scale``, which is what the reference runs FC1 on. The last
+    check is the control: MegaMoE against the reference on the unscaled input
+    must fail, or this test could not tell a dropped scale apart.
+    """
+    dtype = torch.bfloat16
+    num_experts = 8
+    top_k = 2
+    hidden_size = 512
+    intermediate_size = 512
+    seq_len = 16
+
+    verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=dtype,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    mapping = Mapping(rank=mpi_rank())
+    _ensure_single_proc_dist_for_megamoe(MoeBackendType.MEGAMOE_CUTEDSL, mapping.rank)
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        # One vector for every expert, as AWQ writes it, with per-channel
+        # factors in [1/e, e]: dropping it moves FC1's input far past tolerance.
+        pre_quant_scale = torch.empty(hidden_size, device="cuda").uniform_(-1, 1).exp().to(dtype)
+        x_smoothed = x * pre_quant_scale
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x_smoothed, MoeBackendType.MEGAMOE_CUTEDSL
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        ref_cls = quant_kwargs.pop("ref_cls")
+        weights = quantize_util.create_weights(**quant_kwargs)
+        for expert_id in range(num_experts):
+            weights[f"{expert_id}.w1.pre_quant_scale"] = pre_quant_scale
+            weights[f"{expert_id}.w3.pre_quant_scale"] = pre_quant_scale
+        token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+
+        outputs = {}
+        for backend_type in (MoeBackendType.CUTLASS, MoeBackendType.MEGAMOE_CUTEDSL):
+            backend = create_test_backend(
+                backend_type=backend_type,
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4_AWQ),
+                mapping=mapping,
+            )
+            backend.load_weights([weights])
+            backend.post_load_weights()
+            backend.cuda()
+            assert backend.fc31_act_scale is not None
+            with torch.inference_mode():
+                x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+                outputs[backend_type] = run_backend_moe(
+                    backend,
+                    backend_type,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    dtype,
+                    router_logits,
+                )
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method, ref_cls=ref_cls)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe(x_smoothed, router_logits)
+            unscaled_ref_output = ref_fused_moe(x, router_logits)
+
+    cutlass_output = outputs[MoeBackendType.CUTLASS]
+    megamoe_output = outputs[MoeBackendType.MEGAMOE_CUTEDSL]
+    ref_fused_moe.check_accuracy(cutlass_output, ref_output)
+    ref_fused_moe.check_accuracy(megamoe_output, ref_output)
+    ref_fused_moe.check_accuracy(megamoe_output, cutlass_output)
+    with pytest.raises(Exception, match="Mismatch percentage"):
+        ref_fused_moe.check_accuracy(megamoe_output, unscaled_ref_output)
 
 
 @pytest.fixture(scope="module")
@@ -3354,6 +4167,77 @@ def generate_element_wise_test_params() -> List:
 
 
 TEST_PARAMS += generate_element_wise_test_params()
+
+# INT8 weight-only per-channel packs mixed-GEMM weights in row tiles of 64
+# (preprocess_weights_for_mixed_gemm: rows_per_tile = 128 * 8 // BITS_PER_ELT_A,
+# BITS_PER_ELT_A = 16 for W8A16; also num_rows % B_ROWS_PER_MMA == 0, = 16).
+# Every intermediate_size in MOE_MODEL_CONFIGS is a multiple of 64, so the path
+# that pads a non-aligned per-partition intermediate is otherwise uncovered.
+# 200 is a multiple of neither 16 nor 64 and rounds up to 256.
+W8A16_NON_ALIGNED_MOE_MODEL_CONFIGS = [
+    MoeModelConfig(4, 2, 512, 200),
+]
+
+
+def generate_int8_woq_non_aligned_test_params() -> List:
+    """W8A16 CUTLASS coverage for a non-64-aligned intermediate size."""
+    params: List = []
+    # Cover both the non-gated (single up-projection) and gated (gate+up
+    # concatenated) layouts: the gated path pads w3 as well as w1 before the
+    # concatenation, so it exercises a branch the non-gated case does not.
+    for activation_type in (ActivationType.Relu2, ActivationType.Swiglu):
+        for (
+            _,  # swiglu_alpha  (ignored)
+            _,  # swiglu_beta   (ignored)
+            _,  # swiglu_limit  (ignored)
+            model_config,
+            seq_len,
+            dtype,
+            backend_type,
+            quant_algo,
+            routing_method_cls,
+            skip_reason,
+            base_test_id,
+        ) in iter_base_test_configs(
+            [(1, 0, float("inf"))],  # swiglu parameters are irrelevant
+            W8A16_NON_ALIGNED_MOE_MODEL_CONFIGS,
+            SEQ_LENS_TO_TEST,
+            DTYPES_TO_TEST,
+            [MoeBackendType.CUTLASS],
+            [QuantAlgo.W8A16],
+        ):
+            # get_quick_skip_reason() rejects every quantized config whose sizes are
+            # not 128-aligned. That gate is exactly what this case exists to cover:
+            # the INT8-woq path must pad a non-64-aligned per-partition intermediate
+            # up to 64. Honour every other skip reason.
+            if skip_reason and "Non-128-aligned" not in skip_reason:
+                continue
+            test_id = f"act={activation_type.name}-nonaligned-{base_test_id}"
+            gated = is_gated_activation(activation_type)
+            param_values = (
+                dtype,
+                backend_type,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                activation_type,
+                # Gated activations read these; None would be misread as
+                # gptoss-style SwiGLU. Non-gated ignores them.
+                1 if gated else None,
+                0 if gated else None,
+                float("inf") if gated else None,
+                False,
+            )
+            params.append(create_test_param(param_values, test_id))
+    # CPU-only and pre-SM80 runners legitimately yield no cases; elsewhere an empty
+    # list means the 128-alignment skip message was reworded upstream.
+    if not params and get_sm_version() >= 80:
+        raise ValueError("non-aligned W8A16 coverage generated no test cases")
+    return params
+
+
+TEST_PARAMS += generate_int8_woq_non_aligned_test_params()
 
 
 # =====================================================================
@@ -4400,7 +5284,9 @@ def _deployment_at_moe_tp(moe_tp_size: int) -> MoEDeployment:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "backend_cls", [TrtllmCutlassNvfp4Impl, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
+    "backend_cls",
+    [TrtllmCutlassNvfp4Impl, TrtllmCutedslGroupedGemmNvfp4Impl],
+    ids=["cutlass", "cutedsl"],
 )
 @pytest.mark.parametrize(
     "intermediate_size,activation,moe_tp_size,rejected",
@@ -4451,7 +5337,7 @@ def test_w4a16_nvfp4_fc1_row_alignment_gate(moe_tp_size, rejected):
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [TrtllmCutlassNvfp4Impl, CuteDslFusedMoE, CuteDslFc12FusedMoE],
+    [TrtllmCutlassNvfp4Impl, TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE],
     ids=["cutlass", "cutedsl", "cutedsl_fc12"],
 )
 def test_situ_survives_resolution_not_just_construction(backend_cls):
@@ -4473,9 +5359,14 @@ def test_situ_survives_resolution_not_just_construction(backend_cls):
     assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("sm", [100, 103, 107])
 def test_cutedsl_nvfp4_situ_admitted_on_blackwell_and_rubin(sm):
-    """CuteDSL NVFP4 SiTU is eligible on SM100/SM103 and on Rubin (SM107)."""
+    """The NVFP4 grouped-GEMM leaf admits SiTU on SM100/SM103 and on Rubin (SM107).
+
+    Kimi K3 runs NVFP4 SiTU on ``CUTEDSL`` without degradation, so a gate here
+    would fail it at construction rather than fall back.
+    """
     deps = (MoEDep.CUTEDSL_RUBIN,) if sm == 107 else ()
     deployment = MoEDeployment(
         ep_size=1,
@@ -4485,8 +5376,10 @@ def test_cutedsl_nvfp4_situ_admitted_on_blackwell_and_rubin(sm):
         num_slots=256,
         env=MoEEnvironment(sm=sm, available_deps=deps),
     )
-    verdict = CuteDslFusedMoE.can_implement(_nvfp4_problem(2048, "SiTu"), deployment)
-    assert verdict.reject_reason is not MoERejectReason.ACTIVATION_UNSUPPORTED, verdict.detail
+    verdict = TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(
+        _nvfp4_problem(2048, "SiTu"), deployment
+    )
+    assert verdict.eligible, verdict.detail
 
 
 def test_cutedsl_fc12_refuses_relu2_at_resolution():
