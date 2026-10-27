@@ -257,6 +257,20 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     """Common recurrent views and snapshot planning, independent of algorithms."""
 
     _supports_additional_snapshot_offsets = False
+    # Whether the model's GDN layers verify drafts with the fused kernels, which
+    # commit in-layer at every batch size; set by the managers that take it.
+    gdn_fused_verify = False
+
+    def gdn_replay_partitioned(self, num_decodes: int) -> bool:
+        """Whether a GDN decode batch of num_decodes requests takes the
+        partitioned cached replay and one all-layer checkpoint commit; other
+        batches commit inside each layer, as the fused target verify of the
+        model's GDN layers (gdn_fused_verify) does at every batch size."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+        )
+
+        return not self.gdn_fused_verify and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
     @property
     def cuda_state_indices(self) -> torch.Tensor:
