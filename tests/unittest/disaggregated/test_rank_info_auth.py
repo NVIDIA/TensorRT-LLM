@@ -587,8 +587,8 @@ def test_rank_info_timeout_uses_one_deadline_and_closes_socket(after_challenge):
 
 
 def test_messenger_receive_timeout_allows_subsequent_reply():
-    with ZMQMessenger("ROUTER", "tcp://127.0.0.1:*") as server:
-        with ZMQMessenger("DEALER", server.endpoint) as client:
+    with ZMQMessenger("ROUTER", "tcp://127.0.0.1:*", signer=None) as server:
+        with ZMQMessenger("DEALER", server.endpoint, signer=None) as client:
             with pytest.raises(TimeoutError):
                 client.receive(timeout_ms=10)
             client.send([b"request"])
