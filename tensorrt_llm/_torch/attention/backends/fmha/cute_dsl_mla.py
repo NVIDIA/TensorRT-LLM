@@ -265,24 +265,30 @@ class CuteDslMlaFmha(PhasedFmha):
         return True
 
     @staticmethod
-    def _is_nvfp4_manager_fallback_layer(
-        attn: "TrtllmAttention",
-        meta: "TrtllmAttentionMetadata",
-    ) -> bool:
-        """Whether an NVFP4 KV cache manager stores this layer in its FP8 fallback pool.
+    def _page_size_exclusive_to_cute_dsl(meta: "TrtllmAttentionMetadata") -> bool:
+        """Whether this layer's FP4 MLA 128-token KV pages are read by no other MLA generation library.
 
-        The pool uses the FP4 MLA 128-token pages, which only this library
-        consumes for FP8 MLA generation, in decode-only and in mixed batches.
+        Only ``FP4_MLA_TOKENS_PER_BLOCK`` can count as exclusive; every other
+        page size keeps the default routing. The fallback thop op has
+        TRTLLM-Gen MLA generation kernels for 32-token pages only. FlashInfer
+        TRTLLM-Gen reads 128-token pages only when the KV cache manager lists
+        them in ``trtllm_gen_extra_tokens_per_block``. PrimTS reads them on its
+        SMs from an FP8 or BF16 KV cache manager; it is opt-in, but it counts
+        whether or not it is enabled.
         """
-        kv_cache_manager = meta.kv_cache_manager
-        if kv_cache_manager is None or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4:
+        from ..fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
+        from .prims_ts import PrimsTSFmha
+
+        tokens_per_block = meta.tokens_per_block
+        if tokens_per_block != FP4_MLA_TOKENS_PER_BLOCK:
             return False
-        layer_offsets = getattr(kv_cache_manager, "layer_offsets", {})
-        get_kv_cache_dtype = getattr(kv_cache_manager, "get_kv_cache_dtype", None)
-        return (
-            callable(get_kv_cache_dtype)
-            and attn.layer_idx in layer_offsets
-            and get_kv_cache_dtype(attn.layer_idx) == DataType.FP8
+        kv_cache_manager = meta.kv_cache_manager
+        if tokens_per_block in getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()):
+            return False
+        return not (
+            get_sm_version() in PrimsTSFmha.SUPPORTED_SMS
+            and tokens_per_block in PrimsTSFmha.SUPPORTED_PAGE_SIZES
+            and getattr(kv_cache_manager, "dtype", None) in (DataType.FP8, DataType.BF16)
         )
 
     @staticmethod
@@ -471,11 +477,12 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced, except for an NVFP4 manager's FP8 fallback
-        # layer: no other library consumes its pages, and this path already
-        # slices the generation inputs and page tables past num_contexts.
-        nvfp4_fallback_layer = self._is_nvfp4_manager_fallback_layer(attn, meta)
-        if meta.num_generations <= 0 or (meta.num_contexts != 0 and not nvfp4_fallback_layer):
+        # overhead is reduced, except when no other library reads this
+        # layer's FP4 MLA 128-token KV pages (for example an NVFP4 manager's
+        # FP8 fallback layer); this path slices the generation inputs and
+        # page tables past num_contexts.
+        exclusive_page_size = self._page_size_exclusive_to_cute_dsl(meta)
+        if meta.num_generations <= 0 or (meta.num_contexts != 0 and not exclusive_page_size):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -544,7 +551,7 @@ class CuteDslMlaFmha(PhasedFmha):
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
             and get_sm_version() in (100, 103)
         )
-        if not (helix_h96_verify_group or fp8_wide_head_verify_group or nvfp4_fallback_layer):
+        if not (helix_h96_verify_group or fp8_wide_head_verify_group or exclusive_page_size):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,

@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm.bindings import DataType
 
 
 def test_fp8_mla_scales_remain_tensors() -> None:
@@ -336,18 +337,18 @@ def test_decode_kv_lengths_keep_one_pointer_per_step(num_contexts: int) -> None:
 
 
 @pytest.mark.parametrize(
-    "num_contexts, num_generations, fallback_layer, admitted",
+    "num_contexts, num_generations, exclusive_page_size, admitted",
     [
         (2, 4, True, True),
         (2, 4, False, False),
         (2, 0, True, False),
     ],
-    ids=["mixed_fallback", "mixed_non_fallback", "no_generations"],
+    ids=["mixed_exclusive_page_size", "mixed_shared_page_size", "no_generations"],
 )
-def test_mixed_batch_gate_admits_only_nvfp4_fallback_layers(
-    num_contexts: int, num_generations: int, fallback_layer: bool, admitted: bool
+def test_mixed_batch_gate_admits_only_page_sizes_exclusive_to_cute_dsl(
+    num_contexts: int, num_generations: int, exclusive_page_size: bool, admitted: bool
 ) -> None:
-    fmha = SimpleNamespace(_is_nvfp4_manager_fallback_layer=lambda attn, meta: fallback_layer)
+    fmha = SimpleNamespace(_page_size_exclusive_to_cute_dsl=lambda meta: exclusive_page_size)
     meta = SimpleNamespace(
         num_contexts=num_contexts,
         num_generations=num_generations,
@@ -357,8 +358,8 @@ def test_mixed_batch_gate_admits_only_nvfp4_fallback_layers(
         kv_cache_manager=None,
     )
     fwd = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
-    # 128 heads stay off the wide-head verify carve-outs; a fallback layer
-    # also skips the perf gate.
+    # 128 heads stay off the wide-head verify carve-outs; an exclusive page
+    # size also skips the perf gate.
     attn = SimpleNamespace(num_heads=128)
     q = torch.empty(max(num_generations, 1), 8)
 
@@ -369,3 +370,53 @@ def test_mixed_batch_gate_admits_only_nvfp4_fallback_layers(
         assert reason == "KV cache manager is required."
     else:
         assert reason == "CuTe DSL MLA FMHA only supports decode-only batches."
+
+
+@pytest.mark.parametrize(
+    "sm, tokens_per_block, kv_dtype, extra_tokens_per_block, exclusive",
+    [
+        # Only the FP4 MLA 128-token pages can be exclusive.
+        (100, 32, DataType.FP8, (), False),
+        (107, 32, DataType.NVFP4, (), False),
+        (100, 64, DataType.FP8, (), False),
+        (103, 16, DataType.BF16, (), False),
+        (107, 64, DataType.FP8, (), False),
+        (107, 64, DataType.NVFP4, (), False),
+        (100, 256, DataType.FP8, (), False),
+        (107, 256, DataType.NVFP4, (), False),
+        # FlashInfer TRTLLM-Gen reads the manager's extra page sizes.
+        (107, 128, DataType.FP8, (128,), False),
+        (100, 128, DataType.NVFP4, (128,), False),
+        # PrimTS reads 128-token pages of FP8 or BF16 managers on SM100/SM103.
+        (100, 128, DataType.FP8, (), False),
+        (103, 128, DataType.BF16, (), False),
+        (107, 128, DataType.FP8, (), True),
+        # An NVFP4 manager's FP8 fallback layers on the FP4 MLA pages.
+        (100, 128, DataType.NVFP4, (), True),
+        (103, 128, DataType.NVFP4, (), True),
+        (107, 128, DataType.NVFP4, (), True),
+    ],
+)
+def test_page_size_exclusive_to_cute_dsl(
+    monkeypatch,
+    sm: int,
+    tokens_per_block: int,
+    kv_dtype: DataType,
+    extra_tokens_per_block: tuple,
+    exclusive: bool,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import cute_dsl_mla
+
+    monkeypatch.setattr(cute_dsl_mla, "get_sm_version", lambda: sm)
+    kv_cache_manager = SimpleNamespace(dtype=kv_dtype)
+    if extra_tokens_per_block:
+        kv_cache_manager.trtllm_gen_extra_tokens_per_block = frozenset(extra_tokens_per_block)
+    meta = SimpleNamespace(tokens_per_block=tokens_per_block, kv_cache_manager=kv_cache_manager)
+
+    assert CuteDslMlaFmha._page_size_exclusive_to_cute_dsl(meta) is exclusive
+
+
+def test_page_size_exclusive_to_cute_dsl_needs_a_page_size() -> None:
+    meta = SimpleNamespace(tokens_per_block=None, kv_cache_manager=None)
+
+    assert not CuteDslMlaFmha._page_size_exclusive_to_cute_dsl(meta)

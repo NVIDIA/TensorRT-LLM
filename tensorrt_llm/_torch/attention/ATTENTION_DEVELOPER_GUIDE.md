@@ -605,7 +605,15 @@ The FMHA package is split by role:
   16-byte `assumed_align` for the page table and the KV lengths; slices of
   `kv_cache_block_offsets` or `sequence_lengths` that start past the context
   requests or in a non-first pool can break it, so such slices are copied
-  (`_aligned_kernel_input`) while aligned ones launch in place.
+  (`_aligned_kernel_input`) while aligned ones launch in place. It serves
+  mixed context/generation batches, and skips its batch-size performance
+  gate, only on the FP4 MLA 128-token KV pages when no other MLA
+  generation library reads them (`_page_size_exclusive_to_cute_dsl`): the
+  fallback thop op has TRTLLM-Gen MLA generation kernels for 32-token pages
+  only, FlashInfer TRTLLM-Gen reads 128-token pages only when the KV cache
+  manager lists them in `trtllm_gen_extra_tokens_per_block`, and the opt-in
+  PrimTS library reads them on SM100/SM103 from an FP8 or BF16 KV cache
+  manager. Every other page size keeps the default routing.
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
   PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
   it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
