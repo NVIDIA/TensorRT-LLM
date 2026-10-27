@@ -59,8 +59,8 @@ from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
                      next_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellRunner
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVFP4BlackwellRunner, _nvmmh_tactic_space_key)
 
 if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
@@ -1310,6 +1310,12 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # Convert list to tuple for hashability
         allowed_tuple = tuple(self.allowed_backends)
         return (self.output_buffer_kind, self.output_dtype, allowed_tuple)
+
+    def tactic_space_key(self) -> Optional[Tuple]:
+        """The CuTe DSL backend's tactics are pruned when nvMMH is enabled."""
+        if IS_CUTLASS_DSL_AVAILABLE and self._is_backend_allowed("cutedsl"):
+            return _nvmmh_tactic_space_key()
+        return None
 
     def _is_backend_allowed(self, backend_name: str) -> bool:
         """Check if a backend is allowed based on allowed_backends list."""

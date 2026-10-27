@@ -238,6 +238,20 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             raise ValueError(f"split_k must be >= 1, got {split_k}")
         self.split_k = split_k
 
+    def _split_k_range(self, k_tile_cnt, l_coord):
+        """Return ``(k_tile_begin, k_tiles)`` of the split-K slice at scheduler L ``l_coord``.
+
+        Slices take balanced ranges, ``[floor(k_tile_cnt * s / split_k),
+        floor(k_tile_cnt * (s + 1) / split_k))`` for slice ``s = l_coord % split_k``,
+        so any ``split_k <= k_tile_cnt`` gives every slice at least one K tile.
+        """
+        if cutlass.const_expr(self.split_k == 1):
+            return 0, k_tile_cnt
+        split_idx = l_coord % self.split_k
+        k_tile_begin = (k_tile_cnt * split_idx) // self.split_k
+        k_tile_end = (k_tile_cnt * (split_idx + 1)) // self.split_k
+        return k_tile_begin, k_tile_end - k_tile_begin
+
     def _compute_grid(
         self,
         c: cute.Tensor,
@@ -1381,9 +1395,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
+        # Total K tiles; each split-K slice takes a balanced range of them.
         k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
-        if cutlass.const_expr(self.split_k > 1):
-            k_tile_cnt = k_tile_cnt // self.split_k
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -1510,11 +1523,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[2],
                 )
 
-                k_tile_start = 0
+                k_tile_start, tile_k_cnt = self._split_k_range(k_tile_cnt, mma_tile_coord_mnl[2])
                 if cutlass.const_expr(self.split_k > 1):
-                    k_tile_start = cutlass.Int32(
-                        (mma_tile_coord_mnl[2] % self.split_k) * k_tile_cnt
-                    )
                     mma_tile_coord_mnl = (
                         mma_tile_coord_mnl[0],
                         mma_tile_coord_mnl[1],
@@ -1545,7 +1555,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 if self.prefetch_enabled:
                     for pf_k_tile in cutlass.range(
-                        0, min(self.prefetch_dist, k_tile_cnt), unroll=1
+                        0, min(self.prefetch_dist, tile_k_cnt), unroll=1
                     ):
                         prefetch_k = k_tile_start + pf_k_tile
                         cute.prefetch(tma_atom_a, tAgA_slice[(None, prefetch_k)])
@@ -1556,12 +1566,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
-                if ab_producer_state.count < k_tile_cnt:
+                if ab_producer_state.count < tile_k_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, tile_k_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
 
@@ -1598,7 +1608,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
                     # Prefetch: Rolling prefetch for next tiles
                     if self.prefetch_enabled:
-                        if k_tile < k_tile_cnt - self.prefetch_dist:
+                        if k_tile < tile_k_cnt - self.prefetch_dist:
                             future_k_tile = load_k + self.prefetch_dist
                             cute.prefetch(
                                 tma_atom_a,
@@ -1620,7 +1630,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
-                    if ab_producer_state.count < k_tile_cnt:
+                    if ab_producer_state.count < tile_k_cnt:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
                 #
@@ -1706,6 +1716,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
+                _, tile_k_cnt = self._split_k_range(k_tile_cnt, cur_tile_coord[2])
                 if cutlass.const_expr(self.split_k > 1):
                     mma_tile_coord_mnl = (
                         mma_tile_coord_mnl[0],
@@ -1723,7 +1734,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
+                if ab_consumer_state.count < tile_k_cnt and is_leader_cta:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
                 #
@@ -1750,7 +1761,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 # Mma mainloop
                 #
-                for k_tile in range(k_tile_cnt):
+                for k_tile in range(tile_k_cnt):
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
@@ -1853,7 +1864,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
                     ab_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
-                    if ab_consumer_state.count < k_tile_cnt:
+                    if ab_consumer_state.count < tile_k_cnt:
                         if is_leader_cta:
                             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
@@ -2376,10 +2387,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 raise testing.CantImplementError(f"split_k must be >= 1, got {split_k}")
             if split_k > 1:
                 num_k_tiles = k // mma_tiler[2]
-                if l != 1 or k % mma_tiler[2] != 0 or num_k_tiles % split_k != 0:
+                if l != 1 or k % mma_tiler[2] != 0 or split_k > num_k_tiles:
                     raise testing.CantImplementError(
-                        f"split_k={split_k} requires L==1 and K tiles "
-                        f"({num_k_tiles}) divisible by split_k"
+                        f"split_k={split_k} requires L==1 and at least split_k "
+                        f"full K tiles (got {num_k_tiles})"
                     )
             # The grid uses a half-sized per-CTA M tile for 2-CTA MMA.
             # Requiring enough real M tiles avoids phantom cluster peers, which
