@@ -39,6 +39,7 @@ l0_h100:
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_rms_norm_fp8_per_token.py
+  - unittest/_torch/kernels/fused_ops/test_add_rmsnorm_fp8_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py

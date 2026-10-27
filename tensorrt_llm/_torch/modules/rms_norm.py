@@ -23,8 +23,10 @@ from torch import nn
 from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..kernels.fused_ops.add_rmsnorm_fp8_quant import (
+    add_rmsnorm_fp8_quant, add_rmsnorm_fp8_quant_supported)
 from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
-                     is_nvfp4_marlin_enabled)
+                     is_nvfp4_marlin_enabled, is_torch_compiling)
 from .rms_norm_fp8_per_token import add_rms_norm_fp8_per_token
 
 # Hidden-dim bounds of the warp-specialized fused_add_rms_norm_quant kernel
@@ -113,6 +115,9 @@ class RMSNorm(nn.Module):
         # When set, forward returns an Fp8PerTokenQuantizedTensor that also
         # carries the BF16/FP16 normed output.
         self.fp8_per_token_out = False
+        # Static FP8 input scale of the Linear this norm feeds, attached by the
+        # model. When set, the residual path returns ((fp8, output), residual).
+        self.fp8_scale: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -124,7 +129,8 @@ class RMSNorm(nn.Module):
         return_norm_out: bool = False,
     ) -> Union[torch.Tensor, Fp4QuantizedTensor, Tuple[Union[
             torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]], Tuple[
-                Fp4QuantizedTensor, torch.Tensor, torch.Tensor]]:
+                Fp4QuantizedTensor, torch.Tensor, torch.Tensor], Tuple[Tuple[
+                    torch.Tensor, torch.Tensor], torch.Tensor]]:
         has_residual = residual is not self._ARGUMENT_NOT_SPECIFIED_SENTINEL
         if not has_residual:
             residual = None
@@ -156,6 +162,14 @@ class RMSNorm(nn.Module):
             out = (Fp8PerTokenQuantizedTensor(fp8, scale, normed)
                    if hidden_states.shape[0] != 0 else normed)
             return (out, residual) if has_residual else out
+
+        if (self.fp8_scale is not None and residual is not None
+                and not is_torch_compiling()
+                and add_rmsnorm_fp8_quant_supported(hidden_states, residual)):
+            fp8 = add_rmsnorm_fp8_quant(hidden_states, residual, self.weight,
+                                        self.fp8_scale, self.variance_epsilon,
+                                        self.use_gemma)
+            return (fp8, hidden_states), residual
 
         if self.return_hp_output:
             raise ValueError(
