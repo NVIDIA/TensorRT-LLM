@@ -7,11 +7,13 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import (  # noqa: E501
     noaux_tc_op as op,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "noaux_tc_op requires a CUDA device"
@@ -26,7 +28,34 @@ def _build(spec, seed):
     return logits, bias, spec["n_group"], spec["topk_group"], spec["topk"], spec["scale"]
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="the default target's expert chunk, which its attention-DP gather fills",
+            spec=dict(tokens=8192, experts=256, n_group=8, topk_group=4, topk=8, scale=2.5),
+        ),
+        Cell(
+            why="deepseek MTP router: fp32 logits, so the weights are the fp32 "
+            "token_final_scales fused_moe needs",
+            spec=dict(
+                tokens=256,
+                experts=256,
+                n_group=8,
+                topk_group=4,
+                topk=8,
+                scale=2.5,
+                logits_dtype=torch.float32,
+            ),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     with validating(op):

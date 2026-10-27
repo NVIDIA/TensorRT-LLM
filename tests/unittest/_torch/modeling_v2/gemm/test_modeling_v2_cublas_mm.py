@@ -7,9 +7,11 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as op
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import (  # noqa: E402 — needs the path declared above
     ULP,
     assert_within_ulp,
@@ -59,7 +61,65 @@ def _build(spec, seed):
     return mat_a, mat_b, bias, out_dtype
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek q_a, no bias: hidden 7168 -> q_lora 1536",
+            spec=dict(m=16, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek router: bf16 in, fp32 logits out, 256 experts",
+            spec=dict(
+                m=16, k=7168, n=256, dtype=torch.bfloat16, bias=False, out_dtype=torch.float32
+            ),
+        ),
+        Cell(
+            why="deepseek default q_b at attention TP4: q_lora 1536 -> 32 heads x 192",
+            spec=dict(m=16, k=1536, n=6144, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek default kv_b at attention TP8: kv_lora 512 -> 16 heads x 256",
+            spec=dict(m=64, k=512, n=4096, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek default o_proj at attention TP8: 16 heads x 128 -> hidden 7168",
+            spec=dict(m=16, k=2048, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        # The MTP layer's own GEMMs. Its eh_proj is replicated on every rank; its
+        # shared expert is bf16 (the NVFP4 export skips layer 61), so it runs
+        # through cublas_mm rather than nvfp4_gemm, split over attention TP like
+        # the trunk's.
+        Cell(
+            why="deepseek MTP eh_proj: [enorm(e) | hnorm(h)] 2 x 7168 -> hidden 7168",
+            spec=dict(m=16, k=14336, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek MTP shared expert gate_up, whole under attention DP: 7168 -> 2 x 2048",
+            spec=dict(m=16, k=7168, n=4096, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek MTP shared expert gate_up at attention TP8: 7168 -> 2 x 256",
+            spec=dict(m=16, k=7168, n=512, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="deepseek MTP shared expert down at attention TP8: 256 -> hidden 7168",
+            spec=dict(m=16, k=256, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+    ),
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="gpt-oss qkv with fused bias: hidden 2880 -> (64 + 8 + 8) * 64",
+            spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     mat_a, mat_b, bias, out_dtype = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     with validating(op):
