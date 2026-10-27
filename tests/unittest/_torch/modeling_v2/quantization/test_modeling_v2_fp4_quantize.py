@@ -8,11 +8,13 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E501
     fp4_quantize as op,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "fp4_quantize requires a CUDA device"
@@ -39,7 +41,35 @@ def _unpack(packed):
     return codes
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek default at attention TP8: the shared expert's down input, 2048/8 wide",
+            spec=dict(shape=(16, 256), dtype=torch.bfloat16, vec=16, swizzled=True),
+        ),
+    ),
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+        Cell(
+            why="qwen3.8 decode: 1 token, hidden 2560, linear -- its routed-expert input",
+            spec=dict(shape=(1, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="qwen3.8, 7 rows at hidden 2560, linear: several rows, no row padding",
+            spec=dict(shape=(7, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
+            spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     """Codes bit-exact away from the rounding ties the entry declines to predict.
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Decoder execution moved out of ``PyTorchModelEngine``."""
+"""Decoder execution moved out of ``ModelEngine``."""
 
 import contextlib
 import inspect

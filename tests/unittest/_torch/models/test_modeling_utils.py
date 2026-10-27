@@ -69,7 +69,7 @@ def test_load_weights_impl_v2_matches_through_torch_compile_wrapper(monkeypatch)
             self.lm_head = nn.Linear(4, 2, bias=False)
 
     stub = _Stub()
-    # Compile the inner scope the way PyTorchModelEngine does for a
+    # Compile the inner scope the way ModelEngine does for a
     # DecoderModelForCausalLM; the wrapper is only walked, never run.
     stub.model = torch.compile(stub.model, backend="eager")
     assert any("_orig_mod" in n for n, _ in stub.named_parameters())
