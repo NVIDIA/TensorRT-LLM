@@ -621,6 +621,7 @@ def mergeWaiveList(pipeline, globalVars)
         }
         return [targetBranch: targetBranch, targetCommit: targetBranchTOTCommit]
     }
+    def snapshotTime = java.time.Instant.now().toString()
 
     try {
         // Get waive list diff in current MR
@@ -636,8 +637,11 @@ def mergeWaiveList(pipeline, globalVars)
             --latest-waive-list=${waiveTot} \
             --diff-file=diff_content.txt \
             --output-file=waives.txt
-            cp ${waiveTot} waives_TOT_initial_${env.gitlabCommit}.txt
         """
+        // Failed stages only trust waives recorded after this TOT download.
+        writeFile file: "waives_TOT_initial_${env.gitlabCommit}.txt",
+            text: "# snapshot-time: ${snapshotTime}\n" +
+                "# target-branch-commit: ${targetBranchTOTCommit ?: 'unknown'}\n" + readFile(waiveTot)
         trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
         echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
     } catch (InterruptedException e) {

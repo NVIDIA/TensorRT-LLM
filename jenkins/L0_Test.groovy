@@ -2817,33 +2817,23 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             throw classified
                         }
                     }
-                    // pytest also exits 1 when pytest-timeout kills it, including during a
-                    // test's setup (which leaves no unfinished-test record), and this path
-                    // does not rerun the tests left unexecuted. The refresh therefore needs
-                    // the whole rendered test list to prove that every test ran; a split
-                    // job's shard is chosen on the node, so it cannot be proven here.
+                    // pytest can exit 1 on a setup/body timeout. Require the full rendered
+                    // list to detect unexecuted tests, plus single-task/no-perf-failure
+                    // evidence from slurm_run.sh. Split jobs have no local shard list.
                     if (slurmState == "FAILED" && jobExit == "1" && !infraDryRun && unsplitTestListLocal) {
-                        def exitCodesPath = "${WORKSPACE}/${stageName}/pytest_exit_codes.txt"
+                        def eligiblePath = "${WORKSPACE}/${stageName}/tot_waive_eligible.txt"
                         int copied = Utils.exec(pipeline,
-                            script: scpFromRemoteCmd(remote, "${jobWorkspace}/pytest_exit_codes.txt", exitCodesPath),
+                            script: scpFromRemoteCmd(remote, "${jobWorkspace}/tot_waive_eligible.txt", eligiblePath),
                             returnStatus: true, retryOnFail: false)
                         if (copied == 0) {
-                            def exitCodeLines = readFile(exitCodesPath).readLines()
-                            // "<pytest> <perf> <ntasks>" from slurm_run.sh rank 0. A perf
-                            // check failure is never waived, and multi-task jobs are
-                            // excluded because only rank 0's test outcomes are reported.
-                            if (exitCodeLines && exitCodeLines[0].trim().tokenize() == ["1", "0", "1"]) {
-                                def smVersion = (exitCodeLines.size() > 1 &&
-                                    (exitCodeLines[1].trim() ==~ /\d+\.\d+/)) ?
-                                    exitCodeLines[1].trim().replace(".", "") : ""
-                                generateTimeoutTestResultXml(pipeline, stageName)
-                                def refresh = refreshFailedTestWaives(llmSrcLocal, stageName, [
-                                    smVersion: smVersion,
-                                    expectedTestLists: [unsplitTestListLocal],
-                                ])
-                                if (refresh.allFailuresWaived) {
-                                    return
-                                }
+                            def computeCap = readFile(eligiblePath).trim()
+                            generateTimeoutTestResultXml(pipeline, stageName)
+                            def refresh = refreshFailedTestWaives(llmSrcLocal, stageName, [
+                                smVersion: computeCap ==~ /\d+\.\d+/ ? computeCap.replace(".", "") : "",
+                                expectedTestLists: [unsplitTestListLocal],
+                            ])
+                            if (refresh.allFailuresWaived) {
+                                return
                             }
                         }
                     }
@@ -4972,19 +4962,17 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
 }
 
 /**
- * Re-check failed tests against waives added to the target branch since this
- * PR's waive list was merged, and turn newly waived failures into skips.
+ * Re-check failed tests against waives the tracker recorded for the target branch
+ * after the TOT snapshot this PR's waive list was built from, and turn those into skips.
  *
  * options:
  *   smVersion          compute capability without the dot (e.g. "100"); detected locally when empty
- *   expectedTestLists  shard test lists this stage ran; without them an unfinished
- *                      (crashed/timed-out) test is never waived, since the tests after
- *                      it may not have run
+ *   expectedTestLists  shard test lists this stage ran; without them no failure is waived,
+ *                      since a crash or timeout may have left tests unexecuted
  *   isolatedTestList   isolated test list, used to attribute failures to the isolated stage
  *
- * Returns [allFailuresWaived: boolean, report: Map or null]. The report is only
- * returned when it was written by this call and agrees with the exit status
- * (0 = all waived, 1 = failure retained, anything else = refresh unavailable).
+ * Returns [allFailuresWaived: boolean, report: Map or null]
+ * (script exit status: 0 = all waived, 1 = failure retained, anything else = refresh unavailable).
  */
 Map refreshFailedTestWaives(String llmSrc, String stageName, Map options = [:]) {
     def notWaived = [allFailuresWaived: false, report: null]
@@ -5002,16 +4990,18 @@ Map refreshFailedTestWaives(String llmSrc, String stageName, Map options = [:]) 
             echo "TOT waive refresh unavailable for ${stageName}: missing target branch or PR commit"
             return notWaived
         }
-        def initialWaivesUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives_TOT_initial_${env.gitlabCommit}.txt"
-        def reportPath = "${WORKSPACE}/${stageName}/waive_refresh/report.json"
-        boolean staleReport = fileExists(reportPath)
+        // The snapshot (see mergeWaiveList in L0_MergeRequest.groovy) carries the time it was
+        // taken; the script only trusts waives the tracker recorded after it.
+        def auditDir = "${WORKSPACE}/${stageName}/waive_refresh"
+        def initialWaives = "${auditDir}/initial_tot_waives.txt"
+        sh "mkdir -p ${auditDir} && wget -nv --tries=3 -O ${initialWaives} " +
+           "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives_TOT_initial_${env.gitlabCommit}.txt"
         withEnv([
             "WAIVE_REFRESH_SCRIPT=${llmSrc}/jenkins/scripts/refresh_test_waives.py",
             "WAIVE_REFRESH_RESULTS=${WORKSPACE}/${stageName}",
             "WAIVE_REFRESH_STAGE=${stageName}",
-            "WAIVE_REFRESH_INITIAL_URL=${initialWaivesUrl}",
             "WAIVE_REFRESH_BRANCH=${targetBranch}",
-            "WAIVE_REFRESH_COMMIT=${env.gitlabCommit ?: ''}",
+            "WAIVE_REFRESH_INITIAL=${initialWaives}",
             "WAIVE_REFRESH_SM=${options.smVersion ?: ''}",
             "WAIVE_REFRESH_EXPECTED=${(options.expectedTestLists ?: []).join(':')}",
             "WAIVE_REFRESH_ISOLATED=${options.isolatedTestList ?: ''}",
@@ -5020,9 +5010,8 @@ Map refreshFailedTestWaives(String llmSrc, String stageName, Map options = [:]) 
                 python3 "$WAIVE_REFRESH_SCRIPT" \
                     --result-dir "$WAIVE_REFRESH_RESULTS" \
                     --stage-name "$WAIVE_REFRESH_STAGE" \
-                    --initial-waives-url "$WAIVE_REFRESH_INITIAL_URL" \
                     --target-branch "$WAIVE_REFRESH_BRANCH" \
-                    --pr-commit "$WAIVE_REFRESH_COMMIT" \
+                    --initial-waives "$WAIVE_REFRESH_INITIAL" \
                     ${WAIVE_REFRESH_SM:+--sm-version "$WAIVE_REFRESH_SM"} \
                     ${WAIVE_REFRESH_EXPECTED:+--expected-tests "$WAIVE_REFRESH_EXPECTED"} \
                     ${WAIVE_REFRESH_ISOLATED:+--isolated-tests "$WAIVE_REFRESH_ISOLATED"}
@@ -5036,14 +5025,9 @@ Map refreshFailedTestWaives(String llmSrc, String stageName, Map options = [:]) 
         if (status != 0 && status != 1) {
             return notWaived
         }
-        def report = null
-        if (!staleReport && fileExists(reportPath)) {
-            def parsed = readJSON(text: readFile(reportPath), returnPojo: true)
-            if (parsed instanceof Map && parsed.stage_name == stageName &&
-                    parsed.all_failures_waived == (status == 0)) {
-                report = parsed
-            }
-        }
+        // The script refuses to run over an existing report, so one present now is its own.
+        def reportPath = "${auditDir}/report.json"
+        def report = fileExists(reportPath) ? readJSON(text: readFile(reportPath), returnPojo: true) : null
         return [allFailuresWaived: status == 0, report: report]
     } catch (InterruptedException e) {
         throw e

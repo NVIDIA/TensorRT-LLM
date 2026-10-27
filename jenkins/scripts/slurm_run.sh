@@ -213,16 +213,13 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
     echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
 fi
 
-# Evidence for the TOT waive refresh in L0_Test.groovy: "<pytest> <perf> <ntasks>"
-# then the compute capability. Only rank 0's results are reported, so the
-# pipeline waives only single-task jobs, where rank 0 saw every test outcome.
-if [ "${SLURM_PROCID:-0}" -eq 0 ] && [ "$pytest_exit_code" -eq 1 ]; then
-    printf '%s %s %s\n' "$pytest_exit_code" "$perf_check_exit_code" "${SLURM_NTASKS:-1}" \
-        > "$jobWorkspace/pytest_exit_codes.txt"
-    if command -v nvidia-smi > /dev/null; then
-        timeout 10s nvidia-smi --query-gpu=compute_cap --format=csv,noheader \
-            >> "$jobWorkspace/pytest_exit_codes.txt" || true
-    fi
+# The TOT waive refresh in L0_Test.groovy may waive this job's failures only when pytest's
+# own test failures decide it (not the perf check) and a single task ran, so rank 0's results
+# cover every test. The file holds the GPU compute capability for "full:smNN/" waives.
+if [ "${SLURM_PROCID:-0}" -eq 0 ] && [ "$pytest_exit_code" -eq 1 ] && \
+        [ "$perf_check_exit_code" -eq 0 ] && [ "${SLURM_NTASKS:-1}" -eq 1 ]; then
+    timeout 10s nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 \
+        > "$jobWorkspace/tot_waive_eligible.txt" || true
 fi
 
 if [ "$pytest_exit_code" -ne 0 ]; then
