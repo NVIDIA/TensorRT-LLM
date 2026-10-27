@@ -23,15 +23,17 @@ def _evaluator(rouge1: float = 0.0) -> CnnDailymail:
     # Skip __init__ (it downloads the dataset and the rouge metric) and stub
     # the only dependency compute_score touches.
     evaluator = CnnDailymail.__new__(CnnDailymail)
-    evaluator.rouge = SimpleNamespace(
-        compute=lambda predictions, references: {"rouge1": rouge1})
+    evaluator.rouge = SimpleNamespace(compute=lambda predictions, references: {"rouge1": rouge1})
     return evaluator
 
 
-@pytest.mark.parametrize("outputs", [
-    [],
-    [SimpleNamespace(outputs=[])],
-])
+@pytest.mark.parametrize(
+    "outputs",
+    [
+        [],
+        [SimpleNamespace(outputs=[])],
+    ],
+)
 def test_compute_score_degenerate_input_returns_zero(outputs) -> None:
     # Previously: IndexError on an empty request list, UnboundLocalError on a
     # request with no beams. Both now return the 0.0 default.
@@ -40,6 +42,5 @@ def test_compute_score_degenerate_input_returns_zero(outputs) -> None:
 
 def test_compute_score_returns_rouge1_percentage() -> None:
     outputs = [SimpleNamespace(outputs=[SimpleNamespace(text="a summary")])]
-    score = _evaluator(rouge1=0.4321).compute_score(outputs,
-                                                    references=["a summary"])
+    score = _evaluator(rouge1=0.4321).compute_score(outputs, references=["a summary"])
     assert score == pytest.approx(43.21)
