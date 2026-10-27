@@ -48,6 +48,7 @@ from .fuse_elementwise_ops import (
     fused_gdn_post_conv,
     pack_gdn_decode_qkv,
 )
+from .fused_gdn_conv import fused_gdn_conv_post_conv
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import InforwardSnapshotSplit, Mamba2Metadata
@@ -104,6 +105,11 @@ def _prefill_cu_seqlens_cpu(seq_lens: torch.Tensor, num_prefills: int) -> torch.
     cu_seqlens = torch.zeros(num_prefills + 1, dtype=torch.int64)
     cu_seqlens[1:] = torch.cumsum(seq_lens[:num_prefills], dim=0)
     return cu_seqlens
+
+
+def _use_fused_prefill_conv(activation: str) -> bool:
+    """Use ``fused_gdn_conv_post_conv`` for prefill unless TRTLLM_GDN_FUSED_CONV=0 (CUDA conv)."""
+    return activation in ("silu", "swish") and os.getenv("TRTLLM_GDN_FUSED_CONV", "1") == "1"
 
 
 @functools.lru_cache(maxsize=1)
@@ -1225,6 +1231,65 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         return core_attn_out
 
+    def _prefill_conv_post_conv(
+        self,
+        mixed_qkv_p: torch.Tensor,
+        mixed_qkv_d: Optional[torch.Tensor],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        query_start_loc_p: torch.Tensor,
+        state_indices_p: torch.Tensor,
+        has_initial_states_p: torch.Tensor,
+        beta_dtype: torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prefill conv, then ``fused_gdn_post_conv``; ``mixed_qkv_d`` rows are already convolved."""
+        if _use_fused_prefill_conv(self.activation):
+            return fused_gdn_conv_post_conv(
+                mixed_qkv_p,
+                mixed_qkv_d,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_states,
+                query_start_loc_p,
+                state_indices_p,
+                has_initial_states_p,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+                beta_dtype=beta_dtype,
+            )
+        num_tokens, qkv_dim = mixed_qkv_p.shape
+        mixed_qkv_p_t = extract_transpose_prefill_slice(mixed_qkv_p, num_tokens, 0, qkv_dim)
+        mixed_qkv_p_t = causal_conv1d_fn(
+            mixed_qkv_p_t,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            activation=self.activation,
+            conv_states=conv_states,
+            has_initial_state=has_initial_states_p,
+            cache_indices=state_indices_p,
+            query_start_loc=query_start_loc_p,
+        )
+        return fused_gdn_post_conv(
+            mixed_qkv_p_t,
+            mixed_qkv_d,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            self.num_k_heads_per_tp,
+            self.head_k_dim,
+            self.num_v_heads_per_tp,
+            self.head_v_dim,
+            beta_dtype=beta_dtype,
+        )
+
     def forward_extend(
         self,
         conv_states,
@@ -1274,23 +1339,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query_start_loc_p = query_start_loc[: num_prefill + 1]
             has_initial_states_p = has_initial_states[:num_prefill]
 
-            mixed_qkv_p_t = extract_transpose_prefill_slice(
-                mixed_qkv_p,
-                mixed_qkv_p.shape[0],
-                0,
-                mixed_qkv_p.shape[1],
-            )
-            mixed_qkv_p_t = causal_conv1d_fn(
-                mixed_qkv_p_t,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_states_to_use,
-                has_initial_state=has_initial_states_p,
-                cache_indices=state_indices_p,
-                query_start_loc=query_start_loc_p,
-            )
-
             if is_target_verify:
                 a_d = a[num_prefill_tokens:]
                 b_d = b[num_prefill_tokens:]
@@ -1329,17 +1377,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 )
             if is_target_verify:
                 if num_prefill_tokens > 0:
-                    query_p, key_p, value_p, g_p, beta_p = fused_gdn_post_conv(
-                        mixed_qkv_p_t,
+                    query_p, key_p, value_p, g_p, beta_p = self._prefill_conv_post_conv(
+                        mixed_qkv_p,
                         None,
                         a[:num_prefill_tokens],
                         b[:num_prefill_tokens],
-                        self.A_log,
-                        self.dt_bias,
-                        self.num_k_heads_per_tp,
-                        self.head_k_dim,
-                        self.num_v_heads_per_tp,
-                        self.head_v_dim,
+                        conv_states_to_use,
+                        query_start_loc_p,
+                        state_indices_p,
+                        has_initial_states_p,
                         beta_dtype=b.dtype,
                     )
                 layer_cache = kwargs.get("layer_cache")
@@ -1364,51 +1410,32 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                         self.head_v_dim,
                     )
             else:
-                query, key, value, g, beta = fused_gdn_post_conv(
-                    mixed_qkv_p_t,
+                query, key, value, g, beta = self._prefill_conv_post_conv(
+                    mixed_qkv_p,
                     None if split_decode else mixed_qkv_d,
                     a[:num_prefill_tokens] if split_decode else a,
                     b[:num_prefill_tokens] if split_decode else b,
-                    self.A_log,
-                    self.dt_bias,
-                    self.num_k_heads_per_tp,
-                    self.head_k_dim,
-                    self.num_v_heads_per_tp,
-                    self.head_v_dim,
+                    conv_states_to_use,
+                    query_start_loc_p,
+                    state_indices_p,
+                    has_initial_states_p,
                 )
         else:
-            mixed_qkv_t = extract_transpose_prefill_slice(
+            query, key, value, g, beta = self._prefill_conv_post_conv(
                 mixed_qkv,
-                mixed_qkv.shape[0],
-                0,
-                mixed_qkv.shape[1],
-            )
-            mixed_qkv_t = causal_conv1d_fn(
-                mixed_qkv_t,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_states_to_use,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-            )
-            if inforward_split is not None:
-                _inforward_split_conv_states(
-                    conv_states, inforward_window, inforward_split, kwargs["inforward_stage"][1]
-                )
-            query, key, value, g, beta = fused_gdn_post_conv(
-                mixed_qkv_t,
                 None,
                 a,
                 b,
-                self.A_log,
-                self.dt_bias,
-                self.num_k_heads_per_tp,
-                self.head_k_dim,
-                self.num_v_heads_per_tp,
-                self.head_v_dim,
+                conv_states_to_use,
+                query_start_loc,
+                cache_indices,
+                has_initial_states,
             )
+            if inforward_split is not None:
+                # The conv has written the final conv states; the post-conv never reads them.
+                _inforward_split_conv_states(
+                    conv_states, inforward_window, inforward_split, kwargs["inforward_stage"][1]
+                )
 
         if is_target_verify and num_decode_tokens > 0:
             attn_out_prefill = None
