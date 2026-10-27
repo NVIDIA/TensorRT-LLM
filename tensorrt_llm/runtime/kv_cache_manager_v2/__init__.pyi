@@ -32,9 +32,12 @@ from typing import (
     Union,
 )
 
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
+
 # From _common.py
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
+DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY: Final[int]
 BAD_PAGE_INDEX: Final[int]
 GPU_LEVEL: Final[CacheLevel]
 CACHE_LEVEL1: Final[CacheLevel]
@@ -260,6 +263,7 @@ class BufferConfig:
     size: int
     tokens_per_block_override: int | None = None
     is_sparse: bool = False
+    coalescing_group: int = 0
 
 class AttentionReusePolicy(enum.IntEnum):
     REQUIRED = 0
@@ -328,6 +332,7 @@ class KVCacheManagerConfig:
     text_only: bool = False
     enable_partial_commit: bool = True
     pool_rebalance: PoolRebalanceConfig = ...
+    cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -687,6 +692,9 @@ class _KVCache:
         """Bind a standalone consumer's row; Batch members must use Batch.add/remove."""
     def acknowledge_page_storage(self, version: int) -> bool:
         """Clear dirty state after all groups/beams use this same version, if it is still current."""
+    def get_page_priorities(
+        self, layer_group_id: LayerGroupId, beam_index: BeamIndex = ...
+    ) -> list[Priority]: ...
     def get_page_storage_snapshot(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> PageStorageSnapshot:
@@ -842,6 +850,7 @@ class KVCacheManager:
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
+        kv_cache_retention_config: KvCacheRetentionConfig | None = None,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -853,6 +862,11 @@ class KVCacheManager:
         it also marks generation-phase allocation stats.
         """
         ...
+    def refresh_retention(self) -> None: ...
+    def prefetch_reuse(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt], target: CacheLevel
+    ) -> bool:
+        """Prefetch matched storage while preserving request retention policies and deadlines."""
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,

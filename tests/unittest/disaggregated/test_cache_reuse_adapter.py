@@ -23,7 +23,6 @@ import pytest
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
-    _CacheReuseAdapterV1,
     _CacheReuseAdapterV2,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
@@ -126,8 +125,8 @@ def _build_transceiver_for_kv_slice(
 
     `block_ids` is beam-0's stale-stripped chain (valid window followed by any
     speculative / ctx first-token over-hang). The adapter's positional table is
-    modeled by prepending the manager-reported SWA holes: V1 masks its
-    pre-eviction chain to this shape, V2 reports it via valid_only=False.
+    modeled by prepending the manager-reported SWA holes, as V2 reports
+    them via valid_only=False.
     """
     layer_group = AttentionLayerGroup(
         pool_group_idx=0,
@@ -145,8 +144,7 @@ def _build_transceiver_for_kv_slice(
     # the stale (out-of-window) front is reported as -1 holes, followed by the
     # valid window blocks, the speculative/scratch tail, and the ctx
     # first-token over-hang. `block_ids` here is the stale-stripped chain, so
-    # prepend the -1 holes. (V1 masks its full chain to this shape; V2 reports
-    # it directly via valid_only=False.)
+    # prepend the -1 holes, as V2 reports via valid_only=False.
     def get_block_ordinals(req, idx, lg):
         transfer_len = getattr(req, "py_csa2_remote_tail_start", None)
         if transfer_len is None:
@@ -376,6 +374,42 @@ class TestCreateKvSliceBlockSpan:
         expected = np.concatenate([np.full(stale_end, -1, dtype=np.int64), block_ids[:-1]])
         np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], expected)
 
+    def test_dspark_gen_init_draft_reserve_block_is_trimmed(self):
+        # A DSpark gen-init request reserves room for its draft tokens past the
+        # prompt. Here only that reserve spills into a new block: the prompt
+        # plus num_extra_kv_tokens still ends inside the last prompt block. The
+        # spilled block must be dropped without shifting the in-window SWA
+        # blocks that are paired with the ctx side.
+        prompt_len = 1144
+        tokens_per_block = 128
+        num_extra_kv_tokens = 4
+        num_draft_tokens = num_extra_kv_tokens + 1  # max_draft_len, as the helper models it
+        sliding_window_size = 128 + 5
+        prompt_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
+        assert (prompt_len + num_extra_kv_tokens - 1) // tokens_per_block == prompt_blocks - 1
+        assert (
+            prompt_len + num_extra_kv_tokens + num_draft_tokens - 1
+        ) // tokens_per_block == prompt_blocks
+
+        stale_end = max(0, (prompt_len + 1 - sliding_window_size) // tokens_per_block)
+        valid_prompt_blocks = prompt_blocks - stale_end
+        # The in-window prompt blocks followed by the draft-reserve block.
+        block_ids = np.arange(200, 200 + valid_prompt_blocks + 1, dtype=np.int64)
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=num_extra_kv_tokens,
+            prompt_len=prompt_len,
+            tokens_per_block=tokens_per_block,
+            block_ids=block_ids,
+            sliding_window_size=sliding_window_size,
+            is_generation_only=True,
+        )
+        assert len(req.py_draft_tokens) == num_draft_tokens
+
+        kv_slice = transceiver._create_chunk(req)
+
+        expected = np.concatenate([np.full(stale_end, -1, dtype=np.int64), block_ids[:-1]])
+        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], expected)
+
 
 class TestKvSliceProperty:
     """Randomized differential test of _create_chunk.
@@ -553,87 +587,7 @@ def _lg(window=None):
 
 
 class TestAdapterBlockOrdinals:
-    """get_block_ordinals on the real V1/V2 adapters.
-
-    The positional table is index==ordinal with -1 holes for stale/unbound
-    blocks: V1 masks its pre-eviction chain using the manager's authoritative
-    front-removed count; V2 reports the holes directly via valid_only=False.
-    """
-
-    class _V1Mgr:
-        enable_block_reuse = True
-        tokens_per_block = 32
-
-        def __init__(self, beams, front_removed):
-            self._beams = beams
-            self._front_removed = front_removed
-            self.asked = None
-            self.translated = []
-            self.impl = SimpleNamespace(
-                get_batch_cache_block_ids=lambda request_ids, window_size: [
-                    [list(b) for b in self._beams]
-                ]
-            )
-
-        def get_memory_pool_block_indices(self, block_ids, window_size):
-            # Identity translation (nothing offloaded); record what was asked.
-            self.translated.append(list(block_ids))
-            return list(block_ids)
-
-        def get_num_front_blocks_removed(self, request_id, window_size=None):
-            self.asked = (request_id, window_size)
-            return self._front_removed
-
-    def _v1_req(self):
-        req = _FakeReq(prompt_len=7)
-        req.py_request_id = 1
-        req.py_beam_width = 1
-        return req
-
-    def test_v1_masks_stale_front_by_authoritative_count(self):
-        mgr = self._V1Mgr([[10, 11, 12, 13]], front_removed=2)
-        ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._v1_req(), 0, _lg(window=512))
-        np.testing.assert_array_equal(ordinals, [-1, -1, 12, 13])
-        assert mgr.asked == (1, 512)
-
-    def test_v1_evicted_ids_are_never_translated(self):
-        # Evicted blocks were released to the free pool and may be offloaded by
-        # now; the primary-pool translation would abort on them.
-        mgr = self._V1Mgr([[10, 11, 12, 13]], front_removed=2)
-        _CacheReuseAdapterV1(mgr).get_block_ordinals(self._v1_req(), 0, _lg(window=512))
-        assert mgr.translated == [[12, 13]]
-
-    def test_v1_no_eviction_keeps_full_positional_chain(self):
-        mgr = self._V1Mgr([[10, 11, 12, 13]], front_removed=0)
-        ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._v1_req(), 0, _lg(window=512))
-        np.testing.assert_array_equal(ordinals, [10, 11, 12, 13])
-
-    def test_v1_masks_logical_swa_prefix_even_with_zero_front_removed(self):
-        # reuse off / no speculation: addSequenceBatch allocates the whole
-        # prompt up front and adjustBlocksIfNeeded (physical detach) only runs
-        # during generation, so get_num_front_blocks_removed reads 0 here even
-        # though the prompt has already outgrown a 2-block (64-token) window.
-        chain = [10, 11, 12, 13, 14, 15, 16]  # 7 blocks * 32 tpb = 224-token prompt
-        req = _FakeReq(prompt_len=224)
-        req.py_request_id = 1
-        req.py_beam_width = 1
-        mgr = self._V1Mgr([chain], front_removed=0)
-        ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(req, 0, _lg(window=64))
-        # Only the last 2 blocks (64 tokens) are within the window.
-        np.testing.assert_array_equal(ordinals, [-1, -1, -1, -1, -1, 15, 16])
-        # Evicted-looking ids must not be sent through primary-pool translation.
-        assert mgr.translated == [[15, 16]]
-
-    def test_v1_fully_evicted_chain_is_all_holes(self):
-        mgr = self._V1Mgr([[10, 11]], front_removed=5)
-        ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._v1_req(), 0, _lg(window=512))
-        np.testing.assert_array_equal(ordinals, [-1, -1])
-        assert mgr.translated == []
-
-    def test_v1_empty_chain(self):
-        mgr = self._V1Mgr([], front_removed=0)
-        ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._v1_req(), 0, _lg(window=512))
-        assert ordinals.size == 0
+    """V2 positional block ordinals preserve stale and unbound slots as holes."""
 
     def test_v2_reports_stale_as_holes_via_valid_only_false(self):
         class _KvCache:
@@ -743,78 +697,3 @@ class TestTransceiverContextManager:
         tc.shutdown()
         tc.shutdown()  # second call short-circuits after completed teardown.
         tc._transfer_worker.shutdown.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# _CacheReuseAdapterV1 under host offload: the positional table holds primary
-# slots, not block IDs.
-# ---------------------------------------------------------------------------
-
-
-class _OffloadV1Mgr:
-    """KVCacheManager stand-in whose block IDs and primary slots differ."""
-
-    enable_block_reuse = True
-    tokens_per_block = 8
-
-    def __init__(self, chain, slots, error=None):
-        self._slots = dict(zip(chain, slots))
-        self._error = error
-        self.translations = []
-        self.impl = SimpleNamespace(
-            get_batch_cache_block_ids=lambda request_ids, window_size: [[list(chain)]]
-        )
-
-    def get_num_front_blocks_removed(self, request_id, window_size=None):  # noqa: ARG002
-        return 0
-
-    def get_memory_pool_block_indices(self, block_ids, *, window_size):
-        self.translations.append((list(block_ids), window_size))
-        if self._error is not None:
-            raise self._error
-        return [self._slots[block_id] for block_id in block_ids]
-
-
-class TestV1AdapterHostOffloadSlots:
-    """After host offload a block's ID and its primary slot diverge.
-
-    The V1 adapter's positional table must carry the slots the manager translates for
-    the group's window, and the manager's refusal for an offloaded block must surface.
-    """
-
-    def _req(self):
-        return SimpleNamespace(
-            prompt_len=3 * _OffloadV1Mgr.tokens_per_block,
-            py_request_id=7,
-            py_beam_width=1,
-            is_generation_only_request=False,
-        )
-
-    def test_ordinals_are_primary_slots_not_block_ids(self):
-        mgr = _OffloadV1Mgr(chain=[4, 5, 6], slots=[0, 1, 2])
-
-        ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._req(), 0, _lg(window=64))
-
-        assert ordinals.dtype == np.int64
-        np.testing.assert_array_equal(ordinals, [0, 1, 2])
-        assert mgr.translations == [([4, 5, 6], 64)]
-
-    def test_offloaded_block_error_propagates(self):
-        mgr = _OffloadV1Mgr(
-            chain=[4], slots=[0], error=RuntimeError("Block is not in the primary pool")
-        )
-
-        with pytest.raises(RuntimeError, match="not in the primary pool"):
-            _CacheReuseAdapterV1(mgr).get_block_ordinals(self._req(), 0, _lg(window=64))
-
-    def test_sender_chunk_carries_the_translated_slots(self):
-        """Real adapter into the real chunk builder: the sender's table is the slots."""
-        mgr = _OffloadV1Mgr(chain=[4, 5, 6], slots=[0, 1, 2])
-        transceiver = object.__new__(KvCacheTransceiverV2)
-        transceiver._reuse_adapter = _CacheReuseAdapterV1(mgr)
-        transceiver._page_table = SimpleNamespace(layer_groups=[_lg(window=64)])
-        transceiver._kv_cache_manager = SimpleNamespace(num_extra_kv_tokens=0)
-
-        chunk = transceiver._create_chunk(self._req())
-
-        np.testing.assert_array_equal(chunk.block_ids_per_layer_groups[0], [0, 1, 2])

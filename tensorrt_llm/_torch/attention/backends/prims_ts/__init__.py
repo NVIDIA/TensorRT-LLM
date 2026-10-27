@@ -37,6 +37,9 @@ from .context import (
     batch_prefill_with_paged_kv_cache,
 )
 from .mla_decode import (
+    BatchSparseMLADecodePagedTSWrapper,
+    batch_sparse_mla_decode_with_paged_kv_cache,
+    get_prims_ts_sparse_mla_decode_workspace_size,
     BatchMLADecodePagedTSWrapper,
     batch_mla_decode_with_paged_kv_cache,
     get_prims_ts_batch_mla_decode_workspace_size,
@@ -49,6 +52,9 @@ from .q_token_kv_block_sparse_metadata import (
 from .sage import SageAttentionConfig, SageAttentionParams
 
 __all__ = [
+    "BatchSparseMLADecodePagedTSWrapper",
+    "batch_sparse_mla_decode_with_paged_kv_cache",
+    "get_prims_ts_sparse_mla_decode_workspace_size",
     "BlockSparseTSWrapper",
     "SageAttentionConfig",
     "SageAttentionParams",

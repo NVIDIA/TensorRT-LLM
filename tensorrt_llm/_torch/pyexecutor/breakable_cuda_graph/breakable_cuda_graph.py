@@ -5,7 +5,9 @@
 import functools
 import itertools
 import logging
+import sys
 import threading
+from contextlib import ExitStack
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
@@ -14,6 +16,7 @@ from cuda.bindings import runtime as rt
 
 from tensorrt_llm._utils import CUASSERT
 
+from ...nccl_window_graph import nccl_window_graph_owner
 from ...utils import make_weak_ref
 
 logger = logging.getLogger(__name__)
@@ -238,37 +241,41 @@ class BreakableCUDAGraphCapture:
         self._pool = (0, 0) if pool is None else pool
         self._stream = stream
         self._capture_error_mode = capture_error_mode
-        self._stream_context = None
-        self._capture_token = None
-        self._stream_token = None
-        self._forked_token = None
+        self._exit_stack: Optional[ExitStack] = None
 
     def __enter__(self) -> "BreakableCUDAGraphCapture":
-        _install_wait_stream_hook()
-        if self._stream is not None:
-            self._stream_context = torch.cuda.stream(self._stream)
-            self._stream_context.__enter__()
-        self._capture_token = _current_capture.set(self)
-        self._stream_token = _current_stream.set(self._stream or torch.cuda.current_stream())
-        self._forked_token = _forked_streams.set(set())
+        stack = ExitStack()
+        self._exit_stack = stack
         try:
+            _install_wait_stream_hook()
+            stack.callback(_uninstall_wait_stream_hook)
+            stack.enter_context(nccl_window_graph_owner(self._pool))
+            if self._stream is not None:
+                stack.enter_context(torch.cuda.stream(self._stream))
+            capture_token = _current_capture.set(self)
+            stack.callback(_current_capture.reset, capture_token)
+            stream_token = _current_stream.set(self._stream or torch.cuda.current_stream())
+            stack.callback(_current_stream.reset, stream_token)
+            forked_token = _forked_streams.set(set())
+            stack.callback(_forked_streams.reset, forked_token)
             self._begin_new_segment()
-        except Exception:
-            _uninstall_wait_stream_hook()
+        except BaseException:
+            self._exit_stack = None
+            stack.__exit__(*sys.exc_info())
             raise
         return self
 
     def __exit__(self, *args: object) -> bool:
         try:
             self._end_current_segment()
+        except BaseException:
+            args = sys.exc_info()
+            raise
         finally:
-            _forked_streams.reset(self._forked_token)
-            _current_stream.reset(self._stream_token)
-            _current_capture.reset(self._capture_token)
-            if self._stream_context is not None:
-                self._stream_context.__exit__(*args)
-                self._stream_context = None
-            _uninstall_wait_stream_hook()
+            stack = self._exit_stack
+            self._exit_stack = None
+            if stack is not None:
+                stack.__exit__(*args)
         return False
 
     def _begin_new_segment(self) -> None:

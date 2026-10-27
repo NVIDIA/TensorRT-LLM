@@ -24,6 +24,8 @@ The adapter is a pure protocol layer: it never touches the tokenizer,
 chat templates, or the engine.
 """
 
+import base64
+import hashlib
 import json
 import re
 import traceback
@@ -50,6 +52,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicMessagesResponse,
     AnthropicMessageStartEvent,
     AnthropicMessageStopEvent,
+    AnthropicSignatureDelta,
     AnthropicStopReason,
     AnthropicTextBlock,
     AnthropicTextDelta,
@@ -612,6 +615,21 @@ def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
     return anthropic_usage
 
 
+def thinking_signature(thinking: str) -> str:
+    """The signature of a thinking block this server generated.
+
+    Anthropic clients replay a thinking block in later turns only together
+    with its signature, and some turn an unsigned one into a text block -- the
+    pi coding agent does -- so the model then reads its own reasoning back as
+    an answer it gave. Anthropic signs with an encrypted proof of origin; this
+    signature is only the base64 SHA-256 digest of the text. It proves nothing
+    and the server does not check it on replay. It exists so that a thinking
+    block round-trips as thinking.
+    """
+    digest = hashlib.sha256(thinking.encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
 def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMessagesResponse:
     """Translate a non-streaming chat completion into an Anthropic message."""
     content: List[Any] = []
@@ -623,8 +641,10 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
         message = choice.message
         reasoning = message.reasoning_content or message.reasoning
         if reasoning:
-            content.append(AnthropicThinkingBlock(thinking=reasoning))
-        if message.content:
+            content.append(
+                AnthropicThinkingBlock(thinking=reasoning, signature=thinking_signature(reasoning))
+            )
+        if message.content and message.content.strip():
             content.append(AnthropicTextBlock(text=message.content))
         for tool_call in message.tool_calls:
             try:
@@ -723,6 +743,8 @@ class AnthropicStreamReframer:
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
+        # Text of the open thinking block, signed when the block closes.
+        self.thinking_parts: List[str] = []
         # Upstream index of the tool call whose block is currently open.
         self.open_tool_key: Optional[Any] = None
         # Per-upstream-index tool call state. Insertion order is preserved and
@@ -733,6 +755,14 @@ class AnthropicStreamReframer:
         # Whether this stream emitted any tool_use block, which decides the
         # terminating stop_reason; see finish().
         self.emitted_tool_use = False
+        # Whitespace-only text waiting for text that is more than whitespace.
+        # Anthropic clients drop whitespace-only text blocks when they send a
+        # turn back (the API rejects them), so such a block would make the
+        # replayed turn differ from the one served. The model's layout between
+        # blocks (the newlines before a tool call, say) is held here instead:
+        # it opens a text block only together with the text that follows it,
+        # and is dropped when another kind of block opens or the stream ends.
+        self.pending_whitespace = ""
         self.stop_reason: AnthropicStopReason = "end_turn"
         self.stop_sequence: Optional[str] = None
         self.final_usage: Optional[AnthropicUsage] = None
@@ -742,12 +772,27 @@ class AnthropicStreamReframer:
     def _close_block(self) -> List[str]:
         if self.open_block_type is None:
             return []
-        event = AnthropicContentBlockStopEvent(index=self.block_index)
+        frames = []
+        if self.open_block_type == "thinking":
+            # As Anthropic streams it: the signature is the thinking block's
+            # last delta, once its whole text is known.
+            signature = thinking_signature("".join(self.thinking_parts))
+            self.thinking_parts = []
+            frames.append(
+                anthropic_sse(
+                    AnthropicContentBlockDeltaEvent(
+                        index=self.block_index, delta=AnthropicSignatureDelta(signature=signature)
+                    )
+                )
+            )
+        frames.append(anthropic_sse(AnthropicContentBlockStopEvent(index=self.block_index)))
         self.open_block_type = None
         self.open_tool_key = None
-        return [anthropic_sse(event)]
+        return frames
 
     def _open_block(self, block: Any, block_type: str) -> List[str]:
+        if block_type != "text":
+            self.pending_whitespace = ""
         frames = self._close_block()
         self.block_index += 1
         self.open_block_type = block_type
@@ -770,7 +815,11 @@ class AnthropicStreamReframer:
         if block_type == "text":
             frames.extend(self._open_block(AnthropicTextBlock(text=""), "text"))
         elif block_type == "thinking":
-            frames.extend(self._open_block(AnthropicThinkingBlock(thinking=""), "thinking"))
+            # The signature arrives as the block's last delta; the opening block
+            # carries it empty, as a thinking block always has the field.
+            frames.extend(
+                self._open_block(AnthropicThinkingBlock(thinking="", signature=""), "thinking")
+            )
         else:
             raise ValueError(f"unexpected block type {block_type}")
         return frames
@@ -929,6 +978,7 @@ class AnthropicStreamReframer:
             reasoning_delta = delta.reasoning_content or delta.reasoning
             if reasoning_delta:
                 frames.extend(self._ensure_block("thinking"))
+                self.thinking_parts.append(reasoning_delta)
                 frames.append(
                     anthropic_sse(
                         AnthropicContentBlockDeltaEvent(
@@ -937,12 +987,18 @@ class AnthropicStreamReframer:
                         )
                     )
                 )
-            if delta.content:
+            text = delta.content
+            if text and self.open_block_type != "text":
+                text = self.pending_whitespace + text
+                self.pending_whitespace = "" if text.strip() else text
+                if self.pending_whitespace:
+                    text = ""
+            if text:
                 frames.extend(self._ensure_block("text"))
                 frames.append(
                     anthropic_sse(
                         AnthropicContentBlockDeltaEvent(
-                            index=self.block_index, delta=AnthropicTextDelta(text=delta.content)
+                            index=self.block_index, delta=AnthropicTextDelta(text=text)
                         )
                     )
                 )
@@ -1062,8 +1118,20 @@ async def reframe_openai_stream(
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames."""
     reframer = AnthropicStreamReframer(model=model)
+    done = False
+    # The frames that close the message, held from [DONE] until the upstream
+    # has been read to its end.
+    closing_frames: List[str] = []
     try:
         async for line in _iter_openai_sse_lines(openai_sse):
+            if done:
+                # The upstream is read to its end before the message is closed:
+                # the chat stream records the request's metrics after its last
+                # frame, and a consumer that stops reading at message_stop would
+                # leave it suspended at [DONE], to be closed there (GeneratorExit)
+                # without doing that work. A relayed byte stream likewise ends
+                # cleanly at the worker's EOF.
+                continue
             line = line.strip()
             if not line.startswith("data:"):
                 continue
@@ -1071,15 +1139,19 @@ async def reframe_openai_stream(
             if not data:
                 continue
             if data == "[DONE]":
-                for frame in reframer.finish():
-                    yield frame
-                return
+                closing_frames = reframer.finish()
+                done = True
+                continue
             try:
                 chunk = ChatCompletionStreamResponse(**json.loads(data))
             except (json.JSONDecodeError, ValueError) as e:
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
+        if done:
+            for frame in closing_frames:
+                yield frame
+            return
         # Upstream ended without [DONE]. Both streaming producers emit it only
         # after the response is complete, so its absence means the stream was
         # cut short. Calling finish() here would close the message with
@@ -1097,5 +1169,11 @@ async def reframe_openai_stream(
             yield frame
     except Exception as e:  # noqa: BLE001 - stream must end with an event
         logger.error(f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}")
+        if done:
+            # The response was complete at [DONE], so a failure while reading
+            # the rest of the upstream is logged and the message still closes.
+            for frame in closing_frames:
+                yield frame
+            return
         for frame in reframer.error("Internal server error"):
             yield frame

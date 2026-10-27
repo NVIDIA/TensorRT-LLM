@@ -421,7 +421,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             index = completion.index
             # Use cumulative token_ids and compute delta ourselves
             # because token_ids_diff doesn't clear between iterations for n>1
-            all_tokens = list(completion.token_ids) if completion.token_ids else []
+            all_tokens = completion.token_ids or []
             sent_count = sent_token_counts.get(index, 0)
             delta_tokens = all_tokens[sent_count:]
 
@@ -436,7 +436,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 token_ids=delta_tokens,
                 sequence_index=completion.index,
                 prompt_tokens=len(prompt_token_ids),
-                completion_tokens=len(completion.token_ids) if completion.token_ids else 0,
+                completion_tokens=len(all_tokens),
                 cached_tokens=cached_tokens,
             )
 
@@ -496,7 +496,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
 
         # Process all outputs (for n>1 support)
         for completion in gen_result.outputs:
-            output_tokens = list(completion.token_ids) if completion.token_ids else []
+            output_tokens = completion.token_ids or []
 
             complete = trtllm_service_pb2.GenerateComplete(
                 output_token_ids=output_tokens,

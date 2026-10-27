@@ -136,8 +136,8 @@ private:
     //! every real chunk count, so a waiter cannot mistake it for progress.
     static constexpr uint32_t kFillFailed = UINT32_MAX;
 
-    void commitRange(size_t beginOffset);
-    void startFill(size_t beginOffset);
+    void commitRange(size_t beginOffset, int helperCount);
+    void startFill(size_t beginOffset, int helperCount);
     void joinFill() noexcept;
     [[nodiscard]] size_t chunkCount() const noexcept;
 

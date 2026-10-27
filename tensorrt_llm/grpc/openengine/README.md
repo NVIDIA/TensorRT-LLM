@@ -7,17 +7,67 @@
 
 OpenEngine support ships in the base TensorRT-LLM package. `pip install "tensorrt_llm[openengine]"` remains available as a compatibility spelling but installs nothing extra.
 
+Native protobuf (`upb`) is recommended for gRPC throughput. TensorRT-LLM images select it
+by default. In older or custom environments, set
+`PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb` before starting Python and use a
+protobuf wheel that includes the native extension. Both gRPC launchers warn when
+Python protobuf is active and continue startup. Native `cpp` is also accepted
+without a warning.
+
 Then select OpenEngine when starting the gRPC server:
 
 ```bash
 trtllm-serve <model> \
   --grpc \
   --grpc-protocol openengine \
-  --host 0.0.0.0 \
-  --port 50051
+  --host 127.0.0.1 \
+  --port 30001
 ```
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
+
+## Health checks
+
+OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC port as Inference and Control.
+
+`Check` returns the current status. `Watch` sends the current status and later status changes. Rapid changes can merge into one update. The empty service has the same status as `inference`. Use these named services for health probes:
+
+| Service | Meaning | Probe use |
+|---------|---------|----------------|
+| `inference` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Readiness probe |
+| `liveness` | The gRPC server is running and no known fatal engine failure requires a restart. | Startup and liveness probes |
+
+The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. A check that runs longer than five seconds makes inference `NOT_SERVING`; the server keeps at most one engine check in flight and discards a late result before polling again. `Control.Health` reads the same engine predicate directly, so its result can lead the published status by a poll interval or the check deadline. The multi-frontend coordinator reads the monitor's latest engine result without running another engine check. A known fatal executor or worker failure makes both services `NOT_SERVING` and stops the serving process. Other readiness failures leave liveness `SERVING` and can recover. During orderly shutdown, inference reports `NOT_SERVING` while liveness retains its previous status until the listener closes. Each `Watch` ends after its final status. A stopped server cannot answer the probe.
+
+For a Pod with a Dynamo sidecar and native Kubernetes gRPC probes, bind one listener to all Pod interfaces:
+
+```bash
+trtllm-serve <model> --grpc --grpc-protocol openengine \
+  --host 0.0.0.0 --port 30001
+```
+
+The sidecar can use `127.0.0.1:30001`. Kubernetes probes connect to the Pod IP on that same port:
+
+```yaml
+startupProbe:
+  grpc:
+    port: 30001
+    service: liveness
+  periodSeconds: 10
+  failureThreshold: 60
+readinessProbe:
+  grpc:
+    port: 30001
+    service: inference
+livenessProbe:
+  grpc:
+    port: 30001
+    service: liveness
+```
+
+Set `failureThreshold * periodSeconds` to cover the longest expected model startup. The listener has no general client authentication or encryption, and Inference and Control are reachable through the Pod IP along with Health. Review that exposure for the deployment. If only same-Pod clients need access, bind to `127.0.0.1` and use exec probes instead.
+
+OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
 
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
@@ -70,7 +120,7 @@ For attention DP, each publisher binds `base_port + global_rank`. When event str
 
 ### Node-local discovery
 
-OpenEngine exposes optional, versioned `ServerInfo.extra.trtllm_node` metadata without changing the protocol schema. It describes a shared engine incarnation (`engine_id`), local hostname (`node_id`), whether this is the leader, node count, KV block size, local publishing DP ranks, and the global rank-to-node ownership map. Consumers can use this information to partition telemetry collection without introducing routing-framework-specific server options.
+OpenEngine exposes optional, versioned `ServerInfo.extra.trtllm_node` metadata without changing the protocol schema. It describes a shared engine incarnation (`engine_id`), local hostname (`node_id`), whether this is the leader, node count, KV block size, local publishing DP ranks, and the global rank-to-node ownership map. The engine ID matches `GetServerInfo.instance_id` on the serving ingress and node metadata listeners. Consumers can use this information to partition telemetry collection without introducing routing-framework-specific server options.
 
 The serving ingress retains engine-wide `GetKvEventSources` discovery for existing clients. With event streaming enabled, one executor on each other hostname starts a bounded metadata-only listener at the configured OpenEngine port. Its `GetKvEventSources` returns only actual local publishers. It exposes neither inference nor engine-wide load; other RPCs are unimplemented. Metadata listeners stop with their executor, and bind errors fail startup collectively.
 
@@ -136,7 +186,7 @@ Verify that a checkout is current without modifying it:
 python scripts/generate_openengine_protos.py --check --tool-env-root build/openengine-proto-tools
 ```
 
-The wheel ships these bindings only in TensorRT-LLM's private namespace; it does not provide or depend on a top-level `openengine` Python package. Its protobuf and `grpcio>=1.67.1,<2` runtime constraints are base TensorRT-LLM requirements.
+The wheel ships these bindings only in TensorRT-LLM's private namespace; it does not provide or depend on a top-level `openengine` Python package. Its protobuf, `grpcio>=1.73.1,<2`, and `grpcio-health-checking>=1.73.1,<1.82` runtime constraints are base TensorRT-LLM requirements. The health-checking upper bound keeps this protobuf 6 installation on compatible releases. OpenEngine maintainers own Health API behavior and compatibility. Dependency updates require a check of gRPC and protobuf requirements, wheel installation, and the OpenEngine Check/Watch tests in CI. Route Health behavior failures to the OpenEngine maintainers and installation or dependency-resolution failures to the requirements maintainers.
 
 The private Python namespace does not change the protobuf descriptor names: generated modules still register `openengine/v1/*.proto` in the process-wide default descriptor pool. Importing another OpenEngine binding package in the same process is safe only when it registers identical schema bytes; a different schema revision can raise a duplicate-file `TypeError` during import.
 
