@@ -3138,9 +3138,9 @@ class Receiver(ReceiverBase):
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
-          * every head duplication factor is 1, rank-wide and in each matched view pair (target
-            and draft views may replicate heads differently) -- else some ranks don't send KV yet
-            still count in expected_transfers, so the live writers overflow their slots;
+          * every head duplication factor is 1, on both sides, rank-wide and in each matched view
+            pair (target and draft views may replicate heads differently) -- else some ranks don't
+            send KV yet still count in expected_transfers, so the live writers overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
@@ -3151,8 +3151,9 @@ class Receiver(ReceiverBase):
         to split evenly."""
         # Any duplicated head, rank-wide or in a single view pair, leaves some
         # writers without a share (sender side) or doubles one (receiver side).
+        rank_factors = (overlap.duplicate_head_factor, overlap.peer_duplicate_head_factor)
         view_factors = getattr(overlap, "view_duplicate_head_factors", {}).values()
-        if overlap.duplicate_head_factor != 1 or any(
+        if any(factor != 1 for factor in rank_factors) or any(
             factor != 1 for pair in view_factors for factor in pair
         ):
             return False

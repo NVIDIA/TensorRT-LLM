@@ -238,8 +238,13 @@ def test_fanin_bounce_safe_gate() -> None:
 
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
-        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
+    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,), peer_dup: int = 1) -> SimpleNamespace:
+        return SimpleNamespace(
+            duplicate_head_factor=dup,
+            peer_duplicate_head_factor=peer_dup,
+            overlap_pp_size=pp,
+            ranks=list(ranks),
+        )
 
     def ri(lpp: list[int], page_table: SimpleNamespace | None = None) -> SimpleNamespace:
         return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
@@ -252,6 +257,10 @@ def test_fanin_bounce_safe_gate() -> None:
     assert safe(ov(1, 1), ri([24]), None) is True
     assert safe(ov(1, 0), ri([24]), None) is True
     assert safe(ov(2, 1), ri([24]), None) is False  # duplicate heads / MLA -> some don't send
+    # The senders' duplication counts too: with 4 KV heads, ctx TEP8 -> gen TEP2 has 4 writers
+    # but elects 2 of them; MLA ctx TP8 -> gen TP4 elects 1 of 2. The receiver's own factor is 1.
+    assert safe(ov(1, 1, ranks=(0, 1, 2, 3), peer_dup=2), ri([24]), None) is False
+    assert safe(ov(1, 1, ranks=(0, 1), peer_dup=2), ri([24]), None) is False
     # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
     assert safe(ov(1, 4), ri([20, 20, 20, 20]), None) is True
     # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
