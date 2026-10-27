@@ -316,6 +316,7 @@ def test_context_transfer_status_timeout_retains_session_and_request(monkeypatch
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("context", [False, True])
 def test_timeout_description_selects_local_session_without_polling(context: bool) -> None:
     """Executor timeout attribution uses native session data only when available."""
@@ -337,6 +338,7 @@ def test_timeout_description_selects_local_session_without_polling(context: bool
     assert session.close()
 
 
+@pytest.mark.cpu_only
 def test_context_timeout_snapshot_failure_does_not_release_session(monkeypatch) -> None:
     session = _make_tx_session([_FakeTask(TaskStatus.TRANSFERRING)])
     session._base_args = SimpleNamespace(params=SimpleNamespace(disagg_request_id=16))
