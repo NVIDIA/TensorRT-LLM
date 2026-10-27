@@ -23,6 +23,7 @@ Mooncake pool (``TRTLLM_MOONCAKE_PROTOCOL``, default rdma). Allocates device poo
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 from dataclasses import dataclass, replace
@@ -36,6 +37,7 @@ from tensorrt_llm._torch.disaggregation.blob.backend import BlobBackend, BlobCon
 from tensorrt_llm._torch.disaggregation.blob.keys import encode_key
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
+from tensorrt_llm._torch.disaggregation.blob.store import DriverRejected
 from tensorrt_llm._torch.disaggregation.testing.memory_store import (
     DEFAULT_CAPABILITIES,
     Commit,
@@ -103,8 +105,9 @@ class Stores:
         self.backends = []
 
     def open_driver(self):
-        """A driver that moves every row on its own, several at once: the in-memory one takes one
-        row per operation, Mooncake cuts each operation into one-row parts for two workers."""
+        """A driver that moves every row on its own: the in-memory one takes one row per operation,
+        each on a thread of its own; Mooncake cuts each operation into one-row parts for two
+        workers, which run gets two at once and puts one at a time."""
         if self._store is not None:
             driver = MemoryDriver(self._store, capabilities=ONE_ROW_PER_CALL, background=True)
             driver.set_cancel_effective(self._cancel_effective)
@@ -123,7 +126,8 @@ class Stores:
     def close(self) -> None:
         if all(backend.shutdown(WAIT_S) == frozenset() for backend in self.backends):
             for driver in self._drivers:
-                driver.close()
+                with contextlib.suppress(DriverRejected):  # one a failed build never drained
+                    driver.close()
 
 
 @pytest.fixture(params=["memory", "mooncake"])
