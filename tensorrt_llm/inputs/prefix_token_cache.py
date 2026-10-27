@@ -4,8 +4,12 @@
 
 In multi-turn serving each prompt is usually the previous prompt plus a small
 delta, so re-tokenizing the whole prompt every turn is wasted work. This cache
-remembers the token ids of recent prompts and, when a new prompt extends a
-cached one, tokenizes only the tail and splices it onto the cached ids.
+remembers the token ids of recent prompts and, when a new prompt keeps a cached
+one up to its re-tokenization point, tokenizes only the tail and splices it onto
+the cached ids. The re-tokenization point lies ``overlap`` tokens before the end
+of the cached prompt, so the new prompt may also rewrite that end, as a chat
+template does when the previous turn's generation prefix is replaced by the
+response.
 
 Tokenizing a tail in isolation is not generally identical to tokenizing the
 whole prompt, because BPE merges can straddle the split. The cache therefore
@@ -41,12 +45,10 @@ __all__ = [
 # see whether the cache is doing anything without reading its counters.
 LOG_EVERY_REQUESTS = 1000
 # Agentic prompts share a system/tool preamble that can run to tens of thousands
-# of characters, so entries in one bucket cannot be told apart by their start,
-# and they end with the same chat-template suffix, so CPython's own last-character
-# shortcut in str.startswith does not help either. Each entry keeps its last
-# PROBE_CHARS characters; a candidate is only compared in full when the incoming
-# text has that probe at the same position. The probe must be longer than any
-# suffix the chat template appends after the last message.
+# of characters, so entries in one bucket cannot be told apart by their start.
+# Each entry keeps the PROBE_CHARS characters before its re-tokenization point; a
+# candidate is only compared in full when the incoming text has that probe at the
+# same position.
 PROBE_CHARS = 256
 
 
@@ -108,18 +110,18 @@ class PrefixTokenCacheConfig:
 class _Entry:
     text: str
     ids: array  # int32
-    # Every prompt that extends ``text`` is re-tokenized from the same place:
-    # token ``split_token``, which starts at character ``split_char``.
+    # Every prompt that keeps ``text[:split_char]`` is re-tokenized from the same
+    # place: token ``split_token``, which starts at character ``split_char``.
     split_token: int
     split_char: int
-    probe: str  # the last PROBE_CHARS characters of ``text``
+    probe: str  # the PROBE_CHARS characters of ``text`` before ``split_char``
 
 
 class PrefixTokenCache:
     """Splice a cached prefix's token ids with a freshly tokenized tail.
 
     Thread-safe. Eviction is least-recently-used, bounded by both entry count
-    and total cached characters. When a prompt extends a cached entry, the new
+    and total cached characters. When a prompt reuses a cached entry, the new
     prompt replaces that entry rather than sitting alongside it, so a
     conversation costs one entry however many turns it has.
 
@@ -217,7 +219,7 @@ class PrefixTokenCache:
         return hash(text[: self._config.min_chars])
 
     def _lookup(self, text: str) -> tuple[int, _Entry] | None:
-        """Longest cached entry that is a prefix of ``text``, promoted to MRU."""
+        """Cached entry with the longest re-tokenization prefix ``text`` keeps, promoted to MRU."""
         with self._lock:
             candidates = list(self._buckets.get(self._bucket_key(text), {}).items())
         # Entries are immutable, so the comparisons run outside the lock. The
@@ -225,12 +227,12 @@ class PrefixTokenCache:
         # prefix pays the full compare over the shared preamble.
         best: tuple[int, _Entry] | None = None
         for eid, entry in candidates:
-            n = len(entry.text)
+            n = entry.split_char
             if (
                 n <= len(text)
-                and (best is None or n > len(best[1].text))
+                and (best is None or n > best[1].split_char)
                 and text[n - len(entry.probe) : n] == entry.probe
-                and text.startswith(entry.text)
+                and text.startswith(entry.text[:n])
             ):
                 best = (eid, entry)
         if best is not None:
@@ -248,7 +250,8 @@ class PrefixTokenCache:
         if any(entry.text == text for entry in bucket.values()):
             return  # concurrent misses on the same prompt
         eid, self._next_id = self._next_id, self._next_id + 1
-        entry = _Entry(text, array("i", ids), split_token, split_char, text[-PROBE_CHARS:])
+        probe = text[max(split_char - PROBE_CHARS, 0) : split_char]
+        entry = _Entry(text, array("i", ids), split_token, split_char, probe)
         self._entries[eid] = entry
         bucket[eid] = entry
         self._total_chars += len(text)

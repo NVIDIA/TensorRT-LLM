@@ -71,8 +71,9 @@ from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve._frontend_processes import (
-    _init_multi_frontend_mode, _signal_frontend_ready,
-    _spawn_attached_frontends, _terminate_attached_frontends)
+    _frontend_affinity_sockets, _init_multi_frontend_mode,
+    _signal_frontend_ready, _spawn_attached_frontends,
+    _terminate_attached_frontends)
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -610,8 +611,16 @@ def launch_server(
         # until uvicorn takes it over, so no one can steal the port in between.
         _publish_bound_address(report_addr, host, port)
 
-        with _provision_kv_cache_pool(
-                llm_args, owns_engine=not multi_frontend.is_attached_frontend):
+        # The affinity ports are bound before the LLM is created, so the
+        # executor's outgoing connections cannot take one of them.
+        with (_frontend_affinity_sockets(
+                host, port, address_family, multi_frontend,
+                llm_args.get("serve_frontend_affinity_port_stride"),
+                _diagnose_port_in_use) as
+              (affinity_socket, attached_affinity_sockets),
+              _provision_kv_cache_pool(
+                  llm_args,
+                  owns_engine=not multi_frontend.is_attached_frontend)):
             if backend == 'pytorch':
                 llm_args.pop("build_config", None)
                 llm = PyTorchLLM(**llm_args)
@@ -630,7 +639,8 @@ def launch_server(
                     frontend_children = _spawn_attached_frontends(
                         llm,
                         multi_frontend.num_frontends,
-                        report_failure=_report_observed_child_failure)
+                        report_failure=_report_observed_child_failure,
+                        affinity_sockets=attached_affinity_sockets)
 
                 server = OpenAIServer(
                     generator=llm,
@@ -655,7 +665,10 @@ def launch_server(
                     gc.disable()
 
                 _signal_frontend_ready(multi_frontend)
-                uvloop.run(server(host, port, sockets=[s]))
+                sockets = [s]
+                if affinity_socket is not None:
+                    sockets.append(affinity_socket)
+                uvloop.run(server(host, port, sockets=sockets))
             finally:
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)
@@ -2329,7 +2342,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
             role,
             request_timeout,
             max_retries,
-            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key)
+            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key,
+            frontend_affinity=disagg_cfg.ctx_frontend_affinity)
 
     coordinator = DisaggCoordinatorService(
         disagg_cfg,

@@ -184,6 +184,10 @@ class DisaggServerConfig():
     conversation_affinity_header_for_subagents: Optional[str] = None
     # Apply parent affinity to context only (default), or context and generation.
     subagent_affinity_scope: Literal['context', 'both'] = 'context'
+    # (num_serve_frontends, serve_frontend_affinity_port_stride) of the context
+    # servers when they expose per-frontend affinity ports: context requests
+    # with a conversation id go to the port of one frontend.
+    ctx_frontend_affinity: Optional[Tuple[int, int]] = None
 
 
 @dataclass
@@ -306,6 +310,12 @@ def extract_disagg_cfg(
                 # Inherit the value from the top-level
                 servers[key] = value
 
+    ctx_frontend_affinity = None
+    ctx_num_frontends = context_servers.get("num_serve_frontends", 1)
+    ctx_port_stride = context_servers.get("serve_frontend_affinity_port_stride")
+    if ctx_num_frontends > 1 and ctx_port_stride is not None:
+        ctx_frontend_affinity = (ctx_num_frontends, ctx_port_stride)
+
     server_configs = []
     disagg_cluster_config = None
     ctx_router_config = extract_router_config(context_servers)
@@ -366,6 +376,7 @@ def extract_disagg_cfg(
             "subagent_affinity_scope must be 'context' or 'both', got "
             f"{subagent_affinity_scope!r}")
     config.subagent_affinity_scope = subagent_affinity_scope
+    config.ctx_frontend_affinity = ctx_frontend_affinity
     _warn_if_subagent_affinity_inactive(config)
     return config
 
@@ -461,7 +472,9 @@ def extract_router_config(server_cfg: dict) -> RouterConfig:
             args["model_path"] = model_path
 
     # add fields that are not specific to router
-    extract_keys = ["max_batch_size", "max_num_tokens"]
+    extract_keys = [
+        "max_batch_size", "max_num_tokens", "enable_tokenization_cache"
+    ]
     for key in extract_keys:
         if key in server_cfg:
             args[key] = server_cfg[key]

@@ -169,6 +169,18 @@ def test_conversations_sharing_a_long_preamble_find_their_own_entry() -> None:
     assert cache.hits == 16 and cache.resync_failures == 0
 
 
+def test_rewritten_end_of_cached_prompt_reuses_its_prefix() -> None:
+    """A chat template may replace the previous turn's generation prefix."""
+    tokenizer, cache = _MergeTokenizer(), _cache()
+    turn = _turns(1)[0]
+    previous = turn + "<ge>"
+    current = turn + "<gex reply text>"
+    assert not current.startswith(previous)
+    assert cache.encode(tokenizer, previous) == tokenizer(previous)["input_ids"]
+    assert cache.encode(tokenizer, current) == tokenizer(current)["input_ids"]
+    assert cache.hits == 1 and cache.resync_failures == 0
+
+
 def test_eviction_bounds_entry_count() -> None:
     tokenizer, cache = _MergeTokenizer(), _cache(max_entries=8)
     for prompt in _conversations(40):

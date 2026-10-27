@@ -145,6 +145,25 @@ def test_bounded_replay_on_generation_reaches_both_workers():
     assert config.conditional_disagg_config is None
 
 
+@pytest.mark.parametrize("ctx_frontends, expected", [
+    ({
+        "num_serve_frontends": 8,
+        "serve_frontend_affinity_port_stride": 10
+    }, (8, 10)),
+    ({
+        "num_serve_frontends": 8
+    }, None),
+    ({
+        "num_serve_frontends": 1,
+        "serve_frontend_affinity_port_stride": 10
+    }, None),
+])
+def test_extract_disagg_cfg_ctx_frontend_affinity(ctx_frontends, expected):
+    config = get_yaml_config()
+    config["context_servers"].update(ctx_frontends)
+    assert extract_disagg_cfg(**config).ctx_frontend_affinity == expected
+
+
 def test_extract_disagg_metrics_controls():
     yaml_config = get_yaml_config()
     yaml_config["context_servers"]["return_perf_metrics"] = False
