@@ -46,7 +46,9 @@ from tensorrt_llm.serve.openai_protocol import (
     PromptTokensDetails,
     ToolCall,
     UsageInfo,
+    _response_format_to_guided_decoding_params,
 )
+from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
 # CPU-Generic CI stage, which selects with `-m cpu_only`.
@@ -193,7 +195,32 @@ def test_output_config_json_schema_maps_to_response_format():
     )
 
     assert chat.response_format.type == "json_schema"
-    assert chat.response_format.json_schema == {"schema": schema}
+    assert chat.response_format.json_schema == {"name": "structured_output", "schema": schema}
+
+
+def test_output_config_json_schema_has_the_openai_shape():
+    """The converted schema is named, as OpenAI's json_schema requires.
+
+    Anthropic's format carries no name. The kimi_k3 extension holds
+    response_format to the OpenAI shape and answers a nameless schema with a
+    400, so without the name every structured-output request (Claude Code sends
+    them for its side tasks) would fail on that model. Guided decoding still
+    constrains the output to the client's schema alone.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+    }
+    chat = convert_anthropic_request(
+        make_request(output_config={"format": {"type": "json_schema", "schema": schema}})
+    )
+
+    apply_model_chat_extensions(chat, "kimi_k3")
+
+    assert chat.chat_template_kwargs["response_format"] == "json_schema"
+    assert chat.chat_template_kwargs["response_schema"] == schema
+    assert _response_format_to_guided_decoding_params(chat.response_format).json == schema
 
 
 def test_unsupported_output_format_rejected():
