@@ -1067,6 +1067,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
     # One high-precision twin per compressed layer.
     _supports_mixed_precision_kv = True
+    _mixed_precision_native_pool = True
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
         return False

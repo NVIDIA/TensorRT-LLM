@@ -1465,6 +1465,9 @@ class KVCacheManagerV2(BaseResourceManager):
     high_precision_dtype: Optional[DataType] = None
     # Inherited by per-model subclasses; the base's own applies to the base only.
     _supports_mixed_precision_kv = True
+    # True when the manager's own pool already holds the history in the low-precision format;
+    # the base then appends only the twins.
+    _mixed_precision_native_pool = False
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -3615,8 +3618,8 @@ class KVCacheManagerV2(BaseResourceManager):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
         self.high_precision_dtype = str_dtype_to_binding(mixed.high)
-        # A pool already in the low-precision format stays the low pool; twins use mixed.high.
-        if dtype not in (self.high_precision_dtype, self.low_precision_dtype):
+        # A dense manager keeps its pool in mixed.high and builds the low pool itself.
+        if not self._mixed_precision_native_pool and dtype != self.high_precision_dtype:
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
@@ -3677,8 +3680,12 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         if self.mapping.cp_size != 1:
             raise NotImplementedError("Mixed precision requires CP=1")
-        if self.dtype not in (DataType.HALF, DataType.BF16, DataType.FP8, DataType.NVFP4):
-            raise ValueError("Mixed precision requires FP16/BF16/FP8/NVFP4 KV")
+        if not self._mixed_precision_native_pool and self.dtype not in (
+            DataType.HALF,
+            DataType.BF16,
+            DataType.FP8,
+        ):
+            raise ValueError("Mixed precision requires FP16/BF16/FP8 KV")
         layers = list(config.layers)
         # Disaggregated transfer derives collision-free layer ids for the
         # retained-token twins from this (model layer, kind) mapping.
@@ -6923,10 +6930,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 return layer.bytes_per_token()
             return layer.bytes_per_token(data_role)
 
-        # A pool already in the low-precision format keeps its rows; only wider rows are re-encoded.
+        # Only a dense pool is re-encoded; a native pool keeps its rows.
         if (
             self._is_mixed_precision_layer(local_layer_idx)
-            and self.dtype != self.low_precision_dtype
+            and not self._mixed_precision_native_pool
         ):
             return self._mixed_precision_layer_bytes_per_token(local_layer_idx, data_role)
         if self.dtype not in (
