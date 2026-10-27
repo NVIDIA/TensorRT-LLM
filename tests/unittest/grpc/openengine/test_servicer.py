@@ -1719,7 +1719,11 @@ def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expect
             release.set()
             await server.stop(0)
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        # gRPC transport cycles can retain its global poller after the loop closes.
+        gc.collect()
 
 
 def test_generate_aborts_the_engine_when_the_rpc_is_cancelled() -> None:
