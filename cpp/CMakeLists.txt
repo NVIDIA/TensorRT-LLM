@@ -49,10 +49,6 @@ option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_NCCL_EXTENSIONS "Build the nccl-extensions Python wheel" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
-option(
-  BUILD_MODELING_V2
-  "Build the modeling_v2 per-family torch-op libraries (libth_modeling_v2_*)"
-  ON)
 set(TRTLLM_MODELING_V2_TARGETS
     "all"
     CACHE

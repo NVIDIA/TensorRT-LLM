@@ -58,20 +58,6 @@ foreach(arch_file IN LISTS previous_arch_files)
   endif()
 endforeach()
 
-if(WIN32 OR NOT BUILD_MODELING_V2)
-  # As deep_ep does on a build without a matching architecture: an empty
-  # cuda_architectures.txt per family, so build_wheel.py installs nothing,
-  # including a library left from an earlier configuration.
-  foreach(family_list IN LISTS family_lists)
-    get_filename_component(csrc_dir "${family_list}" DIRECTORY)
-    get_filename_component(family_dir "${csrc_dir}" DIRECTORY)
-    get_filename_component(family "${family_dir}" NAME)
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${family}/cuda_architectures.txt"
-         "")
-  endforeach()
-  return()
-endif()
-
 foreach(family_list IN LISTS family_lists)
   get_filename_component(csrc_dir "${family_list}" DIRECTORY)
   get_filename_component(family_dir "${csrc_dir}" DIRECTORY)

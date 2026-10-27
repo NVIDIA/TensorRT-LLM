@@ -7,7 +7,7 @@ Native code of a model family lives with its Python code, in ``models/<family>/c
 (a target's own), and builds into one torch-op library,
 ``libth_modeling_v2_<family>.so``, installed next to ``libth_common.so``. Nothing of
 it is in the stock libraries, and nothing loads it until routing picks a target of
-the family. The API is four names:
+the family. The API is five names:
 
 * :func:`load_target_ops` -- a target package with native code starts with
   ``native_ops = load_target_ops(__name__)``;
@@ -15,15 +15,17 @@ the family. The API is four names:
   from any module of the family;
 * :func:`namespace_of` -- the torch namespace a ``fake_ops.py`` registers its fakes
   in, ``namespace_of(__name__)``;
+* :class:`NativeCodeNotBuilt` -- a target whose native code this installation did
+  not build;
 * :class:`NativeLoadError` -- a library that is installed but broken.
 
 ``route`` imports a target only on the branch that returns it, so loading is part of
 routing, and it follows how the stock code treats its optional native modules
 (``flash_mla``, ``deep_ep``): a library this installation does not have, or a target
 it did not build (it answers ``torch.ops.mv2_<family>.built_targets()``), is a
-:class:`NoTarget`, so ``auto`` keeps the built-in model; a library that fails to
-load, or lacks an op a ``fake_ops.py`` declares, is a :class:`NativeLoadError`,
-never a fallback. The family's ``fake_ops.py`` registers when the library opens, a
+:class:`NativeCodeNotBuilt`, so ``auto`` keeps the built-in model; a library that
+fails to load, or lacks an op a ``fake_ops.py`` declares, is a
+:class:`NativeLoadError`, never a fallback. The family's ``fake_ops.py`` registers when the library opens, a
 target's when the target is found in it.
 
 The "Native code" section of the modeling_v2 README is the guide for authors.
@@ -34,7 +36,6 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import re
-import sys
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Optional, Tuple
 
@@ -48,6 +49,17 @@ _LIBS_DIR = Path(__file__).resolve().parents[3] / "libs"
 
 _built_targets: Dict[str, FrozenSet[str]] = {}
 _family_ops: Dict[str, Any] = {}
+
+
+class NativeCodeNotBuilt(NoTarget):
+    """The target exists, but this installation did not build its native code.
+
+    Its family's library is not installed, or was built without the target: its
+    ``ARCHS`` miss the build's, a ``REQUIRES`` is unmet, or
+    ``TRTLLM_MODELING_V2_TARGETS`` left it out. It is a :class:`NoTarget`, so
+    ``auto`` keeps the built-in model and ``require`` reports why, as for a target
+    that does not fit.
+    """
 
 
 class NativeLoadError(RuntimeError):
@@ -125,14 +137,11 @@ def _load_family_library(family: str) -> FrozenSet[str]:
     """Open ``libth_modeling_v2_<family>.so`` once and return the targets it carries."""
     if family in _built_targets:
         return _built_targets[family]
-    if sys.platform == "win32":
-        raise NoTarget("modeling_v2 native code is not built on Windows")
     path = _LIBS_DIR / _library_name(family)
     if not path.is_file():
-        raise NoTarget(
+        raise NativeCodeNotBuilt(
             f"this installation has no {path.name}: the build compiles a family's library "
-            "only when its CUDA architectures include one of the family's targets, and "
-            "only with BUILD_MODELING_V2=ON"
+            "only when its CUDA architectures include one of the family's targets"
         )
     try:
         built = _open_library(path, family)
@@ -148,8 +157,8 @@ def load_target_ops(package: str) -> Any:
     namespace, ``torch.ops.mv2_<family>_<target>``.
 
     Call it from the target's ``__init__.py`` with ``__name__``. Raises
-    :class:`NoTarget` when this installation does not carry the target and
-    :class:`NativeLoadError` when its library is broken.
+    :class:`NativeCodeNotBuilt` when this installation does not carry the target
+    and :class:`NativeLoadError` when its library is broken.
     """
     family, target = _split(package)
     if target is None or package != f"{_MODELS_PACKAGE}.{family}.{target}":
@@ -157,7 +166,7 @@ def load_target_ops(package: str) -> Any:
     built = _load_family_library(family)
     if target not in built:
         carried = ", ".join(sorted(built)) or "none"
-        raise NoTarget(
+        raise NativeCodeNotBuilt(
             f"{_library_name(family)} does not carry {target}: this build did not compile "
             f"it (its ARCHS miss the build's, a REQUIRES is unmet, or "
             f"TRTLLM_MODELING_V2_TARGETS excluded it); it carries {carried}"
