@@ -112,3 +112,29 @@ def test_placement_does_not_pile_a_hot_prefix_onto_a_loaded_domain():
     # Domain 1 already holds 30 more live requests than domain 0, past max(8, total // 4).
     manager = _placer(matches=(0, 96), load=(10, 40))
     assert KVCacheManagerV2.pick_locality_domain(manager, 0, list(range(128))) == 0
+
+
+def _manager(num_locality_domains, is_draft):
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = SimpleNamespace(num_locality_domains=num_locality_domains)
+    manager.is_draft = is_draft
+    manager.enable_block_reuse = False
+    manager._next_locality_domain = 0
+    return manager
+
+
+@pytest.mark.parametrize("target_domains, draft_domains", [(2, 1), (1, 2)])
+def test_draft_manager_with_a_different_domain_count_gets_a_valid_domain(
+    target_domains, draft_domains
+):
+    target = _manager(target_domains, is_draft=False)
+    draft = _manager(draft_domains, is_draft=True)
+    for request_id in range(4):
+        request = _request(request_id, target.pick_locality_domain(request_id))
+        assert target._request_locality_domain_id(request) == request.py_locality_domain_id
+        draft_domain = draft._request_locality_domain_id(request)
+        if draft_domains == 1:
+            assert draft_domain is None
+        else:
+            assert 0 <= draft_domain < draft_domains
+            assert draft._request_locality_domain_id(request) == draft_domain
