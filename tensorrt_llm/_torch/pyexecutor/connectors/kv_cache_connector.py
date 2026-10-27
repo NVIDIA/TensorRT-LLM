@@ -201,6 +201,18 @@ class KvCacheConnectorWorker(ABC):
     # Opt in only when transfers, endpoints and completion are owner-local,
     # and the backend can safely share compatible cache content across owners.
     supports_attention_dp: bool = False
+    #: Opt in to run next to one-model speculative decoding (MTP or EAGLE3) on
+    #: a disaggregated context server; see
+    #: `KvCacheConnectorManager.speculative_prefill_only`. Declare it only when
+    #: every load and save moves whole pages of every layer group in the
+    #: registered `KvCacheLayout`, which includes the one-model draft layers
+    #: that share the target pool. Per-layer hooks are installed on
+    #: `DecoderLayer` modules only, and whether a model's draft layers are such
+    #: modules depends on the model, so a worker that saves per layer must
+    #: itself make sure it covers the draft layers before opting in. The
+    #: scheduler must declare it too. Only an explicit True counts, and it is
+    #: read from the class before either half is constructed.
+    supports_speculative_prefill: bool = False
     #: The connector stores and offers KV by whole blocks starting at the local
     #: prefix match, so that match must end on a block boundary.
     #: `KVCacheManagerV2` reads it only when a one-model draft's lookahead backoff
@@ -477,6 +489,21 @@ class KvCacheConnectorScheduler(ABC):
     # ADP creates one adapter per rank. Adapters may connect to the same
     # logical storage pool; their request and allocation state stays local.
     supports_attention_dp: bool = False
+    #: Opt in to run next to one-model speculative decoding (MTP or EAGLE3) on
+    #: a disaggregated context server; see
+    #: `KvCacheConnectorManager.speculative_prefill_only`. A one-model draft
+    #: writes KV at each prompt position from the next
+    #: `draft_prompt_lookahead(llm_args.speculative_config)` prompt tokens, so
+    #: declare it only when the adapter's content identity (its store keys)
+    #: covers those tokens past each block's end; a served block's draft-layer
+    #: KV then belongs to this prompt. The adapter must never offer or save a
+    #: block whose lookahead tokens fall outside the prompt, and must never
+    #: save a block this pass has not computed: one-model speculation
+    #: allocates `max_draft_len - 1` extra KV slots past every context chunk,
+    #: so a page can exist before its block is computed. The worker must
+    #: declare it too. Only an explicit True counts, and it is read from the
+    #: class before either half is constructed.
+    supports_speculative_prefill: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -861,6 +888,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     2. Handling MPI communication for tensor parallelism. Under attention DP,
        each rank runs its own scheduler adapter and worker without connector
        collectives. Adapters can use a shared external storage pool.
+    3. Refusing every request that is not context-only work in the
+       speculative-prefill-only mode, so one-model speculative decoding never
+       rejects draft tokens underneath the connector.
 
     Note: This class is solely an implementation detail, and is not part of the connector interface itself.
     When implementing a connector API, you do not need to implement this class.
@@ -872,7 +902,26 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         scheduler: Optional[KvCacheConnectorScheduler],
         *,
         enable_attention_dp: bool = False,
+        speculative_prefill_only: bool = False,
     ) -> None:
+        """Bind the connector halves and the modes the executor runs them in.
+
+        Args:
+            worker: The connector worker, present on every rank.
+            scheduler: The connector scheduler: on every attention-DP owner, or
+                on rank 0 only under tensor parallelism.
+            enable_attention_dp: Run the scheduler locally on each
+                attention-DP owner, without connector collectives. Both halves
+                must declare `supports_attention_dp`.
+            speculative_prefill_only: Allow one-model speculative decoding by
+                refusing every request that is not context-only (disaggregated
+                prefill), which keeps the connector's append-only page deltas
+                valid. Both halves must declare `supports_speculative_prefill`.
+
+        Raises:
+            NotImplementedError: When a mode is asked for and a connector half
+                does not declare it.
+        """
         assert (scheduler is not None) == (enable_attention_dp or mpi_rank() == 0), (
             "A scheduler is required on every attention-DP owner, or only rank 0 for TP."
         )
@@ -898,6 +947,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
         if self.reports_failed_loads:
             self._validate_failed_load_reporting(type(worker))
+        if speculative_prefill_only and not self.declares_speculative_prefill(
+            type(worker), None if scheduler is None else type(scheduler)
+        ):
+            raise NotImplementedError(
+                "Speculative-prefill-only mode requires a connector whose scheduler "
+                "and worker both declare supports_speculative_prefill=True."
+            )
+        #: Whether only context-only requests may reach the connector, which is
+        #: what lets it run next to one-model speculative decoding; see
+        #: `_validate_speculative_prefill_request`. Compared against True like
+        #: `capacity_only`.
+        self.speculative_prefill_only = speculative_prefill_only is True
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -948,6 +1009,28 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     "The connector must declare supports_attention_dp=True "
                     "and implement owner-local scheduling/transfers against a shared pool."
                 )
+
+    @staticmethod
+    def declares_speculative_prefill(worker_cls: type, scheduler_cls: Optional[type]) -> bool:
+        """Whether every present connector half opted into speculative prefill.
+
+        Only an explicit True counts; see
+        `KvCacheConnectorScheduler.supports_speculative_prefill` and
+        `KvCacheConnectorWorker.supports_speculative_prefill`.
+
+        Args:
+            worker_cls: The connector worker class.
+            scheduler_cls: The connector scheduler class, or None on a TP
+                follower rank, which holds no scheduler instance.
+
+        Returns:
+            True when the worker and, if given, the scheduler declare it.
+        """
+        return all(
+            getattr(cls, "supports_speculative_prefill", False) is True
+            for cls in (worker_cls, scheduler_cls)
+            if cls is not None
+        )
 
     @staticmethod
     def _validate_failed_load_reporting(worker_cls: type) -> None:
@@ -1061,6 +1144,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         """Query once per pending attempt and protect the promised source range."""
         if not self.prefix_reservations_enabled or _is_dummy_request(request):
             return None
+        # Ahead of the leader broadcast below, so every tensor-parallel rank
+        # raises for the same request instead of leaving followers waiting.
+        self._validate_speculative_prefill_request(request)
         if local_end < 0:
             raise ValueError("A prefix reservation cannot start before the prompt")
         existing = self.get_prefix_reservation(request)
@@ -1267,6 +1353,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # into it, and the query would cost the leader broadcast below on
             # every request.
             return 0, False
+        # Ahead of the leader broadcast below, so every tensor-parallel rank
+        # raises for the same request instead of leaving followers waiting.
+        self._validate_speculative_prefill_request(request)
 
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
@@ -1351,6 +1440,33 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         num_tokens, load_kv_async = self.query_num_new_matched_tokens(request, num_computed_tokens)
         self.commit_new_matched_tokens(request, num_tokens, load_kv_async)
         return num_tokens
+
+    def _validate_speculative_prefill_request(self, request: LlmRequest) -> None:
+        """Keep one-model speculation's append-only page lists on context-only work.
+
+        A context-only request never rejects a draft token, so its page list
+        only grows; anything else could shrink it underneath the connector.
+        This backs up the executor's admission check, for anything that
+        bypasses it. Dummy requests carry nothing to load or save and pass.
+
+        Args:
+            request: The request about to reach the connector.
+
+        Raises:
+            NotImplementedError: In the speculative-prefill-only mode, for a
+                request that is neither a dummy nor context-only.
+        """
+        if (
+            self.speculative_prefill_only
+            and not _is_dummy_request(request)
+            and getattr(request, "is_context_only_request", False) is not True
+        ):
+            raise NotImplementedError(
+                "This KV connector runs next to one-model speculative decoding on "
+                "context-only (disaggregated prefill) requests only. Run "
+                "speculative generation on a server whose connector transfers no "
+                "KV (capacity_only) or without a connector."
+            )
 
     _GROUPED_SCHEDULER_METHODS = (
         "update_state_after_alloc_by_layer_group",
@@ -1593,6 +1709,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # which on a generation server is inter-token latency.
             # `handle_metadata` returns early when none was built.
             return
+        if self.speculative_prefill_only:
+            # Before the output manager records any state for this batch.
+            for request in (
+                *scheduled_batch.context_requests,
+                *scheduled_batch.generation_requests,
+            ):
+                self._validate_speculative_prefill_request(request)
         async_requests = AsyncRequests(
             {},
             {
