@@ -640,6 +640,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         model=torch.nn.ModuleList([gdn]),
         attn_runtime_features=SimpleNamespace(chunked_prefill=False),
         max_cuda_graph_batch_size=None,
+        input_processor=None,
     )
     mamba_params = MambaKVCacheParams(
         state_size=8,
