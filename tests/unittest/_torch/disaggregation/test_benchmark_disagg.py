@@ -1077,8 +1077,7 @@ class TestBenchmarkFillAdmissionFlowControl:
     def test_kv_balanced_admission_is_off_in_fill_phase_and_warmup(
         self, fill_phase_active, is_warmup, kv_balance
     ):
-        """In the fill phase every request must fit at once and none leaves,
-        so admission is FIFO with count-balanced routing there and in warmup."""
+        """KV-balanced admission is off in the fill phase and warmup."""
         ex = self._make_executor(tp_size=4, fill_phase_active=fill_phase_active)
         ex._is_warmup = is_warmup
 

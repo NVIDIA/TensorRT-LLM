@@ -1788,11 +1788,11 @@ class TestNumInputTokens:
         assert _num_input_tokens(_Req()) == 1234
 
 
-def _gen_only_item(
+def _gen_item(
     req_id,
     num_tokens,
-    request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
     priority=DEFAULT_REQUEST_PRIORITY,
+    request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
 ):
     request = SimpleNamespace(
         num_input_tokens=num_tokens,
@@ -1804,472 +1804,223 @@ def _gen_only_item(
     return RequestQueueItem(req_id, request)
 
 
-def _gen_only_queue(token_counts):
-    return FCFSWaitingQueue([_gen_only_item(i, n) for i, n in enumerate(token_counts)])
+def _gen_queue(token_counts):
+    return FCFSWaitingQueue([_gen_item(i, n) for i, n in enumerate(token_counts)])
 
 
-def _kv_states(tokens, active):
+def _states(tokens, active):
     return [
         RankState(rank=r, num_active_requests=a, num_active_tokens=t)
         for r, (t, a) in enumerate(zip(tokens, active))
     ]
 
 
-class TestPlanKVBalancedAdmission:
-    def test_heavy_rank_takes_short_request_light_rank_takes_long(self):
-        plan = plan_kv_balanced_admission(
-            candidate_tokens=[5000, 200, 1500],
-            candidate_forced=[False] * 3,
-            rank_tokens=[15000, 6000],
-            rank_num_requests=[3, 3],
-            max_requests_per_rank=4,
-            max_new_requests=2,
-        )
-        assert sorted(plan, key=lambda p: p[1]) == [(1, 0), (0, 1)]
+def _ids(items):
+    return [item.id for item in items]
 
-    def test_forced_candidate_goes_first_to_least_loaded_rank(self):
-        plan = plan_kv_balanced_admission(
-            candidate_tokens=[9000, 100],
-            candidate_forced=[True, False],
-            rank_tokens=[100, 50],
-            rank_num_requests=[0, 0],
-            max_requests_per_rank=1,
-            max_new_requests=1,
-        )
-        assert plan == [(0, 1)]
 
-    def test_respects_free_slots_and_budget(self):
-        plan = plan_kv_balanced_admission(
-            candidate_tokens=[1, 2, 3, 4, 5],
-            candidate_forced=[False] * 5,
-            rank_tokens=[0, 0, 0],
-            rank_num_requests=[2, 0, 3],
-            max_requests_per_rank=2,
-            max_new_requests=5,
-        )
-        assert len(plan) == 2
-        assert all(rank == 1 for _, rank in plan)
-        assert plan_kv_balanced_admission([1], [False], [0], [0], 1, 0) == []
-
-    def test_admission_does_not_raise_the_largest_request_count(self):
-        # Rank 0 holds the least KV but already the most requests, so the
-        # next admissions go to the ranks with fewer requests.
-        plan = plan_kv_balanced_admission(
-            candidate_tokens=[100, 100, 100],
-            candidate_forced=[False] * 3,
-            rank_tokens=[0, 50000, 60000],
-            rank_num_requests=[2, 1, 1],
-            max_requests_per_rank=16,
-            max_new_requests=2,
-        )
-        assert sorted(rank for _, rank in plan) == [1, 2]
-
-    def test_rank_below_the_largest_request_count_takes_kv(self):
-        # Rank 1 already holds an even share of the requests (ceil(15 / 4) = 4)
-        # but fewer than rank 0, so it can still take the request, which would
-        # push any other rank past the largest KV load.
-        plan = plan_kv_balanced_admission(
-            candidate_tokens=[20000],
-            candidate_forced=[False],
-            rank_tokens=[100000, 10000, 95000, 99000],
-            rank_num_requests=[6, 4, 2, 2],
-            max_requests_per_rank=16,
-            max_new_requests=1,
-        )
-        assert plan == [(0, 1)]
-
-    def test_whole_window_is_placed_largest_first(self):
-        # Both requests are admitted; placing the long one first puts it on the
-        # empty rank. In queue order the short one would take the empty rank
-        # and the long one would land on top of rank 1's 5000 tokens.
-        plan = plan_kv_balanced_admission(
-            candidate_tokens=[1000, 9000],
-            candidate_forced=[False, False],
-            rank_tokens=[0, 5000],
-            rank_num_requests=[0, 0],
-            max_requests_per_rank=4,
-            max_new_requests=4,
-        )
-        assert plan == [(1, 0), (0, 1)]
-
-    def test_best_fit_keeps_the_light_rank_for_a_long_request(self):
-        # A short request goes to the rank it leaves closest below the largest
-        # KV load (rank 2), not to the least-loaded rank, so a long request
-        # admitted in a later iteration still fits under that load on rank 1.
-        rank_tokens = [100000, 20000, 60000]
-        rank_num_requests = [4, 3, 3]
-        for tokens, expected_rank in ((30000, 2), (70000, 1)):
-            plan = plan_kv_balanced_admission(
-                candidate_tokens=[tokens],
-                candidate_forced=[False],
-                rank_tokens=rank_tokens,
-                rank_num_requests=rank_num_requests,
-                max_requests_per_rank=16,
-                max_new_requests=1,
-            )
-            assert plan == [(0, expected_rank)]
-            rank_tokens[expected_rank] += tokens
-            rank_num_requests[expected_rank] += 1
-        assert max(rank_tokens) == 100000
-
-    def test_later_group_waits_for_an_earlier_one(self):
-        # Only rank 0 has a slot. The 100-token request fits it better, but it
-        # is in a later admission group (lower priority) and must wait.
-        kwargs = dict(
-            candidate_tokens=[9000, 100],
-            candidate_forced=[False, False],
-            rank_tokens=[50000, 50000],
-            rank_num_requests=[7, 8],
-            max_requests_per_rank=8,
-            max_new_requests=1,
-        )
-        assert plan_kv_balanced_admission(**kwargs) == [(1, 0)]
-        assert plan_kv_balanced_admission(**kwargs, candidate_groups=[0, 1]) == [(0, 0)]
-
-    def test_forced_request_does_not_jump_an_earlier_group(self):
-        plan = plan_kv_balanced_admission(
-            candidate_tokens=[300, 9000],
-            candidate_forced=[False, True],
-            rank_tokens=[0, 0],
-            rank_num_requests=[7, 8],
-            max_requests_per_rank=8,
-            max_new_requests=1,
-            candidate_groups=[0, 1],
-        )
-        assert plan == [(0, 0)]
-
-    def test_whole_group_is_admitted_before_the_next_group(self):
-        plan = plan_kv_balanced_admission(
-            candidate_tokens=[100, 200, 9000, 50],
-            candidate_forced=[False] * 4,
-            rank_tokens=[0, 0],
-            rank_num_requests=[0, 0],
-            max_requests_per_rank=8,
-            max_new_requests=3,
-            candidate_groups=[0, 0, 1, 1],
-        )
-        assert sorted(idx for idx, _ in plan[:2]) == [0, 1]
-        assert len(plan) == 3 and plan[2][0] in (2, 3)
+@pytest.mark.parametrize(
+    "tokens,loads,counts,slots,budget,forced,groups,expected",
+    [
+        # More candidates than slots: closest to the mean load.
+        ([5000, 200, 1500], [15000, 6000], [3, 3], 4, 2, None, None, [(0, 1), (1, 0)]),
+        ([1, 2, 3, 4, 5], [0, 0, 0], [2, 0, 3], 2, 5, None, None, [(1, 1), (0, 1)]),
+        # The largest request count is not raised while another rank can take the request.
+        ([100, 100, 100], [0, 50000, 60000], [2, 1, 1], 16, 2, None, None, [(0, 1), (1, 2)]),
+        ([20000], [100000, 10000, 95000, 99000], [6, 4, 2, 2], 16, 1, None, None, [(0, 1)]),
+        # Whole window: largest first, best fit below the KV maximum.
+        ([1000, 9000], [0, 5000], [0, 0], 4, 4, None, None, [(1, 0), (0, 1)]),
+        ([30000], [100000, 20000, 60000], [4, 3, 3], 16, 1, None, None, [(0, 2)]),
+        # Forced candidates first.
+        ([9000, 100], [100, 50], [0, 0], 1, 1, [True, False], None, [(0, 1)]),
+        # Groups go in order, even against a better fit or a forced candidate.
+        ([9000, 100], [50000, 50000], [7, 8], 8, 1, None, None, [(1, 0)]),
+        ([9000, 100], [50000, 50000], [7, 8], 8, 1, None, [0, 1], [(0, 0)]),
+        ([300, 9000], [0, 0], [7, 8], 8, 1, [False, True], [0, 1], [(0, 0)]),
+        ([100, 200, 9000, 50], [0, 0], [0, 0], 8, 3, None, [0, 0, 1, 1], [(1, 0), (0, 1), (3, 0)]),
+        ([1], [0], [0], 1, 0, None, None, []),
+    ],
+)
+def test_plan_kv_balanced_admission(tokens, loads, counts, slots, budget, forced, groups, expected):
+    forced = forced or [False] * len(tokens)
+    assert (
+        plan_kv_balanced_admission(tokens, forced, loads, counts, slots, budget, groups) == expected
+    )
 
 
 class TestDefaultADPRouterKVBalance:
-    """Generation-only (disaggregated decode) admission balances per-rank KV."""
-
-    def test_pop_admits_the_best_fit_and_ages_the_rest(self):
+    def test_pop_ages_the_rest_and_route_follows_the_plan(self):
         router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        queue = _gen_only_queue([8000, 300, 400])
-        # Only rank 1 has a slot; the 400-token request lands it closest to the
-        # mean load, so the 8000-token head request waits.
-        states = _kv_states(tokens=[20000, 21000], active=[8, 7])
-        chosen = router.pop_requests(queue, states, max_new_requests=4, max_num_active_requests=8)
-        assert [item.id for item in chosen] == [2]
-        assert [item.id for item in queue] == [0, 1]
+        queue = _gen_queue([8000, 300, 400])
+        states = _states([20000, 21000], [8, 7])  # only rank 1 has a slot
+        chosen = router.pop_requests(queue, states, 4, max_num_active_requests=8)
+        assert _ids(chosen) == [2] and _ids(queue) == [0, 1]
         assert router._kv_balance_skipped_rounds == {0: 1, 1: 1}
-
         assignment, expected = router.route_requests(states, chosen, max_num_active_requests=8)
-        assert [item.id for item in assignment[1]] == [2]
-        assert assignment[0] == []
-        assert expected == 8
+        assert _ids(assignment[1]) == [2] and assignment[0] == [] and expected == 8
+        assert router._kv_balanced_placement == {}
+        # A round that admits nothing does not age.
+        assert router.pop_requests(queue, _states([0, 0], [8, 8]), 4, 8) == []
+        assert router._kv_balance_skipped_rounds == {0: 1, 1: 1}
 
     def test_request_passed_over_too_often_is_admitted_next(self):
         router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        queue = _gen_only_queue([8000, 300])
         router._kv_balance_skipped_rounds = {0: KV_BALANCE_MAX_SKIPPED_ROUNDS}
-        states = _kv_states(tokens=[20000, 21300], active=[7, 8])
-        chosen = router.pop_requests(queue, states, max_new_requests=4, max_num_active_requests=8)
-        assert [item.id for item in chosen] == [0]
+        chosen = router.pop_requests(_gen_queue([8000, 300]), _states([20000, 21300], [7, 8]), 4, 8)
+        assert _ids(chosen) == [0]
         assert router._kv_balance_skipped_rounds == {1: 1}
-
-    def test_round_without_admission_does_not_age(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        queue = _gen_only_queue([100, 200])
-        states = _kv_states(tokens=[0, 0], active=[8, 8])
-        assert router.pop_requests(queue, states, 4, max_num_active_requests=8) == []
-        assert router._kv_balance_skipped_rounds == {0: 0, 1: 0}
-        assert len(queue) == 2
 
     def test_only_the_head_window_is_considered(self):
         router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        # A perfect fit sits just behind the window.
-        tokens = [1000] * KV_BALANCE_WINDOW + [10]
-        queue = _gen_only_queue(tokens)
-        states = _kv_states(tokens=[0, 0], active=[0, 1])
-        chosen = router.pop_requests(queue, states, 1, max_num_active_requests=1)
-        assert len(chosen) == 1
-        assert chosen[0].id < KV_BALANCE_WINDOW
+        # The best fit (10 tokens) sits just behind the window.
+        queue = _gen_queue([1000] * KV_BALANCE_WINDOW + [10])
+        chosen = router.pop_requests(queue, _states([0, 0], [0, 1]), 1, max_num_active_requests=1)
+        assert _ids(chosen) == [0]
 
-    def test_single_rank_admits_in_queue_order(self):
-        # One rank has no placement to choose, so KV balancing would only
-        # reorder admissions: the queue order is kept.
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=1))
-        queue = _gen_only_queue([1, 100, 2])
-        states = _kv_states(tokens=[0], active=[7])
-        chosen = router.pop_requests(queue, states, 1, max_num_active_requests=8)
-        assert [item.id for item in chosen] == [0]
-        assert router._kv_balanced_placement == {}
-        assert router._kv_balance_skipped_rounds == {}
+    @pytest.mark.parametrize("case", ["kv_balance_off", "context_request", "single_rank"])
+    def test_fifo_fallback(self, case):
+        single_rank = case == "single_rank"
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=1 if single_rank else 2))
+        queue = _gen_queue([8000, 300, 400])
+        if case == "context_request":
+            context_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+            queue.append(_gen_item(3, 400, request_type=context_type))
+        states = _states([0], [7]) if single_rank else _states([20000, 21000], [8, 7])
+        chosen = router.pop_requests(queue, states, 1, 8, kv_balance=case != "kv_balance_off")
+        assert _ids(chosen) == [0]
+        assert router._kv_balanced_placement == {} and router._kv_balance_skipped_rounds == {}
+
+    def test_requests_not_popped_by_kv_admission_keep_heap_routing(self):
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        items = [_gen_item(i, n) for i, n in enumerate([9000, 3000, 3000, 3000])]
+        assignment, expected = router.route_requests(_states([0, 0], [0, 0]), items, 4)
+        assert [len(assignment[r]) for r in range(2)] == [2, 2] and expected == 2
+
+    def test_no_capacity_does_not_touch_the_queue(self):
+        class _UntouchableQueue(FCFSWaitingQueue):
+            def peek_requests(self, k):
+                raise AssertionError("queue read without capacity")
+
+            def __iter__(self):
+                raise AssertionError("queue read without capacity")
+
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        queue = _UntouchableQueue([_gen_item(i, 100) for i in range(4)])
+        assert router.pop_requests(queue, _states([0, 0], [0, 0]), 0, 8) == []
+
+    def test_large_priority_queue_is_not_sorted(self, monkeypatch):
+        def _no_full_scan(self, *args):
+            raise AssertionError("whole priority heap sorted or rebuilt")
+
+        monkeypatch.setattr(PriorityWaitingQueue, "__iter__", _no_full_scan)
+        monkeypatch.setattr(PriorityWaitingQueue, "remove_by_ids", _no_full_scan)
+        queue = PriorityWaitingQueue()
+        queue.add_requests(_gen_item(i, 100 + i % 50, priority=(i % 5) / 10) for i in range(2000))
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        chosen = router.pop_requests(queue, _states([0, 0], [0, 0]), 4, 8)
+        # Only top-priority requests (ids 4, 9, 14, ...) are admitted.
+        assert len(chosen) == 4 and all(item.id % 5 == 4 for item in chosen)
+        assert len(queue) == 2000 - 4
+
+    @pytest.mark.parametrize("policy", ["fcfs", "priority"])
+    def test_requests_not_admitted_keep_their_queue_order(self, policy):
+        items = [_gen_item(i, 8000 if i % 3 else 300, priority=(i * 3 % 4) / 10) for i in range(40)]
+        queue = FCFSWaitingQueue(items) if policy == "fcfs" else PriorityWaitingQueue()
+        if policy == "priority":
+            queue.add_requests(items)
+        order = _ids(queue)
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        chosen = set(_ids(router.pop_requests(queue, _states([20000, 21000], [7, 7]), 2, 8)))
+        assert len(chosen) == 2 and chosen <= set(order[:KV_BALANCE_WINDOW])
+        assert [queue.pop_request().id for _ in range(len(queue))] == [
+            i for i in order if i not in chosen
+        ]
 
     def test_lower_priority_request_waits_for_a_higher_priority_one(self):
-        # By KV alone the 100-token request fits rank 0 better, but it has the
-        # lower priority, so the higher-priority request is admitted first.
         router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         queue = PriorityWaitingQueue()
-        queue.add_request(_gen_only_item(0, 100, priority=0.5))
-        queue.add_request(_gen_only_item(1, 9000, priority=0.9))
-        states = _kv_states(tokens=[50000, 50000], active=[7, 8])
-        chosen = router.pop_requests(queue, states, 1, max_num_active_requests=8)
-        assert [item.id for item in chosen] == [1]
-        assert [item.id for item in queue] == [0]
+        # By KV alone the 100-token request fits rank 0 better.
+        queue.add_requests([_gen_item(0, 100, priority=0.5), _gen_item(1, 9000, priority=0.9)])
+        chosen = router.pop_requests(queue, _states([50000, 50000], [7, 8]), 1, 8)
+        assert _ids(chosen) == [1] and _ids(queue) == [0]
 
-    def test_route_balances_kv_without_raising_the_request_count(self):
+    def test_priority_displacement_restarts_the_skip_count(self):
         router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        states = _kv_states(tokens=[0, 0], active=[0, 0])
-        queue = _gen_only_queue([9000, 3000, 3000, 3000])
-        chosen = router.pop_requests(queue, states, 4, max_num_active_requests=4)
-        assignment, expected = router.route_requests(states, chosen, max_num_active_requests=4)
-        # Two requests per rank; the long one shares its rank with one short one.
-        assert sorted(item.id for item in assignment[0]) == [0, 3]
-        assert sorted(item.id for item in assignment[1]) == [1, 2]
-        assert expected == 2
+        queue = PriorityWaitingQueue()
+        queue.add_requests(_gen_item(i, 100 + i) for i in range(KV_BALANCE_WINDOW))
+        states = _states([0, 0], [0, 0])
+        router.pop_requests(queue, states, 1, 8)
+        passed_over = set(router._kv_balance_skipped_rounds)
+        assert len(passed_over) == KV_BALANCE_WINDOW - 1
+        # Higher-priority arrivals push the passed-over requests out of the window.
+        queue.add_requests(
+            _gen_item(KV_BALANCE_WINDOW + i, 100, priority=1.0) for i in range(KV_BALANCE_WINDOW)
+        )
+        router.pop_requests(queue, states, 1, 8)
+        assert not passed_over & set(router._kv_balance_skipped_rounds)
 
-    def test_pop_without_kv_balance_is_fifo(self):
+    def test_gen_admission_order_is_kept_and_reported(self):
         router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        queue = _gen_only_queue([8000, 300, 400])
-        states = _kv_states(tokens=[20000, 21000], active=[8, 7])
-        chosen = router.pop_requests(queue, states, 1, max_num_active_requests=8, kv_balance=False)
-        assert [item.id for item in chosen] == [0]
-        assert router._kv_balanced_placement == {}
-        assert router._kv_balance_skipped_rounds == {}
+        queue = GenAdmissionWaitingQueue(GenAdmissionConfig(ttft_percentile=100.0))
+        for i in range(KV_BALANCE_WINDOW + 8):
+            item = _gen_item(i, 8000 if i % 3 else 300)
+            # Original arrival runs opposite to the GEN arrival order.
+            item.admit_arrival, item.admit_orig_arrival = float(i), float(-i)
+            queue.add_request(item)
+        order = _ids(queue.peek_requests(len(queue)))
+        chosen = router.pop_requests(queue, _states([20000, 21000], [7, 7]), 2, 8)
+        assert set(_ids(chosen)) == set(order[:2])
+        assert queue.admitted_by_tier == {TIER_OLDEST: 2}
+        assert [queue.pop_request().id for _ in range(len(queue))] == order[2:]
 
-    @pytest.mark.parametrize("seed", [0, 1, 2])
-    def test_trickle_fill_keeps_request_counts_in_lockstep(self, seed):
-        """Gen-only fill: long-tailed requests arrive one or two at a time
-        and none leaves. Per-rank request counts never differ by more than
-        one, so the last requests are not stranded on a few ranks."""
+    def test_equal_priorities_admit_like_fcfs(self):
+        rng = random.Random(0)
+        routers = [DefaultADPRouter(dist=_mock_dist(tp_size=4)) for _ in range(2)]
+        queues = [FCFSWaitingQueue(), PriorityWaitingQueue()]
+        tokens, counts = [0] * 4, [0] * 4
+        next_id = 0
+        for _ in range(60):
+            for _ in range(rng.choice([0, 1, 3])):
+                length = int(rng.lognormvariate(9.0, 1.0))
+                for queue in queues:
+                    queue.add_request(_gen_item(next_id, length))
+                next_id += 1
+            states = _states(tokens, counts)
+            budget = rng.choice([0, 1, 2])
+            chosen = [r.pop_requests(q, states, budget, 8) for r, q in zip(routers, queues)]
+            assert _ids(chosen[0]) == _ids(chosen[1]) and _ids(queues[0]) == _ids(queues[1])
+            assignment, _ = routers[0].route_requests(states, chosen[0], 8)
+            routers[1].route_requests(states, chosen[1], 8)
+            for rank, assigned in assignment.items():
+                counts[rank] += len(assigned)
+                tokens[rank] += sum(item.request.num_input_tokens for item in assigned)
+            for rank in range(4):  # requests finish now and then
+                if counts[rank] and rng.random() < 0.3:
+                    counts[rank] -= 1
+                    tokens[rank] = tokens[rank] * counts[rank] // (counts[rank] + 1)
+
+    def test_trickle_fill_keeps_request_counts_within_one(self):
+        """Gen-only fill without departures: per-rank request counts stay within one."""
         num_ranks, slots = 16, 16
-        rng = random.Random(seed)
+        rng = random.Random(0)
         router = DefaultADPRouter(dist=_mock_dist(tp_size=num_ranks))
-        tokens = [0] * num_ranks
-        counts = [0] * num_ranks
+        tokens, counts = [0] * num_ranks, [0] * num_ranks
         queue = FCFSWaitingQueue()
         next_id = 0
-        while next_id < num_ranks * slots or len(queue):
+        while next_id < num_ranks * slots or queue:
             for _ in range(min(rng.choice([1, 2]), num_ranks * slots - next_id)):
-                length = int(rng.lognormvariate(9.5, 1.0))
-                queue.append(_gen_only_item(next_id, length))
+                queue.append(_gen_item(next_id, int(rng.lognormvariate(9.5, 1.0))))
                 next_id += 1
-            states = _kv_states(tokens=tokens, active=counts)
-            chosen = router.pop_requests(queue, states, len(queue), max_num_active_requests=slots)
-            assignment, _ = router.route_requests(states, chosen, max_num_active_requests=slots)
+            states = _states(tokens, counts)
+            chosen = router.pop_requests(queue, states, len(queue), slots)
+            assignment, _ = router.route_requests(states, chosen, slots)
             for rank, items in assignment.items():
                 counts[rank] += len(items)
                 tokens[rank] += sum(item.request.num_input_tokens for item in items)
             assert max(counts) - min(counts) <= 1, counts
         assert counts == [slots] * num_ranks
 
-    def test_route_places_requests_where_admission_planned_them(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        states = _kv_states(tokens=[0, 0], active=[7, 7])
-        # Planned over the whole window (mean 5033 tokens): 5000 -> rank 0,
-        # 100 -> rank 1. Re-planning only the two admitted requests would
-        # aim at their mean (2550) and swap them.
-        queue = _gen_only_queue([10000, 100, 5000])
-        chosen = router.pop_requests(queue, states, 4, max_num_active_requests=8)
-        assert [item.id for item in chosen] == [1, 2]
-        assignment, expected = router.route_requests(states, chosen, max_num_active_requests=8)
-        assert [item.id for item in assignment[0]] == [2]
-        assert [item.id for item in assignment[1]] == [1]
-        assert expected == 8
-        assert router._kv_balanced_placement == {}
-
-    def test_requests_not_popped_by_kv_admission_keep_heap_routing(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        states = _kv_states(tokens=[0, 0], active=[0, 0])
-        items = [_gen_only_item(i, n) for i, n in enumerate([9000, 3000, 3000, 3000])]
-        assignment, expected = router.route_requests(states, items, max_num_active_requests=4)
-        assert [len(assignment[r]) for r in range(2)] == [2, 2]
-        assert expected == 2
-
-    def test_context_request_in_window_keeps_fifo(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        queue = FCFSWaitingQueue(
-            [
-                _gen_only_item(0, 8000),
-                _gen_only_item(1, 300),
-                _gen_only_item(
-                    2, 400, request_type=RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
-                ),
-            ]
-        )
-        states = _kv_states(tokens=[20000, 21000], active=[8, 7])
-        chosen = router.pop_requests(queue, states, 1, max_num_active_requests=8)
-        assert [item.id for item in chosen] == [0]
-        assert router._kv_balance_skipped_rounds == {}
-
-    def test_context_requests_keep_heap_routing(self):
-        states = _kv_states(tokens=[0, 0], active=[0, 0])
-        items = [
-            _gen_only_item(i, n, request_type=RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION)
-            for i, n in enumerate([9000, 3000, 3000, 3000])
-        ]
-        assignment, expected = DefaultADPRouter(dist=_mock_dist(tp_size=2)).route_requests(
-            states, items, max_num_active_requests=4
-        )
-        # Fair-share count cap: two requests per rank.
-        assert [len(assignment[r]) for r in range(2)] == [2, 2]
-        assert expected == 2
-
-    def test_pop_without_capacity_does_not_look_at_the_queue(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        router._kv_balance_skipped_rounds = {0: 3}
-
-        class _UntouchableQueue(FCFSWaitingQueue):
-            def peek_requests(self, k):
-                raise AssertionError("queue scanned without capacity")
-
-            def __iter__(self):
-                raise AssertionError("queue scanned without capacity")
-
-        queue = _UntouchableQueue([_gen_only_item(i, 100) for i in range(4)])
-        states = _kv_states(tokens=[0, 0], active=[0, 0])
-        assert router.pop_requests(queue, states, 0, max_num_active_requests=8) == []
-        assert len(queue) == 4
-        assert router._kv_balance_skipped_rounds == {0: 3}
-
-    def test_admission_from_a_large_priority_queue_does_not_sort_it(self, monkeypatch):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        queue = PriorityWaitingQueue()
-        for i in range(2000):
-            queue.add_request(_gen_only_item(i, 100 + i % 50, priority=(i % 5) / 10))
-
-        def _no_full_scan(self, *args):
-            raise AssertionError("whole priority heap sorted or rebuilt")
-
-        monkeypatch.setattr(PriorityWaitingQueue, "__iter__", _no_full_scan)
-        monkeypatch.setattr(PriorityWaitingQueue, "remove_by_ids", _no_full_scan)
-        states = _kv_states(tokens=[0, 0], active=[0, 0])
-        chosen = router.pop_requests(queue, states, 4, max_num_active_requests=8)
-        assert len(chosen) == 4
-        # Every admitted request has the top priority (ids 4, 9, 14, ...).
-        assert all(item.id % 5 == 4 for item in chosen)
-        assert len(queue) == 2000 - 4
-        assert len(router._kv_balance_skipped_rounds) == KV_BALANCE_WINDOW - 4
-
-    @pytest.mark.parametrize("policy", ["fcfs", "priority"])
-    def test_requests_not_admitted_keep_their_queue_order(self, policy):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        num_items = KV_BALANCE_WINDOW + 8
-        priorities = [(i * 3 % 4) / 10 for i in range(num_items)]
-        items = [
-            _gen_only_item(i, 8000 if i % 3 else 300, priority=priorities[i])
-            for i in range(num_items)
-        ]
-        if policy == "fcfs":
-            queue = FCFSWaitingQueue()
-            queue.extend(items)
-            expected_order = list(range(num_items))
-        else:
-            queue = PriorityWaitingQueue()
-            queue.add_requests(items)
-            # Pending requests put back by an earlier round sort ahead of
-            # later arrivals of the same priority.
-            queue.prepend_requests([_gen_only_item(num_items, 300, priority=0.3)])
-            num_items += 1
-            priorities.append(0.3)
-            expected_order = [num_items - 1] + sorted(
-                range(num_items - 1), key=lambda i: (-priorities[i], i)
-            )
-        assert [item.id for item in queue] == expected_order
-
-        states = _kv_states(tokens=[20000, 21000], active=[7, 7])
-        chosen = router.pop_requests(queue, states, 2, max_num_active_requests=8)
-        chosen_ids = {item.id for item in chosen}
-        assert len(chosen_ids) == 2
-        assert chosen_ids <= set(expected_order[:KV_BALANCE_WINDOW])
-        remaining = [queue.pop_request().id for _ in range(len(queue))]
-        assert remaining == [i for i in expected_order if i not in chosen_ids]
-
-    def test_priority_displacement_restarts_the_skip_count(self):
-        """Under the priority policy the aging bound covers the head window
-        only: requests that sort ahead push a request out and its count
-        restarts."""
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        queue = PriorityWaitingQueue()
-        queue.add_requests(_gen_only_item(i, 100 + i) for i in range(KV_BALANCE_WINDOW))
-        states = _kv_states(tokens=[0, 0], active=[0, 0])
-        assert len(router.pop_requests(queue, states, 1, max_num_active_requests=8)) == 1
-        passed_over = set(router._kv_balance_skipped_rounds)
-        assert len(passed_over) == KV_BALANCE_WINDOW - 1
-        assert set(router._kv_balance_skipped_rounds.values()) == {1}
-
-        queue.add_requests(
-            _gen_only_item(KV_BALANCE_WINDOW + i, 100, priority=1.0)
-            for i in range(KV_BALANCE_WINDOW)
-        )
-        assert len(router.pop_requests(queue, states, 1, max_num_active_requests=8)) == 1
-        assert not passed_over & set(router._kv_balance_skipped_rounds)
-
-    def test_gen_admission_queue_order_and_admission_report(self):
-        """With GEN admission ordering, requests are admitted in its admission
-        order (KV balancing only places them), the rest keeps that order, and
-        the admitted requests are reported."""
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
-        queue = GenAdmissionWaitingQueue(GenAdmissionConfig(ttft_percentile=100.0))
-        num_items = KV_BALANCE_WINDOW + 8
-        for i in range(num_items):
-            item = _gen_only_item(i, 8000 if i % 3 else 300)
-            # Original arrival runs opposite to the GEN arrival order.
-            item.admit_arrival = float(i)
-            item.admit_orig_arrival = float(-i)
-            queue.add_request(item)
-        expected_order = list(range(num_items - 1, -1, -1))
-        assert [item.id for item in queue.peek_requests(num_items)] == expected_order
-
-        states = _kv_states(tokens=[20000, 21000], active=[7, 7])
-        chosen = router.pop_requests(queue, states, 2, max_num_active_requests=8)
-        chosen_ids = {item.id for item in chosen}
-        assert chosen_ids == set(expected_order[:2])
-        assert queue.admitted_by_tier == {TIER_OLDEST: 2}
-        remaining = [queue.pop_request().id for _ in range(len(queue))]
-        assert remaining == [i for i in expected_order if i not in chosen_ids]
-
-    @pytest.mark.parametrize("seed", [0, 1])
-    def test_priority_queue_of_equal_priorities_admits_like_fcfs(self, seed):
-        """With equal priorities both queue types admit the same requests in
-        every round and keep the same order."""
-        rng = random.Random(seed)
-        fcfs_router = DefaultADPRouter(dist=_mock_dist(tp_size=4))
-        priority_router = DefaultADPRouter(dist=_mock_dist(tp_size=4))
-        fcfs_queue, priority_queue = FCFSWaitingQueue(), PriorityWaitingQueue()
-        tokens, counts = [0] * 4, [0] * 4
-        next_id = 0
-        for _ in range(60):
-            for _ in range(rng.choice([0, 1, 3])):
-                length = int(rng.lognormvariate(9.0, 1.0))
-                fcfs_queue.append(_gen_only_item(next_id, length))
-                priority_queue.add_request(_gen_only_item(next_id, length))
-                next_id += 1
-            states = _kv_states(tokens=tokens, active=counts)
-            budget = rng.choice([0, 1, 2])
-            fcfs_chosen = fcfs_router.pop_requests(fcfs_queue, states, budget, 8)
-            priority_chosen = priority_router.pop_requests(priority_queue, states, budget, 8)
-            assert [i.id for i in fcfs_chosen] == [i.id for i in priority_chosen]
-            assert [i.id for i in fcfs_queue] == [i.id for i in priority_queue]
-            assignment, _ = fcfs_router.route_requests(states, fcfs_chosen, 8)
-            priority_router.route_requests(states, priority_chosen, 8)
-            for rank, assigned in assignment.items():
-                counts[rank] += len(assigned)
-                tokens[rank] += sum(item.request.num_input_tokens for item in assigned)
-            # Requests finish now and then, so admission continues.
-            for rank in range(4):
-                if counts[rank] and rng.random() < 0.3:
-                    counts[rank] -= 1
-                    tokens[rank] = tokens[rank] * counts[rank] // (counts[rank] + 1)
-        assert next_id > 0
-
     def test_affinity_routers_keep_fifo_admission(self):
         router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2))
-        queue = _gen_only_queue([8000, 300, 400])
-        states = _kv_states(tokens=[20000, 21000], active=[8, 7])
-        chosen = router.pop_requests(queue, states, 1, max_num_active_requests=8)
-        assert [item.id for item in chosen] == [0]
+        queue = _gen_queue([8000, 300, 400])
+        assert _ids(router.pop_requests(queue, _states([20000, 21000], [8, 7]), 1, 8)) == [0]

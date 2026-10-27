@@ -56,15 +56,10 @@ if TYPE_CHECKING:
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
-# KV-balanced admission considers this many requests from the head of the
-# waiting queue.
+# KV-balanced admission chooses among this many requests at the head of the queue.
 KV_BALANCE_WINDOW = 32
-# A request passed over in this many admission rounds while among the first
-# KV_BALANCE_WINDOW queued requests is admitted next. This bounds the wait
-# under FCFS, where arrivals join at the tail. Under waiting_queue_policy=PRIORITY
-# (or GEN admission ordering), a request pushed out of that window by requests
-# that sort ahead of it restarts its count; the queue order, not KV balancing,
-# holds it back then.
+# A request passed over in this many admitting rounds while in that window is
+# admitted next (under PRIORITY, a request pushed out of the window starts over).
 KV_BALANCE_MAX_SKIPPED_ROUNDS = 64
 
 
@@ -80,9 +75,7 @@ def _num_input_tokens(request) -> int:
 
 
 def _is_kv_balanced_request(req_item) -> bool:
-    """True for a generation-only request without child requests or a strict
-    ``attention_dp_rank``: its whole prompt KV lands on the chosen rank at
-    admission, and no placement constraint competes with KV balance."""
+    """Generation-only request without child requests or ``attention_dp_rank``."""
     request = req_item.request
     if request is None or req_item.child_req_ids:
         return False
@@ -103,40 +96,22 @@ def plan_kv_balanced_admission(
 ) -> List[Tuple[int, int]]:
     """Plan which candidates to admit and on which rank.
 
-    Ranks step in lockstep under attention DP, so a decode step waits for the
-    slowest rank. Its time grows with two maxima over the ranks: the most KV
-    tokens on one rank (attention over the KV) and the most requests on one
-    rank (per-request work, such as linear-attention state updates). Every
-    placement therefore first avoids raising the largest per-rank request
-    count; that is the only count constraint, so ranks below the largest count
-    stay free to take KV.
-
-    Candidates are admitted group by group, in group order: no candidate is
-    admitted while a candidate of an earlier group stays queued. A group that
-    fits in the remaining admissions is admitted whole, largest first, each
-    candidate to an open rank that raises neither maximum, and among those to
-    the rank it leaves closest below the current KV maximum (best fit), which
-    keeps the lightest ranks free for long requests that arrive later. When
-    every open rank raises a maximum, the smallest rise wins, then the
-    least-loaded rank.
-
-    When a group has more candidates than admissions left, each admission
-    takes the (candidate, rank) pair that does not raise the request-count
-    maximum and brings the rank closest to the target, the mean per-rank load
-    once every admission holds an average-sized candidate of the group; ties
-    go to the earlier candidate. Forced candidates of the group are taken
-    first, in queue order, on the rank the best-fit rule picks.
+    A lockstep decode step waits for the rank with the most KV and for the rank
+    with the most requests, so no admission raises the largest request count
+    while another rank can take it. Groups are admitted in order. A group that
+    fits goes largest first, each candidate to the rank it leaves closest below
+    the KV maximum (best fit); otherwise each slot takes the candidate that
+    brings its rank closest to the mean load, forced candidates first.
 
     Args:
         candidate_tokens: KV tokens of each candidate, in queue order.
-        candidate_forced: Whether the candidate must be admitted first.
-        rank_tokens: Current KV tokens per rank.
-        rank_num_requests: Current requests per rank.
+        candidate_forced: Whether each candidate must be admitted first.
+        rank_tokens: KV tokens per rank.
+        rank_num_requests: Requests per rank.
         max_requests_per_rank: Request slots per rank.
         max_new_requests: Upper bound on the number of admissions.
-        candidate_groups: Admission group of each candidate, numbered from 0
-            in queue order (see ``WaitingQueue.admission_groups``). ``None``
-            puts all candidates in one group.
+        candidate_groups: Admission group of each candidate (see
+            ``WaitingQueue.admission_groups``); ``None`` is one group.
 
     Returns:
         ``(candidate_index, rank)`` pairs in admission order.
@@ -365,20 +340,17 @@ class ADPRouter(ABC):
         max_num_active_requests: int,
         kv_balance: bool = True,
     ) -> list[RequestQueueItem]:
-        """Pop the requests to admit this iteration, to be passed to
-        ``route_requests``. Every rank sees the same waiting queue and rank
-        states, so every rank pops the same requests.
+        """Pop the requests to admit, for ``route_requests``; FIFO by default.
 
-        The default admits in FIFO order; a request with a strict
-        ``attention_dp_rank`` whose rank is full stays queued.
+        Every rank sees the same queue and rank states, so all ranks pop the same
+        requests.
 
         Args:
             waiting_queue: Queue to pop from.
             all_rank_states: State of all ranks (from allgather).
             max_new_requests: Maximum number of requests to admit.
             max_num_active_requests: Maximum active requests per rank.
-            kv_balance: Whether a router may admit by KV load. False admits in
-                FIFO order.
+            kv_balance: Whether the router may admit by KV load.
         """
         return get_from_waiting_queue(
             waiting_queue,
@@ -478,39 +450,19 @@ class DefaultADPRouter(ADPRouter):
            fewer tokens get more requests. Requests are sorted by token count
            (descending) for better load balancing.
 
-    KV-balanced admission: generation-only requests (disaggregated decode)
-    bring their whole prompt KV at admission. While the first
-    ``KV_BALANCE_WINDOW`` queued requests are all such requests (without
-    child requests or a strict ``attention_dp_rank``, see
-    ``_is_kv_balanced_request``), ``pop_requests`` plans admission and
-    placement together (``plan_kv_balanced_admission``): no placement raises
-    the largest per-rank request count while another rank can take the
-    request; when the whole window fits, each request goes, largest first, to
-    the rank it leaves closest below the largest per-rank KV load; otherwise
-    each slot takes the request from that window that brings its rank closest
-    to the mean load. The queue's admission groups bound the reordering
-    (``WaitingQueue.admission_groups``): the FCFS queue is one group, the
-    priority queue one group per priority, so a lower-priority request is
-    never admitted while a higher-priority one waits, and GEN admission
-    ordering one group per request, so its order is kept and only the rank is
-    chosen. A request passed over for
-    ``KV_BALANCE_MAX_SKIPPED_ROUNDS`` admission rounds while in that window is
-    admitted next within its group. That bound is exact under FCFS; under the
-    priority policy, a request pushed out of the window by requests that sort
-    ahead of it restarts its count.
-    ``route_requests`` places the popped requests where that plan put them.
-    The executor turns it off (``kv_balance=False``) during warmup and the
-    disaggregated-benchmark fill phase, where every request must fit at once
-    and none leaves; a single-rank group admits in queue order.
+    Generation-only requests are admitted by KV load: while the first
+    ``KV_BALANCE_WINDOW`` queued requests are all such requests,
+    ``pop_requests`` plans admission and placement together
+    (``plan_kv_balanced_admission``, ordered by ``WaitingQueue.admission_groups``)
+    and ``route_requests`` places them as planned. A single rank, warmup and the
+    benchmark fill phase admit in queue order.
     """
 
     def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = False):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
-        # Request id -> admission rounds in which KV-balanced admission passed
-        # it over; covers the requests in the current head window only.
+        # Request id -> admitting rounds it was passed over in the window.
         self._kv_balance_skipped_rounds: Dict[int, int] = {}
-        # Request id -> rank of the requests the last KV-balanced admission
-        # popped, until route_requests places them.
+        # Request id -> planned rank, until route_requests places it.
         self._kv_balanced_placement: Dict[int, int] = {}
 
     def create_rank_state(
@@ -537,8 +489,7 @@ class DefaultADPRouter(ADPRouter):
         kv_balance: bool = True,
     ) -> list[RequestQueueItem]:
         self._kv_balanced_placement = {}
-        # A single rank has no placement to choose, so KV balancing could only
-        # reorder its admissions.
+        # A single rank has no placement to choose.
         if not kv_balance or max_new_requests <= 0 or len(all_rank_states) <= 1:
             return super().pop_requests(
                 waiting_queue, all_rank_states, max_new_requests, max_num_active_requests
@@ -565,10 +516,7 @@ class DefaultADPRouter(ADPRouter):
         self._kv_balanced_placement = {window[idx].id: rank for idx, rank in plan}
         chosen_ids = set(self._kv_balanced_placement)
         if chosen_ids:
-            # Every chosen request is in the head window: pop the window, put
-            # the others back in queue order and report the admitted ones, as
-            # get_from_waiting_queue does. This avoids remove_by_ids, which
-            # rebuilds the whole queue.
+            # Pop the window and put the rest back in order (no remove_by_ids).
             popped = [waiting_queue.pop_request() for _ in window]
             waiting_queue.prepend_requests(item for item in popped if item.id not in chosen_ids)
             waiting_queue.mark_admitted(chosen)
@@ -596,7 +544,7 @@ class DefaultADPRouter(ADPRouter):
 
         placement, self._kv_balanced_placement = self._kv_balanced_placement, {}
         if new_requests and all(item.id in placement for item in new_requests):
-            # Popped by KV-balanced admission: place them as it planned.
+            # Popped by KV-balanced admission: place them as planned.
             for item in new_requests:
                 rank = placement[item.id]
                 all_ranks_new_requests[rank].append(item)

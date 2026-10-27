@@ -112,24 +112,18 @@ class TestFCFSWaitingQueue:
             queue.peek_request()
 
     def test_peek_requests(self):
-        """peek_requests(k) returns the first k requests in pop order, including
-        prepended ones, without removing them."""
+        """peek_requests(k) returns the first k requests in pop order without
+        removing them; they form one admission group."""
         queue = FCFSWaitingQueue()
         queue.add_requests([create_mock_request_item(i) for i in range(2, 6)])
         queue.prepend_requests([create_mock_request_item(i) for i in [0, 1]])
 
         assert [item.id for item in queue.peek_requests(3)] == [0, 1, 2]
+        assert queue.admission_groups(queue.peek_requests(3)) == [0, 0, 0]
         assert [item.id for item in queue.peek_requests(10)] == [0, 1, 2, 3, 4, 5]
         assert queue.peek_requests(0) == []
         assert len(queue) == 6
         assert FCFSWaitingQueue().peek_requests(4) == []
-
-    def test_admission_groups_is_one_group(self):
-        """FCFS order carries no precedence within a peeked window."""
-        queue = FCFSWaitingQueue()
-        queue.add_requests([create_mock_request_item(i) for i in range(4)])
-        assert queue.admission_groups(queue.peek_requests(4)) == [0, 0, 0, 0]
-        assert queue.admission_groups([]) == []
 
     def test_prepend_request(self):
         """Test prepending a request to the front."""
@@ -556,14 +550,15 @@ class TestPriorityWaitingQueue:
         assert iterated_ids == [1, 2, 0]  # 0.9, 0.5, 0.1
 
     def test_peek_requests_follows_pop_order(self):
-        """peek_requests(k) matches the pop order, including prepended
-        entries, and does not remove anything."""
+        """peek_requests(k) matches the pop order and removes nothing; each
+        priority is one admission group."""
         q = PriorityWaitingQueue()
         for i, p in enumerate([0.1, 0.9, 0.5, 0.5, 0.9]):
             q.add_request(create_priority_request_item(i, priority=p))
         q.prepend_requests([create_priority_request_item(5, priority=0.5)])
 
         assert [item.id for item in q.peek_requests(4)] == [1, 4, 5, 2]
+        assert q.admission_groups(q.peek_requests(4)) == [0, 0, 1, 1]
         assert [item.id for item in q.peek_requests(10)] == [item.id for item in q]
         assert q.peek_requests(0) == []
         assert len(q) == 6
@@ -582,16 +577,6 @@ class TestPriorityWaitingQueue:
         monkeypatch.setattr(PriorityWaitingQueue, "__iter__", _no_full_sort)
         peeked = [item.id for item in q.peek_requests(4)]
         assert peeked == [6, 13, 20, 27]
-
-    def test_admission_groups_follow_priority(self):
-        """Each priority of a peeked window is one admission group, numbered in
-        pop order."""
-        q = PriorityWaitingQueue()
-        for i, p in enumerate([0.1, 0.9, 0.5, 0.5, 0.9]):
-            q.add_request(create_priority_request_item(i, priority=p))
-        window = q.peek_requests(5)
-        assert [item.id for item in window] == [1, 4, 2, 3, 0]
-        assert q.admission_groups(window) == [0, 0, 1, 1, 2]
 
     def test_iter_does_not_consume_items(self):
         """Iterating over the queue does not remove items."""

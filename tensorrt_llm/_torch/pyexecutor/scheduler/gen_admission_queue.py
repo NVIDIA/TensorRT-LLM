@@ -472,7 +472,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         return [entry[4] for entry, _ in self._order[: -k - 1 : -1]]
 
     def admission_groups(self, requests: list) -> list[int]:
-        """Each request is its own group, so the admission order is kept."""
+        """One group per request: the admission order is kept."""
         return list(range(len(requests)))
 
     def prepend_request(self, request) -> None:

@@ -409,23 +409,13 @@ class TestSlackPick:
         )
         q.set_now(now, 0.0)
         assert [r.id for r in q.peek_requests(3)] == [4, 3, 2]
+        assert q.admission_groups(q.peek_requests(3)) == [0, 1, 2]
         assert q.peek_requests(0) == []
         assert admit(q).id == 4
         assert [r.id for r in q.peek_requests(10)] == [3, 2, 5, 1]
         assert len(q) == 4
         assert drain(q) == [3, 2, 5, 1]
         assert q.peek_requests(2) == []
-
-    def test_admission_groups_keep_the_admission_order(self):
-        """Every request is its own admission group, so a caller that may
-        reorder within a group keeps the admission order."""
-        q = fixed_slack(14.0, 20.0)
-        now = 1000.0
-        q.add_requests(
-            [make_item(i, gen_arrival=now - i, orig_arrival=now - 10 - i) for i in range(1, 4)]
-        )
-        q.set_now(now, 0.0)
-        assert q.admission_groups(q.peek_requests(3)) == [0, 1, 2]
 
     def test_stats_line(self):
         q = fixed_slack(14.0, 20.0)

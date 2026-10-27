@@ -6788,9 +6788,8 @@ class PyExecutor:
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
         if self.enable_attention_dp:
-            # Warmup and the benchmark fill phase admit in FIFO order: in the
-            # fill phase every request must fit at once and none leaves, so
-            # placement by KV load could strand the last requests.
+            # FIFO in warmup and the benchmark fill phase, where every request
+            # must fit at once.
             kv_balance = not (self.is_warmup or
                               (self.is_benchmark_disagg
                                and self._benchmark_fill_phase_active))

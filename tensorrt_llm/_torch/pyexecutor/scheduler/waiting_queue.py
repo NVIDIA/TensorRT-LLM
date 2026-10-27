@@ -58,12 +58,10 @@ class WaitingQueue(ABC):
         pass
 
     def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
-        """Return the admission group of each request returned by ``peek_requests``.
+        """Admission group of each request from ``peek_requests``, numbered in pop order.
 
-        A caller that admits peeked requests out of pop order must admit every
-        request of a group before any request of a later group; within a
-        group the order is free. Groups are numbered from 0 in pop order. By
-        default all requests form one group.
+        Out-of-order admission must finish a group before the next one. Default:
+        one group.
         """
         return [0] * len(requests)
 
@@ -253,7 +251,7 @@ class PriorityWaitingQueue(WaitingQueue):
         return [e[2] for e in heapq.nsmallest(max(k, 0), self._heap)]
 
     def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
-        """Requests of equal priority form one group; higher priorities come first."""
+        """One group per priority."""
         groups = []
         group = 0
         for i, request in enumerate(requests):
