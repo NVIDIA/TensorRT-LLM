@@ -1047,8 +1047,15 @@ it does not add execution dependencies between graph replays.
 
 A reservation miss uses the persistent unregistered dispatch buffer; NCCL-EP
 stages the incoming payload and copies it locally in stream order. Combine
-inputs can still use ordinary operation-scoped window leases: the pinned LL
-implementation reads these inputs locally before sending to internal staging.
+inputs use a temporary lease scope around the external NCCL-EP MoE forward.
+The scheduler calls the optional `request_combine_input` communication hook
+before dispatch and first writes the returned destination in
+expert compute after dispatch. The LL dispatch exchanges completion counts with
+all unmasked peers, including peers sending zero tokens, ordering previous
+same-stream consumers before subsequent use. Combine reads this input locally
+before sending to internal staging. Only the final result escapes the scope;
+the combine-input lease is released on the current stream for reuse by later
+layers, subject to the pool's stream and graph-owner restrictions.
 
 At final context teardown, all local streams are synchronized and EP ranks
 rendezvous before the reservation is explicitly released. Graphs referencing

@@ -1505,6 +1505,7 @@ def _worker_nccl_window_reservation_lifetime() -> dict:
 
 def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
     """Queue skewed reuse without host barriers or device sync between iterations."""
+    from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
     from tensorrt_llm._torch.nccl_window_graph import (
         nccl_window_graph_capture,
         release_nccl_window_graph_owner,
@@ -1528,10 +1529,81 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
         )
         weights = torch.ones((num_tokens, 1), device="cuda")
         observed_generic = torch.empty(
-            (2, num_tokens, config.hidden_size), device="cuda", dtype=torch.bfloat16
+            (2, max(config.all_num_tokens), config.hidden_size), device="cuda", dtype=torch.bfloat16
         )
-        observed_recv = torch.empty_like(hidden)
-        generic_ptrs, dispatch_ptrs = [], []
+        observed_recv = torch.empty(
+            (config.all_num_tokens[peer], config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        generic_ptrs, dispatch_ptrs, combine_ptrs = [], [], []
+        max_tokens = max(config.all_num_tokens)
+
+        def run_experts(ctx, workspace):
+            received = ctx.x
+            assert comm._ctx.dispatch_window is not None
+            assert received.data_ptr() == comm._ctx.output_tokens_buf.data_ptr()
+            dispatch_ptrs.append(received.data_ptr())
+            if rank == 0:
+                torch.cuda._sleep(50_000_000)
+            peer_rows = slice(peer * max_tokens, peer * max_tokens + config.all_num_tokens[peer])
+            observed_recv.copy_(received[peer_rows])
+            expert_output = ctx.comm_plan.moe_output
+            assert ctx.comm_plan.combine_window is not None
+            expert_output.zero_()
+            expert_output[peer_rows].copy_(observed_recv)
+            return expert_output
+
+        backend = SimpleNamespace(
+            _supports_load_balancer=lambda: False,
+            supports_moe_output_in_alltoall_workspace=lambda: True,
+            quantize_input=lambda x, **kwargs: (x, None),
+            run_moe=run_experts,
+            input_requirement=SimpleNamespace(
+                requires_run_moe_workspace=False,
+                routing_scales_dtype=torch.float32,
+                requires_sanitized_expert_ids=False,
+            ),
+            capabilities=SimpleNamespace(supports_moe_lora=False),
+        )
+        moe = SimpleNamespace(
+            comm=comm,
+            backend=backend,
+            use_dp=False,
+            enable_alltoall=True,
+            calculate_num_chunks=lambda _: 1,
+            determine_communication_method=lambda *_: None,
+            repeat_idx=0,
+            repeat_count=1,
+            layer_idx=0,
+            num_slots=config.num_experts,
+            apply_router_weight_on_input=False,
+            layer_load_balancer=None,
+            enable_dummy_allreduce=False,
+            routing_method=SimpleNamespace(
+                requires_separated_routing=True,
+                experts_per_token=1,
+                apply=lambda *_: (routes, weights),
+            ),
+            _load_balancer_start_wait_gpu_stage=lambda *_: None,
+            _load_balancer_start_set_cpu_stage=lambda *_: None,
+            _load_balancer_done_set_cpu_stage=lambda *_: None,
+        )
+        scheduler = ExternalCommMoEScheduler(moe)
+        request_input = comm.request_combine_input
+
+        def tracked_request(*args, **kwargs):
+            combine_input = request_input(*args, **kwargs)
+            assert combine_input is not None
+            combine_ptrs.append(combine_input[0].data_ptr())
+            return combine_input
+
+        comm.request_combine_input = tracked_request
+        dispatch = comm.dispatch
+
+        def checked_dispatch(*args, **kwargs):
+            assert len(combine_ptrs) == len(dispatch_ptrs) + 1, "Lease must precede dispatch"
+            return dispatch(*args, **kwargs)
+
+        comm.dispatch = checked_dispatch
 
         def roundtrip():
             # This ordinary pool user has no peer-completion protocol. Its delayed
@@ -1546,28 +1618,21 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
                 if rank == 0:
                     torch.cuda._sleep(50_000_000)
                 observed_generic.copy_(generic)
-            with nccl_window_tensor_scope(hidden):
-                received, _, _, scales = comm.dispatch(
-                    hidden, None, routes, weights, config.all_num_tokens
-                )
-                assert comm._ctx.dispatch_window is not None
-                assert received.data_ptr() == comm._ctx.output_tokens_buf.data_ptr()
-                dispatch_ptrs.append(received.data_ptr())
-                with nccl_window_tensor_scope(received):
-                    # Exercise the separate proof for reuse of a dispatch destination:
-                    # a slow consumer precedes combine, including zero-token peers.
-                    if rank == 0:
-                        torch.cuda._sleep(50_000_000)
-                    observed_recv.copy_(received[peer * num_tokens : (peer + 1) * num_tokens])
-                    expert_output = torch.zeros_like(received)
-                    expert_output[peer * num_tokens : (peer + 1) * num_tokens].copy_(observed_recv)
-                    return comm.combine(expert_output)
+            return scheduler.forward(
+                hidden,
+                weights,
+                do_finalize=True,
+                output_dtype=torch.bfloat16,
+                all_rank_num_tokens=config.all_num_tokens,
+                use_dp_padding=False,
+            )
 
         # Registration and handle setup must finish before the asynchronous loop.
         roundtrip()
         torch.cuda.synchronize()
         generic_ptrs.clear()
         dispatch_ptrs.clear()
+        combine_ptrs.clear()
         if capture:
             graph = torch.cuda.CUDAGraph()
             pool = torch.cuda.graph_pool_handle()
@@ -1575,15 +1640,19 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
                 output = roundtrip()
             torch.cuda.synchronize()
 
-        observations = []
-        for _ in range(8):
-            if capture:
-                graph.replay()
-            else:
-                output = roundtrip()
-            observations.append((observed_generic.clone(), observed_recv.clone(), output.clone()))
+        # Keep an enclosing model scope open across all calls.
+        with nccl_window_tensor_scope(hidden):
+            observations = []
+            for _ in range(8):
+                if capture:
+                    graph.replay()
+                else:
+                    output = roundtrip()
+                observations.append(
+                    (observed_generic.clone(), observed_recv.clone(), output.clone())
+                )
         torch.cuda.synchronize()
-        assert len(set(generic_ptrs)) == len(set(dispatch_ptrs)) == 1, (
+        assert len(set(generic_ptrs)) == len(set(dispatch_ptrs)) == len(set(combine_ptrs)) == 1, (
             "Test must force window reuse"
         )
         for generic, received, combined in observations:
@@ -1594,6 +1663,7 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
             assert torch.equal(combined, hidden), (
                 "Combine result corrupted during pooled window reuse"
             )
+        assert generic_ptrs == combine_ptrs, "Combine must reuse the delayed consumer window"
         assert generic_ptrs[0] != dispatch_ptrs[0], "Dispatch borrowed the general-purpose window"
         return {"rank": rank, "capture": capture}
     finally:
@@ -3341,14 +3411,17 @@ class TestMoEComm:
 
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
     @pytest.mark.parametrize("capture", [False, True], ids=["eager", "graph"])
-    def test_nccl_ep_window_reuse_with_delayed_consumer(self, mpi_pool_executor, capture):
+    @pytest.mark.parametrize("all_num_tokens", [[16, 16], [0, 16]], ids=["balanced", "empty-rank"])
+    def test_nccl_ep_window_reuse_with_delayed_consumer(
+        self, mpi_pool_executor, capture, all_num_tokens
+    ):
         config = CommTestConfig(
             comm_type=COMM_NCCL_EP,
             ep_size=2,
             num_experts=32,
             top_k=1,
             hidden_size=1024,
-            all_num_tokens=[16, 16],
+            all_num_tokens=all_num_tokens,
         )
         reason = _get_skip_reason(config)
         if reason:

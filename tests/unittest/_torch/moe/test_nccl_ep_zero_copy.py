@@ -6,7 +6,7 @@
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import torch
 
@@ -275,6 +275,63 @@ class TestNcclEPZeroCopy(unittest.TestCase):
         desc = self.strategy._handle.combine.call_args.args[0].tokens
         self.assertIs(desc.window, window)
 
+    def test_scheduler_scopes_combine_input_and_preserves_anchor(self):
+        scheduler = ExternalCommMoEScheduler(
+            SimpleNamespace(
+                comm=self.strategy,
+                use_dp=False,
+                calculate_num_chunks=lambda _: 1,
+                determine_communication_method=Mock(),
+            )
+        )
+        hidden = torch.empty((3, 128), dtype=torch.bfloat16)
+        output = torch.empty_like(hidden)
+        logits = torch.empty((3, 32))
+        scope_context = MagicMock()
+        scope = scope_context.__enter__.return_value
+        scope.escape.side_effect = lambda value: value
+        order = Mock()
+        order.attach_mock(scope_context.__enter__, "enter")
+        scheduler._forward_single_chunk = Mock(return_value=output)
+        order.attach_mock(scheduler._forward_single_chunk, "compute")
+        order.attach_mock(scope.escape, "escape")
+        order.attach_mock(scope_context.__exit__, "exit")
+        with patch(
+            "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.nccl_window_tensor_scope",
+            return_value=scope_context,
+        ) as make_scope:
+            result = scheduler.forward(
+                hidden,
+                logits,
+                do_finalize=True,
+                output_dtype=torch.bfloat16,
+                all_rank_num_tokens=[3, 3],
+                use_dp_padding=False,
+            )
+        make_scope.assert_called_once_with(logits)
+        self.assertIs(result, output)
+        self.assertEqual(
+            [entry[0] for entry in order.mock_calls],
+            ["enter", "escape", "compute", "escape", "exit"],
+        )
+        self.assertEqual(scope.escape.call_args_list, [call(logits), call(output)])
+        scope_context.__exit__.assert_called_once_with(None, None, None)
+
+    def test_scheduler_accepts_optional_combine_input_hook(self):
+        pooled = torch.empty((8, 128), dtype=torch.bfloat16)
+        window = object()
+        request = Mock(return_value=(pooled, window))
+        scheduler = ExternalCommMoEScheduler(
+            SimpleNamespace(
+                comm=SimpleNamespace(request_combine_input=request),
+                backend=SimpleNamespace(supports_moe_output_in_alltoall_workspace=lambda: True),
+            )
+        )
+        self.assertEqual(scheduler._request_combine_input(torch.bfloat16, True), (pooled, window))
+        request.assert_called_once_with(torch.bfloat16)
+        scheduler.moe.comm = SimpleNamespace()
+        self.assertIsNone(scheduler._request_combine_input(torch.bfloat16, True))
+
     def test_scheduler_allocates_destination_only_when_supported(self):
         pooled = torch.empty((8, 128), dtype=torch.bfloat16)
         scheduler = object.__new__(ExternalCommMoEScheduler)
@@ -290,7 +347,12 @@ class TestNcclEPZeroCopy(unittest.TestCase):
                             ),
                         )
                         with self.allocator(pooled, kind, handle) as allocate:
-                            plan = scheduler._build_comm_plan([3, 3], torch.bfloat16, finalize)
+                            combine_input = scheduler._request_combine_input(
+                                torch.bfloat16, finalize
+                            )
+                            plan = scheduler._build_comm_plan(
+                                [3, 3], torch.bfloat16, finalize, combine_input=combine_input
+                            )
                         expected = supported and finalize
                         self.assertEqual(allocate.call_count, int(expected))
                         if expected and handle:
@@ -313,7 +375,10 @@ class TestNcclEPZeroCopy(unittest.TestCase):
             with self.subTest(supported=supported, dtype=dtype):
                 self.strategy._ctx.window_buffers_supported = supported
                 with self.allocator(None) as allocate:
-                    plan = scheduler._build_comm_plan([3, 3], dtype, True)
+                    combine_input = scheduler._request_combine_input(dtype, True)
+                    plan = scheduler._build_comm_plan(
+                        [3, 3], dtype, True, combine_input=combine_input
+                    )
                 allocate.assert_not_called()
                 self.assertIsNone(plan.moe_output)
                 self.assertIsNone(plan.combine_window)

@@ -386,6 +386,32 @@ class NcclEP(Communication):
     # Combine -- rank-major LL
     # ------------------------------------------------------------------
 
+    def request_combine_input(
+        self, output_dtype: Optional[torch.dtype]
+    ) -> Optional[Tuple[torch.Tensor, NcclEPWindow]]:
+        """Lease an expert-output destination before dispatch, without writing it.
+
+        The caller must hold a tensor lease scope through combine and enqueue
+        all consumers before releasing it. A miss uses ordinary combine staging.
+        """
+        from tensorrt_llm.bindings.internal.thop import BufferKind
+
+        ctx = self._get_context()
+        if not ctx.window_buffers_supported or output_dtype not in (None, torch.bfloat16):
+            return None
+        output, kind, handle = torch.ops.trtllm.allocate_output_with_nccl_window(
+            ctx.output_tokens_buf,
+            int(BufferKind.NCCL_WINDOW),
+            self.mapping.moe_ep_group,
+            [self.max_recv_tokens, self.hidden_size],
+            torch.bfloat16,
+        )
+        if kind != int(BufferKind.NCCL_WINDOW) or not handle:
+            return None
+        return output, NcclEPWindow(
+            handle, output.data_ptr(), output.numel(), output.dtype, output.device
+        )
+
     def combine(
         self,
         final_hidden_states: torch.Tensor,

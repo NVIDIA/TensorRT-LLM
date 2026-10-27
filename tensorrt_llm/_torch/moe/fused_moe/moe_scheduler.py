@@ -43,12 +43,14 @@ exchange runs:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
@@ -67,6 +69,7 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
+    from .communication.nccl_ep import NcclEPWindow
     from .configurable_moe import ConfigurableMoE
 
 
@@ -212,40 +215,49 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # mutation of ``moe.comm`` from a scheduler.
         moe.determine_communication_method(all_rank_num_tokens_padded, num_chunks)
 
-        # ========== Step 3: Execute MoE computation ==========
-        if num_chunks == 1:
-            outputs = self._forward_single_chunk(
-                x,
-                router_logits,
-                output_dtype,
-                all_rank_num_tokens_padded,
-                use_dp_padding,
-                do_finalize,
-                input_ids,
-                lora_params=lora_params,
-                routing_aux=routing_aux,
-                input_ready_event=input_ready_event,
-            )
-        else:
-            input_ready_event = _wait_input_ready(input_ready_event)
-            outputs = self._forward_multiple_chunks(
-                x,
-                router_logits,
-                num_chunks,
-                output_dtype,
-                all_rank_num_tokens_padded,
-                use_dp_padding,
-                do_finalize,
-                input_ids,
-                lora_params=lora_params,
-                routing_aux=routing_aux,
-            )
+        # Preserve the borrowed scope anchor for callers that still use it.
+        scope_context = (
+            nccl_window_tensor_scope(router_logits)
+            if callable(getattr(moe.comm, "request_combine_input", None))
+            else nullcontext()
+        )
+        with scope_context as scope:
+            if scope is not None:
+                scope.escape(router_logits)
+            # ========== Step 3: Execute MoE computation ==========
+            if num_chunks == 1:
+                outputs = self._forward_single_chunk(
+                    x,
+                    router_logits,
+                    output_dtype,
+                    all_rank_num_tokens_padded,
+                    use_dp_padding,
+                    do_finalize,
+                    input_ids,
+                    lora_params=lora_params,
+                    routing_aux=routing_aux,
+                    input_ready_event=input_ready_event,
+                )
+            else:
+                input_ready_event = _wait_input_ready(input_ready_event)
+                outputs = self._forward_multiple_chunks(
+                    x,
+                    router_logits,
+                    num_chunks,
+                    output_dtype,
+                    all_rank_num_tokens_padded,
+                    use_dp_padding,
+                    do_finalize,
+                    input_ids,
+                    lora_params=lora_params,
+                    routing_aux=routing_aux,
+                )
 
-        # ========== Step 4: Truncate DP padding ==========
-        if moe.use_dp and moe.parallel_size > 1:
-            outputs = outputs[: all_rank_num_tokens[moe.mapping.tp_rank]]
+            # ========== Step 4: Truncate DP padding ==========
+            if moe.use_dp and moe.parallel_size > 1:
+                outputs = outputs[: all_rank_num_tokens[moe.mapping.tp_rank]]
 
-        return outputs
+            return scope.escape(outputs) if scope is not None else outputs
 
     # ------------------------------------------------------------------
     # Communication-strategy probes (used by _forward_chunk_impl to gate
@@ -598,6 +610,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 eplb_dispatch_kwargs["eplb_local_stats"] = local_statistic_tensor_for_dispatch
                 should_update_eplb_after_dispatch = True
 
+        # Acquire before dispatch, but do not write the destination until dispatch
+        # completes: its peer count exchange orders prior consumers on every rank.
+        combine_input = self._request_combine_input(output_dtype, do_finalize)
+
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
         input_ready_event = _wait_input_ready(input_ready_event)
         use_deep_ep_direct_metadata = False
@@ -675,6 +691,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params,
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             x_ready_event=x_ready_event,
+            combine_input=combine_input,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -718,7 +735,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 final_hidden_states,
                 all_rank_max_num_tokens=all_rank_max_num_tokens,
                 **(
-                    {"window": ctx.comm_plan.combine_window} if isinstance(moe.comm, NcclEP) else {}
+                    {"window": ctx.comm_plan.combine_window}
+                    if ctx.comm_plan.combine_window is not None
+                    else {}
                 ),
             )
         else:
@@ -1059,6 +1078,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict],
         use_deep_ep_direct_metadata: bool = False,
         x_ready_event: Optional[torch.cuda.Event] = None,
+        combine_input: Optional[Tuple[torch.Tensor, "NcclEPWindow"]] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -1083,8 +1103,21 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 output_dtype,
                 do_finalize,
                 use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+                combine_input=combine_input,
             ),
         )
+
+    def _request_combine_input(
+        self, output_dtype: Optional[torch.dtype], do_finalize: bool
+    ) -> Optional[Tuple[torch.Tensor, "NcclEPWindow"]]:
+        request = getattr(self.moe.comm, "request_combine_input", None)
+        if (
+            callable(request)
+            and do_finalize
+            and self.moe.backend.supports_moe_output_in_alltoall_workspace()
+        ):
+            return request(output_dtype)
+        return None
 
     def _build_comm_plan(
         self,
@@ -1092,6 +1125,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         do_finalize: bool,
         use_deep_ep_direct_metadata: bool = False,
+        combine_input: Optional[Tuple[torch.Tensor, "NcclEPWindow"]] = None,
     ) -> MoECommPlan:
         """The comm-layer facts for this forward, derived once for every backend.
 
@@ -1108,30 +1142,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
             do_finalize=do_finalize,
         )
         combine_window = None
-        if (
-            isinstance(moe.comm, NcclEP)
-            and do_finalize
-            and moe.backend.supports_moe_output_in_alltoall_workspace()
-        ):
-            from tensorrt_llm.bindings.internal.thop import BufferKind
-
-            from .communication.nccl_ep import NcclEPWindow
-
-            comm = moe.comm
-            comm_ctx = comm._get_context()
-            if comm_ctx.window_buffers_supported and output_dtype in (None, torch.bfloat16):
-                output, kind, handle = torch.ops.trtllm.allocate_output_with_nccl_window(
-                    comm_ctx.output_tokens_buf,
-                    int(BufferKind.NCCL_WINDOW),
-                    comm.mapping.moe_ep_group,
-                    [comm.max_recv_tokens, comm.hidden_size],
-                    torch.bfloat16,
-                )
-                if kind == int(BufferKind.NCCL_WINDOW) and handle:
-                    moe_output = output
-                    combine_window = NcclEPWindow(
-                        handle, output.data_ptr(), output.numel(), output.dtype, output.device
-                    )
+        if combine_input is not None:
+            moe_output, combine_window = combine_input
         if isinstance(moe.comm, NVLinkOneSided):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
