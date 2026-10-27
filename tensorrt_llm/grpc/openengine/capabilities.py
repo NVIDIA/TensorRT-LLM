@@ -67,6 +67,21 @@ def _loaded_model_type(llm: Any) -> str:
     return resolve_top_level_model_type(llm.input_processor.config)
 
 
+def supports_image_routing(llm: Any, modalities: Collection[str]) -> bool:
+    """Whether the loaded model exposes the validated image KV-event contract."""
+    processor_config = getattr(getattr(llm, "input_processor", None), "config", None)
+    if "image" not in modalities or resolve_top_level_model_type(processor_config) != "qwen3_vl":
+        return False
+    cache = getattr(llm.args, "kv_cache_config", None)
+    events = getattr(cache, "kv_events_config", None)
+    return (
+        getattr(cache, "use_kv_cache_manager_v2", False) is True
+        and getattr(cache, "enable_block_reuse", False) is True
+        and getattr(events, "enable_kv_cache_events", False) is True
+        and getattr(events, "publisher", None) == "zmq"
+    )
+
+
 def resolve_media_capabilities(
     llm: Any, implemented_modalities: Collection[str]
 ) -> MediaCapabilities:

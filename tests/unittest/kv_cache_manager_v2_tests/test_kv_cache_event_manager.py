@@ -393,6 +393,12 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
         make_block = real_block_factory(event_sink, tokens_per_block=4)
         digest_a = bytes(range(32))
         digest_b = bytes(reversed(range(32)))
+        manager.remember_multimodal_uuids(
+            [
+                (digest_a, "dynamo-image-v1:0123456789abcdef"),
+                (digest_b, "dynamo-image-v1:fedcba9876543210"),
+            ]
+        )
         first = make_block([1, digest_a, 1001, 1002], [4])
         gap = make_block([2, 3, 4, 5], [4], parent=first)
         continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
@@ -432,6 +438,41 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
             [(digest_a.hex(), 6), (digest_b.hex(), 0)],
         ]
         assert manager.stored_blocks == 4
+        assert stored.trtllm_image_routing.version == 1
+        assert stored.trtllm_image_routing.token_id_offset == 1000
+        assert [[key.uuid for key in keys] for keys in stored.trtllm_image_routing.keys] == [
+            ["dynamo-image-v1:0123456789abcdef"],
+            [],
+            ["dynamo-image-v1:0123456789abcdef"] * 2,
+            ["dynamo-image-v1:0123456789abcdef", "dynamo-image-v1:fedcba9876543210"],
+        ]
+    finally:
+        manager.shutdown()
+
+
+def test_streaming_uuid_hints_are_bounded_and_do_not_replace_content_hashes():
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=1,
+        mm_token_id_offset=1000,
+    )
+    a, b = bytes(range(32)), bytes(reversed(range(32)))
+    try:
+        manager.remember_multimodal_uuids([(a, "same-routing-hint"), (b, "same-routing-hint")])
+        source = manager._event_source
+        assert len(source._uuids) == 1
+        first = source._multimodal_key((a, 0))
+        second = source._multimodal_key((b, 0))
+        assert first.uuid is None
+        assert second.uuid == "same-routing-hint"
+        assert first.hash != second.hash
+        manager.remember_multimodal_uuids([(a, "x" * 257)])
+        assert len(source._uuids) == 1
+        with pytest.raises(ValueError, match="Conflicting UUIDs"):
+            manager.remember_multimodal_uuids([(b, "different-hint")])
     finally:
         manager.shutdown()
 

@@ -29,10 +29,10 @@ import threading
 import time
 import traceback
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import OrderedDict, deque
 from itertools import count
 from queue import Queue
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import msgspec
 import zmq
@@ -80,6 +80,15 @@ class MultimodalKey(
 
     hash: str
     start_offset: int
+    uuid: str | None = None
+
+
+class ImageRoutingMetadata(msgspec.Struct, frozen=True, gc=False):
+    """Versioned digest-first image normalization metadata for KV routers."""
+
+    version: int
+    token_id_offset: int
+    keys: list[list[MultimodalKey]]
 
 
 class BlockStored(KVCacheWireEvent):
@@ -99,6 +108,7 @@ class BlockStored(KVCacheWireEvent):
     locality: str | None = None
     # Aligned one-for-one with block_hashes when multimodal decoding is enabled.
     mm_keys: list[list[MultimodalKey]] | None = None
+    trtllm_image_routing: ImageRoutingMetadata | None = None
 
 
 class BlockRemoved(KVCacheWireEvent):
@@ -551,6 +561,10 @@ class _StreamingEventSource:
             raise ValueError("mm_token_id_offset must be non-negative")
         self._block_size = block_size
         self._include_mm_keys = mm_token_id_offset is not None
+        self._mm_token_id_offset = mm_token_id_offset
+        self._uuid_capacity = max_entries
+        self._uuids: OrderedDict[bytes, str] = OrderedDict()
+        self._uuid_lock = threading.Lock()
         self._event_sink = kv_cache_manager_v2_runtime.StreamingEventSink(
             max_entries=max_entries,
             mm_token_id_offset=mm_token_id_offset,
@@ -560,6 +574,28 @@ class _StreamingEventSource:
     def event_sink(self) -> kv_cache_manager_v2_runtime.StreamingEventSink:
         return self._event_sink
 
+    def remember_multimodal_uuids(self, items: Iterable[tuple[bytes, str]]) -> None:
+        """Retain bounded routing hints without changing native cache keys."""
+        for digest, uuid in items:
+            if len(uuid.encode("utf-8")) > 256:
+                continue
+            with self._uuid_lock:
+                previous = self._uuids.get(digest)
+                if previous is not None and previous != uuid:
+                    raise ValueError("Conflicting UUIDs for a multimodal content digest")
+                self._uuids[digest] = uuid
+                self._uuids.move_to_end(digest)
+                while len(self._uuids) > self._uuid_capacity:
+                    self._uuids.popitem(last=False)
+
+    def _multimodal_key(self, key: tuple) -> MultimodalKey:
+        digest = bytes(key[0])
+        with self._uuid_lock:
+            uuid = key[2] if len(key) > 2 else None
+            if uuid is None:
+                uuid = self._uuids.get(digest)
+        return MultimodalKey(hash=digest.hex(), start_offset=key[1], uuid=uuid)
+
     def set_target_life_cycle(self, life_cycle_id: int) -> None:
         self._event_sink.set_target_life_cycle(life_cycle_id)
 
@@ -567,6 +603,14 @@ class _StreamingEventSource:
         result: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
         for event in self._event_sink.drain_iteration_events():
             if isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockStoredData):
+                mm_keys = (
+                    [
+                        [self._multimodal_key(key) for key in block_keys]
+                        for block_keys in event.mm_keys
+                    ]
+                    if self._include_mm_keys
+                    else None
+                )
                 result.append(
                     BlockStored(
                         block_hashes=list(event.block_hashes),
@@ -576,15 +620,18 @@ class _StreamingEventSource:
                         lora_id=event.lora_id,
                         medium="GPU",
                         lora_name=None,
-                        mm_keys=(
-                            [
-                                [
-                                    MultimodalKey(hash=bytes(key[0]).hex(), start_offset=key[1])
-                                    for key in block_keys
-                                ]
-                                for block_keys in event.mm_keys
-                            ]
-                            if self._include_mm_keys
+                        mm_keys=mm_keys,
+                        trtllm_image_routing=(
+                            ImageRoutingMetadata(
+                                version=1, token_id_offset=self._mm_token_id_offset, keys=mm_keys
+                            )
+                            if mm_keys is not None
+                            and self._mm_token_id_offset is not None
+                            and any(
+                                key.uuid is not None and key.uuid.startswith("dynamo-image-v1:")
+                                for block_keys in mm_keys
+                                for key in block_keys
+                            )
                             else None
                         ),
                     )
@@ -645,6 +692,10 @@ class StreamingKVCacheEventManager:
     def start(self) -> None:
         """Bind the publisher's sockets and start its background thread."""
         self._publisher.start()
+
+    def remember_multimodal_uuids(self, items: Iterable[tuple[bytes, str]]) -> None:
+        """Associate native MM digests with optional request identities."""
+        self._event_source.remember_multimodal_uuids(items)
 
     def get_source_descriptor(self) -> dict[str, str | int] | None:
         """Describe a live ZMQ publisher for OpenEngine node discovery."""

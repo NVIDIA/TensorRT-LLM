@@ -191,6 +191,7 @@ l0_cpu:
   - unittest/_torch/test_shared_tensor_cpu.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py
   - unittest/grpc/openengine/test_control.py
+  - unittest/grpc/openengine/test_image_routing.py
   - unittest/grpc/openengine/test_multimodal.py
   - unittest/grpc/openengine/test_node.py
   - unittest/grpc/openengine/test_openengine.py

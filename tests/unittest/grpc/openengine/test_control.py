@@ -19,7 +19,10 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     model_pb2,
     server_pb2,
 )
-from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
+from tensorrt_llm.grpc.openengine.capabilities import (  # noqa: E402
+    MediaCapabilities,
+    supports_image_routing,
+)
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.llmapi import KVEventsConfig  # noqa: E402
@@ -28,6 +31,23 @@ from tensorrt_llm.llmapi import KVEventsConfig  # noqa: E402
 pytestmark = pytest.mark.cpu_only
 
 MODEL = "test-model"
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen2_vl", "text"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_image_routing_capability_requires_streaming_v2_and_validated_model(model_type, enabled):
+    llm = SimpleNamespace(
+        input_processor=SimpleNamespace(config=SimpleNamespace(model_type=model_type)),
+        args=SimpleNamespace(
+            kv_cache_config=SimpleNamespace(
+                use_kv_cache_manager_v2=enabled,
+                enable_block_reuse=True,
+                kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq"),
+            )
+        ),
+    )
+    assert supports_image_routing(llm, {"image"}) is (enabled and model_type == "qwen3_vl")
+    assert not supports_image_routing(llm, set())
 
 
 class _FakeHandle:

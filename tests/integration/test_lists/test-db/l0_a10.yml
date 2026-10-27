@@ -69,6 +69,7 @@ l0_a10:
   # false advertisement by construction. The image case uses Qwen3-VL-2B.
   - unittest/grpc/openengine/test_capability_conformance.py
   - unittest/grpc/openengine/test_multimodal_conformance.py
+  - unittest/grpc/openengine/test_image_routing_conformance.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py
