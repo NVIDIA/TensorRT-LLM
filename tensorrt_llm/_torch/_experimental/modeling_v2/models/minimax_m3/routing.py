@@ -246,6 +246,9 @@ def route(
         register()
         arm_sm107_shared_opt_ins()
         if parallel == "tp2":
+            from ...catalog.gemm.m31_router_half_pin import arm_router_half_pin
+
+            arm_router_half_pin()
             from .minimax_m31_nvfp4__sm_107__tp2.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp2
 
             return ModelingV2MiniMaxM31Nvfp4Sm107Tp2

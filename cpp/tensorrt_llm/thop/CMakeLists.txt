@@ -165,6 +165,7 @@ target_sources(
 add_th_common_family(
   th_common_gemm_quant
   cutlassScaledMM.cpp
+  m31RouterHalfPinOp.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
