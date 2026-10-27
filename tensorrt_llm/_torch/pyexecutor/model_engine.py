@@ -27,6 +27,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.interface import AttentionMetadata, AttentionRuntimeFeatures
+from ..autotuner import AutoTuner, NvMMHConfig
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -108,6 +109,19 @@ def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
 # refit (976 graphs measured still live) instead of going cold.
 
 
+def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
+    """Install the engine's nvMatmulHeuristics policy on the process AutoTuner.
+
+    Runs before model construction because CuTe DSL runners may enumerate
+    tactics while modules are built. Engines of one process (e.g. target and
+    draft) share the LLM args and therefore the policy.
+    """
+    # Partial test doubles of TorchLlmArgs may omit the field.
+    config = getattr(llm_args, "autotuner_nvmmh_config", None)
+    AutoTuner.get().nvmmh_config = (None if config is None else NvMMHConfig(
+        max_tactics=config.max_tactics))
+
+
 class ModelEngine:
     """Own model setup and coordinate runner execution and resource lifetimes."""
 
@@ -171,6 +185,7 @@ class ModelEngine:
                 "encode_only models run through EncoderExecutor, which does not use ModelEngine."
             )
         init_process_setup(mapping, dist)
+        _configure_autotuner_nvmmh(llm_args)
 
         (
             max_beam_width,
