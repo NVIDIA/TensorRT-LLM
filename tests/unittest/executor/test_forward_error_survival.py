@@ -25,6 +25,8 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
+from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
@@ -580,6 +582,54 @@ def test_fatal_error_flushes_parked_failures():
     assert not executor._transfer_held_failures
     assert executor.active_requests == []
     executor._terminate_request.assert_called_once_with(receiving)
+
+
+def test_timed_out_receive_cancelled_at_loop_head_is_buffered_not_parked_under_adp(monkeypatch):
+    """A receive cancelled at the loop head is buffered, not parked, under ADP.
+
+    The loop head cancelled it after its KV-transfer timeout, and multi-rank
+    ADP fails it at the synced drain. The cancel leaves no transfer behind,
+    so the real _handle_errors must buffer the error response and the
+    termination for the ADP flush instead of parking the failure: the
+    request has already left active_requests, so the held-failure sweep
+    would drop it without a response.
+    """
+    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: False)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    executor = _transfer_executor()
+    # Set before the first executor.disagg access, which builds the coordinator.
+    executor.enable_attention_dp = True
+    executor.dist = Mock(rank=0, world_size=2, tp_size=2, pp_size=1, cp_size=1)
+    executor.dist.tp_allgather_int64.return_value = Mock(any=lambda: True)
+    executor.canceled_req_ids = []
+    transceiver = executor.kv_cache_transceiver
+    transceiver.kv_transfer_timeout_ms = 1000
+    transceiver.supports_inflight_request_cancellation.return_value = False
+    transceiver.check_gen_transfer_status.return_value = GenTransferStatus([], [], [])
+    transceiver.cancel_request.return_value = True
+    receiving = _gen_receive_request(1)
+    receiving.is_child = False
+    receiving.parent_request_id = None
+    receiving.py_kv_transfer_timed_out = True
+    receiving.is_disagg_generation_transmission_in_progress = True
+    executor.active_requests = [receiving]
+
+    executor.disagg.poll_gen_transfers()
+
+    transceiver.cancel_request.assert_called_once_with(receiving)
+    assert executor.active_requests == []
+    assert receiving.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+    executor.disagg.handle_timeouts_synced()
+
+    executor.dist.tp_allgather_int64.assert_called_once_with([True])
+    assert executor._transfer_held_failures == {}
+    assert executor._pending_response_terminations == [receiving]
+    assert [req_id for req_id, _ in executor._pending_transfer_responses] == [1]
+    assert receiving.state == LlmRequestState.GENERATION_COMPLETE
+    executor._terminate_request.assert_not_called()
+    executor._enqueue_responses.assert_not_called()
 
 
 def _terminating_executor():

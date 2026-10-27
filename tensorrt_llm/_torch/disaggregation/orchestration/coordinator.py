@@ -119,6 +119,10 @@ class DisaggTransferCoordinator:
         self._pending_timed_out_requests: List[LlmRequest] = []
         # Requests whose timed-out transfer was already cancelled in flight.
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
+        # Timed-out requests whose cancellation was requested and whose outcome
+        # the transceiver reports later: accepted in-flight cancels, or,
+        # without in-flight cancellation, generation cancels the transceiver
+        # refused.
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
         # When a forward is still in flight at admission, as under the overlap
@@ -223,7 +227,12 @@ class DisaggTransferCoordinator:
 
     @nvtx_range("poll_gen_transfers")
     def poll_gen_transfers(self) -> None:
-        """Poll receive-side transfers and their timeouts; rank-synchronized."""
+        """Poll receive-side transfers and their timeouts; rank-synchronized.
+
+        Without in-flight cancellation, also cancels and fails the receives
+        that ``check_transfer_timeouts`` flagged, so an idle server does not
+        wait for a forward step.
+        """
         if not uses_async_gen_transfer():
             return
         if self._defer_unready_gen_receives:
@@ -235,6 +244,8 @@ class DisaggTransferCoordinator:
         if self.inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
+        else:
+            self._fail_timed_out_gen_transfers()
 
     @nvtx_range("check_transfer_timeouts")
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:
@@ -747,9 +758,19 @@ class DisaggTransferCoordinator:
     def fail_timed_out(self, requests: List[LlmRequest]) -> None:
         """Fail generation requests whose transfer timed out.
 
-        Under multi-rank ADP the error response enters a collective, so it is
-        deferred to ``handle_timeouts_synced``.
+        Callers pass only requests whose transfer no longer touches their
+        blocks, either because ``cancel_request`` returned True or because the
+        transfer already finished. Under multi-rank ADP the error response
+        enters a collective, so it is deferred to ``handle_timeouts_synced``.
         """
+        for req in requests:
+            # cancel_request does not change the state. Left in progress,
+            # PyExecutor._handle_errors would park the failure for a transfer
+            # that no longer exists (_transfer_owns_request_blocks), and
+            # _sweep_transfer_held_failures would drop it without a response
+            # because the request has already left active_requests.
+            if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
         if self._enable_attention_dp and self._dist.world_size != 1:
             self._pending_timed_out_requests.extend(requests)
             return
@@ -855,6 +876,59 @@ class DisaggTransferCoordinator:
                     f"{request.py_request_id}; waiting for C++ transfer status "
                     "to report final cleanup"
                 )
+
+    @nvtx_range("fail_timed_out_gen_transfers")
+    def _fail_timed_out_gen_transfers(self) -> None:
+        """Cancel and fail generation receives flagged by ``check_transfer_timeouts``.
+
+        Runs from ``poll_gen_transfers`` every iteration when in-flight
+        cancellation is inactive. The response pass does the same, but only
+        after a forward step, so without this an idle generation server would
+        keep a request whose KV never arrives until the client gives up.
+
+        A cancel that finishes at once fails the request through
+        ``fail_timed_out``: inline, or buffered for ``handle_timeouts_synced``
+        under multi-rank ADP. A cancel the transceiver refuses is asked only
+        once. The Python transceiver has then marked the session cancelled,
+        and the next ``reap_gen_receives`` fails the request through the
+        transfer-error path. The C++ transceiver cannot cancel a receive
+        already in flight without in-flight cancellation, so retrying would
+        only repeat its warning; that receive settles on its own.
+        User-canceled requests are left to ``_handle_canceled_requests``.
+        """
+        if self._transceiver.kv_transfer_timeout_ms is None:
+            return
+        timed_out = [
+            request
+            for request in self._registry.active_requests()
+            if request.py_kv_transfer_timed_out
+            and request.is_disagg_generation_transmission_in_progress
+            and request.py_request_id not in self._timed_out_gen_cancelled_ids
+        ]
+        if not timed_out:
+            return
+        user_canceled_ids = set(self._registry.canceled_request_ids())
+        cancelled = []
+        for request in timed_out:
+            if self._vote_id(request) in user_canceled_ids:
+                continue
+            if self.request_cancellation(request):
+                cancelled.append(request)
+                logger.warning(
+                    f"Cancelled timed-out generation KV transfer for request "
+                    f"{request.py_request_id}; failing it"
+                )
+            else:
+                self._timed_out_gen_cancelled_ids.add(request.py_request_id)
+                logger.warning(
+                    f"Requested cancellation of timed-out generation KV transfer "
+                    f"for request {request.py_request_id}; waiting for the "
+                    "transceiver to report it"
+                )
+        for request in cancelled:
+            self._registry.remove(request)
+        if cancelled:
+            self.fail_timed_out(cancelled)
 
     @nvtx_range("check_gen_transfer_errors_consensus")
     def _check_gen_transfer_errors_consensus(self) -> None:

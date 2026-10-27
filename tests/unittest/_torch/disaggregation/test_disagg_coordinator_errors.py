@@ -576,3 +576,96 @@ def test_cancelling_part_of_a_saturated_receive_batch_settles_only_those_request
     assert all(req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE for req in kept)
     assert transceiver.check_gen_transfer_complete()
     assert len(executor.resource_manager.free_resources.call_args_list) == 8
+
+
+# -- generation transfer timeouts through the real executor error path -------
+#
+# The coordinator-level timeout tests cannot see what happens after
+# fail_requests: FakeExecutorEffects never runs PyExecutor._handle_errors.
+# These follow a timed-out receive through it, where a request still in its
+# receive state would be parked for a transfer that no longer exists and then
+# dropped without a response or a free.
+
+
+def _cancel_only_marks_pending_receives(transceiver: FakeKvCacheTransceiver) -> list:
+    """Model the Python transceiver with a receive in flight: cancelling it only
+    marks the session cancelled and returns False, and the next status poll
+    reports the cancelled session. Returns the ids of the deferred cancels."""
+    deferred = []
+    cancel_finished_transfer = transceiver.cancel_request
+
+    def cancel_request(req) -> bool:
+        if req.py_request_id not in transceiver._pending_recvs:
+            return cancel_finished_transfer(req)
+        deferred.append(req.py_request_id)
+        transceiver.cancel_recv_remotely(req)
+        return False
+
+    transceiver.cancel_request = cancel_request
+    return deferred
+
+
+@pytest.mark.parametrize(
+    "cancel_finishes_at_once, error_msg",
+    [
+        (True, "Request 1 timed out"),
+        (False, "Error in kv cache transfer for generation requests"),
+    ],
+)
+def test_idle_generation_timeout_is_answered_and_freed_through_the_real_error_path(
+    monkeypatch, clock, no_inflight_cancel, cancel_finishes_at_once: bool, error_msg: str
+) -> None:
+    """Idle loop heads in the executor's order (transfer poll, timeout check,
+    held-failure sweep) cancel a receive whose KV never arrived. The real
+    error path answers the request once, frees its resources once and parks
+    nothing, whether the cancel finishes at once or is reported by the next
+    status poll."""
+    executor, coordinator, transceiver = _executor_with_real_error_path(monkeypatch)
+    transceiver.kv_transfer_timeout_ms = 1000
+    req = _gen_request(1)
+    transceiver.request_and_receive_async(req)
+    executor.active_requests.append(req)
+    req.py_kv_transfer_start_time = clock["t"]
+    clock["t"] += 2.0
+    deferred = [] if cancel_finishes_at_once else _cancel_only_marks_pending_receives(transceiver)
+
+    for _ in range(3):
+        coordinator.poll_gen_transfers()
+        coordinator.check_transfer_timeouts()
+        executor._sweep_transfer_held_failures()
+
+    (response,) = executor.responses[1]
+    assert response.error_msg == error_msg
+    assert req.state == LlmRequestState.GENERATION_COMPLETE
+    assert executor.active_requests == []
+    executor.resource_manager.free_resources.assert_called_once_with(req)
+    assert executor._held_transfer_failures() == {}
+    if cancel_finishes_at_once:
+        assert transceiver.call_log.count("cancel_request:1") == 1
+    else:
+        assert deferred == [1]
+
+
+def test_timed_out_receive_cancelled_by_the_response_pass_is_answered_not_parked(
+    monkeypatch, no_inflight_cancel
+) -> None:
+    """The response pass of a busy server cancels a timed-out receive and
+    fails it through the same helper; the request must be answered and
+    freed, not parked and then dropped."""
+    executor, _, transceiver = _executor_with_real_error_path(monkeypatch)
+    transceiver.kv_transfer_timeout_ms = 1000
+    req = _gen_request(1)
+    transceiver.request_and_receive_async(req)
+    executor.active_requests.append(req)
+    req.py_kv_transfer_timed_out = True
+
+    executor._handle_responses()
+    executor._sweep_transfer_held_failures()
+
+    assert transceiver.call_log.count("cancel_request:1") == 1
+    (response,) = executor.responses[1]
+    assert response.error_msg == "Request 1 timed out"
+    assert req.state == LlmRequestState.GENERATION_COMPLETE
+    assert executor.active_requests == []
+    executor.resource_manager.free_resources.assert_called_once_with(req)
+    assert executor._held_transfer_failures() == {}
