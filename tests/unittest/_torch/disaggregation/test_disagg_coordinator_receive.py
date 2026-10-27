@@ -472,23 +472,40 @@ def test_deferred_receive_of_a_terminated_request_is_dropped_unpublished(
     assert req.state == terminal_state
 
 
-@pytest.mark.parametrize(
-    "mode_env",
-    [
-        pytest.param({"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1"}, id="sync"),
-        pytest.param({"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY": "1"}, id="gen_only_benchmark"),
-    ],
-)
-def test_deferral_takes_no_fence_outside_async_transfer_mode(monkeypatch, mode_env) -> None:
-    """Deferral applies only to asynchronous receives: in the other modes the
-    fence stays with the cache manager, which waits on it itself."""
-    for name, value in mode_env.items():
-        monkeypatch.setenv(name, value)
+def test_deferral_takes_no_fence_for_synchronous_receives(sync_mode) -> None:
+    """Deferral applies only to asynchronous receives: a synchronous receive
+    leaves the fence with the cache manager, which waits on it itself."""
     h = _deferring_harness({1: _ScriptedEvent(False)})
 
     h.coordinator.receive_gen_init([_gen_init(h, 1)])
 
     assert h.taken_fences == []
+
+
+@pytest.mark.parametrize("defer_unready_gen_receives", [False, True])
+def test_gen_only_benchmark_drops_the_fence_without_waiting(
+    gen_only_benchmark, defer_unready_gen_receives
+) -> None:
+    """gen_only_no_context receives nothing, so admission takes the fence away
+    from the cache manager (whose prepare_resources would wait on it) and
+    neither polls nor waits on it."""
+    fence = _ScriptedEvent(False)
+    h = CoordinatorHarness(defer_unready_gen_receives=defer_unready_gen_receives)
+    taken = []
+
+    def take(req):
+        taken.append(req.py_request_id)
+        return fence
+
+    h.kv_cache_manager.take_disagg_receive_ready = take
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert taken == [1]
+    assert fence.queries == 0
+    assert req.state == _COMPLETE
+    assert h.transceiver.call_log == []
 
 
 def test_without_deferral_no_fence_is_taken_and_receives_start_at_admission() -> None:

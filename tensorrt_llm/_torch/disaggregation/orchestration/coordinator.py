@@ -379,14 +379,21 @@ class DisaggTransferCoordinator:
         if not admitted:
             return
         defer_unready = self._defer_unready_gen_receives and uses_async_gen_transfer()
+        no_context_benchmark = is_gen_only_no_context_benchmark()
         # Take the admission readiness events first, so preparing resources
         # does not block this thread on them; publication polls them instead.
-        fences = self._take_receive_fences(admitted) if defer_unready else {}
+        # gen_only_no_context publishes no receive, so its events order
+        # nothing: the forwards that read these pages run on the stream that
+        # recorded them. Dropping them keeps admission from waiting out the
+        # forward still in flight.
+        fences = (
+            self._take_receive_fences(admitted) if defer_unready or no_context_benchmark else {}
+        )
         self._effects.prepare_gen_resources(admitted)
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
-        if is_gen_only_no_context_benchmark():
+        if no_context_benchmark:
             for req in admitted:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
