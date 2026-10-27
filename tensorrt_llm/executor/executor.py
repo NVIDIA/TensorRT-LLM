@@ -135,6 +135,9 @@ class GenerationExecutor(ABC):
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
+
+        ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
+        omit this argument or pass None.
         """
         assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
             prompt_token_ids[0], int)
@@ -181,6 +184,9 @@ class GenerationExecutor(ABC):
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
+
+        ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
+        omit this argument or pass None.
         """
         unbatched = isinstance(prompt_token_ids[0], int)
 

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import time
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -433,9 +434,22 @@ def test_generation_logprobs_need_no_worker_recomputation():
 
 @pytest.mark.cpu_only
 def test_prompt_adapter_rejected_before_loading_or_changing_tokens() -> None:
-    request = SimpleNamespace(id=1,
-                              prompt_adapter_request=object(),
-                              prompt_token_ids=[10, 11])
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        GenerationRequest(prompt_token_ids=[10, 11],
+                          sampling_params=SamplingParams(max_tokens=1))
+        GenerationRequest(prompt_token_ids=[10, 11],
+                          sampling_params=SamplingParams(max_tokens=1),
+                          prompt_adapter_request=None)
+    assert not recorded
+
+    with pytest.warns(DeprecationWarning,
+                      match="prompt_adapter_request is deprecated"):
+        request = GenerationRequest(
+            prompt_token_ids=[10, 11],
+            sampling_params=SamplingParams(max_tokens=1),
+            prompt_adapter_request=object())
+    request.id = 1
     # An unsupported adapter must fail before accessing any worker resources.
     with pytest.raises(RequestError, match="Prompt adapters are not supported"):
         BaseWorker._enqueue_request(SimpleNamespace(), request)
