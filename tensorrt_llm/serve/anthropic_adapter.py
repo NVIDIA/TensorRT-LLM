@@ -1147,13 +1147,18 @@ async def _with_ticks(
     # holds back the source as reading it directly would.
     items: asyncio.Queue = asyncio.Queue(maxsize=1)
     end = object()
+    consumer_stopped = False
 
     async def read_all() -> None:
         try:
             async for item in source:
                 await items.put(item)
         except asyncio.CancelledError:
-            # The consumer has stopped; nobody is left to take the end marker.
+            if not consumer_stopped:
+                # Raised inside the source, not by the consumer stopping: the
+                # consumer still waits, and the end marker ends its stream
+                # instead of leaving it to pings.
+                await items.put(end)
             raise
         except Exception:
             await items.put(end)
@@ -1181,6 +1186,7 @@ async def _with_ticks(
                 return
             yield item
     finally:
+        consumer_stopped = True
         reader.cancel()
         # Return only once the reader has stopped and closed the source.
         await asyncio.gather(reader, return_exceptions=True)

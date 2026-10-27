@@ -2107,3 +2107,24 @@ def test_stream_ends_with_an_error_when_the_upstream_fails_mid_stream(monkeypatc
     assert names[-1] == "error"
     # Reported as the upstream's own failure, not as a stream that ended early.
     assert events[-1][1]["error"]["message"] == "Internal server error"
+
+
+def test_stream_ends_when_the_upstream_is_cancelled_on_its_own(monkeypatch):
+    """A cancellation raised inside the upstream ends the stream instead of leaving it to pings."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)
+
+    async def source():
+        yield _line(chunk({"content": "hello"}))
+        await asyncio.sleep(0.1)
+        raise asyncio.CancelledError()
+
+    async def collect():
+        frames = []
+        with pytest.raises(asyncio.CancelledError):
+            async for frame in reframe_openai_stream(source(), MODEL):
+                frames.append(frame)
+                assert len(frames) < 100, "the stream kept pinging after its upstream ended"
+        return frames
+
+    events = parse_frames(asyncio.run(asyncio.wait_for(collect(), 5)))
+    assert "ping" in [name for name, _ in events]
