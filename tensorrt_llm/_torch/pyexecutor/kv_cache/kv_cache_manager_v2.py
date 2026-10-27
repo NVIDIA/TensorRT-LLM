@@ -2760,6 +2760,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 {
                     self.impl.get_page_stride(layer_id, self._get_pool_roles(pool_id)[0])
                     for layer_id in layer_ids
+                    # Auxiliary layers do not supply model page-table pointers.
+                    if int(layer_id) < self.num_local_layers
                 }
             )
             > 1
