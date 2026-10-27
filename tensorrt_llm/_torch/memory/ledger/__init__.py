@@ -160,8 +160,13 @@ def capture(
     if device_index is None:
         device_index = torch.cuda.current_device()
 
+    if entries is None:
+        from .providers import collect_all
+
+        entries = collect_all()
+
     return LedgerCapture(
-        frame=build_frame(_read_device(device_index), _read_torch(device_index), entries or []),
+        frame=build_frame(_read_device(device_index), _read_torch(device_index), entries),
         capability=probe_capability(),
         tag=tag,
         trigger=trigger,
