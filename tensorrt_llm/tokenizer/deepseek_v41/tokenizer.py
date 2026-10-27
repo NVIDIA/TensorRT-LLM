@@ -43,7 +43,8 @@ differences, each verified against the checkpoint by
 5. **Tool names are namespace-qualified** (``namespace::name``), and a namespace
    description is prepended to the tool description.
 6. **There is no ``developer`` role**, and assistant reasoning is read only from
-   ``reasoning_content`` (V4 also accepted ``reasoning``).
+   ``reasoning_content`` (V4 also accepted ``reasoning``). ``apply_chat_template``
+   renders a developer message as a system message.
 
 Renders text and image placeholders; the multimodal input pipeline decodes images
 and inserts their placeholders.
@@ -616,9 +617,19 @@ class DeepseekV41Tokenizer(TransformersTokenizer):
         reasoning_effort = kwargs.get("reasoning_effort")
 
         conversation = kwargs.get("conversation", messages)
-        messages = list(conversation)
+        # V4.1 has no developer role; a developer message is a system message.
+        messages = [
+            {**message, "role": "system"} if message.get("role") == "developer" else message
+            for message in conversation
+        ]
         if tools:
-            messages.insert(0, {"role": "system", "tools": tools})
+            # The checkpoint's encoder renders tools from the system message that
+            # leads the conversation, after its content: one system block, not a
+            # tools-only block ahead of the caller's system prompt.
+            if messages and messages[0].get("role") == "system" and not messages[0].get("tools"):
+                messages[0] = {**messages[0], "tools": tools}
+            else:
+                messages.insert(0, {"role": "system", "tools": tools})
 
         rendered = encode_messages(
             messages=messages,
