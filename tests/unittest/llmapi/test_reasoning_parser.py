@@ -1427,6 +1427,23 @@ def test_glm_streaming_matches_parse_on_random_text(key: str) -> None:
         assert _glm_stream(key, None, chunks) == expected, chunks
 
 
+@pytest.mark.parametrize("key", ["glm", "glm45", "glm47", "glm_moe_dsa"])
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ("<|assistant|><think>", True),
+        ("<|assistant|></think>", False),
+        ("<|assistant|><think></think>", False),
+        ("<|assistant|>\n<think></think>", False),
+        # GLM-4.5/4.6 with thinking on: the model opens the block itself.
+        ("<|assistant|>", None),
+    ])
+def test_glm_mode_is_read_off_the_prompt(key: str, tail: str,
+                                         expected: bool | None) -> None:
+    assert ReasoningParserFactory.resolve_prefilled_thinking(
+        key, "<|user|>hi" + tail) is expected
+
+
 def test_deepseek_r1_keeps_a_second_close_as_content() -> None:
     result = ReasoningParserFactory.create_reasoning_parser(
         "deepseek-r1").parse("a</think>b</think><tool_call>f")

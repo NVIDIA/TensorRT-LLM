@@ -358,8 +358,10 @@ class GlmReasoningParser(BaseReasoningParser):
     """Reasoning parser for the GLM family.
 
     GLM-4.7 and GLM-5 templates prefill `<think>` (`reasoning_at_start`), or
-    `</think>` when `enable_thinking` is false. GLM-4.5/4.6 (`glm45`) do not
-    prefill `<think>`; the model opens the block at the start of its output.
+    close the block when `enable_thinking` is false; GLM-5.3 prefills `<think>`
+    either way. GLM-4.5/4.6 (`glm45`) do not prefill `<think>`; the model
+    opens the block at the start of its output. A rendered prompt that ends in
+    `<think>` or `</think>` sets the mode, whatever `enable_thinking` says.
 
     The block ends at the first `</think>`, or at a `<tool_call>` opened
     before it; a later `<think>` is text. A `</think>` before any content, or
@@ -370,6 +372,7 @@ class GlmReasoningParser(BaseReasoningParser):
     dropped.
     """
 
+    resolves_thinking_from_prompt = True
     reasoning_start = "<think>"
     reasoning_end = "</think>"
     _tool_call_start = "<tool_call>"
@@ -380,8 +383,9 @@ class GlmReasoningParser(BaseReasoningParser):
                  reasoning_at_start: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
         super().__init__(chat_template_kwargs=chat_template_kwargs)
-        # The templates close the block in the prompt when `enable_thinking`
-        # is passed and false.
+        # `enable_thinking` is the mode read off the rendered prompt when the
+        # server could read it, else the request's; false means the prompt
+        # closed the block.
         if not (chat_template_kwargs or {}).get("enable_thinking", True):
             reasoning_at_start = False
         self.reasoning_at_start = reasoning_at_start
