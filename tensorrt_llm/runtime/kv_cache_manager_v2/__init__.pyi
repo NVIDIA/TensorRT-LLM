@@ -509,6 +509,9 @@ class KVCacheManagerConfig:
     # gives way between them. The two can only conflict if the floors alone exceed this
     # budget, which construction rejects.
     host_sparse_pool_quota: int | None = None
+    # Required alignment of the final prefix match, after backoff and coverage
+    # pruning; a positive divisor of tokens_per_block. 1 keeps token-granular reuse.
+    reuse_match_alignment: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
