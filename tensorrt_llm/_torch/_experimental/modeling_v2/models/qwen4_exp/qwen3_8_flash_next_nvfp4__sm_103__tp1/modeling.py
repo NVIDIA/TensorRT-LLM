@@ -1825,11 +1825,14 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # state silently does not exist.
         _require(
             cm,
-            ("get_conv_states", "get_ssm_states", "ple_layer_cache"),
+            ("mamba_layer_cache", "ple_layer_cache"),
             "reads the recurrent, conv and PLE pools",
         )
-        conv = {i: cm.get_conv_states(i) for i in self.gdn_layers}
-        ssm = {i: cm.get_ssm_states(i) for i in self.gdn_layers}
+        # Bound views survive pool rebalance, so use the kernel-facing extent
+        # consistently for recurrent state, replay history and PLE state.
+        layer_caches = {i: cm.mamba_layer_cache(i) for i in self.gdn_layers}
+        conv = {i: cache.conv for i, cache in layer_caches.items()}
+        ssm = {i: cache.temporal for i, cache in layer_caches.items()}
         conv0, ssm0 = conv[self.gdn_layers[0]], ssm[self.gdn_layers[0]]
         check_recurrent_pools(g, conv0, ssm0)
 
@@ -1899,7 +1902,10 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             "(prev_num_accepted_tokens / cache_buf_idx / widths)"
         )
         history, width = meta.replay_history_size, meta.replay_step_width
-        check_replay_state(history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0)
+        shared = cm.mamba_layer_cache(self.gdn_layers[0])
+        check_replay_state(
+            history, width, shared.prev_num_accepted_tokens, shared.cache_buf_idx, ssm0
+        )
         old = {}
         for i in self.gdn_layers:
             layer_cache = cm.mamba_layer_cache(i)
@@ -1922,7 +1928,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
                 f"{missing}; the partitioned verify call needs both"
             )
         return _Replay(
-            old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width, all_layer
+            old, shared.cache_buf_idx, shared.prev_num_accepted_tokens, history, width, all_layer
         )
 
     def _bind_draft_cache_manager(self, md) -> None:
